@@ -15,9 +15,9 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 
 ## P1 — Architecture correctness / avoid OpenClaw pitfalls
 
-4) Unify capability + tool model
-- ✅ Capabilities unified to `alms-core::Capability` in coordinator.
-- Tools: there are currently two parallel tool registries (`alms-runtime::tools` vs `alms-sandbox::registry`). Pick one and wire runtime → sandbox if sandboxing is the goal.
+4) Unify capability + tool model ✅
+- Capabilities unified to `alms-core::Capability` in coordinator.
+- Tool registry unified: runtime now wraps `alms-sandbox::ToolRegistry`.
 
 5) Session storage strategy ✅
 - Decision captured in `docs/session-storage.md` (MVP: in-memory + snapshots; defer append-only/SQLite choice).
