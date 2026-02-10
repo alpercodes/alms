@@ -131,6 +131,21 @@ pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
 
 pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult<()> {
     let state = AppState::new(gateway);
+
+    {
+        let mut gateway = state.gateway.lock().await;
+        gateway.initialize_channels().await?;
+        gateway.start().await?;
+    }
+
+    let background_gateway = state.gateway.clone();
+    tokio::spawn(async move {
+        let mut gateway = background_gateway.lock().await;
+        if let Err(e) = gateway.run().await {
+            tracing::error!("Gateway message loop exited: {}", e);
+        }
+    });
+
     let app = router().with_state(state);
     
     info!("Starting ALMS Gateway HTTP server on {}", bind_addr);
