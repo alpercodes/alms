@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 alms-core = { path = "../alms-core" }
 alms-session = { path = "../alms-session" }
+alms-sandbox = { path = "../alms-sandbox" }
 
 # Async runtime
 tokio.workspace = true
