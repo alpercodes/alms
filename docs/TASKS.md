@@ -4,26 +4,19 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 
 ## P0 — Blocking (make it build + run end-to-end)
 
-1) Break the **Cargo dependency cycle**
-- Problem: `alms-runtime` <-> `alms-coordinator` cycle.
-- Fix: move shared message types + traits into `alms-core` or a new `alms-protocol` crate; make dependencies one-way.
+1) Break the **Cargo dependency cycle** ✅
+- Fixed: moved MainAgent into coordinator and removed runtime↔coordinator cycle.
 
-2) Fix `alms-gateway` compile/run wiring
-- `crates/alms-cli/src/main.rs` calls `alms_gateway::serve(&bind)` but `server::serve` currently requires `(bind, gateway: Gateway)`.
-- `crates/alms-gateway/src/server.rs` `run_agent` calls `AgentRuntime::new(..., SessionManager)` where `LlmClient` is required.
-- Pick an ownership model:
-  - HTTP server owns gateway and spawns `Gateway::run()` in background; OR
-  - Gateway owns the HTTP server.
-- Ensure one coherent startup path.
+2) Fix `alms-gateway` compile/run wiring ✅
+- Fixed: `serve(bind)` signature, corrected AgentRuntime construction, HTTP server now owns gateway lifecycle.
 
-3) Ensure the canonical repo is a **git repo**
-- `</srv/alms` currently has no `.git` directory.
-- Decide canonical upstream and how branches/PRs are done.
+3) Ensure the canonical repo is a **git repo** ✅
+- Initialized git in `</srv/alms` and committed initial import.
 
 ## P1 — Architecture correctness / avoid OpenClaw pitfalls
 
 4) Unify capability + tool model
-- Capabilities: currently both `alms-core::Capability` (enum) and `Vec<String>` capabilities in coordinator requests.
+- ✅ Capabilities unified to `alms-core::Capability` in coordinator.
 - Tools: there are currently two parallel tool registries (`alms-runtime::tools` vs `alms-sandbox::registry`). Pick one and wire runtime → sandbox if sandboxing is the goal.
 
 5) Session storage strategy
