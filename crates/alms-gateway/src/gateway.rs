@@ -1,0 +1,271 @@
+//! ALMS Gateway - Integrated message router
+//! 
+//! Connects channels (Telegram, etc.) to agent runtimes with session management.
+
+use alms_channel::telegram::TelegramChannel;
+use alms_channel::{Channel, ChannelConfig};
+use alms_core::{AgentId, AlmsResult};
+use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
+use alms_session::{SessionConfig, SessionManager};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+
+/// Gateway configuration
+#[derive(Debug, Clone)]
+pub struct GatewayConfig {
+    /// Telegram bot token
+    pub telegram_token: Option<String>,
+    /// LLM configuration
+    pub llm_config: alms_runtime::LlmConfig,
+    /// Agent configuration
+    pub agent_config: AgentConfig,
+    /// Session configuration
+    pub session_config: SessionConfig,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            telegram_token: None,
+            llm_config: alms_runtime::LlmConfig::default(),
+            agent_config: AgentConfig::default(),
+            session_config: SessionConfig::default(),
+        }
+    }
+}
+
+impl GatewayConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_telegram_token(mut self, token: impl Into<String>) -> Self {
+        self.telegram_token = Some(token.into());
+        self
+    }
+
+    pub fn from_env() -> Self {
+        let token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+        Self {
+            telegram_token: token,
+            llm_config: alms_runtime::LlmConfig::default(),
+            agent_config: AgentConfig::default(),
+            session_config: SessionConfig::default(),
+        }
+    }
+}
+
+/// Active channel connections
+#[derive(Debug)]
+struct Channels {
+    telegram: Option<TelegramChannel>,
+}
+
+/// The ALMS Gateway - orchestrates channels, sessions, and agents
+#[derive(Debug)]
+pub struct Gateway {
+    config: GatewayConfig,
+    session_manager: Arc<SessionManager>,
+    channels: Channels,
+    llm: LlmClient,
+    agent_id: AgentId,
+}
+
+impl Gateway {
+    /// Create a new gateway
+    pub fn new(config: GatewayConfig) -> AlmsResult<Self> {
+        let session_manager = Arc::new(SessionManager::new(config.session_config.clone()));
+        let llm = LlmClient::new(config.llm_config.clone())?;
+        
+        Ok(Self {
+            config,
+            session_manager,
+            channels: Channels { telegram: None },
+            llm,
+            agent_id: AgentId::new(),
+        })
+    }
+
+    /// Create from environment
+    pub fn from_env() -> AlmsResult<Self> {
+        Self::new(GatewayConfig::from_env())
+    }
+
+    /// Initialize channels
+    pub async fn initialize_channels(&mut self) -> AlmsResult<()> {
+        // Initialize Telegram if token is configured
+        if let Some(ref token) = self.config.telegram_token {
+            info!("Initializing Telegram channel");
+            let mut telegram = TelegramChannel::new();
+            
+            let channel_config = ChannelConfig {
+                token: token.clone(),
+                use_webhook: false,
+                webhook_url: None,
+                poll_interval_secs: 5,
+                extra: Default::default(),
+            };
+            
+            telegram.initialize(channel_config).await?;
+            self.channels.telegram = Some(telegram);
+            info!("Telegram channel initialized");
+        } else {
+            warn!("No Telegram token configured, skipping Telegram channel");
+        }
+
+        Ok(())
+    }
+
+    /// Start the gateway
+    pub async fn start(&mut self) -> AlmsResult<()> {
+        info!("Starting ALMS Gateway");
+
+        // Start Telegram channel
+        if let Some(ref telegram) = self.channels.telegram {
+            telegram.start().await?;
+            info!("Telegram channel started");
+        }
+
+        Ok(())
+    }
+
+    /// Run the main message processing loop
+    pub async fn run(&mut self) -> AlmsResult<()> {
+        info!("Starting message processing loop");
+
+        // Start receiving messages from Telegram
+        let mut telegram_rx: Option<mpsc::Receiver<alms_channel::IncomingMessage>> = None;
+        if let Some(ref telegram) = self.channels.telegram {
+            telegram_rx = Some(telegram.receive_updates().await?);
+        }
+
+        // Create agent runtime
+        let runtime = AgentRuntime::new(
+            self.agent_id.clone(),
+            self.config.agent_config.clone(),
+            self.llm.clone(),
+        );
+
+        loop {
+            tokio::select! {
+                // Handle Telegram messages
+                Some(msg) = async {
+                    if let Some(ref mut rx) = telegram_rx {
+                        rx.recv().await
+                    } else {
+                        None
+                    }
+                } => {
+                    if let Err(e) = self.handle_message(&runtime, msg).await {
+                        error!("Error handling message: {}", e);
+                    }
+                }
+                
+                // Add other channel handlers here as needed
+                
+                else => {
+                    // All channels closed
+                    break;
+                }
+            }
+        }
+
+        info!("Message processing loop ended");
+        Ok(())
+    }
+
+    /// Handle an incoming message
+    async fn handle_message(
+        &self,
+        runtime: &AgentRuntime,
+        msg: alms_channel::IncomingMessage,
+    ) -> AlmsResult<()> {
+        info!(
+            "Received message from chat {}: {}",
+            msg.chat_id.0,
+            msg.text
+        );
+
+        // Use chat_id as context_id for session management
+        let context_id = format!("telegram_{}", msg.chat_id.0);
+
+        // Run the agent
+        match runtime.run(&self.session_manager, &context_id, &msg.text).await {
+            Ok(response) => {
+                // Send response back via Telegram
+                if let Some(ref telegram) = self.channels.telegram {
+                    let outgoing = alms_channel::OutgoingMessage {
+                        chat_id: msg.chat_id,
+                        text: response,
+                        reply_to: Some(msg.message_id),
+                        options: Default::default(),
+                    };
+                    
+                    if let Err(e) = telegram.send_message(outgoing).await {
+                        error!("Failed to send response: {}", e);
+                    } else {
+                        info!("Response sent successfully");
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Agent error: {}", e);
+                
+                // Send error message back to user
+                if let Some(ref telegram) = self.channels.telegram {
+                    let outgoing = alms_channel::OutgoingMessage {
+                        chat_id: msg.chat_id,
+                        text: "Sorry, I encountered an error processing your message.".to_string(),
+                        reply_to: Some(msg.message_id),
+                        options: Default::default(),
+                    };
+                    
+                    let _ = telegram.send_message(outgoing).await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Stop the gateway
+    pub async fn stop(&mut self) -> AlmsResult<()> {
+        info!("Stopping ALMS Gateway");
+
+        if let Some(ref telegram) = self.channels.telegram {
+            telegram.stop().await?;
+        }
+
+        Ok(())
+    }
+
+    /// Get session manager reference
+    pub fn session_manager(&self) -> &Arc<SessionManager> {
+        &self.session_manager
+    }
+
+    /// Get agent ID
+    pub fn agent_id(&self) -> &AgentId {
+        &self.agent_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gateway_config_default() {
+        let config = GatewayConfig::default();
+        assert!(config.telegram_token.is_none());
+    }
+
+    #[test]
+    fn test_gateway_config_with_token() {
+        let config = GatewayConfig::new()
+            .with_telegram_token("test_token");
+        
+        assert_eq!(config.telegram_token, Some("test_token".to_string()));
+    }
+}

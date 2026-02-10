@@ -1,0 +1,19 @@
+[package]
+name = "alms-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "alms"
+path = "src/main.rs"
+
+[dependencies]
+alms-core = { path = "../alms-core" }
+alms-gateway = { path = "../alms-gateway" }
+
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

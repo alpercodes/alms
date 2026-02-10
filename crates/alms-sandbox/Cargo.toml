@@ -1,0 +1,24 @@
+[package]
+name = "alms-sandbox"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+alms-core = { path = "../alms-core" }
+
+wasmtime.workspace = true
+wasmtime-wasi = "28.0"
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true

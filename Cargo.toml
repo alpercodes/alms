@@ -1,0 +1,79 @@
+[workspace]
+members = [
+    "crates/alms-gateway",
+    "crates/alms-session",
+    "crates/alms-runtime",
+    "crates/alms-sandbox",
+    "crates/alms-channel",
+    "crates/alms-cli",
+    "crates/alms-core",
+    "crates/alms-coordinator",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Mustafa <alms@mustafa.ai>"]
+license = "MIT"
+repository = "https://github.com/alper/alms"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full", "tracing"] }
+tokio-util = { version = "0.7", features = ["codec", "time"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Web framework
+axum = { version = "0.8", features = ["ws"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# WASM runtime
+wasmtime = "28.0"
+
+# Concurrency
+dashmap = "6.1"
+parking_lot = "0.12"
+crossbeam = "0.8"
+
+# Tracing & Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Configuration
+config = "0.15"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1.13", features = ["v4", "serde"] }
+
+# Async traits
+async-trait = "0.1"
+
+# Testing
+tokio-test = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

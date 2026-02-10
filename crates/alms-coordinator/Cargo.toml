@@ -1,0 +1,24 @@
+[package]
+name = "alms-coordinator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+alms-core = { path = "../alms-core" }
+alms-runtime = { path = "../alms-runtime" }
+alms-session = { path = "../alms-session" }
+
+tokio.workspace = true
+crossbeam.workspace = true
+dashmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio-test.workspace = true
