@@ -249,6 +249,16 @@ impl Gateway {
     pub fn agent_id(&self) -> &AgentId {
         &self.agent_id
     }
+
+    /// Get LLM client reference
+    pub fn llm(&self) -> &LlmClient {
+        &self.llm
+    }
+
+    /// Get agent config reference
+    pub fn agent_config(&self) -> &AgentConfig {
+        &self.config.agent_config
+    }
 }
 
 #[cfg(test)]

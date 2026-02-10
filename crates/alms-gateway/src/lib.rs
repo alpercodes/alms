@@ -25,7 +25,7 @@ pub mod server;
 
 // Re-export main types
 pub use gateway::{Gateway, GatewayConfig};
-pub use server::serve;
+pub use server::{serve, serve_with_gateway};
 
 use alms_core::AlmsResult;
 

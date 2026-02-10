@@ -2,9 +2,9 @@
 //!
 //! Provides REST API endpoints and WebSocket connections for external control.
 
-use crate::gateway::{Gateway, GatewayConfig};
+use crate::gateway::Gateway;
 use alms_core::{AgentId, AlmsResult};
-use alms_session::{Session, SessionConfig, SessionManager};
+use alms_session::SessionManager;
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
     response::IntoResponse,
@@ -86,8 +86,8 @@ async fn run_agent(
     // Create agent runtime
     let runtime = alms_runtime::AgentRuntime::new(
         gateway.agent_id().clone(),
-        alms_runtime::AgentConfig::default(),
-        gateway.session_manager().clone(),
+        gateway.agent_config().clone(),
+        gateway.llm().clone(),
     );
     
     // Run agent
@@ -124,7 +124,12 @@ async fn handle_socket(
 }
 
 /// Start the gateway HTTP server
-pub async fn serve(bind_addr: &str, gateway: Gateway) -> AlmsResult<()> {
+pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
+    let gateway = Gateway::from_env()?;
+    serve_with_gateway(bind_addr, gateway).await
+}
+
+pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult<()> {
     let state = AppState::new(gateway);
     let app = router().with_state(state);
     
