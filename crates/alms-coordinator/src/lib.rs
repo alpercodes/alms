@@ -1,4 +1,4 @@
-use alms_core::{AgentId, AlmsResult, SessionId};
+use alms_core::{AgentId, AlmsResult, Capability, SessionId};
 
 pub mod main_agent;
 
@@ -45,36 +45,36 @@ pub enum SubagentType {
 }
 
 impl SubagentType {
-    pub fn default_capabilities(&self) -> Vec<String> {
+    pub fn default_capabilities(&self) -> Vec<Capability> {
         match self {
             SubagentType::Research => vec![
-                "web_search".to_string(),
-                "read_docs".to_string(),
-                "summarize".to_string(),
+                Capability::Search,
+                Capability::Read,
+                Capability::Custom("summarize".to_string()),
             ],
             SubagentType::Code => vec![
-                "code_gen".to_string(),
-                "lint".to_string(),
-                "test_run".to_string(),
-                "read".to_string(),
-                "write".to_string(),
+                Capability::CodeExecution,
+                Capability::Custom("lint".to_string()),
+                Capability::Custom("test_run".to_string()),
+                Capability::Read,
+                Capability::Write,
             ],
             SubagentType::Data => vec![
-                "query".to_string(),
-                "transform".to_string(),
-                "visualize".to_string(),
+                Capability::Custom("query".to_string()),
+                Capability::Custom("transform".to_string()),
+                Capability::Custom("visualize".to_string()),
             ],
             SubagentType::Integration => vec![
-                "http_request".to_string(),
-                "webhook".to_string(),
-                "notify".to_string(),
+                Capability::Http,
+                Capability::Custom("webhook".to_string()),
+                Capability::Custom("notify".to_string()),
             ],
             SubagentType::Security => vec![
-                "scan".to_string(),
-                "audit".to_string(),
-                "report".to_string(),
+                Capability::Custom("scan".to_string()),
+                Capability::Custom("audit".to_string()),
+                Capability::Custom("report".to_string()),
             ],
-            SubagentType::General => vec!["*".to_string()],
+            SubagentType::General => vec![Capability::Custom("*".to_string())],
         }
     }
 }
@@ -85,7 +85,7 @@ pub struct SubagentRequest {
     pub task: String,
     pub agent_type: SubagentType,
     pub timeout: Duration,
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<Capability>,
     pub parent_session: SessionId,
 }
 
