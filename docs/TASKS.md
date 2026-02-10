@@ -19,9 +19,8 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 - ✅ Capabilities unified to `alms-core::Capability` in coordinator.
 - Tools: there are currently two parallel tool registries (`alms-runtime::tools` vs `alms-sandbox::registry`). Pick one and wire runtime → sandbox if sandboxing is the goal.
 
-5) Session storage strategy
-- MVP: in-memory + snapshot.
-- Decide append-only log + snapshots vs sqlite vs something else; align with the OpenClaw session-issues research.
+5) Session storage strategy ✅
+- Decision captured in `docs/session-storage.md` (MVP: in-memory + snapshots; defer append-only/SQLite choice).
 
 6) Tool sandbox ABI
 - Define stable ABI: how params/results are passed, allocation strategy, bounds checking.
