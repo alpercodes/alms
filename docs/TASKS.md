@@ -22,8 +22,8 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 5) Session storage strategy ✅
 - Decision captured in `docs/session-storage.md` (MVP: in-memory + snapshots; defer append-only/SQLite choice).
 
-6) Tool sandbox ABI
-- Define stable ABI: how params/results are passed, allocation strategy, bounds checking.
+6) Tool sandbox ABI ✅
+- MVP spec captured in `docs/tool-sandbox-abi.md`.
 
 ## P2 — Product/UX
 
@@ -35,4 +35,10 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 
 ---
 
-See also: `docs/mesut-verdict-2026-02-10.md`
+See also:
+- `docs/mesut-verdict-2026-02-10.md`
+- `docs/proposal.md`
+- `docs/tech-stack.md`
+- `docs/security-model.md`
+- `docs/testing-strategy.md`
+- `docs/mvp-plan.md`
