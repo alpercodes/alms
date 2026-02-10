@@ -7,12 +7,11 @@
 /// 4. Spawns subagents for parallel execution
 /// 5. Synthesizes results into coherent responses
 
+use crate::{Coordinator, SubagentRequest, SubagentType, TaskId, TaskResult, TaskStatus};
 use alms_core::{AgentId, AlmsResult};
-use alms_coordinator::{Coordinator, SubagentRequest, SubagentType, TaskId, AgentMessage, TaskResult, TaskStatus};
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 /// Main Agent handles user interactions and orchestrates subagents
 #[derive(Debug)]
@@ -150,8 +149,6 @@ impl MainAgent {
     
     /// Collect results from subagents
     async fn collect_results(&mut self, task_ids: &[TaskId]) -> AlmsResult<()> {
-        let message_rx = self.coordinator.message_sender();
-        
         // In real implementation, this would listen on a channel
         // For now, poll status until all complete
         let mut completed = 0;

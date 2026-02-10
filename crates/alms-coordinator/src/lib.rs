@@ -1,4 +1,8 @@
 use alms_core::{AgentId, AlmsResult, SessionId};
+
+pub mod main_agent;
+
+pub use main_agent::MainAgent;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

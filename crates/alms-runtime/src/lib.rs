@@ -8,10 +8,7 @@
 pub mod agent;
 pub mod llm_client;
 pub mod llm_types;
-pub mod main_agent;
 pub mod tools;
-
-pub use main_agent::MainAgent;
 
 pub use agent::{AgentConfig, AgentRuntime};
 pub use llm_client::LlmClient;

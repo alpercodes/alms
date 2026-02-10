@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 alms-core = { path = "../alms-core" }
-alms-coordinator = { path = "../alms-coordinator" }
 alms-session = { path = "../alms-session" }
 
 # Async runtime
@@ -41,9 +40,6 @@ uuid.workspace = true
 
 # Concurrency
 dashmap.workspace = true
-
-[dev-dependencies]
-tokio-test.workspace = true
 
 [dev-dependencies]
 tokio-test.workspace = true
