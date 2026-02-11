@@ -129,7 +129,9 @@ impl Tool for WasmTool {
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
         let mut sandbox = Sandbox::new(self.config.clone());
-        sandbox.execute(&self.wasm_bytes, &self.entry_point, params).await
+        sandbox
+            .execute(&self.wasm_bytes, &self.entry_point, &self.name, params)
+            .await
     }
 }
 

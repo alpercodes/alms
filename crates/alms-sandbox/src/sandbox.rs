@@ -9,6 +9,10 @@ use wasmtime::{AsContext, AsContextMut, Config, Engine, Instance, Memory, Module
 pub struct SandboxConfig {
     /// Maximum memory per instance in bytes (default: 64MB)
     pub max_memory: usize,
+    /// Maximum input payload bytes (default: 1 MiB)
+    pub max_input_bytes: usize,
+    /// Maximum output payload bytes (default: 4 MiB)
+    pub max_output_bytes: usize,
     /// Execution timeout (default: 30 seconds)
     pub timeout: Duration,
     /// Enable fuel metering for deterministic execution
@@ -25,6 +29,8 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             max_memory: 64 * 1024 * 1024, // 64MB
+            max_input_bytes: 1024 * 1024, // 1 MiB
+            max_output_bytes: 4 * 1024 * 1024, // 4 MiB
             timeout: Duration::from_secs(30),
             fuel_enabled: true,
             initial_fuel: 10_000_000_000, // 10 billion units
@@ -43,6 +49,18 @@ impl SandboxConfig {
     /// Set maximum memory
     pub fn with_max_memory(mut self, bytes: usize) -> Self {
         self.max_memory = bytes;
+        self
+    }
+
+    /// Set maximum input bytes
+    pub fn with_max_input_bytes(mut self, bytes: usize) -> Self {
+        self.max_input_bytes = bytes;
+        self
+    }
+
+    /// Set maximum output bytes
+    pub fn with_max_output_bytes(mut self, bytes: usize) -> Self {
+        self.max_output_bytes = bytes;
         self
     }
 
@@ -141,15 +159,33 @@ impl Sandbox {
     pub async fn execute(
         &mut self,
         wasm_bytes: &[u8],
-        function_name: &str,
+        entrypoint: &str,
+        tool_name: &str,
         params: Value,
     ) -> SandboxResult<Value> {
         let start_time = std::time::Instant::now();
         
         info!(
-            "Executing WASM module, function: {}, params: {:?}",
-            function_name, params
+            "Executing WASM module, entrypoint: {}, tool: {}, params: {:?}",
+            entrypoint, tool_name, params
         );
+
+        // Build ABI envelope
+        let payload = serde_json::json!({
+            "abi": 0,
+            "tool": tool_name,
+            "params": params,
+        });
+
+        // Serialize params to JSON
+        let params_json = serde_json::to_vec(&payload)?;
+        if params_json.len() > self.config.max_input_bytes {
+            return Err(SandboxError::MemoryLimitExceeded {
+                allocated: params_json.len(),
+                limit: self.config.max_input_bytes,
+            });
+        }
+        let params_len = params_json.len() as i32;
 
         // Compile the module
         let module = self.compile(wasm_bytes).await?;
@@ -167,30 +203,40 @@ impl Sandbox {
         let instance = self.instantiate(&mut store, &module).await?;
 
         // Get the exported function
-        let func = self.get_function(&mut store, &instance, function_name)?;
-
-        // Serialize params to JSON
-        let params_json = serde_json::to_vec(&params)?;
-        let params_len = params_json.len() as i32;
+        let func = self.get_function(&mut store, &instance, entrypoint)?;
 
         // Get memory export
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| SandboxError::WasmExecution("Memory export not found".to_string()))?;
 
-        // Allocate space for input and write it
-        let ptr = self.allocate(&mut store, &memory, params_len as usize).await?;
-        
+        // Allocate space for input via exported allocator
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "alms_alloc")
+            .map_err(|_| SandboxError::WasmFunctionNotFound("alms_alloc".to_string()))?;
+        let ptr = alloc
+            .call_async(&mut store, params_len)
+            .await
+            .map_err(|e| SandboxError::WasmExecution(format!("Allocation failed: {}", e)))?;
+        if ptr == 0 {
+            return Err(SandboxError::MemoryLimitExceeded {
+                allocated: params_len as usize,
+                limit: self.config.max_memory,
+            });
+        }
+
         memory.write(&mut store, ptr as usize, &params_json)
-            .map_err(|e| SandboxError::MemoryLimitExceeded {
+            .map_err(|_| SandboxError::MemoryLimitExceeded {
                 allocated: ptr as usize + params_len as usize,
                 limit: self.config.max_memory,
             })?;
 
         // Call the function
         trace!("Calling WASM function with ptr={}, len={}", ptr, params_len);
-        let result_ptr: i32 = func.call_async(&mut store, (ptr, params_len))
+        let call_future = func.call_async(&mut store, (ptr, params_len));
+        let result_ptr: i32 = tokio::time::timeout(self.config.timeout, call_future)
             .await
+            .map_err(|_| SandboxError::ExecutionTimeout(self.config.timeout))?
             .map_err(|e| SandboxError::WasmExecution(format!("Function call failed: {}", e)))?;
 
         // Read result from memory
@@ -201,10 +247,10 @@ impl Sandbox {
         let result_len = i32::from_le_bytes(len_bytes) as usize;
 
         // Validate result length
-        if result_len > self.config.max_memory {
+        if result_len > self.config.max_output_bytes {
             return Err(SandboxError::MemoryLimitExceeded {
                 allocated: result_len,
-                limit: self.config.max_memory,
+                limit: self.config.max_output_bytes,
             });
         }
 
@@ -219,11 +265,6 @@ impl Sandbox {
 
         let elapsed = start_time.elapsed();
         info!("WASM execution completed in {:?}", elapsed);
-
-        // Check for timeout
-        if elapsed > self.config.timeout {
-            return Err(SandboxError::ExecutionTimeout(self.config.timeout));
-        }
 
         Ok(result)
     }
@@ -289,38 +330,6 @@ impl Sandbox {
             })
     }
 
-    /// Allocate memory in the WASM instance
-    async fn allocate(
-        &self,
-        store: &mut Store<SandboxState>,
-        memory: &Memory,
-        size: usize,
-    ) -> SandboxResult<i32> {
-        // Simple allocation: use the first available space
-        // In a real implementation, you'd want to track allocations
-        let current_size = memory.data_size(&*store);
-        
-        if size > self.config.max_memory {
-            return Err(SandboxError::MemoryLimitExceeded {
-                allocated: size,
-                limit: self.config.max_memory,
-            });
-        }
-
-        if size > current_size {
-            // Grow memory
-            let pages_needed = ((size - current_size) + 65535) / 65536;
-            memory.grow(&mut *store, pages_needed as u64)
-                .map_err(|e| SandboxError::MemoryLimitExceeded {
-                    allocated: size,
-                    limit: self.config.max_memory,
-                })?;
-        }
-
-        // Return pointer to start of memory
-        Ok(0)
-    }
-
     /// Get fuel consumed during execution
     pub fn get_fuel_consumed(&self, store: &Store<SandboxState>) -> Option<u64> {
         if self.config.fuel_enabled {
@@ -337,29 +346,93 @@ impl Sandbox {
 mod tests {
     use super::*;
 
-    // Simple test WASM module that doubles a number
-    // This is a minimal valid WASM module for testing
-    // In real usage, you'd compile Rust/C to WASM
-    const TEST_WASM: &[u8] = &[
-        0x00, 0x61, 0x73, 0x6d, // magic
-        0x01, 0x00, 0x00, 0x00, // version
-        // Minimal module with a simple function
-    ];
+    fn wasm_ok() -> Vec<u8> {
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (global $heap (mut i32) (i32.const 64))
+              (func (export "alms_alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                (local.set $ptr (global.get $heap))
+                (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+                (local.get $ptr)
+              )
+              (data (i32.const 0) "\22\00\00\00{\"ok\":true,\"result\":{\"echo\":\"hi\"}}")
+              (func (export "alms_tool_call") (param $ptr i32) (param $len i32) (result i32)
+                (i32.const 0)
+              )
+            )
+        "#;
+        wat::parse_str(wat).expect("valid wat")
+    }
 
-    #[test]
-    fn test_sandbox_config() {
-        let config = SandboxConfig::new()
-            .with_max_memory(128 * 1024 * 1024)
-            .with_timeout(Duration::from_secs(60));
-
-        assert_eq!(config.max_memory, 128 * 1024 * 1024);
-        assert_eq!(config.timeout, Duration::from_secs(60));
+    fn wasm_bad_json() -> Vec<u8> {
+        let wat = r#"
+            (module
+              (memory (export "memory") 1)
+              (global $heap (mut i32) (i32.const 64))
+              (func (export "alms_alloc") (param $len i32) (result i32)
+                (local $ptr i32)
+                (local.set $ptr (global.get $heap))
+                (global.set $heap (i32.add (global.get $heap) (local.get $len)))
+                (local.get $ptr)
+              )
+              (data (i32.const 0) "\05\00\00\00oops!")
+              (func (export "alms_tool_call") (param $ptr i32) (param $len i32) (result i32)
+                (i32.const 0)
+              )
+            )
+        "#;
+        wat::parse_str(wat).expect("valid wat")
     }
 
     #[tokio::test]
-    async fn test_sandbox_creation() {
-        let config = SandboxConfig::default();
-        let sandbox = Sandbox::new(config);
-        assert!(sandbox.config.fuel_enabled);
+    async fn test_execute_ok() {
+        let mut sandbox = Sandbox::new(SandboxConfig::default());
+        let result = sandbox
+            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn test_input_size_limit() {
+        let mut sandbox = Sandbox::new(SandboxConfig::default().with_max_input_bytes(10));
+        let err = sandbox
+            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": "too_large_payload"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::MemoryLimitExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_output_size_limit() {
+        let mut sandbox = Sandbox::new(SandboxConfig::default().with_max_output_bytes(8));
+        let err = sandbox
+            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::MemoryLimitExceeded { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_json_output() {
+        let mut sandbox = Sandbox::new(SandboxConfig::default());
+        let err = sandbox
+            .execute(&wasm_bad_json(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::InvalidResult(_)));
+    }
+
+    #[tokio::test]
+    async fn test_timeout() {
+        let mut sandbox = Sandbox::new(SandboxConfig::default().with_timeout(Duration::from_millis(0)));
+        let err = sandbox
+            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::ExecutionTimeout(_)));
     }
 }
