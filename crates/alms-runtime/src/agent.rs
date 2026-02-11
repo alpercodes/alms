@@ -297,6 +297,25 @@ impl AgentRuntime {
         let start = std::time::Instant::now();
         let args: serde_json::Value = serde_json::from_str(args_str)
             .map_err(|e| alms_core::AlmsError::ToolExecution(format!("Invalid arguments: {}", e)))?;
+
+        // Policy gate: deny unknown tools before execution
+        if !self.tools.contains(name) {
+            let err = alms_core::AlmsError::ToolExecution(format!("Tool '{}' not allowed", name));
+            let _ = session_manager.append_audit(
+                session_id,
+                AuditEvent {
+                    session_id,
+                    run_id: None,
+                    tool: name.to_string(),
+                    decision: AuditDecision::Deny,
+                    params: args,
+                    result: None,
+                    error: Some(err.to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                },
+            );
+            return Err(err);
+        }
         
         // Execute
         let result = self.tools.execute(name, args.clone()).await;
