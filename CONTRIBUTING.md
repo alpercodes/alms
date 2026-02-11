@@ -68,6 +68,8 @@ The CI pipeline (`.github/workflows/ci.yml`) runs:
 3. `cargo test --all` - Runs all tests including golden tests
 4. `cargo build --release` - Verifies release build works
 
+`make ci` runs all of these steps locally for parity.
+
 ## Project Structure
 
 - `crates/alms-core` - Core types and errors

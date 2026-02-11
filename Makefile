@@ -34,8 +34,13 @@ check:
 	cargo check --all
 
 # Full CI pipeline (what CI runs)
-ci: fmt-check clippy test
+ci: fmt-check clippy test build-release
 	@echo "==> All CI checks passed"
+
+# Build release binary (CI includes this)
+build-release:
+	@echo "==> Building release binary"
+	cargo build --release
 
 # Build release binary
 build:
