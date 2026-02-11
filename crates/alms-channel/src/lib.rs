@@ -32,19 +32,3 @@ pub mod telegram;
 
 /// Re-export commonly used types
 pub use alms_core::{Channel, ChannelConfig, IncomingMessage, OutgoingMessage, ChatId, UserId, MessageId};
-
-/// Legacy ChannelAdapter struct (deprecated, use Channel trait implementations)
-#[derive(Debug)]
-pub struct ChannelAdapter;
-
-impl ChannelAdapter {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for ChannelAdapter {
-    fn default() -> Self {
-        Self::new()
-    }
-}
