@@ -45,7 +45,7 @@ impl AgentRuntime {
             agent_id,
             config,
             llm,
-            tools: ToolRegistry::new().with_builtins(),
+            tools: ToolRegistry::with_builtins(),
         }
     }
     
