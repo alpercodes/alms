@@ -65,7 +65,7 @@ Use WebSockets only if you genuinely need bidirectional interactive control.
 
 ## 3) Crate/module strategy: start small, keep seams
 
-See: `docs/mvp-structure.md` for the formal decision.
+See: `docs/mvp-module-crate-structure.md` for the formal decision.
 
 Pushback accepted: **avoid premature splitting into many crates**.
 
