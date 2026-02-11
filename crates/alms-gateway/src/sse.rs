@@ -40,6 +40,8 @@ pub struct SseEventData {
     pub event_type: String,
     pub data: serde_json::Value,
     pub ts: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<u64>,
 }
 
 impl SseEventData {
@@ -48,6 +50,7 @@ impl SseEventData {
             event_type: event_type.to_string(),
             data: serde_json::to_value(data).unwrap_or_default(),
             ts: Utc::now(),
+            event_id: None,
         }
     }
 
@@ -55,9 +58,10 @@ impl SseEventData {
         Self::new("connected", ConnectedData { run_id: run_id.0.to_string() })
     }
 
-    pub fn run_started(run_id: RunId) -> Self {
+    pub fn run_started(run_id: RunId, session_id: alms_core::SessionId) -> Self {
         Self::new("run_started", RunStartedData {
             run_id: run_id.0.to_string(),
+            session_id: session_id.0.to_string(),
             ts: Utc::now(),
         })
     }
@@ -131,7 +135,7 @@ impl RunEventStream {
         let stream = ReceiverStream::new(receiver).map(|data| {
             let event = Event::default()
                 .event(&data.event_type)
-                .id(Uuid::new_v4().to_string())
+                .id(data.event_id.map(|id| id.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()))
                 .json_data(&serde_json::json!({
                     "event": data.event_type,
                     "data": data.data,
@@ -164,6 +168,7 @@ struct ConnectedData {
 #[derive(Debug, Serialize)]
 struct RunStartedData {
     run_id: String,
+    session_id: String,
     ts: DateTime<Utc>,
 }
 
@@ -231,7 +236,7 @@ mod tests {
     #[test]
     fn test_event_data_serialization() {
         let run_id = RunId::new();
-        let event = SseEventData::run_started(run_id);
+        let event = SseEventData::run_started(run_id, alms_core::SessionId::new());
         
         assert_eq!(event.event_type, "run_started");
         

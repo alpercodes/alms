@@ -4,8 +4,8 @@
 
 use crate::gateway::Gateway;
 use crate::runs::{create_run, get_run_status, stream_run_events};
-use crate::sse::{event_channel, RunEventStream, SseEventData};
-use alms_core::{AgentId, AlmsResult};
+use crate::sse::{RunEventStream, SseEventData};
+use alms_core::{AgentId, AlmsResult, Run, RunId};
 use alms_session::SessionManager;
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
@@ -21,30 +21,56 @@ use tracing::info;
 /// Run manager for tracking runs and their event streams
 #[derive(Debug, Clone)]
 pub struct RunManager {
-    pub event_senders: Arc<DashMap<alms_core::RunId, mpsc::UnboundedSender<SseEventData>>>,
+    pub event_senders: Arc<DashMap<RunId, mpsc::UnboundedSender<SseEventData>>>,
+    pub runs: Arc<DashMap<RunId, Run>>,
+    pub event_counters: Arc<DashMap<RunId, u64>>,
 }
 
 impl RunManager {
     pub fn new() -> Self {
         Self {
             event_senders: Arc::new(DashMap::new()),
+            runs: Arc::new(DashMap::new()),
+            event_counters: Arc::new(DashMap::new()),
         }
     }
 
-    pub fn register_sender(&self, run_id: alms_core::RunId, sender: mpsc::UnboundedSender<SseEventData>) {
+    pub fn register_sender(&self, run_id: RunId, sender: mpsc::UnboundedSender<SseEventData>) {
         self.event_senders.insert(run_id, sender);
+        self.event_counters.insert(run_id, 0);
     }
 
-    pub fn get_sender(&self, run_id: alms_core::RunId) -> Option<mpsc::UnboundedSender<SseEventData>> {
+    pub fn get_sender(&self, run_id: RunId) -> Option<mpsc::UnboundedSender<SseEventData>> {
         self.event_senders.get(&run_id).map(|s| s.clone())
     }
 
-    pub fn remove_sender(&self, run_id: alms_core::RunId) {
+    pub fn remove_sender(&self, run_id: RunId) {
         self.event_senders.remove(&run_id);
+        self.event_counters.remove(&run_id);
     }
 
-    pub fn send_event(&self, run_id: alms_core::RunId, event: SseEventData) {
+    pub fn insert_run(&self, run: Run) {
+        self.runs.insert(run.run_id, run);
+    }
+
+    pub fn get_run(&self, run_id: RunId) -> Option<Run> {
+        self.runs.get(&run_id).map(|r| r.clone())
+    }
+
+    pub fn update_run(&self, run: Run) {
+        self.runs.insert(run.run_id, run);
+    }
+
+    pub fn send_event(&self, run_id: RunId, mut event: SseEventData) {
         if let Some(sender) = self.get_sender(run_id) {
+            let next_id = self
+                .event_counters
+                .get(&run_id)
+                .map(|v| *v)
+                .unwrap_or(0)
+                + 1;
+            self.event_counters.insert(run_id, next_id);
+            event.event_id = Some(next_id);
             let _ = sender.send(event);
         }
     }

@@ -2,19 +2,15 @@
 //!
 //! Implements POST /runs and GET /runs/{id}/events per docs/api.md
 
-use crate::server::{AppState, RunManager};
+use crate::server::AppState;
 use crate::sse::{event_channel, RunEventStream, SseEventData};
-use alms_core::{CreateRunRequest, CreateRunResponse, Run, RunId, RunStatus, RunStatusResponse};
+use alms_core::{CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Json,
 };
 use chrono::Utc;
-use dashmap::DashMap;
-use serde::Serialize;
-use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing::{error, info};
 
 /// POST /runs - Create a new run
@@ -24,14 +20,15 @@ pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
 ) -> Result<(StatusCode, Json<CreateRunResponse>), (StatusCode, String)> {
-    // Get or create session
-    let session = state
-        .session_manager
-        .get_or_create(alms_core::AgentId::new(), req.session_id.0.to_string());
+    // Get existing session
+    let session = match state.session_manager.get(req.session_id) {
+        Ok(session) => session,
+        Err(_) => return Err((StatusCode::NOT_FOUND, "Session not found".to_string())),
+    };
 
     // Create run
     let input_text = match req.input {
-        alms_core::RunInput::Text { text } => text,
+        RunInput::Text { text } => text,
     };
     
     let run = Run::new(session.id, session.agent_id, input_text);
@@ -41,6 +38,9 @@ pub async fn create_run(
 
     info!("Creating run {} for session {}", run_id.0, session_id.0);
 
+    // Store run
+    state.run_manager.insert_run(run.clone());
+
     // Spawn background task to execute run
     let state_clone = AppState {
         session_manager: state.session_manager.clone(),
@@ -49,7 +49,7 @@ pub async fn create_run(
     };
 
     tokio::spawn(async move {
-        execute_run(state_clone, run_id, session_id, agent_id).await;
+        execute_run(state_clone, run_id, session_id, agent_id, run.input).await;
     });
 
     let response = CreateRunResponse {
@@ -68,14 +68,19 @@ async fn execute_run(
     run_id: RunId,
     session_id: alms_core::SessionId,
     agent_id: alms_core::AgentId,
+    input: String,
 ) {
     // Register event channel for this run
-    let (tx, mut rx) = event_channel();
+    let (tx, _rx) = event_channel();
     state.run_manager.register_sender(run_id, tx.clone());
 
-    // Send initial events
-    let _ = tx.send(SseEventData::connected(run_id));
-    let _ = tx.send(SseEventData::run_started(run_id));
+    // Send initial events (no "connected" in spec)
+    state.run_manager.send_event(run_id, SseEventData::run_started(run_id, session_id));
+
+    if let Some(mut run) = state.run_manager.get_run(run_id) {
+        run.mark_running();
+        state.run_manager.update_run(run);
+    }
 
     // Execute via gateway
     let gateway = state.gateway.lock().await;
@@ -86,20 +91,32 @@ async fn execute_run(
     );
     
     // For MVP: emit response as single token delta
-    let result = runtime.run(&state.session_manager, &session_id.0.to_string(), "").await;
+    let result = runtime.run(&state.session_manager, &session_id.0.to_string(), input).await;
     drop(gateway);
 
     // Mark completion
     match result {
         Ok(response) => {
             // Send token delta
-            let _ = tx.send(SseEventData::token_delta(run_id, &response));
+            state.run_manager.send_event(run_id, SseEventData::token_delta(run_id, &response));
             // Send finished
-            let _ = tx.send(SseEventData::run_finished(run_id, true));
+            state.run_manager.send_event(run_id, SseEventData::run_finished(run_id, true));
+
+            if let Some(mut run) = state.run_manager.get_run(run_id) {
+                run.mark_completed(response);
+                state.run_manager.update_run(run);
+            }
+
             info!("Run {} completed successfully", run_id.0);
         }
         Err(e) => {
-            let _ = tx.send(SseEventData::run_error(run_id, &e.to_string()));
+            state.run_manager.send_event(run_id, SseEventData::run_error(run_id, &e.to_string()));
+
+            if let Some(mut run) = state.run_manager.get_run(run_id) {
+                run.mark_failed(e.to_string());
+                state.run_manager.update_run(run);
+            }
+
             error!("Run {} failed: {}", run_id.0, e);
         }
     }
@@ -115,9 +132,12 @@ pub async fn get_run_status(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunStatusResponse>, (StatusCode, String)> {
-    // For MVP: return placeholder since we don't persist runs yet
-    // In full implementation, this would query RunManager storage
-    Err((StatusCode::NOT_IMPLEMENTED, "Run status tracking not yet implemented".to_string()))
+    let run = match state.run_manager.get_run(run_id) {
+        Some(run) => run,
+        None => return Err((StatusCode::NOT_FOUND, "Run not found".to_string())),
+    };
+
+    Ok(Json(RunStatusResponse::from(run)))
 }
 
 /// GET /runs/{run_id}/events - Stream events via SSE
