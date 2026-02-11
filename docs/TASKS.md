@@ -23,10 +23,12 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 - Implement minimal audit event schema end-to-end.
 - **Owners:** Atlas
 
-4) SSE-first streaming endpoint (minimal)
+4) SSE-first streaming endpoint (minimal) ✅
 - Provide `POST /agent/run/stream` using SSE with correlation IDs (`session_id`, `run_id`, `tool_invocation_id`).
 - Keep WebSocket as optional later.
 - Add golden tests for event sequencing using a mocked LLM.
+- **Status:** MVP implemented. Golden tests in `crates/alms-gateway/tests/sse_golden_tests.rs`. 
+- **Note:** Current endpoint is `POST /agent/run/stream` but should align with `POST /runs` + `GET /runs/{id}/events` per docs/api.md post-MVP.
 - **Owners:** Mustafa
 
 5) Deterministic test harness for scheduler + timeouts

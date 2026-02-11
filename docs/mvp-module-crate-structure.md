@@ -10,7 +10,16 @@ Ship an end‑to‑end daemon **without destabilizing the codebase** or creating
 Instead:
 - Keep existing crates, but **treat them as thin facades** around internal modules.
 - Avoid adding new cross‑crate dependencies.
-- Use `alms-core` as the only shared dependency between “verticals”.
+- Use `alms-core` as the only shared dependency between “verticals” (gateway/runtime/session/sandbox/channel).
+
+### Dependency policy (MVP)
+Make the dependency graph explicit and keep it acyclic:
+- Allowed: `alms-gateway` → `alms-runtime`, `alms-session`, `alms-sandbox`, `alms-core`
+- Allowed: `alms-runtime` → `alms-session`, `alms-sandbox`, `alms-core`
+- Allowed: `alms-session` → `alms-core`
+- Allowed: `alms-sandbox` → `alms-core`
+- Disallowed: any reverse edges (e.g., `alms-core` depending on other crates)
+- Disallowed: introducing new crate cycles
 
 ### Practical boundaries (MVP)
 - `alms-core` — shared types/protocol/errors (stable)
