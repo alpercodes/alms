@@ -43,10 +43,8 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
   - correlation IDs and retry/reconnect behavior
 - **Owners:** Mesut
 
-7) Docs: Event model + audit log schema
-- Write `docs/events-and-audit.md`:
-  - canonical event types (tool_start/end, token_delta, job_run_start/end, etc.)
-  - minimal audit record fields aligned with `security-model.md`
+7) Docs: Event model + audit log schema ✅
+- Implemented in `docs/events-and-audit.md`.
 - **Owners:** Mesut
 
 8) Docs: Approval UX spec (minimal)

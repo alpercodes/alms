@@ -1,12 +1,14 @@
 pub mod agent;
 pub mod channel;
 pub mod error;
+pub mod run;
 pub mod session;
 pub mod tool;
 
 pub use channel::{Channel, ChannelMessage, IncomingMessage, OutgoingMessage, ChannelConfig};
 
 pub use error::{AlmsError, AlmsResult};
+pub use run::{Run, RunId, RunStatus, RunInput, CreateRunRequest, CreateRunResponse, RunStatusResponse};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -39,22 +41,6 @@ impl SessionId {
 }
 
 impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Unique identifier for runs
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RunId(pub Uuid);
-
-impl RunId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for RunId {
     fn default() -> Self {
         Self::new()
     }
