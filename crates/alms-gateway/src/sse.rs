@@ -143,11 +143,7 @@ impl RunEventStream {
             let event = Event::default()
                 .event(&data.event_type)
                 .id(data.event_id.map(|id| id.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()))
-                .json_data(&serde_json::json!({
-                    "event": data.event_type,
-                    "data": data.data,
-                    "ts": data.ts.to_rfc3339(),
-                }))
+                .json_data(&data.data)
                 .unwrap_or_else(|_| Event::default().data("{}"));
             Ok::<_, Infallible>(event)
         }));
@@ -156,11 +152,7 @@ impl RunEventStream {
             let event = Event::default()
                 .event(&data.event_type)
                 .id(data.event_id.map(|id| id.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()))
-                .json_data(&serde_json::json!({
-                    "event": data.event_type,
-                    "data": data.data,
-                    "ts": data.ts.to_rfc3339(),
-                }))
+                .json_data(&data.data)
                 .unwrap_or_else(|_| Event::default().data("{}"));
             Ok::<_, Infallible>(event)
         });
