@@ -154,12 +154,21 @@ pub async fn stream_run_events(
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    
-    // If reconnecting with last_event_id, replay missed events
+
+    let mut replay_events = Vec::new();
     if let Some(from_id) = last_event_id {
         let missed_events = state.run_manager.events_from(run_id, from_id + 1).await;
         if !missed_events.is_empty() {
             info!("Replaying {} events for run {} starting from {}", missed_events.len(), run_id.0, from_id);
+            replay_events = missed_events
+                .into_iter()
+                .map(|e| SseEventData {
+                    event_type: e.event_type,
+                    data: e.data,
+                    ts: e.ts,
+                    event_id: Some(e.event_id),
+                })
+                .collect();
         }
     }
 
@@ -168,5 +177,5 @@ pub async fn stream_run_events(
     state.run_manager.register_sender(run_id, tx);
 
     info!("Starting event stream for run {}", run_id.0);
-    Ok(RunEventStream::new_with_events(rx, vec![]))
+    Ok(RunEventStream::new_with_events(rx, replay_events))
 }

@@ -3,9 +3,10 @@
 //! Provides REST API endpoints per docs/api.md specification.
 
 use crate::gateway::Gateway;
+use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::runs::{create_run, get_run_status, stream_run_events};
 use crate::sse::{RunEventStream, SseEventData};
-use alms_core::{AgentId, AlmsResult, EventLogManager, Run, RunId, SessionId};
+use alms_core::{AgentId, AlmsResult, Run, RunId, SessionId};
 use alms_session::SessionManager;
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
@@ -82,12 +83,8 @@ impl RunManager {
     }
 
     /// Get events from a specific ID for reconnect
-    pub async fn events_from(&self, run_id: RunId, from_id: u64) -> Vec<alms_core::LoggedEvent> {
-        self.event_log
-            .get_or_create(run_id)
-            .await
-            .events_from(from_id)
-            .await
+    pub async fn events_from(&self, run_id: RunId, from_id: u64) -> Vec<LoggedEvent> {
+        self.event_log.events_from(run_id, from_id).await
     }
 }
 

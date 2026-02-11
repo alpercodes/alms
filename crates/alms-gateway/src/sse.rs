@@ -132,7 +132,27 @@ pub struct RunEventStream;
 
 impl RunEventStream {
     pub fn new(receiver: mpsc::UnboundedReceiver<SseEventData>) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
-        let stream = ReceiverStream::new(receiver).map(|data| {
+        Self::new_with_events(receiver, Vec::new())
+    }
+
+    pub fn new_with_events(
+        receiver: mpsc::UnboundedReceiver<SseEventData>,
+        replay: Vec<SseEventData>,
+    ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+        let replay_stream = tokio_stream::iter(replay.into_iter().map(|data| {
+            let event = Event::default()
+                .event(&data.event_type)
+                .id(data.event_id.map(|id| id.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()))
+                .json_data(&serde_json::json!({
+                    "event": data.event_type,
+                    "data": data.data,
+                    "ts": data.ts.to_rfc3339(),
+                }))
+                .unwrap_or_else(|_| Event::default().data("{}"));
+            Ok::<_, Infallible>(event)
+        }));
+
+        let live_stream = ReceiverStream::new(receiver).map(|data| {
             let event = Event::default()
                 .event(&data.event_type)
                 .id(data.event_id.map(|id| id.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()))
@@ -144,6 +164,8 @@ impl RunEventStream {
                 .unwrap_or_else(|_| Event::default().data("{}"));
             Ok::<_, Infallible>(event)
         });
+
+        let stream = replay_stream.chain(live_stream);
 
         Sse::new(stream)
             .keep_alive(
