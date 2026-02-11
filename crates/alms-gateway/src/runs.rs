@@ -182,3 +182,52 @@ pub async fn stream_run_events(
     info!("Starting event stream for run {}", run_id.0);
     Ok(RunEventStream::new_with_events(rx, replay_events))
 }
+
+/// POST /agent/run/stream - Legacy compatibility endpoint
+///
+/// Combines create_run + stream_run_events into a single call.
+/// Creates a run and immediately returns an SSE stream.
+/// This is an MVP compatibility alias; prefer `POST /runs` + `GET /runs/{id}/events`.
+#[instrument(level = "info", skip(state, req))]
+pub async fn stream_run_legacy(
+    State(state): State<AppState>,
+    Json(req): Json<CreateRunRequest>,
+) -> Result<RunEventStream, (StatusCode, String)> {
+    // First create the run (same as create_run)
+    let session = match state.session_manager.get(req.session_id) {
+        Ok(session) => session,
+        Err(_) => return Err((StatusCode::NOT_FOUND, "Session not found".to_string())),
+    };
+
+    let input_text = match req.input {
+        RunInput::Text { text } => text,
+    };
+
+    let run = Run::new(session.id, session.agent_id, input_text);
+    let run_id = run.run_id;
+    let session_id = run.session_id;
+    let agent_id = run.agent_id.clone();
+
+    info!("Creating run {} for session {} (legacy /agent/run/stream)", run_id.0, session_id.0);
+
+    // Store run
+    state.run_manager.insert_run(run.clone());
+
+    // Create event channel BEFORE spawning background task
+    let (tx, rx) = event_channel();
+    state.run_manager.register_sender(run_id, tx.clone());
+
+    // Spawn background task to execute run
+    let state_clone = AppState {
+        session_manager: state.session_manager.clone(),
+        gateway: state.gateway.clone(),
+        run_manager: state.run_manager.clone(),
+    };
+
+    tokio::spawn(async move {
+        execute_run(state_clone, run_id, session_id, agent_id, run.input).await;
+    });
+
+    info!("Starting legacy event stream for run {}", run_id.0);
+    Ok(RunEventStream::new(rx))
+}

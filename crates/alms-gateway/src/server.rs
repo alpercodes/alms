@@ -4,7 +4,7 @@
 
 use crate::gateway::Gateway;
 use crate::event_log::{EventLogManager, LoggedEvent};
-use crate::runs::{create_run, get_run_status, stream_run_events};
+use crate::runs::{create_run, get_run_status, stream_run_events, stream_run_legacy};
 use crate::sse::{RunEventStream, SseEventData};
 use alms_core::{AgentId, AlmsResult, Run, RunId, SessionId};
 use alms_session::SessionManager;
@@ -127,8 +127,9 @@ pub fn router() -> Router<AppState> {
         .route("/runs", post(create_run))
         .route("/runs/:run_id", get(get_run_status))
         .route("/runs/:run_id/events", get(stream_run_events))
-        // Legacy (deprecated)
+        // Legacy (deprecated) - kept for MVP compatibility
         .route("/agent/run", post(run_agent))
+        .route("/agent/run/stream", post(stream_run_legacy))
         .route("/ws", get(websocket_handler))
 }
 

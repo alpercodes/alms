@@ -28,7 +28,7 @@ pub mod event_log;
 
 // Re-export main types
 pub use gateway::{Gateway, GatewayConfig};
-pub use runs::{create_run, get_run_status, stream_run_events};
+pub use runs::{create_run, get_run_status, stream_run_events, stream_run_legacy};
 pub use server::{serve, serve_with_gateway, AppState, RunManager};
 pub use sse::{RunEventStream, SseEventData, event_channel};
 
