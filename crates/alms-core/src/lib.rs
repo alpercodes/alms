@@ -3,8 +3,6 @@ pub mod channel;
 pub mod error;
 pub mod audit;
 pub mod run;
-pub mod session;
-pub mod tool;
 
 pub use channel::{Channel, ChannelMessage, IncomingMessage, OutgoingMessage, ChannelConfig};
 
