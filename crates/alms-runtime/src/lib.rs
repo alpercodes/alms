@@ -13,7 +13,7 @@ pub mod tools;
 pub use agent::{AgentConfig, AgentRuntime};
 pub use llm_client::LlmClient;
 pub use llm_types::*;
-pub use tools::{Tool, ToolRegistry};
+pub use tools::ToolRegistry;
 
 use alms_core::AgentId;
 

@@ -88,13 +88,12 @@ impl AgentRuntime {
         
         // Get or create session
         let session = session_manager.get_or_create(self.agent_id, context_id);
-        span.record("session_id", %session.id.0);
         
         // Build conversation history
         let history = self.build_messages(session_manager, &session.id, &input).await?;
         
         // Run the agent loop
-        let response = self.agent_loop(history).await?;
+        let response = self.agent_loop(session_manager, session.id, history).await?;
         
         // Store messages
         let user_msg = SessionMessage {
@@ -199,7 +198,7 @@ impl AgentRuntime {
         skip(self, messages),
         fields(agent_id = %self.agent_id.0)
     )]
-    async fn agent_loop(&self, mut messages: Vec<LlmMessage>) -> AlmsResult<String> {
+    async fn agent_loop(&self, session_manager: &SessionManager, session_id: alms_core::SessionId, mut messages: Vec<LlmMessage>) -> AlmsResult<String> {
         let mut iterations = 0;
         
         loop {
@@ -252,7 +251,7 @@ impl AgentRuntime {
                 
                 // Execute tools
                 for tool_call in tool_calls {
-                    let result = self.execute_tool_call(&tool_call, session_manager, session.id).await;
+                    let result = self.execute_tool_call(&tool_call, session_manager, session_id).await;
                     
                     let content = match result {
                         Ok(value) => value.to_string(),
@@ -390,12 +389,6 @@ impl AgentRuntime {
         }
         
         result
-    }
-    
-    /// Add a custom tool
-    pub fn with_tool(mut self, tool: Box<dyn crate::tools::Tool>) -> Self {
-        self.tools.register(tool);
-        self
     }
     
     /// Get tool registry reference
