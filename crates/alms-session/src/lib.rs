@@ -3,13 +3,12 @@ pub mod types;
 
 pub use store::{MemoryStore, SessionStore};
 pub use types::{Content, Message, Role, Session, SessionConfig, SessionStatus};
-pub use types::{AuditEvent};
+pub use alms_core::AuditEvent;
 
 use alms_core::{AgentId, AlmsResult, SessionId};
 use dashmap::DashMap;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
-use types::SessionConfig;
+use tracing::{debug, info};
 
 /// Session manager - owns all session state
 #[derive(Debug)]
@@ -125,7 +124,7 @@ impl SessionManager {
         
         for mut entry in self.sessions.iter_mut() {
             let session = entry.value_mut();
-            let idle = types::Timestamp::now().0 - session.last_activity.0;
+            let idle = alms_core::Timestamp::now().0 - session.last_activity.0;
             
             if idle > chrono::Duration::from_std(timeout).unwrap_or_default() 
                 && session.status == types::SessionStatus::Active {

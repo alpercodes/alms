@@ -1,4 +1,4 @@
-use alms_core::{AgentId, SessionId, Timestamp, AuditEvent};
+use alms_core::{AgentId, SessionId, Timestamp};
 use serde::{Deserialize, Serialize};
 
 /// Session state

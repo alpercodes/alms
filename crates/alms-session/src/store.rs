@@ -4,7 +4,7 @@
 /// Future: Redis, PostgreSQL, or S3 backends
 
 use alms_core::{AlmsResult, SessionId};
-use alms_session::{Message, Session};
+use crate::{Message, Session};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
