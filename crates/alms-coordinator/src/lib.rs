@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
 /// Unique identifier for a subagent task

@@ -6,7 +6,7 @@ use crate::server::AppState;
 use crate::sse::{event_channel, RunEventStream, SseEventData};
 use alms_core::{CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse, SessionId};
 use axum::{
-    extract::{Path, State, Header},
+    extract::{Path, State},
     http::{StatusCode, HeaderMap},
     Json,
 };

@@ -3,10 +3,7 @@
 //! Provides event streaming per docs/api.md specification.
 
 use alms_core::RunId;
-use axum::{
-    http::StatusCode,
-    response::sse::{Event, Sse},
-};
+use axum::response::sse::{Event, Sse};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -14,7 +11,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tracing::{error, info, instrument, Span};
 use uuid::Uuid;
 
 /// Unique identifier for a tool invocation
