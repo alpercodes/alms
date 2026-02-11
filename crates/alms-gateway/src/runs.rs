@@ -4,10 +4,10 @@
 
 use crate::server::AppState;
 use crate::sse::{event_channel, RunEventStream, SseEventData};
-use alms_core::{CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse};
+use alms_core::{CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse, SessionId};
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    extract::{Path, State, Header},
+    http::{StatusCode, HeaderMap},
     Json,
 };
 use chrono::Utc;
@@ -66,7 +66,7 @@ pub async fn create_run(
 async fn execute_run(
     state: AppState,
     run_id: RunId,
-    session_id: alms_core::SessionId,
+    session_id: SessionId,
     agent_id: alms_core::AgentId,
     input: String,
 ) {
@@ -74,8 +74,8 @@ async fn execute_run(
     let (tx, _rx) = event_channel();
     state.run_manager.register_sender(run_id, tx.clone());
 
-    // Send initial events (no "connected" in spec)
-    state.run_manager.send_event(run_id, SseEventData::run_started(run_id, session_id));
+    // Send initial events
+    state.run_manager.send_event(run_id, session_id, SseEventData::run_started(run_id, session_id)).await;
 
     if let Some(mut run) = state.run_manager.get_run(run_id) {
         run.mark_running();
@@ -98,9 +98,9 @@ async fn execute_run(
     match result {
         Ok(response) => {
             // Send token delta
-            state.run_manager.send_event(run_id, SseEventData::token_delta(run_id, &response));
+            state.run_manager.send_event(run_id, session_id, SseEventData::token_delta(run_id, &response)).await;
             // Send finished
-            state.run_manager.send_event(run_id, SseEventData::run_finished(run_id, true));
+            state.run_manager.send_event(run_id, session_id, SseEventData::run_finished(run_id, true)).await;
 
             if let Some(mut run) = state.run_manager.get_run(run_id) {
                 run.mark_completed(response);
@@ -110,7 +110,7 @@ async fn execute_run(
             info!("Run {} completed successfully", run_id.0);
         }
         Err(e) => {
-            state.run_manager.send_event(run_id, SseEventData::run_error(run_id, &e.to_string()));
+            state.run_manager.send_event(run_id, session_id, SseEventData::run_error(run_id, &e.to_string())).await;
 
             if let Some(mut run) = state.run_manager.get_run(run_id) {
                 run.mark_failed(e.to_string());
@@ -143,14 +143,30 @@ pub async fn get_run_status(
 /// GET /runs/{run_id}/events - Stream events via SSE
 ///
 /// Per API spec: Returns SSE stream with event: run_started, token_delta, run_finished, run_error
+/// Supports Last-Event-ID header for reconnect
 pub async fn stream_run_events(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
+    headers: HeaderMap,
 ) -> Result<RunEventStream, (StatusCode, String)> {
+    // Check for Last-Event-ID header for reconnect support
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    
+    // If reconnecting with last_event_id, replay missed events
+    if let Some(from_id) = last_event_id {
+        let missed_events = state.run_manager.events_from(run_id, from_id + 1).await;
+        if !missed_events.is_empty() {
+            info!("Replaying {} events for run {} starting from {}", missed_events.len(), run_id.0, from_id);
+        }
+    }
+
     // Create event channel
     let (tx, rx) = event_channel();
     state.run_manager.register_sender(run_id, tx);
 
     info!("Starting event stream for run {}", run_id.0);
-    Ok(RunEventStream::new(rx))
+    Ok(RunEventStream::new_with_events(rx, vec![]))
 }

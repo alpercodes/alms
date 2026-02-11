@@ -5,7 +5,7 @@
 use crate::gateway::Gateway;
 use crate::runs::{create_run, get_run_status, stream_run_events};
 use crate::sse::{RunEventStream, SseEventData};
-use alms_core::{AgentId, AlmsResult, Run, RunId};
+use alms_core::{AgentId, AlmsResult, EventLogManager, Run, RunId, SessionId};
 use alms_session::SessionManager;
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
@@ -23,7 +23,8 @@ use tracing::info;
 pub struct RunManager {
     pub event_senders: Arc<DashMap<RunId, mpsc::UnboundedSender<SseEventData>>>,
     pub runs: Arc<DashMap<RunId, Run>>,
-    pub event_counters: Arc<DashMap<RunId, u64>>,
+    /// Persistent event log for reconnect-after-restart support
+    pub event_log: EventLogManager,
 }
 
 impl RunManager {
@@ -31,13 +32,12 @@ impl RunManager {
         Self {
             event_senders: Arc::new(DashMap::new()),
             runs: Arc::new(DashMap::new()),
-            event_counters: Arc::new(DashMap::new()),
+            event_log: EventLogManager::new(),
         }
     }
 
     pub fn register_sender(&self, run_id: RunId, sender: mpsc::UnboundedSender<SseEventData>) {
         self.event_senders.insert(run_id, sender);
-        self.event_counters.insert(run_id, 0);
     }
 
     pub fn get_sender(&self, run_id: RunId) -> Option<mpsc::UnboundedSender<SseEventData>> {
@@ -46,7 +46,6 @@ impl RunManager {
 
     pub fn remove_sender(&self, run_id: RunId) {
         self.event_senders.remove(&run_id);
-        self.event_counters.remove(&run_id);
     }
 
     pub fn insert_run(&self, run: Run) {
@@ -61,18 +60,34 @@ impl RunManager {
         self.runs.insert(run.run_id, run);
     }
 
-    pub fn send_event(&self, run_id: RunId, mut event: SseEventData) {
+    /// Send event to active subscribers AND persist to event log
+    pub async fn send_event(
+        &self,
+        run_id: RunId,
+        session_id: SessionId,
+        mut event: SseEventData,
+    ) {
+        // Log event and get persistent ID
+        let event_id = self
+            .event_log
+            .log_event(run_id, session_id, &event.event_type, event.data.clone())
+            .await;
+        
+        event.event_id = Some(event_id);
+        
+        // Send to active subscribers
         if let Some(sender) = self.get_sender(run_id) {
-            let next_id = self
-                .event_counters
-                .get(&run_id)
-                .map(|v| *v)
-                .unwrap_or(0)
-                + 1;
-            self.event_counters.insert(run_id, next_id);
-            event.event_id = Some(next_id);
             let _ = sender.send(event);
         }
+    }
+
+    /// Get events from a specific ID for reconnect
+    pub async fn events_from(&self, run_id: RunId, from_id: u64) -> Vec<alms_core::LoggedEvent> {
+        self.event_log
+            .get_or_create(run_id)
+            .await
+            .events_from(from_id)
+            .await
     }
 }
 

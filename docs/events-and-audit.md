@@ -49,7 +49,36 @@ Non-goals (MVP):
 
 ---
 
-## 2) Definitions
+## 2) User-controlled autonomy / approval posture (setting)
+
+ALMS must support a user setting that controls whether approvals are required.
+
+### Approval posture
+The user can set an agent (or a session/job) to one of these postures:
+
+- **`guarded` (default)**
+  - risky capabilities may emit `approval_required` and transition the run into `waiting_for_approval`
+
+- **`full_control` (no approvals)**
+  - the agent may execute any capability it has been granted **without** pausing for approval
+  - ALMS still emits `policy_decision` events and still records audit entries
+  - intended for trusted environments and power users
+
+Notes:
+- `full_control` does **not** mean “no policy”: capability checks, scopes, limits, and audit still apply.
+- The main behavioral difference is: **no `approval_required` gate**; decisions become `allow`/`deny` only.
+
+### Event implications
+- In `guarded` mode:
+  - `policy_decision=approval_required` ⇒ emit `approval_required` and wait
+- In `full_control` mode:
+  - `approval_required` and `approval_resolved` events must **not** be emitted.
+  - `policy_decision` must resolve to `allow` or `deny` only.
+  - If a capability is granted and within scope, execution proceeds immediately (still emitting `policy_decision` and `tool_start/tool_end`).
+
+---
+
+## 3) Definitions
 
 ### Run
 A single agent execution request bound to a session.
@@ -69,7 +98,7 @@ Important distinction:
 
 ---
 
-## 3) Correlation identifiers (required)
+## 4) Correlation identifiers (required)
 
 All events and audit records must include enough identifiers to correlate:
 - `session_id`
@@ -85,7 +114,7 @@ Optional but recommended:
 
 ---
 
-## 4) Event envelope
+## 5) Event envelope
 
 All events share a common envelope:
 ```json
@@ -96,12 +125,14 @@ All events share a common envelope:
   "session_id": "<uuid>",
   "run_id": "<uuid>",
   "severity": "info",
+  "policy_mode": "guarded",
   "payload": {}
 }
 ```
 
 Fields:
 - `severity`: `debug | info | warn | error`
+- `policy_mode`: `guarded | full_control` (the approval posture active for this run)
 - `payload`: type-specific JSON
 
 Transport mapping:
@@ -111,14 +142,14 @@ Transport mapping:
 
 ---
 
-## 5) Run state machine (MVP)
+## 6) Run state machine (MVP)
 
 Runs should move through explicit states; events must reflect these transitions.
 
 States:
 - `queued`
 - `running`
-- `waiting_for_approval`
+- `waiting_for_approval` *(guarded mode only)*
 - `succeeded`
 - `failed`
 - `cancelled`
@@ -131,7 +162,7 @@ State/event expectations:
 
 ---
 
-## 6) Event taxonomy (what kinds of events exist)
+## 7) Event taxonomy (what kinds of events exist)
 
 ### A) User-facing progress events
 - `run_started`, `token_delta`, `run_finished`
@@ -151,7 +182,7 @@ State/event expectations:
 
 ---
 
-## 7) Run event types (MVP)
+## 8) Run event types (MVP)
 
 ### 7.1 `run_started`
 Emitted once at the beginning.
@@ -281,7 +312,7 @@ or
 
 ---
 
-## 8) Job / cron events (MVP+)
+## 9) Job / cron events (MVP+)
 
 Jobs are “autonomy with persistence”. Keep semantics parallel to runs.
 
@@ -299,7 +330,7 @@ Payload:
 
 ---
 
-## 9) Subagent events (post-MVP shape)
+## 10) Subagent events (post-MVP shape)
 
 Keep the model consistent and parent-correlated:
 - `subagent_started` (includes `subagent_id`, `type`, `task`)
@@ -310,28 +341,32 @@ All must include `run_id` (parent) + `subagent_id`.
 
 ---
 
-## 10) Event invariants (must always hold)
+## 11) Event invariants (must always hold)
 
 These invariants shape correct agent behavior:
 
 1) **Monotonicity**: `event_id` strictly increases per run.
 2) **Pairing**: every `tool_start` has exactly one `tool_end`.
-3) **Approval gating**: if `policy_decision=approval_required`, there must be an `approval_required` before any `tool_start` for that invocation.
-4) **No silent privilege**: any tool execution must be preceded by a `policy_decision` event.
-5) **Terminal event**: every run ends with `run_finished` (even if failed).
+3) **No silent privilege**: any tool execution must be preceded by a `policy_decision` event.
+4) **Approval gating (guarded mode)**:
+   - if `policy_decision=approval_required`, there must be an `approval_required` before any `tool_start` for that invocation.
+5) **No approvals (full_control mode)**:
+   - `approval_required` and `approval_resolved` must not appear.
+   - `policy_decision.decision` must be `allow` or `deny` only.
+6) **Terminal event**: every run ends with `run_finished` (even if failed/cancelled).
 
 ---
 
-## 11) Audit model (append-only)
+## 12) Audit model (append-only)
 
-### 11.1 What must be audited
+### 12.1 What must be audited
 At minimum:
 - every tool invocation (attempt + result)
 - every approval request + resolution
 - every job run
 - policy denials
 
-### 11.2 Audit record envelope
+### 12.2 Audit record envelope
 ```json
 {
   "audit_id": "<uuid>",
@@ -348,14 +383,14 @@ At minimum:
 }
 ```
 
-### 11.3 Decisions
+### 12.3 Decisions
 - `allow`
 - `deny`
 - `approval_required`
 - `approved`
 - `rejected`
 
-### 11.4 Redaction & size limits
+### 12.4 Redaction & size limits
 Tool params/results can contain secrets or huge outputs.
 
 Rules (MVP):
@@ -368,7 +403,7 @@ Recommended:
 
 ---
 
-## 12) Persistence strategy for events (MVP stance)
+## 13) Persistence strategy for events (MVP stance)
 
 Two viable MVP stances:
 
@@ -384,7 +419,7 @@ If approvals are shipped, prefer (B).
 
 ---
 
-## 13) How this ties into testing
+## 14) How this ties into testing
 
 Golden tests should assert:
 - stable event sequences for scripted LLM + tools
@@ -395,7 +430,7 @@ See: `docs/testing-strategy.md`
 
 ---
 
-## 14) Open questions
+## 15) Open questions
 
 1) Do we persist events (for reconnect) in MVP, or treat SSE as best-effort?
 2) What is the minimal redaction approach that is safe but not too complex?
