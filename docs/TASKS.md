@@ -11,11 +11,9 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 - Add tests for restart survival + corrupted snapshot fallback.
 - **Owners:** Atlas
 
-2) Implement Tool Sandbox ABI v0 in code
-- Implement the host↔WASM contract described in `docs/tool-sandbox-abi.md`.
-- Explicit MVP posture: **instance-per-call**.
-- Enforce max input/output byte limits.
-- Add a minimal sample WASM tool + golden tests.
+2) Implement Tool Sandbox ABI v0 in code ✅
+- Implemented host↔WASM contract per `docs/tool-sandbox-abi.md`.
+- Instance-per-call enforced; size limits + allocator + tests added.
 - **Owners:** Atlas, Mustafa
 
 3) Capability enforcement + audit trail (minimal)
@@ -36,38 +34,33 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 - Add at least one scheduler test: schedule → advance time → job run recorded.
 - **Owners:** Atlas
 
-6) Docs: API contract for MVP
-- Write `docs/api.md` describing the MVP HTTP API:
-  - endpoints, request/response JSON, error format
-  - SSE event types and payloads
-  - correlation IDs and retry/reconnect behavior
+6) Docs: API contract for MVP ✅
+- Implemented in `docs/api.md`.
 - **Owners:** Mesut
 
 7) Docs: Event model + audit log schema ✅
 - Implemented in `docs/events-and-audit.md`.
 - **Owners:** Mesut
 
-8) Docs: Approval UX spec (minimal)
-- Write `docs/approvals-ux.md`:
-  - what is shown to the user
-  - allow-once vs allow-for-session vs rule
-  - how approvals map to capabilities/scopes
+8) Docs: Approval UX spec (minimal) ✅
+- Implemented in `docs/approvals-ux.md`.
 - **Owners:** Mesut
 
 ## P1 — Stability & cleanup
 
-9) Remove dead code / fix warnings / tighten interfaces
-- Unused imports, unused fields, ensure public APIs are minimal and coherent.
-- Keep the runtime/tool interface single-path (no duplicate registries).
+9) Remove dead code / fix warnings / tighten interfaces ✅
+- Removed unused imports across coordinator, gateway, runs, sse modules.
+- Removed unused ToolContext struct (53 lines) from sandbox.
+- Removed unused ChannelAdapter struct (16 lines) from channel.
+- Total: 77 lines of dead code removed.
 - **Owners:** Mustafa
 
 10) Decide and document “MVP module vs crate” structure ✅
 - Decision captured in `docs/mvp-structure.md` and linked from `docs/mvp-plan.md`.
 - **Owners:** Atlas
 
-11) Docs: Update tech-stack vs MVP-plan alignment notes
-- Ensure `docs/mvp-plan.md` and `docs/tech-stack.md` don’t contradict each other.
-- Add a short note in `docs/mvp-plan.md` if needed: “tech-stack is target state; MVP plan is execution plan”.
+11) Docs: Update tech-stack vs MVP-plan alignment notes ✅
+- Added an explicit alignment note to `docs/mvp-plan.md`.
 - **Owners:** Mesut
 
 ## P2 — Product / docs
@@ -76,16 +69,16 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 - Once MVP path stabilizes, add a dedicated docs/architecture/UX “designer” agent (docs-only).
 - **Owners:** Atlas
 
-13) Observability
-- Structured tracing, per-session run IDs, subagent lifecycle events.
+13) Observability ✅
+- Structured tracing with `#[instrument]` spans across coordinator, gateway, runtime.
+- Per-session run IDs propagated through subagent requests.
+- Subagent lifecycle events: spawned, started, completed, cancelled, timeout.
+- Tool execution logging with duration metrics.
+- Tracing targets: `coordinator::*`, `subagent::*`, `agent::*`, `agent::tool::*`.
 - **Owners:** Mustafa
 
-14) Docs: Developer onboarding
-- Write `docs/dev-onboarding.md`:
-  - how to run daemon
-  - how to run tests
-  - how to add a tool
-  - how to add a channel adapter
+14) Docs: Developer onboarding ✅
+- Implemented in `docs/dev-onboarding.md`.
 - **Owners:** Mesut
 
 ---
