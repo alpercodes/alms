@@ -1,0 +1,94 @@
+# tool-sandbox-abi.md — Review & proposal (Mesut)
+
+Source reviewed: `docs/tool-sandbox-abi.md` (2026-02-10)
+
+## Verdict
+This is a solid MVP ABI draft. It fixes the most dangerous ambiguity in the current codebase: how bytes move in/out of WASM.
+
+However, to avoid footguns and reduce implementation churn, the ABI needs a few extra details:
+- versioning and feature negotiation
+- explicit memory ownership rules
+- consistent error model
+- clearer requirements around allocation and result lifetime
+
+---
+
+## What’s strong
+- Entry point signature is minimal and conventional.
+- Input and output encoding are simple (JSON), easy to debug.
+- Host-enforced timeouts is the correct MVP posture.
+
+---
+
+## Gaps / changes I recommend (proposal)
+
+### 1) Add ABI version field now (not “next steps”)
+If you ship even one tool without versioning, changing the ABI becomes painful.
+
+Add to input JSON:
+```json
+{ "abi": 0, "tool": "name", "params": { } }
+```
+
+### 2) Clarify memory ownership + free semantics
+Current output model returns a pointer; but who owns that buffer and when is it freed?
+
+Propose explicit rule:
+- tool allocates output with `alms_alloc`
+- tool returns pointer
+- host reads output
+- host calls `alms_free(ptr, total_len)` (required, not optional)
+
+If you want `alms_free` optional for MVP, then you need a hard alternative (e.g., “instance-per-call, memory freed by dropping instance”).
+
+**Recommended explicit MVP choice (Atlas + Mesut):**
+- **Instance-per-call guarantee:** the host creates a fresh WASM instance per invocation and tears it down after reading the result; memory is reclaimed by instance teardown.
+- Therefore `alms_free` can be omitted for MVP.
+
+State this clearly in the ABI to avoid ambiguity.
+
+### 3) Define allocator contract precisely
+- `alms_alloc(len)` returns pointer to a region of at least `len` bytes
+- memory must be in the module’s exported `memory`
+- alignment requirements (usually 4 or 8) — document it
+- failure mode: return 0 or -1? specify
+
+### 4) Define max payload sizes
+To prevent DoS and simplify host enforcement:
+- max input bytes
+- max output bytes
+
+These should be enforced by the host, and included in docs.
+
+### 5) Error model consistency
+Right now errors are JSON with `{ok:false,error:"message"}`. Good.
+
+Recommend adding structured error fields:
+```json
+{ "ok": false, "error": { "code": "INVALID_PARAMS", "message": "..." } }
+```
+Even if codes are limited in MVP, it helps later.
+
+### 6) Testing requirements
+Add a small “must have tests” list:
+- golden test with a sample WASM tool
+- malformed JSON input
+- oversized output
+- timeout termination
+
+Cross-link to `docs/testing-strategy.md`.
+
+---
+
+## Suggested amended spec snippet (MVP)
+
+- Input JSON includes `abi: 0`.
+- Host allocates input using `alms_alloc`, writes bytes, calls `alms_tool_call`.
+- Output pointer points to `[u32_le len][len bytes json]`.
+- Output lifetime is either:
+  - instance-per-call (no free needed) **OR**
+  - required `alms_free` after host reads.
+
+Choose one explicitly. For MVP, choose **instance-per-call**.
+
+*Authored by Mesut (2026-02-10).*

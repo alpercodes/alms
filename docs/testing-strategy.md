@@ -1,0 +1,177 @@
+# ALMS Testing Strategy (MVP → scale-up)
+
+This document defines how ALMS should be tested so we can confidently ship an agent loop system that is correct under concurrency, safe around tools, and stable over time.
+
+Goals:
+- Make concurrency + scheduling behavior **deterministic and testable**
+- Make LLM behavior **mockable**
+- Make storage (SQLite) **repeatable** and fast for tests
+- Make “tool access” **auditable** and verifiable (policy enforcement)
+
+---
+
+## 1) Testing layers
+
+### 1.1 Unit tests (fast, deterministic)
+Focus: pure logic and invariants.
+
+Targets:
+- capability checks (allow/deny/approval-required)
+- scope matching (paths, domains, argv allow/deny)
+- tool argument validation
+- event encoding/decoding
+- cron parsing + next-run computation
+
+Rules:
+- no network
+- no real time
+- no filesystem side effects (use temp dirs if necessary)
+
+### 1.2 Component tests (in-process integration)
+Focus: components working together with mocks.
+
+Targets:
+- runtime tool-call loop with mocked LLM adapter
+- session persistence to SQLite (in-memory or temp-file)
+- scheduler running a job and recording job_run + audit events
+- tool execution path using a “fake tool” that returns deterministic output
+
+### 1.3 End-to-end tests (real daemon, real API)
+Focus: the system works as users experience it.
+
+Targets:
+- start daemon
+- create session
+- run agent
+- stream response events (SSE)
+- run a cronjob
+- validate audit log entries
+
+Keep E2E minimal; they’re slower and flakier.
+
+---
+
+## 2) Deterministic time (critical)
+
+ALMS has scheduling, timeouts, retries, and backoff. Tests must not sleep in real time.
+
+Recommended approach:
+- Use `tokio::time::pause()` and `tokio::time::advance()` in tests.
+- Introduce an internal `Clock` abstraction for places where wall-clock is used.
+
+Example (conceptual):
+- `trait Clock { fn now(&self) -> Instant/Timestamp }`
+- prod: `SystemClock`
+- tests: `MockClock`
+
+Even if you don’t implement a clock trait on day 1, **use tokio time control** for scheduler/tool timeouts.
+
+---
+
+## 3) Mockable LLM adapter (non-negotiable)
+
+Do not bind core logic directly to reqwest/OpenRouter.
+
+Define a narrow interface:
+- `complete(messages, tools, params) -> Completion`
+- `stream(messages, tools, params) -> Stream<Delta>`
+
+Test strategies:
+- “scripted model”: pre-programmed responses (including tool_calls)
+- “echo model”: returns the user input
+- “chaos model”: injects malformed tool args to ensure validation is robust
+
+Tests to include:
+- tool call emitted → tool executed → tool result fed back → final assistant message
+- invalid JSON args in tool_call → graceful error path
+- multiple tool calls in one turn
+- max-iterations reached behavior
+
+---
+
+## 4) SQLite test harness
+
+### Recommended
+- Use in-memory SQLite for most tests (`:memory:`) OR
+- Use temp-file DB for tests that require multiple connections
+
+Always:
+- run migrations at test setup
+- wrap each test in a transaction and rollback if feasible
+
+Things to test:
+- session creation is idempotent for same context
+- message append ordering
+- audit log append-only semantics
+- job + job_run recording
+
+---
+
+## 5) Tool execution tests (policy + audit)
+
+Tools are the danger zone. Tests must prove:
+- capability checks are enforced
+- outputs are truncated/sanitized
+- audit log entries are emitted even on failure/timeout
+
+Suggested test tools:
+- `FakeTool` that returns deterministic JSON
+- `SlowTool` that times out
+- `LargeOutputTool` that exceeds output limit
+- `ShellTool` in “dry-run mode” for deterministic behavior
+
+Key assertions:
+- denied tool call never executes
+- approved tool call executes and is logged
+- failure paths still write audit entries with error status
+
+---
+
+## 6) Scheduler tests
+
+Test with paused time:
+- schedule a job for T+N
+- advance time
+- verify job run started
+- verify job_run record + audit events
+- verify retries/backoff logic deterministically
+
+Also test:
+- concurrency limits (jobs don’t exceed max parallelism)
+- cancellation (disable job stops future runs)
+
+---
+
+## 7) Streaming tests (SSE-first)
+
+If SSE is used:
+- test event framing + reconnect token/last-event-id handling
+- test correlation IDs (`session_id`, `run_id`, `tool_invocation_id`, `job_run_id`)
+
+Golden tests:
+- given deterministic scripted model/tool outputs, the exact event sequence matches a snapshot.
+
+---
+
+## 8) CI pipeline (minimal)
+
+MVP CI stages:
+1) format (`cargo fmt --check`)
+2) lint (`cargo clippy`)
+3) unit + component tests (`cargo test`)
+4) optional minimal E2E smoke (start daemon, hit /health)
+
+---
+
+## 9) MVP acceptance criteria (test-driven)
+
+The MVP is “real” when these pass in CI:
+- one agent type runs end-to-end via HTTP
+- at least one tool call works end-to-end
+- sessions persist to SQLite
+- one cronjob can be scheduled and executed
+- audit log contains entries for tool + job runs
+
+---
+
+*Authored by Mesut (2026-02-10).*

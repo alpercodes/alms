@@ -1,0 +1,68 @@
+# session-storage.md — Review & proposal (Mesut)
+
+Source reviewed: `docs/session-storage.md` (2026-02-10)
+
+## Verdict
+Good MVP decision doc: concise, explicit about deferring the big choice, and aligned with “ship end-to-end first”.
+
+The main risk is that **JSON snapshots can recreate OpenClaw-adjacent failure modes** (partial writes, concurrent writes, corruption) if the daemon becomes even mildly concurrent.
+
+I’d keep the decision for MVP, but add two clarifications + two hard requirements.
+
+---
+
+## What’s strong
+- Clear MVP scope and deferrals.
+- Correctly frames SQLite / append-only log as post-MVP options.
+- Practical next steps.
+
+---
+
+## What I’d change (proposal)
+
+### 1) Make “single-writer” a stated assumption
+Snapshots are fine if you guarantee there’s exactly one writer.
+
+Add a line under MVP Requirements:
+- **Single-writer guarantee:** only the daemon process writes snapshots; internal write operations must serialize through one storage lane/queue.
+
+### 2) Make atomicity non-optional
+Right now it says “once we optimize”. This should be **baseline**, because it’s not an optimization; it’s correctness.
+
+Change:
+- “Snapshot writes should be atomic (temp + fsync + rename).”
+
+Also mention:
+- write temp file in same directory
+- `fsync` directory after rename on Linux for stronger durability
+
+### 3) Add corruption detection + backup rotation
+Add:
+- checksum/version field in snapshot
+- rotate last N snapshots (`snapshot.json`, `snapshot.json.1`, …)
+- if load fails: fall back to last good snapshot and log loudly
+
+### 4) Clarify migration trigger criteria
+“Once concurrency and durability requirements are clear” is true but vague.
+
+Add explicit triggers, e.g.:
+- more than X sessions/messages
+- need multi-process access
+- need crash-consistent auditing
+- need concurrent reads/writes without global locks
+
+---
+
+## Suggested amended text (drop-in section)
+
+Add to **MVP Requirements**:
+- Snapshot writes must be atomic (write temp + fsync + rename + fsync dir).
+- Storage is single-writer: snapshot persistence is serialized by the daemon.
+- Maintain snapshot rotation (keep last N) and detect corruption (version + checksum).
+
+---
+
+## Alignment with other docs
+- This doc should cross-link to `docs/testing-strategy.md` (storage tests: restart survival, corruption fallback) and `docs/mvp-plan.md`.
+
+*Authored by Mesut (2026-02-10).* 

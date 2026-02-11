@@ -22,10 +22,12 @@
 
 pub mod gateway;
 pub mod server;
+pub mod sse;
 
 // Re-export main types
 pub use gateway::{Gateway, GatewayConfig};
 pub use server::{serve, serve_with_gateway};
+pub use sse::{RunId, ToolInvocationId, SseEventType, SseEventData};
 
 use alms_core::AlmsResult;
 

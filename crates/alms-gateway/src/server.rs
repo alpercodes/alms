@@ -3,6 +3,7 @@
 //! Provides REST API endpoints and WebSocket connections for external control.
 
 use crate::gateway::Gateway;
+use crate::sse::{stream_run, SseEventData, SseEventType, RunId, ToolInvocationId};
 use alms_core::{AgentId, AlmsResult};
 use alms_session::SessionManager;
 use axum::{
@@ -13,6 +14,9 @@ use axum::{
 };
 use std::sync::Arc;
 use tracing::info;
+
+// Re-export SSE types for consumers
+pub use crate::sse::{EventSender, EventReceiver, event_channel};
 
 /// Shared application state for HTTP server
 #[derive(Debug, Clone)]
@@ -38,6 +42,7 @@ pub fn router() -> Router<AppState> {
         .route("/sessions/:agent_id/:context_id", get(get_session))
         .route("/ws", get(websocket_handler))
         .route("/agent/run", post(run_agent))
+        .route("/agent/run/stream", post(stream_run))
 }
 
 /// Health check endpoint
