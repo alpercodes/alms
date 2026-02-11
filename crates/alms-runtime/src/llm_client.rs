@@ -84,12 +84,12 @@ impl LlmClient {
     pub async fn complete_stream(
         &self,
         request: CompletionRequest,
-    ) -> AlmsResult<impl futures::Stream<Item = AlmsResult<StreamChunk>>> {
+    ) -> AlmsResult<futures::stream::BoxStream<'static, AlmsResult<StreamChunk>>> {
         use futures::{stream, StreamExt};
 
         if self.config.mock {
             let chunk = self.mock_stream_chunk(&request);
-            return Ok(stream::once(async move { Ok(chunk) }));
+            return Ok(stream::once(async move { Ok(chunk) }).boxed());
         }
         
         let mut request = request;
@@ -122,7 +122,7 @@ impl LlmClient {
                 })
         });
         
-        Ok(stream)
+        Ok(stream.boxed())
     }
     
     /// Parse a Server-Sent Events chunk
