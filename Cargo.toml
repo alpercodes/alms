@@ -70,6 +70,9 @@ uuid = { version = "1.13", features = ["v4", "serde"] }
 # Async traits
 async-trait = "0.1"
 
+# Futures
+futures = "0.3"
+
 # Testing
 tokio-test = "0.4"
 

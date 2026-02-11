@@ -30,6 +30,9 @@ anyhow.workspace = true
 # Async traits
 async-trait.workspace = true
 
+# Futures
+futures.workspace = true
+
 # Configuration
 config.workspace = true
 
