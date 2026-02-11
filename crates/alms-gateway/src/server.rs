@@ -1,9 +1,10 @@
-//! HTTP/WebSocket server for ALMS Gateway
+//! HTTP server for ALMS Gateway
 //!
-//! Provides REST API endpoints and WebSocket connections for external control.
+//! Provides REST API endpoints per docs/api.md specification.
 
 use crate::gateway::Gateway;
-use crate::sse::{stream_run, SseEventData, SseEventType, RunId, ToolInvocationId};
+use crate::runs::{create_run, get_run_status, stream_run_events};
+use crate::sse::{event_channel, RunEventStream, SseEventData};
 use alms_core::{AgentId, AlmsResult};
 use alms_session::SessionManager;
 use axum::{
@@ -12,17 +13,55 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use dashmap::DashMap;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::info;
 
-// Re-export SSE types for consumers
-pub use crate::sse::{EventSender, EventReceiver, event_channel};
+/// Run manager for tracking runs and their event streams
+#[derive(Debug, Clone)]
+pub struct RunManager {
+    pub event_senders: Arc<DashMap<alms_core::RunId, mpsc::UnboundedSender<SseEventData>>>,
+}
+
+impl RunManager {
+    pub fn new() -> Self {
+        Self {
+            event_senders: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn register_sender(&self, run_id: alms_core::RunId, sender: mpsc::UnboundedSender<SseEventData>) {
+        self.event_senders.insert(run_id, sender);
+    }
+
+    pub fn get_sender(&self, run_id: alms_core::RunId) -> Option<mpsc::UnboundedSender<SseEventData>> {
+        self.event_senders.get(&run_id).map(|s| s.clone())
+    }
+
+    pub fn remove_sender(&self, run_id: alms_core::RunId) {
+        self.event_senders.remove(&run_id);
+    }
+
+    pub fn send_event(&self, run_id: alms_core::RunId, event: SseEventData) {
+        if let Some(sender) = self.get_sender(run_id) {
+            let _ = sender.send(event);
+        }
+    }
+}
+
+impl Default for RunManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Shared application state for HTTP server
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub session_manager: Arc<SessionManager>,
     pub gateway: Arc<tokio::sync::Mutex<Gateway>>,
+    pub run_manager: RunManager,
 }
 
 impl AppState {
@@ -30,26 +69,36 @@ impl AppState {
         Self {
             session_manager: gateway.session_manager().clone(),
             gateway: Arc::new(tokio::sync::Mutex::new(gateway)),
+            run_manager: RunManager::new(),
         }
     }
 }
 
-/// Create the gateway router
+// Re-export SSE types
+pub use crate::sse::{SseEventData, event_channel, RunEventStream};
+
+/// Create the gateway router (per docs/api.md)
 pub fn router() -> Router<AppState> {
     Router::new()
+        // Health
         .route("/health", get(health_check))
+        // Sessions
         .route("/sessions", post(create_session))
         .route("/sessions/:agent_id/:context_id", get(get_session))
-        .route("/ws", get(websocket_handler))
+        // Runs (per API spec)
+        .route("/runs", post(create_run))
+        .route("/runs/:run_id", get(get_run_status))
+        .route("/runs/:run_id/events", get(stream_run_events))
+        // Legacy (deprecated)
         .route("/agent/run", post(run_agent))
-        .route("/agent/run/stream", post(stream_run))
+        .route("/ws", get(websocket_handler))
 }
 
 /// Health check endpoint
 async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "healthy",
-        "service": "alms-gateway",
+        "service": "alms",
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }
@@ -81,21 +130,19 @@ async fn get_session(
     Json(session)
 }
 
-/// Run agent on a message (HTTP API)
+/// Legacy: Run agent on a message (HTTP API) -- deprecated, use POST /runs
 async fn run_agent(
     State(state): State<AppState>,
     Json(req): Json<RunAgentRequest>,
 ) -> impl IntoResponse {
     let gateway = state.gateway.lock().await;
     
-    // Create agent runtime
     let runtime = alms_runtime::AgentRuntime::new(
         gateway.agent_id().clone(),
         gateway.agent_config().clone(),
         gateway.llm().clone(),
     );
     
-    // Run agent
     match runtime.run(
         &gateway.session_manager().clone(),
         &req.context_id,
@@ -112,20 +159,14 @@ async fn run_agent(
     }
 }
 
-/// WebSocket handler for real-time communication
+/// WebSocket handler (optional, SSE preferred)
 async fn websocket_handler(
     ws: WebSocketUpgrade,
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
-}
-
-async fn handle_socket(
-    socket: axum::extract::ws::WebSocket,
-    state: AppState,
-) {
-    info!("WebSocket connection established");
-    // TODO: Implement WebSocket protocol for streaming responses
+    ws.on_upgrade(|_socket| async {
+        info!("WebSocket connection established (consider using SSE instead)");
+    })
 }
 
 /// Start the gateway HTTP server
