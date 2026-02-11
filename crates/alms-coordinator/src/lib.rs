@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 /// Unique identifier for a subagent task
@@ -87,6 +87,7 @@ pub struct SubagentRequest {
     pub timeout: Duration,
     pub capabilities: Vec<Capability>,
     pub parent_session: SessionId,
+    pub parent_run_id: Option<alms_core::RunId>, // For tracing correlation
 }
 
 /// Status of a subagent task
@@ -144,6 +145,7 @@ pub struct SubagentHandle {
     pub status: TaskStatus,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub cancel_tx: oneshot::Sender<()>,
+    pub parent_run_id: Option<alms_core::RunId>,
 }
 
 /// Coordinator manages all agents and message routing
@@ -171,6 +173,18 @@ impl Coordinator {
     }
     
     /// Spawn a new subagent for a task
+    #[instrument(
+        level = "info",
+        skip(self, request),
+        fields(
+            task_id = %task_id.0,
+            subagent_type = ?request.agent_type,
+            parent_session = %request.parent_session.0,
+            parent_run_id = ?request.parent_run_id.map(|r| r.0.to_string()),
+            timeout_secs = %request.timeout.as_secs(),
+            capability_count = %request.capabilities.len()
+        )
+    )]
     pub async fn spawn_subagent(
         &self,
         request: SubagentRequest,
@@ -178,6 +192,7 @@ impl Coordinator {
         let task_id = TaskId::new();
         let agent_type = request.agent_type.clone();
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let parent_run_id = request.parent_run_id;
         
         let handle = SubagentHandle {
             task_id,
@@ -185,16 +200,35 @@ impl Coordinator {
             status: TaskStatus::Pending,
             started_at: chrono::Utc::now(),
             cancel_tx,
+            parent_run_id,
         };
         
         self.subagents.insert(task_id, handle);
-        info!("Spawned subagent {:?} for task {:?}", agent_type, task_id);
+        
+        tracing::info!(
+            target: "coordinator::subagent_spawned",
+            task_id = %task_id.0,
+            subagent_type = ?agent_type,
+            parent_session = %request.parent_session.0,
+            "Subagent spawned successfully"
+        );
         
         // Start subagent execution in background
         let subagents = self.subagents.clone();
         let message_tx = self.message_tx.clone();
+        let parent_session = request.parent_session.clone();
+        let parent_run_id_clone = parent_run_id;
         
         tokio::spawn(async move {
+            // Create child span for the subagent task
+            let _span = tracing::info_span!(
+                "subagent::execute",
+                task_id = %task_id.0,
+                parent_session = %parent_session.0,
+                parent_run_id = ?parent_run_id_clone.map(|r| r.0.to_string()),
+            );
+            let _enter = _span.enter();
+            
             run_subagent(task_id, request, subagents, message_tx, cancel_rx).await;
         });
         
@@ -245,10 +279,22 @@ async fn run_subagent(
     message_tx: mpsc::UnboundedSender<AgentMessage>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) {
+    let start = std::time::Instant::now();
+    let parent_run_id = request.parent_run_id;
+    
     // Update status to running
     if let Some(mut handle) = subagents.get_mut(&task_id) {
         handle.status = TaskStatus::Running;
     }
+    
+    tracing::info!(
+        target: "subagent::started",
+        task_id = %task_id.0,
+        task = %request.task,
+        subagent_type = ?request.agent_type,
+        parent_run_id = ?parent_run_id.map(|r| r.0.to_string()),
+        "Subagent execution started"
+    );
     
     // Send initial progress
     let _ = message_tx.send(AgentMessage::Progress(ProgressUpdate {
@@ -259,13 +305,15 @@ async fn run_subagent(
         partial_result: None,
     }));
     
-    // Simulate subagent work (replace with actual implementation)
-    let start = std::time::Instant::now();
-    
     tokio::select! {
         _ = tokio::time::sleep(request.timeout) => {
-            // Timeout
-            warn!("Subagent {:?} timed out", task_id);
+            tracing::warn!(
+                target: "subagent::timeout",
+                task_id = %task_id.0,
+                elapsed_ms = %start.elapsed().as_millis(),
+                timeout_secs = %request.timeout.as_secs(),
+                "Subagent timed out"
+            );
             
             let _ = message_tx.send(AgentMessage::Complete(TaskResult {
                 task_id,
@@ -280,8 +328,12 @@ async fn run_subagent(
             }
         }
         _ = &mut cancel_rx => {
-            // Cancelled
-            info!("Subagent {:?} cancelled", task_id);
+            tracing::info!(
+                target: "subagent::cancelled",
+                task_id = %task_id.0,
+                elapsed_ms = %start.elapsed().as_millis(),
+                "Subagent cancelled by user"
+            );
             
             let _ = message_tx.send(AgentMessage::Complete(TaskResult {
                 task_id,
@@ -296,8 +348,12 @@ async fn run_subagent(
             }
         }
         _ = execute_task(task_id, &request, &message_tx) => {
-            // Completed normally
-            info!("Subagent {:?} completed", task_id);
+            tracing::info!(
+                target: "subagent::completed",
+                task_id = %task_id.0,
+                elapsed_ms = %start.elapsed().as_millis(),
+                "Subagent execution completed normally"
+            );
             
             if let Some(mut handle) = subagents.get_mut(&task_id) {
                 handle.status = TaskStatus::Completed;

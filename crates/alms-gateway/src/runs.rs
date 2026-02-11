@@ -11,11 +11,12 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use tracing::{error, info};
+use tracing::{error, info, instrument};
 
 /// POST /runs - Create a new run
 /// 
 /// Per API spec: Returns 201 Created with { run_id, session_id, status: "queued", ts }
+#[instrument(level = "info", skip(state, req), fields(session_id = %req.session_id.0))]
 pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
@@ -63,6 +64,7 @@ pub async fn create_run(
 }
 
 /// Execute a run in background
+#[instrument(level = "info", skip(state, input), fields(run_id = %run_id.0, session_id = %session_id.0))]
 async fn execute_run(
     state: AppState,
     run_id: RunId,
@@ -144,6 +146,7 @@ pub async fn get_run_status(
 ///
 /// Per API spec: Returns SSE stream with event: run_started, token_delta, run_finished, run_error
 /// Supports Last-Event-ID header for reconnect
+#[instrument(level = "info", skip(state, headers), fields(run_id = %run_id.0, has_last_event_id = headers.contains_key("last-event-id")))]
 pub async fn stream_run_events(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,

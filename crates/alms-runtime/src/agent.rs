@@ -3,7 +3,7 @@ use crate::llm_types::*;
 use crate::tools::ToolRegistry;
 use alms_core::{AgentId, AlmsResult};
 use alms_session::{Message as SessionMessage, Role as SessionRole, SessionManager};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn, Span};
 
 /// Agent runtime configuration
 #[derive(Debug, Clone)]
@@ -56,6 +56,15 @@ impl AgentRuntime {
     }
     
     /// Run the agent on a single input
+    #[instrument(
+        level = "info",
+        skip(self, session_manager, context_id, input),
+        fields(
+            agent_id = %self.agent_id.0,
+            context_id = %context_id.as_ref(),
+            max_iterations = %self.config.max_iterations
+        )
+    )]
     pub async fn run(
         &self,
         session_manager: &SessionManager,
@@ -64,14 +73,22 @@ impl AgentRuntime {
     ) -> AlmsResult<String> {
         let context_id = context_id.as_ref();
         let input = input.into();
+        let span = Span::current();
         
         info!(
-            "Running agent {} for context {}",
-            self.agent_id.0, context_id
+            target: "agent::run_start",
+            agent_id = %self.agent_id.0,
+            context_id = %context_id,
+            input_len = input.len(),
+            "Agent run started"
         );
+        
+        // Record input metrics
+        span.record("input_len", input.len());
         
         // Get or create session
         let session = session_manager.get_or_create(self.agent_id, context_id);
+        span.record("session_id", %session.id.0);
         
         // Build conversation history
         let history = self.build_messages(session_manager, &session.id, &input).await?;
@@ -177,17 +194,33 @@ impl AgentRuntime {
     }
     
     /// Main agent loop with tool execution
+    #[instrument(
+        level = "debug",
+        skip(self, messages),
+        fields(agent_id = %self.agent_id.0)
+    )]
     async fn agent_loop(&self, mut messages: Vec<LlmMessage>) -> AlmsResult<String> {
         let mut iterations = 0;
         
         loop {
             if iterations >= self.config.max_iterations {
-                warn!("Max iterations reached, returning partial response");
+                warn!(
+                    target: "agent::loop",
+                    agent_id = %self.agent_id.0,
+                    iterations,
+                    max_iterations = %self.config.max_iterations,
+                    "Max iterations reached"
+                );
                 return Ok("[Max iterations reached]".to_string());
             }
             iterations += 1;
             
-            debug!("Agent loop iteration {}", iterations);
+            debug!(
+                target: "agent::loop",
+                agent_id = %self.agent_id.0,
+                iteration = iterations,
+                "Agent loop iteration"
+            );
             
             // Build request
             let request = CompletionRequest::new(self.llm.default_model())
@@ -239,18 +272,61 @@ impl AgentRuntime {
     }
     
     /// Execute a tool call
+    #[instrument(
+        level = "info",
+        skip(self, tool_call),
+        fields(
+            agent_id = %self.agent_id.0,
+            tool_name = %tool_call.function.name,
+            tool_call_id = %tool_call.id
+        )
+    )]
     async fn execute_tool_call(&self, tool_call: &ToolCall) -> AlmsResult<serde_json::Value> {
         let name = &tool_call.function.name;
         let args_str = &tool_call.function.arguments;
         
-        info!("Executing tool: {}", name);
+        info!(
+            target: "agent::tool::start",
+            agent_id = %self.agent_id.0,
+            tool_name = %name,
+            tool_call_id = %tool_call.id,
+            "Executing tool"
+        );
         
         // Parse arguments
+        let start = std::time::Instant::now();
         let args: serde_json::Value = serde_json::from_str(args_str)
             .map_err(|e| alms_core::AlmsError::ToolExecution(format!("Invalid arguments: {}", e)))?;
         
         // Execute
-        self.tools.execute(name, args).await
+        let result = self.tools.execute(name, args).await;
+        let elapsed = start.elapsed();
+        
+        match &result {
+            Ok(_) => {
+                info!(
+                    target: "agent::tool::success",
+                    agent_id = %self.agent_id.0,
+                    tool_name = %name,
+                    tool_call_id = %tool_call.id,
+                    duration_ms = %elapsed.as_millis(),
+                    "Tool execution succeeded"
+                );
+            }
+            Err(e) => {
+                error!(
+                    target: "agent::tool::error",
+                    agent_id = %self.agent_id.0,
+                    tool_name = %name,
+                    tool_call_id = %tool_call.id,
+                    error = %e,
+                    duration_ms = %elapsed.as_millis(),
+                    "Tool execution failed"
+                );
+            }
+        }
+        
+        result
     }
     
     /// Add a custom tool

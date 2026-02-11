@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
-use tracing::{error, info};
+use tracing::{error, info, instrument, Span};
 use uuid::Uuid;
 
 /// Unique identifier for a tool invocation
