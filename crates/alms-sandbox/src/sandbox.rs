@@ -159,20 +159,21 @@ impl Sandbox {
     pub async fn execute(
         &mut self,
         wasm_bytes: &[u8],
-        function_name: &str,
+        entrypoint: &str,
+        tool_name: &str,
         params: Value,
     ) -> SandboxResult<Value> {
         let start_time = std::time::Instant::now();
         
         info!(
-            "Executing WASM module, function: {}, params: {:?}",
-            function_name, params
+            "Executing WASM module, entrypoint: {}, tool: {}, params: {:?}",
+            entrypoint, tool_name, params
         );
 
         // Build ABI envelope
         let payload = serde_json::json!({
             "abi": 0,
-            "tool": function_name,
+            "tool": tool_name,
             "params": params,
         });
 
@@ -202,7 +203,7 @@ impl Sandbox {
         let instance = self.instantiate(&mut store, &module).await?;
 
         // Get the exported function
-        let func = self.get_function(&mut store, &instance, function_name)?;
+        let func = self.get_function(&mut store, &instance, entrypoint)?;
 
         // Get memory export
         let memory = instance
@@ -232,8 +233,10 @@ impl Sandbox {
 
         // Call the function
         trace!("Calling WASM function with ptr={}, len={}", ptr, params_len);
-        let result_ptr: i32 = func.call_async(&mut store, (ptr, params_len))
+        let call_future = func.call_async(&mut store, (ptr, params_len));
+        let result_ptr: i32 = tokio::time::timeout(self.config.timeout, call_future)
             .await
+            .map_err(|_| SandboxError::ExecutionTimeout(self.config.timeout))?
             .map_err(|e| SandboxError::WasmExecution(format!("Function call failed: {}", e)))?;
 
         // Read result from memory
@@ -262,11 +265,6 @@ impl Sandbox {
 
         let elapsed = start_time.elapsed();
         info!("WASM execution completed in {:?}", elapsed);
-
-        // Check for timeout
-        if elapsed >= self.config.timeout {
-            return Err(SandboxError::ExecutionTimeout(self.config.timeout));
-        }
 
         Ok(result)
     }
@@ -392,7 +390,7 @@ mod tests {
     async fn test_execute_ok() {
         let mut sandbox = Sandbox::new(SandboxConfig::default());
         let result = sandbox
-            .execute(&wasm_ok(), "alms_tool_call", serde_json::json!({"x": 1}))
+            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
             .await
             .unwrap();
         assert_eq!(result["ok"], true);
@@ -402,7 +400,7 @@ mod tests {
     async fn test_input_size_limit() {
         let mut sandbox = Sandbox::new(SandboxConfig::default().with_max_input_bytes(10));
         let err = sandbox
-            .execute(&wasm_ok(), "alms_tool_call", serde_json::json!({"x": "too_large_payload"}))
+            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": "too_large_payload"}))
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::MemoryLimitExceeded { .. }));
@@ -412,7 +410,7 @@ mod tests {
     async fn test_output_size_limit() {
         let mut sandbox = Sandbox::new(SandboxConfig::default().with_max_output_bytes(8));
         let err = sandbox
-            .execute(&wasm_ok(), "alms_tool_call", serde_json::json!({"x": 1}))
+            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::MemoryLimitExceeded { .. }));
@@ -422,7 +420,7 @@ mod tests {
     async fn test_invalid_json_output() {
         let mut sandbox = Sandbox::new(SandboxConfig::default());
         let err = sandbox
-            .execute(&wasm_bad_json(), "alms_tool_call", serde_json::json!({"x": 1}))
+            .execute(&wasm_bad_json(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::InvalidResult(_)));
@@ -432,7 +430,7 @@ mod tests {
     async fn test_timeout() {
         let mut sandbox = Sandbox::new(SandboxConfig::default().with_timeout(Duration::from_millis(0)));
         let err = sandbox
-            .execute(&wasm_ok(), "alms_tool_call", serde_json::json!({"x": 1}))
+            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::ExecutionTimeout(_)));
