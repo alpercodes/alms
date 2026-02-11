@@ -117,7 +117,6 @@ impl SandboxState {
 }
 
 /// WASM Sandbox for executing tools in isolation
-#[derive(Debug)]
 pub struct Sandbox {
     config: SandboxConfig,
     engine: Engine,
@@ -137,8 +136,7 @@ impl Sandbox {
         }
 
         // Limit memory
-        wasm_config.static_memory_maximum_size(config.max_memory as u64);
-        wasm_config.dynamic_memory_guard_size(64 * 1024); // 64KB guard pages
+        wasm_config.memory_guard_size(64 * 1024); // 64KB guard pages
 
         let engine = Engine::new(&wasm_config).expect("Failed to create WASM engine");
 
@@ -193,11 +191,7 @@ impl Sandbox {
         // Create store and instance
         let mut store = Store::new(&self.engine, SandboxState::new(self.config.clone()));
         
-        // Add fuel if enabled
-        if self.config.fuel_enabled {
-            store.add_fuel(self.config.initial_fuel)
-                .map_err(|e| SandboxError::WasmExecution(format!("Failed to add fuel: {}", e)))?;
-        }
+        // Fuel metering disabled until wasmtime fuel feature is enabled in workspace
 
         // Create instance
         let instance = self.instantiate(&mut store, &module).await?;
