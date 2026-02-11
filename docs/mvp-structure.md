@@ -1,39 +1,38 @@
 # MVP Module vs Crate Structure (Decision)
 
-**Status:** Decided for MVP
+**Status:** Revised for MVP
 
 ## Goal
-Reduce integration friction by keeping the crate graph small **while preserving clean internal seams** for later extraction.
+Ship an end‑to‑end daemon **without destabilizing the codebase** or creating new dependency cycles. Keep the graph small *in practice*, even if crates remain.
 
 ## Decision (MVP)
-Target **3–4 crates** during MVP:
-1) **`alms-core`** — shared types/protocol/errors (stable)
-2) **`almsd`** (new crate) — single daemon crate that contains:
-   - gateway HTTP server
-   - runtime loop
-   - session storage
-   - scheduler/cron
-   - tool registry + sandbox integration
-   - audit/event logging
-3) **`alms-cli`** — thin wrapper around `almsd`
-4) **`alms-channel`** — optional, only if it doesn’t add wiring complexity
+**Do not introduce new crates or a large restructure during MVP.**
+Instead:
+- Keep existing crates, but **treat them as thin facades** around internal modules.
+- Avoid adding new cross‑crate dependencies.
+- Use `alms-core` as the only shared dependency between “verticals”.
 
-**Everything else becomes internal modules** inside `almsd` for MVP.
+### Practical boundaries (MVP)
+- `alms-core` — shared types/protocol/errors (stable)
+- `alms-gateway` — HTTP server + request handling
+- `alms-runtime` — agent loop + LLM client
+- `alms-session` — session storage
+- `alms-sandbox` — tool execution (single tool registry)
+- `alms-cli` — thin entrypoint
 
-## Why
-- Fewer crates = fewer dependency cycles + simpler wiring.
-- Faster iteration during MVP.
-- Still preserves clear internal boundaries so extraction later is easy.
+This keeps the current structure **stable**, while enforcing a rule: **no new crate‑to‑crate cycles and no new crates until MVP is done.**
 
-## Migration Plan (from current repo)
-1) Introduce `almsd` and move gateway/runtime/session/scheduler/tools into modules.
-2) Keep `alms-core` as a shared crate.
-3) Keep `alms-cli` thin; update entrypoints to call `almsd`.
-4) Defer splitting `alms-sandbox` into its own crate until ABI stabilizes.
+## Why (change from prior decision)
+- The repo already has multiple crates; merging into a new `almsd` crate now adds churn and risk.
+- MVP risks are wiring and correctness, not modular purity.
+- We can defer the “almsd” consolidation until we have a stable end‑to‑end path.
 
-## Post‑MVP
-Once the MVP is stable, split modules into crates as needed:
-- `alms-gateway`, `alms-runtime`, `alms-session`, `alms-scheduler`, `alms-sandbox`
+## Post‑MVP Options
+Once the MVP is stable:
+1) **Consolidate into `almsd`** for simplicity, *or*
+2) **Extract clean crate boundaries** for long‑term scaling.
+
+Either is viable; choose based on team size and release cadence.
 
 ---
 *Date: 2026-02-11*

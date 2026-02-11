@@ -10,7 +10,7 @@ The core idea: **prove the foundation works** with a single daemon running end-t
 
 ## 0) Guiding principle
 
-**Ship a single working daemon + SQLite + one agent type end-to-end.**
+**Ship a single working daemon + snapshot-backed sessions + one agent type end-to-end.**
 
 That milestone proves the architecture is real. Everything else is detail.
 
@@ -24,10 +24,11 @@ That milestone proves the architecture is real. Everything else is detail.
    - `/health`
    - `POST /agent/run` (non-stream)
    - `POST /agent/run/stream` (SSE streaming) *(recommended)*
-3) **SQLite-backed sessions**
+3) **Snapshot-backed sessions (MVP)**
    - create session by context
    - append messages
    - load history
+   - survive restart via snapshot
 4) **Single agent loop**
    - one agent type that can respond
    - tool-call loop works for at least one tool
@@ -89,9 +90,9 @@ The repo currently has “wiring issues” (startup inconsistencies, wrong const
   - runtime + storage
 - Remove/avoid duplicate “gateway start” patterns.
 
-### Step 2 — SQLite session store
-- Replace in-memory history as source of truth
-- Keep an in-memory cache if needed, but DB is authoritative
+### Step 2 — Snapshot session store (MVP)
+- Use in‑memory + snapshot persistence as the source of truth
+- Add atomic writes + rotation + corruption fallback
 
 ### Step 3 — One tool registry + one capability model
 - Decide which registry is canonical (recommended: sandbox-owned registry)
@@ -115,7 +116,7 @@ The repo currently has “wiring issues” (startup inconsistencies, wrong const
 
 - Deterministic time (tokio pause/advance)
 - Mockable LLM adapter
-- In-memory SQLite test harness
+- Snapshot‑backed storage test harness (restart + corruption cases)
 - Golden tests for SSE event sequences
 
 Reference: `docs/testing-strategy.md`
