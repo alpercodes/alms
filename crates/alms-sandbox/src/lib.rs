@@ -3,7 +3,6 @@ use dashmap::DashMap;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
 use wasmtime::{Config as WasmConfig, Engine, Instance, Memory, Module, Store, TypedFunc};
 
 pub mod builtin;
@@ -192,58 +191,6 @@ impl Tool for NativeTool {
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
         (self.handler)(params)
-    }
-}
-
-/// Tool context passed during execution
-#[derive(Debug, Clone)]
-pub struct ToolContext {
-    /// Tool name
-    pub tool_name: String,
-    /// Execution timeout
-    pub timeout: Duration,
-    /// Memory limit in bytes
-    pub memory_limit: usize,
-    /// Additional context data
-    pub metadata: Option<Value>,
-}
-
-impl Default for ToolContext {
-    fn default() -> Self {
-        Self {
-            tool_name: String::new(),
-            timeout: Duration::from_secs(30),
-            memory_limit: 64 * 1024 * 1024, // 64MB
-            metadata: None,
-        }
-    }
-}
-
-impl ToolContext {
-    /// Create a new tool context
-    pub fn new(tool_name: impl Into<String>) -> Self {
-        Self {
-            tool_name: tool_name.into(),
-            ..Default::default()
-        }
-    }
-
-    /// Set the timeout
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Set the memory limit
-    pub fn with_memory_limit(mut self, limit: usize) -> Self {
-        self.memory_limit = limit;
-        self
-    }
-
-    /// Set metadata
-    pub fn with_metadata(mut self, metadata: Value) -> Self {
-        self.metadata = Some(metadata);
-        self
     }
 }
 
