@@ -1,6 +1,6 @@
 # Contributing (Local)
 
-## PR-only workflow (ENFORCED)
+## PR-only workflow (Policy)
 - **No direct commits** to the canonical repo: `</srv/alms`
 - All changes must be made on **feature branches** in agent workspaces
 - Submit changes via a **PR summary** in chat for review/merge

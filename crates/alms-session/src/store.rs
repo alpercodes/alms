@@ -138,7 +138,7 @@ impl MemoryStore {
         let snapshot_bytes = serde_json::to_vec(&envelope.snapshot)?;
         let checksum = Self::checksum(&snapshot_bytes);
         if checksum != envelope.checksum {
-            return Err(alms_core::AlmsError::InvalidConfig("snapshot checksum mismatch".to_string()));
+            return Err(alms_core::AlmsError::InvalidConfig("corrupt snapshot (checksum mismatch)".to_string()));
         }
 
         Ok(envelope.snapshot)
@@ -169,7 +169,7 @@ impl MemoryStore {
     }
 
     fn atomic_write(path: &Path, data: &[u8]) -> AlmsResult<()> {
-        let tmp_path = path.with_extension("tmp");
+        let tmp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
         {
             use std::io::Write;
             let mut file = std::fs::File::create(&tmp_path)?;
