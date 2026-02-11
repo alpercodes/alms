@@ -264,7 +264,7 @@ impl Sandbox {
         info!("WASM execution completed in {:?}", elapsed);
 
         // Check for timeout
-        if elapsed > self.config.timeout {
+        if elapsed >= self.config.timeout {
             return Err(SandboxError::ExecutionTimeout(self.config.timeout));
         }
 
