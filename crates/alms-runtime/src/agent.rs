@@ -1,7 +1,7 @@
 use crate::llm_client::LlmClient;
 use crate::llm_types::*;
 use crate::tools::ToolRegistry;
-use alms_core::{AgentId, AlmsResult};
+use alms_core::{AgentId, AlmsResult, AuditEvent, AuditDecision};
 use alms_session::{Message as SessionMessage, Role as SessionRole, SessionManager};
 use tracing::{debug, error, info, instrument, warn, Span};
 
@@ -252,7 +252,7 @@ impl AgentRuntime {
                 
                 // Execute tools
                 for tool_call in tool_calls {
-                    let result = self.execute_tool_call(&tool_call).await;
+                    let result = self.execute_tool_call(&tool_call, session_manager, session.id).await;
                     
                     let content = match result {
                         Ok(value) => value.to_string(),
@@ -281,7 +281,7 @@ impl AgentRuntime {
             tool_call_id = %tool_call.id
         )
     )]
-    async fn execute_tool_call(&self, tool_call: &ToolCall) -> AlmsResult<serde_json::Value> {
+    async fn execute_tool_call(&self, tool_call: &ToolCall, session_manager: &SessionManager, session_id: alms_core::SessionId) -> AlmsResult<serde_json::Value> {
         let name = &tool_call.function.name;
         let args_str = &tool_call.function.arguments;
         
@@ -299,11 +299,11 @@ impl AgentRuntime {
             .map_err(|e| alms_core::AlmsError::ToolExecution(format!("Invalid arguments: {}", e)))?;
         
         // Execute
-        let result = self.tools.execute(name, args).await;
+        let result = self.tools.execute(name, args.clone()).await;
         let elapsed = start.elapsed();
-        
+
         match &result {
-            Ok(_) => {
+            Ok(value) => {
                 info!(
                     target: "agent::tool::success",
                     agent_id = %self.agent_id.0,
@@ -311,6 +311,19 @@ impl AgentRuntime {
                     tool_call_id = %tool_call.id,
                     duration_ms = %elapsed.as_millis(),
                     "Tool execution succeeded"
+                );
+                let _ = session_manager.append_audit(
+                    session_id,
+                    AuditEvent {
+                        session_id,
+                        run_id: None,
+                        tool: name.to_string(),
+                        decision: AuditDecision::Allow,
+                        params: args,
+                        result: Some(value.clone()),
+                        error: None,
+                        timestamp: alms_core::Timestamp::now(),
+                    },
                 );
             }
             Err(e) => {
@@ -322,6 +335,19 @@ impl AgentRuntime {
                     error = %e,
                     duration_ms = %elapsed.as_millis(),
                     "Tool execution failed"
+                );
+                let _ = session_manager.append_audit(
+                    session_id,
+                    AuditEvent {
+                        session_id,
+                        run_id: None,
+                        tool: name.to_string(),
+                        decision: AuditDecision::Deny,
+                        params: args,
+                        result: None,
+                        error: Some(e.to_string()),
+                        timestamp: alms_core::Timestamp::now(),
+                    },
                 );
             }
         }

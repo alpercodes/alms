@@ -3,6 +3,7 @@ pub mod types;
 
 pub use store::{MemoryStore, SessionStore};
 pub use types::{Content, Message, Role, Session, SessionConfig, SessionStatus};
+pub use types::{AuditEvent};
 
 use alms_core::{AgentId, AlmsResult, SessionId};
 use dashmap::DashMap;
@@ -17,6 +18,8 @@ pub struct SessionManager {
     sessions: Arc<DashMap<(AgentId, String), Session>>,
     /// Session history: session_id -> Vec<Message>
     history: Arc<DashMap<SessionId, Vec<Message>>>,
+    /// Audit events: session_id -> Vec<AuditEvent>
+    audit: Arc<DashMap<SessionId, Vec<AuditEvent>>>,
     /// Configuration
     config: SessionConfig,
 }
@@ -26,6 +29,7 @@ impl SessionManager {
         Self {
             sessions: Arc::new(DashMap::new()),
             history: Arc::new(DashMap::new()),
+            audit: Arc::new(DashMap::new()),
             config,
         }
     }
@@ -44,6 +48,7 @@ impl SessionManager {
         let session = Session::new(agent_id, context_id);
         self.sessions.insert(key, session.clone());
         self.history.insert(session.id, Vec::new());
+        self.audit.insert(session.id, Vec::new());
         info!("Created new session: {:?}", session.id);
         
         session
@@ -83,6 +88,24 @@ impl SessionManager {
         self.history
             .get(&session_id)
             .map(|h| h.clone())
+            .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
+    }
+
+    /// Append audit event
+    pub fn append_audit(&self, session_id: SessionId, event: AuditEvent) -> AlmsResult<()> {
+        if let Some(mut audit) = self.audit.get_mut(&session_id) {
+            audit.push(event);
+            Ok(())
+        } else {
+            Err(alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
+        }
+    }
+
+    /// Get audit events
+    pub fn get_audit(&self, session_id: SessionId) -> AlmsResult<Vec<AuditEvent>> {
+        self.audit
+            .get(&session_id)
+            .map(|a| a.clone())
             .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
     }
     

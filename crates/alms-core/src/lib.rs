@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod channel;
 pub mod error;
+pub mod audit;
 pub mod run;
 pub mod session;
 pub mod tool;
@@ -8,6 +9,7 @@ pub mod tool;
 pub use channel::{Channel, ChannelMessage, IncomingMessage, OutgoingMessage, ChannelConfig};
 
 pub use error::{AlmsError, AlmsResult};
+pub use audit::{AuditDecision, AuditEvent};
 pub use run::{Run, RunId, RunStatus, RunInput, CreateRunRequest, CreateRunResponse, RunStatusResponse};
 
 use chrono::{DateTime, Utc};
