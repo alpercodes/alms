@@ -63,15 +63,6 @@ This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
 - Added an explicit alignment note to `docs/mvp-plan.md`.
 - **Owners:** Mesut
 
-## P1.5 — Tool system consolidation
-
-15) Unify tool registry interface + add real parameter schemas
-- The runtime `ToolRegistry` is already a thin wrapper around the sandbox `ToolRegistry` (good), but there are loose ends:
-  a) **Parameter schemas are empty stubs.** `runtime::ToolRegistry::to_definitions()` emits `{"type":"object","properties":{},"required":[]}` for every tool. The LLM has no idea what arguments tools accept. Each `Tool` impl should expose its own JSON Schema via a `fn parameters(&self) -> Value` method on the `Tool` trait, and `to_definitions()` should use it.
-  b) **Capability model duplication.** `alms-core::Capability` is an enum, but `alms-coordinator::SubagentRequest.capabilities` uses `Vec<String>`. Pick one representation and use it everywhere. Recommendation: enum in core, with `From<&str>` / `Display` for serialization boundaries.
-  c) **The runtime wrapper may be unnecessary long-term.** If the only value is error mapping and LLM definition conversion, consider moving those into the sandbox crate directly (e.g. a `ToolRegistry::to_llm_definitions()` method) and having the runtime use `SandboxRegistry` directly. Less indirection.
-- **Owners:** Zeki (approach), Atlas/Mustafa (implementation)
-
 ## P2 — Product / docs
 
 12) Make onboarding/docs non-drifting

@@ -78,9 +78,9 @@ Previous wiring issues (circular deps, signature mismatches, stale imports) were
 - **Task created:** P1.5 #15 on `feature/zeki-tool-consolidation` branch.
 
 ### 3e) Persistence
-- In-memory sessions + JSON snapshot. No SQLite yet.
-- Snapshot persistence spec exists in docs but atomic write + rotation + checksum aren't implemented.
-- Sessions don't survive daemon restarts with any reliability.
+- Atomic snapshot persistence **is implemented** (merged by Atlas): temp file → fsync → rename → dir fsync, 3-rotation backup, SHA256 checksum verification, corruption fallback. Tests cover roundtrip and corrupted-file recovery.
+- In-memory + snapshot is the current store. No SQLite yet — that's the next persistence step.
+- Sessions should survive daemon restarts via snapshots, though this needs real-world verification.
 
 ### 3f) Approval workflow
 - Fully documented (events, state machine, UX spec).
@@ -101,9 +101,9 @@ Previous wiring issues (circular deps, signature mismatches, stale imports) were
 |-----------|-------|-----------|
 | Architecture / Design | 8.5/10 | Docs are better than most shipped products. Specific, actionable, opinionated. |
 | Code quality | 7/10 | Clean Rust, proper error handling, tracing, tests. Some stubs pretending to be features. |
-| Completeness | 3.5/10 | Single-agent HTTP path ~80% there. Multi-agent 0%. No persistence, approvals, cron, real tool schemas. |
+| Completeness | 4/10 | Single-agent HTTP path ~80% there. Snapshot persistence implemented. Multi-agent 0%. No SQLite, approvals, cron, or real tool schemas. |
 | Team execution | 7/10 | Clear roles, proper git workflow, fast iteration. Velocity is the main risk. |
-| **Overall** | **~5/10** | Solid foundation, not yet a product. Maybe 15-20% toward an MVP that could replace OpenClaw. |
+| **Overall** | **~5/10** | Solid foundation, not yet a product. Maybe 20% toward an MVP that could replace OpenClaw. |
 
 ## 5) Critical path — what to focus on next
 
@@ -125,9 +125,9 @@ Ordered by "unblocks the most value":
 
 ### Tier 2 — Shortly after
 
-**C) Atomic snapshot persistence.**
-- Implement the spec in `docs/session-storage.md`: temp write → fsync → rename → rotation.
-- Sessions must survive daemon restarts. This is table stakes.
+**C) ~~Atomic snapshot persistence.~~ ✅ Done.**
+- Already implemented by Atlas: atomic write, rotation, checksums, corruption fallback with tests.
+- Next step is verifying it works in real-world daemon restarts.
 
 **D) SQLite storage layer.**
 - Replace JSON snapshots with SQLite for sessions, messages, audit log.
