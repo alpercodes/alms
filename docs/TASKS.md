@@ -1,93 +1,100 @@
 # ALMS Tasks / TODO (triaged)
 
-This is a running task list so agents (Mesut/Atlas/Mustafa) can coordinate.
+This is the running task list for ALMS. Keep it short, current, and merge-friendly.
 
-**Note:** Previously-blocking wiring tasks were completed and removed from this list to keep it actionable.
+## Status snapshot
+- **Docs spine is in place** (`docs/index.md`, `api.md`, `events-and-audit.md`, `security-model.md`, `capability-model.md`, `approvals-ux.md`, `policy-reasons.md`, `artifacts.md`).
+- Core engineering work is now about **making runs/approvals/audit/event persistence real and coherent**.
 
-## P0 — MVP foundation (end-to-end + safety)
+---
 
-1) Atomic snapshot persistence + rotation + corruption fallback
-- Implement the requirements in `docs/session-storage.md` (temp write + fsync + rename + fsync dir, keep last N, checksum/version).
-- Add tests for restart survival + corrupted snapshot fallback.
+## P0 — MVP foundation (must work end-to-end)
+
+1) Snapshot persistence: atomic + rotation + checksum + fallback ✅
+- Implemented in `crates/alms-session/src/store.rs`.
 - **Owners:** Atlas
 
-2) Implement Tool Sandbox ABI v0 in code ✅
-- Implemented host↔WASM contract per `docs/tool-sandbox-abi.md`.
-- Instance-per-call enforced; size limits + allocator + tests added.
+2) Tool Sandbox ABI v0 in code ✅
+- Allocator (`alms_alloc`), size limits, ABI envelope (`abi:0`), tests.
 - **Owners:** Atlas, Mustafa
 
-3) Capability enforcement + audit trail (minimal)
-- Ensure every tool invocation goes through a single policy gate and produces an audit event.
-- Implement minimal audit event schema end-to-end.
+3) Minimal audit trail for tools + policy gate ✅ *(pending merge if PR not yet merged)*
+- `feature/atlas-audit` implements minimal audit events + deny unknown tools.
+- After merge, ensure audit records include `run_id` when available.
 - **Owners:** Atlas
 
-4) SSE-first streaming endpoint (minimal) ✅
-- Provide `POST /agent/run/stream` using SSE with correlation IDs (`session_id`, `run_id`, `tool_invocation_id`).
-- Keep WebSocket as optional later.
-- Add golden tests for event sequencing using a mocked LLM.
-- **Status:** MVP implemented. Golden tests in `crates/alms-gateway/tests/sse_golden_tests.rs`. 
-- **Note:** Current endpoint is `POST /agent/run/stream` but should align with `POST /runs` + `GET /runs/{id}/events` per docs/api.md post-MVP.
+4) SSE streaming for runs ✅
+- SSE endpoint exists + golden tests.
 - **Owners:** Mustafa
 
 5) Deterministic test harness for scheduler + timeouts
-- Apply `docs/testing-strategy.md`: tokio paused time, mock LLM adapter, in-memory SQLite if/when introduced.
-- Add at least one scheduler test: schedule → advance time → job run recorded.
+- Use paused tokio time; at least one scheduler test: schedule → advance time → job run recorded.
 - **Owners:** Atlas
 
-6) Docs: API contract for MVP ✅
-- Implemented in `docs/api.md`.
-- **Owners:** Mesut
+---
 
-7) Docs: Event model + audit log schema ✅
-- Implemented in `docs/events-and-audit.md`.
-- **Owners:** Mesut
+## P1 — Converge on the Run/Event/Approval model (ALMS identity)
 
-8) Docs: Approval UX spec (minimal) ✅
-- Implemented in `docs/approvals-ux.md`.
-- **Owners:** Mesut
+6) Canonical Run API (introduce without breaking MVP compatibility)
+- Implement `POST /runs` + `GET /runs/{run_id}/events` as canonical.
+- Keep `/agent/run` + `/agent/run/stream` as compatibility aliases (deprecated).
+- Ensure event invariants in `docs/events-and-audit.md` hold.
+- **Owners:** Atlas, Mustafa
 
-## P1 — Stability & cleanup
+7) Approvals end-to-end (guarded posture)
+- Implement `approval_required` → pause → `approval_resolved` → continue.
+- Minimal `/approvals` endpoints (list pending, resolve approve/deny).
+- Guarantee `full_control` posture never emits approvals.
+- **Owners:** Atlas, Mustafa
 
-9) Remove dead code / fix warnings / tighten interfaces ✅
-- Removed unused imports across coordinator, gateway, runs, sse modules.
-- Removed unused ToolContext struct (53 lines) from sandbox.
-- Removed unused ChannelAdapter struct (16 lines) from channel.
-- Total: 77 lines of dead code removed.
+8) Event persistence stance (required if approvals ship)
+- Decide and implement: best-effort streaming vs persisted per-run event log.
+- Recommendation: persist per-run events if approvals exist (reconnect/replay).
+- **Owners:** Atlas
+
+9) Audit surfacing (minimal)
+- Add minimal query path for audit per session/run (even if in-memory for MVP).
+- Redaction/truncation rules aligned with `docs/security-model.md`.
+- **Owners:** Atlas
+
+10) Tool parameter schemas (tool-call reliability)
+- Fix tool calling reliability by providing real JSON Schemas for tool parameters.
+- Today, LLM tool definitions may be missing/empty schemas → unreliable tool calls.
+- Recommendation:
+  - add `parameters() -> JSON Schema` to the tool trait
+  - implement schemas for built-ins (echo/math/http_get)
+  - ensure runtime uses these schemas when creating LLM tool definitions
+- **Owners:** Zeki (approach), Atlas/Mustafa (implementation)
+
+---
+
+## P2 — Stability / quality
+
+10) CI basics
+- `cargo fmt`, `cargo clippy`, `cargo test` (including golden tests) in CI.
 - **Owners:** Mustafa
 
-10) Decide and document “MVP module vs crate” structure ✅
-- Decision captured in `docs/mvp-structure.md` and linked from `docs/mvp-plan.md`.
-- **Owners:** Atlas
-
-11) Docs: Update tech-stack vs MVP-plan alignment notes ✅
-- Added an explicit alignment note to `docs/mvp-plan.md`.
-- **Owners:** Mesut
-
-## P2 — Product / docs
-
-12) Make onboarding/docs non-drifting
-- Once MVP path stabilizes, add a dedicated docs/architecture/UX “designer” agent (docs-only).
-- **Owners:** Atlas
-
-13) Observability ✅
-- Structured tracing with `#[instrument]` spans across coordinator, gateway, runtime.
-- Per-session run IDs propagated through subagent requests.
-- Subagent lifecycle events: spawned, started, completed, cancelled, timeout.
-- Tool execution logging with duration metrics.
-- Tracing targets: `coordinator::*`, `subagent::*`, `agent::*`, `agent::tool::*`.
-- **Owners:** Mustafa
-
-14) Docs: Developer onboarding ✅
-- Implemented in `docs/dev-onboarding.md`.
+11) Documentation drift checks
+- Keep `docs/api.md`, `docs/events-and-audit.md`, and implementation aligned.
+- Add a “docs index” link in README (optional).
 - **Owners:** Mesut
 
 ---
 
-See also:
-- `docs/proposal.md`
-- `docs/tech-stack.md`
+## Docs index
+Start here:
+- `docs/index.md`
+
+Spine:
+- `docs/api.md`
+- `docs/events-and-audit.md`
 - `docs/security-model.md`
-- `docs/session-storage.md`
-- `docs/tool-sandbox-abi.md`
-- `docs/testing-strategy.md`
+- `docs/capability-model.md`
+- `docs/approvals-ux.md`
+- `docs/policy-reasons.md`
+- `docs/artifacts.md`
+
+Execution plan:
 - `docs/mvp-plan.md`
+- `docs/mvp-module-crate-structure.md`
+- `docs/testing-strategy.md`
