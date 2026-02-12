@@ -214,6 +214,27 @@ Result Generation → Stream Progress → Complete → Report
 
 ---
 
+## Token Efficiency — A First-Class Concern
+
+Most agent frameworks (including OpenClaw) burn tokens aggressively:
+
+1. **Full system prompt on every turn** — The entire agent context (instructions, tools, memory) is re-sent with each API call. Caching helps but isn't always available or used.
+2. **Multiple round-trips per user message** — Each tool call is a separate API request carrying the full conversation history. A single user prompt can trigger 4-5+ API calls.
+3. **Context window bloat** — Conversation history grows linearly, and naive implementations send everything every time.
+
+**ALMS should treat token cost as a core design constraint, not an afterthought:**
+
+- **Context compression:** Summarize or prune history before re-sending. Only include what's relevant to the current task.
+- **Selective system prompts:** Subagents should receive minimal, task-specific instructions — not the full agent persona.
+- **Tool call batching:** Where possible, batch independent tool calls into a single round-trip rather than sequential calls.
+- **Cache-aware design:** Design prompts and context to maximize cache hits (stable prefixes, consistent ordering).
+- **Cost observability:** Surface per-run and per-agent token usage and cost so operators can identify waste.
+- **Tiered model routing:** Route simple tasks to cheaper models, reserve expensive models for complex reasoning. This should be automatic, not manual.
+
+*These observations come from real-world experience running multiple agents on Opus 4.6 via OpenRouter — where a single conversation can burn through dollars in minutes.*
+
+---
+
 ## Multi-Agent Benefits
 
 | Aspect | Single Agent | Multi-Agent (ALMS) |
