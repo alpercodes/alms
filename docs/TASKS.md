@@ -57,6 +57,15 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Redaction/truncation rules aligned with `docs/security-model.md`.
 - **Owners:** Atlas
 
+10) Tool parameter schemas (tool-call reliability)
+- Fix tool calling reliability by providing real JSON Schemas for tool parameters.
+- Today, LLM tool definitions may be missing/empty schemas → unreliable tool calls.
+- Recommendation:
+  - add `parameters() -> JSON Schema` to the tool trait
+  - implement schemas for built-ins (echo/math/http_get)
+  - ensure runtime uses these schemas when creating LLM tool definitions
+- **Owners:** Zeki (approach), Atlas/Mustafa (implementation)
+
 ---
 
 ## P2 — Stability / quality
