@@ -31,4 +31,5 @@
 pub mod telegram;
 
 /// Re-export commonly used types
-pub use alms_core::{Channel, ChannelConfig, IncomingMessage, OutgoingMessage, ChatId, UserId, MessageId};
+pub use alms_core::{Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
+pub use alms_core::channel::{ChatId, UserId, MessageId};
