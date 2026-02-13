@@ -1,6 +1,7 @@
 //! Telegram Bot API client implementation
 
-use crate::telegram::types::*;
+mod types;
+use types::*;
 use alms_core::channel::{ChatId, MessageId, UserId};
 use alms_core::{AlmsResult, Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
 use async_trait::async_trait;
