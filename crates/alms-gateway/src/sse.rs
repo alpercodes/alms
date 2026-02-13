@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -127,14 +127,16 @@ impl SseEventData {
 pub struct RunEventStream;
 
 impl RunEventStream {
-    pub fn new(receiver: mpsc::UnboundedReceiver<SseEventData>) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    pub fn new(
+        receiver: mpsc::UnboundedReceiver<SseEventData>,
+    ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
         Self::new_with_events(receiver, Vec::new())
     }
 
     pub fn new_with_events(
         receiver: mpsc::UnboundedReceiver<SseEventData>,
         replay: Vec<SseEventData>,
-    ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
         let replay_stream = tokio_stream::iter(replay.into_iter().map(|data| {
             let event = Event::default()
                 .event(&data.event_type)
@@ -144,7 +146,7 @@ impl RunEventStream {
             Ok::<_, Infallible>(event)
         }));
 
-        let live_stream = ReceiverStream::new(receiver).map(|data| {
+        let live_stream = UnboundedReceiverStream::new(receiver).map(|data| {
             let event = Event::default()
                 .event(&data.event_type)
                 .id(data.event_id.map(|id| id.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()))
