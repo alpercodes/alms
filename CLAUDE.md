@@ -8,6 +8,7 @@ ALMS (Agent Loop Management System) is a Rust-based multi-agent coordination pla
 
 ```bash
 # Requires Rust nightly (auto-installed from rust-toolchain.toml)
+# On Windows, cargo is at ~/.cargo/bin/cargo — use `export PATH="$HOME/.cargo/bin:$PATH"` if needed
 cargo build --release
 cargo run --bin alms -- gateway --bind 127.0.0.1:8080
 
@@ -23,14 +24,19 @@ make clippy      # cargo clippy -- -D warnings
 ```
 crates/
   alms-core/         # Core types (IDs, Capability, AuditEvent, Channel trait, errors)
+                     #   config.rs — unified AlmsConfig (layered: defaults → TOML → env vars)
   alms-gateway/      # Axum HTTP server, SSE streaming, run lifecycle, event log
   alms-runtime/      # Agent loop, LLM client (OpenAI-compat), tool execution, audit
+                     #   context.rs — ContextBuilder (token-budgeted context window)
+                     #   workspace.rs — AgentWorkspace (personality/goals/memories files)
   alms-coordinator/  # Multi-agent orchestration (scaffold — not yet real)
   alms-session/      # Session store, JSON snapshot persistence (atomic + rotation + checksums)
   alms-sandbox/      # WASM tool sandbox, builtin tools (echo, math, http_get), registry
   alms-channel/      # Channel adapters (Telegram polling implemented)
   alms-cli/          # Thin CLI entrypoint (clap)
 docs/                # Design docs — api.md, architecture.md, security-model.md, etc.
+                     #   agent-runtime-design.md — detailed design for config/context/workspace
+                     #   agent-ux-requirements.md — Alper's UX requirements
 _quarantine/         # Archived/superseded docs
 research/            # Competitive analysis and tech-stack decisions
 ```
@@ -58,11 +64,40 @@ alms-cli → alms-gateway → alms-runtime  → alms-core
 - **IDs**: Newtype wrappers (`AgentId`, `SessionId`, `RunId`, etc.) — never raw strings
 - **Tests**: `#[cfg(test)] mod tests` in each file. Golden tests for SSE in `alms-gateway/tests/`
 
+## Configuration System
+
+Unified config in `alms-core/src/config.rs` (`AlmsConfig`):
+- **Layered precedence**: compiled defaults → `alms.toml` config file → env var overrides
+- **Secrets** (API keys, tokens) are ONLY loaded from env vars, never from config files (`#[serde(skip)]`)
+- See `alms.toml.example` for all options with documentation
+- Key env vars: `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `ALMS_LLM_MOCK=1`, `DEFAULT_MODEL`, `LLM_BASE_URL`
+- `GatewayConfig::from_env()` uses `AlmsConfig::load()` internally — single source of truth
+
+## Agent Runtime Architecture
+
+The agent runtime (`alms-runtime`) has three key subsystems:
+
+1. **ContextBuilder** (`context.rs`): Assembles token-budgeted context windows for LLM calls. Strategies: `truncate` (default), `full`, `sliding-summary` (falls back to truncate for now). Config via `ContextConfig`.
+
+2. **AgentWorkspace** (`workspace.rs`): Per-agent persistent identity files:
+   - `personality.md` — tone, style, constraints (user-editable only)
+   - `goals.md` — current objectives (agent + user editable)
+   - `memories.md` — learned facts, preferences (agent + user editable)
+   - Prepended to system prompt when workspace is attached to runtime
+   - `needs_bootstrap()` detects first-time agents
+
+3. **ToolRegistry** (`tools.rs`): Tools expose JSON Schema parameters via `fn parameters() -> Value`. Definitions serialize to OpenAI format: `{"type": "function", "function": {"name", "description", "parameters"}}`.
+
+## LLM Types
+
+- `LlmMessage.content` is `Option<String>` (null when LLM returns tool calls only)
+- Two `LlmConfig` types exist: `alms_core::config::LlmConfig` (canonical) and `alms_runtime::llm_types::LlmConfig` (legacy, with `From` bridge). Prefer the core one for new code.
+
 ## Git Workflow
 
 - Feature branches: `feature/<name>`
 - PRs target `main`
-- Pre-commit hook blocks direct main commits
+- Pre-commit hook blocks direct main commits (bypass: `ALMS_ALLOW_MAIN_COMMIT=1`)
 - Remote name `canonical` is used for upstream (not `origin`)
 - Run `make ci` before pushing
 
@@ -73,11 +108,20 @@ alms-cli → alms-gateway → alms-runtime  → alms-core
 - **WASM sandbox** for tool isolation; native builtins bypass WASM for now
 - **Single-process daemon** — no microservice split planned for MVP
 - **Mock LLM** available via `ALMS_LLM_MOCK=1` env var for testing without API keys
+- **Simple config** — avoid the OpenClaw pattern of confusing nested settings; flat, predictable keys
 
-## Current State (as of 2026-02)
+## Known Issues
 
-Working: core types, session management, agent runtime with tool loop, HTTP gateway with SSE, Telegram adapter, snapshot persistence, builtin tools.
+- 4 sandbox/wasmtime tests fail with "must use async instantiation when async support is enabled" — pre-existing wasmtime config issue
+- Pre-existing unused import warnings across several crates (alms-sandbox, alms-channel, alms-core)
+- `sliding-summary` context strategy falls back to `truncate` (not yet implemented)
+- `workspace_write` tool referenced in workspace docs but not yet created
+- Coordinator is still a stub — `execute_task` is a placeholder
 
-Not yet real: coordinator/multi-agent (stub), approval workflow, cron/scheduler, SQLite storage, tool parameter schemas (empty `{}`).
+## Current State (as of 2026-02-14)
 
-See `docs/TASKS.md` for the prioritized task list and `docs/zeki-review-2026-02-12.md` for the most recent full review.
+**Working**: core types, unified config system, session management, agent runtime with tool loop + context builder + workspace integration, HTTP gateway with SSE, Telegram adapter, snapshot persistence, builtin tools with real JSON schemas, OpenAI-format tool definitions.
+
+**Not yet real**: coordinator/multi-agent (stub), approval workflow, cron/scheduler, SQLite storage, sliding-summary context strategy, workspace_write tool.
+
+See `docs/TASKS.md` for the prioritized task list, `docs/agent-runtime-design.md` for the runtime design, and `docs/agent-ux-requirements.md` for UX requirements.
