@@ -10,6 +10,7 @@ pub mod context;
 pub mod llm_client;
 pub mod llm_types;
 pub mod tools;
+pub mod workspace;
 
 pub use agent::{AgentConfig, AgentRuntime};
 pub use context::ContextBuilder;
