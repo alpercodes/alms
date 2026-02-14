@@ -116,6 +116,8 @@ Spine:
 - `docs/policy-reasons.md`
 - `docs/artifacts.md`
 - `docs/zeki-review-2026-02-12.md`
+- `docs/workflow-layer.md`
+- `docs/ux-principles.md`
 
 UX requirements:
 - `docs/agent-ux-requirements.md`
