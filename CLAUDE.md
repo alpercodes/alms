@@ -98,8 +98,15 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 - Feature branches: `feature/<name>`
 - PRs target `main`
 - Pre-commit hook blocks direct main commits (bypass: `ALMS_ALLOW_MAIN_COMMIT=1`)
-- Remote name `canonical` is used for upstream (not `origin`)
 - Run `make ci` before pushing
+
+### VPS & Remotes
+
+- **VPS**: `root@<vps-host>` (Ubuntu 24.04, 4GB RAM)
+- **Canonical repo on VPS**: `</srv/alms` (has `main` checked out)
+- **Git remote `atlas`**: points to the VPS canonical repo
+- **Pushing to VPS**: The VPS repo has `main` checked out, so direct pushes are refused by default. To push: temporarily set `receive.denyCurrentBranch=updateInstead` on VPS, push, then reset to `refuse`.
+- **Agent workspace repos**: `</srv/workspace-atlas/alms`, `</srv/workspace-mustafa/alms`
 
 ## Key Design Decisions
 
