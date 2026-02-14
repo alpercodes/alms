@@ -1,11 +1,13 @@
 pub mod agent;
 pub mod channel;
+pub mod config;
 pub mod error;
 pub mod audit;
 pub mod run;
 
 pub use channel::{Channel, ChannelMessage, IncomingMessage, OutgoingMessage, ChannelConfig};
 
+pub use config::AlmsConfig;
 pub use error::{AlmsError, AlmsResult};
 pub use audit::{AuditDecision, AuditEvent};
 pub use run::{Run, RunId, RunStatus, RunInput, CreateRunRequest, CreateRunResponse, RunStatusResponse};

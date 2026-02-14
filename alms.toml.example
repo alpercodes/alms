@@ -1,0 +1,59 @@
+# ALMS Configuration
+# Copy to alms.toml and customize. All values shown are defaults.
+# Secrets (API keys, tokens) are loaded from environment variables, never this file.
+
+[server]
+bind = "127.0.0.1:8080"
+
+[llm]
+# provider base URL
+base_url = "https://openrouter.ai/api/v1"
+# model identifier
+model = "openrouter/moonshotai/kimi-k2.5"
+# request timeout
+timeout_secs = 120
+# retry count on transient failures
+max_retries = 2
+# token budget per run (0 = unlimited)
+max_tokens_per_run = 0
+# set to true for testing without an API key
+mock = false
+
+# Set API key via environment variable:
+#   export OPENROUTER_API_KEY=sk-...
+#   export OPENAI_API_KEY=sk-...        (alternative)
+#   export ALMS_LLM_MOCK=1             (mock mode, no key needed)
+
+[session]
+idle_timeout_secs = 86400            # 24 hours
+auto_archive = true
+archive_ttl_secs = 2592000          # 30 days
+max_messages = 10000
+max_context_tokens = 128000
+snapshot_dir = "./data/snapshots"
+
+[context]
+# Context window strategy:
+#   "truncate"        - keep last N messages (simple, no LLM calls)
+#   "sliding-summary" - rolling summary + recent window (best quality)
+#   "full"            - send everything (for small conversations)
+strategy = "truncate"
+# max tokens to send to the LLM per request
+max_input_tokens = 32000
+# number of recent messages to always keep in full
+recent_window = 20
+# how often to update rolling summary (in messages, for sliding-summary)
+summary_interval = 30
+
+[tools]
+# which builtin tools to enable
+enabled = ["echo", "math", "http_get"]
+# timeout for tool execution
+timeout_secs = 30
+# max output size from a tool (bytes)
+max_output_bytes = 65536
+
+# Telegram channel (optional)
+# Set token via: export TELEGRAM_BOT_TOKEN=...
+# [channels.telegram]
+# poll_interval_secs = 5

@@ -6,11 +6,13 @@
 //! - Agent loop orchestration
 
 pub mod agent;
+pub mod context;
 pub mod llm_client;
 pub mod llm_types;
 pub mod tools;
 
 pub use agent::{AgentConfig, AgentRuntime};
+pub use context::ContextBuilder;
 pub use llm_client::LlmClient;
 pub use llm_types::*;
 pub use tools::ToolRegistry;

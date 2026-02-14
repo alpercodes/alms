@@ -1,7 +1,9 @@
+use crate::context::ContextBuilder;
 use crate::llm_client::LlmClient;
 use crate::llm_types::*;
 use crate::tools::ToolRegistry;
 use alms_core::{AgentId, AlmsResult, AuditEvent, AuditDecision};
+use alms_core::config::ContextConfig;
 use alms_session::{Message as SessionMessage, Role as SessionRole, SessionManager};
 use tracing::{debug, error, info, instrument, warn, Span};
 
@@ -89,8 +91,8 @@ impl AgentRuntime {
         // Get or create session
         let session = session_manager.get_or_create(self.agent_id, context_id);
         
-        // Build conversation history
-        let history = self.build_messages(session_manager, &session.id, &input).await?;
+        // Build conversation history via ContextBuilder
+        let history = self.build_context(session_manager, &session.id, &input)?;
         
         // Run the agent loop
         let response = self.agent_loop(session_manager, session.id, history).await?;
@@ -143,53 +145,25 @@ impl AgentRuntime {
         Ok(stream::once(async move { Ok(response) }))
     }
     
-    /// Build message history for LLM
-    async fn build_messages(
+    /// Build context window for LLM using ContextBuilder
+    fn build_context(
         &self,
         session_manager: &SessionManager,
         session_id: &alms_core::SessionId,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
-        let mut messages = vec![LlmMessage::system(&self.config.system_prompt)];
-        
-        // Add history
-        match session_manager.get_history(*session_id) {
-            Ok(history) => {
-                for msg in history.iter().take(50) { // Limit context
-                    let llm_msg = match msg.role {
-                        SessionRole::System => continue, // Skip system messages
-                        SessionRole::User => LlmMessage::user(self.content_to_string(&msg.content)),
-                        SessionRole::Assistant => LlmMessage::assistant(self.content_to_string(&msg.content)),
-                        SessionRole::Tool => continue, // Handle tool separately
-                    };
-                    messages.push(llm_msg);
-                }
-            }
+        let context_config = ContextConfig::default();
+        let builder = ContextBuilder::new(context_config);
+
+        let history = match session_manager.get_history(*session_id) {
+            Ok(h) => h,
             Err(e) => {
                 warn!("Failed to get history: {}", e);
+                Vec::new()
             }
-        }
-        
-        // Add current input
-        messages.push(LlmMessage::user(input));
-        
-        Ok(messages)
-    }
-    
-    /// Convert session content to string
-    fn content_to_string(&self, content: &alms_session::Content) -> String {
-        match content {
-            alms_session::Content::Text(text) => text.clone(),
-            alms_session::Content::ToolCall { name, params } => {
-                format!("Tool call: {}({})", name, params)
-            }
-            alms_session::Content::ToolResult { tool_id, result } => {
-                format!("Tool result {}: {}", tool_id, result)
-            }
-            alms_session::Content::Image { url, .. } => {
-                format!("[Image: {}]", url)
-            }
-        }
+        };
+
+        Ok(builder.build(&self.config.system_prompt, &history, input))
     }
     
     /// Main agent loop with tool execution
@@ -411,15 +385,22 @@ mod tests {
     }
     
     #[test]
-    fn test_content_to_string() {
+    fn test_build_context() {
         let runtime = AgentRuntime {
             agent_id: AgentId::new(),
             config: AgentConfig::default(),
             llm: LlmClient::new(LlmConfig::default()).unwrap(),
             tools: ToolRegistry::new(),
         };
-        
-        let text = runtime.content_to_string(&alms_session::Content::Text("hello".to_string()));
-        assert_eq!(text, "hello");
+
+        let session_config = alms_session::SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+        let messages = runtime.build_context(&session_manager, &session.id, "hello").unwrap();
+        // system prompt + current input = 2
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
     }
 }

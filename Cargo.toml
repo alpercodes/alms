@@ -60,6 +60,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 
 # Configuration
 config = "0.15"
+toml = "0.8"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
