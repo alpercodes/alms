@@ -24,6 +24,16 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
     /// Get the tool description
     fn description(&self) -> &str;
 
+    /// Get the JSON Schema for this tool's parameters.
+    /// LLMs use this to know what arguments the tool accepts.
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+
     /// Execute the tool with JSON parameters
     async fn execute(&self, params: Value) -> SandboxResult<Value>;
 

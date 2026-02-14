@@ -5,7 +5,9 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: String,
-    pub content: String,
+    /// Content can be null when the LLM returns tool calls only
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16,48 +18,62 @@ impl LlmMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".to_string(),
-            content: content.into(),
+            content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
         }
     }
-    
+
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".to_string(),
-            content: content.into(),
+            content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
         }
     }
-    
+
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: content.into(),
+            content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
         }
     }
-    
+
     pub fn with_tool_calls(mut self, calls: Vec<ToolCall>) -> Self {
         self.tool_calls = Some(calls);
         self
     }
-    
+
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".to_string(),
-            content: content.into(),
+            content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
         }
     }
+
+    /// Get content as string, defaulting to empty string if None
+    pub fn content_str(&self) -> &str {
+        self.content.as_deref().unwrap_or("")
+    }
 }
 
-/// Tool definition for LLM
+/// Tool definition for LLM — serializes to OpenAI format:
+/// `{"type": "function", "function": {"name", "description", "parameters"}}`
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: FunctionDefinition,
+}
+
+/// The function definition inside a tool definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
@@ -66,18 +82,21 @@ pub struct ToolDefinition {
 impl ToolDefinition {
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
-            name: name.into(),
-            description: description.into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {},
-                "required": []
-            }),
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.into(),
+                description: description.into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }),
+            },
         }
     }
-    
+
     pub fn with_parameters(mut self, params: Value) -> Self {
-        self.parameters = params;
+        self.function.parameters = params;
         self
     }
 }

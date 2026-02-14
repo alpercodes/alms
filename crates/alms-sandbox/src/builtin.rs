@@ -1,6 +1,5 @@
 use crate::{error::SandboxResult, SandboxError, Tool};
 use serde_json::Value;
-use std::collections::HashMap;
 
 /// Built-in tool trait marker
 pub trait BuiltinTool: Tool {}
@@ -28,6 +27,19 @@ impl Tool for EchoTool {
 
     fn is_builtin(&self) -> bool {
         true
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The message to echo back"
+                }
+            },
+            "required": ["message"]
+        })
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
@@ -123,6 +135,32 @@ impl Tool for MathTool {
 
     fn is_builtin(&self) -> bool {
         true
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "description": "The math operation to perform",
+                    "enum": ["add", "subtract", "multiply", "divide", "power", "sqrt", "abs", "round", "floor", "ceil"]
+                },
+                "a": {
+                    "type": "number",
+                    "description": "First operand (used by add, subtract, multiply, divide, power)"
+                },
+                "b": {
+                    "type": "number",
+                    "description": "Second operand (used by add, subtract, multiply, divide, power)"
+                },
+                "n": {
+                    "type": "number",
+                    "description": "Single operand (used by sqrt, abs, round, floor, ceil). Falls back to 'a' if not provided."
+                }
+            },
+            "required": ["operation"]
+        })
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
@@ -221,6 +259,24 @@ impl Tool for HttpGetTool {
 
     fn is_builtin(&self) -> bool {
         true
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to send a GET request to"
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional HTTP headers as key-value pairs",
+                    "additionalProperties": { "type": "string" }
+                }
+            },
+            "required": ["url"]
+        })
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {

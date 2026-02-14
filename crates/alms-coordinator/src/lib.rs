@@ -121,7 +121,7 @@ pub struct TaskResult {
 }
 
 /// Message types for inter-agent communication
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug)]
 pub enum AgentMessage {
     /// Spawn a new subagent
     SpawnSubagent(SubagentRequest, oneshot::Sender<TaskId>),

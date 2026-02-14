@@ -9,7 +9,7 @@ use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
 use alms_session::{SessionConfig, SessionManager};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Gateway configuration
 #[derive(Debug, Clone)]
@@ -49,7 +49,7 @@ impl GatewayConfig {
         let token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
         Self {
             telegram_token: token,
-            llm_config: alms_runtime::LlmConfig::default(),
+            llm_config: alms_runtime::LlmConfig::from_env(),
             agent_config: AgentConfig::default(),
             session_config: SessionConfig::default(),
         }

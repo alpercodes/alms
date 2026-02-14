@@ -82,6 +82,7 @@ impl MainAgent {
                 timeout: Duration::from_secs(300),
                 capabilities: SubagentType::Research.default_capabilities(),
                 parent_session: alms_core::SessionId::new(),
+                parent_run_id: None,
             }])
         } else if input_lower.contains("code") || input_lower.contains("build") || input_lower.contains("implement") {
             Ok(vec![SubagentRequest {
@@ -90,6 +91,7 @@ impl MainAgent {
                 timeout: Duration::from_secs(600),
                 capabilities: SubagentType::Code.default_capabilities(),
                 parent_session: alms_core::SessionId::new(),
+                parent_run_id: None,
             }])
         } else if input_lower.contains("analyze") || input_lower.contains("data") {
             Ok(vec![SubagentRequest {
@@ -98,6 +100,7 @@ impl MainAgent {
                 timeout: Duration::from_secs(300),
                 capabilities: SubagentType::Data.default_capabilities(),
                 parent_session: alms_core::SessionId::new(),
+                parent_run_id: None,
             }])
         } else if input_lower.contains("security") || input_lower.contains("audit") {
             Ok(vec![SubagentRequest {
@@ -106,6 +109,7 @@ impl MainAgent {
                 timeout: Duration::from_secs(300),
                 capabilities: SubagentType::Security.default_capabilities(),
                 parent_session: alms_core::SessionId::new(),
+                parent_run_id: None,
             }])
         } else {
             // Complex task - decompose into multiple subtasks
@@ -117,6 +121,7 @@ impl MainAgent {
                         timeout: Duration::from_secs(300),
                         capabilities: SubagentType::Research.default_capabilities(),
                         parent_session: alms_core::SessionId::new(),
+                        parent_run_id: None,
                     },
                     SubagentRequest {
                         task: format!("Implementation phase of: {}", input),
@@ -124,6 +129,7 @@ impl MainAgent {
                         timeout: Duration::from_secs(600),
                         capabilities: SubagentType::Code.default_capabilities(),
                         parent_session: alms_core::SessionId::new(),
+                        parent_run_id: None,
                     },
                 ])
             } else {
@@ -227,10 +233,11 @@ impl MainAgent {
     /// Cancel all running subagents
     pub fn cancel_all(&self) {
         let active = self.coordinator.list_active();
+        let count = active.len();
         for (task_id, _, _) in active {
             let _ = self.coordinator.cancel_subagent(task_id);
         }
-        info!("Cancelled {} subagents", active.len());
+        info!("Cancelled {} subagents", count);
     }
     
     /// Get coordinator for advanced operations

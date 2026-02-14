@@ -163,7 +163,7 @@ impl LlmClient {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.content)
+            .and_then(|c| c.message.content)
             .ok_or_else(|| AlmsError::Runtime("No response from LLM".to_string()))
     }
 
@@ -173,7 +173,7 @@ impl LlmClient {
             .iter()
             .rev()
             .find(|msg| msg.role == "user")
-            .map(|msg| msg.content.clone())
+            .and_then(|msg| msg.content.clone())
             .unwrap_or_else(|| "(no user input)".to_string());
 
         CompletionResponse {
@@ -200,7 +200,7 @@ impl LlmClient {
             .iter()
             .rev()
             .find(|msg| msg.role == "user")
-            .map(|msg| msg.content.clone())
+            .and_then(|msg| msg.content.clone())
             .unwrap_or_else(|| "(no user input)".to_string());
 
         StreamChunk {
@@ -263,8 +263,9 @@ mod tests {
             },
             "required": ["expression"]
         }));
-        
-        assert_eq!(tool.name, "calculator");
-        assert_eq!(tool.description, "Perform arithmetic operations");
+
+        assert_eq!(tool.function.name, "calculator");
+        assert_eq!(tool.function.description, "Perform arithmetic operations");
+        assert_eq!(tool.tool_type, "function");
     }
 }

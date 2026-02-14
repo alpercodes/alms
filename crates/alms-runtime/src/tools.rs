@@ -34,7 +34,7 @@ impl ToolRegistry {
         self.registry.contains(name)
     }
 
-    /// Get tool definitions for LLM (parameters TBD)
+    /// Get tool definitions for LLM with real parameter schemas
     pub fn to_definitions(&self) -> Vec<crate::llm_types::ToolDefinition> {
         self.registry
             .list()
@@ -43,11 +43,7 @@ impl ToolRegistry {
                 let tool = self.registry.lookup(&name).ok()?;
                 Some(
                     crate::llm_types::ToolDefinition::new(tool.name(), tool.description())
-                        .with_parameters(serde_json::json!({
-                            "type": "object",
-                            "properties": {},
-                            "required": []
-                        })),
+                        .with_parameters(tool.parameters()),
                 )
             })
             .collect()

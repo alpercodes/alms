@@ -266,7 +266,7 @@ impl AgentRuntime {
             }
             
             // No tool calls - return the response
-            return Ok(message.content);
+            return Ok(message.content.unwrap_or_default());
         }
     }
     
