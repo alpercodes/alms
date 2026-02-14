@@ -4,7 +4,7 @@
 
 use alms_channel::telegram::TelegramChannel;
 use alms_channel::{Channel, ChannelConfig};
-use alms_core::{AgentId, AlmsResult};
+use alms_core::{AgentId, AlmsConfig, AlmsResult};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
 use alms_session::{SessionConfig, SessionManager};
 use std::sync::Arc;
@@ -45,14 +45,24 @@ impl GatewayConfig {
         self
     }
 
-    pub fn from_env() -> Self {
-        let token = std::env::var("TELEGRAM_BOT_TOKEN").ok();
+    /// Build GatewayConfig from the unified AlmsConfig.
+    /// This is the preferred way to construct a GatewayConfig.
+    pub fn from_alms_config(config: &AlmsConfig) -> Self {
         Self {
-            telegram_token: token,
-            llm_config: alms_runtime::LlmConfig::from_env(),
-            agent_config: AgentConfig::default(),
+            telegram_token: config.channels.telegram_token.clone(),
+            llm_config: config.llm.clone().into(),
+            agent_config: AgentConfig {
+                context_config: config.context.clone(),
+                ..AgentConfig::default()
+            },
             session_config: SessionConfig::default(),
         }
+    }
+
+    /// Load from environment using the unified config system.
+    pub fn from_env() -> AlmsResult<Self> {
+        let config = AlmsConfig::load()?;
+        Ok(Self::from_alms_config(&config))
     }
 }
 
@@ -89,7 +99,7 @@ impl Gateway {
 
     /// Create from environment
     pub fn from_env() -> AlmsResult<Self> {
-        Self::new(GatewayConfig::from_env())
+        Self::new(GatewayConfig::from_env()?)
     }
 
     /// Initialize channels

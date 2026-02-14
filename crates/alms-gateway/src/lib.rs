@@ -13,7 +13,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let mut gateway = Gateway::new(GatewayConfig::from_env()).unwrap();
+//!     let mut gateway = Gateway::new(GatewayConfig::from_env().unwrap()).unwrap();
 //!     gateway.initialize_channels().await.unwrap();
 //!     gateway.start().await.unwrap();
 //!     gateway.run().await.unwrap();
@@ -28,7 +28,7 @@ pub mod event_log;
 
 // Re-export main types
 pub use gateway::{Gateway, GatewayConfig};
-pub use runs::{create_run, get_run_status, stream_run_events, stream_run_legacy};
+pub use runs::{create_run, get_run_status};
 pub use server::{serve, serve_with_gateway, AppState, RunManager};
 pub use sse::{RunEventStream, SseEventData, event_channel};
 
@@ -37,10 +37,10 @@ use alms_core::AlmsResult;
 /// Run the complete ALMS system with all channels
 pub async fn run() -> AlmsResult<()> {
     let mut gateway = Gateway::from_env()?;
-    
+
     gateway.initialize_channels().await?;
     gateway.start().await?;
     gateway.run().await?;
-    
+
     Ok(())
 }

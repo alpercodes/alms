@@ -225,7 +225,9 @@ pub struct Delta {
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-/// Configuration for LLM client
+/// Configuration for LLM client.
+/// Note: prefer alms_core::config::LlmConfig for new code.
+/// This type is kept for backward compatibility with existing runtime/gateway code.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {
     pub api_key: String,
@@ -243,6 +245,18 @@ impl Default for LlmConfig {
             default_model: "openrouter/moonshotai/kimi-k2.5".to_string(),
             timeout_secs: 120,
             mock: false,
+        }
+    }
+}
+
+impl From<alms_core::config::LlmConfig> for LlmConfig {
+    fn from(c: alms_core::config::LlmConfig) -> Self {
+        Self {
+            api_key: c.api_key.unwrap_or_default(),
+            base_url: c.base_url,
+            default_model: c.model,
+            timeout_secs: c.timeout_secs,
+            mock: c.mock,
         }
     }
 }

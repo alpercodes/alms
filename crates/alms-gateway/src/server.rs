@@ -5,7 +5,7 @@
 use crate::gateway::Gateway;
 use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::runs::{create_run, get_run_status, stream_run_events, stream_run_legacy};
-use crate::sse::{RunEventStream, SseEventData};
+use crate::sse::SseEventData;
 use alms_core::{AgentId, AlmsResult, Run, RunId, SessionId};
 use alms_session::SessionManager;
 use axum::{
@@ -42,7 +42,7 @@ impl RunManager {
     }
 
     pub fn get_sender(&self, run_id: RunId) -> Option<mpsc::UnboundedSender<SseEventData>> {
-        self.event_senders.get(&run_id).map(|s| s.clone())
+        self.event_senders.get(&run_id).map(|s| s.value().clone())
     }
 
     pub fn remove_sender(&self, run_id: RunId) {
@@ -54,7 +54,7 @@ impl RunManager {
     }
 
     pub fn get_run(&self, run_id: RunId) -> Option<Run> {
-        self.runs.get(&run_id).map(|r| r.clone())
+        self.runs.get(&run_id).map(|r| r.value().clone())
     }
 
     pub fn update_run(&self, run: Run) {
@@ -113,7 +113,7 @@ impl AppState {
 }
 
 // Re-export SSE types
-pub use crate::sse::{SseEventData, event_channel, RunEventStream};
+pub use crate::sse::{event_channel, RunEventStream};
 
 /// Create the gateway router (per docs/api.md)
 pub fn router() -> Router<AppState> {

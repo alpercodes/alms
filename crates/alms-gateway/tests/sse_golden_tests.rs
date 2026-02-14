@@ -13,7 +13,7 @@ async fn test_event_sequence_basic_run() {
     
     // Send events per API spec
     tx.send(SseEventData::connected(run_id)).unwrap();
-    tx.send(SseEventData::run_started(run_id)).unwrap();
+    tx.send(SseEventData::run_started(run_id, alms_core::SessionId::new())).unwrap();
     tx.send(SseEventData::token_delta(run_id, "Hello world")).unwrap();
     tx.send(SseEventData::run_finished(run_id, true)).unwrap();
     
@@ -44,7 +44,7 @@ async fn test_event_fields_match_spec() {
     let run_id = RunId::new();
     
     // Send run_started per API spec
-    tx.send(SseEventData::run_started(run_id)).unwrap();
+    tx.send(SseEventData::run_started(run_id, alms_core::SessionId::new())).unwrap();
     
     let event = rx.recv().await.unwrap();
     
@@ -63,7 +63,7 @@ async fn test_event_sequence_with_error() {
     let (tx, mut rx) = event_channel();
     let run_id = RunId::new();
     
-    tx.send(SseEventData::run_started(run_id)).unwrap();
+    tx.send(SseEventData::run_started(run_id, alms_core::SessionId::new())).unwrap();
     tx.send(SseEventData::run_error(run_id, "Something went wrong")).unwrap();
     
     let events = vec![

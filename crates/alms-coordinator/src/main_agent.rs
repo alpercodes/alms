@@ -140,6 +140,7 @@ impl MainAgent {
                     timeout: Duration::from_secs(300),
                     capabilities: SubagentType::General.default_capabilities(),
                     parent_session: alms_core::SessionId::new(),
+                    parent_run_id: None,
                 }])
             }
         }

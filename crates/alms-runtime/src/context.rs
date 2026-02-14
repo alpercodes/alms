@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens() {
-        assert_eq!(estimate_tokens(""), 1); // (0+3)/4 = 0... actually let me check
+        assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("hello"), 2); // (5+3)/4 = 2
         assert_eq!(estimate_tokens("hello world"), 3); // (11+3)/4 = 3
     }

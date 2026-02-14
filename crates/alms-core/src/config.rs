@@ -21,6 +21,7 @@ pub struct AlmsConfig {
     pub session: SessionConfig,
     pub context: ContextConfig,
     pub tools: ToolsConfig,
+    pub channels: ChannelsConfig,
 }
 
 impl Default for AlmsConfig {
@@ -31,6 +32,7 @@ impl Default for AlmsConfig {
             session: SessionConfig::default(),
             context: ContextConfig::default(),
             tools: ToolsConfig::default(),
+            channels: ChannelsConfig::default(),
         }
     }
 }
@@ -115,9 +117,9 @@ impl AlmsConfig {
             self.server.bind = bind;
         }
 
-        // Telegram
+        // Channels
         if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
-            self.llm.telegram_token = Some(token);
+            self.channels.telegram_token = Some(token);
         }
 
         // Context settings
@@ -204,9 +206,6 @@ pub struct LlmConfig {
     pub max_retries: u32,
     pub max_tokens_per_run: u32,
     pub mock: bool,
-    /// Telegram token — loaded from env only
-    #[serde(skip)]
-    pub telegram_token: Option<String>,
 }
 
 impl Default for LlmConfig {
@@ -219,7 +218,6 @@ impl Default for LlmConfig {
             max_retries: 2,
             max_tokens_per_run: 0,
             mock: false,
-            telegram_token: None,
         }
     }
 }
@@ -292,6 +290,25 @@ impl Default for ToolsConfig {
             enabled: vec!["echo".into(), "math".into(), "http_get".into()],
             timeout_secs: 30,
             max_output_bytes: 65536,
+        }
+    }
+}
+
+/// Channel configuration (Telegram, etc.)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChannelsConfig {
+    /// Telegram bot token — loaded from env only
+    #[serde(skip)]
+    pub telegram_token: Option<String>,
+    pub telegram_poll_interval_secs: u64,
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            telegram_token: None,
+            telegram_poll_interval_secs: 5,
         }
     }
 }

@@ -8,7 +8,7 @@
 //! These are read at the start of each run and injected into the system prompt.
 //! The agent can update goals.md and memories.md via the workspace_write tool.
 
-use alms_core::AgentId;
+use alms_core::{AgentId, AlmsError, AlmsResult};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
@@ -88,38 +88,39 @@ impl AgentWorkspace {
     }
 
     /// Write a workspace file. Only goals.md and memories.md are agent-writable.
-    pub fn write_file(&self, file: WorkspaceFile, content: &str) -> Result<(), String> {
+    pub fn write_file(&self, file: WorkspaceFile, content: &str) -> AlmsResult<()> {
         if !file.agent_writable() {
-            return Err(format!(
+            return Err(AlmsError::InvalidConfig(format!(
                 "{} is not agent-writable (edit it manually)",
                 file.filename()
-            ));
+            )));
         }
 
-        if let Err(e) = self.ensure_dir() {
-            return Err(format!("Cannot create workspace dir: {}", e));
-        }
+        self.ensure_dir().map_err(|e| {
+            AlmsError::Runtime(format!("Cannot create workspace dir: {}", e))
+        })?;
 
         let path = self.dir().join(file.filename());
-        std::fs::write(&path, content)
-            .map_err(|e| format!("Failed to write {}: {}", path.display(), e))?;
+        std::fs::write(&path, content).map_err(|e| {
+            AlmsError::Runtime(format!("Failed to write {}: {}", path.display(), e))
+        })?;
 
         info!("Updated workspace file: {}", path.display());
         Ok(())
     }
 
     /// Append to a workspace file (for memories).
-    pub fn append_file(&self, file: WorkspaceFile, content: &str) -> Result<(), String> {
+    pub fn append_file(&self, file: WorkspaceFile, content: &str) -> AlmsResult<()> {
         if !file.agent_writable() {
-            return Err(format!(
+            return Err(AlmsError::InvalidConfig(format!(
                 "{} is not agent-writable",
                 file.filename()
-            ));
+            )));
         }
 
-        if let Err(e) = self.ensure_dir() {
-            return Err(format!("Cannot create workspace dir: {}", e));
-        }
+        self.ensure_dir().map_err(|e| {
+            AlmsError::Runtime(format!("Cannot create workspace dir: {}", e))
+        })?;
 
         let path = self.dir().join(file.filename());
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -129,8 +130,9 @@ impl AgentWorkspace {
             format!("{}\n{}", existing.trim_end(), content)
         };
 
-        std::fs::write(&path, new_content)
-            .map_err(|e| format!("Failed to append to {}: {}", path.display(), e))?;
+        std::fs::write(&path, new_content).map_err(|e| {
+            AlmsError::Runtime(format!("Failed to append to {}: {}", path.display(), e))
+        })?;
 
         info!("Appended to workspace file: {}", path.display());
         Ok(())

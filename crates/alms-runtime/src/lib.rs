@@ -17,6 +17,7 @@ pub use context::ContextBuilder;
 pub use llm_client::LlmClient;
 pub use llm_types::*;
 pub use tools::ToolRegistry;
+pub use workspace::{AgentWorkspace, WorkspaceFile};
 
 use alms_core::AgentId;
 

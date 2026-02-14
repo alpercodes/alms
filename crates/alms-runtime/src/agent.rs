@@ -2,6 +2,7 @@ use crate::context::ContextBuilder;
 use crate::llm_client::LlmClient;
 use crate::llm_types::*;
 use crate::tools::ToolRegistry;
+use crate::workspace::AgentWorkspace;
 use alms_core::{AgentId, AlmsResult, AuditEvent, AuditDecision};
 use alms_core::config::ContextConfig;
 use alms_session::{Message as SessionMessage, Role as SessionRole, SessionManager};
@@ -18,6 +19,8 @@ pub struct AgentConfig {
     pub temperature: f32,
     /// Maximum tokens per response
     pub max_tokens: u32,
+    /// Context window management config
+    pub context_config: ContextConfig,
 }
 
 impl Default for AgentConfig {
@@ -27,6 +30,7 @@ impl Default for AgentConfig {
             max_iterations: 10,
             temperature: 0.7,
             max_tokens: 4096,
+            context_config: ContextConfig::default(),
         }
     }
 }
@@ -38,6 +42,7 @@ pub struct AgentRuntime {
     config: AgentConfig,
     llm: LlmClient,
     tools: ToolRegistry,
+    workspace: Option<AgentWorkspace>,
 }
 
 impl AgentRuntime {
@@ -48,9 +53,16 @@ impl AgentRuntime {
             config,
             llm,
             tools: ToolRegistry::with_builtins(),
+            workspace: None,
         }
     }
-    
+
+    /// Create with an agent workspace for persistent identity files
+    pub fn with_workspace(mut self, workspace: AgentWorkspace) -> Self {
+        self.workspace = Some(workspace);
+        self
+    }
+
     /// Create with default config
     pub fn with_defaults(agent_id: AgentId) -> AlmsResult<Self> {
         let llm = LlmClient::from_env()?;
@@ -145,15 +157,27 @@ impl AgentRuntime {
         Ok(stream::once(async move { Ok(response) }))
     }
     
-    /// Build context window for LLM using ContextBuilder
+    /// Build context window for LLM using ContextBuilder.
+    /// If a workspace is configured, its identity files are prepended to the system prompt.
     fn build_context(
         &self,
         session_manager: &SessionManager,
         session_id: &alms_core::SessionId,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
-        let context_config = ContextConfig::default();
-        let builder = ContextBuilder::new(context_config);
+        let builder = ContextBuilder::new(self.config.context_config.clone());
+
+        // Assemble system prompt: workspace prefix + base system prompt
+        let system_prompt = if let Some(ref ws) = self.workspace {
+            let prefix = ws.build_system_prompt_prefix();
+            if prefix.is_empty() {
+                self.config.system_prompt.clone()
+            } else {
+                format!("{}\n\n{}", prefix, self.config.system_prompt)
+            }
+        } else {
+            self.config.system_prompt.clone()
+        };
 
         let history = match session_manager.get_history(*session_id) {
             Ok(h) => h,
@@ -163,7 +187,7 @@ impl AgentRuntime {
             }
         };
 
-        Ok(builder.build(&self.config.system_prompt, &history, input))
+        Ok(builder.build(&system_prompt, &history, input))
     }
     
     /// Main agent loop with tool execution
@@ -391,6 +415,7 @@ mod tests {
             config: AgentConfig::default(),
             llm: LlmClient::new(LlmConfig::default()).unwrap(),
             tools: ToolRegistry::new(),
+            workspace: None,
         };
 
         let session_config = alms_session::SessionConfig::default();

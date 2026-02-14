@@ -8,6 +8,7 @@ use alms_core::{CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunSt
 use axum::{
     extract::{Path, State},
     http::{StatusCode, HeaderMap},
+    response::IntoResponse,
     Json,
 };
 use chrono::Utc;
@@ -151,7 +152,7 @@ pub async fn stream_run_events(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
     headers: HeaderMap,
-) -> Result<RunEventStream, (StatusCode, String)> {
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     // Check for Last-Event-ID header for reconnect support
     let last_event_id = headers
         .get("last-event-id")
@@ -192,7 +193,7 @@ pub async fn stream_run_events(
 pub async fn stream_run_legacy(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
-) -> Result<RunEventStream, (StatusCode, String)> {
+) -> Result<impl IntoResponse, (StatusCode, String)> {
     // First create the run (same as create_run)
     let session = match state.session_manager.get(req.session_id) {
         Ok(session) => session,

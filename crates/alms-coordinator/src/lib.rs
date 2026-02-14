@@ -1,4 +1,5 @@
-use alms_core::{AgentId, AlmsResult, Capability, SessionId};
+use alms_core::{AgentId, AlmsResult, SessionId};
+use alms_core::agent::Capability;
 
 pub mod main_agent;
 
@@ -177,10 +178,8 @@ impl Coordinator {
         level = "info",
         skip(self, request),
         fields(
-            task_id = %task_id.0,
             subagent_type = ?request.agent_type,
             parent_session = %request.parent_session.0,
-            parent_run_id = ?request.parent_run_id.map(|r| r.0.to_string()),
             timeout_secs = %request.timeout.as_secs(),
             capability_count = %request.capabilities.len()
         )
