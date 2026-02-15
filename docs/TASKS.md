@@ -16,10 +16,11 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Options: add swap, use a beefier build machine, or dev-toggle wasmtime.
 - **Owners:** Mustafa (infra), Atlas
 
-2) Real LLM end-to-end smoke
-- Prove: `POST /runs` → real OpenRouter call → streamed tokens back.
-- Capture a repeatable smoke script in repo (`scripts/smoke.sh`) or Makefile target.
-- **Owners:** Atlas, Mustafa
+2) Real LLM end-to-end smoke ✅
+- `scripts/smoke.sh` — tests health, sessions, /agent/run, /runs, SSE events, tool execution.
+- `make smoke` (mock LLM) and `make smoke-real` (real LLM via OpenRouter).
+- Covers: health check, session creation, legacy + canonical run APIs, status polling, SSE replay.
+- **Owners:** Zeki (script), Atlas/Mustafa (run on build machine)
 
 ---
 

@@ -61,3 +61,13 @@ update:
 run:
 	@echo "==> Running ALMS gateway"
 	cargo run --package alms-cli -- gateway --bind 127.0.0.1:8080
+
+# End-to-end smoke test (mock LLM, no API key needed)
+smoke:
+	@echo "==> Running smoke test (mock LLM)"
+	./scripts/smoke.sh
+
+# End-to-end smoke test with real LLM (needs OPENROUTER_API_KEY)
+smoke-real:
+	@echo "==> Running smoke test (real LLM)"
+	./scripts/smoke.sh --real
