@@ -122,11 +122,11 @@ pub fn router() -> Router<AppState> {
         .route("/health", get(health_check))
         // Sessions
         .route("/sessions", post(create_session))
-        .route("/sessions/:agent_id/:context_id", get(get_session))
+        .route("/sessions/{agent_id}/{context_id}", get(get_session))
         // Runs (per API spec)
         .route("/runs", post(create_run))
-        .route("/runs/:run_id", get(get_run_status))
-        .route("/runs/:run_id/events", get(stream_run_events))
+        .route("/runs/{run_id}", get(get_run_status))
+        .route("/runs/{run_id}/events", get(stream_run_events))
         // Legacy (deprecated) - kept for MVP compatibility
         .route("/agent/run", post(run_agent))
         .route("/agent/run/stream", post(stream_run_legacy))
