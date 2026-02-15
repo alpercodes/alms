@@ -13,7 +13,7 @@
 #   5. GET /runs/:id (status polling)
 #   6. GET /runs/:id/events (SSE stream)
 
-set -euo pipefail
+set -uo pipefail
 
 BIND="127.0.0.1:18080"
 BASE="http://${BIND}"
@@ -50,6 +50,11 @@ log_fail() {
 
 json_field() {
     python3 -c "import sys,json; print(json.load(sys.stdin).get('$1',''))" 2>/dev/null <<< "$2"
+}
+
+# Generate a v4 UUID (works on Linux with python3)
+gen_uuid() {
+    python3 -c "import uuid; print(uuid.uuid4())"
 }
 
 # Parse args
@@ -128,9 +133,10 @@ fi
 # Test 2: Session creation
 # ============================================================
 echo "Test 2: Session creation"
+AGENT_UUID=$(gen_uuid)
 SESSION=$(curl -s -X POST "${BASE}/sessions" \
     -H "Content-Type: application/json" \
-    -d '{"agent_id":"smoke-agent","context_id":"smoke-ctx-1"}')
+    -d "{\"agent_id\":\"${AGENT_UUID}\",\"context_id\":\"smoke-ctx-1\"}")
 SESSION_ID=$(json_field "session_id" "$SESSION")
 if [ -n "$SESSION_ID" ]; then
     log_pass "POST /sessions → session_id=${SESSION_ID}"
