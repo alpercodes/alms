@@ -1,6 +1,8 @@
+pub mod sqlite;
 pub mod store;
 pub mod types;
 
+pub use sqlite::SqliteStore;
 pub use store::{MemoryStore, SessionStore};
 pub use types::{Content, Message, Role, Session, SessionConfig, SessionStatus};
 pub use alms_core::AuditEvent;
@@ -8,7 +10,7 @@ pub use alms_core::AuditEvent;
 use alms_core::{AgentId, AlmsResult, SessionId};
 use dashmap::DashMap;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Session manager - owns all session state
 #[derive(Debug)]
@@ -21,6 +23,8 @@ pub struct SessionManager {
     audit: Arc<DashMap<SessionId, Vec<AuditEvent>>>,
     /// Configuration
     config: SessionConfig,
+    /// Optional SQLite write-through store
+    store: Option<Arc<SqliteStore>>,
 }
 
 impl SessionManager {
@@ -30,26 +34,63 @@ impl SessionManager {
             history: Arc::new(DashMap::new()),
             audit: Arc::new(DashMap::new()),
             config,
+            store: None,
         }
+    }
+
+    /// Create a session manager backed by SQLite at `db_path`.
+    ///
+    /// Opens (or creates) the database, runs schema migrations, then loads all
+    /// persisted sessions + messages + audit events into the in-memory maps.
+    pub fn with_sqlite(config: SessionConfig, db_path: &str) -> AlmsResult<Self> {
+        let store = SqliteStore::open(db_path)?;
+        let mut manager = Self::new(config);
+        manager.store = Some(Arc::new(store));
+        manager.load_from_store()?;
+        Ok(manager)
+    }
+
+    /// Populate in-memory maps from the SQLite store (called once on startup).
+    fn load_from_store(&self) -> AlmsResult<()> {
+        let Some(store) = &self.store else { return Ok(()); };
+        let sessions = store.load_all_sessions()?;
+        let count = sessions.len();
+        for session in sessions {
+            let key = (session.agent_id, session.context_id.clone());
+            let session_id = session.id;
+            self.sessions.insert(key, session);
+            self.history.insert(session_id, store.load_messages(session_id)?);
+            self.audit.insert(session_id, store.load_audit(session_id)?);
+        }
+        if count > 0 {
+            info!("Loaded {} session(s) from SQLite", count);
+        }
+        Ok(())
     }
     
     /// Get or create a session
     pub fn get_or_create(&self, agent_id: AgentId, context_id: impl Into<String>) -> Session {
         let context_id = context_id.into();
         let key = (agent_id, context_id.clone());
-        
+
         if let Some(entry) = self.sessions.get(&key) {
             let session = entry.clone();
             debug!("Found existing session: {:?}", session.id);
             return session;
         }
-        
+
         let session = Session::new(agent_id, context_id);
         self.sessions.insert(key, session.clone());
         self.history.insert(session.id, Vec::new());
         self.audit.insert(session.id, Vec::new());
+
+        if let Some(store) = &self.store {
+            if let Err(e) = store.save_session(&session) {
+                warn!("Failed to persist session {}: {}", session.id.0, e);
+            }
+        }
+
         info!("Created new session: {:?}", session.id);
-        
         session
     }
     
@@ -66,8 +107,14 @@ impl SessionManager {
     /// Append a message to a session
     pub fn append_message(&self, session_id: SessionId, message: Message) -> AlmsResult<()> {
         if let Some(mut history) = self.history.get_mut(&session_id) {
+            if let Some(store) = &self.store {
+                if let Err(e) = store.save_message(session_id, &message) {
+                    warn!("Failed to persist message for session {}: {}", session_id.0, e);
+                }
+            }
+
             history.push(message);
-            
+
             // Update last activity
             for mut entry in self.sessions.iter_mut() {
                 if entry.value().id == session_id {
@@ -75,7 +122,7 @@ impl SessionManager {
                     break;
                 }
             }
-            
+
             Ok(())
         } else {
             Err(alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
@@ -93,6 +140,11 @@ impl SessionManager {
     /// Append audit event
     pub fn append_audit(&self, session_id: SessionId, event: AuditEvent) -> AlmsResult<()> {
         if let Some(mut audit) = self.audit.get_mut(&session_id) {
+            if let Some(store) = &self.store {
+                if let Err(e) = store.save_audit(&event) {
+                    warn!("Failed to persist audit event for session {}: {}", session_id.0, e);
+                }
+            }
             audit.push(event);
             Ok(())
         } else {

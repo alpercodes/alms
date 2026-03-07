@@ -22,6 +22,8 @@ pub struct GatewayConfig {
     pub agent_config: AgentConfig,
     /// Session configuration
     pub session_config: SessionConfig,
+    /// Path to SQLite database file (None = in-memory only, not persisted)
+    pub db_path: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -31,6 +33,7 @@ impl Default for GatewayConfig {
             llm_config: alms_runtime::LlmConfig::default(),
             agent_config: AgentConfig::default(),
             session_config: SessionConfig::default(),
+            db_path: None,
         }
     }
 }
@@ -56,13 +59,18 @@ impl GatewayConfig {
                 ..AgentConfig::default()
             },
             session_config: SessionConfig::default(),
+            db_path: None,
         }
     }
 
     /// Load from environment using the unified config system.
+    ///
+    /// Set `ALMS_DB_PATH` to enable SQLite session persistence.
     pub fn from_env() -> AlmsResult<Self> {
         let config = AlmsConfig::load()?;
-        Ok(Self::from_alms_config(&config))
+        let mut gateway_config = Self::from_alms_config(&config);
+        gateway_config.db_path = std::env::var("ALMS_DB_PATH").ok();
+        Ok(gateway_config)
     }
 }
 
@@ -85,7 +93,13 @@ pub struct Gateway {
 impl Gateway {
     /// Create a new gateway
     pub fn new(config: GatewayConfig) -> AlmsResult<Self> {
-        let session_manager = Arc::new(SessionManager::new(config.session_config.clone()));
+        let session_manager = match &config.db_path {
+            Some(path) => {
+                info!("Opening SQLite session store at {}", path);
+                Arc::new(SessionManager::with_sqlite(config.session_config.clone(), path)?)
+            }
+            None => Arc::new(SessionManager::new(config.session_config.clone())),
+        };
         let llm = LlmClient::new(config.llm_config.clone())?;
         
         Ok(Self {

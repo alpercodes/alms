@@ -85,9 +85,12 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ## P3 — Persistence upgrade (post-MVP foundation, but should be planned now)
 
-13) SQLite storage layer (sessions/messages/audit)
-- Replace (or complement) JSON snapshots with SQLite as source of truth.
-- Migrations in-repo.
+13) SQLite storage layer (sessions/messages/audit) ✅
+- `SqliteStore` in `alms-session/src/sqlite.rs`: sessions, messages, audit_events tables.
+- WAL mode + FK enforcement; schema applied on open (idempotent `CREATE TABLE IF NOT EXISTS`).
+- `SessionManager::with_sqlite(config, db_path)`: loads all data on startup, write-through on every mutation.
+- Gateway reads `ALMS_DB_PATH` env var — set it to enable persistence, omit for in-memory only.
+- 7 unit tests covering roundtrip, upsert, ordering, and session isolation.
 - **Owners:** Atlas
 
 ---
