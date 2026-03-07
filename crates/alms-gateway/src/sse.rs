@@ -104,6 +104,15 @@ impl SseEventData {
         })
     }
 
+    pub fn approval_resolved(run_id: RunId, approval_id: &str, decision: &str) -> Self {
+        Self::new("approval_resolved", ApprovalResolvedData {
+            run_id: run_id.0.to_string(),
+            approval_id: approval_id.to_string(),
+            decision: decision.to_string(),
+            ts: Utc::now(),
+        })
+    }
+
     pub fn run_finished(run_id: RunId, ok: bool) -> Self {
         Self::new("run_finished", RunFinishedData {
             run_id: run_id.0.to_string(),
@@ -219,6 +228,14 @@ struct ApprovalRequiredData {
     approval_id: String,
     capability: String,
     request: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ApprovalResolvedData {
+    run_id: String,
+    approval_id: String,
+    decision: String,
+    ts: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]

@@ -2,19 +2,22 @@
 //!
 //! Provides REST API endpoints per docs/api.md specification.
 
-use crate::gateway::Gateway;
+use crate::approvals::{list_approvals, resolve_approval, ApprovalStore};
 use crate::event_log::{EventLogManager, LoggedEvent};
+use crate::gateway::Gateway;
 use crate::runs::{create_run, get_run_status, stream_run_events, stream_run_legacy};
 use crate::sse::SseEventData;
 use alms_core::{AgentId, AlmsResult, Run, RunId, SessionId};
 use alms_session::SessionManager;
 use axum::{
-    extract::{Path, State, WebSocketUpgrade},
+    extract::{Path, Query, State, WebSocketUpgrade},
+    http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use dashmap::DashMap;
+use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
@@ -68,15 +71,13 @@ impl RunManager {
         session_id: SessionId,
         mut event: SseEventData,
     ) {
-        // Log event and get persistent ID
         let event_id = self
             .event_log
             .log_event(run_id, session_id, &event.event_type, event.data.clone())
             .await;
-        
+
         event.event_id = Some(event_id);
-        
-        // Send to active subscribers
+
         if let Some(sender) = self.get_sender(run_id) {
             let _ = sender.send(event);
         }
@@ -100,6 +101,7 @@ pub struct AppState {
     pub session_manager: Arc<SessionManager>,
     pub gateway: Arc<tokio::sync::Mutex<Gateway>>,
     pub run_manager: RunManager,
+    pub approval_store: ApprovalStore,
 }
 
 impl AppState {
@@ -108,6 +110,7 @@ impl AppState {
             session_manager: gateway.session_manager().clone(),
             gateway: Arc::new(tokio::sync::Mutex::new(gateway)),
             run_manager: RunManager::new(),
+            approval_store: ApprovalStore::new(),
         }
     }
 }
@@ -123,10 +126,15 @@ pub fn router() -> Router<AppState> {
         // Sessions
         .route("/sessions", post(create_session))
         .route("/sessions/{agent_id}/{context_id}", get(get_session))
-        // Runs (per API spec)
+        // Runs (canonical API per spec)
         .route("/runs", post(create_run))
         .route("/runs/{run_id}", get(get_run_status))
         .route("/runs/{run_id}/events", get(stream_run_events))
+        // Approvals
+        .route("/approvals", get(list_approvals))
+        .route("/approvals/{approval_id}", post(resolve_approval))
+        // Audit
+        .route("/audit", get(get_audit))
         // Legacy (deprecated) - kept for MVP compatibility
         .route("/agent/run", post(run_agent))
         .route("/agent/run/stream", post(stream_run_legacy))
@@ -150,7 +158,7 @@ async fn create_session(
     let session = state
         .session_manager
         .get_or_create(req.agent_id, req.context_id);
-    
+
     Json(CreateSessionResponse {
         session_id: session.id,
         created: true,
@@ -165,8 +173,29 @@ async fn get_session(
     let session = state
         .session_manager
         .get_or_create(agent_id, context_id);
-    
+
     Json(session)
+}
+
+/// GET /audit?session_id=<uuid>&limit=<n>
+async fn get_audit(
+    State(state): State<AppState>,
+    Query(params): Query<AuditQuery>,
+) -> impl IntoResponse {
+    match state.session_manager.get_audit(params.session_id) {
+        Ok(mut events) => {
+            let limit = params.limit.unwrap_or(100);
+            events.truncate(limit);
+            Json(serde_json::json!({ "events": events })).into_response()
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": { "code": "NOT_FOUND", "message": "Session not found" }
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// Legacy: Run agent on a message (HTTP API) -- deprecated, use POST /runs
@@ -174,19 +203,22 @@ async fn run_agent(
     State(state): State<AppState>,
     Json(req): Json<RunAgentRequest>,
 ) -> impl IntoResponse {
-    let gateway = state.gateway.lock().await;
-    
-    let runtime = alms_runtime::AgentRuntime::new(
-        gateway.agent_id().clone(),
-        gateway.agent_config().clone(),
-        gateway.llm().clone(),
-    );
-    
-    match runtime.run(
-        &gateway.session_manager().clone(),
-        &req.context_id,
-        &req.message,
-    ).await {
+    // Extract what we need, then drop the lock before the LLM call
+    let (agent_id, agent_config, llm) = {
+        let gateway = state.gateway.lock().await;
+        (
+            gateway.agent_id().clone(),
+            gateway.agent_config().clone(),
+            gateway.llm().clone(),
+        )
+    };
+
+    let runtime = alms_runtime::AgentRuntime::new(agent_id, agent_config, llm);
+
+    match runtime
+        .run(&state.session_manager, &req.context_id, &req.message)
+        .await
+    {
         Ok(response) => Json(serde_json::json!({
             "success": true,
             "response": response,
@@ -232,12 +264,12 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     });
 
     let app = router().with_state(state);
-    
+
     info!("Starting ALMS Gateway HTTP server on {}", bind_addr);
-    
+
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;
-    
+
     Ok(())
 }
 
@@ -257,4 +289,10 @@ struct CreateSessionResponse {
 struct RunAgentRequest {
     context_id: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditQuery {
+    session_id: alms_core::SessionId,
+    limit: Option<usize>,
 }

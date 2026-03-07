@@ -1,4 +1,5 @@
 use crate::context::ContextBuilder;
+use crate::events::{RuntimeEvent, RuntimeEventSender};
 use crate::llm_client::LlmClient;
 use crate::llm_types::*;
 use crate::tools::ToolRegistry;
@@ -7,6 +8,17 @@ use alms_core::{AgentId, AlmsResult, AuditEvent, AuditDecision};
 use alms_core::config::ContextConfig;
 use alms_session::{Message as SessionMessage, Role as SessionRole, SessionManager};
 use tracing::{debug, error, info, instrument, warn, Span};
+use uuid::Uuid;
+
+/// Execution posture: controls whether tools require approval before running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Posture {
+    /// Execute tools directly without approval (default).
+    #[default]
+    FullControl,
+    /// Require explicit user approval before each tool execution.
+    Guarded,
+}
 
 /// Agent runtime configuration
 #[derive(Debug, Clone)]
@@ -21,6 +33,8 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     /// Context window management config
     pub context_config: ContextConfig,
+    /// Execution posture (full_control or guarded)
+    pub posture: Posture,
 }
 
 impl Default for AgentConfig {
@@ -31,6 +45,7 @@ impl Default for AgentConfig {
             temperature: 0.7,
             max_tokens: 4096,
             context_config: ContextConfig::default(),
+            posture: Posture::FullControl,
         }
     }
 }
@@ -43,6 +58,10 @@ pub struct AgentRuntime {
     llm: LlmClient,
     tools: ToolRegistry,
     workspace: Option<AgentWorkspace>,
+    /// Optional channel for emitting runtime events to the gateway layer.
+    event_sender: Option<RuntimeEventSender>,
+    /// Run ID for audit event correlation (set by gateway before execution).
+    run_id: Option<alms_core::RunId>,
 }
 
 impl AgentRuntime {
@@ -54,12 +73,26 @@ impl AgentRuntime {
             llm,
             tools: ToolRegistry::with_builtins(),
             workspace: None,
+            event_sender: None,
+            run_id: None,
         }
     }
 
-    /// Create with an agent workspace for persistent identity files
+    /// Attach an agent workspace for persistent identity files.
     pub fn with_workspace(mut self, workspace: AgentWorkspace) -> Self {
         self.workspace = Some(workspace);
+        self
+    }
+
+    /// Attach a runtime event sender so the gateway can observe tool events.
+    pub fn with_event_sender(mut self, sender: RuntimeEventSender) -> Self {
+        self.event_sender = Some(sender);
+        self
+    }
+
+    /// Set the run ID for audit event correlation.
+    pub fn with_run_id(mut self, run_id: alms_core::RunId) -> Self {
+        self.run_id = Some(run_id);
         self
     }
 
@@ -68,7 +101,7 @@ impl AgentRuntime {
         let llm = LlmClient::from_env()?;
         Ok(Self::new(agent_id, AgentConfig::default(), llm))
     }
-    
+
     /// Run the agent on a single input
     #[instrument(
         level = "info",
@@ -88,7 +121,7 @@ impl AgentRuntime {
         let context_id = context_id.as_ref();
         let input = input.into();
         let span = Span::current();
-        
+
         info!(
             target: "agent::run_start",
             agent_id = %self.agent_id.0,
@@ -96,20 +129,13 @@ impl AgentRuntime {
             input_len = input.len(),
             "Agent run started"
         );
-        
-        // Record input metrics
+
         span.record("input_len", input.len());
-        
-        // Get or create session
+
         let session = session_manager.get_or_create(self.agent_id, context_id);
-        
-        // Build conversation history via ContextBuilder
         let history = self.build_context(session_manager, &session.id, &input)?;
-        
-        // Run the agent loop
         let response = self.agent_loop(session_manager, session.id, history).await?;
-        
-        // Store messages
+
         let user_msg = SessionMessage {
             id: uuid::Uuid::new_v4().to_string(),
             role: SessionRole::User,
@@ -117,7 +143,7 @@ impl AgentRuntime {
             timestamp: alms_core::Timestamp::now(),
             metadata: None,
         };
-        
+
         let assistant_msg = SessionMessage {
             id: uuid::Uuid::new_v4().to_string(),
             role: SessionRole::Assistant,
@@ -125,15 +151,15 @@ impl AgentRuntime {
             timestamp: alms_core::Timestamp::now(),
             metadata: None,
         };
-        
+
         session_manager.append_message(session.id, user_msg)?;
         session_manager.append_message(session.id, assistant_msg)?;
-        
+
         info!("Agent {} completed for context {}", self.agent_id.0, context_id);
-        
+
         Ok(response)
     }
-    
+
     /// Run with streaming response
     pub async fn run_stream(
         &self,
@@ -143,22 +169,19 @@ impl AgentRuntime {
     ) -> AlmsResult<impl futures::Stream<Item = AlmsResult<String>>> {
         let context_id = context_id.as_ref();
         let input = input.into();
-        
+
         info!(
             "Running agent {} (streaming) for context {}",
             self.agent_id.0, context_id
         );
-        
-        // For streaming, we'd implement SSE-style response
-        // For now, return a simple single-chunk stream
+
         let response = self.run(session_manager, context_id, input).await?;
-        
+
         use futures::stream;
         Ok(stream::once(async move { Ok(response) }))
     }
-    
+
     /// Build context window for LLM using ContextBuilder.
-    /// If a workspace is configured, its identity files are prepended to the system prompt.
     fn build_context(
         &self,
         session_manager: &SessionManager,
@@ -167,7 +190,6 @@ impl AgentRuntime {
     ) -> AlmsResult<Vec<LlmMessage>> {
         let builder = ContextBuilder::new(self.config.context_config.clone());
 
-        // Assemble system prompt: workspace prefix + base system prompt
         let system_prompt = if let Some(ref ws) = self.workspace {
             let prefix = ws.build_system_prompt_prefix();
             if prefix.is_empty() {
@@ -189,16 +211,21 @@ impl AgentRuntime {
 
         Ok(builder.build(&system_prompt, &history, input))
     }
-    
+
     /// Main agent loop with tool execution
     #[instrument(
         level = "debug",
         skip(self, messages),
         fields(agent_id = %self.agent_id.0)
     )]
-    async fn agent_loop(&self, session_manager: &SessionManager, session_id: alms_core::SessionId, mut messages: Vec<LlmMessage>) -> AlmsResult<String> {
+    async fn agent_loop(
+        &self,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        mut messages: Vec<LlmMessage>,
+    ) -> AlmsResult<String> {
         let mut iterations = 0;
-        
+
         loop {
             if iterations >= self.config.max_iterations {
                 warn!(
@@ -211,64 +238,59 @@ impl AgentRuntime {
                 return Ok("[Max iterations reached]".to_string());
             }
             iterations += 1;
-            
+
             debug!(
                 target: "agent::loop",
                 agent_id = %self.agent_id.0,
                 iteration = iterations,
                 "Agent loop iteration"
             );
-            
-            // Build request
+
             let request = CompletionRequest::new(self.llm.default_model())
                 .with_messages(messages.clone())
                 .with_tools(self.tools.to_definitions())
                 .with_temperature(self.config.temperature)
                 .with_max_tokens(self.config.max_tokens);
-            
-            // Get completion
+
             let response = self.llm.complete(request).await?;
-            
+
             let choice = response
                 .choices
                 .into_iter()
                 .next()
                 .ok_or_else(|| alms_core::AlmsError::Runtime("No response from LLM".to_string()))?;
-            
+
             let message = choice.message;
-            
-            // Check if there are tool calls
+
             if let Some(tool_calls) = message.tool_calls {
-                // Add assistant message with tool calls
                 messages.push(LlmMessage {
                     role: "assistant".to_string(),
                     content: message.content.clone(),
                     tool_calls: Some(tool_calls.clone()),
                     tool_call_id: None,
                 });
-                
-                // Execute tools
+
                 for tool_call in tool_calls {
-                    let result = self.execute_tool_call(&tool_call, session_manager, session_id).await;
-                    
+                    let result = self
+                        .execute_tool_call(&tool_call, session_manager, session_id)
+                        .await;
+
                     let content = match result {
                         Ok(value) => value.to_string(),
                         Err(e) => format!("Error: {}", e),
                     };
-                    
+
                     messages.push(LlmMessage::tool_result(&tool_call.id, content));
                 }
-                
-                // Continue loop for final response
+
                 continue;
             }
-            
-            // No tool calls - return the response
+
             return Ok(message.content.unwrap_or_default());
         }
     }
-    
-    /// Execute a tool call
+
+    /// Execute a tool call, emitting tool_start/tool_end events and handling approvals.
     #[instrument(
         level = "info",
         skip(self, tool_call),
@@ -278,10 +300,15 @@ impl AgentRuntime {
             tool_call_id = %tool_call.id
         )
     )]
-    async fn execute_tool_call(&self, tool_call: &ToolCall, session_manager: &SessionManager, session_id: alms_core::SessionId) -> AlmsResult<serde_json::Value> {
+    async fn execute_tool_call(
+        &self,
+        tool_call: &ToolCall,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+    ) -> AlmsResult<serde_json::Value> {
         let name = &tool_call.function.name;
         let args_str = &tool_call.function.arguments;
-        
+
         info!(
             target: "agent::tool::start",
             agent_id = %self.agent_id.0,
@@ -289,18 +316,20 @@ impl AgentRuntime {
             tool_call_id = %tool_call.id,
             "Executing tool"
         );
-        
-        // Parse arguments
+
         let start = std::time::Instant::now();
+
+        // Parse arguments
         let args: serde_json::Value = match serde_json::from_str(args_str) {
             Ok(value) => value,
             Err(e) => {
-                let err = alms_core::AlmsError::ToolExecution(format!("Invalid arguments: {}", e));
+                let err =
+                    alms_core::AlmsError::ToolExecution(format!("Invalid arguments: {}", e));
                 let _ = session_manager.append_audit(
                     session_id,
                     AuditEvent {
                         session_id,
-                        run_id: None,
+                        run_id: self.run_id,
                         tool: name.to_string(),
                         decision: AuditDecision::Deny,
                         params: serde_json::Value::String(args_str.to_string()),
@@ -315,12 +344,13 @@ impl AgentRuntime {
 
         // Policy gate: deny unknown tools before execution
         if !self.tools.contains(name) {
-            let err = alms_core::AlmsError::ToolExecution(format!("Tool '{}' not allowed", name));
+            let err =
+                alms_core::AlmsError::ToolExecution(format!("Tool '{}' not allowed", name));
             let _ = session_manager.append_audit(
                 session_id,
                 AuditEvent {
                     session_id,
-                    run_id: None,
+                    run_id: self.run_id,
                     tool: name.to_string(),
                     decision: AuditDecision::Deny,
                     params: args,
@@ -331,7 +361,55 @@ impl AgentRuntime {
             );
             return Err(err);
         }
-        
+
+        // Stable ID for correlating tool_start / tool_end SSE events
+        let invocation_id = Uuid::new_v4();
+
+        // Emit tool_start
+        if let Some(ref sender) = self.event_sender {
+            let _ = sender.send(RuntimeEvent::ToolStart {
+                invocation_id,
+                tool: name.to_string(),
+                params: args.clone(),
+            });
+        }
+
+        // Guarded posture: block until user approves or denies
+        if self.config.posture == Posture::Guarded {
+            let sender = self.event_sender.as_ref().ok_or_else(|| {
+                alms_core::AlmsError::Runtime(
+                    "Guarded posture requires an event sender for approvals".to_string(),
+                )
+            })?;
+            let approval_id = Uuid::new_v4();
+            let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
+            let _ = sender.send(RuntimeEvent::ApprovalRequired {
+                approval_id,
+                tool: name.to_string(),
+                params: args.clone(),
+                decision_tx,
+            });
+            match decision_rx.await {
+                Ok(true) => {} // approved — proceed
+                Ok(false) => {
+                    let _ = sender.send(RuntimeEvent::ToolEnd {
+                        invocation_id,
+                        ok: false,
+                        result: serde_json::json!({"error": "denied by user"}),
+                    });
+                    return Err(alms_core::AlmsError::ToolExecution(format!(
+                        "Tool '{}' denied by user",
+                        name
+                    )));
+                }
+                Err(_) => {
+                    return Err(alms_core::AlmsError::ToolExecution(
+                        "Approval channel closed".to_string(),
+                    ));
+                }
+            }
+        }
+
         // Execute
         let result = self.tools.execute(name, args.clone()).await;
         let elapsed = start.elapsed();
@@ -350,7 +428,7 @@ impl AgentRuntime {
                     session_id,
                     AuditEvent {
                         session_id,
-                        run_id: None,
+                        run_id: self.run_id,
                         tool: name.to_string(),
                         decision: AuditDecision::Allow,
                         params: args,
@@ -359,6 +437,13 @@ impl AgentRuntime {
                         timestamp: alms_core::Timestamp::now(),
                     },
                 );
+                if let Some(ref sender) = self.event_sender {
+                    let _ = sender.send(RuntimeEvent::ToolEnd {
+                        invocation_id,
+                        ok: true,
+                        result: value.clone(),
+                    });
+                }
             }
             Err(e) => {
                 error!(
@@ -374,7 +459,7 @@ impl AgentRuntime {
                     session_id,
                     AuditEvent {
                         session_id,
-                        run_id: None,
+                        run_id: self.run_id,
                         tool: name.to_string(),
                         decision: AuditDecision::Deny,
                         params: args,
@@ -383,12 +468,19 @@ impl AgentRuntime {
                         timestamp: alms_core::Timestamp::now(),
                     },
                 );
+                if let Some(ref sender) = self.event_sender {
+                    let _ = sender.send(RuntimeEvent::ToolEnd {
+                        invocation_id,
+                        ok: false,
+                        result: serde_json::json!({"error": e.to_string()}),
+                    });
+                }
             }
         }
-        
+
         result
     }
-    
+
     /// Get tool registry reference
     pub fn tools(&self) -> &ToolRegistry {
         &self.tools
@@ -399,15 +491,16 @@ impl AgentRuntime {
 mod tests {
     use super::*;
     use alms_session::{SessionConfig, SessionManager};
-    
+
     #[tokio::test]
     async fn test_agent_config_default() {
         let config = AgentConfig::default();
         assert_eq!(config.max_iterations, 10);
         assert_eq!(config.temperature, 0.7);
         assert!(!config.system_prompt.is_empty());
+        assert_eq!(config.posture, Posture::FullControl);
     }
-    
+
     #[test]
     fn test_build_context() {
         let runtime = AgentRuntime {
@@ -416,13 +509,17 @@ mod tests {
             llm: LlmClient::new(LlmConfig::default()).unwrap(),
             tools: ToolRegistry::new(),
             workspace: None,
+            event_sender: None,
+            run_id: None,
         };
 
-        let session_config = alms_session::SessionConfig::default();
+        let session_config = SessionConfig::default();
         let session_manager = SessionManager::new(session_config);
         let session = session_manager.get_or_create(runtime.agent_id, "test");
 
-        let messages = runtime.build_context(&session_manager, &session.id, "hello").unwrap();
+        let messages = runtime
+            .build_context(&session_manager, &session.id, "hello")
+            .unwrap();
         // system prompt + current input = 2
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");

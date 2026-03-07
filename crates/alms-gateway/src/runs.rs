@@ -2,9 +2,11 @@
 //!
 //! Implements POST /runs and GET /runs/{id}/events per docs/api.md
 
+use crate::approvals::{ApprovalStore, PendingApproval};
 use crate::server::AppState;
-use crate::sse::{event_channel, RunEventStream, SseEventData};
+use crate::sse::{RunEventStream, SseEventData, ToolInvocationId, event_channel};
 use alms_core::{CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse, SessionId};
+use alms_runtime::RuntimeEvent;
 use axum::{
     extract::{Path, State},
     http::{StatusCode, HeaderMap},
@@ -12,27 +14,33 @@ use axum::{
     Json,
 };
 use chrono::Utc;
+use tokio::sync::mpsc;
 use tracing::{error, info, instrument};
 
 /// POST /runs - Create a new run
-/// 
+///
 /// Per API spec: Returns 201 Created with { run_id, session_id, status: "queued", ts }
 #[instrument(level = "info", skip(state, req), fields(session_id = %req.session_id.0))]
 pub async fn create_run(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
-) -> Result<(StatusCode, Json<CreateRunResponse>), (StatusCode, String)> {
-    // Get existing session
+) -> Result<(StatusCode, Json<CreateRunResponse>), (StatusCode, Json<serde_json::Value>)> {
     let session = match state.session_manager.get(req.session_id) {
         Ok(session) => session,
-        Err(_) => return Err((StatusCode::NOT_FOUND, "Session not found".to_string())),
+        Err(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": { "code": "NOT_FOUND", "message": "Session not found" }
+                })),
+            ))
+        }
     };
 
-    // Create run
     let input_text = match req.input {
         RunInput::Text { text } => text,
     };
-    
+
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
@@ -40,16 +48,9 @@ pub async fn create_run(
 
     info!("Creating run {} for session {}", run_id.0, session_id.0);
 
-    // Store run
     state.run_manager.insert_run(run.clone());
 
-    // Spawn background task to execute run
-    let state_clone = AppState {
-        session_manager: state.session_manager.clone(),
-        gateway: state.gateway.clone(),
-        run_manager: state.run_manager.clone(),
-    };
-
+    let state_clone = state.clone();
     tokio::spawn(async move {
         execute_run(state_clone, run_id, session_id, agent_id, run.input).await;
     });
@@ -64,7 +65,7 @@ pub async fn create_run(
     Ok((StatusCode::CREATED, Json(response)))
 }
 
-/// Execute a run in background
+/// Execute a run in background, forwarding runtime events to SSE.
 #[instrument(level = "info", skip(state, input), fields(run_id = %run_id.0, session_id = %session_id.0))]
 async fn execute_run(
     state: AppState,
@@ -73,37 +74,59 @@ async fn execute_run(
     agent_id: alms_core::AgentId,
     input: String,
 ) {
-    // Register event channel for this run
-    let (tx, _rx) = event_channel();
-    state.run_manager.register_sender(run_id, tx.clone());
+    // Events are persisted to the event log regardless of whether an SSE
+    // client is connected. The SSE client registers its own sender when it
+    // calls GET /runs/{id}/events (or via the legacy stream endpoint which
+    // pre-registers before spawning). No placeholder sender here — avoids
+    // overwriting a real sender from stream_run_legacy.
 
-    // Send initial events
-    state.run_manager.send_event(run_id, session_id, SseEventData::run_started(run_id, session_id)).await;
+    state
+        .run_manager
+        .send_event(run_id, session_id, SseEventData::run_started(run_id, session_id))
+        .await;
 
     if let Some(mut run) = state.run_manager.get_run(run_id) {
         run.mark_running();
         state.run_manager.update_run(run);
     }
 
-    // Execute via gateway
-    let gateway = state.gateway.lock().await;
-    let runtime = alms_runtime::AgentRuntime::new(
-        agent_id,
-        gateway.agent_config().clone(),
-        gateway.llm().clone(),
-    );
-    
-    // For MVP: emit response as single token delta
-    let result = runtime.run(&state.session_manager, &session_id.0.to_string(), input).await;
-    drop(gateway);
+    // Build runtime — drop gateway lock before running to avoid blocking other requests
+    let (agent_config, llm) = {
+        let gateway = state.gateway.lock().await;
+        (gateway.agent_config().clone(), gateway.llm().clone())
+    };
 
-    // Mark completion
+    // Create a runtime event channel so we can forward tool events to SSE
+    let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+
+    let runtime = alms_runtime::AgentRuntime::new(agent_id, agent_config, llm)
+        .with_event_sender(runtime_tx)
+        .with_run_id(run_id);
+
+    // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals)
+    let forwarder_state = state.clone();
+    tokio::spawn(forward_runtime_events(
+        runtime_rx,
+        run_id,
+        session_id,
+        forwarder_state.run_manager.clone(),
+        forwarder_state.approval_store.clone(),
+    ));
+
+    let result = runtime
+        .run(&state.session_manager, &session_id.0.to_string(), input)
+        .await;
+
     match result {
         Ok(response) => {
-            // Send token delta
-            state.run_manager.send_event(run_id, session_id, SseEventData::token_delta(run_id, &response)).await;
-            // Send finished
-            state.run_manager.send_event(run_id, session_id, SseEventData::run_finished(run_id, true)).await;
+            state
+                .run_manager
+                .send_event(run_id, session_id, SseEventData::token_delta(run_id, &response))
+                .await;
+            state
+                .run_manager
+                .send_event(run_id, session_id, SseEventData::run_finished(run_id, true))
+                .await;
 
             if let Some(mut run) = state.run_manager.get_run(run_id) {
                 run.mark_completed(response);
@@ -113,7 +136,10 @@ async fn execute_run(
             info!("Run {} completed successfully", run_id.0);
         }
         Err(e) => {
-            state.run_manager.send_event(run_id, session_id, SseEventData::run_error(run_id, &e.to_string())).await;
+            state
+                .run_manager
+                .send_event(run_id, session_id, SseEventData::run_error(run_id, &e.to_string()))
+                .await;
 
             if let Some(mut run) = state.run_manager.get_run(run_id) {
                 run.mark_failed(e.to_string());
@@ -124,36 +150,102 @@ async fn execute_run(
         }
     }
 
-    // Cleanup
     state.run_manager.remove_sender(run_id);
+    // Clean up any stale pending approvals for this run
+    state.approval_store.clear_for_run(run_id);
+}
+
+/// Reads RuntimeEvents from the runtime and forwards them as SSE events.
+/// Also stores ApprovalRequired events in the approval store so clients can resolve them.
+async fn forward_runtime_events(
+    mut rx: mpsc::UnboundedReceiver<RuntimeEvent>,
+    run_id: RunId,
+    session_id: SessionId,
+    run_manager: crate::server::RunManager,
+    approval_store: ApprovalStore,
+) {
+    while let Some(event) = rx.recv().await {
+        match event {
+            RuntimeEvent::ToolStart { invocation_id, tool, params } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::tool_start(
+                            run_id,
+                            ToolInvocationId(invocation_id),
+                            &tool,
+                            params,
+                        ),
+                    )
+                    .await;
+            }
+            RuntimeEvent::ToolEnd { invocation_id, ok, result } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::tool_end(
+                            run_id,
+                            ToolInvocationId(invocation_id),
+                            ok,
+                            result,
+                        ),
+                    )
+                    .await;
+            }
+            RuntimeEvent::ApprovalRequired { approval_id, tool, params, decision_tx } => {
+                let request = serde_json::json!({"tool": &tool, "params": &params});
+                approval_store.insert(PendingApproval {
+                    approval_id,
+                    run_id,
+                    tool: tool.clone(),
+                    params: params.clone(),
+                    requested_at: Utc::now(),
+                    decision_tx,
+                });
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::approval_required(
+                            run_id,
+                            &approval_id.to_string(),
+                            &tool,
+                            request,
+                        ),
+                    )
+                    .await;
+            }
+        }
+    }
 }
 
 /// GET /runs/{run_id} - Get run status
-///
-/// Per API spec: Returns { run_id, session_id, agent_id, status, started_at, ended_at, ts }
 pub async fn get_run_status(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
-) -> Result<Json<RunStatusResponse>, (StatusCode, String)> {
-    let run = match state.run_manager.get_run(run_id) {
-        Some(run) => run,
-        None => return Err((StatusCode::NOT_FOUND, "Run not found".to_string())),
-    };
-
-    Ok(Json(RunStatusResponse::from(run)))
+) -> Result<Json<RunStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
+    match state.run_manager.get_run(run_id) {
+        Some(run) => Ok(Json(RunStatusResponse::from(run))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": { "code": "NOT_FOUND", "message": "Run not found" }
+            })),
+        )),
+    }
 }
 
 /// GET /runs/{run_id}/events - Stream events via SSE
 ///
-/// Per API spec: Returns SSE stream with event: run_started, token_delta, run_finished, run_error
-/// Supports Last-Event-ID header for reconnect
-#[instrument(level = "info", skip(state, headers), fields(run_id = %run_id.0, has_last_event_id = headers.contains_key("last-event-id")))]
+/// Supports Last-Event-ID header for reconnect.
+#[instrument(level = "info", skip(state, headers), fields(run_id = %run_id.0))]
 pub async fn stream_run_events(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // Check for Last-Event-ID header for reconnect support
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let last_event_id = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -175,28 +267,28 @@ pub async fn stream_run_events(
         info!("Replaying {} events for run {}", replay_events.len(), run_id.0);
     }
 
-    // Create event channel for live events
     let (tx, rx) = event_channel();
     state.run_manager.register_sender(run_id, tx);
 
-    info!("Starting event stream for run {}", run_id.0);
     Ok(RunEventStream::new_with_events(rx, replay_events))
 }
 
 /// POST /agent/run/stream - Legacy compatibility endpoint
-///
-/// Combines create_run + stream_run_events into a single call.
-/// Creates a run and immediately returns an SSE stream.
-/// This is an MVP compatibility alias; prefer `POST /runs` + `GET /runs/{id}/events`.
 #[instrument(level = "info", skip(state, req))]
 pub async fn stream_run_legacy(
     State(state): State<AppState>,
     Json(req): Json<CreateRunRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // First create the run (same as create_run)
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     let session = match state.session_manager.get(req.session_id) {
         Ok(session) => session,
-        Err(_) => return Err((StatusCode::NOT_FOUND, "Session not found".to_string())),
+        Err(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": { "code": "NOT_FOUND", "message": "Session not found" }
+                })),
+            ))
+        }
     };
 
     let input_text = match req.input {
@@ -208,26 +300,21 @@ pub async fn stream_run_legacy(
     let session_id = run.session_id;
     let agent_id = run.agent_id.clone();
 
-    info!("Creating run {} for session {} (legacy /agent/run/stream)", run_id.0, session_id.0);
+    info!(
+        "Creating run {} for session {} (legacy /agent/run/stream)",
+        run_id.0, session_id.0
+    );
 
-    // Store run
     state.run_manager.insert_run(run.clone());
 
-    // Create event channel BEFORE spawning background task
+    // Register SSE channel before spawning so early events aren't missed
     let (tx, rx) = event_channel();
-    state.run_manager.register_sender(run_id, tx.clone());
+    state.run_manager.register_sender(run_id, tx);
 
-    // Spawn background task to execute run
-    let state_clone = AppState {
-        session_manager: state.session_manager.clone(),
-        gateway: state.gateway.clone(),
-        run_manager: state.run_manager.clone(),
-    };
-
+    let state_clone = state.clone();
     tokio::spawn(async move {
         execute_run(state_clone, run_id, session_id, agent_id, run.input).await;
     });
 
-    info!("Starting legacy event stream for run {}", run_id.0);
     Ok(RunEventStream::new(rx))
 }

@@ -20,11 +20,12 @@
 //! }
 //! ```
 
+pub mod approvals;
+pub mod event_log;
 pub mod gateway;
 pub mod runs;
 pub mod server;
 pub mod sse;
-pub mod event_log;
 
 // Re-export main types
 pub use gateway::{Gateway, GatewayConfig};
