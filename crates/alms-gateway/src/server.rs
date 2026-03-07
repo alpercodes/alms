@@ -121,6 +121,8 @@ pub use crate::sse::{event_channel, RunEventStream};
 /// Create the gateway router (per docs/api.md)
 pub fn router() -> Router<AppState> {
     Router::new()
+        // Web UI
+        .route("/", get(serve_ui))
         // Health
         .route("/health", get(health_check))
         // Sessions
@@ -139,6 +141,11 @@ pub fn router() -> Router<AppState> {
         .route("/agent/run", post(run_agent))
         .route("/agent/run/stream", post(stream_run_legacy))
         .route("/ws", get(websocket_handler))
+}
+
+/// Serve the embedded web UI
+async fn serve_ui() -> impl IntoResponse {
+    axum::response::Html(include_str!("../static/index.html"))
 }
 
 /// Health check endpoint

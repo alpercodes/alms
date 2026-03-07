@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ALMS</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Courier New', Courier, monospace;
+      background: #0d1117;
+      color: #e6edf3;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      flex-shrink: 0;
+      padding: 10px 18px;
+      border-bottom: 1px solid #21262d;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    header h1 { font-size: 15px; color: #58a6ff; letter-spacing: 1px; }
+    #status { font-size: 11px; color: #8b949e; }
+    #status.ok      { color: #3fb950; }
+    #status.running { color: #d29922; }
+    #status.error   { color: #f85149; }
+
+    /* ── Message list ── */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .msg { display: flex; flex-direction: column; gap: 3px; max-width: 78%; }
+    .msg.user  { align-self: flex-end; }
+    .msg.agent { align-self: flex-start; }
+
+    .msg-label {
+      font-size: 10px;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+    .msg-body {
+      padding: 9px 13px;
+      border-radius: 7px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .msg.user  .msg-body { background: #1f6feb; color: #fff; }
+    .msg.agent .msg-body { background: #161b22; border: 1px solid #30363d; }
+
+    /* ── Tool events ── */
+    .tool-row {
+      align-self: flex-start;
+      font-size: 11px;
+      color: #8b949e;
+      padding: 5px 10px;
+      background: #0d1117;
+      border: 1px solid #21262d;
+      border-left: 3px solid #388bfd;
+      border-radius: 4px;
+      max-width: 78%;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .tool-row.done  { border-left-color: #3fb950; color: #3fb950; }
+    .tool-row.fail  { border-left-color: #f85149; color: #f85149; }
+
+    /* ── Approval card ── */
+    .approval-card {
+      align-self: flex-start;
+      max-width: 78%;
+      background: #161b22;
+      border: 1px solid #d29922;
+      border-radius: 8px;
+      padding: 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+    .approval-card h3 { font-size: 12px; color: #d29922; }
+    .approval-card pre {
+      font-size: 11px;
+      color: #8b949e;
+      overflow: auto;
+      max-height: 110px;
+    }
+    .approval-card.resolved { border-color: #30363d; }
+    .approval-card.resolved h3 { color: #8b949e; }
+
+    .approval-btns { display: flex; gap: 8px; }
+    .btn {
+      padding: 5px 14px;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+      transition: opacity .15s;
+    }
+    .btn:disabled { opacity: 0.45; cursor: default; }
+    .btn-approve { background: #238636; color: #fff; }
+    .btn-approve:not(:disabled):hover { background: #2ea043; }
+    .btn-deny    { background: #8b1922; color: #fff; }
+    .btn-deny:not(:disabled):hover { background: #da3633; }
+
+    /* ── Input area ── */
+    #input-area {
+      flex-shrink: 0;
+      padding: 12px 18px;
+      border-top: 1px solid #21262d;
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+    }
+    #prompt {
+      flex: 1;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 9px 13px;
+      color: #e6edf3;
+      font-family: inherit;
+      font-size: 14px;
+      resize: none;
+      outline: none;
+      line-height: 1.5;
+      min-height: 42px;
+      max-height: 140px;
+    }
+    #prompt:focus { border-color: #388bfd; }
+    #prompt:disabled { opacity: 0.5; }
+
+    #send {
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 9px 18px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 14px;
+      white-space: nowrap;
+    }
+    #send:not(:disabled):hover { background: #2ea043; }
+    #send:disabled { opacity: 0.5; cursor: default; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>ALMS</h1>
+  <span id="status">connecting…</span>
+</header>
+
+<div id="messages"></div>
+
+<div id="input-area">
+  <textarea id="prompt" rows="2" placeholder="Send a message… (Enter to send, Shift+Enter for newline)" disabled></textarea>
+  <button id="send" disabled>Send</button>
+</div>
+
+<script>
+'use strict';
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let sessionId   = null;
+let activeEs    = null;   // current EventSource
+
+const statusEl   = document.getElementById('status');
+const messagesEl = document.getElementById('messages');
+const promptEl   = document.getElementById('prompt');
+const sendBtn    = document.getElementById('send');
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls ?? '';
+}
+
+function scrollToBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+// ── DOM builders ──────────────────────────────────────────────────────────────
+
+/** Append a user or agent message bubble. Returns the body element. */
+function appendMsg(role, text) {
+  const wrap = document.createElement('div');
+  wrap.className = `msg ${role}`;
+
+  const label = document.createElement('div');
+  label.className = 'msg-label';
+  label.textContent = role;
+
+  const body = document.createElement('div');
+  body.className = 'msg-body';
+  if (text) body.textContent = text;
+
+  wrap.appendChild(label);
+  wrap.appendChild(body);
+  messagesEl.appendChild(wrap);
+  scrollToBottom();
+  return body;
+}
+
+/** Append a tool event row. Returns the element so it can be updated. */
+function appendToolRow(text, cls) {
+  const el = document.createElement('div');
+  el.className = `tool-row${cls ? ' ' + cls : ''}`;
+  el.textContent = text;
+  messagesEl.appendChild(el);
+  scrollToBottom();
+  return el;
+}
+
+/** Append an approval request card with Approve / Deny buttons. */
+function appendApprovalCard(approvalId, capability, request) {
+  const card = document.createElement('div');
+  card.className = 'approval-card';
+  card.dataset.approvalId = approvalId;
+
+  const title = document.createElement('h3');
+  title.textContent = `⚠ Approval required — ${capability}`;
+
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify(request, null, 2);
+
+  const btns = document.createElement('div');
+  btns.className = 'approval-btns';
+
+  function makeBtn(label, cls, decision) {
+    const btn = document.createElement('button');
+    btn.className = `btn ${cls}`;
+    btn.textContent = label;
+    btn.onclick = () => resolveApproval(approvalId, decision, card);
+    return btn;
+  }
+
+  btns.appendChild(makeBtn('Approve', 'btn-approve', 'approve'));
+  btns.appendChild(makeBtn('Deny',    'btn-deny',    'deny'));
+
+  card.appendChild(title);
+  card.appendChild(pre);
+  card.appendChild(btns);
+  messagesEl.appendChild(card);
+  scrollToBottom();
+}
+
+// ── Session init ──────────────────────────────────────────────────────────────
+async function initSession() {
+  setStatus('connecting…');
+
+  // Reuse stored identifiers across page reloads.
+  sessionId = localStorage.getItem('alms_session_id');
+  let agentId = localStorage.getItem('alms_agent_id');
+
+  if (!agentId) {
+    agentId = crypto.randomUUID();
+    localStorage.setItem('alms_agent_id', agentId);
+  }
+
+  if (!sessionId) {
+    try {
+      const res = await fetch('/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_id: agentId, context_id: 'web-chat' }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      sessionId = data.session_id;
+      localStorage.setItem('alms_session_id', sessionId);
+    } catch (e) {
+      setStatus('server offline', 'error');
+      // Retry after a few seconds.
+      setTimeout(initSession, 4000);
+      return;
+    }
+  }
+
+  setStatus(`session ${sessionId.slice(0, 8)}…`, 'ok');
+  promptEl.disabled = false;
+  sendBtn.disabled = false;
+  promptEl.focus();
+}
+
+// ── Send message ──────────────────────────────────────────────────────────────
+async function sendMessage() {
+  const text = promptEl.value.trim();
+  if (!text || !sessionId) return;
+
+  promptEl.value = '';
+  promptEl.disabled = true;
+  sendBtn.disabled = true;
+  setStatus('running…', 'running');
+
+  appendMsg('user', text);
+
+  // Kill any previous stream.
+  if (activeEs) { activeEs.close(); activeEs = null; }
+
+  // Create the run.
+  let runId;
+  try {
+    const res = await fetch('/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: sessionId,
+        input: { type: 'text', text },
+      }),
+    });
+    if (!res.ok) {
+      // Session may have expired (server restart without SQLite). Reset and retry.
+      if (res.status === 404 || res.status === 400) {
+        localStorage.removeItem('alms_session_id');
+        sessionId = null;
+        promptEl.disabled = false;
+        sendBtn.disabled = false;
+        setStatus('session expired — reconnecting…', 'running');
+        await initSession();
+        promptEl.value = text;   // restore message
+      }
+      throw new Error(`HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    runId = data.run_id;
+  } catch (e) {
+    setStatus('failed to start run', 'error');
+    promptEl.disabled = false;
+    sendBtn.disabled = false;
+    return;
+  }
+
+  openEventStream(runId);
+}
+
+// ── SSE event stream ──────────────────────────────────────────────────────────
+function openEventStream(runId) {
+  const es = new EventSource(`/runs/${runId}/events`);
+  activeEs = es;
+
+  // The agent response body — built token by token.
+  let agentBody = null;
+  function getAgentBody() {
+    if (!agentBody) agentBody = appendMsg('agent', '');
+    return agentBody;
+  }
+
+  // Pending tool rows, keyed by tool_invocation_id.
+  const toolRows = {};
+
+  function done() {
+    es.close();
+    activeEs = null;
+    setStatus(`session ${sessionId.slice(0, 8)}…`, 'ok');
+    promptEl.disabled = false;
+    sendBtn.disabled = false;
+    promptEl.focus();
+  }
+
+  es.addEventListener('token_delta', e => {
+    const { delta } = JSON.parse(e.data);
+    getAgentBody().textContent += delta;
+    scrollToBottom();
+  });
+
+  es.addEventListener('tool_start', e => {
+    const { tool_invocation_id, tool, params } = JSON.parse(e.data);
+    const label = `▶ ${tool}(${JSON.stringify(params)})`;
+    toolRows[tool_invocation_id] = appendToolRow(label);
+  });
+
+  es.addEventListener('tool_end', e => {
+    const { tool_invocation_id, ok, result } = JSON.parse(e.data);
+    const row = toolRows[tool_invocation_id];
+    const summary = JSON.stringify(result).slice(0, 160);
+    if (row) {
+      row.textContent = `${ok ? '✓' : '✗'} ${summary}`;
+      row.classList.add(ok ? 'done' : 'fail');
+    } else {
+      appendToolRow(`${ok ? '✓' : '✗'} ${summary}`, ok ? 'done' : 'fail');
+    }
+  });
+
+  es.addEventListener('approval_required', e => {
+    const { approval_id, capability, request } = JSON.parse(e.data);
+    appendApprovalCard(approval_id, capability, request);
+  });
+
+  es.addEventListener('approval_resolved', e => {
+    const { approval_id, decision } = JSON.parse(e.data);
+    const card = document.querySelector(`.approval-card[data-approval-id="${CSS.escape(approval_id)}"]`);
+    if (card) {
+      card.classList.add('resolved');
+      const title = card.querySelector('h3');
+      if (title) title.textContent = `${decision === 'approve' ? '✓ Approved' : '✗ Denied'} — ${card.querySelector('h3').textContent.replace(/.*— /, '')}`;
+      card.querySelectorAll('.btn').forEach(b => b.disabled = true);
+    }
+  });
+
+  es.addEventListener('run_finished', e => {
+    const { ok } = JSON.parse(e.data);
+    done();
+    if (!ok && !agentBody) appendMsg('agent', '(run completed without output)');
+  });
+
+  es.addEventListener('run_error', e => {
+    const { error } = JSON.parse(e.data);
+    done();
+    appendMsg('agent', `Error: ${error?.message ?? JSON.stringify(error)}`);
+    setStatus('error', 'error');
+  });
+
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED) return;
+    done();
+    setStatus('stream disconnected', 'error');
+  };
+}
+
+// ── Approval resolution ───────────────────────────────────────────────────────
+async function resolveApproval(approvalId, decision, card) {
+  card.querySelectorAll('.btn').forEach(b => b.disabled = true);
+  try {
+    await fetch(`/approvals/${approvalId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision }),
+    });
+  } catch {
+    setStatus('approval request failed', 'error');
+  }
+}
+
+// ── Input handling ────────────────────────────────────────────────────────────
+promptEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+sendBtn.addEventListener('click', sendMessage);
+
+// Auto-grow textarea.
+promptEl.addEventListener('input', () => {
+  promptEl.style.height = 'auto';
+  promptEl.style.height = Math.min(promptEl.scrollHeight, 140) + 'px';
+});
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+initSession();
+</script>
+</body>
+</html>
