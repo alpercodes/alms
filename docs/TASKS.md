@@ -4,8 +4,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ## Status snapshot
 - **Docs spine is in place** (`docs/index.md`, `api.md`, `events-and-audit.md`, `security-model.md`, `capability-model.md`, `approvals-ux.md`, `policy-reasons.md`, `artifacts.md`, plus Zeki's review).
-- Core engineering work is now about **making runs/approvals/audit/event persistence real and coherent**.
 - **2026-02-14:** Tool parameter schemas implemented, OpenAI API format fixed, LlmMessage.content nullability fixed, multiple compilation fixes applied, GatewayConfig env loading fixed, CLI health command functional. See `docs/agent-ux-requirements.md` for new UX requirements from Alper.
+- **2026-03-07:** Run/event/approval/audit pipeline fully implemented. MVP HTTP API is end-to-end functional with SSE streaming, guarded posture approvals, event replay, and audit log. CI pipeline live on GitHub Actions.
 
 ---
 
@@ -51,26 +51,27 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ## P2 — Converge on the Run/Event/Approval model (ALMS identity)
 
-8) Canonical Run API (introduce without breaking MVP compatibility)
-- Implement `POST /runs` + `GET /runs/{run_id}/events` as canonical.
-- Keep `/agent/run` + `/agent/run/stream` as compatibility aliases (deprecated).
-- Ensure event invariants in `docs/events-and-audit.md` hold.
+8) Canonical Run API (introduce without breaking MVP compatibility) ✅
+- `POST /runs` + `GET /runs/{run_id}` + `GET /runs/{run_id}/events` implemented.
+- `/agent/run` + `/agent/run/stream` kept as deprecated compatibility aliases.
+- Tool events (`tool_start`, `tool_end`) wired via RuntimeEvent channel.
 - **Owners:** Atlas, Mustafa
 
-9) Approvals end-to-end (guarded posture)
-- Implement `approval_required` → pause → `approval_resolved` → continue.
-- Minimal `/approvals` endpoints (list pending, resolve approve/deny).
-- Guarantee `full_control` posture never emits approvals.
+9) Approvals end-to-end (guarded posture) ✅
+- `approval_required` → pause (oneshot channel) → `approval_resolved` → continue.
+- `GET /approvals` (list pending, filterable by session_id) + `POST /approvals/{id}` (approve/deny).
+- Guarded posture blocks if no event_sender attached (security guarantee).
+- `clear_for_run()` cleans up stale approvals on run completion.
 - **Owners:** Atlas, Mustafa
 
-10) Event persistence stance (required if approvals ship)
-- Decide and implement: best-effort streaming vs persisted per-run event log.
-- Recommendation: persist per-run events if approvals exist (reconnect/replay).
+10) Event persistence (in-memory event log) ✅
+- In-memory per-run event log (`EventLogManager`) persists all events with sequential IDs.
+- `GET /runs/{run_id}/events` replays missed events via `Last-Event-ID` header on reconnect.
 - **Owners:** Atlas
 
-11) Audit surfacing (minimal)
-- Add minimal query path for audit per session/run (even if in-memory for MVP).
-- Redaction/truncation rules aligned with `docs/security-model.md`.
+11) Audit surfacing (minimal) ✅
+- `GET /audit?session_id=<uuid>&limit=<n>` returns session audit events.
+- In-memory for MVP; audit records include `run_id` on all tool events.
 - **Owners:** Atlas
 
 12) Tool parameter schemas (tool-call reliability) ✅
@@ -93,8 +94,10 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ## P4 — Stability / quality
 
-14) CI basics
-- `cargo fmt`, `cargo clippy`, `cargo test` (including golden tests) in CI.
+14) CI basics ✅
+- `.github/workflows/ci.yml`: fmt-check + clippy + test + build-release on push/PR to main.
+- `ALMS_LLM_MOCK=1` set in CI env; `Swatinem/rust-cache` for fast builds.
+- Local: `make ci` runs the same checks.
 - **Owners:** Mustafa
 
 15) Documentation drift checks
