@@ -10,6 +10,7 @@ pub mod context;
 pub mod events;
 pub mod llm_client;
 pub mod llm_types;
+pub mod scheduler;
 pub mod tools;
 pub mod workspace;
 
@@ -18,6 +19,7 @@ pub use events::{RuntimeEvent, RuntimeEventSender};
 pub use context::ContextBuilder;
 pub use llm_client::LlmClient;
 pub use llm_types::*;
+pub use scheduler::{JobId, JobRun, Scheduler};
 pub use tools::ToolRegistry;
 pub use workspace::{AgentWorkspace, WorkspaceFile};
 

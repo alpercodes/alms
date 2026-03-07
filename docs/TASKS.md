@@ -43,8 +43,11 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - SSE endpoint exists + golden tests.
 - **Owners:** Mustafa
 
-7) Deterministic test harness for scheduler + timeouts
-- Use paused tokio time; at least one scheduler test: schedule → advance time → job run recorded.
+7) Deterministic test harness for scheduler + timeouts ✅
+- `alms-runtime/src/scheduler.rs`: `Scheduler` with `schedule_once`, `schedule_recurring`, `cancel`.
+- Background runner uses `tokio::time::sleep_until` + `Notify` for instant wake on new jobs.
+- 5 deterministic tests via `tokio::time::pause()` + `advance()` — all pass in 0ms.
+- Covers: one-shot firing, early non-firing, recurring multi-fire, cancel, multi-job ordering.
 - **Owners:** Atlas
 
 ---
