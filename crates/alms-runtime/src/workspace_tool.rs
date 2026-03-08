@@ -1,13 +1,10 @@
-//! workspace_write tool — lets the agent update its own goals.md and memories.md.
+//! workspace_write tool — lets the agent update its own workspace files.
 
 use crate::workspace::{AgentWorkspace, WorkspaceFile};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
 
 /// Built-in tool that lets the agent write to its own workspace files.
-///
-/// The agent may write to `goals.md` and `memories.md` only.
-/// `personality.md` is user-only and will be rejected with an error.
 #[derive(Debug, Clone)]
 pub struct WorkspaceWriteTool {
     workspace: AgentWorkspace,
@@ -26,8 +23,8 @@ impl Tool for WorkspaceWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write or append to the agent's own workspace files (goals.md or memories.md). \
-         Use this to persist goals and memories across conversations."
+        "Write or append to the agent's own workspace files (personality.md, goals.md, memories.md). \
+         Use this to persist identity, goals, and memories across conversations."
     }
 
     fn parameters(&self) -> Value {
@@ -36,8 +33,9 @@ impl Tool for WorkspaceWriteTool {
             "properties": {
                 "file": {
                     "type": "string",
-                    "enum": ["goals", "memories"],
+                    "enum": ["personality", "goals", "memories"],
                     "description": "Which workspace file to write. \
+                                    'personality' for tone/style/role, \
                                     'goals' for current objectives, \
                                     'memories' for learned facts and preferences."
                 },
@@ -63,16 +61,12 @@ impl Tool for WorkspaceWriteTool {
             .ok_or_else(|| SandboxError::InvalidParameters("'file' is required".to_string()))?;
 
         let workspace_file = match file_str {
+            "personality" => WorkspaceFile::Personality,
             "goals" => WorkspaceFile::Goals,
             "memories" => WorkspaceFile::Memories,
-            "personality" => {
-                return Err(SandboxError::InvalidParameters(
-                    "File 'personality' is read-only (user-managed only)".to_string(),
-                ));
-            }
             other => {
                 return Err(SandboxError::InvalidParameters(format!(
-                    "Unknown file '{}': must be 'goals' or 'memories'",
+                    "Unknown file '{}': must be 'personality', 'goals', or 'memories'",
                     other
                 )));
             }
@@ -164,17 +158,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_personality_rejected_with_clear_message() {
+    async fn test_personality_writable() {
         let (_dir, tool) = test_tool();
-        let err = tool
-            .execute(serde_json::json!({
-                "file": "personality",
-                "content": "overwrite"
-            }))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, SandboxError::InvalidParameters(_)));
-        assert!(err.to_string().contains("read-only"));
+        tool.execute(serde_json::json!({
+            "file": "personality",
+            "content": "I am a helpful assistant."
+        }))
+        .await
+        .unwrap();
+        let content = tool.workspace.read_file(WorkspaceFile::Personality).unwrap();
+        assert!(content.contains("helpful assistant"));
     }
 
     #[tokio::test]
