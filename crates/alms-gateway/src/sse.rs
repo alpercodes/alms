@@ -4,6 +4,7 @@
 
 use alms_core::RunId;
 use axum::response::sse::{Event, Sse};
+use tracing::error;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -203,7 +204,10 @@ impl RunEventStream {
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| Uuid::new_v4().to_string()))
                 .json_data(&data.data)
-                .unwrap_or_else(|_| Event::default().data("{}"));
+                .unwrap_or_else(|e| {
+                    error!("Failed to serialize SSE replay event '{}': {}", data.event_type, e);
+                    Event::default().data("{}")
+                });
             Ok::<_, Infallible>(event)
         }));
 
@@ -215,7 +219,10 @@ impl RunEventStream {
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| Uuid::new_v4().to_string()))
                 .json_data(&data.data)
-                .unwrap_or_else(|_| Event::default().data("{}"));
+                .unwrap_or_else(|e| {
+                    error!("Failed to serialize SSE live event '{}': {}", data.event_type, e);
+                    Event::default().data("{}")
+                });
             Ok::<_, Infallible>(event)
         });
 

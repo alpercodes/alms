@@ -16,6 +16,7 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
+use tracing::warn;
 
 /// POST /jobs
 pub async fn create_job(
@@ -75,7 +76,14 @@ pub async fn create_job(
             .unwrap_or(std::time::Duration::ZERO);
         let instant = tokio::time::Instant::now() + delay;
         state.scheduler.schedule_once(job.id, instant).await;
-        let _ = state.job_store.update_next_run_at(job.id, Some(fire_at));
+        if let Err(e) = state.job_store.update_next_run_at(job.id, Some(fire_at)) {
+            warn!("Failed to persist next_run_at for job {}: {}", job.id.0, e);
+        }
+    } else {
+        warn!(
+            "Job {} has no computable fire time — created but will not fire",
+            job.id.0
+        );
     }
 
     (StatusCode::CREATED, Json(serde_json::json!(job))).into_response()

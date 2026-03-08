@@ -19,6 +19,8 @@ use tracing::{debug, info, warn};
 pub struct SessionManager {
     /// Active sessions: (agent_id, context_id) -> Session
     sessions: Arc<DashMap<(AgentId, String), Session>>,
+    /// Reverse index: session_id -> (agent_id, context_id) for O(1) lookup by ID.
+    session_by_id: Arc<DashMap<SessionId, (AgentId, String)>>,
     /// Session history: session_id -> Vec<Message>
     history: Arc<DashMap<SessionId, Vec<Message>>>,
     /// Audit events: session_id -> Vec<AuditEvent>
@@ -33,6 +35,7 @@ impl SessionManager {
     pub fn new(config: SessionConfig) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
+            session_by_id: Arc::new(DashMap::new()),
             history: Arc::new(DashMap::new()),
             audit: Arc::new(DashMap::new()),
             config,
@@ -62,6 +65,7 @@ impl SessionManager {
         for session in sessions {
             let key = (session.agent_id, session.context_id.clone());
             let session_id = session.id;
+            self.session_by_id.insert(session_id, key.clone());
             self.sessions.insert(key, session);
             self.history
                 .insert(session_id, store.load_messages(session_id)?);
@@ -85,6 +89,7 @@ impl SessionManager {
         }
 
         let session = Session::new(agent_id, context_id);
+        self.session_by_id.insert(session.id, key.clone());
         self.sessions.insert(key, session.clone());
         self.history.insert(session.id, Vec::new());
         self.audit.insert(session.id, Vec::new());
@@ -101,10 +106,10 @@ impl SessionManager {
 
     /// Get a session by ID
     pub fn get(&self, session_id: SessionId) -> AlmsResult<Session> {
-        for entry in self.sessions.iter() {
-            if entry.value().id == session_id {
-                return Ok(entry.value().clone());
-            }
+        if let Some(key) = self.session_by_id.get(&session_id)
+            && let Some(session) = self.sessions.get(key.value())
+        {
+            return Ok(session.clone());
         }
         Err(alms_core::AlmsError::SessionNotFound(
             session_id.0.to_string(),
@@ -125,12 +130,11 @@ impl SessionManager {
 
             history.push(message);
 
-            // Update last activity
-            for mut entry in self.sessions.iter_mut() {
-                if entry.value().id == session_id {
-                    entry.value_mut().touch();
-                    break;
-                }
+            // Update last_activity via the reverse index — O(1), no full scan.
+            if let Some(key) = self.session_by_id.get(&session_id)
+                && let Some(mut session) = self.sessions.get_mut(key.value())
+            {
+                session.touch();
             }
 
             Ok(())
@@ -212,6 +216,7 @@ impl SessionManager {
         let key = (agent_id, context_id.as_ref().to_string());
 
         if let Some((_, session)) = self.sessions.remove(&key) {
+            self.session_by_id.remove(&session.id);
             self.history.remove(&session.id);
             info!("Deleted session: {:?}", session.id);
             Ok(())

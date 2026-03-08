@@ -93,10 +93,7 @@ async fn execute_run(
         )
         .await;
 
-    if let Some(mut run) = state.run_manager.get_run(run_id) {
-        run.mark_running();
-        state.run_manager.update_run(run);
-    }
+    state.run_manager.mark_run_as_running(run_id);
 
     // Build runtime — drop gateway lock before running to avoid blocking other requests
     let (agent_config, llm) = {
@@ -117,9 +114,11 @@ async fn execute_run(
         runtime = runtime.with_workspace(workspace);
     }
 
-    // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals)
+    // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals).
+    // We keep the handle so we can await it after the runtime finishes, ensuring
+    // all tool events are flushed before we send run_finished.
     let forwarder_state = state.clone();
-    tokio::spawn(forward_runtime_events(
+    let forwarder_handle = tokio::spawn(forward_runtime_events(
         runtime_rx,
         run_id,
         session_id,
@@ -130,6 +129,12 @@ async fn execute_run(
     let result = runtime
         .run(&state.session_manager, &session_id.0.to_string(), input)
         .await;
+
+    // Drop `runtime` explicitly to close `runtime_tx` and signal EOF to the
+    // forwarder. Then await the forwarder so all buffered tool events are
+    // forwarded before we send run_finished / run_error.
+    drop(runtime);
+    forwarder_handle.await.ok();
 
     match result {
         Ok(output) => {
@@ -150,10 +155,9 @@ async fn execute_run(
                 )
                 .await;
 
-            if let Some(mut run) = state.run_manager.get_run(run_id) {
-                run.mark_completed(output.response, output.usage);
-                state.run_manager.update_run(run);
-            }
+            state
+                .run_manager
+                .mark_run_as_completed(run_id, output.response, output.usage);
 
             info!("Run {} completed successfully", run_id.0);
         }
@@ -167,10 +171,7 @@ async fn execute_run(
                 )
                 .await;
 
-            if let Some(mut run) = state.run_manager.get_run(run_id) {
-                run.mark_failed(e.to_string());
-                state.run_manager.update_run(run);
-            }
+            state.run_manager.mark_run_as_failed(run_id, e.to_string());
 
             error!("Run {} failed: {}", run_id.0, e);
         }

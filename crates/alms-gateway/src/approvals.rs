@@ -13,6 +13,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use tracing::warn;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -154,25 +155,27 @@ pub async fn resolve_approval(
     };
 
     if let Some(info) = state.approval_store.resolve(approval_id, approve) {
-        // Emit approval_resolved SSE event
+        // Emit approval_resolved SSE event — only if the run is still tracked.
         let decision_str = if approve { "approve" } else { "deny" };
-        state
-            .run_manager
-            .send_event(
-                info.run_id,
-                // session_id is not on ApprovalInfo; use a lookup from the run
-                state
-                    .run_manager
-                    .get_run(info.run_id)
-                    .map(|r| r.session_id)
-                    .unwrap_or(alms_core::SessionId::new()),
-                crate::sse::SseEventData::approval_resolved(
+        if let Some(run) = state.run_manager.get_run(info.run_id) {
+            state
+                .run_manager
+                .send_event(
                     info.run_id,
-                    &approval_id.to_string(),
-                    decision_str,
-                ),
-            )
-            .await;
+                    run.session_id,
+                    crate::sse::SseEventData::approval_resolved(
+                        info.run_id,
+                        &approval_id.to_string(),
+                        decision_str,
+                    ),
+                )
+                .await;
+        } else {
+            warn!(
+                "resolve_approval: run {} not found, skipping approval_resolved SSE event",
+                info.run_id.0
+            );
+        }
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
         Err((

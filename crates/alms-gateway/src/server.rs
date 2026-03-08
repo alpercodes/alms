@@ -70,6 +70,25 @@ impl RunManager {
         self.runs.insert(run.run_id, run);
     }
 
+    /// Atomically transition a run to Running state.
+    pub fn mark_run_as_running(&self, run_id: RunId) {
+        self.runs.entry(run_id).and_modify(|r| r.mark_running());
+    }
+
+    /// Atomically transition a run to Completed state.
+    pub fn mark_run_as_completed(&self, run_id: RunId, output: String, usage: alms_core::TokenUsage) {
+        self.runs
+            .entry(run_id)
+            .and_modify(|r| r.mark_completed(output.clone(), usage));
+    }
+
+    /// Atomically transition a run to Failed state.
+    pub fn mark_run_as_failed(&self, run_id: RunId, error: String) {
+        self.runs
+            .entry(run_id)
+            .and_modify(|r| r.mark_failed(error.clone()));
+    }
+
     /// Send event to active subscribers AND persist to event log
     pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
         let event_id = self

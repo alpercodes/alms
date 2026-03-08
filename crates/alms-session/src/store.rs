@@ -5,12 +5,11 @@
 
 use crate::{Message, Session};
 use alms_core::{AlmsResult, SessionId};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Store trait for session persistence
 #[async_trait::async_trait]
@@ -40,7 +39,9 @@ pub struct MemoryStore {
     snapshot_path: Option<PathBuf>,
     sessions: RwLock<HashMap<SessionId, Session>>,
     messages: RwLock<HashMap<SessionId, Vec<Message>>>,
-    loaded: AtomicBool,
+    /// Mutex guards the one-time snapshot load — holds the lock during I/O to
+    /// prevent two concurrent callers from both seeing `false` and double-loading.
+    loaded: Mutex<bool>,
 }
 
 impl Default for MemoryStore {
@@ -55,7 +56,7 @@ impl MemoryStore {
             snapshot_path: None,
             sessions: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
-            loaded: AtomicBool::new(false),
+            loaded: Mutex::new(false),
         }
     }
 
@@ -64,14 +65,16 @@ impl MemoryStore {
             snapshot_path: Some(path.as_ref().to_path_buf()),
             sessions: RwLock::new(HashMap::new()),
             messages: RwLock::new(HashMap::new()),
-            loaded: AtomicBool::new(false),
+            loaded: Mutex::new(false),
         }
     }
 
     fn load_snapshot(&self) -> AlmsResult<()> {
-        if self.loaded.swap(true, Ordering::SeqCst) {
+        let mut loaded = self.loaded.lock();
+        if *loaded {
             return Ok(());
         }
+        *loaded = true;
 
         let Some(path) = &self.snapshot_path else {
             return Ok(());
