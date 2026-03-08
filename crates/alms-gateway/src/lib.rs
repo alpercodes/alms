@@ -1,5 +1,5 @@
 //! ALMS Gateway - HTTP/WebSocket API and message routing
-//! 
+//!
 //! The gateway provides:
 //! - HTTP REST API for session management
 //! - WebSocket endpoint for real-time communication  
@@ -23,14 +23,16 @@
 pub mod approvals;
 pub mod event_log;
 pub mod gateway;
+pub mod jobs;
 pub mod runs;
 pub mod server;
 pub mod sse;
+pub mod workspace;
 
 // Re-export main types
 pub use gateway::{Gateway, GatewayConfig};
 pub use runs::{create_run, get_run_status};
-pub use server::{serve, serve_with_gateway, AppState, RunManager};
+pub use server::{AppState, RunManager, serve, serve_with_gateway};
 pub use sse::{RunEventStream, SseEventData, event_channel};
 
 use alms_core::AlmsResult;

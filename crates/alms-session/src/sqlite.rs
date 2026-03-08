@@ -4,9 +4,12 @@
 //! mutation; full load on startup so the in-memory DashMaps stay warm.
 
 use crate::types::{Content, Message, Role, Session, SessionStatus};
-use alms_core::{AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, RunId, SessionId, Timestamp};
+use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
+use alms_core::{
+    AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, RunId, SessionId, Timestamp,
+};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -47,6 +50,17 @@ CREATE TABLE IF NOT EXISTS audit_events (
     error      TEXT,
     ts         TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id          TEXT PRIMARY KEY,
+    agent_id    TEXT NOT NULL,
+    prompt      TEXT NOT NULL,
+    schedule    TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TEXT NOT NULL,
+    next_run_at TEXT,
+    last_run_at TEXT
+);
 ";
 
 // ---------------------------------------------------------------------------
@@ -66,18 +80,22 @@ impl std::fmt::Debug for SqliteStore {
 
 impl Clone for SqliteStore {
     fn clone(&self) -> Self {
-        Self { conn: Arc::clone(&self.conn) }
+        Self {
+            conn: Arc::clone(&self.conn),
+        }
     }
 }
 
 impl SqliteStore {
     /// Open or create a SQLite database at `path`.
     pub fn open<P: AsRef<Path>>(path: P) -> AlmsResult<Self> {
-        let conn = Connection::open(path)
-            .map_err(|e| AlmsError::Runtime(format!("SQLite open: {e}")))?;
+        let conn =
+            Connection::open(path).map_err(|e| AlmsError::Runtime(format!("SQLite open: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| AlmsError::Runtime(format!("SQLite schema init: {e}")))?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// Open an in-memory database (for tests).
@@ -86,27 +104,31 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite open_in_memory: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| AlmsError::Runtime(format!("SQLite schema init: {e}")))?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     // ── Sessions ─────────────────────────────────────────────────────────────
 
     /// Upsert a session row.
     pub fn save_session(&self, session: &Session) -> AlmsResult<()> {
-        self.conn.lock().execute(
-            "INSERT OR REPLACE INTO sessions \
+        self.conn
+            .lock()
+            .execute(
+                "INSERT OR REPLACE INTO sessions \
              (id, agent_id, context_id, created_at, last_activity, status) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                session.id.0.to_string(),
-                session.agent_id.0.to_string(),
-                &session.context_id,
-                session.created_at.0.to_rfc3339(),
-                session.last_activity.0.to_rfc3339(),
-                status_to_str(session.status),
-            ],
-        )
-        .map_err(|e| AlmsError::Runtime(format!("SQLite save_session: {e}")))?;
+                params![
+                    session.id.0.to_string(),
+                    session.agent_id.0.to_string(),
+                    &session.context_id,
+                    session.created_at.0.to_rfc3339(),
+                    session.last_activity.0.to_rfc3339(),
+                    status_to_str(session.status),
+                ],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite save_session: {e}")))?;
         Ok(())
     }
 
@@ -133,20 +155,22 @@ impl SqliteStore {
             })
             .map_err(|e| AlmsError::Runtime(format!("SQLite query sessions: {e}")))?
             .filter_map(|r| r.ok())
-            .filter_map(|(id, agent_id, context_id, created_at, last_activity, status)| {
-                let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
-                let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
-                let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
-                let last = chrono::DateTime::parse_from_rfc3339(&last_activity).ok()?;
-                Some(Session {
-                    id: SessionId(id_uuid),
-                    agent_id: AgentId(agent_uuid),
-                    context_id,
-                    created_at: Timestamp(created.with_timezone(&chrono::Utc)),
-                    last_activity: Timestamp(last.with_timezone(&chrono::Utc)),
-                    status: str_to_status(&status),
-                })
-            })
+            .filter_map(
+                |(id, agent_id, context_id, created_at, last_activity, status)| {
+                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
+                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
+                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
+                    let last = chrono::DateTime::parse_from_rfc3339(&last_activity).ok()?;
+                    Some(Session {
+                        id: SessionId(id_uuid),
+                        agent_id: AgentId(agent_uuid),
+                        context_id,
+                        created_at: Timestamp(created.with_timezone(&chrono::Utc)),
+                        last_activity: Timestamp(last.with_timezone(&chrono::Utc)),
+                        status: str_to_status(&status),
+                    })
+                },
+            )
             .collect();
 
         Ok(rows)
@@ -157,21 +181,27 @@ impl SqliteStore {
     /// Upsert a single message row.
     pub fn save_message(&self, session_id: SessionId, msg: &Message) -> AlmsResult<()> {
         let content_json = serde_json::to_string(&msg.content)?;
-        let metadata_json = msg.metadata.as_ref().map(serde_json::to_string).transpose()?;
-        self.conn.lock().execute(
-            "INSERT OR REPLACE INTO messages \
+        let metadata_json = msg
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        self.conn
+            .lock()
+            .execute(
+                "INSERT OR REPLACE INTO messages \
              (id, session_id, role, content, timestamp, metadata) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                &msg.id,
-                session_id.0.to_string(),
-                role_to_str(msg.role),
-                content_json,
-                msg.timestamp.0.to_rfc3339(),
-                metadata_json,
-            ],
-        )
-        .map_err(|e| AlmsError::Runtime(format!("SQLite save_message: {e}")))?;
+                params![
+                    &msg.id,
+                    session_id.0.to_string(),
+                    role_to_str(msg.role),
+                    content_json,
+                    msg.timestamp.0.to_rfc3339(),
+                    metadata_json,
+                ],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite save_message: {e}")))?;
         Ok(())
     }
 
@@ -219,27 +249,33 @@ impl SqliteStore {
     /// Append an audit event row.
     pub fn save_audit(&self, event: &AuditEvent) -> AlmsResult<()> {
         let params_json = serde_json::to_string(&event.params)?;
-        let result_json = event.result.as_ref().map(serde_json::to_string).transpose()?;
+        let result_json = event
+            .result
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         let decision = match event.decision {
             AuditDecision::Allow => "allow",
             AuditDecision::Deny => "deny",
         };
-        self.conn.lock().execute(
-            "INSERT INTO audit_events \
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO audit_events \
              (session_id, run_id, tool, decision, params, result, error, ts) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                event.session_id.0.to_string(),
-                event.run_id.map(|r| r.0.to_string()),
-                &event.tool,
-                decision,
-                params_json,
-                result_json,
-                event.error.as_deref(),
-                event.timestamp.0.to_rfc3339(),
-            ],
-        )
-        .map_err(|e| AlmsError::Runtime(format!("SQLite save_audit: {e}")))?;
+                params![
+                    event.session_id.0.to_string(),
+                    event.run_id.map(|r| r.0.to_string()),
+                    &event.tool,
+                    decision,
+                    params_json,
+                    result_json,
+                    event.error.as_deref(),
+                    event.timestamp.0.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite save_audit: {e}")))?;
         Ok(())
     }
 
@@ -269,7 +305,16 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite query audit: {e}")))?
             .filter_map(|r| r.ok())
             .filter_map(
-                |(sid, run_id_str, tool, decision_str, params_str, result_str, error_str, ts_str)| {
+                |(
+                    sid,
+                    run_id_str,
+                    tool,
+                    decision_str,
+                    params_str,
+                    result_str,
+                    error_str,
+                    ts_str,
+                )| {
                     let session_uuid = uuid::Uuid::parse_str(&sid).ok()?;
                     let run_id = run_id_str
                         .and_then(|s| uuid::Uuid::parse_str(&s).ok())
@@ -291,6 +336,96 @@ impl SqliteStore {
                         result,
                         error: error_str,
                         timestamp: Timestamp(ts.with_timezone(&chrono::Utc)),
+                    })
+                },
+            )
+            .collect();
+
+        Ok(rows)
+    }
+
+    // ── Jobs ──────────────────────────────────────────────────────────────────
+
+    /// Upsert a job row (handles both insert and update via OR REPLACE).
+    pub fn save_job(&self, job: &Job) -> AlmsResult<()> {
+        let schedule_json = serde_json::to_string(&job.schedule)
+            .map_err(|e| AlmsError::Runtime(format!("SQLite save_job serialize: {e}")))?;
+        self.conn
+            .lock()
+            .execute(
+                "INSERT OR REPLACE INTO jobs \
+                 (id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    job.id.0.to_string(),
+                    job.agent_id.0.to_string(),
+                    &job.prompt,
+                    schedule_json,
+                    job_status_to_str(job.status),
+                    job.created_at.to_rfc3339(),
+                    job.next_run_at.map(|t| t.to_rfc3339()),
+                    job.last_run_at.map(|t| t.to_rfc3339()),
+                ],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite save_job: {e}")))?;
+        Ok(())
+    }
+
+    /// Load all non-cancelled jobs, oldest first.
+    pub fn load_all_jobs(&self) -> AlmsResult<Vec<Job>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
+                 FROM jobs WHERE status != 'cancelled' ORDER BY rowid",
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare jobs: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query jobs: {e}")))?
+            .filter_map(|r| r.ok())
+            .filter_map(
+                |(
+                    id,
+                    agent_id,
+                    prompt,
+                    schedule_json,
+                    status,
+                    created_at,
+                    next_run_at,
+                    last_run_at,
+                )| {
+                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
+                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
+                    let schedule: JobSchedule = serde_json::from_str(&schedule_json).ok()?;
+                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
+                    let next_run = next_run_at
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc));
+                    let last_run = last_run_at
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc));
+                    Some(Job {
+                        id: JobId(id_uuid),
+                        agent_id: AgentId(agent_uuid),
+                        prompt,
+                        schedule,
+                        status: str_to_job_status(&status),
+                        created_at: created.with_timezone(&chrono::Utc),
+                        next_run_at: next_run,
+                        last_run_at: last_run,
                     })
                 },
             )
@@ -338,6 +473,22 @@ fn str_to_role(s: &str) -> Role {
     }
 }
 
+fn job_status_to_str(status: JobStatus) -> &'static str {
+    match status {
+        JobStatus::Pending => "pending",
+        JobStatus::Active => "active",
+        JobStatus::Cancelled => "cancelled",
+    }
+}
+
+fn str_to_job_status(s: &str) -> JobStatus {
+    match s {
+        "active" => JobStatus::Active,
+        "cancelled" => JobStatus::Cancelled,
+        _ => JobStatus::Pending,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -345,8 +496,9 @@ fn str_to_role(s: &str) -> Role {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alms_core::{AgentId, RunId};
     use crate::types::{Content, Message, Role, Session};
+    use alms_core::job::{CreateJobRequest, JobSchedule};
+    use alms_core::{AgentId, RunId};
 
     fn new_session() -> Session {
         Session::new(AgentId::new(), "test-ctx")
@@ -411,7 +563,9 @@ mod tests {
         store.save_session(&session).unwrap();
 
         for i in 0..3 {
-            store.save_message(session.id, &new_message(&format!("msg {i}"))).unwrap();
+            store
+                .save_message(session.id, &new_message(&format!("msg {i}")))
+                .unwrap();
         }
 
         let messages = store.load_messages(session.id).unwrap();

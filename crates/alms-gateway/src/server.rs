@@ -2,19 +2,21 @@
 //!
 //! Provides REST API endpoints per docs/api.md specification.
 
-use crate::approvals::{list_approvals, resolve_approval, ApprovalStore};
+use crate::approvals::{ApprovalStore, list_approvals, resolve_approval};
 use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
+use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{create_run, get_run_status, stream_run_events, stream_run_legacy};
 use crate::sse::SseEventData;
+use crate::workspace::{get_workspace, update_workspace_file};
 use alms_core::{AgentId, AlmsResult, Run, RunId, SessionId};
-use alms_session::SessionManager;
+use alms_session::{JobStore, SessionManager};
 use axum::{
+    Json, Router,
     extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use dashmap::DashMap;
 use serde::Deserialize;
@@ -65,12 +67,7 @@ impl RunManager {
     }
 
     /// Send event to active subscribers AND persist to event log
-    pub async fn send_event(
-        &self,
-        run_id: RunId,
-        session_id: SessionId,
-        mut event: SseEventData,
-    ) {
+    pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
         let event_id = self
             .event_log
             .log_event(run_id, session_id, &event.event_type, event.data.clone())
@@ -102,21 +99,35 @@ pub struct AppState {
     pub gateway: Arc<tokio::sync::Mutex<Gateway>>,
     pub run_manager: RunManager,
     pub approval_store: ApprovalStore,
+    /// Base directory for agent workspace files (None = workspace API disabled)
+    pub workspace_dir: Option<std::path::PathBuf>,
+    /// Job store for scheduled jobs
+    pub job_store: Arc<JobStore>,
 }
 
 impl AppState {
-    pub fn new(gateway: Gateway) -> Self {
-        Self {
+    pub fn new(gateway: Gateway) -> AlmsResult<Self> {
+        let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
+        let job_store = match gateway.db_path() {
+            Some(path) => {
+                tracing::info!("Opening SQLite job store at {}", path);
+                Arc::new(JobStore::with_sqlite(path)?)
+            }
+            None => Arc::new(JobStore::new()),
+        };
+        Ok(Self {
             session_manager: gateway.session_manager().clone(),
             gateway: Arc::new(tokio::sync::Mutex::new(gateway)),
             run_manager: RunManager::new(),
             approval_store: ApprovalStore::new(),
-        }
+            workspace_dir,
+            job_store,
+        })
     }
 }
 
 // Re-export SSE types
-pub use crate::sse::{event_channel, RunEventStream};
+pub use crate::sse::{RunEventStream, event_channel};
 
 /// Create the gateway router (per docs/api.md)
 pub fn router() -> Router<AppState> {
@@ -137,6 +148,15 @@ pub fn router() -> Router<AppState> {
         .route("/approvals/{approval_id}", post(resolve_approval))
         // Audit
         .route("/audit", get(get_audit))
+        // Workspace (agent identity files)
+        .route("/agents/{agent_id}/workspace", get(get_workspace))
+        .route(
+            "/agents/{agent_id}/workspace/{file}",
+            axum::routing::put(update_workspace_file),
+        )
+        // Jobs (scheduled agent runs)
+        .route("/jobs", post(create_job).get(list_jobs))
+        .route("/jobs/{job_id}", get(get_job).delete(cancel_job))
         // Legacy (deprecated) - kept for MVP compatibility
         .route("/agent/run", post(run_agent))
         .route("/agent/run/stream", post(stream_run_legacy))
@@ -177,9 +197,7 @@ async fn get_session(
     State(state): State<AppState>,
     Path((agent_id, context_id)): Path<(AgentId, String)>,
 ) -> impl IntoResponse {
-    let session = state
-        .session_manager
-        .get_or_create(agent_id, context_id);
+    let session = state.session_manager.get_or_create(agent_id, context_id);
 
     Json(session)
 }
@@ -214,7 +232,7 @@ async fn run_agent(
     let (agent_id, agent_config, llm) = {
         let gateway = state.gateway.lock().await;
         (
-            gateway.agent_id().clone(),
+            *gateway.agent_id(),
             gateway.agent_config().clone(),
             gateway.llm().clone(),
         )
@@ -226,9 +244,9 @@ async fn run_agent(
         .run(&state.session_manager, &req.context_id, &req.message)
         .await
     {
-        Ok(response) => Json(serde_json::json!({
+        Ok(output) => Json(serde_json::json!({
             "success": true,
-            "response": response,
+            "response": output.response,
         })),
         Err(e) => Json(serde_json::json!({
             "success": false,
@@ -254,7 +272,7 @@ pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
 }
 
 pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult<()> {
-    let state = AppState::new(gateway);
+    let state = AppState::new(gateway)?;
 
     {
         let mut gateway = state.gateway.lock().await;

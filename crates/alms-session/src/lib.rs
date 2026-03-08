@@ -1,11 +1,13 @@
+pub mod job_store;
 pub mod sqlite;
 pub mod store;
 pub mod types;
 
+pub use alms_core::AuditEvent;
+pub use job_store::JobStore;
 pub use sqlite::SqliteStore;
 pub use store::{MemoryStore, SessionStore};
 pub use types::{Content, Message, Role, Session, SessionConfig, SessionStatus};
-pub use alms_core::AuditEvent;
 
 use alms_core::{AgentId, AlmsResult, SessionId};
 use dashmap::DashMap;
@@ -52,14 +54,17 @@ impl SessionManager {
 
     /// Populate in-memory maps from the SQLite store (called once on startup).
     fn load_from_store(&self) -> AlmsResult<()> {
-        let Some(store) = &self.store else { return Ok(()); };
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
         let sessions = store.load_all_sessions()?;
         let count = sessions.len();
         for session in sessions {
             let key = (session.agent_id, session.context_id.clone());
             let session_id = session.id;
             self.sessions.insert(key, session);
-            self.history.insert(session_id, store.load_messages(session_id)?);
+            self.history
+                .insert(session_id, store.load_messages(session_id)?);
             self.audit.insert(session_id, store.load_audit(session_id)?);
         }
         if count > 0 {
@@ -67,7 +72,7 @@ impl SessionManager {
         }
         Ok(())
     }
-    
+
     /// Get or create a session
     pub fn get_or_create(&self, agent_id: AgentId, context_id: impl Into<String>) -> Session {
         let context_id = context_id.into();
@@ -84,16 +89,16 @@ impl SessionManager {
         self.history.insert(session.id, Vec::new());
         self.audit.insert(session.id, Vec::new());
 
-        if let Some(store) = &self.store {
-            if let Err(e) = store.save_session(&session) {
-                warn!("Failed to persist session {}: {}", session.id.0, e);
-            }
+        if let Some(store) = &self.store
+            && let Err(e) = store.save_session(&session)
+        {
+            warn!("Failed to persist session {}: {}", session.id.0, e);
         }
 
         info!("Created new session: {:?}", session.id);
         session
     }
-    
+
     /// Get a session by ID
     pub fn get(&self, session_id: SessionId) -> AlmsResult<Session> {
         for entry in self.sessions.iter() {
@@ -101,16 +106,21 @@ impl SessionManager {
                 return Ok(entry.value().clone());
             }
         }
-        Err(alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
+        Err(alms_core::AlmsError::SessionNotFound(
+            session_id.0.to_string(),
+        ))
     }
-    
+
     /// Append a message to a session
     pub fn append_message(&self, session_id: SessionId, message: Message) -> AlmsResult<()> {
         if let Some(mut history) = self.history.get_mut(&session_id) {
-            if let Some(store) = &self.store {
-                if let Err(e) = store.save_message(session_id, &message) {
-                    warn!("Failed to persist message for session {}: {}", session_id.0, e);
-                }
+            if let Some(store) = &self.store
+                && let Err(e) = store.save_message(session_id, &message)
+            {
+                warn!(
+                    "Failed to persist message for session {}: {}",
+                    session_id.0, e
+                );
             }
 
             history.push(message);
@@ -125,10 +135,12 @@ impl SessionManager {
 
             Ok(())
         } else {
-            Err(alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
+            Err(alms_core::AlmsError::SessionNotFound(
+                session_id.0.to_string(),
+            ))
         }
     }
-    
+
     /// Get session history
     pub fn get_history(&self, session_id: SessionId) -> AlmsResult<Vec<Message>> {
         self.history
@@ -140,15 +152,20 @@ impl SessionManager {
     /// Append audit event
     pub fn append_audit(&self, session_id: SessionId, event: AuditEvent) -> AlmsResult<()> {
         if let Some(mut audit) = self.audit.get_mut(&session_id) {
-            if let Some(store) = &self.store {
-                if let Err(e) = store.save_audit(&event) {
-                    warn!("Failed to persist audit event for session {}: {}", session_id.0, e);
-                }
+            if let Some(store) = &self.store
+                && let Err(e) = store.save_audit(&event)
+            {
+                warn!(
+                    "Failed to persist audit event for session {}: {}",
+                    session_id.0, e
+                );
             }
             audit.push(event);
             Ok(())
         } else {
-            Err(alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
+            Err(alms_core::AlmsError::SessionNotFound(
+                session_id.0.to_string(),
+            ))
         }
     }
 
@@ -159,7 +176,7 @@ impl SessionManager {
             .map(|a| a.clone())
             .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
     }
-    
+
     /// List active sessions for an agent
     pub fn list_active(&self, agent_id: AgentId) -> Vec<Session> {
         self.sessions
@@ -168,31 +185,32 @@ impl SessionManager {
             .map(|e| e.value().clone())
             .collect()
     }
-    
+
     /// Archive idle sessions
     pub fn archive_idle(&self) -> usize {
         let mut count = 0;
         let timeout = std::time::Duration::from_secs(self.config.idle_timeout_secs);
-        
+
         for mut entry in self.sessions.iter_mut() {
             let session = entry.value_mut();
             let idle = alms_core::Timestamp::now().0 - session.last_activity.0;
-            
-            if idle > chrono::Duration::from_std(timeout).unwrap_or_default() 
-                && session.status == types::SessionStatus::Active {
+
+            if idle > chrono::Duration::from_std(timeout).unwrap_or_default()
+                && session.status == types::SessionStatus::Active
+            {
                 session.status = types::SessionStatus::Idle;
                 count += 1;
                 info!("Archived idle session: {:?}", session.id);
             }
         }
-        
+
         count
     }
-    
+
     /// Delete a session
     pub fn delete(&self, agent_id: AgentId, context_id: impl AsRef<str>) -> AlmsResult<()> {
         let key = (agent_id, context_id.as_ref().to_string());
-        
+
         if let Some((_, session)) = self.sessions.remove(&key) {
             self.history.remove(&session.id);
             info!("Deleted session: {:?}", session.id);
@@ -201,7 +219,7 @@ impl SessionManager {
             Err(alms_core::AlmsError::SessionNotFound(key.1))
         }
     }
-    
+
     /// Get config
     pub fn config(&self) -> &SessionConfig {
         &self.config

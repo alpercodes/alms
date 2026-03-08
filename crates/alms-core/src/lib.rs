@@ -1,16 +1,21 @@
 pub mod agent;
+pub mod audit;
 pub mod channel;
 pub mod config;
 pub mod error;
-pub mod audit;
+pub mod job;
 pub mod run;
 
-pub use channel::{Channel, ChannelMessage, IncomingMessage, OutgoingMessage, ChannelConfig};
+pub use channel::{Channel, ChannelConfig, ChannelMessage, IncomingMessage, OutgoingMessage};
 
+pub use audit::{AuditDecision, AuditEvent};
 pub use config::AlmsConfig;
 pub use error::{AlmsError, AlmsResult};
-pub use audit::{AuditDecision, AuditEvent};
-pub use run::{Run, RunId, RunStatus, RunInput, CreateRunRequest, CreateRunResponse, RunStatusResponse};
+pub use job::{CreateJobRequest, Job, JobId, JobSchedule, JobStatus};
+pub use run::{
+    CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
+    TokenUsage,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

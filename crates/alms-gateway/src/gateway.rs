@@ -1,5 +1,5 @@
 //! ALMS Gateway - Integrated message router
-//! 
+//!
 //! Connects channels (Telegram, etc.) to agent runtimes with session management.
 
 use alms_channel::telegram::TelegramChannel;
@@ -24,8 +24,11 @@ pub struct GatewayConfig {
     pub session_config: SessionConfig,
     /// Path to SQLite database file (None = in-memory only, not persisted)
     pub db_path: Option<String>,
+    /// Base directory for agent workspace files (None = workspace API disabled)
+    pub workspace_dir: Option<std::path::PathBuf>,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
@@ -34,6 +37,7 @@ impl Default for GatewayConfig {
             agent_config: AgentConfig::default(),
             session_config: SessionConfig::default(),
             db_path: None,
+            workspace_dir: None,
         }
     }
 }
@@ -60,16 +64,19 @@ impl GatewayConfig {
             },
             session_config: SessionConfig::default(),
             db_path: None,
+            workspace_dir: None,
         }
     }
 
     /// Load from environment using the unified config system.
     ///
     /// Set `ALMS_DB_PATH` to enable SQLite session persistence.
+    /// Set `ALMS_WORKSPACE_DIR` to enable the workspace API.
     pub fn from_env() -> AlmsResult<Self> {
         let config = AlmsConfig::load()?;
         let mut gateway_config = Self::from_alms_config(&config);
         gateway_config.db_path = std::env::var("ALMS_DB_PATH").ok();
+        gateway_config.workspace_dir = std::env::var("ALMS_WORKSPACE_DIR").ok().map(Into::into);
         Ok(gateway_config)
     }
 }
@@ -96,12 +103,15 @@ impl Gateway {
         let session_manager = match &config.db_path {
             Some(path) => {
                 info!("Opening SQLite session store at {}", path);
-                Arc::new(SessionManager::with_sqlite(config.session_config.clone(), path)?)
+                Arc::new(SessionManager::with_sqlite(
+                    config.session_config.clone(),
+                    path,
+                )?)
             }
             None => Arc::new(SessionManager::new(config.session_config.clone())),
         };
         let llm = LlmClient::new(config.llm_config.clone())?;
-        
+
         Ok(Self {
             config,
             session_manager,
@@ -122,7 +132,7 @@ impl Gateway {
         if let Some(ref token) = self.config.telegram_token {
             info!("Initializing Telegram channel");
             let mut telegram = TelegramChannel::new();
-            
+
             let channel_config = ChannelConfig {
                 token: token.clone(),
                 use_webhook: false,
@@ -130,7 +140,7 @@ impl Gateway {
                 poll_interval_secs: 5,
                 extra: Default::default(),
             };
-            
+
             telegram.initialize(channel_config).await?;
             self.channels.telegram = Some(telegram);
             info!("Telegram channel initialized");
@@ -166,7 +176,7 @@ impl Gateway {
 
         // Create agent runtime
         let runtime = AgentRuntime::new(
-            self.agent_id.clone(),
+            self.agent_id,
             self.config.agent_config.clone(),
             self.llm.clone(),
         );
@@ -185,9 +195,9 @@ impl Gateway {
                         error!("Error handling message: {}", e);
                     }
                 }
-                
+
                 // Add other channel handlers here as needed
-                
+
                 else => {
                     // All channels closed
                     break;
@@ -205,27 +215,26 @@ impl Gateway {
         runtime: &AgentRuntime,
         msg: alms_channel::IncomingMessage,
     ) -> AlmsResult<()> {
-        info!(
-            "Received message from chat {}: {}",
-            msg.chat_id.0,
-            msg.text
-        );
+        info!("Received message from chat {}: {}", msg.chat_id.0, msg.text);
 
         // Use chat_id as context_id for session management
         let context_id = format!("telegram_{}", msg.chat_id.0);
 
         // Run the agent
-        match runtime.run(&self.session_manager, &context_id, &msg.text).await {
-            Ok(response) => {
+        match runtime
+            .run(&self.session_manager, &context_id, &msg.text)
+            .await
+        {
+            Ok(output) => {
                 // Send response back via Telegram
                 if let Some(ref telegram) = self.channels.telegram {
                     let outgoing = alms_channel::OutgoingMessage {
                         chat_id: msg.chat_id,
-                        text: response,
+                        text: output.response,
                         reply_to: Some(msg.message_id),
                         options: Default::default(),
                     };
-                    
+
                     if let Err(e) = telegram.send_message(outgoing).await {
                         error!("Failed to send response: {}", e);
                     } else {
@@ -235,7 +244,7 @@ impl Gateway {
             }
             Err(e) => {
                 error!("Agent error: {}", e);
-                
+
                 // Send error message back to user
                 if let Some(ref telegram) = self.channels.telegram {
                     let outgoing = alms_channel::OutgoingMessage {
@@ -244,7 +253,7 @@ impl Gateway {
                         reply_to: Some(msg.message_id),
                         options: Default::default(),
                     };
-                    
+
                     let _ = telegram.send_message(outgoing).await;
                 }
             }
@@ -283,6 +292,16 @@ impl Gateway {
     pub fn agent_config(&self) -> &AgentConfig {
         &self.config.agent_config
     }
+
+    /// Get workspace base directory (None = workspace API disabled)
+    pub fn workspace_dir(&self) -> Option<&std::path::Path> {
+        self.config.workspace_dir.as_deref()
+    }
+
+    /// Get SQLite database path (None = in-memory only)
+    pub fn db_path(&self) -> Option<&str> {
+        self.config.db_path.as_deref()
+    }
 }
 
 #[cfg(test)]
@@ -297,9 +316,8 @@ mod tests {
 
     #[test]
     fn test_gateway_config_with_token() {
-        let config = GatewayConfig::new()
-            .with_telegram_token("test_token");
-        
+        let config = GatewayConfig::new().with_telegram_token("test_token");
+
         assert_eq!(config.telegram_token, Some("test_token".to_string()));
     }
 }
