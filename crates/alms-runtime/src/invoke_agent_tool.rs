@@ -131,6 +131,7 @@ mod tests {
     use super::*;
     use alms_core::{AlmsResult, RunId, SessionId};
     use async_trait::async_trait;
+    use uuid::Uuid;
 
     #[derive(Debug)]
     struct MockDispatcher(String);
@@ -217,5 +218,82 @@ mod tests {
         let schema = tool.parameters();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "task"));
+    }
+
+    // ── background=true tests ───────────────────────────────────────────────
+
+    /// A dispatcher that implements dispatch_background, returning a fixed UUID.
+    #[derive(Debug)]
+    struct BackgroundDispatcher(Uuid);
+
+    #[async_trait]
+    impl SubagentDispatcher for BackgroundDispatcher {
+        async fn dispatch(
+            &self,
+            _task: String,
+            _system_prompt: Option<String>,
+            _parent_session_id: SessionId,
+            _parent_run_id: Option<RunId>,
+            _parent_event_tx: Option<RuntimeEventSender>,
+        ) -> AlmsResult<String> {
+            Ok("foreground".to_string())
+        }
+
+        async fn dispatch_background(
+            &self,
+            _task: String,
+            _system_prompt: Option<String>,
+            _parent_session_id: SessionId,
+            _parent_run_id: Option<RunId>,
+            _parent_event_tx: Option<RuntimeEventSender>,
+        ) -> AlmsResult<Uuid> {
+            Ok(self.0)
+        }
+    }
+
+    fn make_background_tool(task_id: Uuid) -> InvokeAgentTool {
+        InvokeAgentTool::new(
+            Arc::new(BackgroundDispatcher(task_id)),
+            SessionId::new(),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_background_returns_task_id() {
+        let expected = Uuid::new_v4();
+        let tool = make_background_tool(expected);
+        let result = tool
+            .execute(serde_json::json!({ "task": "do something", "background": true }))
+            .await
+            .unwrap();
+
+        // Must have a "task_id" field and no "response" field
+        assert!(result.get("task_id").is_some(), "missing task_id field");
+        assert!(result.get("response").is_none(), "unexpected response field");
+        assert_eq!(result["task_id"], expected.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_background_false_uses_dispatch() {
+        // background=false should fall through to regular dispatch
+        let tool = make_tool("direct result");
+        let result = tool
+            .execute(serde_json::json!({ "task": "do something", "background": false }))
+            .await
+            .unwrap();
+        assert_eq!(result["response"], "direct result");
+    }
+
+    #[tokio::test]
+    async fn test_background_default_is_foreground() {
+        // Omitting background should behave the same as background=false
+        let tool = make_tool("default result");
+        let result = tool
+            .execute(serde_json::json!({ "task": "do something" }))
+            .await
+            .unwrap();
+        assert_eq!(result["response"], "default result");
     }
 }
