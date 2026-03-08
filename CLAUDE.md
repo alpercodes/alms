@@ -80,11 +80,11 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 1. **ContextBuilder** (`context.rs`): Assembles token-budgeted context windows for LLM calls. Strategies: `truncate` (default), `full`, `sliding-summary` (falls back to truncate for now). Config via `ContextConfig`.
 
 2. **AgentWorkspace** (`workspace.rs`): Per-agent persistent identity files:
-   - `personality.md` — tone, style, constraints (user-editable only)
+   - `personality.md` — tone, style, constraints (agent + user editable; agent writes during bootstrap)
    - `goals.md` — current objectives (agent + user editable)
    - `memories.md` — learned facts, preferences (agent + user editable)
    - Prepended to system prompt when workspace is attached to runtime
-   - `needs_bootstrap()` detects first-time agents
+   - `needs_bootstrap()` detects first-time agents (no `personality.md`)
 
 3. **ToolRegistry** (`tools.rs`): Tools expose JSON Schema parameters via `fn parameters() -> Value`. Definitions serialize to OpenAI format: `{"type": "function", "function": {"name", "description", "parameters"}}`.
 
@@ -97,7 +97,7 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 
 - Feature branches: `feature/<name>`
 - PRs target `main`
-- Pre-commit hook blocks direct main commits (bypass: `ALMS_ALLOW_MAIN_COMMIT=1`)
+- Commit directly to `main` (pre-commit hook removed)
 - Run `make ci` before pushing
 
 ### VPS & Remotes
@@ -111,7 +111,7 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 ## Key Design Decisions
 
 - **SSE over WebSockets** for streaming (simpler, proxy-friendly, reconnect via Last-Event-ID)
-- **Snapshot persistence** (JSON + atomic write + rotation) is the current store; SQLite is planned
+- **SQLite persistence** via `SqliteStore` — sessions + audit events persisted to `./data/alms.db` by default
 - **WASM sandbox** for tool isolation; native builtins bypass WASM for now
 - **Single-process daemon** — no microservice split planned for MVP
 - **Mock LLM** available via `ALMS_LLM_MOCK=1` env var for testing without API keys
@@ -120,15 +120,14 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 ## Known Issues
 
 - 4 sandbox/wasmtime tests fail with "must use async instantiation when async support is enabled" — pre-existing wasmtime config issue
-- Pre-existing unused import warnings across several crates (alms-sandbox, alms-channel, alms-core)
 - `sliding-summary` context strategy falls back to `truncate` (not yet implemented)
-- `workspace_write` tool referenced in workspace docs but not yet created
 - Coordinator is still a stub — `execute_task` is a placeholder
+- `shell_exec` / `fs_*` tools have no path-prefix or command allowlist beyond `..` traversal rejection — treat these as power-user features; use `Guarded` posture in shared environments
 
-## Current State (as of 2026-02-14)
+## Current State (as of 2026-03-09)
 
-**Working**: core types, unified config system, session management, agent runtime with tool loop + context builder + workspace integration, HTTP gateway with SSE, Telegram adapter, snapshot persistence, builtin tools with real JSON schemas, OpenAI-format tool definitions.
+**Working**: core types, unified config, session management, agent runtime with tool loop + context builder + workspace integration, HTTP gateway with SSE, Telegram adapter, SQLite persistence (`./data/alms.db`), agent workspace files (personality/goals/memories), bootstrap interview, builtin tools (echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write), per-run overrides (model, temperature, max_tokens, posture), approval workflow (guarded posture), cron/scheduler, scheduled jobs (SQLite-backed), audit log, web UI with settings/workspace/jobs/audit panels.
 
-**Not yet real**: coordinator/multi-agent (stub), approval workflow, cron/scheduler, SQLite storage, sliding-summary context strategy, workspace_write tool.
+**Not yet real**: coordinator/multi-agent (stub), sliding-summary context strategy.
 
 See `docs/TASKS.md` for the prioritized task list, `docs/agent-runtime-design.md` for the runtime design, and `docs/agent-ux-requirements.md` for UX requirements.

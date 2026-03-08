@@ -4,6 +4,33 @@ use serde_json::Value;
 /// Built-in tool trait marker
 pub trait BuiltinTool: Tool {}
 
+/// Reject paths that contain `..` components to prevent directory traversal.
+fn check_no_traversal(path: &str) -> SandboxResult<()> {
+    let p = std::path::Path::new(path);
+    for component in p.components() {
+        if component == std::path::Component::ParentDir {
+            return Err(SandboxError::SandboxViolation(
+                format!("Path traversal not allowed: '{}'", path),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
+/// Appends a truncation note when the string is shortened.
+fn safe_truncate(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    // Walk back from max_bytes until we land on a char boundary.
+    let boundary = (0..=max_bytes)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    format!("{}…[truncated, {} bytes omitted]", &s[..boundary], s.len() - boundary)
+}
+
 /// Echo tool - returns the input unchanged
 #[derive(Debug, Clone, Default)]
 pub struct EchoTool;
@@ -416,10 +443,15 @@ impl Tool for ShellExecTool {
             .as_str()
             .ok_or_else(|| SandboxError::InvalidParameters("argv[0] must be a string".to_string()))?;
 
-        let args: Vec<&str> = argv[1..]
+        let args = argv[1..]
             .iter()
-            .map(|v| v.as_str().unwrap_or(""))
-            .collect();
+            .enumerate()
+            .map(|(i, v)| {
+                v.as_str().ok_or_else(|| {
+                    SandboxError::InvalidParameters(format!("argv[{}] must be a string", i + 1))
+                })
+            })
+            .collect::<SandboxResult<Vec<&str>>>()?;
 
         let timeout_secs = params
             .get("timeout_secs")
@@ -431,11 +463,15 @@ impl Tool for ShellExecTool {
         cmd.args(&args);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
 
         if let Some(cwd) = params.get("cwd").and_then(|v| v.as_str()) {
             cmd.current_dir(cwd);
         }
 
+        // Clear the daemon's environment (which holds API keys, tokens, etc.)
+        // before applying user-specified env vars.
+        cmd.env_clear();
         if let Some(env_obj) = params.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env_obj {
                 if let Some(val) = v.as_str() {
@@ -459,17 +495,8 @@ impl Tool for ShellExecTool {
         const MAX_OUTPUT: usize = 8000;
         let stdout = String::from_utf8_lossy(&result.stdout);
         let stderr = String::from_utf8_lossy(&result.stderr);
-
-        let stdout_str = if stdout.len() > MAX_OUTPUT {
-            format!("{}…[truncated {} chars]", &stdout[..MAX_OUTPUT], stdout.len() - MAX_OUTPUT)
-        } else {
-            stdout.into_owned()
-        };
-        let stderr_str = if stderr.len() > MAX_OUTPUT {
-            format!("{}…[truncated {} chars]", &stderr[..MAX_OUTPUT], stderr.len() - MAX_OUTPUT)
-        } else {
-            stderr.into_owned()
-        };
+        let stdout_str = safe_truncate(&stdout, MAX_OUTPUT);
+        let stderr_str = safe_truncate(&stderr, MAX_OUTPUT);
 
         Ok(serde_json::json!({
             "exit_code": result.status.code().unwrap_or(-1),
@@ -522,16 +549,14 @@ impl Tool for FsReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
+        check_no_traversal(path)?;
+
         let content = tokio::fs::read_to_string(path)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
 
         const MAX_CONTENT: usize = 32000;
-        let result = if content.len() > MAX_CONTENT {
-            format!("{}…[truncated, {} chars total]", &content[..MAX_CONTENT], content.len())
-        } else {
-            content
-        };
+        let result = safe_truncate(&content, MAX_CONTENT);
 
         Ok(serde_json::json!({ "content": result }))
     }
@@ -585,6 +610,8 @@ impl Tool for FsWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
+        check_no_traversal(path)?;
+
         let content = params
             .get("content")
             .and_then(|v| v.as_str())
@@ -605,6 +632,11 @@ impl Tool for FsWriteTool {
         }
 
         match mode {
+            "write" => {
+                tokio::fs::write(path, content)
+                    .await
+                    .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", path, e)))?;
+            }
             "append" => {
                 use tokio::io::AsyncWriteExt;
                 let mut file = tokio::fs::OpenOptions::new()
@@ -617,10 +649,11 @@ impl Tool for FsWriteTool {
                     .await
                     .map_err(|e| SandboxError::Io(format!("Failed to append to '{}': {}", path, e)))?;
             }
-            _ => {
-                tokio::fs::write(path, content)
-                    .await
-                    .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", path, e)))?;
+            other => {
+                return Err(SandboxError::InvalidParameters(format!(
+                    "Invalid mode '{}': must be 'write' or 'append'",
+                    other
+                )));
             }
         }
 
@@ -666,16 +699,26 @@ impl Tool for FsListTool {
             .and_then(|v| v.as_str())
             .unwrap_or(".");
 
+        check_no_traversal(path)?;
+
         let mut read_dir = tokio::fs::read_dir(path)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to list '{}': {}", path, e)))?;
 
+        const MAX_ENTRIES: usize = 500;
         let mut entries = Vec::new();
         while let Some(entry) = read_dir
             .next_entry()
             .await
             .map_err(|e| SandboxError::Io(format!("Error reading dir entry: {}", e)))?
         {
+            if entries.len() >= MAX_ENTRIES {
+                entries.push(serde_json::json!({
+                    "name": "…[truncated: more than 500 entries]",
+                    "is_dir": false
+                }));
+                break;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = entry
                 .file_type()
@@ -782,5 +825,234 @@ mod tests {
         assert!(!EchoTool::new().description().is_empty());
         assert!(!MathTool::new().description().is_empty());
         assert!(!HttpGetTool::new().description().is_empty());
+        assert!(!ShellExecTool::new().description().is_empty());
+        assert!(!FsReadTool::new().description().is_empty());
+        assert!(!FsWriteTool::new().description().is_empty());
+        assert!(!FsListTool::new().description().is_empty());
+    }
+
+    // ── safe_truncate ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_safe_truncate_short_string() {
+        assert_eq!(safe_truncate("hello", 100), "hello");
+    }
+
+    #[test]
+    fn test_safe_truncate_exact_boundary() {
+        let s = "hello";
+        assert_eq!(safe_truncate(s, 5), "hello");
+    }
+
+    #[test]
+    fn test_safe_truncate_ascii() {
+        let s = "abcde";
+        let result = safe_truncate(s, 3);
+        assert!(result.starts_with("abc"));
+        assert!(result.contains("truncated"));
+    }
+
+    #[test]
+    fn test_safe_truncate_multibyte() {
+        // '€' is 3 bytes (0xE2 0x82 0xAC). Truncating at byte 4 would split it.
+        let s = "€€€";
+        // Truncate at 4 bytes — must not panic and must land on a char boundary.
+        let result = safe_truncate(s, 4);
+        // '€' (3 bytes) fits; second '€' starts at byte 3, so boundary is 3.
+        assert!(result.starts_with('€'));
+        assert!(result.contains("truncated"));
+    }
+
+    // ── check_no_traversal ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_traversal_rejected() {
+        assert!(check_no_traversal("../etc/passwd").is_err());
+        assert!(check_no_traversal("foo/../../secret").is_err());
+        assert!(check_no_traversal("..").is_err());
+    }
+
+    #[test]
+    fn test_traversal_allowed() {
+        assert!(check_no_traversal("data/logs/app.log").is_ok());
+        assert!(check_no_traversal("/absolute/path").is_ok());
+        assert!(check_no_traversal("relative").is_ok());
+        assert!(check_no_traversal(".").is_ok());
+    }
+
+    // ── ShellExecTool ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_shell_exec_missing_argv() {
+        let result = ShellExecTool::new().execute(serde_json::json!({})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_shell_exec_empty_argv() {
+        let result = ShellExecTool::new().execute(serde_json::json!({"argv": []})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_shell_exec_non_string_arg() {
+        let result = ShellExecTool::new()
+            .execute(serde_json::json!({"argv": ["echo", 42]}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_echo() {
+        let result = ShellExecTool::new()
+            .execute(serde_json::json!({"argv": ["echo", "hello"]}))
+            .await
+            .unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert!(result["stdout"].as_str().unwrap().contains("hello"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_env_cleared() {
+        // The daemon env has OPENROUTER_API_KEY etc. After env_clear(), "env" output
+        // should not contain any inherited vars — just whatever PATH-equivalent the
+        // OS injects by default.
+        let result = ShellExecTool::new()
+            .execute(serde_json::json!({"argv": ["env"]}))
+            .await
+            .unwrap();
+        // With env_clear(), no OPENROUTER_API_KEY should leak.
+        assert!(!result["stdout"].as_str().unwrap().contains("OPENROUTER_API_KEY"));
+    }
+
+    // ── FsReadTool ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_fs_read_traversal_rejected() {
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": "../../../etc/passwd"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_missing_path() {
+        let result = FsReadTool::new().execute(serde_json::json!({})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_nonexistent_file() {
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": "nonexistent_file_xyz.txt"}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    // ── FsWriteTool ───────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_fs_write_traversal_rejected() {
+        let result = FsWriteTool::new()
+            .execute(serde_json::json!({"path": "../../evil.sh", "content": "rm -rf /"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_invalid_mode() {
+        let result = FsWriteTool::new()
+            .execute(serde_json::json!({"path": "test.txt", "content": "hi", "mode": "replace"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid mode"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_and_read_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        let path_str = path.to_str().unwrap();
+
+        // Write
+        let result = FsWriteTool::new()
+            .execute(serde_json::json!({"path": path_str, "content": "world"}))
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+
+        // Read back
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path_str}))
+            .await
+            .unwrap();
+        assert_eq!(result["content"], "world");
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("append.txt");
+        let path_str = path.to_str().unwrap();
+
+        FsWriteTool::new()
+            .execute(serde_json::json!({"path": path_str, "content": "line1\n"}))
+            .await
+            .unwrap();
+        FsWriteTool::new()
+            .execute(serde_json::json!({"path": path_str, "content": "line2\n", "mode": "append"}))
+            .await
+            .unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path_str}))
+            .await
+            .unwrap();
+        assert_eq!(result["content"], "line1\nline2\n");
+    }
+
+    // ── FsListTool ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_fs_list_traversal_rejected() {
+        let result = FsListTool::new()
+            .execute(serde_json::json!({"path": "../../"}))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fs_list_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path_str = dir.path().to_str().unwrap();
+
+        // Create a file and a subdirectory
+        std::fs::write(dir.path().join("file.txt"), "").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let result = FsListTool::new()
+            .execute(serde_json::json!({"path": path_str}))
+            .await
+            .unwrap();
+
+        let entries = result["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        // Dirs come first
+        assert_eq!(entries[0]["name"], "subdir");
+        assert_eq!(entries[0]["is_dir"], true);
+        assert_eq!(entries[1]["name"], "file.txt");
+        assert_eq!(entries[1]["is_dir"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_list_nonexistent() {
+        let result = FsListTool::new()
+            .execute(serde_json::json!({"path": "nonexistent_dir_xyz"}))
+            .await;
+        assert!(result.is_err());
     }
 }

@@ -14,12 +14,11 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         Posture::Guarded => "guarded",
     };
 
-    // Base builtin tools always available; workspace_write added when workspace is configured.
-    let mut tools = alms_runtime::ToolRegistry::with_builtins().list();
+    // List tools by name directly — avoids constructing a full ToolRegistry per request.
+    let mut tools: Vec<&str> = vec!["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec"];
     if state.workspace_dir.is_some() {
-        tools.push("workspace_write".to_string());
+        tools.push("workspace_write");
     }
-    tools.sort();
 
     Json(serde_json::json!({
         "model": llm.default_model,

@@ -148,12 +148,25 @@ async fn execute_run(
     // Apply per-run overrides (temperature, max_tokens, posture).
     let agent_config = {
         let mut cfg = agent_config;
-        if let Some(t) = overrides.temperature { cfg.temperature = t; }
-        if let Some(m) = overrides.max_tokens  { cfg.max_tokens = m; }
+        if let Some(t) = overrides.temperature {
+            // Clamp to the range LLMs accept; values outside 0.0–2.0 are rejected by most providers.
+            cfg.temperature = t.clamp(0.0, 2.0);
+        }
+        if let Some(m) = overrides.max_tokens {
+            if m == 0 {
+                warn!("Run {}: max_tokens override of 0 ignored (must be >= 1)", run_id.0);
+            } else {
+                cfg.max_tokens = m;
+            }
+        }
         if let Some(ref p) = overrides.posture {
             cfg.posture = match p.as_str() {
                 "guarded" => alms_runtime::Posture::Guarded,
-                _ => alms_runtime::Posture::FullControl,
+                "full_control" => alms_runtime::Posture::FullControl,
+                other => {
+                    warn!("Run {}: unknown posture '{}', keeping server default", run_id.0, other);
+                    cfg.posture
+                }
             };
         }
         cfg
