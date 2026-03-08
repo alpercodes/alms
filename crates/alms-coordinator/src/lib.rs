@@ -6,15 +6,12 @@ use alms_runtime::{AgentConfig, AgentRuntime, LlmClient, RunOutput};
 use alms_session::SessionManager;
 use async_trait::async_trait;
 use dashmap::DashMap;
-pub use main_agent::MainAgent;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
-
-pub mod main_agent;
 
 /// Unique identifier for a subagent task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
