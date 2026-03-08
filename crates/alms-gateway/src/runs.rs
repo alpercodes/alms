@@ -131,6 +131,21 @@ async fn execute_run(
     // Create a runtime event channel so we can forward tool events to SSE
     let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
 
+    // Override system prompt with bootstrap prompt for first-time agents
+    let agent_config = if let Some(ref workspace_dir) = state.workspace_dir {
+        let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, agent_id);
+        if workspace.needs_bootstrap() {
+            info!("Agent {} has no personality.md — using bootstrap prompt", agent_id.0);
+            let mut cfg = agent_config;
+            cfg.system_prompt = alms_runtime::AgentWorkspace::bootstrap_prompt().to_string();
+            cfg
+        } else {
+            agent_config
+        }
+    } else {
+        agent_config
+    };
+
     let mut runtime = alms_runtime::AgentRuntime::new(agent_id, agent_config, llm)
         .with_event_sender(runtime_tx)
         .with_run_id(run_id);
