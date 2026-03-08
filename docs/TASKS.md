@@ -142,17 +142,19 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Implemented in `alms-gateway/src/workspace.rs`; routes wired in `server.rs`.
 - **Owners:** Atlas
 
-19) Jobs HTTP API + SQLite persistence
-- `POST /jobs` — create a scheduled job (once or recurring, with prompt + agent_id).
-- `GET /jobs` — list all jobs with status and next_run_at.
-- `DELETE /jobs/{id}` — cancel a job.
-- Add `jobs` table to SQLite store; jobs survive restart.
+19) Jobs HTTP API + SQLite persistence ✅
+- `POST /jobs`, `GET /jobs`, `GET /jobs/{id}`, `DELETE /jobs/{id}` implemented.
+- `jobs` table in SQLite; `JobStore` with DashMap + write-through; jobs survive restart.
+- `cancel()` returns `Option<bool>` to distinguish 404 from 409 Conflict.
 - **Owners:** Atlas
 
-20) Scheduler → agent run integration
-- When a scheduled job fires, create a `Run` and execute it through the agent loop.
-- Job run results linked to the job record; visible in run history.
-- Completes the full cron loop: schedule → fire → run → audit → persist.
+20) Scheduler → agent run integration ✅
+- Fired job IDs sent via mpsc channel → `fire_job_run` → `execute_run`.
+- `Run.job_id` links run back to the triggering job; visible in `GET /runs/{id}`.
+- `record_run()` updates `last_run_at`, `status`, `next_run_at` atomically.
+- Recurring jobs re-armed with next cron time after each firing.
+- `bootstrap_scheduler()` re-registers persisted jobs on startup.
+- Cancellation mid-run is detected before re-arm (guard in `fire_job_run`).
 - **Owners:** Atlas
 
 21) Extended web UI

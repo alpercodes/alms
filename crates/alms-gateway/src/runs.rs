@@ -228,6 +228,18 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     // Execute the run (awaits completion; errors are handled inside execute_run).
     execute_run(state.clone(), run_id, session_id, job.agent_id, run.input).await;
 
+    // Guard: if the job was cancelled while the run was in progress, do not
+    // overwrite the Cancelled status or re-arm the scheduler.
+    if state
+        .job_store
+        .get(job_id)
+        .map(|j| j.status == JobStatus::Cancelled)
+        .unwrap_or(true)
+    {
+        info!("Job was cancelled during run, skipping post-run update");
+        return Ok(());
+    }
+
     // Update job record after run completes.
     let now = Utc::now();
     let (new_status, next_run_at) = match &job.schedule {
