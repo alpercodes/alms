@@ -3,13 +3,17 @@
 //! Provides REST API endpoints per docs/api.md specification.
 
 use crate::approvals::{ApprovalStore, list_approvals, resolve_approval};
+use crate::cron_utils;
 use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
-use crate::runs::{create_run, get_run_status, stream_run_events, stream_run_legacy};
+use crate::runs::{
+    create_run, get_run_status, scheduler_fire_loop, stream_run_events, stream_run_legacy,
+};
 use crate::sse::SseEventData;
 use crate::workspace::{get_workspace, update_workspace_file};
-use alms_core::{AgentId, AlmsResult, Run, RunId, SessionId};
+use alms_core::{AgentId, AlmsResult, JobStatus, Run, RunId, SessionId};
+use alms_runtime::Scheduler;
 use alms_session::{JobStore, SessionManager};
 use axum::{
     Json, Router,
@@ -103,10 +107,12 @@ pub struct AppState {
     pub workspace_dir: Option<std::path::PathBuf>,
     /// Job store for scheduled jobs
     pub job_store: Arc<JobStore>,
+    /// Scheduler for firing jobs at the right time
+    pub scheduler: Arc<Scheduler>,
 }
 
 impl AppState {
-    pub fn new(gateway: Gateway) -> AlmsResult<Self> {
+    pub fn new(gateway: Gateway, scheduler: Arc<Scheduler>) -> AlmsResult<Self> {
         let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
         let job_store = match gateway.db_path() {
             Some(path) => {
@@ -122,6 +128,7 @@ impl AppState {
             approval_store: ApprovalStore::new(),
             workspace_dir,
             job_store,
+            scheduler,
         })
     }
 }
@@ -272,13 +279,29 @@ pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
 }
 
 pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult<()> {
-    let state = AppState::new(gateway)?;
+    // Create the scheduler with a fire channel so job IDs are forwarded to
+    // the gateway for actual agent-run dispatch.
+    let (fire_tx, fire_rx) = tokio::sync::mpsc::unbounded_channel::<alms_core::JobId>();
+    let scheduler = Arc::new(Scheduler::new().with_fire_channel(fire_tx));
+
+    let state = AppState::new(gateway, scheduler)?;
 
     {
         let mut gateway = state.gateway.lock().await;
         gateway.initialize_channels().await?;
         gateway.start().await?;
     }
+
+    // Re-register persisted jobs before starting the runner so the heap is
+    // populated before the first sleep.
+    bootstrap_scheduler(&state).await?;
+
+    // Start the background scheduler runner.
+    let _scheduler_handle = state.scheduler.start();
+
+    // Spawn the fire-receiver: turns fired JobIds into real agent runs.
+    let fire_state = state.clone();
+    tokio::spawn(scheduler_fire_loop(fire_rx, fire_state));
 
     let background_gateway = state.gateway.clone();
     tokio::spawn(async move {
@@ -295,6 +318,35 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+/// Re-register all non-cancelled persisted jobs with the scheduler on startup.
+async fn bootstrap_scheduler(state: &AppState) -> AlmsResult<()> {
+    let now = chrono::Utc::now();
+    let jobs = state.job_store.list();
+    let mut registered = 0usize;
+
+    for job in jobs {
+        if job.status == JobStatus::Cancelled {
+            continue;
+        }
+        let Some(fire_at) = cron_utils::compute_next_fire(&job, now) else {
+            tracing::warn!("Job {} has no future fire time, skipping bootstrap", job.id);
+            continue;
+        };
+        let delay = (fire_at - now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        let instant = tokio::time::Instant::now() + delay;
+        state.scheduler.schedule_once(job.id, instant).await;
+        state.job_store.update_next_run_at(job.id, Some(fire_at))?;
+        registered += 1;
+    }
+
+    if registered > 0 {
+        info!("Bootstrapped {} job(s) into scheduler", registered);
+    }
     Ok(())
 }
 

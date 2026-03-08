@@ -20,7 +20,7 @@ pub use context::ContextBuilder;
 pub use events::{RuntimeEvent, RuntimeEventSender};
 pub use llm_client::LlmClient;
 pub use llm_types::*;
-pub use scheduler::{JobId, JobRun, Scheduler};
+pub use scheduler::{JobRun, Scheduler};
 pub use tools::ToolRegistry;
 pub use workspace::{AgentWorkspace, WorkspaceFile};
 

@@ -13,6 +13,7 @@ alms-channel = { path = "../alms-channel" }
 
 axum.workspace = true
 chrono.workspace = true
+cron.workspace = true
 dashmap.workspace = true
 tokio.workspace = true
 tokio-stream = { version = "0.1", features = ["sync"] }

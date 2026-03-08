@@ -3,49 +3,37 @@
 //! Uses `tokio::time::sleep_until` exclusively so tests can freeze/advance the
 //! simulated clock with `tokio::time::pause()` + `tokio::time::advance()`.
 //!
+//! Jobs are identified by [`alms_core::JobId`] supplied by the caller.
+//! When a job fires, its ID is sent on an optional mpsc channel so the gateway
+//! can dispatch the actual agent run without blocking the scheduler loop.
+//!
 //! # Usage
 //! ```ignore
-//! let scheduler = Scheduler::new();
+//! let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+//! let scheduler = Scheduler::new().with_fire_channel(tx);
 //! let handle = scheduler.start();
-//! scheduler.schedule_once("my-job", Instant::now() + Duration::from_secs(60)).await;
-//! // ... later ...
-//! let runs = scheduler.completed_runs().await;
+//! let id = alms_core::JobId::new();
+//! scheduler.schedule_once(id, Instant::now() + Duration::from_secs(60)).await;
+//! let fired_id = rx.recv().await.unwrap(); // == id
 //! ```
 
+use alms_core::JobId;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::{self, Instant};
 use tracing::info;
-use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Opaque identifier for a scheduled job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct JobId(Uuid);
-
-impl JobId {
-    fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl std::fmt::Display for JobId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Record of a single job execution.
+/// Record of a single job execution (useful for testing / history).
 #[derive(Debug, Clone)]
 pub struct JobRun {
     pub job_id: JobId,
-    pub job_name: String,
     pub scheduled_at: Instant,
     pub ran_at: Instant,
 }
@@ -57,9 +45,8 @@ pub struct JobRun {
 #[derive(Debug, Clone)]
 struct PendingJob {
     id: JobId,
-    name: String,
     run_at: Instant,
-    /// Some(d) = recurring; re-enqueued after each firing.
+    /// Some(d) = interval-recurring; re-enqueued after each firing.
     interval: Option<Duration>,
 }
 
@@ -89,13 +76,15 @@ impl Ord for PendingJob {
 ///
 /// Call [`start`] once to spawn the background runner, then use
 /// [`schedule_once`] / [`schedule_recurring`] to add jobs.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Scheduler {
     pending: Arc<Mutex<BinaryHeap<Reverse<PendingJob>>>>,
     cancelled: Arc<Mutex<HashSet<JobId>>>,
     history: Arc<Mutex<Vec<JobRun>>>,
     /// Wakes the runner loop when a new job is added (or a cancel occurs).
     notify: Arc<Notify>,
+    /// Optional channel: fired job IDs are sent here for the gateway to dispatch.
+    fire_tx: Option<Arc<mpsc::UnboundedSender<JobId>>>,
 }
 
 impl Default for Scheduler {
@@ -111,41 +100,39 @@ impl Scheduler {
             cancelled: Arc::new(Mutex::new(HashSet::new())),
             history: Arc::new(Mutex::new(Vec::new())),
             notify: Arc::new(Notify::new()),
+            fire_tx: None,
         }
     }
 
-    /// Schedule a one-shot job to run at `at`.
-    pub async fn schedule_once(&self, name: impl Into<String>, at: Instant) -> JobId {
-        let id = JobId::new();
+    /// Attach a fire channel. When a job fires, its `JobId` is sent on `tx`.
+    pub fn with_fire_channel(mut self, tx: mpsc::UnboundedSender<JobId>) -> Self {
+        self.fire_tx = Some(Arc::new(tx));
+        self
+    }
+
+    /// Schedule a one-shot job with a caller-supplied ID to run at `at`.
+    pub async fn schedule_once(&self, id: JobId, at: Instant) {
         self.pending.lock().await.push(Reverse(PendingJob {
             id,
-            name: name.into(),
             run_at: at,
             interval: None,
         }));
         self.notify.notify_one();
-        id
     }
 
-    /// Schedule a recurring job: first fires at `start`, then every `interval`.
-    pub async fn schedule_recurring(
-        &self,
-        name: impl Into<String>,
-        start: Instant,
-        interval: Duration,
-    ) -> JobId {
-        let id = JobId::new();
+    /// Schedule a recurring job with a caller-supplied ID: first fires at `start`,
+    /// then every `interval`. For cron-based jobs prefer the one-shot pattern
+    /// (re-arm after each firing with the next cron time).
+    pub async fn schedule_recurring(&self, id: JobId, start: Instant, interval: Duration) {
         self.pending.lock().await.push(Reverse(PendingJob {
             id,
-            name: name.into(),
             run_at: start,
             interval: Some(interval),
         }));
         self.notify.notify_one();
-        id
     }
 
-    /// Cancel future firings of a job. Runs already recorded are not removed.
+    /// Cancel future firings of a job. Already-recorded runs are not removed.
     pub async fn cancel(&self, id: JobId) {
         self.cancelled.lock().await.insert(id);
         // Wake the runner so it skips this job if it's currently sleeping for it.
@@ -220,14 +207,13 @@ impl Scheduler {
             }
         }
 
-        // Re-enqueue recurring jobs (unless cancelled).
+        // Re-enqueue interval-recurring jobs (unless cancelled).
         for job in &due {
             if let Some(interval) = job.interval
                 && !cancelled.contains(&job.id)
             {
                 pending.push(Reverse(PendingJob {
                     id: job.id,
-                    name: job.name.clone(),
                     run_at: job.run_at + interval,
                     interval: Some(interval),
                 }));
@@ -239,13 +225,15 @@ impl Scheduler {
         let ran_at = Instant::now();
         let mut history = self.history.lock().await;
         for job in due {
-            info!(job_name = %job.name, job_id = %job.id, "Scheduled job fired");
+            info!(job_id = %job.id, "Scheduled job fired");
             history.push(JobRun {
                 job_id: job.id,
-                job_name: job.name.clone(),
                 scheduled_at: job.run_at,
                 ran_at,
             });
+            if let Some(ref tx) = self.fire_tx {
+                let _ = tx.send(job.id);
+            }
         }
     }
 }
@@ -257,6 +245,7 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alms_core::JobId;
     use std::time::Duration;
     use tokio::time::Instant;
 
@@ -275,14 +264,15 @@ mod tests {
         let scheduler = Scheduler::new();
         let handle = scheduler.start();
 
+        let id = JobId::new();
         let at = Instant::now() + Duration::from_secs(60);
-        scheduler.schedule_once("test-job", at).await;
+        scheduler.schedule_once(id, at).await;
 
         advance(Duration::from_secs(61)).await;
 
         let runs = scheduler.completed_runs().await;
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].job_name, "test-job");
+        assert_eq!(runs[0].job_id, id);
 
         handle.abort();
     }
@@ -294,8 +284,9 @@ mod tests {
         let scheduler = Scheduler::new();
         let handle = scheduler.start();
 
+        let id = JobId::new();
         let at = Instant::now() + Duration::from_secs(60);
-        scheduler.schedule_once("too-soon", at).await;
+        scheduler.schedule_once(id, at).await;
 
         // Advance only 30 s — job should not have fired.
         advance(Duration::from_secs(30)).await;
@@ -313,9 +304,10 @@ mod tests {
         let scheduler = Scheduler::new();
         let handle = scheduler.start();
 
+        let id = JobId::new();
         let start = Instant::now() + Duration::from_secs(10);
         scheduler
-            .schedule_recurring("ticker", start, Duration::from_secs(10))
+            .schedule_recurring(id, start, Duration::from_secs(10))
             .await;
 
         // First firing.
@@ -330,9 +322,9 @@ mod tests {
         advance(Duration::from_secs(10)).await;
         assert_eq!(scheduler.completed_runs().await.len(), 3);
 
-        // All runs are named correctly.
+        // All runs reference the same job ID.
         for run in scheduler.completed_runs().await {
-            assert_eq!(run.job_name, "ticker");
+            assert_eq!(run.job_id, id);
         }
 
         handle.abort();
@@ -345,9 +337,10 @@ mod tests {
         let scheduler = Scheduler::new();
         let handle = scheduler.start();
 
+        let id = JobId::new();
         let start = Instant::now() + Duration::from_secs(10);
-        let id = scheduler
-            .schedule_recurring("cancelable", start, Duration::from_secs(10))
+        scheduler
+            .schedule_recurring(id, start, Duration::from_secs(10))
             .await;
 
         // Let it fire once.
@@ -377,22 +370,44 @@ mod tests {
         let scheduler = Scheduler::new();
         let handle = scheduler.start();
 
+        let id_a = JobId::new();
+        let id_b = JobId::new();
         let now = Instant::now();
         scheduler
-            .schedule_once("job-b", now + Duration::from_secs(20))
+            .schedule_once(id_b, now + Duration::from_secs(20))
             .await;
         scheduler
-            .schedule_once("job-a", now + Duration::from_secs(10))
+            .schedule_once(id_a, now + Duration::from_secs(10))
             .await;
 
         advance(Duration::from_secs(25)).await;
 
         let runs = scheduler.completed_runs().await;
         assert_eq!(runs.len(), 2);
-        // Both should have fired; order in history is firing order.
-        let names: Vec<&str> = runs.iter().map(|r| r.job_name.as_str()).collect();
-        assert!(names.contains(&"job-a"));
-        assert!(names.contains(&"job-b"));
+        let ids: Vec<JobId> = runs.iter().map(|r| r.job_id).collect();
+        assert!(ids.contains(&id_a));
+        assert!(ids.contains(&id_b));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_fire_channel_receives_fired_ids() {
+        tokio::time::pause();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new().with_fire_channel(tx);
+        let handle = scheduler.start();
+
+        let id = JobId::new();
+        scheduler
+            .schedule_once(id, Instant::now() + Duration::from_secs(5))
+            .await;
+
+        advance(Duration::from_secs(6)).await;
+
+        let fired = rx.try_recv().expect("should have received fired job id");
+        assert_eq!(fired, id);
 
         handle.abort();
     }

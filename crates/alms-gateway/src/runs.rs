@@ -3,11 +3,12 @@
 //! Implements POST /runs and GET /runs/{id}/events per docs/api.md
 
 use crate::approvals::{ApprovalStore, PendingApproval};
+use crate::cron_utils;
 use crate::server::AppState;
 use crate::sse::{RunEventStream, SseEventData, ToolInvocationId, event_channel};
 use alms_core::{
-    CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
-    SessionId,
+    CreateRunRequest, CreateRunResponse, JobId, JobSchedule, JobStatus, Run, RunId, RunInput,
+    RunStatus, RunStatusResponse, SessionId,
 };
 use alms_runtime::RuntimeEvent;
 use axum::{
@@ -18,7 +19,7 @@ use axum::{
 };
 use chrono::Utc;
 use tokio::sync::mpsc;
-use tracing::{error, info, instrument};
+use tracing::{error, info, instrument, warn};
 
 /// POST /runs - Create a new run
 ///
@@ -178,6 +179,81 @@ async fn execute_run(
     state.run_manager.remove_sender(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
+}
+
+// ---------------------------------------------------------------------------
+// Scheduler integration
+// ---------------------------------------------------------------------------
+
+/// Receives fired job IDs from the scheduler and dispatches agent runs.
+///
+/// Each fired job is handled in its own spawned task so a slow run does not
+/// block the fire loop from processing subsequent firings.
+pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, state: AppState) {
+    while let Some(job_id) = rx.recv().await {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = fire_job_run(state_clone, job_id).await {
+                error!("Job {} run dispatch failed: {}", job_id, e);
+            }
+        });
+    }
+}
+
+/// Create and execute an agent run triggered by a scheduled job.
+#[instrument(level = "info", skip(state), fields(job_id = %job_id))]
+async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<()> {
+    // Look up the job — it may have been cancelled between scheduling and firing.
+    let Some(job) = state.job_store.get(job_id) else {
+        info!("Skipping fired job — not found in store");
+        return Ok(());
+    };
+    if job.status == JobStatus::Cancelled {
+        info!("Skipping fired job — already cancelled");
+        return Ok(());
+    }
+
+    // Use a stable context_id so each job accumulates session history across firings.
+    let context_id = format!("job_{}", job_id.0);
+    let session = state
+        .session_manager
+        .get_or_create(job.agent_id, &context_id);
+    let session_id = session.id;
+
+    let run = Run::for_job(session_id, job.agent_id, job.prompt.clone(), job_id);
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+    info!("Job fired → run {}", run_id.0);
+
+    // Execute the run (awaits completion; errors are handled inside execute_run).
+    execute_run(state.clone(), run_id, session_id, job.agent_id, run.input).await;
+
+    // Update job record after run completes.
+    let now = Utc::now();
+    let (new_status, next_run_at) = match &job.schedule {
+        JobSchedule::Once { .. } => (JobStatus::Cancelled, None),
+        JobSchedule::Recurring { cron } => {
+            let next = cron_utils::next_after(cron, now);
+            if next.is_none() {
+                warn!("Recurring cron '{}' has no future occurrences", cron);
+            }
+            (JobStatus::Active, next)
+        }
+    };
+
+    state
+        .job_store
+        .record_run(job_id, now, new_status, next_run_at)?;
+
+    // Re-arm recurring jobs with the next computed fire time.
+    if let Some(next) = next_run_at {
+        let delay = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
+        let instant = tokio::time::Instant::now() + delay;
+        state.scheduler.schedule_once(job_id, instant).await;
+        info!("Recurring job re-armed for {}", next);
+    }
+
+    Ok(())
 }
 
 /// Reads RuntimeEvents from the runtime and forwards them as SSE events.

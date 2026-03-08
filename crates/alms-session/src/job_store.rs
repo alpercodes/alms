@@ -102,6 +102,52 @@ impl JobStore {
         self.jobs.get(&id).map(|e| e.value().clone())
     }
 
+    /// Update the next scheduled fire time for a job (used after bootstrap and create).
+    pub fn update_next_run_at(
+        &self,
+        id: JobId,
+        next: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AlmsResult<()> {
+        if let Some(mut entry) = self.jobs.get_mut(&id) {
+            entry.next_run_at = next;
+            let job = entry.clone();
+            drop(entry);
+            if let Some(ref store) = self.store
+                && let Err(e) = store.save_job(&job)
+            {
+                warn!("Failed to persist next_run_at for job {}: {}", id.0, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record that a job fired: update last_run_at, status, and next_run_at atomically.
+    ///
+    /// Returns the updated job, or `None` if the job was not found (e.g. deleted mid-flight).
+    pub fn record_run(
+        &self,
+        id: JobId,
+        ran_at: chrono::DateTime<chrono::Utc>,
+        new_status: JobStatus,
+        next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> AlmsResult<Option<Job>> {
+        let Some(mut entry) = self.jobs.get_mut(&id) else {
+            return Ok(None);
+        };
+        entry.last_run_at = Some(ran_at);
+        entry.status = new_status;
+        entry.next_run_at = next_run_at;
+        let job = entry.clone();
+        drop(entry);
+        if let Some(ref store) = self.store
+            && let Err(e) = store.save_job(&job)
+        {
+            warn!("Failed to persist record_run for job {}: {}", id.0, e);
+        }
+        info!("Job {} run recorded (status={:?})", id.0, new_status);
+        Ok(Some(job))
+    }
+
     /// Cancel a job.
     ///
     /// Returns:

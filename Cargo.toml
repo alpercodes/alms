@@ -64,6 +64,7 @@ toml = "0.8"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+cron = "0.15"
 
 # UUID
 uuid = { version = "1.13", features = ["v4", "serde"] }

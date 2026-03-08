@@ -6,6 +6,7 @@
 //!   GET    /jobs/{job_id}  — get a single job
 //!   DELETE /jobs/{job_id}  — cancel a job
 
+use crate::cron_utils;
 use crate::server::AppState;
 use alms_core::job::{CreateJobRequest, JobId, JobSchedule};
 use axum::{
@@ -14,13 +15,14 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use chrono::Utc;
 
 /// POST /jobs
 pub async fn create_job(
     State(state): State<AppState>,
     Json(req): Json<CreateJobRequest>,
 ) -> impl IntoResponse {
-    // Validate cron expression for recurring jobs (must be 5 fields).
+    // Validate cron expression for recurring jobs (must be 5 fields and parseable).
     if let JobSchedule::Recurring { ref cron } = req.schedule {
         let fields: Vec<&str> = cron.split_whitespace().collect();
         if fields.len() != 5 {
@@ -38,18 +40,45 @@ pub async fn create_job(
             )
                 .into_response();
         }
+        if cron_utils::next_after(cron, Utc::now()).is_none() {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "INVALID_CRON",
+                        "message": "cron expression is invalid or has no future occurrences"
+                    }
+                })),
+            )
+                .into_response();
+        }
     }
 
-    match state.job_store.create(req) {
-        Ok(job) => (StatusCode::CREATED, Json(serde_json::json!(job))).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "INTERNAL_ERROR", "message": e.to_string() }
-            })),
-        )
-            .into_response(),
+    let job = match state.job_store.create(req) {
+        Ok(job) => job,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": { "code": "INTERNAL_ERROR", "message": e.to_string() }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Register the job with the scheduler so it fires at the right time.
+    let now = Utc::now();
+    if let Some(fire_at) = cron_utils::compute_next_fire(&job, now) {
+        let delay = (fire_at - now)
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        let instant = tokio::time::Instant::now() + delay;
+        state.scheduler.schedule_once(job.id, instant).await;
+        let _ = state.job_store.update_next_run_at(job.id, Some(fire_at));
     }
+
+    (StatusCode::CREATED, Json(serde_json::json!(job))).into_response()
 }
 
 /// GET /jobs
@@ -81,7 +110,11 @@ pub async fn cancel_job(
     Path(job_id): Path<JobId>,
 ) -> impl IntoResponse {
     match state.job_store.cancel(job_id) {
-        Ok(Some(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Some(true)) => {
+            // Also cancel in the scheduler so it doesn't fire again.
+            state.scheduler.cancel(job_id).await;
+            StatusCode::NO_CONTENT.into_response()
+        }
         Ok(Some(false)) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({

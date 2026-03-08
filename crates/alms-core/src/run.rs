@@ -1,6 +1,6 @@
 //! Run types and status for ALMS
 
-use crate::{AgentId, SessionId};
+use crate::{AgentId, SessionId, job::JobId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -58,6 +58,8 @@ pub struct Run {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
+    /// Set when this run was triggered by a scheduled job.
+    pub job_id: Option<JobId>,
 }
 
 impl Run {
@@ -74,6 +76,15 @@ impl Run {
             created_at: Utc::now(),
             started_at: None,
             ended_at: None,
+            job_id: None,
+        }
+    }
+
+    /// Create a run triggered by a scheduled job.
+    pub fn for_job(session_id: SessionId, agent_id: AgentId, input: String, job_id: JobId) -> Self {
+        Self {
+            job_id: Some(job_id),
+            ..Self::new(session_id, agent_id, input)
         }
     }
 
@@ -135,6 +146,8 @@ pub struct RunStatusResponse {
     pub ended_at: Option<DateTime<Utc>>,
     pub usage: Option<TokenUsage>,
     pub ts: DateTime<Utc>,
+    /// Set when this run was triggered by a scheduled job.
+    pub job_id: Option<JobId>,
 }
 
 impl From<Run> for RunStatusResponse {
@@ -148,6 +161,7 @@ impl From<Run> for RunStatusResponse {
             ended_at: run.ended_at,
             usage: run.usage,
             ts: Utc::now(),
+            job_id: run.job_id,
         }
     }
 }
