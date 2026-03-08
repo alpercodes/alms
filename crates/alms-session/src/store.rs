@@ -1,10 +1,10 @@
-/// Persistent store for sessions
-/// 
-/// For MVP: in-memory only with periodic snapshots
-/// Future: Redis, PostgreSQL, or S3 backends
+//! Persistent store for sessions
+//!
+//! For MVP: in-memory only with periodic snapshots.
+//! Future: Redis, PostgreSQL, or S3 backends.
 
-use alms_core::{AlmsResult, SessionId};
 use crate::{Message, Session};
+use alms_core::{AlmsResult, SessionId};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,6 +43,12 @@ pub struct MemoryStore {
     loaded: AtomicBool,
 }
 
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemoryStore {
     pub fn new() -> Self {
         Self {
@@ -52,7 +58,7 @@ impl MemoryStore {
             loaded: AtomicBool::new(false),
         }
     }
-    
+
     pub fn with_snapshot<P: AsRef<Path>>(path: P) -> Self {
         Self {
             snapshot_path: Some(path.as_ref().to_path_buf()),
@@ -138,7 +144,9 @@ impl MemoryStore {
         let snapshot_bytes = serde_json::to_vec(&envelope.snapshot)?;
         let checksum = Self::checksum(&snapshot_bytes);
         if checksum != envelope.checksum {
-            return Err(alms_core::AlmsError::InvalidConfig("corrupt snapshot (checksum mismatch)".to_string()));
+            return Err(alms_core::AlmsError::InvalidConfig(
+                "corrupt snapshot (checksum mismatch)".to_string(),
+            ));
         }
 
         Ok(envelope.snapshot)
@@ -154,7 +162,10 @@ impl MemoryStore {
         for i in (1..=3).rev() {
             let mut src = path.to_path_buf();
             let mut dst = path.to_path_buf();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("snapshot.json");
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("snapshot.json");
             if i == 1 {
                 src.set_file_name(name);
             } else {
@@ -177,9 +188,12 @@ impl MemoryStore {
             file.sync_all()?;
         }
         std::fs::rename(&tmp_path, path)?;
-        if let Some(parent) = path.parent() {
-            let dir = std::fs::File::open(parent)?;
-            dir.sync_all()?;
+        // Best-effort directory fsync for durability (no-op on Windows where
+        // FlushFileBuffers on a directory requires write access).
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = std::fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
         Ok(())
     }
@@ -201,9 +215,7 @@ impl SessionStore for MemoryStore {
 
     async fn save_messages(&self, session_id: SessionId, messages: &[Message]) -> AlmsResult<()> {
         self.load_snapshot()?;
-        self.messages
-            .write()
-            .insert(session_id, messages.to_vec());
+        self.messages.write().insert(session_id, messages.to_vec());
         self.persist_snapshot()?;
         Ok(())
     }

@@ -8,10 +8,10 @@
 use crate::server::AppState;
 use alms_core::RunId;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -149,7 +149,7 @@ pub async fn resolve_approval(
                 Json(serde_json::json!({
                     "error": { "code": "BAD_REQUEST", "message": "decision must be 'approve' or 'deny'" }
                 })),
-            ))
+            ));
         }
     };
 

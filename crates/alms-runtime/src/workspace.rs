@@ -9,8 +9,8 @@
 //! The agent can update goals.md and memories.md via the workspace_write tool.
 
 use alms_core::{AgentId, AlmsError, AlmsResult};
-use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use std::path::PathBuf;
+use tracing::{debug, info};
 
 /// Agent workspace — reads and manages persistent agent identity files.
 #[derive(Debug, Clone)]
@@ -82,7 +82,7 @@ impl AgentWorkspace {
                 debug!("Read workspace file: {}", path.display());
                 Some(content)
             }
-            Ok(_) => None, // empty file
+            Ok(_) => None,  // empty file
             Err(_) => None, // doesn't exist
         }
     }
@@ -96,9 +96,8 @@ impl AgentWorkspace {
             )));
         }
 
-        self.ensure_dir().map_err(|e| {
-            AlmsError::Runtime(format!("Cannot create workspace dir: {}", e))
-        })?;
+        self.ensure_dir()
+            .map_err(|e| AlmsError::Runtime(format!("Cannot create workspace dir: {}", e)))?;
 
         let path = self.dir().join(file.filename());
         std::fs::write(&path, content).map_err(|e| {
@@ -118,9 +117,8 @@ impl AgentWorkspace {
             )));
         }
 
-        self.ensure_dir().map_err(|e| {
-            AlmsError::Runtime(format!("Cannot create workspace dir: {}", e))
-        })?;
+        self.ensure_dir()
+            .map_err(|e| AlmsError::Runtime(format!("Cannot create workspace dir: {}", e)))?;
 
         let path = self.dir().join(file.filename());
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -228,7 +226,8 @@ mod tests {
     #[test]
     fn test_write_and_read() {
         let (_dir, ws) = test_workspace();
-        ws.write_file(WorkspaceFile::Goals, "Build the thing").unwrap();
+        ws.write_file(WorkspaceFile::Goals, "Build the thing")
+            .unwrap();
         assert_eq!(
             ws.read_file(WorkspaceFile::Goals).unwrap(),
             "Build the thing"
@@ -267,7 +266,8 @@ mod tests {
             "I am concise and technical.",
         )
         .unwrap();
-        ws.write_file(WorkspaceFile::Goals, "Help with Rust").unwrap();
+        ws.write_file(WorkspaceFile::Goals, "Help with Rust")
+            .unwrap();
 
         let prefix = ws.build_system_prompt_prefix();
         assert!(prefix.contains("concise and technical"));

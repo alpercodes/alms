@@ -1,4 +1,4 @@
-use crate::{error::SandboxResult, SandboxError, Tool};
+use crate::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
 
 /// Built-in tool trait marker
@@ -82,7 +82,9 @@ impl MathTool {
     /// Perform division
     fn divide(&self, a: f64, b: f64) -> SandboxResult<f64> {
         if b == 0.0 {
-            Err(SandboxError::InvalidParameters("Division by zero".to_string()))
+            Err(SandboxError::InvalidParameters(
+                "Division by zero".to_string(),
+            ))
         } else {
             Ok(a / b)
         }
@@ -96,7 +98,9 @@ impl MathTool {
     /// Calculate square root
     fn sqrt(&self, n: f64) -> SandboxResult<f64> {
         if n < 0.0 {
-            Err(SandboxError::InvalidParameters("Cannot calculate square root of negative number".to_string()))
+            Err(SandboxError::InvalidParameters(
+                "Cannot calculate square root of negative number".to_string(),
+            ))
         } else {
             Ok(n.sqrt())
         }
@@ -167,7 +171,9 @@ impl Tool for MathTool {
         let operation = params
             .get("operation")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| SandboxError::InvalidParameters("Missing 'operation' field".to_string()))?;
+            .ok_or_else(|| {
+                SandboxError::InvalidParameters("Missing 'operation' field".to_string())
+            })?;
 
         let a = params.get("a").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let b = params.get("b").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -202,7 +208,7 @@ impl Tool for MathTool {
                 return Err(SandboxError::InvalidParameters(format!(
                     "Unknown operation: {}",
                     operation
-                )))
+                )));
             }
         };
 
@@ -289,19 +295,18 @@ impl Tool for HttpGetTool {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(hdrs) = params.get("headers").and_then(|v| v.as_object()) {
             for (key, value) in hdrs {
-                if let Some(val_str) = value.as_str() {
-                    if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes()) {
-                        if let Ok(header_value) = reqwest::header::HeaderValue::from_str(val_str) {
-                            headers.insert(header_name, header_value);
-                        }
-                    }
+                if let Some(val_str) = value.as_str()
+                    && let Ok(header_name) = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                    && let Ok(header_value) = reqwest::header::HeaderValue::from_str(val_str)
+                {
+                    headers.insert(header_name, header_value);
                 }
             }
         }
 
         // Build request
         let mut request = self.client.get(url);
-        
+
         // Add headers
         if !headers.is_empty() {
             request = request.headers(headers);
@@ -309,7 +314,7 @@ impl Tool for HttpGetTool {
 
         // Execute request
         let response = request.send().await.map_err(SandboxError::from)?;
-        
+
         let status = response.status().as_u16();
         let content_type = response
             .headers()
@@ -346,20 +351,26 @@ mod tests {
     #[tokio::test]
     async fn test_echo_tool() {
         let tool = EchoTool::new();
-        
+
         // Test with message field
-        let result = tool.execute(serde_json::json!({"message": "hello"})).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({"message": "hello"}))
+            .await
+            .unwrap();
         assert_eq!(result, "hello");
 
         // Test without message field
-        let result = tool.execute(serde_json::json!({"key": "value"})).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({"key": "value"}))
+            .await
+            .unwrap();
         assert_eq!(result, serde_json::json!({"key": "value"}));
     }
 
     #[tokio::test]
     async fn test_math_tool_add() {
         let tool = MathTool::new();
-        
+
         let result = tool
             .execute(serde_json::json!({"operation": "add", "a": 10, "b": 32}))
             .await
@@ -370,7 +381,7 @@ mod tests {
     #[tokio::test]
     async fn test_math_tool_divide() {
         let tool = MathTool::new();
-        
+
         let result = tool
             .execute(serde_json::json!({"operation": "divide", "a": 10, "b": 2}))
             .await
@@ -387,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn test_math_tool_sqrt() {
         let tool = MathTool::new();
-        
+
         let result = tool
             .execute(serde_json::json!({"operation": "sqrt", "n": 16}))
             .await
@@ -404,7 +415,7 @@ mod tests {
     #[tokio::test]
     async fn test_http_get_invalid_url() {
         let tool = HttpGetTool::new();
-        
+
         // Missing URL
         let result = tool.execute(serde_json::json!({})).await;
         assert!(result.is_err());

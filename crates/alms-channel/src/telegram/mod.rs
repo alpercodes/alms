@@ -1,16 +1,15 @@
 //! Telegram Bot API client implementation
 
 mod types;
-use types::*;
 use alms_core::channel::{ChatId, MessageId, UserId};
 use alms_core::{AlmsResult, Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
 use async_trait::async_trait;
-use reqwest::{Client, Url};
+use reqwest::Client;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Duration};
-use tracing::{debug, error, info, warn};
+use tokio::time::{Duration, interval};
+use tracing::{error, info, warn};
+use types::*;
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org/bot";
 
@@ -50,21 +49,27 @@ impl TelegramChannel {
     /// Make a GET request to the Telegram API
     async fn get<T: serde::de::DeserializeOwned>(&self, method: &str) -> AlmsResult<T> {
         let url = self.api_url(method);
-        let response = self.client.get(&url).send().await.map_err(|e| {
-            alms_core::AlmsError::Channel(format!("HTTP error: {}", e))
-        })?;
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| alms_core::AlmsError::Channel(format!("HTTP error: {}", e)))?;
 
-        let api_response: TelegramResponse<T> = response.json().await.map_err(|e| {
-            alms_core::AlmsError::Channel(format!("JSON parse error: {}", e))
-        })?;
+        let api_response: TelegramResponse<T> = response
+            .json()
+            .await
+            .map_err(|e| alms_core::AlmsError::Channel(format!("JSON parse error: {}", e)))?;
 
         if api_response.ok {
-            api_response.result.ok_or_else(|| {
-                alms_core::AlmsError::Channel("Empty result from API".to_string())
-            })
+            api_response
+                .result
+                .ok_or_else(|| alms_core::AlmsError::Channel("Empty result from API".to_string()))
         } else {
             Err(alms_core::AlmsError::Channel(
-                api_response.description.unwrap_or_else(|| "Unknown API error".to_string())
+                api_response
+                    .description
+                    .unwrap_or_else(|| "Unknown API error".to_string()),
             ))
         }
     }
@@ -76,21 +81,28 @@ impl TelegramChannel {
         body: &B,
     ) -> AlmsResult<T> {
         let url = self.api_url(method);
-        let response = self.client.post(&url).json(body).send().await.map_err(|e| {
-            alms_core::AlmsError::Channel(format!("HTTP error: {}", e))
-        })?;
+        let response = self
+            .client
+            .post(&url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| alms_core::AlmsError::Channel(format!("HTTP error: {}", e)))?;
 
-        let api_response: TelegramResponse<T> = response.json().await.map_err(|e| {
-            alms_core::AlmsError::Channel(format!("JSON parse error: {}", e))
-        })?;
+        let api_response: TelegramResponse<T> = response
+            .json()
+            .await
+            .map_err(|e| alms_core::AlmsError::Channel(format!("JSON parse error: {}", e)))?;
 
         if api_response.ok {
-            api_response.result.ok_or_else(|| {
-                alms_core::AlmsError::Channel("Empty result from API".to_string())
-            })
+            api_response
+                .result
+                .ok_or_else(|| alms_core::AlmsError::Channel("Empty result from API".to_string()))
         } else {
             Err(alms_core::AlmsError::Channel(
-                api_response.description.unwrap_or_else(|| "Unknown API error".to_string())
+                api_response
+                    .description
+                    .unwrap_or_else(|| "Unknown API error".to_string()),
             ))
         }
     }
@@ -101,7 +113,11 @@ impl TelegramChannel {
     }
 
     /// Send a raw message via the API
-    pub async fn send_raw_message(&self, chat_id: i64, text: impl Into<String>) -> AlmsResult<SentMessage> {
+    pub async fn send_raw_message(
+        &self,
+        chat_id: i64,
+        text: impl Into<String>,
+    ) -> AlmsResult<SentMessage> {
         let request = SendMessageRequest::new(chat_id, text);
         self.post("sendMessage", &request).await
     }
@@ -116,7 +132,11 @@ impl TelegramChannel {
     }
 
     /// Set webhook for receiving updates
-    async fn set_webhook(&self, url: impl Into<String>, secret_token: Option<String>) -> AlmsResult<bool> {
+    async fn set_webhook(
+        &self,
+        url: impl Into<String>,
+        secret_token: Option<String>,
+    ) -> AlmsResult<bool> {
         let request = SetWebhookRequest {
             url: url.into(),
             secret_token,
@@ -142,11 +162,11 @@ impl TelegramChannel {
     fn convert_update(&self, update: Update) -> Option<IncomingMessage> {
         // Get the message (either regular or edited)
         let message = update.message.or(update.edited_message)?;
-        
+
         // Only handle text messages for now
         let text = message.text?;
         let from = message.from?;
-        
+
         let mut incoming = IncomingMessage {
             chat_id: ChatId(message.chat.id),
             user_id: UserId(from.id),
@@ -172,27 +192,28 @@ impl TelegramChannel {
     async fn run_polling(&self, tx: mpsc::Sender<IncomingMessage>) -> AlmsResult<()> {
         info!("Starting Telegram polling loop");
         let mut ticker = interval(Duration::from_secs(self.poll_interval_secs));
-        
+
         while self.running.load(Ordering::Relaxed) {
             ticker.tick().await;
-            
+
             let offset = self.last_update_id.load(Ordering::Relaxed);
             let offset_param = if offset > 0 { Some(offset + 1) } else { None };
-            
+
             match self.get_updates(offset_param).await {
                 Ok(updates) => {
                     for update in updates {
                         // Update the last update ID
                         if update.update_id > self.last_update_id.load(Ordering::Relaxed) {
-                            self.last_update_id.store(update.update_id, Ordering::Relaxed);
+                            self.last_update_id
+                                .store(update.update_id, Ordering::Relaxed);
                         }
-                        
+
                         // Convert and send the update
-                        if let Some(message) = self.convert_update(update) {
-                            if tx.send(message).await.is_err() {
-                                warn!("Message receiver dropped, stopping polling");
-                                return Ok(());
-                            }
+                        if let Some(message) = self.convert_update(update)
+                            && tx.send(message).await.is_err()
+                        {
+                            warn!("Message receiver dropped, stopping polling");
+                            return Ok(());
                         }
                     }
                 }
@@ -202,7 +223,7 @@ impl TelegramChannel {
                 }
             }
         }
-        
+
         info!("Telegram polling loop stopped");
         Ok(())
     }
@@ -223,7 +244,7 @@ impl Channel for TelegramChannel {
     async fn initialize(&mut self, config: ChannelConfig) -> AlmsResult<()> {
         if config.token.is_empty() {
             return Err(alms_core::AlmsError::InvalidConfig(
-                "Telegram bot token is required".to_string()
+                "Telegram bot token is required".to_string(),
             ));
         }
 
@@ -245,9 +266,8 @@ impl Channel for TelegramChannel {
     }
 
     async fn send_message(&self, message: OutgoingMessage) -> AlmsResult<MessageId> {
-        let request = SendMessageRequest::new(message.chat_id.0, message.text)
-            .parse_mode("HTML");
-        
+        let request = SendMessageRequest::new(message.chat_id.0, message.text).parse_mode("HTML");
+
         let request = if let Some(reply_to) = message.reply_to {
             request.reply_to(reply_to.0)
         } else {
@@ -260,7 +280,7 @@ impl Channel for TelegramChannel {
 
     async fn receive_updates(&self) -> AlmsResult<mpsc::Receiver<IncomingMessage>> {
         let (tx, rx) = mpsc::channel(100);
-        
+
         // Start polling in a background task
         let channel = TelegramChannel {
             token: self.token.clone(),
@@ -284,7 +304,7 @@ impl Channel for TelegramChannel {
 
     async fn start(&self) -> AlmsResult<()> {
         self.running.store(true, Ordering::Relaxed);
-        
+
         if self.use_webhook {
             if let Some(ref url) = self.webhook_url {
                 info!("Setting Telegram webhook to: {}", url);
@@ -296,18 +316,18 @@ impl Channel for TelegramChannel {
             info!("Starting Telegram in polling mode");
             self.delete_webhook().await?;
         }
-        
+
         Ok(())
     }
 
     async fn stop(&self) -> AlmsResult<()> {
         info!("Stopping Telegram channel");
         self.running.store(false, Ordering::Relaxed);
-        
+
         if self.use_webhook {
             self.delete_webhook().await?;
         }
-        
+
         Ok(())
     }
 }

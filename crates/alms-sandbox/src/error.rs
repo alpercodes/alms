@@ -111,7 +111,7 @@ mod tests {
         // Create a fake wasmtime error by creating a string-based error
         let wasm_err = wasmtime::Error::msg("memory out of bounds access");
         let sandbox_err: SandboxError = wasm_err.into();
-        
+
         match sandbox_err {
             SandboxError::SandboxViolation(msg) => {
                 assert!(msg.contains("Memory access"));

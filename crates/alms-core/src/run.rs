@@ -5,6 +5,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Accumulated token usage for a run
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+}
+
 /// Unique identifier for runs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunId(pub Uuid);
@@ -47,6 +54,7 @@ pub struct Run {
     pub input: String,
     pub output: Option<String>,
     pub error: Option<String>,
+    pub usage: Option<TokenUsage>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -62,6 +70,7 @@ impl Run {
             input,
             output: None,
             error: None,
+            usage: None,
             created_at: Utc::now(),
             started_at: None,
             ended_at: None,
@@ -73,9 +82,10 @@ impl Run {
         self.started_at = Some(Utc::now());
     }
 
-    pub fn mark_completed(&mut self, output: String) {
+    pub fn mark_completed(&mut self, output: String, usage: TokenUsage) {
         self.status = RunStatus::Completed;
         self.output = Some(output);
+        self.usage = Some(usage);
         self.ended_at = Some(Utc::now());
     }
 
@@ -123,6 +133,7 @@ pub struct RunStatusResponse {
     pub status: RunStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
+    pub usage: Option<TokenUsage>,
     pub ts: DateTime<Utc>,
 }
 
@@ -135,6 +146,7 @@ impl From<Run> for RunStatusResponse {
             status: run.status,
             started_at: run.started_at,
             ended_at: run.ended_at,
+            usage: run.usage,
             ts: Utc::now(),
         }
     }

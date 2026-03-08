@@ -3,7 +3,6 @@
 use crate::{AlmsResult, Timestamp};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::pin::Pin;
 use tokio::sync::mpsc;
 
 /// Unique identifier for a chat/channel
@@ -74,7 +73,7 @@ impl Command {
     /// Parse a command from text like "/start arg1 arg2"
     pub fn parse(text: &str) -> Option<Self> {
         let trimmed = text.trim();
-        
+
         // Check if it starts with /
         if !trimmed.starts_with('/') {
             return None;
@@ -88,7 +87,7 @@ impl Command {
         let cmd_part = parts[0];
         // Remove the leading /
         let name = cmd_part.strip_prefix('/').unwrap_or(cmd_part).to_string();
-        
+
         // Get arguments (everything after the command)
         let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
 
@@ -176,7 +175,11 @@ pub trait Channel: Send + Sync {
     async fn send_message(&self, message: OutgoingMessage) -> AlmsResult<MessageId>;
 
     /// Send a simple text message
-    async fn send_text(&self, chat_id: ChatId, text: impl Into<String> + Send) -> AlmsResult<MessageId> {
+    async fn send_text(
+        &self,
+        chat_id: ChatId,
+        text: impl Into<String> + Send,
+    ) -> AlmsResult<MessageId> {
         self.send_message(OutgoingMessage::new(chat_id, text)).await
     }
 

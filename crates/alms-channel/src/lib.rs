@@ -1,14 +1,14 @@
 //! Channel adapters for messaging platforms
-//! 
+//!
 //! This crate provides adapters for various messaging platforms including:
 //! - Telegram (via Bot API)
-//! 
+//!
 //! ## Example Usage
-//! 
+//!
 //! ```rust,no_run
 //! use alms_channel::telegram::TelegramChannel;
 //! use alms_core::{Channel, ChannelConfig};
-//! 
+//!
 //! #[tokio::main]
 //! async fn main() {
 //!     let mut channel = TelegramChannel::new();
@@ -30,6 +30,6 @@
 
 pub mod telegram;
 
+pub use alms_core::channel::{ChatId, MessageId, UserId};
 /// Re-export commonly used types
 pub use alms_core::{Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
-pub use alms_core::channel::{ChatId, UserId, MessageId};

@@ -1,5 +1,7 @@
 //! Telegram Bot API types
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 
 /// Telegram Update object

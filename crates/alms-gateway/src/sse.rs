@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 
 /// Unique identifier for a tool invocation
@@ -51,84 +51,133 @@ impl SseEventData {
     }
 
     pub fn connected(run_id: RunId) -> Self {
-        Self::new("connected", ConnectedData { run_id: run_id.0.to_string() })
+        Self::new(
+            "connected",
+            ConnectedData {
+                run_id: run_id.0.to_string(),
+            },
+        )
     }
 
     pub fn run_started(run_id: RunId, session_id: alms_core::SessionId) -> Self {
-        Self::new("run_started", RunStartedData {
-            run_id: run_id.0.to_string(),
-            session_id: session_id.0.to_string(),
-            ts: Utc::now(),
-        })
+        Self::new(
+            "run_started",
+            RunStartedData {
+                run_id: run_id.0.to_string(),
+                session_id: session_id.0.to_string(),
+                ts: Utc::now(),
+            },
+        )
     }
 
     pub fn token_delta(run_id: RunId, delta: &str) -> Self {
-        Self::new("token_delta", TokenDeltaData {
-            run_id: run_id.0.to_string(),
-            delta: delta.to_string(),
-        })
+        Self::new(
+            "token_delta",
+            TokenDeltaData {
+                run_id: run_id.0.to_string(),
+                delta: delta.to_string(),
+            },
+        )
     }
 
-    pub fn tool_start(run_id: RunId, tool_invocation_id: ToolInvocationId, tool: &str, params: serde_json::Value) -> Self {
-        Self::new("tool_start", ToolStartData {
-            run_id: run_id.0.to_string(),
-            tool_invocation_id: tool_invocation_id.0.to_string(),
-            tool: tool.to_string(),
-            params,
-        })
+    pub fn tool_start(
+        run_id: RunId,
+        tool_invocation_id: ToolInvocationId,
+        tool: &str,
+        params: serde_json::Value,
+    ) -> Self {
+        Self::new(
+            "tool_start",
+            ToolStartData {
+                run_id: run_id.0.to_string(),
+                tool_invocation_id: tool_invocation_id.0.to_string(),
+                tool: tool.to_string(),
+                params,
+            },
+        )
     }
 
-    pub fn tool_end(run_id: RunId, tool_invocation_id: ToolInvocationId, ok: bool, result: serde_json::Value) -> Self {
-        Self::new("tool_end", ToolEndData {
-            run_id: run_id.0.to_string(),
-            tool_invocation_id: tool_invocation_id.0.to_string(),
-            ok,
-            result,
-        })
+    pub fn tool_end(
+        run_id: RunId,
+        tool_invocation_id: ToolInvocationId,
+        ok: bool,
+        result: serde_json::Value,
+    ) -> Self {
+        Self::new(
+            "tool_end",
+            ToolEndData {
+                run_id: run_id.0.to_string(),
+                tool_invocation_id: tool_invocation_id.0.to_string(),
+                ok,
+                result,
+            },
+        )
     }
 
     pub fn tool_error(run_id: RunId, tool_invocation_id: ToolInvocationId, error: &str) -> Self {
-        Self::new("tool_error", ToolErrorData {
-            run_id: run_id.0.to_string(),
-            tool_invocation_id: tool_invocation_id.0.to_string(),
-            error: error.to_string(),
-        })
+        Self::new(
+            "tool_error",
+            ToolErrorData {
+                run_id: run_id.0.to_string(),
+                tool_invocation_id: tool_invocation_id.0.to_string(),
+                error: error.to_string(),
+            },
+        )
     }
 
-    pub fn approval_required(run_id: RunId, approval_id: &str, capability: &str, request: serde_json::Value) -> Self {
-        Self::new("approval_required", ApprovalRequiredData {
-            run_id: run_id.0.to_string(),
-            approval_id: approval_id.to_string(),
-            capability: capability.to_string(),
-            request,
-        })
+    pub fn approval_required(
+        run_id: RunId,
+        approval_id: &str,
+        capability: &str,
+        request: serde_json::Value,
+    ) -> Self {
+        Self::new(
+            "approval_required",
+            ApprovalRequiredData {
+                run_id: run_id.0.to_string(),
+                approval_id: approval_id.to_string(),
+                capability: capability.to_string(),
+                request,
+            },
+        )
     }
 
     pub fn approval_resolved(run_id: RunId, approval_id: &str, decision: &str) -> Self {
-        Self::new("approval_resolved", ApprovalResolvedData {
-            run_id: run_id.0.to_string(),
-            approval_id: approval_id.to_string(),
-            decision: decision.to_string(),
-            ts: Utc::now(),
-        })
+        Self::new(
+            "approval_resolved",
+            ApprovalResolvedData {
+                run_id: run_id.0.to_string(),
+                approval_id: approval_id.to_string(),
+                decision: decision.to_string(),
+                ts: Utc::now(),
+            },
+        )
     }
 
-    pub fn run_finished(run_id: RunId, ok: bool) -> Self {
-        Self::new("run_finished", RunFinishedData {
-            run_id: run_id.0.to_string(),
-            ok,
-            ts: Utc::now(),
-        })
+    pub fn run_finished(run_id: RunId, ok: bool, usage: alms_core::TokenUsage) -> Self {
+        Self::new(
+            "run_finished",
+            RunFinishedData {
+                run_id: run_id.0.to_string(),
+                ok,
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                ts: Utc::now(),
+            },
+        )
     }
 
     pub fn run_error(run_id: RunId, error: &str) -> Self {
-        Self::new("run_error", RunErrorData {
-            run_id: run_id.0.to_string(),
-            error: ErrorData {
-                code: "INTERNAL".to_string(),
-                message: error.to_string(),
+        Self::new(
+            "run_error",
+            RunErrorData {
+                run_id: run_id.0.to_string(),
+                error: ErrorData {
+                    code: "INTERNAL".to_string(),
+                    message: error.to_string(),
+                },
             },
-        })
+        )
     }
 }
 
@@ -136,20 +185,23 @@ impl SseEventData {
 pub struct RunEventStream;
 
 impl RunEventStream {
-    pub fn new(
+    pub fn stream(
         receiver: mpsc::UnboundedReceiver<SseEventData>,
     ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
-        Self::new_with_events(receiver, Vec::new())
+        Self::stream_with_replay(receiver, Vec::new())
     }
 
-    pub fn new_with_events(
+    pub fn stream_with_replay(
         receiver: mpsc::UnboundedReceiver<SseEventData>,
         replay: Vec<SseEventData>,
     ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
         let replay_stream = tokio_stream::iter(replay.into_iter().map(|data| {
             let event = Event::default()
                 .event(&data.event_type)
-                .id(data.event_id.map(|id| id.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()))
+                .id(data
+                    .event_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()))
                 .json_data(&data.data)
                 .unwrap_or_else(|_| Event::default().data("{}"));
             Ok::<_, Infallible>(event)
@@ -158,7 +210,10 @@ impl RunEventStream {
         let live_stream = UnboundedReceiverStream::new(receiver).map(|data| {
             let event = Event::default()
                 .event(&data.event_type)
-                .id(data.event_id.map(|id| id.to_string()).unwrap_or_else(|| Uuid::new_v4().to_string()))
+                .id(data
+                    .event_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()))
                 .json_data(&data.data)
                 .unwrap_or_else(|_| Event::default().data("{}"));
             Ok::<_, Infallible>(event)
@@ -166,17 +221,19 @@ impl RunEventStream {
 
         let stream = replay_stream.chain(live_stream);
 
-        Sse::new(stream)
-            .keep_alive(
-                axum::response::sse::KeepAlive::new()
-                    .interval(Duration::from_secs(15))
-                    .text("ping"),
-            )
+        Sse::new(stream).keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("ping"),
+        )
     }
 }
 
 /// Create event channel
-pub fn event_channel() -> (mpsc::UnboundedSender<SseEventData>, mpsc::UnboundedReceiver<SseEventData>) {
+pub fn event_channel() -> (
+    mpsc::UnboundedSender<SseEventData>,
+    mpsc::UnboundedReceiver<SseEventData>,
+) {
     mpsc::unbounded_channel()
 }
 
@@ -242,6 +299,8 @@ struct ApprovalResolvedData {
 struct RunFinishedData {
     run_id: String,
     ok: bool,
+    prompt_tokens: u32,
+    completion_tokens: u32,
     ts: DateTime<Utc>,
 }
 
@@ -266,9 +325,9 @@ mod tests {
     fn test_event_data_serialization() {
         let run_id = RunId::new();
         let event = SseEventData::run_started(run_id, alms_core::SessionId::new());
-        
+
         assert_eq!(event.event_type, "run_started");
-        
+
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("run_started"));
         assert!(json.contains(&run_id.0.to_string()));
@@ -278,9 +337,10 @@ mod tests {
     fn test_tool_end_event() {
         let run_id = RunId::new();
         let tool_id = ToolInvocationId::new();
-        
-        let event = SseEventData::tool_end(run_id, tool_id, true, serde_json::json!({"output": "test"}));
-        
+
+        let event =
+            SseEventData::tool_end(run_id, tool_id, true, serde_json::json!({"output": "test"}));
+
         assert_eq!(event.event_type, "tool_end");
     }
 }

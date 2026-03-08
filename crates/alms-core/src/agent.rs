@@ -73,7 +73,7 @@ impl AgentConfig {
             timeout_secs: 600,
         }
     }
-    
+
     /// Create config for a code subagent
     pub fn code_subagent() -> Self {
         Self {
@@ -87,15 +87,12 @@ impl AgentConfig {
             timeout_secs: 600,
         }
     }
-    
+
     /// Create config for a research subagent
     pub fn research_subagent() -> Self {
         Self {
             role: AgentRole::Subagent,
-            capabilities: vec![
-                Capability::Http,
-                Capability::Search,
-            ],
+            capabilities: vec![Capability::Http, Capability::Search],
             max_concurrent: 4,
             timeout_secs: 300,
         }

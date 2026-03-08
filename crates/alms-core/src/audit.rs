@@ -21,7 +21,12 @@ pub struct AuditEvent {
 }
 
 impl AuditEvent {
-    pub fn allow(session_id: SessionId, tool: impl Into<String>, params: serde_json::Value, result: serde_json::Value) -> Self {
+    pub fn allow(
+        session_id: SessionId,
+        tool: impl Into<String>,
+        params: serde_json::Value,
+        result: serde_json::Value,
+    ) -> Self {
         Self {
             session_id,
             run_id: None,
@@ -34,7 +39,12 @@ impl AuditEvent {
         }
     }
 
-    pub fn deny(session_id: SessionId, tool: impl Into<String>, params: serde_json::Value, error: impl Into<String>) -> Self {
+    pub fn deny(
+        session_id: SessionId,
+        tool: impl Into<String>,
+        params: serde_json::Value,
+        error: impl Into<String>,
+    ) -> Self {
         Self {
             session_id,
             run_id: None,

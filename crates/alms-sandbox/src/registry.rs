@@ -1,5 +1,5 @@
-use crate::{error::SandboxResult, BuiltinTool, NativeTool, SandboxError, Tool, ToolDef, WasmTool};
 use crate::sandbox::SandboxConfig;
+use crate::{NativeTool, SandboxError, Tool, ToolDef, WasmTool, error::SandboxResult};
 use dashmap::DashMap;
 use serde_json::Value;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ impl ToolRegistry {
     /// Register a tool
     pub fn register(&self, tool: Arc<dyn Tool>) -> SandboxResult<()> {
         let name = tool.name().to_string();
-        
+
         if self.tools.contains_key(&name) {
             warn!("Tool '{}' already registered, replacing", name);
         }
@@ -42,7 +42,7 @@ impl ToolRegistry {
         debug!("Registering tool: {}", name);
         self.tools.insert(name.clone(), tool);
         info!("Successfully registered tool: {}", name);
-        
+
         Ok(())
     }
 
@@ -96,10 +96,7 @@ impl ToolRegistry {
 
     /// List all registered tool names
     pub fn list(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .map(|e| e.key().clone())
-            .collect()
+        self.tools.iter().map(|e| e.key().clone()).collect()
     }
 
     /// List built-in tools
@@ -195,11 +192,13 @@ mod tests {
     #[test]
     fn test_register_and_lookup() {
         let registry = ToolRegistry::new();
-        
-        registry.register_native("double", |params| {
-            let n = params.get("n").and_then(|v| v.as_i64()).unwrap_or(0);
-            Ok(Value::from(n * 2))
-        }).unwrap();
+
+        registry
+            .register_native("double", |params| {
+                let n = params.get("n").and_then(|v| v.as_i64()).unwrap_or(0);
+                Ok(Value::from(n * 2))
+            })
+            .unwrap();
 
         assert!(registry.contains("double"));
         assert!(!registry.contains("triple"));
@@ -211,7 +210,7 @@ mod tests {
     #[test]
     fn test_tool_not_found() {
         let registry = ToolRegistry::new();
-        
+
         match registry.lookup("nonexistent") {
             Err(SandboxError::ToolNotFound(name)) => {
                 assert_eq!(name, "nonexistent");
@@ -223,7 +222,7 @@ mod tests {
     #[test]
     fn test_list_tools() {
         let registry = ToolRegistry::with_builtin_tools();
-        
+
         let tools = registry.list();
         assert!(tools.contains(&"echo".to_string()));
         assert!(tools.contains(&"math".to_string()));
@@ -233,8 +232,10 @@ mod tests {
     #[test]
     fn test_unregister() {
         let registry = ToolRegistry::new();
-        
-        registry.register_native("test", |_| Ok(Value::Null)).unwrap();
+
+        registry
+            .register_native("test", |_| Ok(Value::Null))
+            .unwrap();
         assert!(registry.contains("test"));
 
         registry.unregister("test").unwrap();
@@ -244,14 +245,19 @@ mod tests {
     #[tokio::test]
     async fn test_execute() {
         let registry = ToolRegistry::new();
-        
-        registry.register_native("add", |params| {
-            let a = params.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
-            let b = params.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
-            Ok(Value::from(a + b))
-        }).unwrap();
 
-        let result = registry.execute("add", serde_json::json!({"a": 10, "b": 32})).await.unwrap();
+        registry
+            .register_native("add", |params| {
+                let a = params.get("a").and_then(|v| v.as_i64()).unwrap_or(0);
+                let b = params.get("b").and_then(|v| v.as_i64()).unwrap_or(0);
+                Ok(Value::from(a + b))
+            })
+            .unwrap();
+
+        let result = registry
+            .execute("add", serde_json::json!({"a": 10, "b": 32}))
+            .await
+            .unwrap();
         assert_eq!(result, 42);
     }
 }

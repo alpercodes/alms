@@ -1,9 +1,6 @@
 use alms_core::{AlmsError, AlmsResult};
-use dashmap::DashMap;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::Duration;
-use wasmtime::{Config as WasmConfig, Engine, Instance, Memory, Module, Store, TypedFunc};
 
 pub mod builtin;
 pub mod error;
@@ -138,7 +135,7 @@ impl Tool for WasmTool {
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
-        let mut sandbox = Sandbox::new(self.config.clone());
+        let sandbox = Sandbox::new(self.config.clone());
         sandbox
             .execute(&self.wasm_bytes, &self.entry_point, &self.name, params)
             .await
@@ -146,9 +143,7 @@ impl Tool for WasmTool {
 }
 
 /// A tool that wraps a native function
-pub type NativeToolFn = Arc<
-    dyn Fn(Value) -> SandboxResult<Value> + Send + Sync,
->;
+pub type NativeToolFn = Arc<dyn Fn(Value) -> SandboxResult<Value> + Send + Sync>;
 
 /// Native tool implementation
 #[derive(Clone)]
@@ -217,7 +212,10 @@ mod tests {
             Ok(Value::from(value * 2))
         });
 
-        let result = tool.execute(serde_json::json!({"value": 21})).await.unwrap();
+        let result = tool
+            .execute(serde_json::json!({"value": 21}))
+            .await
+            .unwrap();
         assert_eq!(result, 42);
     }
 

@@ -141,27 +141,27 @@ impl CompletionRequest {
             stream: None,
         }
     }
-    
+
     pub fn with_messages(mut self, messages: Vec<LlmMessage>) -> Self {
         self.messages = messages;
         self
     }
-    
+
     pub fn with_tools(mut self, tools: Vec<ToolDefinition>) -> Self {
         self.tools = Some(tools);
         self
     }
-    
+
     pub fn with_temperature(mut self, temp: f32) -> Self {
         self.temperature = Some(temp);
         self
     }
-    
+
     pub fn with_max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
         self
     }
-    
+
     pub fn with_streaming(mut self) -> Self {
         self.stream = Some(true);
         self
@@ -264,15 +264,15 @@ impl From<alms_core::config::LlmConfig> for LlmConfig {
 impl LlmConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
-        
+
         if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") {
             config.api_key = api_key;
         }
-        
+
         if let Ok(base_url) = std::env::var("LLM_BASE_URL") {
             config.base_url = base_url;
         }
-        
+
         if let Ok(model) = std::env::var("DEFAULT_MODEL") {
             config.default_model = model;
         }
@@ -281,7 +281,7 @@ impl LlmConfig {
             let mock = mock.to_lowercase();
             config.mock = mock == "1" || mock == "true" || mock == "yes";
         }
-        
+
         config
     }
 }

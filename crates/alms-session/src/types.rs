@@ -24,7 +24,7 @@ impl Session {
             status: SessionStatus::Active,
         }
     }
-    
+
     pub fn touch(&mut self) {
         self.last_activity = Timestamp::now();
     }
@@ -59,9 +59,18 @@ pub enum Role {
 #[serde(rename_all = "snake_case")]
 pub enum Content {
     Text(String),
-    ToolCall { name: String, params: serde_json::Value },
-    ToolResult { tool_id: String, result: serde_json::Value },
-    Image { url: String, alt: Option<String> },
+    ToolCall {
+        name: String,
+        params: serde_json::Value,
+    },
+    ToolResult {
+        tool_id: String,
+        result: serde_json::Value,
+    },
+    Image {
+        url: String,
+        alt: Option<String>,
+    },
 }
 
 /// Session configuration

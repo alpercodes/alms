@@ -1,8 +1,8 @@
-use crate::{error::SandboxResult, SandboxError};
+use crate::{SandboxError, error::SandboxResult};
 use serde_json::Value;
 use std::time::Duration;
 use tracing::{debug, error, info, trace, warn};
-use wasmtime::{AsContext, AsContextMut, Config, Engine, Instance, Memory, Module, Store, TypedFunc, Val, ValType};
+use wasmtime::{Config, Engine, Module, Store};
 
 /// Configuration for the WASM sandbox
 #[derive(Debug, Clone)]
@@ -28,8 +28,8 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            max_memory: 64 * 1024 * 1024, // 64MB
-            max_input_bytes: 1024 * 1024, // 1 MiB
+            max_memory: 64 * 1024 * 1024,      // 64MB
+            max_input_bytes: 1024 * 1024,      // 1 MiB
             max_output_bytes: 4 * 1024 * 1024, // 4 MiB
             timeout: Duration::from_secs(30),
             fuel_enabled: true,
@@ -95,28 +95,22 @@ impl SandboxConfig {
     }
 }
 
-/// WASM execution state
+/// WASM execution state (host data stored in wasmtime Store).
+/// Currently empty — the log callback only needs memory access via Caller.
 #[derive(Debug)]
-struct SandboxState {
-    /// Memory buffer for passing data
-    memory: Option<Memory>,
-    /// Allocated memory size
-    allocated: usize,
-    /// Config reference
-    config: SandboxConfig,
-}
+pub(crate) struct SandboxState;
 
 impl SandboxState {
-    fn new(config: SandboxConfig) -> Self {
-        Self {
-            memory: None,
-            allocated: 0,
-            config,
-        }
+    fn new(_config: SandboxConfig) -> Self {
+        Self
     }
 }
 
-/// WASM Sandbox for executing tools in isolation
+/// WASM Sandbox for executing tools in isolation.
+///
+/// Uses `tokio::task::spawn_blocking` so WASM execution runs on a dedicated
+/// thread pool thread instead of a wasmtime fiber, avoiding Windows fiber
+/// stack overflow issues and keeping the tokio runtime unblocked.
 pub struct Sandbox {
     config: SandboxConfig,
     engine: Engine,
@@ -127,16 +121,12 @@ impl Sandbox {
     pub fn new(config: SandboxConfig) -> Self {
         let mut wasm_config = Config::new();
         wasm_config.wasm_memory64(false);
-        wasm_config.async_support(true);
-        wasm_config.epoch_interruption(true);
-        
-        // Enable fuel metering if configured
+        wasm_config.memory_guard_size(64 * 1024); // 64KB guard pages
+
+        // Fuel metering for deterministic execution limits
         if config.fuel_enabled {
             wasm_config.consume_fuel(true);
         }
-
-        // Limit memory
-        wasm_config.memory_guard_size(64 * 1024); // 64KB guard pages
 
         let engine = Engine::new(&wasm_config).expect("Failed to create WASM engine");
 
@@ -144,38 +134,44 @@ impl Sandbox {
         Self { config, engine }
     }
 
-    /// Execute a WASM module
-    /// 
-    /// The WASM module should export a function with the given name that takes
-    /// two i32 parameters (pointer and length) and returns an i32 (pointer to result).
-    /// 
-    /// Memory layout:
-    /// - Input JSON is written to memory
-    /// - Function is called with (ptr, len)
-    /// - Function returns ptr to result JSON
-    /// - Result is read from memory
+    /// Execute a WASM module.
+    ///
+    /// The WASM module must export:
+    /// - `memory` — linear memory
+    /// - `alms_alloc(len: i32) -> i32` — allocates `len` bytes, returns pointer
+    /// - `<entrypoint>(ptr: i32, len: i32) -> i32` — tool call; returns pointer to result
+    ///
+    /// Result layout at the returned pointer:
+    /// - 4 bytes little-endian length
+    /// - `length` bytes of JSON
+    ///
+    /// Timeout is enforced via `tokio::time::timeout`; WASM runs on a blocking
+    /// thread via `spawn_blocking` so it does not block the async runtime.
     pub async fn execute(
-        &mut self,
+        &self,
         wasm_bytes: &[u8],
         entrypoint: &str,
         tool_name: &str,
         params: Value,
     ) -> SandboxResult<Value> {
         let start_time = std::time::Instant::now();
-        
+
         info!(
             "Executing WASM module, entrypoint: {}, tool: {}, params: {:?}",
             entrypoint, tool_name, params
         );
 
-        // Build ABI envelope
+        // Short-circuit for zero timeout — no point in starting execution.
+        if self.config.timeout.is_zero() {
+            return Err(SandboxError::ExecutionTimeout(self.config.timeout));
+        }
+
+        // Build ABI envelope and check input size before touching the engine.
         let payload = serde_json::json!({
             "abi": 0,
             "tool": tool_name,
             "params": params,
         });
-
-        // Serialize params to JSON
         let params_json = serde_json::to_vec(&payload)?;
         if params_json.len() > self.config.max_input_bytes {
             return Err(SandboxError::MemoryLimitExceeded {
@@ -183,156 +179,144 @@ impl Sandbox {
                 limit: self.config.max_input_bytes,
             });
         }
-        let params_len = params_json.len() as i32;
 
-        // Compile the module
-        let module = self.compile(wasm_bytes).await?;
+        // Compile the module (synchronous Cranelift compilation; fast for small tools).
+        trace!("Compiling WASM module ({} bytes)", wasm_bytes.len());
+        let module = Module::new(&self.engine, wasm_bytes).map_err(|e| {
+            error!("WASM compilation failed: {}", e);
+            SandboxError::WasmCompile(e.to_string())
+        })?;
 
-        // Create store and instance
-        let mut store = Store::new(&self.engine, SandboxState::new(self.config.clone()));
-        
-        // Fuel metering disabled until wasmtime fuel feature is enabled in workspace
+        // Move everything needed for execution into the blocking closure.
+        let engine = self.engine.clone();
+        let config = self.config.clone();
+        let entrypoint = entrypoint.to_string();
+        let timeout = config.timeout;
 
-        // Create instance
-        let instance = self.instantiate(&mut store, &module).await?;
-
-        // Get the exported function
-        let func = self.get_function(&mut store, &instance, entrypoint)?;
-
-        // Get memory export
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| SandboxError::WasmExecution("Memory export not found".to_string()))?;
-
-        // Allocate space for input via exported allocator
-        let alloc = instance
-            .get_typed_func::<i32, i32>(&mut store, "alms_alloc")
-            .map_err(|_| SandboxError::WasmFunctionNotFound("alms_alloc".to_string()))?;
-        let ptr = alloc
-            .call_async(&mut store, params_len)
-            .await
-            .map_err(|e| SandboxError::WasmExecution(format!("Allocation failed: {}", e)))?;
-        if ptr == 0 {
-            return Err(SandboxError::MemoryLimitExceeded {
-                allocated: params_len as usize,
-                limit: self.config.max_memory,
-            });
-        }
-
-        memory.write(&mut store, ptr as usize, &params_json)
-            .map_err(|_| SandboxError::MemoryLimitExceeded {
-                allocated: ptr as usize + params_len as usize,
-                limit: self.config.max_memory,
-            })?;
-
-        // Call the function
-        trace!("Calling WASM function with ptr={}, len={}", ptr, params_len);
-        let call_future = func.call_async(&mut store, (ptr, params_len));
-        let result_ptr: i32 = tokio::time::timeout(self.config.timeout, call_future)
-            .await
-            .map_err(|_| SandboxError::ExecutionTimeout(self.config.timeout))?
-            .map_err(|e| SandboxError::WasmExecution(format!("Function call failed: {}", e)))?;
-
-        // Read result from memory
-        // First read 4 bytes for length
-        let mut len_bytes = [0u8; 4];
-        memory.read(&store, result_ptr as usize, &mut len_bytes)
-            .map_err(|e| SandboxError::WasmExecution(format!("Failed to read result length: {}", e)))?;
-        let result_len = i32::from_le_bytes(len_bytes) as usize;
-
-        // Validate result length
-        if result_len > self.config.max_output_bytes {
-            return Err(SandboxError::MemoryLimitExceeded {
-                allocated: result_len,
-                limit: self.config.max_output_bytes,
-            });
-        }
-
-        // Read the actual result
-        let mut result_bytes = vec![0u8; result_len];
-        memory.read(&store, (result_ptr + 4) as usize, &mut result_bytes)
-            .map_err(|e| SandboxError::WasmExecution(format!("Failed to read result: {}", e)))?;
-
-        // Parse result JSON
-        let result: Value = serde_json::from_slice(&result_bytes)
-            .map_err(|e| SandboxError::InvalidResult(format!("Failed to parse result: {}", e)))?;
+        let result = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || {
+                Self::run_sync(engine, module, config, &entrypoint, params_json)
+            }),
+        )
+        .await;
 
         let elapsed = start_time.elapsed();
         info!("WASM execution completed in {:?}", elapsed);
 
-        Ok(result)
+        match result {
+            Err(_elapsed) => Err(SandboxError::ExecutionTimeout(timeout)),
+            Ok(Err(join_err)) => Err(SandboxError::WasmExecution(join_err.to_string())),
+            Ok(Ok(inner)) => inner,
+        }
     }
 
-    /// Compile WASM bytes to a module
-    async fn compile(&self, wasm_bytes: &[u8]) -> SandboxResult<Module> {
-        trace!("Compiling WASM module ({} bytes)", wasm_bytes.len());
-        
-        Module::new(&self.engine, wasm_bytes)
+    /// Synchronous WASM execution — runs on a `spawn_blocking` thread.
+    fn run_sync(
+        engine: Engine,
+        module: Module,
+        config: SandboxConfig,
+        entrypoint: &str,
+        params_json: Vec<u8>,
+    ) -> SandboxResult<Value> {
+        let params_len = params_json.len() as i32;
+
+        let mut store = Store::new(&engine, SandboxState::new(config.clone()));
+
+        if config.fuel_enabled {
+            store
+                .set_fuel(config.initial_fuel)
+                .map_err(|e| SandboxError::WasmExecution(format!("Failed to set fuel: {}", e)))?;
+        }
+
+        // Build the linker with host imports.
+        let mut linker = wasmtime::Linker::new(&engine);
+        linker
+            .func_wrap(
+                "env",
+                "log",
+                |mut caller: wasmtime::Caller<'_, SandboxState>, ptr: i32, len: i32| {
+                    let memory = caller
+                        .get_export("memory")
+                        .and_then(|e| e.into_memory())
+                        .expect("memory export");
+                    let mut buffer = vec![0u8; len as usize];
+                    memory
+                        .read(&caller, ptr as usize, &mut buffer)
+                        .expect("read memory");
+                    debug!("WASM log: {}", String::from_utf8_lossy(&buffer));
+                },
+            )
+            .map_err(|e| SandboxError::WasmInstantiate(e.to_string()))?;
+
+        let instance = linker.instantiate(&mut store, &module).map_err(|e| {
+            error!("WASM instantiation failed: {}", e);
+            SandboxError::WasmInstantiate(e.to_string())
+        })?;
+
+        // Resolve exports.
+        let func = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, entrypoint)
             .map_err(|e| {
-                error!("WASM compilation failed: {}", e);
-                SandboxError::WasmCompile(e.to_string())
-            })
-    }
-
-    /// Create a WASM instance
-    async fn instantiate(
-        &self,
-        store: &mut Store<SandboxState>,
-        module: &Module,
-    ) -> SandboxResult<Instance> {
-        // Define imports - provide a simple allocation function
-        let mut linker = wasmtime::Linker::new(&self.engine);
-
-        // Add a log function for debugging
-        linker.func_wrap(
-            "env",
-            "log",
-            |mut caller: wasmtime::Caller<'_, SandboxState>, ptr: i32, len: i32| {
-                let memory = caller.get_export("memory")
-                    .and_then(|e| e.into_memory())
-                    .expect("memory export");
-                
-                let mut buffer = vec![0u8; len as usize];
-                memory.read(&caller, ptr as usize, &mut buffer).expect("read memory");
-                
-                let msg = String::from_utf8_lossy(&buffer);
-                debug!("WASM log: {}", msg);
-            },
-        ).map_err(|e| SandboxError::WasmInstantiate(e.to_string()))?;
-
-        let instance = linker.instantiate(store, module)
-            .map_err(|e| {
-                error!("WASM instantiation failed: {}", e);
-                SandboxError::WasmInstantiate(e.to_string())
+                warn!("WASM function '{}' not found: {}", entrypoint, e);
+                SandboxError::WasmFunctionNotFound(entrypoint.to_string())
             })?;
 
-        Ok(instance)
-    }
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| SandboxError::WasmExecution("Memory export not found".to_string()))?;
 
-    /// Get an exported function from the instance
-    fn get_function(
-        &self,
-        store: &mut Store<SandboxState>,
-        instance: &Instance,
-        name: &str,
-    ) -> SandboxResult<TypedFunc<(i32, i32), i32>> {
-        instance
-            .get_typed_func::<(i32, i32), i32>(store, name)
-            .map_err(|e| {
-                warn!("WASM function '{}' not found: {}", name, e);
-                SandboxError::WasmFunctionNotFound(name.to_string())
-            })
-    }
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&mut store, "alms_alloc")
+            .map_err(|_| SandboxError::WasmFunctionNotFound("alms_alloc".to_string()))?;
 
-    /// Get fuel consumed during execution
-    pub fn get_fuel_consumed(&self, store: &Store<SandboxState>) -> Option<u64> {
-        if self.config.fuel_enabled {
-            store.get_fuel().ok().map(|remaining| {
-                self.config.initial_fuel.saturating_sub(remaining)
-            })
-        } else {
-            None
+        // Allocate input buffer inside WASM memory.
+        let ptr = alloc
+            .call(&mut store, params_len)
+            .map_err(|e| SandboxError::WasmExecution(format!("Allocation failed: {}", e)))?;
+        if ptr == 0 {
+            return Err(SandboxError::MemoryLimitExceeded {
+                allocated: params_len as usize,
+                limit: config.max_memory,
+            });
         }
+
+        memory
+            .write(&mut store, ptr as usize, &params_json)
+            .map_err(|_| SandboxError::MemoryLimitExceeded {
+                allocated: ptr as usize + params_len as usize,
+                limit: config.max_memory,
+            })?;
+
+        // Call the tool entrypoint.
+        trace!("Calling WASM function with ptr={}, len={}", ptr, params_len);
+        let result_ptr: i32 = func
+            .call(&mut store, (ptr, params_len))
+            .map_err(|e| SandboxError::WasmExecution(format!("Function call failed: {}", e)))?;
+
+        // Read result: 4-byte LE length prefix followed by JSON bytes.
+        let mut len_bytes = [0u8; 4];
+        memory
+            .read(&store, result_ptr as usize, &mut len_bytes)
+            .map_err(|e| {
+                SandboxError::WasmExecution(format!("Failed to read result length: {}", e))
+            })?;
+        let result_len = i32::from_le_bytes(len_bytes) as usize;
+
+        if result_len > config.max_output_bytes {
+            return Err(SandboxError::MemoryLimitExceeded {
+                allocated: result_len,
+                limit: config.max_output_bytes,
+            });
+        }
+
+        let mut result_bytes = vec![0u8; result_len];
+        memory
+            .read(&store, (result_ptr + 4) as usize, &mut result_bytes)
+            .map_err(|e| SandboxError::WasmExecution(format!("Failed to read result: {}", e)))?;
+
+        serde_json::from_slice(&result_bytes)
+            .map_err(|e| SandboxError::InvalidResult(format!("Failed to parse result: {}", e)))
     }
 }
 
@@ -382,9 +366,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_ok() {
-        let mut sandbox = Sandbox::new(SandboxConfig::default());
+        let sandbox = Sandbox::new(SandboxConfig::default());
         let result = sandbox
-            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
+            .execute(
+                &wasm_ok(),
+                "alms_tool_call",
+                "echo",
+                serde_json::json!({"x": 1}),
+            )
             .await
             .unwrap();
         assert_eq!(result["ok"], true);
@@ -392,9 +381,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_input_size_limit() {
-        let mut sandbox = Sandbox::new(SandboxConfig::default().with_max_input_bytes(10));
+        let sandbox = Sandbox::new(SandboxConfig::default().with_max_input_bytes(10));
         let err = sandbox
-            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": "too_large_payload"}))
+            .execute(
+                &wasm_ok(),
+                "alms_tool_call",
+                "echo",
+                serde_json::json!({"x": "too_large_payload"}),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::MemoryLimitExceeded { .. }));
@@ -402,9 +396,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_output_size_limit() {
-        let mut sandbox = Sandbox::new(SandboxConfig::default().with_max_output_bytes(8));
+        let sandbox = Sandbox::new(SandboxConfig::default().with_max_output_bytes(8));
         let err = sandbox
-            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
+            .execute(
+                &wasm_ok(),
+                "alms_tool_call",
+                "echo",
+                serde_json::json!({"x": 1}),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::MemoryLimitExceeded { .. }));
@@ -412,9 +411,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_invalid_json_output() {
-        let mut sandbox = Sandbox::new(SandboxConfig::default());
+        let sandbox = Sandbox::new(SandboxConfig::default());
         let err = sandbox
-            .execute(&wasm_bad_json(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
+            .execute(
+                &wasm_bad_json(),
+                "alms_tool_call",
+                "echo",
+                serde_json::json!({"x": 1}),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::InvalidResult(_)));
@@ -422,9 +426,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_timeout() {
-        let mut sandbox = Sandbox::new(SandboxConfig::default().with_timeout(Duration::from_millis(0)));
+        let sandbox = Sandbox::new(SandboxConfig::default().with_timeout(Duration::from_millis(0)));
         let err = sandbox
-            .execute(&wasm_ok(), "alms_tool_call", "echo", serde_json::json!({"x": 1}))
+            .execute(
+                &wasm_ok(),
+                "alms_tool_call",
+                "echo",
+                serde_json::json!({"x": 1}),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::ExecutionTimeout(_)));

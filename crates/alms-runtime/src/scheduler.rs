@@ -222,15 +222,15 @@ impl Scheduler {
 
         // Re-enqueue recurring jobs (unless cancelled).
         for job in &due {
-            if let Some(interval) = job.interval {
-                if !cancelled.contains(&job.id) {
-                    pending.push(Reverse(PendingJob {
-                        id: job.id,
-                        name: job.name.clone(),
-                        run_at: job.run_at + interval,
-                        interval: Some(interval),
-                    }));
-                }
+            if let Some(interval) = job.interval
+                && !cancelled.contains(&job.id)
+            {
+                pending.push(Reverse(PendingJob {
+                    id: job.id,
+                    name: job.name.clone(),
+                    run_at: job.run_at + interval,
+                    interval: Some(interval),
+                }));
             }
         }
         drop(pending);
@@ -378,8 +378,12 @@ mod tests {
         let handle = scheduler.start();
 
         let now = Instant::now();
-        scheduler.schedule_once("job-b", now + Duration::from_secs(20)).await;
-        scheduler.schedule_once("job-a", now + Duration::from_secs(10)).await;
+        scheduler
+            .schedule_once("job-b", now + Duration::from_secs(20))
+            .await;
+        scheduler
+            .schedule_once("job-a", now + Duration::from_secs(10))
+            .await;
 
         advance(Duration::from_secs(25)).await;
 

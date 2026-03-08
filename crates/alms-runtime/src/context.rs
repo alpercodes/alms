@@ -53,7 +53,10 @@ impl ContextBuilder {
                 self.build_truncate(history, history_budget, &mut messages);
             }
             _ => {
-                warn!("Unknown context strategy '{}', using truncate", self.config.strategy);
+                warn!(
+                    "Unknown context strategy '{}', using truncate",
+                    self.config.strategy
+                );
                 self.build_truncate(history, history_budget, &mut messages);
             }
         }
@@ -72,12 +75,7 @@ impl ContextBuilder {
     }
 
     /// Full strategy: include all history (oldest to newest), skip if over budget
-    fn build_full(
-        &self,
-        history: &[Message],
-        budget: usize,
-        messages: &mut Vec<LlmMessage>,
-    ) {
+    fn build_full(&self, history: &[Message], budget: usize, messages: &mut Vec<LlmMessage>) {
         let mut used = 0;
         for msg in history {
             let llm_msg = self.session_msg_to_llm(msg);
@@ -97,12 +95,7 @@ impl ContextBuilder {
 
     /// Truncate strategy: keep the most recent messages within budget.
     /// Walks backwards from the newest message.
-    fn build_truncate(
-        &self,
-        history: &[Message],
-        budget: usize,
-        messages: &mut Vec<LlmMessage>,
-    ) {
+    fn build_truncate(&self, history: &[Message], budget: usize, messages: &mut Vec<LlmMessage>) {
         let mut selected: Vec<LlmMessage> = Vec::new();
         let mut used = 0;
         let max_messages = self.config.recent_window;
@@ -132,10 +125,7 @@ impl ContextBuilder {
             Role::System => LlmMessage::system(content_to_string(&msg.content)),
             Role::User => LlmMessage::user(content_to_string(&msg.content)),
             Role::Assistant => LlmMessage::assistant(content_to_string(&msg.content)),
-            Role::Tool => LlmMessage::tool_result(
-                msg.id.clone(),
-                content_to_string(&msg.content),
-            ),
+            Role::Tool => LlmMessage::tool_result(msg.id.clone(), content_to_string(&msg.content)),
         }
     }
 
@@ -152,7 +142,7 @@ impl ContextBuilder {
 /// without changing the interface.
 pub fn estimate_tokens(text: &str) -> usize {
     // chars/4 is a reasonable approximation for GPT-style tokenizers
-    (text.len() + 3) / 4
+    text.len().div_ceil(4)
 }
 
 /// Convert session Content to a string for LLM context
@@ -265,14 +255,22 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 100, // very small budget
-            recent_window: 100,     // allow many messages
+            recent_window: 100,    // allow many messages
             summary_interval: 30,
         };
         let builder = ContextBuilder::new(config);
 
         // Create messages with substantial text
         let history: Vec<Message> = (0..20)
-            .map(|i| make_msg(Role::User, &format!("This is a reasonably long message number {} with some content", i)))
+            .map(|i| {
+                make_msg(
+                    Role::User,
+                    &format!(
+                        "This is a reasonably long message number {} with some content",
+                        i
+                    ),
+                )
+            })
             .collect();
 
         let messages = builder.build("System prompt", &history, "Input");

@@ -24,6 +24,7 @@ pub struct AlmsConfig {
     pub channels: ChannelsConfig,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for AlmsConfig {
     fn default() -> Self {
         Self {
@@ -126,10 +127,10 @@ impl AlmsConfig {
         if let Ok(val) = std::env::var("ALMS_CONTEXT_STRATEGY") {
             self.context.strategy = val;
         }
-        if let Ok(val) = std::env::var("ALMS_MAX_INPUT_TOKENS") {
-            if let Ok(n) = val.parse() {
-                self.context.max_input_tokens = n;
-            }
+        if let Ok(val) = std::env::var("ALMS_MAX_INPUT_TOKENS")
+            && let Ok(n) = val.parse()
+        {
+            self.context.max_input_tokens = n;
         }
     }
 
@@ -137,7 +138,9 @@ impl AlmsConfig {
     pub fn validate(&self) -> AlmsResult<()> {
         // LLM validation
         if !self.llm.mock && self.llm.api_key.is_none() {
-            warn!("No LLM API key configured. Set OPENROUTER_API_KEY or OPENAI_API_KEY, or enable mock mode with ALMS_LLM_MOCK=1");
+            warn!(
+                "No LLM API key configured. Set OPENROUTER_API_KEY or OPENAI_API_KEY, or enable mock mode with ALMS_LLM_MOCK=1"
+            );
         }
 
         if self.llm.timeout_secs == 0 {
