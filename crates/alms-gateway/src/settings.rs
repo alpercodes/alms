@@ -20,6 +20,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "fs_list",
         "fs_read",
         "fs_write",
+        "get_task_result",
         "http_get",
         "invoke_agent",
         "math",

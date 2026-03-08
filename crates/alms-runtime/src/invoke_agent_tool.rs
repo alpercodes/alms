@@ -61,6 +61,12 @@ impl Tool for InvokeAgentTool {
                     "type": "string",
                     "description": "Optional system prompt override for the subagent. \
                                     If omitted, the subagent uses a default general-purpose prompt."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "When true, spawn the subagent in the background and return \
+                                    immediately with a task_id. Poll for the result with \
+                                    get_task_result(task_id). Default: false."
                 }
             },
             "required": ["task"]
@@ -78,6 +84,27 @@ impl Tool for InvokeAgentTool {
             .get("system_prompt")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+
+        let background = params
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if background {
+            let task_id = self
+                .dispatcher
+                .dispatch_background(
+                    task,
+                    system_prompt,
+                    self.parent_session_id,
+                    self.parent_run_id,
+                    self.parent_event_tx.clone(),
+                )
+                .await
+                .map_err(|e| SandboxError::Io(format!("Subagent error: {}", e)))?;
+
+            return Ok(serde_json::json!({ "task_id": task_id.to_string() }));
+        }
 
         let response = self
             .dispatcher

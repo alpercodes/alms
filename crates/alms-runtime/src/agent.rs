@@ -1,5 +1,6 @@
 use crate::context::{ContextBuilder, content_to_string};
 use crate::events::{RuntimeEvent, RuntimeEventSender};
+use crate::get_task_result_tool::GetTaskResultTool;
 use crate::invoke_agent_tool::InvokeAgentTool;
 use crate::llm_client::LlmClient;
 use crate::llm_types::*;
@@ -108,6 +109,12 @@ impl AgentRuntime {
 
     /// Register the `invoke_agent` tool so the agent can spawn subagents.
     pub fn with_invoke_agent(self, tool: InvokeAgentTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
+    /// Register the `get_task_result` tool for polling background subagents.
+    pub fn with_get_task_result(self, tool: GetTaskResultTool) -> Self {
         self.tools.register(std::sync::Arc::new(tool));
         self
     }
@@ -437,16 +444,20 @@ impl AgentRuntime {
                     tool_call_id: None,
                 });
 
-                for tool_call in tool_calls {
-                    let result = self
-                        .execute_tool_call(&tool_call, session_manager, session_id)
-                        .await;
+                // Run all tool calls concurrently so background invoke_agent calls
+                // don't block each other, and independent tools finish in parallel.
+                let results = futures::future::join_all(
+                    tool_calls
+                        .iter()
+                        .map(|tc| self.execute_tool_call(tc, session_manager, session_id)),
+                )
+                .await;
 
+                for (tool_call, result) in tool_calls.iter().zip(results) {
                     let content = match result {
                         Ok(value) => value.to_string(),
                         Err(e) => format!("Error: {}", e),
                     };
-
                     messages.push(LlmMessage::tool_result(&tool_call.id, content));
                 }
 

@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod context;
 pub mod events;
+pub mod get_task_result_tool;
 pub mod invoke_agent_tool;
 pub mod llm_client;
 pub mod llm_types;
@@ -20,6 +21,7 @@ pub mod workspace_tool;
 pub use agent::{AgentConfig, AgentRuntime, Posture, RunOutput};
 pub use context::ContextBuilder;
 pub use events::{RuntimeEvent, RuntimeEventSender};
+pub use get_task_result_tool::GetTaskResultTool;
 pub use invoke_agent_tool::InvokeAgentTool;
 pub use llm_client::LlmClient;
 pub use llm_types::*;

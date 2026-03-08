@@ -217,17 +217,19 @@ async fn execute_run(
         runtime = runtime.with_workspace(workspace);
     }
 
-    // Register invoke_agent tool — subagent events are forwarded into this run's SSE stream
+    // Register invoke_agent + get_task_result tools.
+    // Subagent events are forwarded into this run's SSE stream.
     {
         let dispatcher: std::sync::Arc<dyn alms_runtime::SubagentDispatcher> =
             state.coordinator.clone();
+        let get_task_tool = alms_runtime::GetTaskResultTool::new(dispatcher.clone());
         let invoke_tool = alms_runtime::InvokeAgentTool::new(
             dispatcher,
             session_id,
             Some(run_id),
             Some(invoke_agent_tx),
         );
-        runtime = runtime.with_invoke_agent(invoke_tool);
+        runtime = runtime.with_invoke_agent(invoke_tool).with_get_task_result(get_task_tool);
     }
 
     // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals).
