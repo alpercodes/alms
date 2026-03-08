@@ -1,4 +1,19 @@
 use alms_core::{AgentId, SessionId, Timestamp};
+
+/// Rolling context summary for a session (used by the sliding-summary strategy).
+///
+/// Tracks how many messages from the start of the session history have been
+/// compressed into `text`, so the runtime always knows where the "recent window"
+/// begins.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContextSummary {
+    /// The accumulated summary text.
+    pub text: String,
+    /// Number of messages from the session history covered by this summary.
+    pub messages_covered: usize,
+    /// Timestamp of the last summary update.
+    pub updated_at: Option<Timestamp>,
+}
 use serde::{Deserialize, Serialize};
 
 /// Session state

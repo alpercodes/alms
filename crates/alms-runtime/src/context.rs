@@ -21,12 +21,16 @@ impl ContextBuilder {
     /// Build the message list for an LLM call.
     ///
     /// Takes the full session history and produces a token-budgeted context window:
-    /// [system_prompt, (summary if needed), recent_messages, current_input]
+    /// `[system_prompt, (summary if needed), recent_messages, current_input]`
+    ///
+    /// `existing_summary` is only used when `strategy == "sliding-summary"`.
+    /// Pass `None` for all other strategies.
     pub fn build(
         &self,
         system_prompt: &str,
         history: &[Message],
         current_input: &str,
+        existing_summary: Option<&str>,
     ) -> Vec<LlmMessage> {
         let mut messages = Vec::new();
 
@@ -49,8 +53,7 @@ impl ContextBuilder {
                 self.build_truncate(history, history_budget, &mut messages);
             }
             "sliding-summary" => {
-                // Fall back to truncate until summary generation is implemented
-                self.build_truncate(history, history_budget, &mut messages);
+                self.build_sliding_summary(history, history_budget, &mut messages, existing_summary);
             }
             _ => {
                 warn!(
@@ -119,6 +122,52 @@ impl ContextBuilder {
         messages.extend(selected);
     }
 
+    /// Sliding-summary strategy: inject the pre-computed rolling summary then fill
+    /// with the most-recent messages that fit within the remaining budget.
+    fn build_sliding_summary(
+        &self,
+        history: &[Message],
+        budget: usize,
+        messages: &mut Vec<LlmMessage>,
+        summary: Option<&str>,
+    ) {
+        let mut used = 0;
+
+        // 1. Inject summary block if present
+        if let Some(text) = summary.filter(|s| !s.is_empty()) {
+            let tokens = estimate_tokens(text) + 4;
+            if tokens < budget {
+                messages.push(LlmMessage::system(format!(
+                    "[Context summary of earlier conversation]\n{}",
+                    text
+                )));
+                used += tokens;
+            }
+        }
+
+        // 2. Fill remaining budget with most-recent messages (newest-first walk, then reverse)
+        let remaining = budget.saturating_sub(used);
+        let mut selected: Vec<LlmMessage> = Vec::new();
+        let mut msg_used = 0;
+        let max_messages = self.config.recent_window;
+
+        for msg in history.iter().rev() {
+            if selected.len() >= max_messages {
+                break;
+            }
+            let llm_msg = self.session_msg_to_llm(msg);
+            let tokens = estimate_tokens(llm_msg.content_str()) + 4;
+            if msg_used + tokens > remaining {
+                break;
+            }
+            msg_used += tokens;
+            selected.push(llm_msg);
+        }
+
+        selected.reverse();
+        messages.extend(selected);
+    }
+
     /// Convert a session Message to an LlmMessage
     fn session_msg_to_llm(&self, msg: &Message) -> LlmMessage {
         match msg.role {
@@ -146,7 +195,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 /// Convert session Content to a string for LLM context
-fn content_to_string(content: &Content) -> String {
+pub(crate) fn content_to_string(content: &Content) -> String {
     match content {
         Content::Text(text) => text.clone(),
         Content::ToolCall { name, params } => {
@@ -201,6 +250,7 @@ mod tests {
             max_input_tokens: 32000,
             recent_window: 20,
             summary_interval: 30,
+            summary_model: None,
         };
         let builder = ContextBuilder::new(config);
 
@@ -209,7 +259,7 @@ mod tests {
             make_msg(Role::Assistant, "Hi there!"),
         ];
 
-        let messages = builder.build("You are helpful.", &history, "What's up?");
+        let messages = builder.build("You are helpful.", &history, "What's up?", None);
 
         // system + 2 history + current input = 4
         assert_eq!(messages.len(), 4);
@@ -226,6 +276,7 @@ mod tests {
             max_input_tokens: 32000,
             recent_window: 3,
             summary_interval: 30,
+            summary_model: None,
         };
         let builder = ContextBuilder::new(config);
 
@@ -240,7 +291,7 @@ mod tests {
             })
             .collect();
 
-        let messages = builder.build("System", &history, "Final question");
+        let messages = builder.build("System", &history, "Final question", None);
 
         // system + 3 recent + current = 5
         assert_eq!(messages.len(), 5);
@@ -257,6 +308,7 @@ mod tests {
             max_input_tokens: 100, // very small budget
             recent_window: 100,    // allow many messages
             summary_interval: 30,
+            summary_model: None,
         };
         let builder = ContextBuilder::new(config);
 
@@ -273,10 +325,59 @@ mod tests {
             })
             .collect();
 
-        let messages = builder.build("System prompt", &history, "Input");
+        let messages = builder.build("System prompt", &history, "Input", None);
 
         // Should have fewer than 20 history messages due to token budget
         assert!(messages.len() < 22); // system + some history + input
+    }
+
+    #[test]
+    fn test_sliding_summary_no_prior_summary() {
+        let config = ContextConfig {
+            strategy: "sliding-summary".into(),
+            max_input_tokens: 32000,
+            recent_window: 3,
+            summary_interval: 30,
+            summary_model: None,
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history: Vec<Message> = (0..6)
+            .map(|i| make_msg(Role::User, &format!("msg {i}")))
+            .collect();
+
+        // Without a summary it should behave like truncate (keep last 3)
+        let messages = builder.build("System", &history, "current", None);
+        assert_eq!(messages[0].role, "system");
+        // 3 history + current
+        let body_count = messages.len() - 2; // subtract system + current
+        assert_eq!(body_count, 3);
+    }
+
+    #[test]
+    fn test_sliding_summary_injects_summary_block() {
+        let config = ContextConfig {
+            strategy: "sliding-summary".into(),
+            max_input_tokens: 32000,
+            recent_window: 3,
+            summary_interval: 30,
+            summary_model: None,
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history: Vec<Message> = (0..6)
+            .map(|i| make_msg(Role::User, &format!("msg {i}")))
+            .collect();
+
+        let messages =
+            builder.build("System", &history, "current", Some("Earlier the user greeted."));
+
+        // system + summary_block + 3 recent + current = 6
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "system"); // summary injected as second system message
+        assert!(messages[1].content_str().contains("[Context summary"));
+        assert!(messages[1].content_str().contains("Earlier the user greeted."));
     }
 
     #[test]

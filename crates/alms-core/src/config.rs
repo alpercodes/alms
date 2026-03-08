@@ -263,17 +263,21 @@ pub struct ContextConfig {
     pub max_input_tokens: usize,
     /// Number of recent messages to always keep in full
     pub recent_window: usize,
-    /// How often to update the rolling summary (in messages)
+    /// How often to trigger a new summary (in uncovered messages beyond recent_window)
     pub summary_interval: usize,
+    /// Optional separate (cheaper) model for generating summaries.
+    /// Falls back to the agent's default model when None.
+    pub summary_model: Option<String>,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            strategy: "truncate".into(), // safe default until sliding-summary is implemented
+            strategy: "truncate".into(),
             max_input_tokens: 32000,
             recent_window: 20,
             summary_interval: 30,
+            summary_model: None,
         }
     }
 }

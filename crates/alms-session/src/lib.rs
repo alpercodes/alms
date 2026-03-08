@@ -7,7 +7,7 @@ pub use alms_core::AuditEvent;
 pub use job_store::JobStore;
 pub use sqlite::SqliteStore;
 pub use store::{MemoryStore, SessionStore};
-pub use types::{Content, Message, Role, Session, SessionConfig, SessionStatus};
+pub use types::{Content, ContextSummary, Message, Role, Session, SessionConfig, SessionStatus};
 
 use alms_core::{AgentId, AlmsResult, SessionId};
 use dashmap::DashMap;
@@ -25,6 +25,8 @@ pub struct SessionManager {
     history: Arc<DashMap<SessionId, Vec<Message>>>,
     /// Audit events: session_id -> Vec<AuditEvent>
     audit: Arc<DashMap<SessionId, Vec<AuditEvent>>>,
+    /// Rolling context summaries: session_id -> ContextSummary
+    summaries: Arc<DashMap<SessionId, ContextSummary>>,
     /// Configuration
     config: SessionConfig,
     /// Optional SQLite write-through store
@@ -38,6 +40,7 @@ impl SessionManager {
             session_by_id: Arc::new(DashMap::new()),
             history: Arc::new(DashMap::new()),
             audit: Arc::new(DashMap::new()),
+            summaries: Arc::new(DashMap::new()),
             config,
             store: None,
         }
@@ -70,6 +73,10 @@ impl SessionManager {
             self.history
                 .insert(session_id, store.load_messages(session_id)?);
             self.audit.insert(session_id, store.load_audit(session_id)?);
+            let summary = store
+                .load_summary(session_id)?
+                .unwrap_or_default();
+            self.summaries.insert(session_id, summary);
         }
         if count > 0 {
             info!("Loaded {} session(s) from SQLite", count);
@@ -93,6 +100,9 @@ impl SessionManager {
         self.sessions.insert(key, session.clone());
         self.history.insert(session.id, Vec::new());
         self.audit.insert(session.id, Vec::new());
+        self.summaries
+            .entry(session.id)
+            .or_default();
 
         if let Some(store) = &self.store
             && let Err(e) = store.save_session(&session)
@@ -192,8 +202,7 @@ impl SessionManager {
 
     /// List all sessions across all agents, sorted by last_activity descending.
     pub fn list_all(&self) -> Vec<Session> {
-        let mut sessions: Vec<Session> =
-            self.sessions.iter().map(|e| e.value().clone()).collect();
+        let mut sessions: Vec<Session> = self.sessions.iter().map(|e| e.value().clone()).collect();
         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity.0));
         sessions
     }
@@ -231,6 +240,33 @@ impl SessionManager {
         } else {
             Err(alms_core::AlmsError::SessionNotFound(key.1))
         }
+    }
+
+    /// Get the rolling context summary for a session.
+    pub fn get_summary(&self, session_id: SessionId) -> AlmsResult<ContextSummary> {
+        self.summaries
+            .get(&session_id)
+            .map(|s| s.clone())
+            .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
+    }
+
+    /// Replace the rolling context summary for a session (write-through to SQLite).
+    pub fn update_summary(&self, session_id: SessionId, summary: ContextSummary) -> AlmsResult<()> {
+        if !self.summaries.contains_key(&session_id) {
+            return Err(alms_core::AlmsError::SessionNotFound(
+                session_id.0.to_string(),
+            ));
+        }
+        if let Some(store) = &self.store
+            && let Err(e) = store.save_summary(session_id, &summary)
+        {
+            warn!(
+                "Failed to persist summary for session {}: {}",
+                session_id.0, e
+            );
+        }
+        self.summaries.insert(session_id, summary);
+        Ok(())
     }
 
     /// Get config

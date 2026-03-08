@@ -1,4 +1,4 @@
-use crate::context::ContextBuilder;
+use crate::context::{ContextBuilder, content_to_string};
 use crate::events::{RuntimeEvent, RuntimeEventSender};
 use crate::invoke_agent_tool::InvokeAgentTool;
 use crate::llm_client::LlmClient;
@@ -8,7 +8,9 @@ use crate::workspace::AgentWorkspace;
 use crate::workspace_tool::WorkspaceWriteTool;
 use alms_core::config::ContextConfig;
 use alms_core::{AgentId, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
-use alms_session::{Message as SessionMessage, Role as SessionRole, SessionManager};
+use alms_session::{
+    ContextSummary, Message as SessionMessage, Role as SessionRole, SessionManager,
+};
 use tracing::{Span, debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -153,7 +155,7 @@ impl AgentRuntime {
         span.record("input_len", input.len());
 
         let session = session_manager.get_or_create(self.agent_id, context_id);
-        let history = self.build_context(session_manager, &session.id, &input)?;
+        let history = self.build_context(session_manager, &session.id, &input).await?;
         let (response, usage) = self
             .agent_loop(session_manager, session.id, history)
             .await?;
@@ -207,14 +209,15 @@ impl AgentRuntime {
     }
 
     /// Build context window for LLM using ContextBuilder.
-    fn build_context(
+    ///
+    /// For the `sliding-summary` strategy this is async because it may call the
+    /// LLM to compress old messages into a rolling summary.
+    async fn build_context(
         &self,
         session_manager: &SessionManager,
         session_id: &alms_core::SessionId,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
-        let builder = ContextBuilder::new(self.config.context_config.clone());
-
         let system_prompt = if let Some(ref ws) = self.workspace {
             let prefix = ws.build_system_prompt_prefix();
             if prefix.is_empty() {
@@ -234,7 +237,140 @@ impl AgentRuntime {
             }
         };
 
-        Ok(builder.build(&system_prompt, &history, input))
+        // For sliding-summary, attempt to compress old messages before building context.
+        // On failure we log a warning and fall back (None summary → truncate behaviour).
+        let summary_text: Option<String> =
+            if self.config.context_config.strategy == "sliding-summary" {
+                let current = session_manager
+                    .get_summary(*session_id)
+                    .unwrap_or_default();
+                match self
+                    .maybe_summarize(session_manager, *session_id, &history, current)
+                    .await
+                {
+                    Ok(s) => Some(s.text).filter(|t| !t.is_empty()),
+                    Err(e) => {
+                        warn!(
+                            "Sliding-summary compression failed, falling back to truncation: {}",
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+        let builder = ContextBuilder::new(self.config.context_config.clone());
+        Ok(builder.build(&system_prompt, &history, input, summary_text.as_deref()))
+    }
+
+    /// Check whether history has grown past the summarization threshold and, if so,
+    /// call the LLM to extend the rolling summary with the oldest uncovered messages.
+    ///
+    /// Returns the (possibly updated) `ContextSummary`. On success the updated
+    /// summary is also persisted via `session_manager.update_summary()`.
+    async fn maybe_summarize(
+        &self,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        history: &[alms_session::Message],
+        mut current: ContextSummary,
+    ) -> AlmsResult<ContextSummary> {
+        let recent_window = self.config.context_config.recent_window;
+        let summary_interval = self.config.context_config.summary_interval;
+
+        // Guard against corrupt messages_covered value.
+        current.messages_covered = current.messages_covered.min(history.len());
+
+        let uncovered = history.len().saturating_sub(current.messages_covered);
+        let compressible = uncovered.saturating_sub(recent_window);
+
+        if compressible < summary_interval {
+            return Ok(current); // not enough new material to justify a summary call
+        }
+
+        // Compress everything from messages_covered up to (history.len() - recent_window)
+        // so we always keep the recent window verbatim.
+        let compress_end = history.len() - recent_window;
+        let to_compress = &history[current.messages_covered..compress_end];
+        if to_compress.is_empty() {
+            return Ok(current);
+        }
+
+        // Build summarization prompt
+        let mut sum_messages = vec![LlmMessage::system(
+            "You are a conversation summarizer. \
+             Given a sequence of messages, produce a concise factual summary \
+             (3–7 sentences) capturing key decisions, facts learned, and actions taken. \
+             No pleasantries or meta-commentary.",
+        )];
+
+        let user_prefix = if current.text.is_empty() {
+            "Summarize the following conversation:".to_string()
+        } else {
+            format!(
+                "Extend this existing summary with the new messages below.\n\
+                 Existing summary:\n{}\n\nNew messages to incorporate:",
+                current.text
+            )
+        };
+        sum_messages.push(LlmMessage::user(user_prefix));
+
+        let transcript: String = to_compress
+            .iter()
+            .map(|m| {
+                let role_label = match m.role {
+                    SessionRole::User => "User",
+                    SessionRole::Assistant => "Assistant",
+                    SessionRole::System => "System",
+                    SessionRole::Tool => "Tool",
+                };
+                format!("{}: {}", role_label, content_to_string(&m.content))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sum_messages.push(LlmMessage::user(transcript));
+
+        let model = self
+            .config
+            .context_config
+            .summary_model
+            .as_deref()
+            .unwrap_or_else(|| self.llm.default_model());
+
+        let request = CompletionRequest::new(model)
+            .with_messages(sum_messages)
+            .with_temperature(0.3) // lower temp for factual compression
+            .with_max_tokens(512);
+
+        let response = self.llm.complete(request).await?;
+
+        let new_text = response
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|c| c.message.content)
+            .ok_or_else(|| {
+                alms_core::AlmsError::Runtime(
+                    "Summarization LLM returned empty response".to_string(),
+                )
+            })?;
+
+        current.text = new_text;
+        current.messages_covered = compress_end;
+        current.updated_at = Some(alms_core::Timestamp::now());
+
+        session_manager.update_summary(session_id, current.clone())?;
+
+        info!(
+            "Sliding-summary: compressed {} messages (now {} covered, {} in recent window)",
+            to_compress.len(),
+            compress_end,
+            recent_window,
+        );
+
+        Ok(current)
     }
 
     /// Main agent loop with tool execution
@@ -530,8 +666,8 @@ mod tests {
         assert_eq!(config.posture, Posture::FullControl);
     }
 
-    #[test]
-    fn test_build_context() {
+    #[tokio::test]
+    async fn test_build_context() {
         let runtime = AgentRuntime {
             agent_id: AgentId::new(),
             config: AgentConfig::default(),
@@ -548,6 +684,7 @@ mod tests {
 
         let messages = runtime
             .build_context(&session_manager, &session.id, "hello")
+            .await
             .unwrap();
         // system prompt + current input = 2
         assert_eq!(messages.len(), 2);
