@@ -570,7 +570,7 @@ function renderSessions() {
 }
 
 async function newSession() {
-  if (!S.agentId) return;
+  if (activeEs || !S.agentId) return;
   const contextId = 'web-' + Date.now().toString(36);
   try {
     const res = await fetch('/sessions', {
@@ -589,9 +589,9 @@ async function newSession() {
 
 function switchSession(sessionId) {
   if (sessionId === S.activeSessionId) return;
-
-  // Close any running stream before switching.
-  if (activeEs) { activeEs.close(); activeEs = null; }
+  // Don't switch while a run is in progress — the user would miss live events.
+  // (Events are logged server-side; they'll appear in run history after completion.)
+  if (activeEs) return;
 
   S.activeSessionId = sessionId;
   localStorage.setItem('alms_session_id', sessionId);
@@ -1000,8 +1000,11 @@ async function loadWorkspace() {
   if (!S.agentId) return;
   if (S.wsFiles !== null) { renderWorkspace(); return; }  // cached
 
+  // Capture agentId so we can abort if it changes during the async fetch.
+  const capturedAgentId = S.agentId;
   try {
-    const res = await fetch(`/agents/${S.agentId}/workspace`);
+    const res = await fetch(`/agents/${capturedAgentId}/workspace`);
+    if (S.agentId !== capturedAgentId) return;  // agent changed mid-fetch
     if (res.status === 503) {
       S.wsFiles = 'unavailable';
     } else if (!res.ok) {
@@ -1011,6 +1014,7 @@ async function loadWorkspace() {
       S.wsFiles = data.files || {};
     }
   } catch {
+    if (S.agentId !== capturedAgentId) return;
     S.wsFiles = 'error';
   }
   renderWorkspace();
@@ -1073,7 +1077,13 @@ function renderWorkspace() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ content: ta.value }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (!res.ok) {
+          let msg = `HTTP ${res.status}`;
+          try { const b = await res.json(); msg = b?.error?.message || msg; } catch {}
+          flash.textContent = msg;
+          flash.className = 'ws-flash err';
+          return;
+        }
         S.wsFiles[filename] = ta.value;
         flash.textContent = 'Saved';
         flash.className = 'ws-flash ok';
