@@ -120,6 +120,15 @@ pub struct CreateRunRequest {
     /// Optional model override — uses server default when absent.
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional temperature override (0.0–2.0).
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Optional max_tokens override.
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    /// Optional posture override: "full_control" | "guarded".
+    #[serde(default)]
+    pub posture: Option<String>,
 }
 
 /// Input to a run

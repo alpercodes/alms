@@ -152,7 +152,7 @@ impl ToolRegistry {
 
     /// Register all built-in tools
     pub fn register_builtin_tools(&self) {
-        use crate::builtin::*;
+        use crate::builtin::{EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool, ShellExecTool};
 
         // Register echo tool
         if let Err(e) = self.register(Arc::new(EchoTool::new())) {
@@ -167,6 +167,22 @@ impl ToolRegistry {
         // Register http_get tool
         if let Err(e) = self.register(Arc::new(HttpGetTool::new())) {
             error!("Failed to register http_get tool: {}", e);
+        }
+
+        // Register shell_exec tool
+        if let Err(e) = self.register(Arc::new(ShellExecTool::new())) {
+            error!("Failed to register shell_exec tool: {}", e);
+        }
+
+        // Register filesystem tools
+        if let Err(e) = self.register(Arc::new(FsReadTool::new())) {
+            error!("Failed to register fs_read tool: {}", e);
+        }
+        if let Err(e) = self.register(Arc::new(FsWriteTool::new())) {
+            error!("Failed to register fs_write tool: {}", e);
+        }
+        if let Err(e) = self.register(Arc::new(FsListTool::new())) {
+            error!("Failed to register fs_list tool: {}", e);
         }
 
         info!("Registered all built-in tools");

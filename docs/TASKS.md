@@ -6,6 +6,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **Docs spine is in place** (`docs/index.md`, `api.md`, `events-and-audit.md`, `security-model.md`, `capability-model.md`, `approvals-ux.md`, `policy-reasons.md`, `artifacts.md`, plus Zeki's review).
 - **2026-02-14:** Tool parameter schemas implemented, OpenAI API format fixed, LlmMessage.content nullability fixed, multiple compilation fixes applied, GatewayConfig env loading fixed, CLI health command functional. See `docs/agent-ux-requirements.md` for new UX requirements from Alper.
 - **2026-03-07:** Run/event/approval/audit pipeline fully implemented. MVP HTTP API is end-to-end functional with SSE streaming, guarded posture approvals, event replay, and audit log. CI pipeline live on GitHub Actions.
+- **2026-03-09:** Extended tools (#23): shell_exec + fs_read/write/list builtins; per-run temperature/max_tokens/posture overrides via API; Settings UI and Audit panel extended; posture badge in header.
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -164,6 +165,17 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **Token usage** — per-run badge on agent messages; cumulative p/c shown in run history sidebar.
 - **Run history** — `GET /runs?session_id=` (new), last 20 runs with status icon + token counts.
 - 3-column layout: session sidebar | chat | right panel (toggled via header buttons).
+- **Owners:** Atlas
+
+23) Extended tools + full settings UI ✅
+- `shell_exec` tool: argv array (no shell injection), cwd, env, timeout, stdout/stderr truncation.
+- `fs_read`, `fs_write`, `fs_list` filesystem tools; all registered in default builtin registry.
+- `CreateRunRequest` accepts `temperature`, `max_tokens`, `posture` per-run overrides.
+- `GET /settings` now returns temperature, max_tokens, posture, context_strategy, enabled_tools.
+- UI Settings modal extended: temperature, max_tokens, posture fields; server info block.
+- UI header: posture badge (amber when guarded), Audit log button.
+- Audit log right panel: shows tool name, allow/deny, timestamp, params for active session.
+- Settings button turns amber when any override is active.
 - **Owners:** Atlas
 
 22) Context compression (sliding-summary strategy)

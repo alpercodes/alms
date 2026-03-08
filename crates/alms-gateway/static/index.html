@@ -32,6 +32,18 @@
     #status.running { color: #d29922; }
     #status.error   { color: #f85149; }
 
+    #posture-badge {
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 3px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      color: #8b949e;
+      flex-shrink: 0;
+      display: none;
+    }
+    #posture-badge.guarded { color: #d29922; border-color: #d29922; }
+
     .header-btns { display: flex; gap: 6px; }
     .hbtn {
       padding: 4px 10px;
@@ -447,7 +459,7 @@
     .settings-row { display: flex; flex-direction: column; gap: 5px; }
     .settings-label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.6px; }
     .settings-hint  { font-size: 10px; color: #484f58; }
-    .settings-input {
+    .settings-input, .settings-select {
       background: #0d1117;
       border: 1px solid #30363d;
       border-radius: 4px;
@@ -458,7 +470,9 @@
       outline: none;
       width: 100%;
     }
-    .settings-input:focus { border-color: #388bfd; }
+    .settings-select option { background: #0d1117; }
+    .settings-input:focus, .settings-select:focus { border-color: #388bfd; }
+    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .settings-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
     .settings-save {
       padding: 6px 16px; font-size: 12px; font-family: inherit;
@@ -471,17 +485,36 @@
     }
     .settings-cancel:hover { color: #e6edf3; }
     #btn-settings.active { color: #d29922; border-color: #d29922; }
+
+    /* ── Audit tab ── */
+    .audit-event {
+      font-size: 11px;
+      border-bottom: 1px solid #21262d;
+      padding: 6px 0;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .audit-event:last-child { border-bottom: none; }
+    .audit-tool { font-weight: bold; color: #e6edf3; }
+    .audit-allow { color: #3fb950; }
+    .audit-deny  { color: #f85149; }
+    .audit-time  { color: #484f58; }
+    .audit-params { color: #8b949e; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .audit-empty { font-size: 12px; color: #484f58; font-style: italic; padding: 8px 0; }
   </style>
 </head>
 <body>
 
 <header>
   <h1>ALMS</h1>
-  <span id="build" style="font-size:10px;color:#484f58;flex-shrink:0">v0.1</span>
+  <span id="build" style="font-size:10px;color:#484f58;flex-shrink:0">v0.2</span>
+  <span id="posture-badge" title="Execution posture">full_control</span>
   <span id="status">connecting…</span>
   <div class="header-btns">
     <button class="hbtn" id="btn-workspace" onclick="togglePanel('workspace')">Workspace</button>
     <button class="hbtn" id="btn-jobs" onclick="togglePanel('jobs')">Jobs</button>
+    <button class="hbtn" id="btn-audit" onclick="togglePanel('audit')">Audit</button>
     <button class="hbtn" id="btn-settings" onclick="openSettings()">⚙ Settings</button>
   </div>
 </header>
@@ -508,6 +541,36 @@
         <option value="mistralai/mistral-7b-instruct:free">
       </datalist>
       <div class="settings-hint" id="settings-model-hint"></div>
+    </div>
+
+    <div class="settings-grid">
+      <div class="settings-row">
+        <div class="settings-label">Temperature</div>
+        <input type="number" class="settings-input" id="settings-temperature"
+               min="0" max="2" step="0.05" placeholder="server default">
+        <div class="settings-hint">0.0–2.0 · creativity</div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-label">Max tokens</div>
+        <input type="number" class="settings-input" id="settings-max-tokens"
+               min="256" max="32768" step="256" placeholder="server default">
+        <div class="settings-hint">max response length</div>
+      </div>
+    </div>
+
+    <div class="settings-row">
+      <div class="settings-label">Posture</div>
+      <select class="settings-select" id="settings-posture">
+        <option value="">server default</option>
+        <option value="full_control">full_control — execute tools directly</option>
+        <option value="guarded">guarded — require approval per tool call</option>
+      </select>
+      <div class="settings-hint">Guarded posture pauses before each tool execution.</div>
+    </div>
+
+    <div class="settings-row">
+      <div class="settings-label">Server info</div>
+      <div class="settings-hint" id="settings-server-info">loading…</div>
     </div>
 
     <div class="settings-footer">
@@ -547,12 +610,13 @@
     </div>
   </div>
 
-  <!-- ── Right panel (workspace / jobs) ── -->
+  <!-- ── Right panel (workspace / jobs / audit) ── -->
   <div id="panel">
 
     <div class="panel-tabs">
       <button class="panel-tab" id="tab-workspace" onclick="switchPanelTab('workspace')">Workspace</button>
       <button class="panel-tab" id="tab-jobs" onclick="switchPanelTab('jobs')">Jobs</button>
+      <button class="panel-tab" id="tab-audit" onclick="switchPanelTab('audit')">Audit</button>
     </div>
 
     <!-- Workspace tab -->
@@ -563,6 +627,11 @@
     <!-- Jobs tab -->
     <div class="panel-body" id="panel-jobs" style="display:none">
       <!-- populated by renderJobs() -->
+    </div>
+
+    <!-- Audit tab -->
+    <div class="panel-body" id="panel-audit" style="display:none">
+      <!-- populated by renderAudit() -->
     </div>
 
   </div>
@@ -580,7 +649,8 @@ const S = {
   runs:            [],            // runs for active session
   wsFiles:         null,          // { 'personality.md': '...', ... } or null
   jobs:            [],
-  activePanel:     null,          // 'workspace' | 'jobs' | null
+  auditEvents:     null,          // audit log for active session
+  activePanel:     null,          // 'workspace' | 'jobs' | 'audit' | null
   activePanelTab:  'workspace',   // which tab is shown when panel is open
 };
 
@@ -597,6 +667,7 @@ const sessionTokensEl = document.getElementById('session-tokens');
 const panelEl      = document.getElementById('panel');
 const wsBodyEl     = document.getElementById('panel-workspace');
 const jobsBodyEl   = document.getElementById('panel-jobs');
+const auditBodyEl  = document.getElementById('panel-audit');
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 function setStatus(text, cls) {
@@ -680,7 +751,8 @@ function switchSession(sessionId) {
   S.activeSessionId = sessionId;
   localStorage.setItem('alms_session_id', sessionId);
   S.runs = [];
-  S.wsFiles = null;  // force workspace reload on next open
+  S.wsFiles = null;       // force workspace reload on next open
+  S.auditEvents = null;   // force audit reload on next open
 
   messagesEl.innerHTML = '';
   renderSessions();
@@ -938,8 +1010,11 @@ async function sendMessage() {
       session_id: S.activeSessionId,
       input: { type: 'text', text },
     };
-    const activeModel = getActiveModel();
-    if (activeModel) runBody.model = activeModel;
+    const local = loadLocalSettings();
+    if (local.model)       runBody.model       = local.model;
+    if (local.temperature != null) runBody.temperature = local.temperature;
+    if (local.max_tokens  != null) runBody.max_tokens  = local.max_tokens;
+    if (local.posture)     runBody.posture      = local.posture;
 
     const res = await fetch('/runs', {
       method: 'POST',
@@ -994,8 +1069,9 @@ function openEventStream(runId) {
     setStatus(`session ${S.activeSessionId.slice(0, 8)}…`, 'ok');
     enableInput();
     promptEl.focus();
-    // Refresh run history after completion.
+    // Refresh run history and audit log after completion.
     loadRuns();
+    if (S.activePanel === 'audit') { S.auditEvents = null; loadAudit(); }
   }
 
   es.addEventListener('token_delta', e => {
@@ -1081,26 +1157,31 @@ function togglePanel(tab) {
     // Close panel.
     S.activePanel = null;
     panelEl.classList.remove('open');
-    document.getElementById('btn-workspace').classList.remove('active');
-    document.getElementById('btn-jobs').classList.remove('active');
+    ['workspace', 'jobs', 'audit'].forEach(t =>
+      document.getElementById('btn-' + t)?.classList.remove('active')
+    );
   } else {
     S.activePanel = tab;
     panelEl.classList.add('open');
-    document.getElementById('btn-workspace').classList.toggle('active', tab === 'workspace');
-    document.getElementById('btn-jobs').classList.toggle('active', tab === 'jobs');
+    ['workspace', 'jobs', 'audit'].forEach(t =>
+      document.getElementById('btn-' + t)?.classList.toggle('active', t === tab)
+    );
     switchPanelTab(tab);
   }
 }
 
 function switchPanelTab(tab) {
   S.activePanelTab = tab;
-  document.getElementById('tab-workspace').classList.toggle('active', tab === 'workspace');
-  document.getElementById('tab-jobs').classList.toggle('active', tab === 'jobs');
-  wsBodyEl.style.display   = tab === 'workspace' ? 'flex' : 'none';
-  jobsBodyEl.style.display = tab === 'jobs'      ? 'flex' : 'none';
+  ['workspace', 'jobs', 'audit'].forEach(t => {
+    document.getElementById('tab-' + t)?.classList.toggle('active', t === tab);
+  });
+  wsBodyEl.style.display    = tab === 'workspace' ? 'flex' : 'none';
+  jobsBodyEl.style.display  = tab === 'jobs'      ? 'flex' : 'none';
+  auditBodyEl.style.display = tab === 'audit'     ? 'flex' : 'none';
 
   if (tab === 'workspace') loadWorkspace();
   if (tab === 'jobs')      loadJobs();
+  if (tab === 'audit')     loadAudit();
 }
 
 // ── Workspace panel ────────────────────────────────────────────────────────────
@@ -1393,13 +1474,94 @@ function renderJobs() {
   }
 }
 
+// ── Audit panel ────────────────────────────────────────────────────────────────
+async function loadAudit() {
+  if (!S.activeSessionId) { renderAudit(); return; }
+  try {
+    const res = await fetch(`/audit?session_id=${S.activeSessionId}&limit=50`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    S.auditEvents = data.events || [];
+  } catch {
+    S.auditEvents = [];
+  }
+  renderAudit();
+}
+
+function renderAudit() {
+  auditBodyEl.innerHTML = '';
+  auditBodyEl.style.flexDirection = 'column';
+
+  const hdr = document.createElement('div');
+  hdr.style.cssText = 'display:flex;justify-content:space-between;align-items:center;margin-bottom:6px';
+  const title = document.createElement('span');
+  title.style.cssText = 'font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.6px';
+  title.textContent = 'Tool audit log';
+  const refreshBtn = document.createElement('button');
+  refreshBtn.className = 'hbtn';
+  refreshBtn.style.cssText = 'font-size:10px;padding:2px 7px';
+  refreshBtn.textContent = '↺';
+  refreshBtn.title = 'Refresh';
+  refreshBtn.onclick = () => { S.auditEvents = null; loadAudit(); };
+  hdr.appendChild(title);
+  hdr.appendChild(refreshBtn);
+  auditBodyEl.appendChild(hdr);
+
+  if (!S.auditEvents || S.auditEvents.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'audit-empty';
+    empty.textContent = 'No tool executions recorded for this session.';
+    auditBodyEl.appendChild(empty);
+    return;
+  }
+
+  // Newest first
+  const events = [...S.auditEvents].reverse();
+  for (const ev of events) {
+    const row = document.createElement('div');
+    row.className = 'audit-event';
+
+    const top = document.createElement('div');
+    top.style.cssText = 'display:flex;gap:6px;align-items:baseline';
+
+    const toolSpan = document.createElement('span');
+    toolSpan.className = 'audit-tool';
+    toolSpan.textContent = ev.tool;
+
+    const decSpan = document.createElement('span');
+    decSpan.className = ev.decision === 'allow' ? 'audit-allow' : 'audit-deny';
+    decSpan.textContent = ev.decision === 'allow' ? '✓' : '✗';
+
+    const timeSpan = document.createElement('span');
+    timeSpan.className = 'audit-time';
+    timeSpan.textContent = fmtTime(ev.timestamp);
+    timeSpan.style.marginLeft = 'auto';
+
+    top.appendChild(toolSpan);
+    top.appendChild(decSpan);
+    top.appendChild(timeSpan);
+
+    const params = document.createElement('div');
+    params.className = 'audit-params';
+    params.textContent = JSON.stringify(ev.params);
+
+    row.appendChild(top);
+    row.appendChild(params);
+    auditBodyEl.appendChild(row);
+  }
+}
+
 // ── Settings ───────────────────────────────────────────────────────────────────
 const SETTINGS_KEY = 'alms_settings';
-let serverDefaults = { model: '', base_url: '' };
+let serverDefaults = {};
 
-const settingsOverlay  = document.getElementById('settings-overlay');
-const settingsModelIn  = document.getElementById('settings-model');
-const settingsModelHint = document.getElementById('settings-model-hint');
+const settingsOverlay    = document.getElementById('settings-overlay');
+const settingsModelIn    = document.getElementById('settings-model');
+const settingsModelHint  = document.getElementById('settings-model-hint');
+const settingsTempIn     = document.getElementById('settings-temperature');
+const settingsMaxTokIn   = document.getElementById('settings-max-tokens');
+const settingsPostureSel = document.getElementById('settings-posture');
+const settingsServerInfo = document.getElementById('settings-server-info');
 
 function loadLocalSettings() {
   try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; }
@@ -1410,24 +1572,47 @@ function saveLocalSettings(obj) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(obj));
 }
 
-function getActiveModel() {
-  return loadLocalSettings().model || null;
-}
+function getActiveModel()    { return loadLocalSettings().model       || null; }
+function getActivePosture()  { return loadLocalSettings().posture     || null; }
 
 async function fetchServerDefaults() {
   try {
     const res = await fetch('/settings');
     if (res.ok) serverDefaults = await res.json();
   } catch { /* offline */ }
+  updatePostureBadge();
+}
+
+function updatePostureBadge() {
+  const badge = document.getElementById('posture-badge');
+  const localPosture = getActivePosture();
+  const effectivePosture = localPosture || serverDefaults.posture || 'full_control';
+  badge.textContent = effectivePosture;
+  badge.style.display = '';
+  badge.classList.toggle('guarded', effectivePosture === 'guarded');
 }
 
 function openSettings() {
   const local = loadLocalSettings();
-  settingsModelIn.value = local.model || '';
+  settingsModelIn.value    = local.model       || '';
+  settingsTempIn.value     = local.temperature != null ? local.temperature : '';
+  settingsMaxTokIn.value   = local.max_tokens  != null ? local.max_tokens  : '';
+  settingsPostureSel.value = local.posture     || '';
+
   settingsModelIn.placeholder = serverDefaults.model || 'server default';
+  settingsTempIn.placeholder  = serverDefaults.temperature != null ? String(serverDefaults.temperature) : 'server default';
+  settingsMaxTokIn.placeholder = serverDefaults.max_tokens != null ? String(serverDefaults.max_tokens) : 'server default';
+
   settingsModelHint.textContent = serverDefaults.model
     ? `Server default: ${serverDefaults.model}`
     : 'Leave blank to use the server default';
+
+  const infoLines = [];
+  if (serverDefaults.base_url)         infoLines.push(`URL: ${serverDefaults.base_url}`);
+  if (serverDefaults.context_strategy) infoLines.push(`Context: ${serverDefaults.context_strategy}`);
+  if (serverDefaults.enabled_tools)    infoLines.push(`Tools: ${serverDefaults.enabled_tools.join(', ')}`);
+  settingsServerInfo.textContent = infoLines.join(' · ') || '—';
+
   settingsOverlay.classList.add('open');
   settingsModelIn.focus();
 }
@@ -1442,17 +1627,25 @@ function onOverlayClick(e) {
 
 function applySettings() {
   const local = loadLocalSettings();
-  const model = settingsModelIn.value.trim();
-  saveLocalSettings({ ...local, model: model || null });
+  const model       = settingsModelIn.value.trim() || null;
+  const temperature = settingsTempIn.value !== '' ? parseFloat(settingsTempIn.value) : null;
+  const max_tokens  = settingsMaxTokIn.value !== '' ? parseInt(settingsMaxTokIn.value, 10) : null;
+  const posture     = settingsPostureSel.value || null;
+  saveLocalSettings({ ...local, model, temperature, max_tokens, posture });
   updateSettingsBtn();
+  updatePostureBadge();
   closeSettings();
 }
 
 function updateSettingsBtn() {
-  const activeModel = getActiveModel();
+  const local = loadLocalSettings();
+  const hasOverride = !!(local.model || local.temperature != null || local.max_tokens != null || local.posture);
   const btn = document.getElementById('btn-settings');
-  btn.classList.toggle('active', !!activeModel);
-  btn.title = activeModel ? `Model override: ${activeModel}` : 'Settings';
+  btn.classList.toggle('active', hasOverride);
+  const parts = [];
+  if (local.model) parts.push(`model: ${local.model}`);
+  if (local.posture) parts.push(`posture: ${local.posture}`);
+  btn.title = parts.length ? parts.join(', ') : 'Settings';
 }
 
 // Close modal on Escape

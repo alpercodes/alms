@@ -22,6 +22,15 @@ use chrono::Utc;
 use tokio::sync::mpsc;
 use tracing::{error, info, instrument, warn};
 
+/// Per-run overrides that can be sent by the client to customise a single run.
+#[derive(Debug, Default)]
+struct RunOverrides {
+    model:       Option<String>,
+    temperature: Option<f32>,
+    max_tokens:  Option<u32>,
+    posture:     Option<String>,
+}
+
 /// GET /runs?session_id=<uuid>&limit=<n> — list runs for a session
 pub async fn list_runs(
     State(state): State<AppState>,
@@ -63,7 +72,12 @@ pub async fn create_run(
         RunInput::Text { text } => text,
     };
 
-    let model_override = req.model.clone();
+    let overrides = RunOverrides {
+        model:       req.model.clone(),
+        temperature: req.temperature,
+        max_tokens:  req.max_tokens,
+        posture:     req.posture.clone(),
+    };
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
@@ -75,7 +89,7 @@ pub async fn create_run(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        execute_run(state_clone, run_id, session_id, agent_id, run.input, model_override).await;
+        execute_run(state_clone, run_id, session_id, agent_id, run.input, overrides).await;
     });
 
     let response = CreateRunResponse {
@@ -89,14 +103,14 @@ pub async fn create_run(
 }
 
 /// Execute a run in background, forwarding runtime events to SSE.
-#[instrument(level = "info", skip(state, input, model_override), fields(run_id = %run_id.0, session_id = %session_id.0))]
+#[instrument(level = "info", skip(state, input, overrides), fields(run_id = %run_id.0, session_id = %session_id.0))]
 async fn execute_run(
     state: AppState,
     run_id: RunId,
     session_id: SessionId,
     agent_id: alms_core::AgentId,
     input: String,
-    model_override: Option<String>,
+    overrides: RunOverrides,
 ) {
     // Events are persisted to the event log regardless of whether an SSE
     // client is connected. The SSE client registers its own sender when it
@@ -119,7 +133,7 @@ async fn execute_run(
     let (agent_config, llm) = {
         let gateway = state.gateway.lock().await;
         let llm = gateway.llm().clone();
-        let llm = if let Some(model) = model_override {
+        let llm = if let Some(model) = overrides.model {
             info!("Run {} using model override: {}", run_id.0, model);
             llm.with_model(model)
         } else {
@@ -130,6 +144,20 @@ async fn execute_run(
 
     // Create a runtime event channel so we can forward tool events to SSE
     let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+
+    // Apply per-run overrides (temperature, max_tokens, posture).
+    let agent_config = {
+        let mut cfg = agent_config;
+        if let Some(t) = overrides.temperature { cfg.temperature = t; }
+        if let Some(m) = overrides.max_tokens  { cfg.max_tokens = m; }
+        if let Some(ref p) = overrides.posture {
+            cfg.posture = match p.as_str() {
+                "guarded" => alms_runtime::Posture::Guarded,
+                _ => alms_runtime::Posture::FullControl,
+            };
+        }
+        cfg
+    };
 
     // Override system prompt with bootstrap prompt for first-time agents
     let agent_config = if let Some(ref workspace_dir) = state.workspace_dir {
@@ -269,7 +297,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     info!("Job fired → run {}", run_id.0);
 
     // Execute the run (awaits completion; errors are handled inside execute_run).
-    execute_run(state.clone(), run_id, session_id, job.agent_id, run.input, None).await;
+    execute_run(state.clone(), run_id, session_id, job.agent_id, run.input, RunOverrides::default()).await;
 
     // Guard: if the job was cancelled while the run was in progress, do not
     // overwrite the Cancelled status or re-arm the scheduler.
@@ -481,7 +509,7 @@ pub async fn stream_run_legacy(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        execute_run(state_clone, run_id, session_id, agent_id, run.input, None).await;
+        execute_run(state_clone, run_id, session_id, agent_id, run.input, RunOverrides::default()).await;
     });
 
     Ok(RunEventStream::stream(rx))

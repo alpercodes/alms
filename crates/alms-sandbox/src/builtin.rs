@@ -344,6 +344,362 @@ impl Tool for HttpGetTool {
 
 impl BuiltinTool for HttpGetTool {}
 
+// ---------------------------------------------------------------------------
+// Shell execution tool
+// ---------------------------------------------------------------------------
+
+/// Shell exec tool — runs an external program via argv (no shell injection).
+///
+/// Parameters:
+///   argv     : [string, ...]   — program + args, e.g. ["ls", "-la"]
+///   cwd      : string?         — working directory (default: current dir)
+///   env      : {string: string}? — extra environment variables
+///   timeout_secs : number?    — max wait time in seconds (default: 30, max: 120)
+#[derive(Debug, Clone, Default)]
+pub struct ShellExecTool;
+
+impl ShellExecTool {
+    pub fn new() -> Self { Self }
+}
+
+#[async_trait::async_trait]
+impl Tool for ShellExecTool {
+    fn name(&self) -> &str { "shell_exec" }
+
+    fn description(&self) -> &str {
+        "Run an external program via argv array (no shell — safe from injection). \
+        Returns stdout, stderr, and exit_code. Use for file system operations, \
+        running scripts, checking system state, etc."
+    }
+
+    fn is_builtin(&self) -> bool { true }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "argv": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Program and arguments, e.g. [\"ls\", \"-la\", \"/tmp\"]",
+                    "minItems": 1
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for the process. Defaults to current directory."
+                },
+                "env": {
+                    "type": "object",
+                    "description": "Extra environment variables as key-value pairs.",
+                    "additionalProperties": { "type": "string" }
+                },
+                "timeout_secs": {
+                    "type": "number",
+                    "description": "Max execution time in seconds (default 30, max 120)."
+                }
+            },
+            "required": ["argv"]
+        })
+    }
+
+    async fn execute(&self, params: Value) -> SandboxResult<Value> {
+        let argv = params
+            .get("argv")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| SandboxError::InvalidParameters("'argv' must be an array".to_string()))?;
+
+        if argv.is_empty() {
+            return Err(SandboxError::InvalidParameters("'argv' must not be empty".to_string()));
+        }
+
+        let program = argv[0]
+            .as_str()
+            .ok_or_else(|| SandboxError::InvalidParameters("argv[0] must be a string".to_string()))?;
+
+        let args: Vec<&str> = argv[1..]
+            .iter()
+            .map(|v| v.as_str().unwrap_or(""))
+            .collect();
+
+        let timeout_secs = params
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30)
+            .min(120);
+
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&args);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        if let Some(cwd) = params.get("cwd").and_then(|v| v.as_str()) {
+            cmd.current_dir(cwd);
+        }
+
+        if let Some(env_obj) = params.get("env").and_then(|v| v.as_object()) {
+            for (k, v) in env_obj {
+                if let Some(val) = v.as_str() {
+                    cmd.env(k, val);
+                }
+            }
+        }
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| SandboxError::Io(format!("Failed to spawn '{}': {}", program, e)))?;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        .map_err(|_| SandboxError::Io(format!("Process timed out after {}s", timeout_secs)))?
+        .map_err(|e| SandboxError::Io(format!("Process error: {}", e)))?;
+
+        const MAX_OUTPUT: usize = 8000;
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+
+        let stdout_str = if stdout.len() > MAX_OUTPUT {
+            format!("{}…[truncated {} chars]", &stdout[..MAX_OUTPUT], stdout.len() - MAX_OUTPUT)
+        } else {
+            stdout.into_owned()
+        };
+        let stderr_str = if stderr.len() > MAX_OUTPUT {
+            format!("{}…[truncated {} chars]", &stderr[..MAX_OUTPUT], stderr.len() - MAX_OUTPUT)
+        } else {
+            stderr.into_owned()
+        };
+
+        Ok(serde_json::json!({
+            "exit_code": result.status.code().unwrap_or(-1),
+            "stdout": stdout_str,
+            "stderr": stderr_str,
+        }))
+    }
+}
+
+impl BuiltinTool for ShellExecTool {}
+
+// ---------------------------------------------------------------------------
+// Filesystem tools
+// ---------------------------------------------------------------------------
+
+/// Read a file from the filesystem.
+#[derive(Debug, Clone, Default)]
+pub struct FsReadTool;
+
+impl FsReadTool {
+    pub fn new() -> Self { Self }
+}
+
+#[async_trait::async_trait]
+impl Tool for FsReadTool {
+    fn name(&self) -> &str { "fs_read" }
+
+    fn description(&self) -> &str {
+        "Read the text content of a file. Returns the file's content as a string."
+    }
+
+    fn is_builtin(&self) -> bool { true }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to read."
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, params: Value) -> SandboxResult<Value> {
+        let path = params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
+
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+
+        const MAX_CONTENT: usize = 32000;
+        let result = if content.len() > MAX_CONTENT {
+            format!("{}…[truncated, {} chars total]", &content[..MAX_CONTENT], content.len())
+        } else {
+            content
+        };
+
+        Ok(serde_json::json!({ "content": result }))
+    }
+}
+
+impl BuiltinTool for FsReadTool {}
+
+/// Write (or append to) a file on the filesystem.
+#[derive(Debug, Clone, Default)]
+pub struct FsWriteTool;
+
+impl FsWriteTool {
+    pub fn new() -> Self { Self }
+}
+
+#[async_trait::async_trait]
+impl Tool for FsWriteTool {
+    fn name(&self) -> &str { "fs_write" }
+
+    fn description(&self) -> &str {
+        "Write or append text content to a file. Creates the file and parent directories if needed."
+    }
+
+    fn is_builtin(&self) -> bool { true }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to write."
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Text content to write."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["write", "append"],
+                    "description": "Write mode: 'write' (overwrite, default) or 'append'."
+                }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    async fn execute(&self, params: Value) -> SandboxResult<Value> {
+        let path = params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
+
+        let content = params
+            .get("content")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| SandboxError::InvalidParameters("'content' is required".to_string()))?;
+
+        let mode = params
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("write");
+
+        // Create parent directories if needed.
+        if let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| SandboxError::Io(format!("Failed to create dirs for '{}': {}", path, e)))?;
+        }
+
+        match mode {
+            "append" => {
+                use tokio::io::AsyncWriteExt;
+                let mut file = tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .await
+                    .map_err(|e| SandboxError::Io(format!("Failed to open '{}': {}", path, e)))?;
+                file.write_all(content.as_bytes())
+                    .await
+                    .map_err(|e| SandboxError::Io(format!("Failed to append to '{}': {}", path, e)))?;
+            }
+            _ => {
+                tokio::fs::write(path, content)
+                    .await
+                    .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", path, e)))?;
+            }
+        }
+
+        Ok(serde_json::json!({ "ok": true, "path": path }))
+    }
+}
+
+impl BuiltinTool for FsWriteTool {}
+
+/// List directory contents.
+#[derive(Debug, Clone, Default)]
+pub struct FsListTool;
+
+impl FsListTool {
+    pub fn new() -> Self { Self }
+}
+
+#[async_trait::async_trait]
+impl Tool for FsListTool {
+    fn name(&self) -> &str { "fs_list" }
+
+    fn description(&self) -> &str {
+        "List the contents of a directory. Returns filenames and whether each entry is a directory."
+    }
+
+    fn is_builtin(&self) -> bool { true }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Directory path to list. Defaults to current working directory."
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, params: Value) -> SandboxResult<Value> {
+        let path = params
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
+
+        let mut read_dir = tokio::fs::read_dir(path)
+            .await
+            .map_err(|e| SandboxError::Io(format!("Failed to list '{}': {}", path, e)))?;
+
+        let mut entries = Vec::new();
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(|e| SandboxError::Io(format!("Error reading dir entry: {}", e)))?
+        {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = entry
+                .file_type()
+                .await
+                .map(|t| t.is_dir())
+                .unwrap_or(false);
+            entries.push(serde_json::json!({ "name": name, "is_dir": is_dir }));
+        }
+
+        // Sort: directories first, then files, both alphabetically.
+        entries.sort_by(|a, b| {
+            let a_dir = a["is_dir"].as_bool().unwrap_or(false);
+            let b_dir = b["is_dir"].as_bool().unwrap_or(false);
+            b_dir.cmp(&a_dir).then_with(|| {
+                a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+            })
+        });
+
+        Ok(serde_json::json!({ "path": path, "entries": entries }))
+    }
+}
+
+impl BuiltinTool for FsListTool {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
