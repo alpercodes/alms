@@ -1,296 +1,224 @@
-# ALMS Architecture v0.2 — Multi-Agent Coordination
+# ALMS Architecture — Multi-Agent Hierarchy
 
 ## What is ALMS?
 
 **ALMS** = **Agent Loop Management System**
 
-A **coordinator-based multi-agent platform** where a Main Agent orchestrates specialized Subagents to accomplish complex tasks through delegation, parallel execution, and result synthesis.
+A Rust-based agent platform where any agent can spawn ephemeral subagents to delegate work, forming a pure tree hierarchy. Results flow up from children to parents — there is no peer-to-peer messaging between agents.
 
 ---
 
 ## Core Design Principles
 
-1. **Coordination over Monolith** — Main Agent delegates, Subagents execute
-2. **Explicit over Implicit** — Clear task boundaries, observable handoffs
-3. **Parallel by Default** — Independent tasks run concurrently
-4. **Security First** — Capability-based permissions, strict sandboxing
+1. **Pure Hierarchy** — Any agent can be an orchestrator; subagents return results to their parent
+2. **Ephemeral Workers** — Subagents are short-lived; they do work, return a result, then stop
+3. **No Peer Messaging** — Agents do not talk to each other directly; all communication goes through the parent-child relationship
+4. **Explicit over Implicit** — Clear task boundaries, observable handoffs via SSE
+5. **Security First** — Capability-based permissions, strict sandboxing
 
 ---
 
-## System Components
+## Multi-Agent Topology
 
-### 1. Coordinator (alms-coordinator) — NEW ⭐
+### Option 3 — Pure Hierarchy (current design)
 
-**Purpose:** Central orchestrator that manages the Main Agent and Subagent lifecycle
-
-**Architecture Pattern: Hub-and-Spoke**
+Any agent running inside ALMS can call the `invoke_agent` tool to spawn a subagent. The subagent executes its task independently and returns its result as a tool call response. The parent receives the result and continues its own loop. Subagents can themselves spawn subagents, creating an arbitrary-depth tree.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      COORDINATOR                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │  Main Agent  │  │  Subagent A  │  │  Subagent B  │      │
-│  │  (Planner)   │  │  (Research)  │  │  (Code Gen)  │      │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘      │
-│         │                  │                  │             │
-│         └──────────────────┴──────────────────┘             │
-│                            │                                │
-│                    ┌───────┴───────┐                        │
-│                    │  Message Bus  │                        │
-│                    │  (crossbeam)  │                        │
-│                    └───────────────┘                        │
-└─────────────────────────────────────────────────────────────┘
+[User] ──► [Agent A]
+                │
+                ├── invoke_agent → [Subagent B]
+                │                       │
+                │                       └── returns result ──► [Agent A continues]
+                │
+                └── invoke_agent → [Subagent C]
+                                        │
+                                        ├── invoke_agent → [Subagent D]
+                                        │                       │
+                                        │                       └── returns result ──► [C continues]
+                                        │
+                                        └── returns result ──► [Agent A continues]
 ```
 
-**Key Responsibilities:**
-- Spawn/kill subagents based on Main Agent requests
-- Route messages between agents (Main ↔ Subagents)
-- Enforce resource limits per agent
-- Monitor agent health, restart failed agents
-- Aggregate subagent results for Main Agent synthesis
+**Key properties:**
+- No special "Main Agent" type — any agent instance can orchestrate
+- Subagents are ephemeral: spawned for a task, destroyed on completion
+- Results propagate up the tree via tool responses
+- Cancellation cascades downward (cancel parent → cancel all children)
+- Each subagent has its own tool registry, context window, and system prompt
 
-**Agent Types:**
+### Option 2 — Peer Mesh (future direction, not yet designed)
 
-| Type | Role | Lifecycle |
-|------|------|-----------|
-| **Main** | Planner, decision maker, user interface | Persistent |
-| **Subagent** | Specialist worker (research, code, analysis) | Ephemeral |
-| **Tool** | WASM-based capability | Per-invocation |
+Agents form a mesh where any agent can send messages to any other agent directly, enabling bidirectional collaboration without requiring a parent-child relationship. This supports scenarios like two long-running agents coordinating on a shared task. Not planned for current implementation — noted here for future consideration.
 
 ---
 
-### 2. Main Agent
+## Components
 
-**Purpose:** The user's primary interface and task planner
+### Coordinator (`alms-coordinator`)
 
-**Loop:**
+Manages the lifecycle of subagent tasks spawned by a parent agent.
+
+**Responsibilities:**
+- Accept `invoke_agent` requests (task description, agent type, timeout, capabilities)
+- Spawn a subagent `AgentRuntime` for each request
+- Return the subagent's final response to the caller as a `TaskResult`
+- Cancel subagents when the parent run is cancelled
+- Expose active tasks via `GET /tasks` and `GET /tasks/{id}`
+
+**Current state:** Scaffolding exists (`Coordinator`, `SubagentHandle`, `TaskId`). `execute_task()` is a placeholder that simulates work. Wiring to real `AgentRuntime` is task #29.
+
 ```
-User Input → Understand Intent → Decompose Task → 
-Spawn Subagents → Collect Results → Synthesize Response → Reply
-```
-
-**Capabilities:**
-- Natural language understanding
-- Task decomposition and planning
-- Subagent orchestration (when, who, what)
-- Result synthesis and quality control
-- Escalation to user when stuck
-
-**Never does:**
-- Direct tool execution (delegates to Tool Subagents)
-- Long-running computations (delegates to Compute Subagents)
-- External API calls (delegates to Integration Subagents)
-
----
-
-### 3. Subagent System
-
-**Purpose:** Specialized workers for specific task types
-
-**Spawning Protocol:**
-```rust
-// Main Agent requests subagent
-coordinator.spawn(SubagentRequest {
-    task: "Research Rust async patterns",
-    agent_type: SubagentType::Research,
-    timeout: Duration::from_secs(300),
-    capabilities: vec!["web_search", "read_docs"],
-});
-
-// Subagent executes independently
-// Results stream back to Main Agent
-// Main Agent synthesizes when all complete
+[Parent AgentRuntime]
+        │  invoke_agent tool call
+        ▼
+[Coordinator::spawn_subagent()]
+        │
+        ▼
+[Subagent AgentRuntime] ──► runs its own agent loop ──► returns TaskResult
+        │
+        ▼ (forwarded back as tool result)
+[Parent AgentRuntime continues]
 ```
 
-**Built-in Subagent Types:**
+### Agent Runtime (`alms-runtime`)
 
-| Type | Specialization | Tools |
-|------|---------------|-------|
-| `research` | Information gathering, analysis | web_search, read_docs, summarize |
-| `code` | Code generation, review, debugging | code_gen, lint, test_run |
-| `data` | Data processing, transformation | query, transform, visualize |
-| `integration` | External API interactions | http_request, webhook, notify |
-| `security` | Security analysis, auditing | scan, audit, report |
+Executes agent loops for all agents — both top-level (user-facing) and subagents. There is no separate "Main Agent" implementation; the same `AgentRuntime` is used at every level of the hierarchy.
 
-**Subagent Lifecycle:**
+**Agent loop:**
 ```
-Spawn → Execute → Stream Progress → Complete/Fail → Report → Destroy
+Assemble context → LLM call → Parse response →
+  If tool calls: execute tools (including invoke_agent) → loop
+  If final reply: emit run_finished → stop
 ```
 
-**Key Properties:**
-- Isolated memory space (separate WASM instances)
-- Timeboxed execution (configurable timeout)
-- Resource-limited (CPU, memory caps)
-- Independent failure (one fails, others continue)
-
----
-
-### 4. Session Manager (alms-session)
-
-**Purpose:** Owns all session state across Main Agent and Subagents
-
-**Storage Hierarchy:**
+**Subagent loop (same, different inputs):**
 ```
-session:{main_id}           ← Main Agent session
-  └── subagent:{task_id}    ← Subagent sessions (child-of)
-      └── tool:{invoke_id}  ← Tool invocations (child-of)
+Receive task description as initial user message →
+Assemble minimal context (task-specific system prompt + capabilities) →
+LLM call → ... → emit result → stop
 ```
 
-**Key Design:**
-- Parent sessions track child subagent sessions
-- Subagent results automatically roll up to parent
-- Cancellation cascades: kill parent → kills all children
-- Billing/usage aggregated at parent level
+### Tool Sandbox (`alms-sandbox`)
 
----
+Isolated tool execution used by every agent regardless of hierarchy level.
 
-### 5. Agent Runtime (alms-runtime)
+**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list`, `workspace_write`
 
-**Purpose:** Executes agent loops for both Main and Subagents
+**Planned tool:** `invoke_agent` — calls `Coordinator::spawn_subagent()`, awaits `TaskResult`, returns result string.
 
-**The Main Agent Loop:**
+**Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
+
+### Session Manager (`alms-session`)
+
+Owns conversation history and workspace state.
+
+**Hierarchy:**
 ```
-Inbound Message → Intent Classification → Task Decomposition →
-Parallel Subagent Spawn → Progress Monitoring →
-Result Aggregation → Synthesis → Stream Response → Persist
-```
-
-**The Subagent Loop:**
-```
-Task Assignment → Context Assembly → Tool Execution →
-Result Generation → Stream Progress → Complete → Report
+session:{parent_id}
+  └── subagent_session:{task_id}    (child session, created per subagent spawn)
+      └── subagent_session:{task_id}  (grandchild, if subagent spawns further)
 ```
 
-**Concurrency:**
-- Each agent runs in its own async task
-- Work-stealing across CPU cores
-- Message-passing between agents (no shared state)
+- Parent sessions track active child task IDs
+- Cancellation cascades: cancelling a parent cancels all descendants
+- Token usage is aggregated at each level and rolled up to the root
 
----
+### Gateway (`alms-gateway`)
 
-### 6. Tool Sandbox (alms-sandbox)
+HTTP/SSE control plane. Handles top-level user interactions and exposes coordinator state.
 
-**Purpose:** Isolated tool execution for both Main Agent and Subagents
+**Run endpoints:** `POST /runs`, `GET /runs/{id}`, `GET /runs/{id}/events`
+**Coordinator endpoints (planned):** `GET /tasks`, `GET /tasks/{id}`
 
-**Capability Inheritance:**
-- Subagents inherit capabilities from Main Agent's request
-- Tools inherit capabilities from Subagent manifest
-- Runtime enforces capability boundaries
+**SSE event propagation:** Subagent `tool_start`/`tool_end`/`progress` events are forwarded into the parent run's SSE stream so the UI can show subagent activity inline.
 
----
+### Channel Adapters (`alms-channel`)
 
-### 7. Channel Adapters (alms-channel)
-
-**Purpose:** User-facing interface connects only to Main Agent
-
-**Design:**
-- Users interact with Main Agent only
-- Subagents are invisible to users (implementation detail)
-- Main Agent decides what to show vs. what to delegate
+User-facing interfaces (Telegram, web UI) connect only to top-level runs. Subagent activity is surfaced through the parent's event stream — subagents are never directly addressable by users.
 
 ---
 
 ## Message Flow Example
 
-**User:** "Build me a Rust web server with user auth"
+**User:** "Build me a Rust web server with JWT auth"
 
 ```
-[User] ──► [Main Agent]
-              │
-              ├── Decomposes: [1] Design API, [2] Implement auth, [3] Code server
-              │
-              ├── Spawns Subagent "code-api" → designs OpenAPI spec
-              ├── Spawns Subagent "research-auth" → evaluates auth libraries  
-              └── Spawns Subagent "code-server" → implements (waits for 1,2)
-              │
-              ├── Collects results from 1, 2
-              ├── Provides context to 3
-              ├── Collects final code from 3
-              │
-              └── Synthesizes: "Here's your server with JWT auth using axum..."
-                  │
-[User] ◄──────────┘
+[User] ──► [Top-level Agent]
+                │
+                │  Decides to delegate:
+                ├── invoke_agent("Design the API schema") ──► [Subagent: Design]
+                │                                                   │ returns OpenAPI spec
+                │                                                   ▼
+                ├── invoke_agent("Implement auth middleware") ──► [Subagent: Auth]
+                │   (receives spec as context)                       │ returns auth code
+                │                                                   ▼
+                └── Synthesizes results: "Here's your server with JWT auth..."
+                    │
+[User] ◄────────────┘
 ```
+
+The top-level agent decides *when* and *what* to delegate. Subagents do not communicate with each other — the parent sequences or parallelizes them as it sees fit.
 
 ---
 
-## Token Efficiency — A First-Class Concern
+## Token Efficiency
 
-Most agent frameworks (including OpenClaw) burn tokens aggressively:
+Token cost is a first-class constraint:
 
-1. **Full system prompt on every turn** — The entire agent context (instructions, tools, memory) is re-sent with each API call. Caching helps but isn't always available or used.
-2. **Multiple round-trips per user message** — Each tool call is a separate API request carrying the full conversation history. A single user prompt can trigger 4-5+ API calls.
-3. **Context window bloat** — Conversation history grows linearly, and naive implementations send everything every time.
-
-**ALMS should treat token cost as a core design constraint, not an afterthought:**
-
-- **Context compression:** Summarize or prune history before re-sending. Only include what's relevant to the current task.
-- **Selective system prompts:** Subagents should receive minimal, task-specific instructions — not the full agent persona.
-- **Tool call batching:** Where possible, batch independent tool calls into a single round-trip rather than sequential calls.
-- **Cache-aware design:** Design prompts and context to maximize cache hits (stable prefixes, consistent ordering).
-- **Cost observability:** Surface per-run and per-agent token usage and cost so operators can identify waste.
-- **Tiered model routing:** Route simple tasks to cheaper models, reserve expensive models for complex reasoning. This should be automatic, not manual.
-
-*These observations come from real-world experience running multiple agents on Opus 4.6 via OpenRouter — where a single conversation can burn through dollars in minutes.*
-
----
-
-## Multi-Agent Benefits
-
-| Aspect | Single Agent | Multi-Agent (ALMS) |
-|--------|--------------|-------------------|
-| **Complexity** | Becomes bloated | Each agent focused |
-| **Latency** | Sequential tasks | Parallel execution |
-| **Reliability** | One failure = all fail | Isolated failures |
-| **Specialization** | Generalist | Domain experts |
-| **Debugging** | Opaque | Observable handoffs |
-| **Scaling** | Vertical only | Horizontal spawn |
+- **Minimal subagent context** — Subagents receive a task-specific system prompt, not the full agent persona
+- **Context compression** — `ContextBuilder` with `truncate` (default) and `sliding-summary` (planned) strategies
+- **Usage tracking** — `prompt_tokens` + `completion_tokens` accumulated per run, including subagent usage rolled up to parent
+- **Cost observability** — `run_finished` SSE event and `GET /runs/{id}` expose per-run token counts
+- **Tiered routing** — Subagents can be routed to cheaper models for simpler tasks (planned)
 
 ---
 
 ## Implementation Status
 
 ### Completed ✅
-- [x] Core types and errors
-- [x] Session manager with parent-child hierarchy
-- [x] Basic agent runtime
-- [x] WASM tool sandbox
-- [x] Telegram channel adapter
+- Core types, session manager, agent runtime, WASM sandbox
+- HTTP gateway with SSE streaming, approval workflow, audit log
+- Built-in tools: echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write
+- Cron/scheduler, SQLite persistence, web UI
+- Coordinator scaffolding (Coordinator, SubagentHandle, TaskId, spawn_subagent, cancel_subagent)
 
-### In Progress 🚧
-- [ ] Coordinator service (message routing)
-- [ ] Main Agent loop with planning
-- [ ] Subagent spawn/kill lifecycle
-- [ ] Inter-agent message bus
-- [ ] Result aggregation
-
-### Next 🎯
-- [ ] End-to-end: Main Agent spawns subagent for task
-- [ ] Parallel subagent execution
-- [ ] Progress streaming from subagents
-- [ ] Task decomposition prompt engineering
+### Pending 🎯
+- `invoke_agent` tool (task #28)
+- Wire `execute_task()` to real `AgentRuntime` (task #29)
+- Expose coordinator state via HTTP: `GET /tasks`, `GET /tasks/{id}` (task #29)
+- Forward subagent SSE events into parent run stream (task #29)
 
 ---
 
 ## Code Structure
 
 ```
-alms/
-├── crates/
-│   ├── alms-core/          # Shared types, messages
-│   ├── alms-coordinator/   # ⭐ NEW: Agent orchestration
-│   ├── alms-session/       # Session management (hierarchical)
-│   ├── alms-runtime/
-│   │   ├── main_agent.rs   # ⭐ NEW: Main agent loop
-│   │   ├── subagent.rs     # ⭐ NEW: Subagent implementation
-│   │   └── ...
-│   ├── alms-sandbox/       # WASM tool execution
-│   ├── alms-channel/       # User interface adapters
-│   └── alms-gateway/       # Control plane
+crates/
+  alms-core/          # Shared types, errors, unified config
+  alms-coordinator/   # Subagent lifecycle management (hierarchy root)
+  alms-runtime/       # Agent loop (shared by all levels of hierarchy)
+  alms-session/       # Session state, SQLite persistence
+  alms-sandbox/       # Tool execution, WASM sandbox, builtin tools
+  alms-channel/       # User-facing adapters (Telegram, web)
+  alms-gateway/       # HTTP/SSE control plane
+  alms-cli/           # CLI entrypoint
+```
+
+### Dependency graph (no cycles)
+
+```
+alms-cli → alms-gateway → alms-runtime  → alms-core
+                        → alms-channel  → alms-core
+                        → alms-session  → alms-core
+           alms-runtime → alms-sandbox  → alms-core
+                        → alms-session
+     alms-coordinator   → alms-core
+                        → alms-session
 ```
 
 ---
 
-*Architecture Date: 2026-02-09*  
-*Multi-Agent Update: 2026-02-09*  
-*Built by Mustafa for Alper*
+*Architecture Date: 2026-03-09*
+*Topology: Pure hierarchy — any agent can spawn subagents, no peer-to-peer*
+*Future: Option 2 (peer mesh) under consideration for long-running agent collaboration*

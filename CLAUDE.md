@@ -29,7 +29,7 @@ crates/
   alms-runtime/      # Agent loop, LLM client (OpenAI-compat), tool execution, audit
                      #   context.rs — ContextBuilder (token-budgeted context window)
                      #   workspace.rs — AgentWorkspace (personality/goals/memories files)
-  alms-coordinator/  # Multi-agent orchestration (scaffold — not yet real)
+  alms-coordinator/  # Multi-agent orchestration — pure hierarchy (scaffold, not yet wired)
   alms-session/      # Session store, JSON snapshot persistence (atomic + rotation + checksums)
   alms-sandbox/      # WASM tool sandbox, builtin tools (echo, math, http_get), registry
   alms-channel/      # Channel adapters (Telegram polling implemented)
@@ -116,18 +116,19 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 - **Single-process daemon** — no microservice split planned for MVP
 - **Mock LLM** available via `ALMS_LLM_MOCK=1` env var for testing without API keys
 - **Simple config** — avoid the OpenClaw pattern of confusing nested settings; flat, predictable keys
+- **Pure hierarchy multi-agent** — any agent can spawn subagents via `invoke_agent` tool; results flow up from children to parents; no peer-to-peer messaging between agents. Peer mesh (Option 2) is a possible future direction.
 
 ## Known Issues
 
 - 4 sandbox/wasmtime tests fail with "must use async instantiation when async support is enabled" — pre-existing wasmtime config issue
 - `sliding-summary` context strategy falls back to `truncate` (not yet implemented)
-- Coordinator is still a stub — `execute_task` is a placeholder
+- Coordinator is still a stub — `execute_task` is a placeholder; task #29 will wire it to real `AgentRuntime`
 - `shell_exec` / `fs_*` tools have no path-prefix or command allowlist beyond `..` traversal rejection — treat these as power-user features; use `Guarded` posture in shared environments
 
 ## Current State (as of 2026-03-09)
 
 **Working**: core types, unified config, session management, agent runtime with tool loop + context builder + workspace integration, HTTP gateway with SSE, Telegram adapter, SQLite persistence (`./data/alms.db`), agent workspace files (personality/goals/memories), bootstrap interview, builtin tools (echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write), per-run overrides (model, temperature, max_tokens, posture), approval workflow (guarded posture), cron/scheduler, scheduled jobs (SQLite-backed), audit log, web UI with settings/workspace/jobs/audit panels.
 
-**Not yet real**: coordinator/multi-agent (stub), sliding-summary context strategy.
+**Not yet real**: coordinator/multi-agent (stub — pure hierarchy topology chosen; peer mesh is future), sliding-summary context strategy.
 
 See `docs/TASKS.md` for the prioritized task list, `docs/agent-runtime-design.md` for the runtime design, and `docs/agent-ux-requirements.md` for UX requirements.
