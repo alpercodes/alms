@@ -210,7 +210,13 @@ pub fn router() -> Router<AppState> {
 
 /// Serve the embedded web UI
 async fn serve_ui() -> impl IntoResponse {
-    axum::response::Html(include_str!("../static/index.html"))
+    (
+        [
+            ("Cache-Control", "no-store"),
+            ("Content-Type", "text/html; charset=utf-8"),
+        ],
+        include_str!("../static/index.html"),
+    )
 }
 
 /// Health check endpoint
