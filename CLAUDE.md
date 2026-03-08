@@ -127,8 +127,8 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 
 ## Current State (as of 2026-03-09)
 
-**Working**: core types, unified config, session management, agent runtime with tool loop + context builder + workspace integration, HTTP gateway with SSE, Telegram adapter, SQLite persistence (`./data/alms.db`), agent workspace files (personality/goals/memories), bootstrap interview, builtin tools (echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write), per-run overrides (model, temperature, max_tokens, posture), approval workflow (guarded posture), cron/scheduler, scheduled jobs (SQLite-backed), audit log, web UI with settings/workspace/jobs/audit panels.
+**Working**: core types, unified config, session management, agent runtime with tool loop + context builder + workspace integration, HTTP gateway with SSE, Telegram adapter, SQLite persistence (`./data/alms.db`), agent workspace files (personality/goals/memories), bootstrap interview, builtin tools (echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent), per-run overrides (model, temperature, max_tokens, posture), approval workflow (guarded posture), cron/scheduler, scheduled jobs (SQLite-backed), audit log, web UI with agent management/settings/workspace/jobs/audit panels, multi-agent (pure hierarchy — any agent can spawn subagents via invoke_agent tool).
 
-**Not yet real**: coordinator/multi-agent (stub — pure hierarchy topology chosen; peer mesh is future), sliding-summary context strategy.
+**Not yet real**: sliding-summary context strategy. Coordinator is functional but limited to single-turn subagents — no multi-turn orchestration or task decomposition yet.
 
 See `docs/TASKS.md` for the prioritized task list, `docs/agent-runtime-design.md` for the runtime design, and `docs/agent-ux-requirements.md` for UX requirements.

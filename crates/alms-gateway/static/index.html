@@ -771,45 +771,6 @@ function switchAgent(agentId) {
   promptEl.focus();
 }
 
-// Legacy stub kept so any stale code referencing newSession() does not crash.
-async function newSession() {
-  if (activeEs || !S.agentId) return;
-  const contextId = 'web-' + Date.now().toString(36);
-  try {
-    const res = await fetch('/sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent_id: S.agentId, context_id: contextId }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    await loadSessions();
-    switchSession(data.session_id);
-  } catch (e) {
-    setStatus('failed to create session', 'error');
-  }
-}
-
-function switchSession(sessionId) {
-  if (sessionId === S.activeSessionId) return;
-  // Don't switch while a run is in progress — the user would miss live events.
-  // (Events are logged server-side; they'll appear in run history after completion.)
-  if (activeEs) return;
-
-  S.activeSessionId = sessionId;
-  localStorage.setItem('alms_session_id', sessionId);
-  S.runs = [];
-  S.wsFiles = null;       // force workspace reload on next open
-  S.auditEvents = null;   // force audit reload on next open
-
-  messagesEl.innerHTML = '';
-  renderSessions();
-  loadRuns();
-  loadSessionHistory(sessionId);
-  enableInput();
-  setStatus(`session ${sessionId.slice(0, 8)}…`, 'ok');
-  promptEl.focus();
-}
 
 // ── Run history sidebar ────────────────────────────────────────────────────────
 
