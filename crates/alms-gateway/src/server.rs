@@ -8,7 +8,8 @@ use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
-    create_run, get_run_status, scheduler_fire_loop, stream_run_events, stream_run_legacy,
+    create_run, get_run_status, list_runs, scheduler_fire_loop, stream_run_events,
+    stream_run_legacy,
 };
 use crate::sse::SseEventData;
 use crate::workspace::{get_workspace, update_workspace_file};
@@ -89,6 +90,19 @@ impl RunManager {
             .and_modify(|r| r.mark_failed(error.clone()));
     }
 
+    /// List runs for a session, newest first, up to `limit`.
+    pub fn list_by_session(&self, session_id: SessionId, limit: usize) -> Vec<Run> {
+        let mut runs: Vec<Run> = self
+            .runs
+            .iter()
+            .filter(|e| e.value().session_id == session_id)
+            .map(|e| e.value().clone())
+            .collect();
+        runs.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        runs.truncate(limit);
+        runs
+    }
+
     /// Send event to active subscribers AND persist to event log
     pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
         let event_id = self
@@ -163,10 +177,10 @@ pub fn router() -> Router<AppState> {
         // Health
         .route("/health", get(health_check))
         // Sessions
-        .route("/sessions", post(create_session))
+        .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{agent_id}/{context_id}", get(get_session))
         // Runs (canonical API per spec)
-        .route("/runs", post(create_run))
+        .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{run_id}", get(get_run_status))
         .route("/runs/{run_id}/events", get(stream_run_events))
         // Approvals
@@ -201,6 +215,12 @@ async fn health_check() -> impl IntoResponse {
         "service": "alms",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// GET /sessions — list all sessions across all agents
+async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
+    let sessions = state.session_manager.list_all();
+    Json(serde_json::json!({ "sessions": sessions }))
 }
 
 /// Create a new session

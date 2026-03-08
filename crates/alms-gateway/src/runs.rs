@@ -13,13 +13,31 @@ use alms_core::{
 use alms_runtime::RuntimeEvent;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use serde::Deserialize;
 use chrono::Utc;
 use tokio::sync::mpsc;
 use tracing::{error, info, instrument, warn};
+
+/// GET /runs?session_id=<uuid>&limit=<n> — list runs for a session
+pub async fn list_runs(
+    State(state): State<AppState>,
+    Query(params): Query<ListRunsQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50);
+    let runs = state.run_manager.list_by_session(params.session_id, limit);
+    let responses: Vec<RunStatusResponse> = runs.into_iter().map(RunStatusResponse::from).collect();
+    Json(serde_json::json!({ "runs": responses }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListRunsQuery {
+    pub session_id: SessionId,
+    pub limit: Option<usize>,
+}
 
 /// POST /runs - Create a new run
 ///

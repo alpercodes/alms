@@ -14,31 +14,152 @@
       height: 100dvh;
       display: flex;
       flex-direction: column;
+      overflow: hidden;
     }
 
     /* ── Header ── */
     header {
       flex-shrink: 0;
-      padding: 10px 18px;
+      padding: 8px 14px;
       border-bottom: 1px solid #21262d;
       display: flex;
       align-items: center;
-      gap: 14px;
+      gap: 12px;
     }
-    header h1 { font-size: 15px; color: #58a6ff; letter-spacing: 1px; }
-    #status { font-size: 11px; color: #8b949e; }
+    header h1 { font-size: 14px; color: #58a6ff; letter-spacing: 1px; flex-shrink: 0; }
+    #status { font-size: 11px; color: #8b949e; flex: 1; }
     #status.ok      { color: #3fb950; }
     #status.running { color: #d29922; }
     #status.error   { color: #f85149; }
 
-    /* ── Message list ── */
+    .header-btns { display: flex; gap: 6px; }
+    .hbtn {
+      padding: 4px 10px;
+      font-size: 11px;
+      font-family: inherit;
+      background: #21262d;
+      color: #8b949e;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .hbtn:hover { color: #e6edf3; border-color: #58a6ff; }
+    .hbtn.active { color: #58a6ff; border-color: #58a6ff; background: #161b22; }
+
+    /* ── Main layout ── */
+    #main {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* ── Sidebar ── */
+    #sidebar {
+      width: 190px;
+      flex-shrink: 0;
+      border-right: 1px solid #21262d;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sidebar-section {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .sidebar-section + .sidebar-section {
+      border-top: 1px solid #21262d;
+    }
+
+    .sidebar-label {
+      font-size: 10px;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      padding: 8px 10px 4px;
+      flex-shrink: 0;
+    }
+
+    #session-list {
+      flex: 1;
+      overflow-y: auto;
+      min-height: 60px;
+      max-height: 200px;
+    }
+
+    .session-item {
+      padding: 6px 10px;
+      font-size: 12px;
+      cursor: pointer;
+      color: #8b949e;
+      border-left: 2px solid transparent;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .session-item:hover { background: #161b22; color: #e6edf3; }
+    .session-item.active { color: #58a6ff; border-left-color: #58a6ff; background: #0d1117; }
+
+    #new-session-btn {
+      flex-shrink: 0;
+      margin: 6px 10px;
+      padding: 4px 8px;
+      font-size: 11px;
+      font-family: inherit;
+      background: #21262d;
+      color: #8b949e;
+      border: 1px dashed #30363d;
+      border-radius: 4px;
+      cursor: pointer;
+      text-align: left;
+    }
+    #new-session-btn:hover { color: #3fb950; border-color: #3fb950; }
+
+    /* ── Run history ── */
+    #run-history-section { flex: 1; min-height: 0; }
+    #run-history-section .sidebar-label { display: flex; align-items: center; justify-content: space-between; }
+    #session-tokens { font-size: 10px; color: #8b949e; font-style: normal; }
+
+    #run-list {
+      flex: 1;
+      overflow-y: auto;
+      min-height: 40px;
+    }
+
+    .run-item {
+      padding: 5px 10px;
+      font-size: 11px;
+      color: #8b949e;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .run-item .run-status { flex-shrink: 0; }
+    .run-item .run-meta { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .run-item .run-tokens { flex-shrink: 0; font-size: 10px; color: #484f58; }
+    .run-item.completed .run-status { color: #3fb950; }
+    .run-item.failed    .run-status { color: #f85149; }
+    .run-item.running   .run-status { color: #d29922; }
+    .run-empty { padding: 8px 10px; font-size: 11px; color: #484f58; font-style: italic; }
+
+    /* ── Chat area ── */
+    #chat {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      overflow: hidden;
+    }
+
     #messages {
       flex: 1;
       overflow-y: auto;
-      padding: 20px 18px;
+      padding: 16px 18px;
       display: flex;
       flex-direction: column;
-      gap: 14px;
+      gap: 12px;
     }
 
     .msg { display: flex; flex-direction: column; gap: 3px; max-width: 78%; }
@@ -61,12 +182,18 @@
     .msg.user  .msg-body { background: #1f6feb; color: #fff; }
     .msg.agent .msg-body { background: #161b22; border: 1px solid #30363d; }
 
+    .msg-tokens {
+      font-size: 10px;
+      color: #484f58;
+      padding: 0 2px;
+    }
+
     /* ── Tool events ── */
     .tool-row {
       align-self: flex-start;
       font-size: 11px;
       color: #8b949e;
-      padding: 5px 10px;
+      padding: 4px 9px;
       background: #0d1117;
       border: 1px solid #21262d;
       border-left: 3px solid #388bfd;
@@ -75,8 +202,8 @@
       white-space: pre-wrap;
       word-break: break-all;
     }
-    .tool-row.done  { border-left-color: #3fb950; color: #3fb950; }
-    .tool-row.fail  { border-left-color: #f85149; color: #f85149; }
+    .tool-row.done { border-left-color: #3fb950; color: #3fb950; }
+    .tool-row.fail { border-left-color: #f85149; color: #f85149; }
 
     /* ── Approval card ── */
     .approval-card {
@@ -91,12 +218,7 @@
       gap: 9px;
     }
     .approval-card h3 { font-size: 12px; color: #d29922; }
-    .approval-card pre {
-      font-size: 11px;
-      color: #8b949e;
-      overflow: auto;
-      max-height: 110px;
-    }
+    .approval-card pre { font-size: 11px; color: #8b949e; overflow: auto; max-height: 110px; }
     .approval-card.resolved { border-color: #30363d; }
     .approval-card.resolved h3 { color: #8b949e; }
 
@@ -119,7 +241,7 @@
     /* ── Input area ── */
     #input-area {
       flex-shrink: 0;
-      padding: 12px 18px;
+      padding: 10px 18px;
       border-top: 1px solid #21262d;
       display: flex;
       gap: 10px;
@@ -130,15 +252,15 @@
       background: #161b22;
       border: 1px solid #30363d;
       border-radius: 6px;
-      padding: 9px 13px;
+      padding: 8px 12px;
       color: #e6edf3;
       font-family: inherit;
       font-size: 14px;
       resize: none;
       outline: none;
       line-height: 1.5;
-      min-height: 42px;
-      max-height: 140px;
+      min-height: 40px;
+      max-height: 120px;
     }
     #prompt:focus { border-color: #388bfd; }
     #prompt:disabled { opacity: 0.5; }
@@ -148,14 +270,156 @@
       color: #fff;
       border: none;
       border-radius: 6px;
-      padding: 9px 18px;
+      padding: 8px 16px;
       cursor: pointer;
       font-family: inherit;
       font-size: 14px;
       white-space: nowrap;
+      flex-shrink: 0;
     }
     #send:not(:disabled):hover { background: #2ea043; }
     #send:disabled { opacity: 0.5; cursor: default; }
+
+    /* ── Right panel ── */
+    #panel {
+      width: 300px;
+      flex-shrink: 0;
+      border-left: 1px solid #21262d;
+      display: none;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #panel.open { display: flex; }
+
+    .panel-tabs {
+      display: flex;
+      border-bottom: 1px solid #21262d;
+      flex-shrink: 0;
+    }
+    .panel-tab {
+      flex: 1;
+      padding: 8px;
+      font-size: 11px;
+      font-family: inherit;
+      background: none;
+      color: #8b949e;
+      border: none;
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+      text-align: center;
+    }
+    .panel-tab.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+    .panel-tab:hover:not(.active) { color: #e6edf3; }
+
+    .panel-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    /* ── Workspace panel ── */
+    .ws-file { display: flex; flex-direction: column; gap: 6px; }
+    .ws-file-label {
+      font-size: 11px;
+      color: #8b949e;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+    .ws-textarea {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 7px 9px;
+      color: #e6edf3;
+      font-family: inherit;
+      font-size: 12px;
+      resize: vertical;
+      line-height: 1.5;
+      min-height: 80px;
+      outline: none;
+    }
+    .ws-textarea:focus { border-color: #388bfd; }
+    .ws-save {
+      align-self: flex-end;
+      padding: 4px 12px;
+      font-size: 11px;
+      font-family: inherit;
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .ws-save:hover { background: #2ea043; }
+    .ws-save:disabled { opacity: 0.5; cursor: default; }
+    .ws-flash { font-size: 10px; align-self: flex-end; }
+    .ws-flash.ok  { color: #3fb950; }
+    .ws-flash.err { color: #f85149; }
+    .ws-notice { font-size: 12px; color: #d29922; background: #161b22; border: 1px solid #d29922; border-radius: 4px; padding: 9px; line-height: 1.5; }
+
+    /* ── Jobs panel ── */
+    .jobs-form { display: flex; flex-direction: column; gap: 8px; }
+    .jobs-form label { font-size: 11px; color: #8b949e; }
+    .jobs-input, .jobs-select, .jobs-textarea {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 6px 9px;
+      color: #e6edf3;
+      font-family: inherit;
+      font-size: 12px;
+      outline: none;
+      width: 100%;
+    }
+    .jobs-input:focus, .jobs-select:focus, .jobs-textarea:focus { border-color: #388bfd; }
+    .jobs-select option { background: #161b22; }
+    .jobs-textarea { resize: vertical; min-height: 56px; }
+    .jobs-submit {
+      padding: 5px 12px;
+      font-size: 12px;
+      font-family: inherit;
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      align-self: flex-start;
+    }
+    .jobs-submit:hover { background: #2ea043; }
+    .jobs-divider { border: none; border-top: 1px solid #21262d; margin: 4px 0; }
+    .job-item {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .job-item-top { display: flex; align-items: flex-start; gap: 6px; }
+    .job-prompt { flex: 1; font-size: 12px; color: #e6edf3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .job-cancel {
+      flex-shrink: 0;
+      padding: 2px 7px;
+      font-size: 10px;
+      font-family: inherit;
+      background: none;
+      color: #f85149;
+      border: 1px solid #f85149;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    .job-cancel:hover { background: #8b1922; }
+    .job-cancel:disabled { opacity: 0.4; cursor: default; }
+    .job-meta { font-size: 10px; color: #8b949e; }
+    .job-status-active    { color: #3fb950; }
+    .job-status-cancelled { color: #484f58; text-decoration: line-through; }
+    .job-status-pending   { color: #d29922; }
+    .jobs-empty { font-size: 12px; color: #484f58; font-style: italic; }
+    .jobs-error { font-size: 11px; color: #f85149; }
   </style>
 </head>
 <body>
@@ -163,28 +427,94 @@
 <header>
   <h1>ALMS</h1>
   <span id="status">connecting…</span>
+  <div class="header-btns">
+    <button class="hbtn" id="btn-workspace" onclick="togglePanel('workspace')">Workspace</button>
+    <button class="hbtn" id="btn-jobs" onclick="togglePanel('jobs')">Jobs</button>
+  </div>
 </header>
 
-<div id="messages"></div>
+<div id="main">
 
-<div id="input-area">
-  <textarea id="prompt" rows="2" placeholder="Send a message… (Enter to send, Shift+Enter for newline)" disabled></textarea>
-  <button id="send" disabled>Send</button>
-</div>
+  <!-- ── Left sidebar ── -->
+  <div id="sidebar">
+
+    <div class="sidebar-section" style="flex:0 0 auto">
+      <div class="sidebar-label">Sessions</div>
+      <div id="session-list"></div>
+      <button id="new-session-btn" onclick="newSession()">+ New session</button>
+    </div>
+
+    <div class="sidebar-section" id="run-history-section" style="flex:1">
+      <div class="sidebar-label">
+        Runs
+        <span id="session-tokens"></span>
+      </div>
+      <div id="run-list"></div>
+    </div>
+
+  </div>
+
+  <!-- ── Chat area ── -->
+  <div id="chat">
+    <div id="messages"></div>
+    <div id="input-area">
+      <textarea id="prompt" rows="2" placeholder="Send a message… (Enter to send, Shift+Enter for newline)" disabled></textarea>
+      <button id="send" disabled>Send</button>
+    </div>
+  </div>
+
+  <!-- ── Right panel (workspace / jobs) ── -->
+  <div id="panel">
+
+    <div class="panel-tabs">
+      <button class="panel-tab" id="tab-workspace" onclick="switchPanelTab('workspace')">Workspace</button>
+      <button class="panel-tab" id="tab-jobs" onclick="switchPanelTab('jobs')">Jobs</button>
+    </div>
+
+    <!-- Workspace tab -->
+    <div class="panel-body" id="panel-workspace" style="display:none">
+      <!-- populated by renderWorkspace() -->
+    </div>
+
+    <!-- Jobs tab -->
+    <div class="panel-body" id="panel-jobs" style="display:none">
+      <!-- populated by renderJobs() -->
+    </div>
+
+  </div>
+
+</div><!-- #main -->
 
 <script>
 'use strict';
 
-// ── State ─────────────────────────────────────────────────────────────────────
-let sessionId   = null;
-let activeEs    = null;   // current EventSource
+// ── State ──────────────────────────────────────────────────────────────────────
+const S = {
+  agentId:         localStorage.getItem('alms_agent_id') || null,
+  sessions:        [],
+  activeSessionId: null,
+  runs:            [],            // runs for active session
+  wsFiles:         null,          // { 'personality.md': '...', ... } or null
+  jobs:            [],
+  activePanel:     null,          // 'workspace' | 'jobs' | null
+  activePanelTab:  'workspace',   // which tab is shown when panel is open
+};
 
-const statusEl   = document.getElementById('status');
-const messagesEl = document.getElementById('messages');
-const promptEl   = document.getElementById('prompt');
-const sendBtn    = document.getElementById('send');
+let activeEs = null;  // current EventSource
 
-// ── Utilities ─────────────────────────────────────────────────────────────────
+// ── DOM refs ───────────────────────────────────────────────────────────────────
+const statusEl     = document.getElementById('status');
+const messagesEl   = document.getElementById('messages');
+const promptEl     = document.getElementById('prompt');
+const sendBtn      = document.getElementById('send');
+const sessionListEl = document.getElementById('session-list');
+const runListEl    = document.getElementById('run-list');
+const sessionTokensEl = document.getElementById('session-tokens');
+const panelEl      = document.getElementById('panel');
+const wsBodyEl     = document.getElementById('panel-workspace');
+const jobsBodyEl   = document.getElementById('panel-jobs');
+
+// ── Utilities ──────────────────────────────────────────────────────────────────
 function setStatus(text, cls) {
   statusEl.textContent = text;
   statusEl.className = cls ?? '';
@@ -194,9 +524,163 @@ function scrollToBottom() {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-// ── DOM builders ──────────────────────────────────────────────────────────────
+function fmtTime(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
 
-/** Append a user or agent message bubble. Returns the body element. */
+function fmtDate(iso) {
+  const d = new Date(iso);
+  const today = new Date();
+  if (d.toDateString() === today.toDateString()) return fmtTime(iso);
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+// ── Session sidebar ────────────────────────────────────────────────────────────
+
+async function loadSessions() {
+  try {
+    const res = await fetch('/sessions');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    S.sessions = data.sessions || [];
+  } catch {
+    S.sessions = [];
+  }
+  renderSessions();
+}
+
+function renderSessions() {
+  sessionListEl.innerHTML = '';
+  if (S.sessions.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'run-empty';
+    empty.textContent = 'No sessions yet';
+    sessionListEl.appendChild(empty);
+    return;
+  }
+  for (const sess of S.sessions) {
+    const el = document.createElement('div');
+    el.className = 'session-item' + (sess.id === S.activeSessionId ? ' active' : '');
+    el.title = `${sess.context_id}\nCreated ${new Date(sess.created_at).toLocaleString()}`;
+    el.textContent = sess.context_id;
+    el.onclick = () => switchSession(sess.id);
+    sessionListEl.appendChild(el);
+  }
+}
+
+async function newSession() {
+  if (!S.agentId) return;
+  const contextId = 'web-' + Date.now().toString(36);
+  try {
+    const res = await fetch('/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: S.agentId, context_id: contextId }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    await loadSessions();
+    switchSession(data.session_id);
+  } catch (e) {
+    setStatus('failed to create session', 'error');
+  }
+}
+
+function switchSession(sessionId) {
+  if (sessionId === S.activeSessionId) return;
+
+  // Close any running stream before switching.
+  if (activeEs) { activeEs.close(); activeEs = null; }
+
+  S.activeSessionId = sessionId;
+  localStorage.setItem('alms_session_id', sessionId);
+  S.runs = [];
+  S.wsFiles = null;  // force workspace reload on next open
+
+  messagesEl.innerHTML = '';
+  renderSessions();
+  loadRuns();
+  enableInput();
+  setStatus(`session ${sessionId.slice(0, 8)}…`, 'ok');
+  promptEl.focus();
+}
+
+// ── Run history sidebar ────────────────────────────────────────────────────────
+
+async function loadRuns() {
+  if (!S.activeSessionId) { renderRuns(); return; }
+  try {
+    const res = await fetch(`/runs?session_id=${S.activeSessionId}&limit=20`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    S.runs = data.runs || [];
+  } catch {
+    S.runs = [];
+  }
+  renderRuns();
+}
+
+function renderRuns() {
+  runListEl.innerHTML = '';
+
+  if (S.runs.length === 0) {
+    const el = document.createElement('div');
+    el.className = 'run-empty';
+    el.textContent = 'No runs yet';
+    runListEl.appendChild(el);
+    sessionTokensEl.textContent = '';
+    return;
+  }
+
+  // Cumulative token usage
+  let totalPrompt = 0, totalCompletion = 0;
+  for (const r of S.runs) {
+    if (r.usage) {
+      totalPrompt     += r.usage.prompt_tokens     || 0;
+      totalCompletion += r.usage.completion_tokens || 0;
+    }
+  }
+  if (totalPrompt + totalCompletion > 0) {
+    sessionTokensEl.textContent = `${totalPrompt}p/${totalCompletion}c`;
+  } else {
+    sessionTokensEl.textContent = '';
+  }
+
+  for (const run of S.runs) {
+    const el = document.createElement('div');
+    const st = run.status;
+    el.className = `run-item ${st}`;
+
+    const icon = st === 'completed' ? '✓'
+               : st === 'failed'    ? '✗'
+               : st === 'running'   ? '⋯'
+               : '·';
+
+    const statusSpan = document.createElement('span');
+    statusSpan.className = 'run-status';
+    statusSpan.textContent = icon;
+
+    const metaSpan = document.createElement('span');
+    metaSpan.className = 'run-meta';
+    metaSpan.textContent = fmtDate(run.ts || run.started_at || '');
+    metaSpan.title = run.run_id;
+
+    const tokSpan = document.createElement('span');
+    tokSpan.className = 'run-tokens';
+    if (run.usage) {
+      tokSpan.textContent = `${run.usage.prompt_tokens}+${run.usage.completion_tokens}`;
+    }
+
+    el.appendChild(statusSpan);
+    el.appendChild(metaSpan);
+    el.appendChild(tokSpan);
+    runListEl.appendChild(el);
+  }
+}
+
+// ── DOM builders (chat) ────────────────────────────────────────────────────────
+
 function appendMsg(role, text) {
   const wrap = document.createElement('div');
   wrap.className = `msg ${role}`;
@@ -213,10 +697,16 @@ function appendMsg(role, text) {
   wrap.appendChild(body);
   messagesEl.appendChild(wrap);
   scrollToBottom();
-  return body;
+  return { wrap, body };
 }
 
-/** Append a tool event row. Returns the element so it can be updated. */
+function appendTokenBadge(wrap, promptTokens, completionTokens) {
+  const badge = document.createElement('div');
+  badge.className = 'msg-tokens';
+  badge.textContent = `${promptTokens}p + ${completionTokens}c tokens`;
+  wrap.appendChild(badge);
+}
+
 function appendToolRow(text, cls) {
   const el = document.createElement('div');
   el.className = `tool-row${cls ? ' ' + cls : ''}`;
@@ -226,7 +716,6 @@ function appendToolRow(text, cls) {
   return el;
 }
 
-/** Append an approval request card with Approve / Deny buttons. */
 function appendApprovalCard(approvalId, capability, request) {
   const card = document.createElement('div');
   card.className = 'approval-card';
@@ -259,117 +748,146 @@ function appendApprovalCard(approvalId, capability, request) {
   scrollToBottom();
 }
 
-// ── Session init ──────────────────────────────────────────────────────────────
-async function initSession() {
+// ── Session init ───────────────────────────────────────────────────────────────
+async function boot() {
   setStatus('connecting…');
 
-  // Reuse stored identifiers across page reloads.
-  sessionId = localStorage.getItem('alms_session_id');
-  let agentId = localStorage.getItem('alms_agent_id');
-
-  if (!agentId) {
-    agentId = crypto.randomUUID();
-    localStorage.setItem('alms_agent_id', agentId);
+  // Ensure we have an agent ID persisted.
+  if (!S.agentId) {
+    S.agentId = crypto.randomUUID();
+    localStorage.setItem('alms_agent_id', S.agentId);
   }
 
-  if (!sessionId) {
+  // Load all sessions from server.
+  await loadSessions();
+
+  // Try to resume previously active session.
+  const savedSessionId = localStorage.getItem('alms_session_id');
+  const found = S.sessions.find(s => s.id === savedSessionId);
+
+  if (found) {
+    S.activeSessionId = found.id;
+    renderSessions();
+    await loadRuns();
+    enableInput();
+    setStatus(`session ${found.id.slice(0, 8)}…`, 'ok');
+  } else if (S.sessions.length > 0) {
+    // Default to the most recent session.
+    S.activeSessionId = S.sessions[0].id;
+    localStorage.setItem('alms_session_id', S.activeSessionId);
+    renderSessions();
+    await loadRuns();
+    enableInput();
+    setStatus(`session ${S.activeSessionId.slice(0, 8)}…`, 'ok');
+  } else {
+    // No sessions — create the default one.
     try {
       const res = await fetch('/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agent_id: agentId, context_id: 'web-chat' }),
+        body: JSON.stringify({ agent_id: S.agentId, context_id: 'web-chat' }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      sessionId = data.session_id;
-      localStorage.setItem('alms_session_id', sessionId);
-    } catch (e) {
+      S.activeSessionId = data.session_id;
+      localStorage.setItem('alms_session_id', S.activeSessionId);
+      await loadSessions();
+      renderSessions();
+      enableInput();
+      setStatus(`session ${S.activeSessionId.slice(0, 8)}…`, 'ok');
+    } catch {
       setStatus('server offline', 'error');
-      // Retry after a few seconds.
-      setTimeout(initSession, 4000);
+      setTimeout(boot, 4000);
       return;
     }
   }
 
-  setStatus(`session ${sessionId.slice(0, 8)}…`, 'ok');
-  promptEl.disabled = false;
-  sendBtn.disabled = false;
   promptEl.focus();
 }
 
-// ── Send message ──────────────────────────────────────────────────────────────
-async function sendMessage() {
-  const text = promptEl.value.trim();
-  if (!text || !sessionId) return;
+function enableInput() {
+  promptEl.disabled = false;
+  sendBtn.disabled = false;
+}
 
-  promptEl.value = '';
+function disableInput() {
   promptEl.disabled = true;
   sendBtn.disabled = true;
+}
+
+// ── Send message ───────────────────────────────────────────────────────────────
+async function sendMessage() {
+  const text = promptEl.value.trim();
+  if (!text || !S.activeSessionId) return;
+
+  promptEl.value = '';
+  disableInput();
   setStatus('running…', 'running');
 
   appendMsg('user', text);
 
-  // Kill any previous stream.
   if (activeEs) { activeEs.close(); activeEs = null; }
 
-  // Create the run.
   let runId;
   try {
     const res = await fetch('/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        session_id: sessionId,
+        session_id: S.activeSessionId,
         input: { type: 'text', text },
       }),
     });
     if (!res.ok) {
-      // Session may have expired (server restart without SQLite). Reset and retry.
       if (res.status === 404 || res.status === 400) {
+        // Session expired (server restart without SQLite). Recreate.
         localStorage.removeItem('alms_session_id');
-        sessionId = null;
-        promptEl.disabled = false;
-        sendBtn.disabled = false;
+        S.activeSessionId = null;
+        S.sessions = [];
+        enableInput();
         setStatus('session expired — reconnecting…', 'running');
-        await initSession();
-        promptEl.value = text;   // restore message
+        await boot();
+        promptEl.value = text;
       }
       throw new Error(`HTTP ${res.status}`);
     }
     const data = await res.json();
     runId = data.run_id;
-  } catch (e) {
+  } catch {
     setStatus('failed to start run', 'error');
-    promptEl.disabled = false;
-    sendBtn.disabled = false;
+    enableInput();
     return;
   }
 
   openEventStream(runId);
 }
 
-// ── SSE event stream ──────────────────────────────────────────────────────────
+// ── SSE event stream ───────────────────────────────────────────────────────────
 function openEventStream(runId) {
   const es = new EventSource(`/runs/${runId}/events`);
   activeEs = es;
 
-  // The agent response body — built token by token.
+  let agentWrap = null;
   let agentBody = null;
   function getAgentBody() {
-    if (!agentBody) agentBody = appendMsg('agent', '');
+    if (!agentBody) {
+      const r = appendMsg('agent', '');
+      agentWrap = r.wrap;
+      agentBody = r.body;
+    }
     return agentBody;
   }
 
-  // Pending tool rows, keyed by tool_invocation_id.
   const toolRows = {};
 
   function done() {
     es.close();
     activeEs = null;
-    setStatus(`session ${sessionId.slice(0, 8)}…`, 'ok');
-    promptEl.disabled = false;
-    sendBtn.disabled = false;
+    setStatus(`session ${S.activeSessionId.slice(0, 8)}…`, 'ok');
+    enableInput();
     promptEl.focus();
+    // Refresh run history after completion.
+    loadRuns();
   }
 
   es.addEventListener('token_delta', e => {
@@ -380,8 +898,7 @@ function openEventStream(runId) {
 
   es.addEventListener('tool_start', e => {
     const { tool_invocation_id, tool, params } = JSON.parse(e.data);
-    const label = `▶ ${tool}(${JSON.stringify(params)})`;
-    toolRows[tool_invocation_id] = appendToolRow(label);
+    toolRows[tool_invocation_id] = appendToolRow(`▶ ${tool}(${JSON.stringify(params)})`);
   });
 
   es.addEventListener('tool_end', e => {
@@ -407,15 +924,19 @@ function openEventStream(runId) {
     if (card) {
       card.classList.add('resolved');
       const title = card.querySelector('h3');
-      if (title) title.textContent = `${decision === 'approve' ? '✓ Approved' : '✗ Denied'} — ${card.querySelector('h3').textContent.replace(/.*— /, '')}`;
+      if (title) title.textContent = `${decision === 'approve' ? '✓ Approved' : '✗ Denied'} — ${title.textContent.replace(/.*— /, '')}`;
       card.querySelectorAll('.btn').forEach(b => b.disabled = true);
     }
   });
 
   es.addEventListener('run_finished', e => {
-    const { ok } = JSON.parse(e.data);
-    done();
+    const { ok, prompt_tokens, completion_tokens } = JSON.parse(e.data);
     if (!ok && !agentBody) appendMsg('agent', '(run completed without output)');
+    // Append token badge to the agent message.
+    if (agentWrap && (prompt_tokens || completion_tokens)) {
+      appendTokenBadge(agentWrap, prompt_tokens || 0, completion_tokens || 0);
+    }
+    done();
   });
 
   es.addEventListener('run_error', e => {
@@ -432,7 +953,7 @@ function openEventStream(runId) {
   };
 }
 
-// ── Approval resolution ───────────────────────────────────────────────────────
+// ── Approval resolution ────────────────────────────────────────────────────────
 async function resolveApproval(approvalId, decision, card) {
   card.querySelectorAll('.btn').forEach(b => b.disabled = true);
   try {
@@ -446,7 +967,315 @@ async function resolveApproval(approvalId, decision, card) {
   }
 }
 
-// ── Input handling ────────────────────────────────────────────────────────────
+// ── Right panel ────────────────────────────────────────────────────────────────
+function togglePanel(tab) {
+  if (S.activePanel === tab) {
+    // Close panel.
+    S.activePanel = null;
+    panelEl.classList.remove('open');
+    document.getElementById('btn-workspace').classList.remove('active');
+    document.getElementById('btn-jobs').classList.remove('active');
+  } else {
+    S.activePanel = tab;
+    panelEl.classList.add('open');
+    document.getElementById('btn-workspace').classList.toggle('active', tab === 'workspace');
+    document.getElementById('btn-jobs').classList.toggle('active', tab === 'jobs');
+    switchPanelTab(tab);
+  }
+}
+
+function switchPanelTab(tab) {
+  S.activePanelTab = tab;
+  document.getElementById('tab-workspace').classList.toggle('active', tab === 'workspace');
+  document.getElementById('tab-jobs').classList.toggle('active', tab === 'jobs');
+  wsBodyEl.style.display   = tab === 'workspace' ? 'flex' : 'none';
+  jobsBodyEl.style.display = tab === 'jobs'      ? 'flex' : 'none';
+
+  if (tab === 'workspace') loadWorkspace();
+  if (tab === 'jobs')      loadJobs();
+}
+
+// ── Workspace panel ────────────────────────────────────────────────────────────
+async function loadWorkspace() {
+  if (!S.agentId) return;
+  if (S.wsFiles !== null) { renderWorkspace(); return; }  // cached
+
+  try {
+    const res = await fetch(`/agents/${S.agentId}/workspace`);
+    if (res.status === 503) {
+      S.wsFiles = 'unavailable';
+    } else if (!res.ok) {
+      S.wsFiles = 'error';
+    } else {
+      const data = await res.json();
+      S.wsFiles = data.files || {};
+    }
+  } catch {
+    S.wsFiles = 'error';
+  }
+  renderWorkspace();
+}
+
+function renderWorkspace() {
+  wsBodyEl.innerHTML = '';
+
+  if (S.wsFiles === 'unavailable') {
+    const notice = document.createElement('div');
+    notice.className = 'ws-notice';
+    notice.textContent = 'Workspace not configured. Set ALMS_WORKSPACE_DIR on the server to enable agent memory files.';
+    wsBodyEl.appendChild(notice);
+    return;
+  }
+  if (S.wsFiles === 'error' || S.wsFiles === null) {
+    const notice = document.createElement('div');
+    notice.className = 'ws-notice';
+    notice.style.borderColor = '#f85149';
+    notice.style.color = '#f85149';
+    notice.textContent = 'Failed to load workspace.';
+    wsBodyEl.appendChild(notice);
+    return;
+  }
+
+  const fileMap = {
+    'personality.md': 'Personality',
+    'goals.md':       'Goals',
+    'memories.md':    'Memories',
+  };
+
+  for (const [filename, label] of Object.entries(fileMap)) {
+    const section = document.createElement('div');
+    section.className = 'ws-file';
+
+    const lbl = document.createElement('div');
+    lbl.className = 'ws-file-label';
+    lbl.textContent = label;
+
+    const ta = document.createElement('textarea');
+    ta.className = 'ws-textarea';
+    ta.rows = 5;
+    ta.value = S.wsFiles[filename] || '';
+    ta.placeholder = `${label.toLowerCase()} content…`;
+
+    const flash = document.createElement('span');
+    flash.className = 'ws-flash';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'ws-save';
+    saveBtn.textContent = 'Save';
+    saveBtn.onclick = async () => {
+      saveBtn.disabled = true;
+      flash.textContent = '';
+      flash.className = 'ws-flash';
+      const fileKey = filename.replace('.md', '');
+      try {
+        const res = await fetch(`/agents/${S.agentId}/workspace/${fileKey}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: ta.value }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        S.wsFiles[filename] = ta.value;
+        flash.textContent = 'Saved';
+        flash.className = 'ws-flash ok';
+      } catch {
+        flash.textContent = 'Save failed';
+        flash.className = 'ws-flash err';
+      } finally {
+        saveBtn.disabled = false;
+        setTimeout(() => { flash.textContent = ''; }, 2500);
+      }
+    };
+
+    section.appendChild(lbl);
+    section.appendChild(ta);
+    section.appendChild(saveBtn);
+    section.appendChild(flash);
+    wsBodyEl.appendChild(section);
+  }
+}
+
+// ── Jobs panel ────────────────────────────────────────────────────────────────
+async function loadJobs() {
+  try {
+    const res = await fetch('/jobs');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    S.jobs = data.jobs || [];
+  } catch {
+    S.jobs = [];
+  }
+  renderJobs();
+}
+
+function renderJobs() {
+  jobsBodyEl.innerHTML = '';
+
+  // ── Create job form ──
+  const form = document.createElement('div');
+  form.className = 'jobs-form';
+
+  const promptLbl = document.createElement('label');
+  promptLbl.textContent = 'Prompt';
+  const promptTa = document.createElement('textarea');
+  promptTa.className = 'jobs-textarea';
+  promptTa.rows = 3;
+  promptTa.placeholder = 'What should the agent do?';
+
+  const schedLbl = document.createElement('label');
+  schedLbl.textContent = 'Schedule type';
+  const schedSel = document.createElement('select');
+  schedSel.className = 'jobs-select';
+  schedSel.innerHTML = '<option value="once">Once</option><option value="recurring">Recurring (cron)</option>';
+
+  const onceDiv = document.createElement('div');
+  const onceLbl = document.createElement('label');
+  onceLbl.textContent = 'Run at (local time)';
+  const onceInput = document.createElement('input');
+  onceInput.type = 'datetime-local';
+  onceInput.className = 'jobs-input';
+  onceDiv.appendChild(onceLbl);
+  onceDiv.appendChild(onceInput);
+
+  const cronDiv = document.createElement('div');
+  cronDiv.style.display = 'none';
+  const cronLbl = document.createElement('label');
+  cronLbl.textContent = 'Cron expression (min hour dom month dow)';
+  const cronInput = document.createElement('input');
+  cronInput.type = 'text';
+  cronInput.className = 'jobs-input';
+  cronInput.placeholder = '0 9 * * 1-5  (weekdays at 9am)';
+  cronDiv.appendChild(cronLbl);
+  cronDiv.appendChild(cronInput);
+
+  schedSel.onchange = () => {
+    const isOnce = schedSel.value === 'once';
+    onceDiv.style.display = isOnce ? '' : 'none';
+    cronDiv.style.display  = isOnce ? 'none' : '';
+  };
+
+  const formError = document.createElement('div');
+  formError.className = 'jobs-error';
+
+  const submitBtn = document.createElement('button');
+  submitBtn.className = 'jobs-submit';
+  submitBtn.textContent = 'Create job';
+  submitBtn.onclick = async () => {
+    formError.textContent = '';
+    const prompt = promptTa.value.trim();
+    if (!prompt) { formError.textContent = 'Prompt is required.'; return; }
+
+    let schedule;
+    if (schedSel.value === 'once') {
+      if (!onceInput.value) { formError.textContent = 'Run-at datetime is required.'; return; }
+      // Convert local datetime-local value to UTC ISO string.
+      schedule = { type: 'once', run_at: new Date(onceInput.value).toISOString() };
+    } else {
+      const cron = cronInput.value.trim();
+      if (!cron) { formError.textContent = 'Cron expression is required.'; return; }
+      schedule = { type: 'recurring', cron };
+    }
+
+    submitBtn.disabled = true;
+    try {
+      const res = await fetch('/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_id: S.agentId, prompt, schedule }),
+      });
+      const body = await res.json();
+      if (!res.ok) {
+        formError.textContent = body?.error?.message || `Error ${res.status}`;
+        return;
+      }
+      // Reset form and reload.
+      promptTa.value = '';
+      onceInput.value = '';
+      cronInput.value = '';
+      await loadJobs();
+    } catch (e) {
+      formError.textContent = 'Request failed.';
+    } finally {
+      submitBtn.disabled = false;
+    }
+  };
+
+  form.appendChild(promptLbl);
+  form.appendChild(promptTa);
+  form.appendChild(schedLbl);
+  form.appendChild(schedSel);
+  form.appendChild(onceDiv);
+  form.appendChild(cronDiv);
+  form.appendChild(formError);
+  form.appendChild(submitBtn);
+  jobsBodyEl.appendChild(form);
+
+  const hr = document.createElement('hr');
+  hr.className = 'jobs-divider';
+  jobsBodyEl.appendChild(hr);
+
+  // ── Job list ──
+  if (S.jobs.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'jobs-empty';
+    empty.textContent = 'No jobs scheduled.';
+    jobsBodyEl.appendChild(empty);
+    return;
+  }
+
+  for (const job of S.jobs) {
+    const item = document.createElement('div');
+    item.className = 'job-item';
+
+    const top = document.createElement('div');
+    top.className = 'job-item-top';
+
+    const promptSpan = document.createElement('span');
+    promptSpan.className = 'job-prompt';
+    promptSpan.title = job.prompt;
+    promptSpan.textContent = job.prompt.length > 60 ? job.prompt.slice(0, 57) + '…' : job.prompt;
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'job-cancel';
+    cancelBtn.textContent = '✕';
+    cancelBtn.title = 'Cancel job';
+    cancelBtn.disabled = job.status === 'cancelled';
+    cancelBtn.onclick = async () => {
+      cancelBtn.disabled = true;
+      try {
+        const res = await fetch(`/jobs/${job.id}`, { method: 'DELETE' });
+        if (res.status === 409) {
+          // Already cancelled — just reload.
+        } else if (!res.ok) {
+          cancelBtn.disabled = false;
+          return;
+        }
+        await loadJobs();
+      } catch {
+        cancelBtn.disabled = false;
+      }
+    };
+
+    top.appendChild(promptSpan);
+    top.appendChild(cancelBtn);
+
+    const meta = document.createElement('div');
+    meta.className = 'job-meta';
+
+    const scheduleDesc = job.schedule?.type === 'recurring'
+      ? `↻ ${job.schedule.cron}`
+      : `→ ${job.schedule?.run_at ? fmtDate(job.schedule.run_at) : 'once'}`;
+
+    const statusClass = `job-status-${job.status}`;
+    const nextRun = job.next_run_at ? ` · next ${fmtDate(job.next_run_at)}` : '';
+    meta.innerHTML = `<span class="${statusClass}">${job.status}</span> · ${scheduleDesc}${nextRun}`;
+
+    item.appendChild(top);
+    item.appendChild(meta);
+    jobsBodyEl.appendChild(item);
+  }
+}
+
+// ── Input handling ─────────────────────────────────────────────────────────────
 promptEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
@@ -455,14 +1284,13 @@ promptEl.addEventListener('keydown', e => {
 });
 sendBtn.addEventListener('click', sendMessage);
 
-// Auto-grow textarea.
 promptEl.addEventListener('input', () => {
   promptEl.style.height = 'auto';
-  promptEl.style.height = Math.min(promptEl.scrollHeight, 140) + 'px';
+  promptEl.style.height = Math.min(promptEl.scrollHeight, 120) + 'px';
 });
 
-// ── Boot ──────────────────────────────────────────────────────────────────────
-initSession();
+// ── Boot ───────────────────────────────────────────────────────────────────────
+boot();
 </script>
 </body>
 </html>

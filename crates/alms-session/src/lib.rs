@@ -190,6 +190,14 @@ impl SessionManager {
             .collect()
     }
 
+    /// List all sessions across all agents, sorted by last_activity descending.
+    pub fn list_all(&self) -> Vec<Session> {
+        let mut sessions: Vec<Session> =
+            self.sessions.iter().map(|e| e.value().clone()).collect();
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity.0));
+        sessions
+    }
+
     /// Archive idle sessions
     pub fn archive_idle(&self) -> usize {
         let mut count = 0;

@@ -157,12 +157,13 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Cancellation mid-run is detected before re-arm (guard in `fire_job_run`).
 - **Owners:** Atlas
 
-21) Extended web UI
-- **Multi-session sidebar** — list sessions, switch between them, start new session.
-- **Agent config panel** — view and edit workspace files (personality, goals, memories) via workspace API.
-- **Cron jobs panel** — list scheduled jobs, create new job (prompt + schedule), delete/cancel.
-- **Token usage** — show prompt + completion tokens per run, cumulative per session.
-- **Run history** — list past runs for the active session with status + token counts.
+21) Extended web UI ✅
+- **Multi-session sidebar** — `GET /sessions` (new), list + switch + new session button.
+- **Agent config panel** — right drawer: personality/goals/memories textareas with Save; 503 handled gracefully.
+- **Cron jobs panel** — right drawer: job list + create form (Once/Recurring), delete/cancel.
+- **Token usage** — per-run badge on agent messages; cumulative p/c shown in run history sidebar.
+- **Run history** — `GET /runs?session_id=` (new), last 20 runs with status icon + token counts.
+- 3-column layout: session sidebar | chat | right panel (toggled via header buttons).
 - **Owners:** Atlas
 
 22) Context compression (sliding-summary strategy)
