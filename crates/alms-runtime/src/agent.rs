@@ -446,6 +446,10 @@ impl AgentRuntime {
 
                 // Run all tool calls concurrently so background invoke_agent calls
                 // don't block each other, and independent tools finish in parallel.
+                //
+                // NOTE — Guarded posture: when multiple tool calls arrive in a single
+                // LLM response, all approval requests are emitted concurrently. The UI
+                // will show them simultaneously rather than one at a time.
                 let results = futures::future::join_all(
                     tool_calls
                         .iter()

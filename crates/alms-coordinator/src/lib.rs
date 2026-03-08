@@ -1,7 +1,7 @@
 use alms_core::agent::Capability;
 use alms_core::{AgentId, AlmsResult, RunId, SessionId};
 use alms_runtime::events::RuntimeEventSender;
-use alms_runtime::subagent::SubagentDispatcher;
+use alms_runtime::subagent::{PollResult, SubagentDispatcher};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient, RunOutput};
 use alms_session::SessionManager;
 use async_trait::async_trait;
@@ -9,6 +9,11 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// How long (in seconds) a subagent is allowed to run before it times out,
+/// and also how long its result is kept in memory after completion so that
+/// background callers can poll via `get_task_result`.
+const SUBAGENT_TTL_SECS: u64 = 300;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{Instrument, debug, info, instrument, warn};
 use uuid::Uuid;
@@ -152,6 +157,9 @@ pub struct SubagentHandle {
     pub parent_run_id: Option<RunId>,
     /// Receiver for the final TaskResult — taken by `dispatch()` to await completion.
     pub result_rx: Option<oneshot::Receiver<TaskResult>>,
+    /// Stored result for background tasks — set by `run_subagent` on completion
+    /// so `poll_task` can retrieve it without consuming the oneshot receiver.
+    pub completed_result: Option<TaskResult>,
 }
 
 /// Coordinator manages subagent lifecycle in a pure hierarchy.
@@ -220,6 +228,7 @@ impl Coordinator {
             cancel_tx,
             parent_run_id,
             result_rx: Some(result_rx),
+            completed_result: None,
         };
 
         self.subagents.insert(task_id, handle);
@@ -268,6 +277,14 @@ impl Coordinator {
     /// Returns `None` if the task does not exist or the receiver was already taken.
     pub fn take_result_rx(&self, task_id: TaskId) -> Option<oneshot::Receiver<TaskResult>> {
         self.subagents.get_mut(&task_id)?.result_rx.take()
+    }
+
+    /// Get the completed result for a finished background task.
+    ///
+    /// Returns `None` if the task is still running, not found, or is a
+    /// foreground task whose result was consumed by `dispatch()`.
+    pub fn get_completed_result(&self, task_id: TaskId) -> Option<TaskResult> {
+        self.subagents.get(&task_id)?.completed_result.clone()
     }
 
     /// Cancel a running subagent
@@ -319,7 +336,7 @@ impl SubagentDispatcher for Coordinator {
         let request = SubagentRequest {
             task,
             agent_type: SubagentType::General,
-            timeout: Duration::from_secs(300),
+            timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
             capabilities: SubagentType::General.default_capabilities(),
             parent_session: parent_session_id,
             parent_run_id,
@@ -356,6 +373,74 @@ impl SubagentDispatcher for Coordinator {
             _ => Err(alms_core::AlmsError::Runtime(
                 "Subagent ended in unexpected state".to_string(),
             )),
+        }
+    }
+
+    #[instrument(
+        level = "info",
+        skip(self, task, system_prompt, parent_event_tx),
+        fields(parent_session = %parent_session_id.0)
+    )]
+    async fn dispatch_background(
+        &self,
+        task: String,
+        system_prompt: Option<String>,
+        parent_session_id: SessionId,
+        parent_run_id: Option<RunId>,
+        parent_event_tx: Option<RuntimeEventSender>,
+    ) -> alms_core::AlmsResult<Uuid> {
+        let request = SubagentRequest {
+            task,
+            agent_type: SubagentType::General,
+            timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
+            capabilities: SubagentType::General.default_capabilities(),
+            parent_session: parent_session_id,
+            parent_run_id,
+            system_prompt,
+        };
+        let task_id = self.spawn_subagent(request, parent_event_tx).await?;
+
+        // Drop the oneshot receiver — background callers poll via completed_result,
+        // not the channel. This frees the allocation; run_subagent's result_tx.send()
+        // will silently fail (already uses `let _ = ...`), which is intentional.
+        drop(self.take_result_rx(task_id));
+
+        info!(
+            task_id = %task_id.0,
+            "Background subagent spawned (non-blocking)"
+        );
+        Ok(task_id.0)
+    }
+
+    #[instrument(level = "debug", skip(self), fields(task_id = %task_id))]
+    async fn poll_task(&self, task_id: Uuid) -> alms_core::AlmsResult<PollResult> {
+        let tid = TaskId(task_id);
+        match self.get_status(tid) {
+            None => Err(alms_core::AlmsError::Runtime(format!(
+                "Task {task_id} not found (may have expired after {SUBAGENT_TTL_SECS}s)"
+            ))),
+            Some(TaskStatus::Pending | TaskStatus::Running) => Ok(PollResult::Running),
+            Some(done_status) => match self.get_completed_result(tid) {
+                None => Err(alms_core::AlmsError::Runtime(
+                    "Task finished but result unavailable".to_string(),
+                )),
+                Some(result) => Ok(match done_status {
+                    TaskStatus::Completed => PollResult::Completed(
+                        result.result["response"]
+                            .as_str()
+                            .unwrap_or("[no response]")
+                            .to_string(),
+                    ),
+                    TaskStatus::Failed => PollResult::Failed(
+                        result.result["error"]
+                            .as_str()
+                            .unwrap_or("subagent failed")
+                            .to_string(),
+                    ),
+                    TaskStatus::Cancelled => PollResult::Cancelled,
+                    _ => PollResult::Failed("unexpected terminal state".to_string()),
+                }),
+            },
         }
     }
 }
@@ -461,17 +546,19 @@ async fn run_subagent(
         tokens_used,
     };
 
+    // Store result in the handle for background-mode polling, then update status.
     if let Some(mut handle) = subagents.get_mut(&task_id) {
         handle.status = new_status;
+        handle.completed_result = Some(task_result.clone());
     }
 
-    // Deliver result to dispatch() caller
+    // Deliver result to dispatch() caller (foreground mode — may already be dropped)
     let _ = result_tx.send(task_result.clone());
     // Also publish on the message bus for any other listeners
     let _ = message_tx.send(AgentMessage::Complete(task_result));
 
-    // Keep the handle around briefly so callers can query status
-    tokio::time::sleep(Duration::from_secs(60)).await;
+    // Keep the handle long enough for background callers to poll the result.
+    tokio::time::sleep(Duration::from_secs(SUBAGENT_TTL_SECS)).await;
     subagents.remove(&task_id);
     debug!("Cleaned up subagent {:?}", task_id);
 }
