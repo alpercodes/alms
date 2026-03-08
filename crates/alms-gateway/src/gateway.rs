@@ -70,13 +70,22 @@ impl GatewayConfig {
 
     /// Load from environment using the unified config system.
     ///
-    /// Set `ALMS_DB_PATH` to enable SQLite session persistence.
-    /// Set `ALMS_WORKSPACE_DIR` to enable the workspace API.
+    /// Defaults to `./data/alms.db` for SQLite persistence and
+    /// `./data/workspace` for agent workspace files. Override with
+    /// `ALMS_DB_PATH` and `ALMS_WORKSPACE_DIR` env vars.
     pub fn from_env() -> AlmsResult<Self> {
         let config = AlmsConfig::load()?;
         let mut gateway_config = Self::from_alms_config(&config);
-        gateway_config.db_path = std::env::var("ALMS_DB_PATH").ok();
-        gateway_config.workspace_dir = std::env::var("ALMS_WORKSPACE_DIR").ok().map(Into::into);
+
+        gateway_config.db_path = Some(
+            std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| "./data/alms.db".to_string()),
+        );
+        gateway_config.workspace_dir = Some(
+            std::env::var("ALMS_WORKSPACE_DIR")
+                .map(Into::into)
+                .unwrap_or_else(|_| std::path::PathBuf::from("./data/workspace")),
+        );
+
         Ok(gateway_config)
     }
 }

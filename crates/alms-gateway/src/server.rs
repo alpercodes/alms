@@ -361,6 +361,10 @@ pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
 }
 
 pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult<()> {
+    // Ensure the data directory exists (needed for SQLite and workspace files).
+    if let Err(e) = std::fs::create_dir_all("./data") {
+        tracing::warn!("Could not create ./data directory: {}", e);
+    }
     // Create the scheduler with a fire channel so job IDs are forwarded to
     // the gateway for actual agent-run dispatch.
     let (fire_tx, fire_rx) = tokio::sync::mpsc::unbounded_channel::<alms_core::JobId>();
