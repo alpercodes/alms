@@ -11,7 +11,10 @@
 
 use crate::{Coordinator, SubagentRequest, SubagentType, TaskId, TaskResult, TaskStatus};
 use alms_core::{AgentId, AlmsResult};
+use alms_runtime::LlmClient;
+use alms_session::SessionManager;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -27,8 +30,8 @@ pub struct MainAgent {
 }
 
 impl MainAgent {
-    pub fn new(agent_id: AgentId) -> Self {
-        let coordinator = Coordinator::new(agent_id);
+    pub fn new(agent_id: AgentId, session_manager: Arc<SessionManager>, llm: LlmClient) -> Self {
+        let coordinator = Coordinator::new(agent_id, session_manager, llm);
 
         Self {
             agent_id,
@@ -85,6 +88,7 @@ impl MainAgent {
                 capabilities: SubagentType::Research.default_capabilities(),
                 parent_session: alms_core::SessionId::new(),
                 parent_run_id: None,
+                system_prompt: None,
             }])
         } else if input_lower.contains("code")
             || input_lower.contains("build")
@@ -97,6 +101,7 @@ impl MainAgent {
                 capabilities: SubagentType::Code.default_capabilities(),
                 parent_session: alms_core::SessionId::new(),
                 parent_run_id: None,
+                system_prompt: None,
             }])
         } else if input_lower.contains("analyze") || input_lower.contains("data") {
             Ok(vec![SubagentRequest {
@@ -106,6 +111,7 @@ impl MainAgent {
                 capabilities: SubagentType::Data.default_capabilities(),
                 parent_session: alms_core::SessionId::new(),
                 parent_run_id: None,
+                system_prompt: None,
             }])
         } else if input_lower.contains("security") || input_lower.contains("audit") {
             Ok(vec![SubagentRequest {
@@ -115,6 +121,7 @@ impl MainAgent {
                 capabilities: SubagentType::Security.default_capabilities(),
                 parent_session: alms_core::SessionId::new(),
                 parent_run_id: None,
+                system_prompt: None,
             }])
         } else {
             // Complex task - decompose into multiple subtasks
@@ -127,6 +134,7 @@ impl MainAgent {
                         capabilities: SubagentType::Research.default_capabilities(),
                         parent_session: alms_core::SessionId::new(),
                         parent_run_id: None,
+                        system_prompt: None,
                     },
                     SubagentRequest {
                         task: format!("Implementation phase of: {}", input),
@@ -135,6 +143,7 @@ impl MainAgent {
                         capabilities: SubagentType::Code.default_capabilities(),
                         parent_session: alms_core::SessionId::new(),
                         parent_run_id: None,
+                        system_prompt: None,
                     },
                 ])
             } else {
@@ -146,6 +155,7 @@ impl MainAgent {
                     capabilities: SubagentType::General.default_capabilities(),
                     parent_session: alms_core::SessionId::new(),
                     parent_run_id: None,
+                    system_prompt: None,
                 }])
             }
         }
@@ -153,7 +163,10 @@ impl MainAgent {
 
     /// Spawn a subagent for a task
     async fn spawn_subagent_for_task(&mut self, request: SubagentRequest) -> AlmsResult<TaskId> {
-        let task_id = self.coordinator.spawn_subagent(request.clone()).await?;
+        let task_id = self
+            .coordinator
+            .spawn_subagent(request.clone(), None)
+            .await?;
         self.pending_tasks.insert(task_id, request);
         debug!("Spawned subagent {:?} for task", task_id);
         Ok(task_id)

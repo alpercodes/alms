@@ -1,5 +1,6 @@
 use crate::context::ContextBuilder;
 use crate::events::{RuntimeEvent, RuntimeEventSender};
+use crate::invoke_agent_tool::InvokeAgentTool;
 use crate::llm_client::LlmClient;
 use crate::llm_types::*;
 use crate::tools::ToolRegistry;
@@ -100,6 +101,12 @@ impl AgentRuntime {
     /// Attach a runtime event sender so the gateway can observe tool events.
     pub fn with_event_sender(mut self, sender: RuntimeEventSender) -> Self {
         self.event_sender = Some(sender);
+        self
+    }
+
+    /// Register the `invoke_agent` tool so the agent can spawn subagents.
+    pub fn with_invoke_agent(self, tool: InvokeAgentTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
         self
     }
 

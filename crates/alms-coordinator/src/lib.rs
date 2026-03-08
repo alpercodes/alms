@@ -1,16 +1,20 @@
 use alms_core::agent::Capability;
-use alms_core::{AgentId, AlmsResult, SessionId};
-
-pub mod main_agent;
-
+use alms_core::{AgentId, AlmsResult, RunId, SessionId};
+use alms_runtime::events::RuntimeEventSender;
+use alms_runtime::subagent::SubagentDispatcher;
+use alms_runtime::{AgentConfig, AgentRuntime, LlmClient, RunOutput};
+use alms_session::SessionManager;
+use async_trait::async_trait;
 use dashmap::DashMap;
 pub use main_agent::MainAgent;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
+
+pub mod main_agent;
 
 /// Unique identifier for a subagent task
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -88,7 +92,9 @@ pub struct SubagentRequest {
     pub timeout: Duration,
     pub capabilities: Vec<Capability>,
     pub parent_session: SessionId,
-    pub parent_run_id: Option<alms_core::RunId>, // For tracing correlation
+    pub parent_run_id: Option<RunId>,
+    /// Optional system prompt override for the subagent.
+    pub system_prompt: Option<String>,
 }
 
 /// Status of a subagent task
@@ -146,49 +152,67 @@ pub struct SubagentHandle {
     pub status: TaskStatus,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub cancel_tx: oneshot::Sender<()>,
-    pub parent_run_id: Option<alms_core::RunId>,
+    pub parent_run_id: Option<RunId>,
+    /// Receiver for the final TaskResult — taken by `dispatch()` to await completion.
+    pub result_rx: Option<oneshot::Receiver<TaskResult>>,
 }
 
-/// Coordinator manages all agents and message routing
+/// Coordinator manages subagent lifecycle in a pure hierarchy.
+///
+/// Any agent can spawn subagents by calling `dispatch()`. Subagents are
+/// ephemeral — they complete their task and return a result to the parent.
+/// There is no peer-to-peer communication between agents.
 #[derive(Debug)]
 pub struct Coordinator {
-    /// Main agent ID
+    /// Main agent ID (used for tracing/identification only)
     #[allow(dead_code)]
     main_agent: AgentId,
     /// Active subagents: TaskId -> SubagentHandle
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
-    /// Message bus: crossbeam channel for agent communication
+    /// Message bus
     message_tx: mpsc::UnboundedSender<AgentMessage>,
     message_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<AgentMessage>>>,
+    /// Shared session manager — used to give each subagent its own context
+    session_manager: Arc<SessionManager>,
+    /// LLM client — cloned for each subagent runtime
+    llm: LlmClient,
 }
 
 impl Coordinator {
-    pub fn new(main_agent: AgentId) -> Self {
+    pub fn new(main_agent: AgentId, session_manager: Arc<SessionManager>, llm: LlmClient) -> Self {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
-
         Self {
             main_agent,
             subagents: Arc::new(DashMap::new()),
             message_tx,
             message_rx: Arc::new(tokio::sync::Mutex::new(message_rx)),
+            session_manager,
+            llm,
         }
     }
 
-    /// Spawn a new subagent for a task
+    /// Spawn a new subagent for a task.
+    ///
+    /// Returns a `TaskId` immediately. The caller can await the result by
+    /// calling `take_result_rx(task_id)` to get the oneshot receiver.
     #[instrument(
         level = "info",
-        skip(self, request),
+        skip(self, request, parent_event_tx),
         fields(
             subagent_type = ?request.agent_type,
             parent_session = %request.parent_session.0,
             timeout_secs = %request.timeout.as_secs(),
-            capability_count = %request.capabilities.len()
         )
     )]
-    pub async fn spawn_subagent(&self, request: SubagentRequest) -> AlmsResult<TaskId> {
+    pub async fn spawn_subagent(
+        &self,
+        request: SubagentRequest,
+        parent_event_tx: Option<RuntimeEventSender>,
+    ) -> AlmsResult<TaskId> {
         let task_id = TaskId::new();
         let agent_type = request.agent_type;
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (result_tx, result_rx) = oneshot::channel::<TaskResult>();
         let parent_run_id = request.parent_run_id;
 
         let handle = SubagentHandle {
@@ -198,38 +222,54 @@ impl Coordinator {
             started_at: chrono::Utc::now(),
             cancel_tx,
             parent_run_id,
+            result_rx: Some(result_rx),
         };
 
         self.subagents.insert(task_id, handle);
 
-        tracing::info!(
+        info!(
             target: "coordinator::subagent_spawned",
             task_id = %task_id.0,
             subagent_type = ?agent_type,
             parent_session = %request.parent_session.0,
-            "Subagent spawned successfully"
+            "Subagent spawned"
         );
 
-        // Start subagent execution in background
         let subagents = self.subagents.clone();
         let message_tx = self.message_tx.clone();
-        let parent_session = request.parent_session;
-        let parent_run_id_clone = parent_run_id;
+        let session_manager = self.session_manager.clone();
+        let llm = self.llm.clone();
 
         tokio::spawn(async move {
-            // Create child span for the subagent task
             let _span = tracing::info_span!(
                 "subagent::execute",
                 task_id = %task_id.0,
-                parent_session = %parent_session.0,
-                parent_run_id = ?parent_run_id_clone.map(|r| r.0.to_string()),
+                parent_run_id = ?parent_run_id.map(|r| r.0.to_string()),
             );
             let _enter = _span.enter();
 
-            run_subagent(task_id, request, subagents, message_tx, cancel_rx).await;
+            run_subagent(
+                task_id,
+                request,
+                subagents,
+                message_tx,
+                cancel_rx,
+                result_tx,
+                session_manager,
+                llm,
+                parent_event_tx,
+            )
+            .await;
         });
 
         Ok(task_id)
+    }
+
+    /// Take the result receiver for a task (can only be called once per task).
+    ///
+    /// Returns `None` if the task does not exist or the receiver was already taken.
+    pub fn take_result_rx(&self, task_id: TaskId) -> Option<oneshot::Receiver<TaskResult>> {
+        self.subagents.get_mut(&task_id)?.result_rx.take()
     }
 
     /// Cancel a running subagent
@@ -268,32 +308,90 @@ impl Coordinator {
     }
 }
 
-/// Run a subagent task
+#[async_trait]
+impl SubagentDispatcher for Coordinator {
+    async fn dispatch(
+        &self,
+        task: String,
+        system_prompt: Option<String>,
+        parent_session_id: SessionId,
+        parent_run_id: Option<RunId>,
+        parent_event_tx: Option<RuntimeEventSender>,
+    ) -> AlmsResult<String> {
+        let request = SubagentRequest {
+            task,
+            agent_type: SubagentType::General,
+            timeout: Duration::from_secs(300),
+            capabilities: SubagentType::General.default_capabilities(),
+            parent_session: parent_session_id,
+            parent_run_id,
+            system_prompt,
+        };
+
+        let task_id = self.spawn_subagent(request, parent_event_tx).await?;
+
+        // Take the result receiver — must happen immediately after spawn_subagent
+        // since the handle is already in the DashMap.
+        let result_rx = self.take_result_rx(task_id).ok_or_else(|| {
+            alms_core::AlmsError::Runtime("No result channel for subagent".to_string())
+        })?;
+
+        // Block until the subagent completes (or is cancelled/times out)
+        let task_result = result_rx.await.map_err(|_| {
+            alms_core::AlmsError::Runtime("Subagent result channel closed unexpectedly".to_string())
+        })?;
+
+        match task_result.status {
+            TaskStatus::Completed => Ok(task_result.result["response"]
+                .as_str()
+                .unwrap_or("[no response]")
+                .to_string()),
+            TaskStatus::Failed => Err(alms_core::AlmsError::Runtime(
+                task_result.result["error"]
+                    .as_str()
+                    .unwrap_or("subagent failed")
+                    .to_string(),
+            )),
+            TaskStatus::Cancelled => Err(alms_core::AlmsError::Runtime(
+                "Subagent was cancelled".to_string(),
+            )),
+            _ => Err(alms_core::AlmsError::Runtime(
+                "Subagent ended in unexpected state".to_string(),
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal subagent runner
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     task_id: TaskId,
     request: SubagentRequest,
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
     message_tx: mpsc::UnboundedSender<AgentMessage>,
     mut cancel_rx: oneshot::Receiver<()>,
+    result_tx: oneshot::Sender<TaskResult>,
+    session_manager: Arc<SessionManager>,
+    llm: LlmClient,
+    parent_event_tx: Option<RuntimeEventSender>,
 ) {
     let start = std::time::Instant::now();
-    let parent_run_id = request.parent_run_id;
 
-    // Update status to running
     if let Some(mut handle) = subagents.get_mut(&task_id) {
         handle.status = TaskStatus::Running;
     }
 
-    tracing::info!(
+    info!(
         target: "subagent::started",
         task_id = %task_id.0,
         task = %request.task,
         subagent_type = ?request.agent_type,
-        parent_run_id = ?parent_run_id.map(|r| r.0.to_string()),
         "Subagent execution started"
     );
 
-    // Send initial progress
     let _ = message_tx.send(AgentMessage::Progress(ProgressUpdate {
         task_id,
         status: TaskStatus::Running,
@@ -305,97 +403,153 @@ async fn run_subagent(
         partial_result: None,
     }));
 
-    tokio::select! {
+    let (new_status, result_value, tokens_used) = tokio::select! {
         _ = tokio::time::sleep(request.timeout) => {
-            tracing::warn!(
+            warn!(
                 target: "subagent::timeout",
                 task_id = %task_id.0,
-                elapsed_ms = %start.elapsed().as_millis(),
                 timeout_secs = %request.timeout.as_secs(),
                 "Subagent timed out"
             );
-
-            let _ = message_tx.send(AgentMessage::Complete(TaskResult {
-                task_id,
-                status: TaskStatus::Failed,
-                result: serde_json::json!({"error": "Timeout"}),
-                execution_time_ms: start.elapsed().as_millis() as u64,
-                tokens_used: None,
-            }));
-
-            if let Some(mut handle) = subagents.get_mut(&task_id) {
-                handle.status = TaskStatus::Failed;
-            }
+            (TaskStatus::Failed, serde_json::json!({"error": "Timeout"}), None)
         }
         _ = &mut cancel_rx => {
-            tracing::info!(
+            info!(
                 target: "subagent::cancelled",
                 task_id = %task_id.0,
-                elapsed_ms = %start.elapsed().as_millis(),
-                "Subagent cancelled by user"
+                "Subagent cancelled"
             );
-
-            let _ = message_tx.send(AgentMessage::Complete(TaskResult {
-                task_id,
-                status: TaskStatus::Cancelled,
-                result: serde_json::json!({"cancelled": true}),
-                execution_time_ms: start.elapsed().as_millis() as u64,
-                tokens_used: None,
-            }));
-
-            if let Some(mut handle) = subagents.get_mut(&task_id) {
-                handle.status = TaskStatus::Cancelled;
+            (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None)
+        }
+        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx) => {
+            match output {
+                Ok(run_output) => {
+                    info!(
+                        target: "subagent::completed",
+                        task_id = %task_id.0,
+                        elapsed_ms = %start.elapsed().as_millis(),
+                        "Subagent completed"
+                    );
+                    let tokens = (run_output.usage.prompt_tokens
+                        + run_output.usage.completion_tokens) as usize;
+                    (
+                        TaskStatus::Completed,
+                        serde_json::json!({"response": run_output.response}),
+                        Some(tokens),
+                    )
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "subagent::error",
+                        task_id = %task_id.0,
+                        error = %e,
+                        "Subagent run failed"
+                    );
+                    (
+                        TaskStatus::Failed,
+                        serde_json::json!({"error": e.to_string()}),
+                        None,
+                    )
+                }
             }
         }
-        _ = execute_task(task_id, &request, &message_tx) => {
-            tracing::info!(
-                target: "subagent::completed",
-                task_id = %task_id.0,
-                elapsed_ms = %start.elapsed().as_millis(),
-                "Subagent execution completed normally"
-            );
+    };
 
-            if let Some(mut handle) = subagents.get_mut(&task_id) {
-                handle.status = TaskStatus::Completed;
-            }
-        }
+    let task_result = TaskResult {
+        task_id,
+        status: new_status,
+        result: result_value,
+        execution_time_ms: start.elapsed().as_millis() as u64,
+        tokens_used,
+    };
+
+    if let Some(mut handle) = subagents.get_mut(&task_id) {
+        handle.status = new_status;
     }
 
-    // Cleanup after delay
+    // Deliver result to dispatch() caller
+    let _ = result_tx.send(task_result.clone());
+    // Also publish on the message bus for any other listeners
+    let _ = message_tx.send(AgentMessage::Complete(task_result));
+
+    // Keep the handle around briefly so callers can query status
     tokio::time::sleep(Duration::from_secs(60)).await;
     subagents.remove(&task_id);
     debug!("Cleaned up subagent {:?}", task_id);
 }
 
-/// Execute the actual task (placeholder for real implementation)
-async fn execute_task(
+/// Build an `AgentConfig` appropriate for the given subagent type.
+fn agent_config_for_type(
+    agent_type: SubagentType,
+    system_prompt_override: Option<String>,
+) -> AgentConfig {
+    let default_prompt = match agent_type {
+        SubagentType::Research => {
+            "You are a research specialist. Gather information, analyse sources, \
+             and provide comprehensive, well-structured summaries."
+        }
+        SubagentType::Code => {
+            "You are a code specialist. Generate, review, and debug code with \
+             precision, following best practices for the language in use."
+        }
+        SubagentType::Data => {
+            "You are a data analysis specialist. Process, transform, and analyse \
+             data to extract actionable insights."
+        }
+        SubagentType::Integration => {
+            "You are an integration specialist. Interact with external APIs and \
+             services efficiently and handle errors gracefully."
+        }
+        SubagentType::Security => {
+            "You are a security analysis specialist. Identify vulnerabilities, \
+             audit systems, and produce clear security reports."
+        }
+        SubagentType::General => {
+            "You are a general-purpose assistant. Complete the given task \
+             thoroughly and accurately."
+        }
+    };
+    AgentConfig {
+        system_prompt: system_prompt_override.unwrap_or_else(|| default_prompt.to_string()),
+        ..AgentConfig::default()
+    }
+}
+
+/// Run the actual agent loop for a subagent.
+///
+/// Creates a fresh `AgentRuntime`, forwards its events to the parent's
+/// event channel (if provided), then calls `runtime.run()`.
+async fn run_agent_loop(
     task_id: TaskId,
     request: &SubagentRequest,
-    message_tx: &mpsc::UnboundedSender<AgentMessage>,
-) {
-    // Simulate work with progress updates
-    for i in 1..=5 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    session_manager: &Arc<SessionManager>,
+    llm: &LlmClient,
+    parent_event_tx: Option<RuntimeEventSender>,
+) -> AlmsResult<RunOutput> {
+    let agent_id = AgentId::new();
+    let config = agent_config_for_type(request.agent_type, request.system_prompt.clone());
 
-        let _ = message_tx.send(AgentMessage::Progress(ProgressUpdate {
-            task_id,
-            status: TaskStatus::Running,
-            progress_percent: i * 20,
-            message: format!("Working... {}%", i * 20),
-            partial_result: None,
-        }));
+    // Create a per-subagent event channel
+    let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
+
+    let runtime = AgentRuntime::new(agent_id, config, llm.clone()).with_event_sender(sub_tx);
+
+    // Forward subagent tool events into the parent run's event stream
+    if let Some(parent_tx) = parent_event_tx {
+        tokio::spawn(async move {
+            let mut rx = sub_rx;
+            while let Some(event) = rx.recv().await {
+                let _ = parent_tx.send(event);
+            }
+        });
+    } else {
+        // Nobody is consuming — drop the receiver so sends silently fail
+        drop(sub_rx);
     }
 
-    // Send completion
-    let _ = message_tx.send(AgentMessage::Complete(TaskResult {
-        task_id,
-        status: TaskStatus::Completed,
-        result: serde_json::json!({
-            "task": request.task,
-            "agent_type": format!("{:?}", request.agent_type),
-            "capabilities": request.capabilities,
-        }),
-        execution_time_ms: 500,
-        tokens_used: Some(1000),
-    }));
+    // Each subagent gets its own context so it doesn't share history with the parent
+    let context_id = format!("subagent_{}", task_id.0);
+    runtime
+        .run(session_manager, &context_id, &request.task)
+        .await
 }

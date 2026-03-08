@@ -8,9 +8,11 @@
 pub mod agent;
 pub mod context;
 pub mod events;
+pub mod invoke_agent_tool;
 pub mod llm_client;
 pub mod llm_types;
 pub mod scheduler;
+pub mod subagent;
 pub mod tools;
 pub mod workspace;
 pub mod workspace_tool;
@@ -18,9 +20,11 @@ pub mod workspace_tool;
 pub use agent::{AgentConfig, AgentRuntime, Posture, RunOutput};
 pub use context::ContextBuilder;
 pub use events::{RuntimeEvent, RuntimeEventSender};
+pub use invoke_agent_tool::InvokeAgentTool;
 pub use llm_client::LlmClient;
 pub use llm_types::*;
 pub use scheduler::{JobRun, Scheduler};
+pub use subagent::SubagentDispatcher;
 pub use tools::ToolRegistry;
 pub use workspace::{AgentWorkspace, WorkspaceFile};
 

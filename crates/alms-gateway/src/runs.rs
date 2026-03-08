@@ -17,18 +17,18 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use serde::Deserialize;
 use chrono::Utc;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{error, info, instrument, warn};
 
 /// Per-run overrides that can be sent by the client to customise a single run.
 #[derive(Debug, Default)]
 struct RunOverrides {
-    model:       Option<String>,
+    model: Option<String>,
     temperature: Option<f32>,
-    max_tokens:  Option<u32>,
-    posture:     Option<String>,
+    max_tokens: Option<u32>,
+    posture: Option<String>,
 }
 
 /// GET /runs?session_id=<uuid>&limit=<n> — list runs for a session
@@ -73,10 +73,10 @@ pub async fn create_run(
     };
 
     let overrides = RunOverrides {
-        model:       req.model.clone(),
+        model: req.model.clone(),
         temperature: req.temperature,
-        max_tokens:  req.max_tokens,
-        posture:     req.posture.clone(),
+        max_tokens: req.max_tokens,
+        posture: req.posture.clone(),
     };
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;
@@ -89,7 +89,15 @@ pub async fn create_run(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        execute_run(state_clone, run_id, session_id, agent_id, run.input, overrides).await;
+        execute_run(
+            state_clone,
+            run_id,
+            session_id,
+            agent_id,
+            run.input,
+            overrides,
+        )
+        .await;
     });
 
     let response = CreateRunResponse {
@@ -142,8 +150,11 @@ async fn execute_run(
         (gateway.agent_config().clone(), llm)
     };
 
-    // Create a runtime event channel so we can forward tool events to SSE
+    // Create a runtime event channel so we can forward tool events to SSE.
+    // Clone before moving into `with_event_sender` so invoke_agent can forward
+    // subagent events into the same stream.
     let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+    let invoke_agent_tx = runtime_tx.clone();
 
     // Apply per-run overrides (temperature, max_tokens, posture).
     let agent_config = {
@@ -154,7 +165,10 @@ async fn execute_run(
         }
         if let Some(m) = overrides.max_tokens {
             if m == 0 {
-                warn!("Run {}: max_tokens override of 0 ignored (must be >= 1)", run_id.0);
+                warn!(
+                    "Run {}: max_tokens override of 0 ignored (must be >= 1)",
+                    run_id.0
+                );
             } else {
                 cfg.max_tokens = m;
             }
@@ -164,7 +178,10 @@ async fn execute_run(
                 "guarded" => alms_runtime::Posture::Guarded,
                 "full_control" => alms_runtime::Posture::FullControl,
                 other => {
-                    warn!("Run {}: unknown posture '{}', keeping server default", run_id.0, other);
+                    warn!(
+                        "Run {}: unknown posture '{}', keeping server default",
+                        run_id.0, other
+                    );
                     cfg.posture
                 }
             };
@@ -176,7 +193,10 @@ async fn execute_run(
     let agent_config = if let Some(ref workspace_dir) = state.workspace_dir {
         let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, agent_id);
         if workspace.needs_bootstrap() {
-            info!("Agent {} has no personality.md — using bootstrap prompt", agent_id.0);
+            info!(
+                "Agent {} has no personality.md — using bootstrap prompt",
+                agent_id.0
+            );
             let mut cfg = agent_config;
             cfg.system_prompt = alms_runtime::AgentWorkspace::bootstrap_prompt().to_string();
             cfg
@@ -195,6 +215,19 @@ async fn execute_run(
     if let Some(ref workspace_dir) = state.workspace_dir {
         let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, agent_id);
         runtime = runtime.with_workspace(workspace);
+    }
+
+    // Register invoke_agent tool — subagent events are forwarded into this run's SSE stream
+    {
+        let dispatcher: std::sync::Arc<dyn alms_runtime::SubagentDispatcher> =
+            state.coordinator.clone();
+        let invoke_tool = alms_runtime::InvokeAgentTool::new(
+            dispatcher,
+            session_id,
+            Some(run_id),
+            Some(invoke_agent_tx),
+        );
+        runtime = runtime.with_invoke_agent(invoke_tool);
     }
 
     // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals).
@@ -310,7 +343,15 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     info!("Job fired → run {}", run_id.0);
 
     // Execute the run (awaits completion; errors are handled inside execute_run).
-    execute_run(state.clone(), run_id, session_id, job.agent_id, run.input, RunOverrides::default()).await;
+    execute_run(
+        state.clone(),
+        run_id,
+        session_id,
+        job.agent_id,
+        run.input,
+        RunOverrides::default(),
+    )
+    .await;
 
     // Guard: if the job was cancelled while the run was in progress, do not
     // overwrite the Cancelled status or re-arm the scheduler.
@@ -522,7 +563,15 @@ pub async fn stream_run_legacy(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        execute_run(state_clone, run_id, session_id, agent_id, run.input, RunOverrides::default()).await;
+        execute_run(
+            state_clone,
+            run_id,
+            session_id,
+            agent_id,
+            run.input,
+            RunOverrides::default(),
+        )
+        .await;
     });
 
     Ok(RunEventStream::stream(rx))

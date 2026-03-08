@@ -73,7 +73,9 @@ name = "alms-coordinator"
 version = "0.1.0"
 dependencies = [
  "alms-core",
+ "alms-runtime",
  "alms-session",
+ "async-trait",
  "chrono",
  "crossbeam",
  "dashmap",
@@ -107,6 +109,7 @@ name = "alms-gateway"
 version = "0.1.0"
 dependencies = [
  "alms-channel",
+ "alms-coordinator",
  "alms-core",
  "alms-runtime",
  "alms-session",

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 alms-core = { path = "../alms-core" }
 alms-session = { path = "../alms-session" }
+alms-runtime = { path = "../alms-runtime" }
 
 tokio.workspace = true
 crossbeam.workspace = true
@@ -18,6 +19,7 @@ uuid.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+async-trait.workspace = true
 
 [dev-dependencies]
 tokio-test.workspace = true

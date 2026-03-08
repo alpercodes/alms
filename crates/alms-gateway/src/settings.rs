@@ -15,7 +15,16 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     // List tools by name directly — avoids constructing a full ToolRegistry per request.
-    let mut tools: Vec<&str> = vec!["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec"];
+    let mut tools: Vec<&str> = vec![
+        "echo",
+        "fs_list",
+        "fs_read",
+        "fs_write",
+        "http_get",
+        "invoke_agent",
+        "math",
+        "shell_exec",
+    ];
     if state.workspace_dir.is_some() {
         tools.push("workspace_write");
     }

@@ -9,6 +9,7 @@ license.workspace = true
 alms-core = { path = "../alms-core" }
 alms-session = { path = "../alms-session" }
 alms-runtime = { path = "../alms-runtime" }
+alms-coordinator = { path = "../alms-coordinator" }
 alms-channel = { path = "../alms-channel" }
 
 axum.workspace = true

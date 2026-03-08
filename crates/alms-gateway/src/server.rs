@@ -13,10 +13,12 @@ use crate::runs::{
 };
 use crate::settings::get_settings;
 use crate::sse::SseEventData;
+use crate::tasks::{get_task, list_tasks};
 use crate::workspace::{get_workspace, update_workspace_file};
+use alms_coordinator::Coordinator;
 use alms_core::{AgentId, AlmsResult, JobStatus, Run, RunId, SessionId};
-use alms_session::{Content, Role};
 use alms_runtime::Scheduler;
+use alms_session::{Content, Role};
 use alms_session::{JobStore, SessionManager};
 use axum::{
     Json, Router,
@@ -79,7 +81,12 @@ impl RunManager {
     }
 
     /// Atomically transition a run to Completed state.
-    pub fn mark_run_as_completed(&self, run_id: RunId, output: String, usage: alms_core::TokenUsage) {
+    pub fn mark_run_as_completed(
+        &self,
+        run_id: RunId,
+        output: String,
+        usage: alms_core::TokenUsage,
+    ) {
         self.runs
             .entry(run_id)
             .and_modify(|r| r.mark_completed(output.clone(), usage));
@@ -144,11 +151,16 @@ pub struct AppState {
     pub job_store: Arc<JobStore>,
     /// Scheduler for firing jobs at the right time
     pub scheduler: Arc<Scheduler>,
+    /// Coordinator for subagent lifecycle management
+    pub coordinator: Arc<Coordinator>,
 }
 
 impl AppState {
     pub fn new(gateway: Gateway, scheduler: Arc<Scheduler>) -> AlmsResult<Self> {
         let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
+        let session_manager = gateway.session_manager().clone();
+        let llm = gateway.llm().clone();
+        let agent_id = *gateway.agent_id();
         let job_store = match gateway.db_path() {
             Some(path) => {
                 tracing::info!("Opening SQLite job store at {}", path);
@@ -156,14 +168,16 @@ impl AppState {
             }
             None => Arc::new(JobStore::new()),
         };
+        let coordinator = Arc::new(Coordinator::new(agent_id, session_manager.clone(), llm));
         Ok(Self {
-            session_manager: gateway.session_manager().clone(),
+            session_manager,
             gateway: Arc::new(tokio::sync::Mutex::new(gateway)),
             run_manager: RunManager::new(),
             approval_store: ApprovalStore::new(),
             workspace_dir,
             job_store,
             scheduler,
+            coordinator,
         })
     }
 }
@@ -202,6 +216,9 @@ pub fn router() -> Router<AppState> {
         // Jobs (scheduled agent runs)
         .route("/jobs", post(create_job).get(list_jobs))
         .route("/jobs/{job_id}", get(get_job).delete(cancel_job))
+        // Coordinator tasks (active subagents)
+        .route("/tasks", get(list_tasks))
+        .route("/tasks/{task_id}", get(get_task))
         // Legacy (deprecated) - kept for MVP compatibility
         .route("/agent/run", post(run_agent))
         .route("/agent/run/stream", post(stream_run_legacy))

@@ -29,6 +29,7 @@ pub mod runs;
 pub mod server;
 pub mod settings;
 pub mod sse;
+pub mod tasks;
 pub mod workspace;
 
 // Re-export main types
