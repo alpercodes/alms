@@ -4,10 +4,11 @@ use crate::llm_client::LlmClient;
 use crate::llm_types::*;
 use crate::tools::ToolRegistry;
 use crate::workspace::AgentWorkspace;
-use alms_core::{AgentId, AlmsResult, AuditEvent, AuditDecision};
+use crate::workspace_tool::WorkspaceWriteTool;
 use alms_core::config::ContextConfig;
+use alms_core::{AgentId, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
 use alms_session::{Message as SessionMessage, Role as SessionRole, SessionManager};
-use tracing::{debug, error, info, instrument, warn, Span};
+use tracing::{Span, debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 /// Execution posture: controls whether tools require approval before running.
@@ -50,6 +51,13 @@ impl Default for AgentConfig {
     }
 }
 
+/// Result of a single agent run, including the response text and accumulated token usage.
+#[derive(Debug, Clone)]
+pub struct RunOutput {
+    pub response: String,
+    pub usage: TokenUsage,
+}
+
 /// Agent runtime - executes agent loops
 #[derive(Debug)]
 pub struct AgentRuntime {
@@ -79,7 +87,12 @@ impl AgentRuntime {
     }
 
     /// Attach an agent workspace for persistent identity files.
+    ///
+    /// Also registers the `workspace_write` tool so the agent can update
+    /// its `goals.md` and `memories.md` during runs.
     pub fn with_workspace(mut self, workspace: AgentWorkspace) -> Self {
+        let tool = WorkspaceWriteTool::new(workspace.clone());
+        self.tools.register(std::sync::Arc::new(tool));
         self.workspace = Some(workspace);
         self
     }
@@ -117,7 +130,7 @@ impl AgentRuntime {
         session_manager: &SessionManager,
         context_id: impl AsRef<str>,
         input: impl Into<String>,
-    ) -> AlmsResult<String> {
+    ) -> AlmsResult<RunOutput> {
         let context_id = context_id.as_ref();
         let input = input.into();
         let span = Span::current();
@@ -134,7 +147,9 @@ impl AgentRuntime {
 
         let session = session_manager.get_or_create(self.agent_id, context_id);
         let history = self.build_context(session_manager, &session.id, &input)?;
-        let response = self.agent_loop(session_manager, session.id, history).await?;
+        let (response, usage) = self
+            .agent_loop(session_manager, session.id, history)
+            .await?;
 
         let user_msg = SessionMessage {
             id: uuid::Uuid::new_v4().to_string(),
@@ -155,9 +170,12 @@ impl AgentRuntime {
         session_manager.append_message(session.id, user_msg)?;
         session_manager.append_message(session.id, assistant_msg)?;
 
-        info!("Agent {} completed for context {}", self.agent_id.0, context_id);
+        info!(
+            "Agent {} completed for context {} (prompt={} completion={} tokens)",
+            self.agent_id.0, context_id, usage.prompt_tokens, usage.completion_tokens
+        );
 
-        Ok(response)
+        Ok(RunOutput { response, usage })
     }
 
     /// Run with streaming response
@@ -175,10 +193,10 @@ impl AgentRuntime {
             self.agent_id.0, context_id
         );
 
-        let response = self.run(session_manager, context_id, input).await?;
+        let output = self.run(session_manager, context_id, input).await?;
 
         use futures::stream;
-        Ok(stream::once(async move { Ok(response) }))
+        Ok(stream::once(async move { Ok(output.response) }))
     }
 
     /// Build context window for LLM using ContextBuilder.
@@ -223,8 +241,9 @@ impl AgentRuntime {
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
         mut messages: Vec<LlmMessage>,
-    ) -> AlmsResult<String> {
+    ) -> AlmsResult<(String, TokenUsage)> {
         let mut iterations = 0;
+        let mut total_usage = TokenUsage::default();
 
         loop {
             if iterations >= self.config.max_iterations {
@@ -235,7 +254,7 @@ impl AgentRuntime {
                     max_iterations = %self.config.max_iterations,
                     "Max iterations reached"
                 );
-                return Ok("[Max iterations reached]".to_string());
+                return Ok(("[Max iterations reached]".to_string(), total_usage));
             }
             iterations += 1;
 
@@ -254,11 +273,16 @@ impl AgentRuntime {
 
             let response = self.llm.complete(request).await?;
 
-            let choice = response
-                .choices
-                .into_iter()
-                .next()
-                .ok_or_else(|| alms_core::AlmsError::Runtime("No response from LLM".to_string()))?;
+            // Accumulate token usage from this LLM call
+            if let Some(usage) = &response.usage {
+                total_usage.prompt_tokens += usage.prompt_tokens;
+                total_usage.completion_tokens += usage.completion_tokens;
+            }
+
+            let choice =
+                response.choices.into_iter().next().ok_or_else(|| {
+                    alms_core::AlmsError::Runtime("No response from LLM".to_string())
+                })?;
 
             let message = choice.message;
 
@@ -286,7 +310,7 @@ impl AgentRuntime {
                 continue;
             }
 
-            return Ok(message.content.unwrap_or_default());
+            return Ok((message.content.unwrap_or_default(), total_usage));
         }
     }
 
@@ -323,8 +347,7 @@ impl AgentRuntime {
         let args: serde_json::Value = match serde_json::from_str(args_str) {
             Ok(value) => value,
             Err(e) => {
-                let err =
-                    alms_core::AlmsError::ToolExecution(format!("Invalid arguments: {}", e));
+                let err = alms_core::AlmsError::ToolExecution(format!("Invalid arguments: {}", e));
                 let _ = session_manager.append_audit(
                     session_id,
                     AuditEvent {
@@ -344,8 +367,7 @@ impl AgentRuntime {
 
         // Policy gate: deny unknown tools before execution
         if !self.tools.contains(name) {
-            let err =
-                alms_core::AlmsError::ToolExecution(format!("Tool '{}' not allowed", name));
+            let err = alms_core::AlmsError::ToolExecution(format!("Tool '{}' not allowed", name));
             let _ = session_manager.append_audit(
                 session_id,
                 AuditEvent {

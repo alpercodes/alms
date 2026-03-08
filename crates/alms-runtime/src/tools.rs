@@ -9,6 +9,12 @@ pub struct ToolRegistry {
     registry: SandboxRegistry,
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
     /// Create empty registry
     pub fn new() -> Self {
@@ -21,6 +27,13 @@ impl ToolRegistry {
     pub fn with_builtins() -> Self {
         Self {
             registry: SandboxRegistry::with_builtin_tools(),
+        }
+    }
+
+    /// Register a custom tool implementation (e.g. WorkspaceWriteTool).
+    pub fn register(&self, tool: std::sync::Arc<dyn alms_sandbox::Tool>) {
+        if let Err(e) = self.registry.register(tool) {
+            warn!("Failed to register tool: {}", e);
         }
     }
 
