@@ -684,6 +684,7 @@ function switchSession(sessionId) {
   messagesEl.innerHTML = '';
   renderSessions();
   loadRuns();
+  loadSessionHistory(sessionId);
   enableInput();
   setStatus(`session ${sessionId.slice(0, 8)}…`, 'ok');
   promptEl.focus();
@@ -831,6 +832,25 @@ function appendApprovalCard(approvalId, capability, request) {
   scrollToBottom();
 }
 
+// ── Chat history loader ────────────────────────────────────────────────────────
+
+async function loadSessionHistory(sessionId) {
+  if (!sessionId) return;
+  try {
+    const res = await fetch(`/sessions/${sessionId}/messages`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const msgs = data.messages || [];
+    if (msgs.length === 0) return;
+    // Render historic messages with a subtle visual indicator
+    for (const m of msgs) {
+      const role = m.role === 'user' ? 'user' : 'agent';
+      appendMsg(role, m.content);
+    }
+    scrollToBottom();
+  } catch { /* silently ignore */ }
+}
+
 // ── Session init ───────────────────────────────────────────────────────────────
 async function boot() {
   setStatus('connecting…');
@@ -851,7 +871,7 @@ async function boot() {
   if (found) {
     S.activeSessionId = found.id;
     renderSessions();
-    await loadRuns();
+    await Promise.all([loadRuns(), loadSessionHistory(found.id)]);
     enableInput();
     setStatus(`session ${found.id.slice(0, 8)}…`, 'ok');
   } else if (S.sessions.length > 0) {
@@ -859,7 +879,7 @@ async function boot() {
     S.activeSessionId = S.sessions[0].id;
     localStorage.setItem('alms_session_id', S.activeSessionId);
     renderSessions();
-    await loadRuns();
+    await Promise.all([loadRuns(), loadSessionHistory(S.activeSessionId)]);
     enableInput();
     setStatus(`session ${S.activeSessionId.slice(0, 8)}…`, 'ok');
   } else {

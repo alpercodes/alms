@@ -15,6 +15,7 @@ use crate::settings::get_settings;
 use crate::sse::SseEventData;
 use crate::workspace::{get_workspace, update_workspace_file};
 use alms_core::{AgentId, AlmsResult, JobStatus, Run, RunId, SessionId};
+use alms_session::{Content, Role};
 use alms_runtime::Scheduler;
 use alms_session::{JobStore, SessionManager};
 use axum::{
@@ -179,6 +180,7 @@ pub fn router() -> Router<AppState> {
         .route("/health", get(health_check))
         // Sessions
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/{session_id}/messages", get(get_session_messages))
         .route("/sessions/{agent_id}/{context_id}", get(get_session))
         // Runs (canonical API per spec)
         .route("/runs", get(list_runs).post(create_run))
@@ -249,6 +251,44 @@ async fn get_session(
     let session = state.session_manager.get_or_create(agent_id, context_id);
 
     Json(session)
+}
+
+/// GET /sessions/{session_id}/messages — return user/assistant chat history
+async fn get_session_messages(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> impl IntoResponse {
+    match state.session_manager.get_history(session_id) {
+        Ok(messages) => {
+            let visible: Vec<serde_json::Value> = messages
+                .into_iter()
+                .filter_map(|m| {
+                    let role = match m.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        _ => return None, // skip system / tool messages
+                    };
+                    let text = match m.content {
+                        Content::Text(t) => t,
+                        _ => return None, // skip non-text content
+                    };
+                    Some(serde_json::json!({
+                        "role": role,
+                        "content": text,
+                        "timestamp": m.timestamp,
+                    }))
+                })
+                .collect();
+            Json(serde_json::json!({ "messages": visible })).into_response()
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": { "code": "NOT_FOUND", "message": "Session not found" }
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /audit?session_id=<uuid>&limit=<n>
