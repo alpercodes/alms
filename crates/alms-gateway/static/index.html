@@ -586,9 +586,9 @@
   <div id="sidebar">
 
     <div class="sidebar-section" style="flex:0 0 auto">
-      <div class="sidebar-label">Sessions</div>
-      <div id="session-list"></div>
-      <button id="new-session-btn" onclick="newSession()">+ New session</button>
+      <div class="sidebar-label">Agents</div>
+      <div id="agent-list"></div>
+      <button id="new-agent-btn" onclick="newAgent()">+ New agent</button>
     </div>
 
     <div class="sidebar-section" id="run-history-section" style="flex:1">
@@ -643,8 +643,9 @@
 
 // ── State ──────────────────────────────────────────────────────────────────────
 const S = {
-  agentId:         localStorage.getItem('alms_agent_id') || null,
-  sessions:        [],
+  agents:          [],            // [{ id, name, sessionId }] — managed in localStorage
+  activeAgentId:   null,          // UUID of the active agent
+  agentId:         null,          // same — kept for workspace/jobs API calls
   activeSessionId: null,
   runs:            [],            // runs for active session
   wsFiles:         null,          // { 'personality.md': '...', ... } or null
@@ -661,7 +662,7 @@ const statusEl     = document.getElementById('status');
 const messagesEl   = document.getElementById('messages');
 const promptEl     = document.getElementById('prompt');
 const sendBtn      = document.getElementById('send');
-const sessionListEl = document.getElementById('session-list');
+const agentListEl  = document.getElementById('agent-list');
 const runListEl    = document.getElementById('run-list');
 const sessionTokensEl = document.getElementById('session-tokens');
 const panelEl      = document.getElementById('panel');
@@ -691,39 +692,86 @@ function fmtDate(iso) {
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-// ── Session sidebar ────────────────────────────────────────────────────────────
+// ── Agent sidebar ──────────────────────────────────────────────────────────────
 
-async function loadSessions() {
-  try {
-    const res = await fetch('/sessions');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    S.sessions = data.sessions || [];
-  } catch {
-    S.sessions = [];
-  }
-  renderSessions();
+const AGENTS_KEY      = 'alms_agents';
+const ACTIVE_AGENT_KEY = 'alms_active_agent';
+
+function loadAgentsFromStorage() {
+  try { return JSON.parse(localStorage.getItem(AGENTS_KEY)) || []; }
+  catch { return []; }
 }
 
-function renderSessions() {
-  sessionListEl.innerHTML = '';
-  if (S.sessions.length === 0) {
+function saveAgentsToStorage() {
+  localStorage.setItem(AGENTS_KEY, JSON.stringify(S.agents));
+}
+
+function renderAgents() {
+  agentListEl.innerHTML = '';
+  if (S.agents.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'run-empty';
-    empty.textContent = 'No sessions yet';
-    sessionListEl.appendChild(empty);
+    empty.textContent = 'No agents';
+    agentListEl.appendChild(empty);
     return;
   }
-  for (const sess of S.sessions) {
+  for (const agent of S.agents) {
     const el = document.createElement('div');
-    el.className = 'session-item' + (sess.id === S.activeSessionId ? ' active' : '');
-    el.title = `${sess.context_id}\nCreated ${new Date(sess.created_at).toLocaleString()}`;
-    el.textContent = sess.context_id;
-    el.onclick = () => switchSession(sess.id);
-    sessionListEl.appendChild(el);
+    el.className = 'session-item' + (agent.id === S.activeAgentId ? ' active' : '');
+    el.title = `ID: ${agent.id}`;
+    el.textContent = agent.name;
+    el.onclick = () => switchAgent(agent.id);
+    agentListEl.appendChild(el);
   }
 }
 
+async function newAgent() {
+  if (activeEs) return;
+  const name = prompt('Agent name:');
+  if (!name || !name.trim()) return;
+  const agentId = crypto.randomUUID();
+  const contextId = 'web-chat';
+  try {
+    const res = await fetch('/sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: agentId, context_id: contextId }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const agent = { id: agentId, name: name.trim(), sessionId: data.session_id };
+    S.agents.push(agent);
+    saveAgentsToStorage();
+    renderAgents();
+    switchAgent(agentId);
+  } catch {
+    setStatus('failed to create agent', 'error');
+  }
+}
+
+function switchAgent(agentId) {
+  const agent = S.agents.find(a => a.id === agentId);
+  if (!agent || agentId === S.activeAgentId) return;
+  if (activeEs) return;
+
+  S.activeAgentId = agentId;
+  S.agentId = agentId;
+  S.activeSessionId = agent.sessionId;
+  localStorage.setItem(ACTIVE_AGENT_KEY, agentId);
+  S.runs = [];
+  S.wsFiles = null;
+  S.auditEvents = null;
+
+  messagesEl.innerHTML = '';
+  renderAgents();
+  loadRuns();
+  if (agent.sessionId) loadSessionHistory(agent.sessionId);
+  enableInput();
+  setStatus(`agent ${agentId.slice(0, 8)}…`, 'ok');
+  promptEl.focus();
+}
+
+// Legacy stub kept so any stale code referencing newSession() does not crash.
 async function newSession() {
   if (activeEs || !S.agentId) return;
   const contextId = 'web-' + Date.now().toString(36);
@@ -924,53 +972,29 @@ async function loadSessionHistory(sessionId) {
   } catch { /* silently ignore */ }
 }
 
-// ── Session init ───────────────────────────────────────────────────────────────
+// ── Agent init ─────────────────────────────────────────────────────────────────
 async function boot() {
   setStatus('connecting…');
 
-  // Ensure we have an agent ID persisted.
-  if (!S.agentId) {
-    S.agentId = crypto.randomUUID();
-    localStorage.setItem('alms_agent_id', S.agentId);
-  }
+  // Fetch server defaults first — we need agent_id for the default agent.
+  await fetchServerDefaults();
 
-  // Load all sessions from server.
-  await loadSessions();
+  // Load agents from localStorage.
+  S.agents = loadAgentsFromStorage();
 
-  // Try to resume previously active session.
-  const savedSessionId = localStorage.getItem('alms_session_id');
-  const found = S.sessions.find(s => s.id === savedSessionId);
-
-  if (found) {
-    S.activeSessionId = found.id;
-    renderSessions();
-    await Promise.all([loadRuns(), loadSessionHistory(found.id)]);
-    enableInput();
-    setStatus(`session ${found.id.slice(0, 8)}…`, 'ok');
-  } else if (S.sessions.length > 0) {
-    // Default to the most recent session.
-    S.activeSessionId = S.sessions[0].id;
-    localStorage.setItem('alms_session_id', S.activeSessionId);
-    renderSessions();
-    await Promise.all([loadRuns(), loadSessionHistory(S.activeSessionId)]);
-    enableInput();
-    setStatus(`session ${S.activeSessionId.slice(0, 8)}…`, 'ok');
-  } else {
-    // No sessions — create the default one.
+  if (S.agents.length === 0) {
+    // First run: create the default "Main Agent" using the server's configured agent_id.
+    const serverAgentId = serverDefaults.agent_id || crypto.randomUUID();
     try {
       const res = await fetch('/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agent_id: S.agentId, context_id: 'web-chat' }),
+        body: JSON.stringify({ agent_id: serverAgentId, context_id: 'web-chat' }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      S.activeSessionId = data.session_id;
-      localStorage.setItem('alms_session_id', S.activeSessionId);
-      await loadSessions();
-      renderSessions();
-      enableInput();
-      setStatus(`session ${S.activeSessionId.slice(0, 8)}…`, 'ok');
+      S.agents = [{ id: serverAgentId, name: 'Main Agent', sessionId: data.session_id }];
+      saveAgentsToStorage();
     } catch {
       setStatus('server offline', 'error');
       setTimeout(boot, 4000);
@@ -978,6 +1002,37 @@ async function boot() {
     }
   }
 
+  // Restore the last active agent, falling back to the first.
+  const savedAgentId = localStorage.getItem(ACTIVE_AGENT_KEY);
+  let activeAgent = S.agents.find(a => a.id === savedAgentId) || S.agents[0];
+
+  // If the agent has no session yet (e.g. created offline), create one now.
+  if (!activeAgent.sessionId) {
+    try {
+      const res = await fetch('/sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_id: activeAgent.id, context_id: 'web-chat' }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        activeAgent.sessionId = data.session_id;
+        saveAgentsToStorage();
+      }
+    } catch { /* ignore — will retry on next message */ }
+  }
+
+  S.activeAgentId = activeAgent.id;
+  S.agentId = activeAgent.id;
+  S.activeSessionId = activeAgent.sessionId;
+  localStorage.setItem(ACTIVE_AGENT_KEY, activeAgent.id);
+
+  renderAgents();
+  if (S.activeSessionId) {
+    await Promise.all([loadRuns(), loadSessionHistory(S.activeSessionId)]);
+  }
+  enableInput();
+  setStatus(`agent ${activeAgent.id.slice(0, 8)}…`, 'ok');
   promptEl.focus();
 }
 
@@ -1668,8 +1723,8 @@ promptEl.addEventListener('input', () => {
 });
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
-fetchServerDefaults().then(updateSettingsBtn);
-boot();
+// fetchServerDefaults is called inside boot() so the agent_id is available.
+boot().then(updateSettingsBtn);
 </script>
 </body>
 </html>

@@ -29,6 +29,8 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         tools.push("workspace_write");
     }
 
+    let agent_id = gateway.agent_id().0.to_string();
+
     Json(serde_json::json!({
         "model": llm.default_model,
         "base_url": llm.base_url,
@@ -37,5 +39,6 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "posture": posture_str,
         "context_strategy": agent.context_config.strategy,
         "enabled_tools": tools,
+        "agent_id": agent_id,
     }))
 }

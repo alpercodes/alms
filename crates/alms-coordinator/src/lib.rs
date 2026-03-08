@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, instrument, warn};
+use tracing::{Instrument, debug, info, instrument, warn};
 use uuid::Uuid;
 
 /// Unique identifier for a subagent task
@@ -237,27 +237,28 @@ impl Coordinator {
         let session_manager = self.session_manager.clone();
         let llm = self.llm.clone();
 
-        tokio::spawn(async move {
-            let _span = tracing::info_span!(
-                "subagent::execute",
-                task_id = %task_id.0,
-                parent_run_id = ?parent_run_id.map(|r| r.0.to_string()),
-            );
-            let _enter = _span.enter();
-
-            run_subagent(
-                task_id,
-                request,
-                subagents,
-                message_tx,
-                cancel_rx,
-                result_tx,
-                session_manager,
-                llm,
-                parent_event_tx,
-            )
-            .await;
-        });
+        let span = tracing::info_span!(
+            "subagent::execute",
+            task_id = %task_id.0,
+            parent_run_id = ?parent_run_id.map(|r| r.0.to_string()),
+        );
+        tokio::spawn(
+            async move {
+                run_subagent(
+                    task_id,
+                    request,
+                    subagents,
+                    message_tx,
+                    cancel_rx,
+                    result_tx,
+                    session_manager,
+                    llm,
+                    parent_event_tx,
+                )
+                .await;
+            }
+            .instrument(span),
+        );
 
         Ok(task_id)
     }
