@@ -41,7 +41,7 @@ impl WorkspaceFile {
     /// Whether the agent is allowed to write this file
     pub fn agent_writable(&self) -> bool {
         match self {
-            WorkspaceFile::Personality => false, // user-only
+            WorkspaceFile::Personality => true,
             WorkspaceFile::Goals => true,
             WorkspaceFile::Memories => true,
         }
