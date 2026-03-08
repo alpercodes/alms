@@ -5,13 +5,16 @@
 use crate::approvals::{ApprovalStore, PendingApproval};
 use crate::server::AppState;
 use crate::sse::{RunEventStream, SseEventData, ToolInvocationId, event_channel};
-use alms_core::{CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse, SessionId};
+use alms_core::{
+    CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
+    SessionId,
+};
 use alms_runtime::RuntimeEvent;
 use axum::{
-    extract::{Path, State},
-    http::{StatusCode, HeaderMap},
-    response::IntoResponse,
     Json,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
 };
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -33,7 +36,7 @@ pub async fn create_run(
                 Json(serde_json::json!({
                     "error": { "code": "NOT_FOUND", "message": "Session not found" }
                 })),
-            ))
+            ));
         }
     };
 
@@ -44,7 +47,7 @@ pub async fn create_run(
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
-    let agent_id = run.agent_id.clone();
+    let agent_id = run.agent_id;
 
     info!("Creating run {} for session {}", run_id.0, session_id.0);
 
@@ -82,7 +85,11 @@ async fn execute_run(
 
     state
         .run_manager
-        .send_event(run_id, session_id, SseEventData::run_started(run_id, session_id))
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::run_started(run_id, session_id),
+        )
         .await;
 
     if let Some(mut run) = state.run_manager.get_run(run_id) {
@@ -99,9 +106,15 @@ async fn execute_run(
     // Create a runtime event channel so we can forward tool events to SSE
     let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
 
-    let runtime = alms_runtime::AgentRuntime::new(agent_id, agent_config, llm)
+    let mut runtime = alms_runtime::AgentRuntime::new(agent_id, agent_config, llm)
         .with_event_sender(runtime_tx)
         .with_run_id(run_id);
+
+    // Attach workspace if configured — registers the workspace_write tool for this run
+    if let Some(ref workspace_dir) = state.workspace_dir {
+        let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, agent_id);
+        runtime = runtime.with_workspace(workspace);
+    }
 
     // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals)
     let forwarder_state = state.clone();
@@ -118,18 +131,26 @@ async fn execute_run(
         .await;
 
     match result {
-        Ok(response) => {
+        Ok(output) => {
             state
                 .run_manager
-                .send_event(run_id, session_id, SseEventData::token_delta(run_id, &response))
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::token_delta(run_id, &output.response),
+                )
                 .await;
             state
                 .run_manager
-                .send_event(run_id, session_id, SseEventData::run_finished(run_id, true))
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_finished(run_id, true, output.usage),
+                )
                 .await;
 
             if let Some(mut run) = state.run_manager.get_run(run_id) {
-                run.mark_completed(response);
+                run.mark_completed(output.response, output.usage);
                 state.run_manager.update_run(run);
             }
 
@@ -138,7 +159,11 @@ async fn execute_run(
         Err(e) => {
             state
                 .run_manager
-                .send_event(run_id, session_id, SseEventData::run_error(run_id, &e.to_string()))
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_error(run_id, &e.to_string()),
+                )
                 .await;
 
             if let Some(mut run) = state.run_manager.get_run(run_id) {
@@ -166,7 +191,11 @@ async fn forward_runtime_events(
 ) {
     while let Some(event) = rx.recv().await {
         match event {
-            RuntimeEvent::ToolStart { invocation_id, tool, params } => {
+            RuntimeEvent::ToolStart {
+                invocation_id,
+                tool,
+                params,
+            } => {
                 run_manager
                     .send_event(
                         run_id,
@@ -180,21 +209,25 @@ async fn forward_runtime_events(
                     )
                     .await;
             }
-            RuntimeEvent::ToolEnd { invocation_id, ok, result } => {
+            RuntimeEvent::ToolEnd {
+                invocation_id,
+                ok,
+                result,
+            } => {
                 run_manager
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::tool_end(
-                            run_id,
-                            ToolInvocationId(invocation_id),
-                            ok,
-                            result,
-                        ),
+                        SseEventData::tool_end(run_id, ToolInvocationId(invocation_id), ok, result),
                     )
                     .await;
             }
-            RuntimeEvent::ApprovalRequired { approval_id, tool, params, decision_tx } => {
+            RuntimeEvent::ApprovalRequired {
+                approval_id,
+                tool,
+                params,
+                decision_tx,
+            } => {
                 let request = serde_json::json!({"tool": &tool, "params": &params});
                 approval_store.insert(PendingApproval {
                     approval_id,
@@ -264,13 +297,17 @@ pub async fn stream_run_events(
         .collect();
 
     if !replay_events.is_empty() {
-        info!("Replaying {} events for run {}", replay_events.len(), run_id.0);
+        info!(
+            "Replaying {} events for run {}",
+            replay_events.len(),
+            run_id.0
+        );
     }
 
     let (tx, rx) = event_channel();
     state.run_manager.register_sender(run_id, tx);
 
-    Ok(RunEventStream::new_with_events(rx, replay_events))
+    Ok(RunEventStream::stream_with_replay(rx, replay_events))
 }
 
 /// POST /agent/run/stream - Legacy compatibility endpoint
@@ -287,7 +324,7 @@ pub async fn stream_run_legacy(
                 Json(serde_json::json!({
                     "error": { "code": "NOT_FOUND", "message": "Session not found" }
                 })),
-            ))
+            ));
         }
     };
 
@@ -298,7 +335,7 @@ pub async fn stream_run_legacy(
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
-    let agent_id = run.agent_id.clone();
+    let agent_id = run.agent_id;
 
     info!(
         "Creating run {} for session {} (legacy /agent/run/stream)",
@@ -316,5 +353,5 @@ pub async fn stream_run_legacy(
         execute_run(state_clone, run_id, session_id, agent_id, run.input).await;
     });
 
-    Ok(RunEventStream::new(rx))
+    Ok(RunEventStream::stream(rx))
 }
