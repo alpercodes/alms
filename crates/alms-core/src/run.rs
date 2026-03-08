@@ -117,6 +117,9 @@ impl Run {
 pub struct CreateRunRequest {
     pub session_id: SessionId,
     pub input: RunInput,
+    /// Optional model override — uses server default when absent.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Input to a run

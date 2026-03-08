@@ -420,6 +420,57 @@
     .job-status-pending   { color: #d29922; }
     .jobs-empty { font-size: 12px; color: #484f58; font-style: italic; }
     .jobs-error { font-size: 11px; color: #f85149; }
+
+    /* ── Settings modal ── */
+    .settings-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.65);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+    }
+    .settings-overlay.open { display: flex; }
+    .settings-modal {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 22px 26px;
+      width: 420px;
+      max-width: 92vw;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .settings-modal h2 { font-size: 14px; color: #e6edf3; margin: 0; }
+    .settings-row { display: flex; flex-direction: column; gap: 5px; }
+    .settings-label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.6px; }
+    .settings-hint  { font-size: 10px; color: #484f58; }
+    .settings-input {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 7px 10px;
+      color: #e6edf3;
+      font-family: inherit;
+      font-size: 13px;
+      outline: none;
+      width: 100%;
+    }
+    .settings-input:focus { border-color: #388bfd; }
+    .settings-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 4px; }
+    .settings-save {
+      padding: 6px 16px; font-size: 12px; font-family: inherit;
+      background: #238636; color: #fff; border: none; border-radius: 4px; cursor: pointer;
+    }
+    .settings-save:hover { background: #2ea043; }
+    .settings-cancel {
+      padding: 6px 16px; font-size: 12px; font-family: inherit;
+      background: #21262d; color: #8b949e; border: 1px solid #30363d; border-radius: 4px; cursor: pointer;
+    }
+    .settings-cancel:hover { color: #e6edf3; }
+    #btn-settings.active { color: #d29922; border-color: #d29922; }
   </style>
 </head>
 <body>
@@ -430,8 +481,40 @@
   <div class="header-btns">
     <button class="hbtn" id="btn-workspace" onclick="togglePanel('workspace')">Workspace</button>
     <button class="hbtn" id="btn-jobs" onclick="togglePanel('jobs')">Jobs</button>
+    <button class="hbtn" id="btn-settings" onclick="openSettings()">⚙ Settings</button>
   </div>
 </header>
+
+<!-- ── Settings modal ── -->
+<div class="settings-overlay" id="settings-overlay" onclick="onOverlayClick(event)">
+  <div class="settings-modal" role="dialog" aria-modal="true" aria-label="Settings">
+    <h2>Settings</h2>
+
+    <div class="settings-row">
+      <div class="settings-label">Model</div>
+      <input type="text" class="settings-input" id="settings-model"
+             list="model-suggestions" placeholder="server default"
+             autocomplete="off" spellcheck="false">
+      <datalist id="model-suggestions">
+        <option value="moonshotai/kimi-k2.5">
+        <option value="anthropic/claude-3.5-haiku">
+        <option value="anthropic/claude-3.5-sonnet">
+        <option value="anthropic/claude-3-opus">
+        <option value="openai/gpt-4o">
+        <option value="openai/gpt-4o-mini">
+        <option value="google/gemini-flash-1.5">
+        <option value="meta-llama/llama-3.1-8b-instruct:free">
+        <option value="mistralai/mistral-7b-instruct:free">
+      </datalist>
+      <div class="settings-hint" id="settings-model-hint"></div>
+    </div>
+
+    <div class="settings-footer">
+      <button class="settings-cancel" onclick="closeSettings()">Cancel</button>
+      <button class="settings-save" onclick="applySettings()">Apply</button>
+    </div>
+  </div>
+</div>
 
 <div id="main">
 
@@ -830,13 +913,17 @@ async function sendMessage() {
 
   let runId;
   try {
+    const runBody = {
+      session_id: S.activeSessionId,
+      input: { type: 'text', text },
+    };
+    const activeModel = getActiveModel();
+    if (activeModel) runBody.model = activeModel;
+
     const res = await fetch('/runs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        session_id: S.activeSessionId,
-        input: { type: 'text', text },
-      }),
+      body: JSON.stringify(runBody),
     });
     if (!res.ok) {
       if (res.status === 404 || res.status === 400) {
@@ -1285,6 +1372,73 @@ function renderJobs() {
   }
 }
 
+// ── Settings ───────────────────────────────────────────────────────────────────
+const SETTINGS_KEY = 'alms_settings';
+let serverDefaults = { model: '', base_url: '' };
+
+const settingsOverlay  = document.getElementById('settings-overlay');
+const settingsModelIn  = document.getElementById('settings-model');
+const settingsModelHint = document.getElementById('settings-model-hint');
+
+function loadLocalSettings() {
+  try { return JSON.parse(localStorage.getItem(SETTINGS_KEY)) || {}; }
+  catch { return {}; }
+}
+
+function saveLocalSettings(obj) {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(obj));
+}
+
+function getActiveModel() {
+  return loadLocalSettings().model || null;
+}
+
+async function fetchServerDefaults() {
+  try {
+    const res = await fetch('/settings');
+    if (res.ok) serverDefaults = await res.json();
+  } catch { /* offline */ }
+}
+
+function openSettings() {
+  const local = loadLocalSettings();
+  settingsModelIn.value = local.model || '';
+  settingsModelIn.placeholder = serverDefaults.model || 'server default';
+  settingsModelHint.textContent = serverDefaults.model
+    ? `Server default: ${serverDefaults.model}`
+    : 'Leave blank to use the server default';
+  settingsOverlay.classList.add('open');
+  settingsModelIn.focus();
+}
+
+function closeSettings() {
+  settingsOverlay.classList.remove('open');
+}
+
+function onOverlayClick(e) {
+  if (e.target === settingsOverlay) closeSettings();
+}
+
+function applySettings() {
+  const local = loadLocalSettings();
+  const model = settingsModelIn.value.trim();
+  saveLocalSettings({ ...local, model: model || null });
+  updateSettingsBtn();
+  closeSettings();
+}
+
+function updateSettingsBtn() {
+  const activeModel = getActiveModel();
+  const btn = document.getElementById('btn-settings');
+  btn.classList.toggle('active', !!activeModel);
+  btn.title = activeModel ? `Model override: ${activeModel}` : 'Settings';
+}
+
+// Close modal on Escape
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && settingsOverlay.classList.contains('open')) closeSettings();
+});
+
 // ── Input handling ─────────────────────────────────────────────────────────────
 promptEl.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
@@ -1300,6 +1454,7 @@ promptEl.addEventListener('input', () => {
 });
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
+fetchServerDefaults().then(updateSettingsBtn);
 boot();
 </script>
 </body>

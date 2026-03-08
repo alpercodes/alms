@@ -298,6 +298,11 @@ impl Gateway {
         self.config.workspace_dir.as_deref()
     }
 
+    /// Get LLM config reference (for exposing server defaults)
+    pub fn llm_config(&self) -> &alms_runtime::LlmConfig {
+        &self.config.llm_config
+    }
+
     /// Get SQLite database path (None = in-memory only)
     pub fn db_path(&self) -> Option<&str> {
         self.config.db_path.as_deref()

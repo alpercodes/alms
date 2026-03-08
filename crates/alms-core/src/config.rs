@@ -215,7 +215,7 @@ impl Default for LlmConfig {
     fn default() -> Self {
         Self {
             base_url: "https://openrouter.ai/api/v1".into(),
-            model: "openrouter/moonshotai/kimi-k2.5".into(),
+            model: "moonshotai/kimi-k2.5".into(),
             api_key: None,
             timeout_secs: 120,
             max_retries: 2,

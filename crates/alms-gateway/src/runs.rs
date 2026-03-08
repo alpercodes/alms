@@ -63,6 +63,7 @@ pub async fn create_run(
         RunInput::Text { text } => text,
     };
 
+    let model_override = req.model.clone();
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
@@ -74,7 +75,7 @@ pub async fn create_run(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        execute_run(state_clone, run_id, session_id, agent_id, run.input).await;
+        execute_run(state_clone, run_id, session_id, agent_id, run.input, model_override).await;
     });
 
     let response = CreateRunResponse {
@@ -88,13 +89,14 @@ pub async fn create_run(
 }
 
 /// Execute a run in background, forwarding runtime events to SSE.
-#[instrument(level = "info", skip(state, input), fields(run_id = %run_id.0, session_id = %session_id.0))]
+#[instrument(level = "info", skip(state, input, model_override), fields(run_id = %run_id.0, session_id = %session_id.0))]
 async fn execute_run(
     state: AppState,
     run_id: RunId,
     session_id: SessionId,
     agent_id: alms_core::AgentId,
     input: String,
+    model_override: Option<String>,
 ) {
     // Events are persisted to the event log regardless of whether an SSE
     // client is connected. The SSE client registers its own sender when it
@@ -116,7 +118,14 @@ async fn execute_run(
     // Build runtime — drop gateway lock before running to avoid blocking other requests
     let (agent_config, llm) = {
         let gateway = state.gateway.lock().await;
-        (gateway.agent_config().clone(), gateway.llm().clone())
+        let llm = gateway.llm().clone();
+        let llm = if let Some(model) = model_override {
+            info!("Run {} using model override: {}", run_id.0, model);
+            llm.with_model(model)
+        } else {
+            llm
+        };
+        (gateway.agent_config().clone(), llm)
     };
 
     // Create a runtime event channel so we can forward tool events to SSE
@@ -245,7 +254,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     info!("Job fired → run {}", run_id.0);
 
     // Execute the run (awaits completion; errors are handled inside execute_run).
-    execute_run(state.clone(), run_id, session_id, job.agent_id, run.input).await;
+    execute_run(state.clone(), run_id, session_id, job.agent_id, run.input, None).await;
 
     // Guard: if the job was cancelled while the run was in progress, do not
     // overwrite the Cancelled status or re-arm the scheduler.
@@ -457,7 +466,7 @@ pub async fn stream_run_legacy(
 
     let state_clone = state.clone();
     tokio::spawn(async move {
-        execute_run(state_clone, run_id, session_id, agent_id, run.input).await;
+        execute_run(state_clone, run_id, session_id, agent_id, run.input, None).await;
     });
 
     Ok(RunEventStream::stream(rx))

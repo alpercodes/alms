@@ -11,6 +11,7 @@ use crate::runs::{
     create_run, get_run_status, list_runs, scheduler_fire_loop, stream_run_events,
     stream_run_legacy,
 };
+use crate::settings::get_settings;
 use crate::sse::SseEventData;
 use crate::workspace::{get_workspace, update_workspace_file};
 use alms_core::{AgentId, AlmsResult, JobStatus, Run, RunId, SessionId};
@@ -194,6 +195,8 @@ pub fn router() -> Router<AppState> {
             "/agents/{agent_id}/workspace/{file}",
             axum::routing::put(update_workspace_file),
         )
+        // Settings (server defaults for UI pre-population)
+        .route("/settings", get(get_settings))
         // Jobs (scheduled agent runs)
         .route("/jobs", post(create_job).get(list_jobs))
         .route("/jobs/{job_id}", get(get_job).delete(cancel_job))
