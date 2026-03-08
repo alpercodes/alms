@@ -86,6 +86,11 @@ impl GatewayConfig {
                 .unwrap_or_else(|_| std::path::PathBuf::from("./data/workspace")),
         );
 
+        // Ensure ./data/ exists before SQLite tries to open files there.
+        if let Err(e) = std::fs::create_dir_all("./data") {
+            tracing::warn!("Could not create ./data directory: {}", e);
+        }
+
         Ok(gateway_config)
     }
 }

@@ -258,8 +258,14 @@ async fn get_session_messages(
     State(state): State<AppState>,
     Path(session_id): Path<SessionId>,
 ) -> impl IntoResponse {
+    tracing::debug!("GET /sessions/{}/messages", session_id.0);
     match state.session_manager.get_history(session_id) {
         Ok(messages) => {
+            tracing::debug!(
+                "Session {} has {} total messages",
+                session_id.0,
+                messages.len()
+            );
             let visible: Vec<serde_json::Value> = messages
                 .into_iter()
                 .filter_map(|m| {
@@ -361,10 +367,6 @@ pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
 }
 
 pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult<()> {
-    // Ensure the data directory exists (needed for SQLite and workspace files).
-    if let Err(e) = std::fs::create_dir_all("./data") {
-        tracing::warn!("Could not create ./data directory: {}", e);
-    }
     // Create the scheduler with a fire channel so job IDs are forwarded to
     // the gateway for actual agent-run dispatch.
     let (fire_tx, fire_rx) = tokio::sync::mpsc::unbounded_channel::<alms_core::JobId>();
