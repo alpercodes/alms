@@ -292,16 +292,46 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ---
 
-## P8 — Deployment hardening (required before VPS goes public)
+## P8 — Correctness bugs (breaks core promises today)
 
-35) Bearer token authentication
+38) Fix session context_id mismatch in execute_run (CRITICAL)
+- `execute_run()` calls `runtime.run(session_manager, &session_id.0.to_string(), input)` — passing the session UUID string as the context_id.
+- `AgentRuntime::run()` then calls `get_or_create(agent_id, UUID-string)`, looking up key `(agent_id, "uuid-string")`.
+- But the original session was stored under `(agent_id, original-context-id)` — a different key. Every run silently creates a shadow session. History never accumulates in the session the caller selected.
+- Fix: pass the session's actual `context_id` field through to `execute_run()` and use it as the context_id argument to `runtime.run()`. The session object is already resolved in `create_run()` — just thread `session.context_id` through.
+- **Owners:** Atlas
+
+39) Persist AgentId across restarts (HIGH)
+- `Gateway::new()` calls `AgentId::new()` on every process start. On restart: agent_id changes, workspace files (keyed by agent_id on disk) become unreachable, all sessions in SQLite under the old agent_id are orphaned, bootstrap re-triggers as if it's a new agent.
+- This is more fundamental than task #31 (UI/server alignment) — the server itself is the source of the instability.
+- Fix: persist the agent_id to SQLite (or a sidecar file in the workspace dir) on first boot, reload it on subsequent starts.
+- Related to #31 — once the server persists a stable ID, the UI can reliably use it.
+- **Owners:** Atlas
+
+40) Fix Telegram double-deserialization bug (HIGH)
+- `set_webhook()` and `delete_webhook()` call `self.post::<_, TelegramResponse<bool>>(...)`, but `post<B, T>` internally parses the HTTP body as `TelegramResponse<T>`. With T = `TelegramResponse<bool>`, it tries to parse `{"ok":true,"result":true}` as `TelegramResponse<TelegramResponse<bool>>` — which fails because `result: true` is not an object.
+- Since `start()` always calls `delete_webhook()` in polling mode (the default), Telegram startup fails with a JSON parse error whenever a bot token is configured.
+- Fix: change the type parameter in `set_webhook` and `delete_webhook` to `bool` instead of `TelegramResponse<bool>`.
+- **Owners:** Atlas
+
+41) Fix scheduler sleep calculation (MEDIUM)
+- `run_loop()` uses `BinaryHeap::iter().find(...)` to find the next job's run_at time. `BinaryHeap::iter()` is unordered — it may skip over the earliest job and return a later one, causing jobs to fire late.
+- `process_due_jobs()` correctly uses `peek()`/`pop()` (ordered), so no jobs are lost, only potentially delayed.
+- Fix: replace `iter().find(...)` with the heap's `peek()` and filter cancelled IDs from there, or maintain a secondary sorted structure.
+- **Owners:** Atlas
+
+---
+
+## P9 — Deployment hardening (required before VPS goes public)
+
+42) Bearer token authentication
 - Every HTTP endpoint is currently open to any network client, including `shell_exec` and `fs_write`.
 - Add an Axum middleware that checks `Authorization: Bearer <token>` against `ALMS_AUTH_TOKEN` env var.
 - Skip auth for `GET /health` only. Return 401 for missing/wrong token.
 - ~50 lines in `alms-gateway/src/server.rs`. High security impact, low effort.
 - **Owners:** Atlas
 
-36) Graceful shutdown
+43) Graceful shutdown
 - SIGTERM currently kills in-flight LLM calls, background subagents, the scheduler loop, and the Telegram polling loop abruptly.
 - Use `tokio::signal::ctrl_c()` (and SIGTERM on Unix) + a `CancellationToken` to coordinate shutdown:
   a) Stop accepting new requests
