@@ -46,6 +46,14 @@ impl SessionManager {
         }
     }
 
+    /// Create a session manager backed by an existing `SqliteStore` (for tests).
+    pub fn with_store(config: SessionConfig, store: SqliteStore) -> AlmsResult<Self> {
+        let mut manager = Self::new(config);
+        manager.store = Some(Arc::new(store));
+        manager.load_from_store()?;
+        Ok(manager)
+    }
+
     /// Create a session manager backed by SQLite at `db_path`.
     ///
     /// Opens (or creates) the database, runs schema migrations, then loads all
@@ -145,6 +153,15 @@ impl SessionManager {
                 && let Some(mut session) = self.sessions.get_mut(key.value())
             {
                 session.touch();
+                // Write-through updated last_activity to SQLite
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save_session(&session)
+                {
+                    warn!(
+                        "Failed to persist last_activity for session {}: {}",
+                        session_id.0, e
+                    );
+                }
             }
 
             Ok(())
@@ -220,6 +237,15 @@ impl SessionManager {
                 && session.status == types::SessionStatus::Active
             {
                 session.status = types::SessionStatus::Idle;
+                // Write-through updated status to SQLite
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save_session(session)
+                {
+                    warn!(
+                        "Failed to persist idle status for session {:?}: {}",
+                        session.id, e
+                    );
+                }
                 count += 1;
                 info!("Archived idle session: {:?}", session.id);
             }
@@ -235,6 +261,17 @@ impl SessionManager {
         if let Some((_, session)) = self.sessions.remove(&key) {
             self.session_by_id.remove(&session.id);
             self.history.remove(&session.id);
+            self.audit.remove(&session.id);
+            self.summaries.remove(&session.id);
+            // Remove from SQLite
+            if let Some(store) = &self.store
+                && let Err(e) = store.delete_session(session.id)
+            {
+                warn!(
+                    "Failed to delete session {} from SQLite: {}",
+                    session.id.0, e
+                );
+            }
             info!("Deleted session: {:?}", session.id);
             Ok(())
         } else {
@@ -272,5 +309,85 @@ impl SessionManager {
     /// Get config
     pub fn config(&self) -> &SessionConfig {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Content, Message, Role};
+
+    fn make_manager() -> SessionManager {
+        let store = SqliteStore::open_in_memory().unwrap();
+        SessionManager::with_store(SessionConfig::default(), store).unwrap()
+    }
+
+    fn make_msg(text: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: Content::Text(text.to_string()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_append_message_persists_last_activity() {
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+        let session = mgr.get_or_create(agent_id, "ctx1");
+        let original_activity = session.last_activity;
+
+        // Small delay so touch() produces a different timestamp
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        mgr.append_message(session.id, make_msg("hello")).unwrap();
+
+        // Reload from SQLite to verify write-through
+        let store = mgr.store.as_ref().unwrap();
+        let reloaded = store.load_all_sessions().unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert!(reloaded[0].last_activity.0 > original_activity.0);
+    }
+
+    #[test]
+    fn test_archive_idle_persists_status() {
+        let config = SessionConfig {
+            idle_timeout_secs: 0, // immediate idle
+            ..SessionConfig::default()
+        };
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mgr = SessionManager::with_store(config, store).unwrap();
+
+        let agent_id = AgentId::new();
+        let session = mgr.get_or_create(agent_id, "ctx-idle");
+        assert_eq!(session.status, SessionStatus::Active);
+
+        // Small delay to exceed 0s timeout
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let count = mgr.archive_idle();
+        assert_eq!(count, 1);
+
+        // Reload from SQLite
+        let store = mgr.store.as_ref().unwrap();
+        let reloaded = store.load_all_sessions().unwrap();
+        assert_eq!(reloaded[0].status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn test_delete_removes_from_sqlite() {
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+        let session = mgr.get_or_create(agent_id, "ctx-del");
+        mgr.append_message(session.id, make_msg("bye")).unwrap();
+
+        mgr.delete(agent_id, "ctx-del").unwrap();
+
+        // Verify SQLite is empty
+        let store = mgr.store.as_ref().unwrap();
+        let sessions = store.load_all_sessions().unwrap();
+        assert!(sessions.is_empty());
+        let messages = store.load_messages(session.id).unwrap();
+        assert!(messages.is_empty());
     }
 }

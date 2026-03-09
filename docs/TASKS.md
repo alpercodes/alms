@@ -15,6 +15,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-09:** Fix #40 (HIGH): Telegram double-deserialization — `set_webhook`/`delete_webhook` used `TelegramResponse<bool>` as type param to `post()` which already unwraps the envelope.
 - **2026-03-09:** Fix #41 (MEDIUM): scheduler sleep calculation — replaced `iter().find()` with peek-and-drain; filter cancelled jobs before firing.
 - **2026-03-09:** Bearer auth (#42): `ALMS_AUTH_TOKEN` env var enables auth middleware on all routes except `/health`. Supports `?token=` query param for SSE.
+- **2026-03-09:** Fix #45 (MEDIUM): session `last_activity` and `status` now write-through to SQLite on every `append_message()` and `archive_idle()`. `delete()` cascades to SQLite (messages, audit, summaries, session row). `SessionManager::with_store()` constructor for test injection.
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -266,10 +267,12 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: store a `Vec` of senders per run and broadcast to all; eliminate the snapshot→register gap by registering first, then replaying.
 - **Owners:** Atlas
 
-45) Session last_activity and status not persisted to SQLite
-- `append_message()` updates `session.last_activity` in memory (via `touch()`) but does not write it to SQLite. `archive_idle()` changes `session.status` only in memory.
-- On restart, SQLite reloads stale `last_activity` and `status` even though message history is correct. Sessions that were archived in memory are treated as active again after restart.
-- Fix: call `store.save_session(&session)` after `touch()` in `append_message()` and after status changes in `archive_idle()`.
+45) Session last_activity and status not persisted to SQLite ✅
+- `append_message()` now writes through `last_activity` to SQLite after `touch()`.
+- `archive_idle()` now writes through `status` to SQLite after setting to `Idle`.
+- `delete()` cascades to SQLite: deletes messages, audit events, summaries, and session row.
+- `SessionManager::with_store()` constructor added for test injection.
+- 3 new integration tests: persist_last_activity, persist_idle_status, delete_from_sqlite.
 - **Owners:** Atlas
 
 32) Clean up dead coordinator scaffolding

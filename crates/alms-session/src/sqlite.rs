@@ -139,6 +139,22 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Delete a session and all its related data (messages, audit, summaries).
+    pub fn delete_session(&self, session_id: SessionId) -> AlmsResult<()> {
+        let conn = self.conn.lock();
+        let id_str = session_id.0.to_string();
+        // Delete dependent rows first (foreign key order)
+        conn.execute("DELETE FROM context_summaries WHERE session_id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete summaries: {e}")))?;
+        conn.execute("DELETE FROM audit_events WHERE session_id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit: {e}")))?;
+        conn.execute("DELETE FROM messages WHERE session_id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete messages: {e}")))?;
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete session: {e}")))?;
+        Ok(())
+    }
+
     /// Load every session row, oldest first.
     pub fn load_all_sessions(&self) -> AlmsResult<Vec<Session>> {
         let conn = self.conn.lock();
