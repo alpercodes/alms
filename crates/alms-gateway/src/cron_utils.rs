@@ -41,7 +41,7 @@ pub fn compute_next_fire(job: &Job, now: DateTime<Utc>) -> Option<DateTime<Utc>>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike as _};
 
     #[test]
     fn test_next_after_valid_expr() {
@@ -92,7 +92,3 @@ mod tests {
         }
     }
 }
-
-// Re-export chrono::Timelike for the hour() call in tests
-#[cfg(test)]
-use chrono::Timelike as _;

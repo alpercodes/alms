@@ -13,13 +13,13 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
-use tracing::warn;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
+use tracing::warn;
 use uuid::Uuid;
 
 /// A pending approval waiting for a user decision.
@@ -231,7 +231,7 @@ mod tests {
         let info = store.resolve(id, true);
         assert!(info.is_some());
         assert_eq!(info.unwrap().tool, "echo");
-        assert_eq!(rx.blocking_recv().unwrap(), true);
+        assert!(rx.blocking_recv().unwrap());
         assert!(store.list_pending().is_empty());
     }
 
@@ -251,7 +251,7 @@ mod tests {
         });
 
         assert!(store.resolve(id, false).is_some());
-        assert_eq!(rx.blocking_recv().unwrap(), false);
+        assert!(!rx.blocking_recv().unwrap());
     }
 
     #[test]

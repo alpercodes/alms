@@ -92,7 +92,7 @@ mod tests {
             decision_tx.send(true).unwrap();
         }
 
-        assert_eq!(decision_rx.await.unwrap(), true);
+        assert!(decision_rx.await.unwrap());
     }
 
     #[tokio::test]
@@ -112,7 +112,7 @@ mod tests {
             decision_tx.send(false).unwrap();
         }
 
-        assert_eq!(decision_rx.await.unwrap(), false);
+        assert!(!decision_rx.await.unwrap());
     }
 
     #[tokio::test]

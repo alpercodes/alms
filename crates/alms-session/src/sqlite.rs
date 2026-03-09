@@ -560,7 +560,6 @@ fn str_to_job_status(s: &str) -> JobStatus {
 mod tests {
     use super::*;
     use crate::types::{Content, Message, Role, Session};
-    use alms_core::job::{CreateJobRequest, JobSchedule};
     use alms_core::{AgentId, RunId};
 
     fn new_session() -> Session {

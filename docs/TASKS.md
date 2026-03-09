@@ -255,6 +255,18 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: UI boot sequence should read `agent_id` from `GET /settings` and use it as the default agent ID instead of generating one. The fix is already half-done — `GET /settings` returns `agent_id`.
 - **Owners:** Atlas
 
+44) SSE single-subscriber limitation
+- `RunManager` stores one `mpsc::Sender` per run. A second browser tab connecting to the same run's event stream replaces the first subscriber's sender, cutting it off.
+- There is also a narrow race window in `stream_run_events()` between `events_from()` (snapshot) and `register_sender()` (live channel) — events in that gap are missed. Last-Event-ID reconnect partially mitigates this.
+- Fix: store a `Vec` of senders per run and broadcast to all; eliminate the snapshot→register gap by registering first, then replaying.
+- **Owners:** Atlas
+
+45) Session last_activity and status not persisted to SQLite
+- `append_message()` updates `session.last_activity` in memory (via `touch()`) but does not write it to SQLite. `archive_idle()` changes `session.status` only in memory.
+- On restart, SQLite reloads stale `last_activity` and `status` even though message history is correct. Sessions that were archived in memory are treated as active again after restart.
+- Fix: call `store.save_session(&session)` after `touch()` in `append_message()` and after status changes in `archive_idle()`.
+- **Owners:** Atlas
+
 32) Clean up dead coordinator scaffolding
 - `AgentMessage` enum, `process_messages()` method, `message_tx`/`message_rx` in Coordinator are unused since the peer-mesh design was rejected.
 - Leaving unused concurrent code in place creates confusion (is it intentionally inactive? a bug?).

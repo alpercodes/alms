@@ -4,7 +4,6 @@
 
 use alms_core::{RunId, TokenUsage};
 use alms_gateway::sse::{SseEventData, event_channel};
-use serde_json::json;
 
 #[tokio::test]
 async fn test_event_sequence_basic_run() {
@@ -28,7 +27,7 @@ async fn test_event_sequence_basic_run() {
     .unwrap();
 
     // Collect events
-    let events = vec![
+    let events = [
         rx.recv().await.unwrap(),
         rx.recv().await.unwrap(),
         rx.recv().await.unwrap(),
@@ -85,7 +84,7 @@ async fn test_event_sequence_with_error() {
     tx.send(SseEventData::run_error(run_id, "Something went wrong"))
         .unwrap();
 
-    let events = vec![rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+    let events = [rx.recv().await.unwrap(), rx.recv().await.unwrap()];
 
     assert_eq!(events[0].event_type, "run_started");
     assert_eq!(events[1].event_type, "run_error");
