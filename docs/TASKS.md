@@ -116,6 +116,17 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Add a “docs index” link in README (optional).
 - **Owners:** Mesut
 
+30) Coordinator integration tests
+- alms-coordinator has 0 tests across 640 lines of concurrent code (DashMap + oneshot channels + spawned tasks + timeout + cancellation). Single biggest quality gap in the codebase.
+- Required tests (use `ALMS_LLM_MOCK=1` + in-memory `SessionManager`):
+  a) `dispatch` foreground — success path returns response text
+  b) `dispatch` foreground — LLM error propagates as `Err`
+  c) `dispatch_background` + `poll_task` lifecycle: `Running` while in progress → `Completed` when done
+  d) `cancel_subagent` — verify status becomes `Cancelled`, poll returns `PollResult::Cancelled`
+  e) Timeout — `SubagentRequest` with very short timeout, verify `Failed` status
+  f) `poll_task` on unknown task_id — returns `Err`
+- **Owners:** Atlas
+
 ---
 
 ## P5 — Extended MVP: agent UX + cron + richer UI
@@ -225,6 +236,29 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Chat UI already consumes token_delta events — backend just needs to produce them.
 - **Owners:** Atlas
 
+31) Fix agent ID mismatch (UI / server alignment)
+- The web UI generates its own random UUID for the agent and stores it in localStorage.
+- The server has its own AgentId (generated at startup, exposed via `GET /settings` as `agent_id`).
+- These are different — workspace files are keyed to the server ID, so the UI is siloed from them.
+- Fix: UI boot sequence should read `agent_id` from `GET /settings` and use it as the default agent ID instead of generating one. The fix is already half-done — `GET /settings` returns `agent_id`.
+- **Owners:** Atlas
+
+32) Clean up dead coordinator scaffolding
+- `AgentMessage` enum, `process_messages()` method, `message_tx`/`message_rx` in Coordinator are unused since the peer-mesh design was rejected.
+- Leaving unused concurrent code in place creates confusion (is it intentionally inactive? a bug?).
+- Delete these; if peer-to-peer messaging is added later it should be designed fresh.
+- **Owners:** Atlas
+
+33) Fix Span::enter() across .await in coordinator
+- Any `Span::enter()` guard held across an `.await` point is incorrect per tracing docs — can cause wrong span attribution and memory leaks.
+- Audit `run_subagent` in `alms-coordinator/src/lib.rs` for sync span guards held across awaits; replace with `.instrument(span)`.
+- **Owners:** Atlas
+
+34) Fix CreateSessionResponse.created always true
+- `create_session` uses `get_or_create` semantics but always returns `"created": true`, even for existing sessions. Misleading for clients.
+- Either track whether the session was newly created and return the correct value, or remove the field.
+- **Owners:** Atlas
+
 28) invoke_agent tool (agent-to-agent delegation) ✅
 - `invoke_agent(task, system_prompt?, background?)` spawns a subagent via the Coordinator.
 - Foreground (default): blocks and returns `{ response }`. Background: returns `{ task_id }` immediately.
@@ -242,6 +276,26 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Subagent SSE events forwarded into parent run's event stream via mpsc forwarding task.
 - `GET /tasks`, `GET /tasks/{id}` HTTP endpoints expose coordinator state.
 - Background mode: `dispatch_background()` fires non-blocking; `poll_task()` reads stored `completed_result`.
+- **Owners:** Atlas
+
+---
+
+## P8 — Deployment hardening (required before VPS goes public)
+
+35) Bearer token authentication
+- Every HTTP endpoint is currently open to any network client, including `shell_exec` and `fs_write`.
+- Add an Axum middleware that checks `Authorization: Bearer <token>` against `ALMS_AUTH_TOKEN` env var.
+- Skip auth for `GET /health` only. Return 401 for missing/wrong token.
+- ~50 lines in `alms-gateway/src/server.rs`. High security impact, low effort.
+- **Owners:** Atlas
+
+36) Graceful shutdown
+- SIGTERM currently kills in-flight LLM calls, background subagents, the scheduler loop, and the Telegram polling loop abruptly.
+- Use `tokio::signal::ctrl_c()` (and SIGTERM on Unix) + a `CancellationToken` to coordinate shutdown:
+  a) Stop accepting new requests
+  b) Signal scheduler and channel adapter to stop
+  c) Wait for in-flight runs to complete (with a timeout, e.g. 30s)
+  d) Flush SQLite WAL
 - **Owners:** Atlas
 
 ---

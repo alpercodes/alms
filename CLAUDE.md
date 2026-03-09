@@ -44,12 +44,13 @@ research/            # Competitive analysis and tech-stack decisions
 ### Dependency graph (no cycles)
 
 ```
-alms-cli → alms-gateway → alms-runtime  → alms-core
-                        → alms-channel  → alms-core
-                        → alms-session  → alms-core
-           alms-runtime → alms-sandbox  → alms-core
-                        → alms-session
-     alms-coordinator   → alms-core
+alms-cli → alms-gateway → alms-runtime    → alms-core
+                        → alms-coordinator → alms-core
+                                           → alms-session
+                                           → alms-runtime
+                        → alms-channel    → alms-core
+                        → alms-session    → alms-core
+           alms-runtime → alms-sandbox    → alms-core
                         → alms-session
 ```
 
