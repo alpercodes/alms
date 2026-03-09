@@ -236,6 +236,18 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Chat UI already consumes token_delta events — backend just needs to produce them.
 - **Owners:** Atlas
 
+37) Add user.md to agent workspace
+- Current workspace files (personality.md, goals.md, memories.md) conflate agent identity with user identity. memories.md is supposed to hold "user preferences" alongside agent learnings — these should be separated.
+- Add `user.md` as a fourth workspace file: describes the human the agent is working with (name, working style, preferences, background, communication preferences).
+- `personality.md` → describes the *agent* (tone, role, constraints). `user.md` → describes the *user*.
+- Changes required:
+  a) `AgentWorkspace`: add `user.md` to the file set, read it in `build_system_prompt_prefix()`
+  b) `workspace_write` tool: add `"user"` as a valid file target (alongside goals/memories)
+  c) Workspace HTTP API: include `user.md` in `GET /agents/{id}/workspace` response and `PUT` handler
+  d) Bootstrap prompt: rewrite to fill out both `personality.md` (agent self-description) and `user.md` (user info) — "What should I call you?", "What's your background?", "How do you prefer to communicate?" → user.md
+  e) `needs_bootstrap()`: still keyed to absence of `personality.md` — no change needed
+- **Owners:** Atlas
+
 31) Fix agent ID mismatch (UI / server alignment)
 - The web UI generates its own random UUID for the agent and stores it in localStorage.
 - The server has its own AgentId (generated at startup, exposed via `GET /settings` as `agent_id`).

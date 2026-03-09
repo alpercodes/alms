@@ -81,9 +81,10 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 1. **ContextBuilder** (`context.rs`): Assembles token-budgeted context windows for LLM calls. Strategies: `truncate` (default), `full`, `sliding-summary` (rolling LLM summary of old messages + recent window verbatim). Config via `ContextConfig`.
 
 2. **AgentWorkspace** (`workspace.rs`): Per-agent persistent identity files:
-   - `personality.md` — tone, style, constraints (agent + user editable; agent writes during bootstrap)
-   - `goals.md` — current objectives (agent + user editable)
-   - `memories.md` — learned facts, preferences (agent + user editable)
+   - `personality.md` — the *agent's* tone, style, role, constraints (agent + user editable; agent writes during bootstrap)
+   - `goals.md` — the agent's current objectives (agent + user editable)
+   - `memories.md` — what the agent has learned: domain facts, past decisions, accumulated knowledge (agent + user editable)
+   - `user.md` — who the *user* is: name, working style, preferences, background (agent + user editable; filled during bootstrap interview) — **not yet implemented, see task #37**
    - Prepended to system prompt when workspace is attached to runtime
    - `needs_bootstrap()` detects first-time agents (no `personality.md`)
 
