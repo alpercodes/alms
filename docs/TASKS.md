@@ -12,6 +12,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-09:** Extended tools (#23): shell_exec + fs_read/write/list builtins; per-run temperature/max_tokens/posture overrides via API; Settings UI and Audit panel extended; posture badge in header.
 - **2026-03-09:** Fix #38 (CRITICAL): session context_id mismatch — `execute_run()` was creating shadow sessions by passing session UUID as context_id. Threaded `session.context_id` through all callers.
 - **2026-03-09:** Fix #39 (HIGH): persisted AgentId via sidecar file `./data/agent_id`. Restarts no longer orphan workspace files, sessions, or jobs.
+- **2026-03-09:** Fix #40 (HIGH): Telegram double-deserialization — `set_webhook`/`delete_webhook` used `TelegramResponse<bool>` as type param to `post()` which already unwraps the envelope.
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -320,10 +321,9 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - 5 new tests covering create/load/stability/invalid/config-passthrough.
 - **Owners:** Atlas
 
-40) Fix Telegram double-deserialization bug (HIGH)
-- `set_webhook()` and `delete_webhook()` call `self.post::<_, TelegramResponse<bool>>(...)`, but `post<B, T>` internally parses the HTTP body as `TelegramResponse<T>`. With T = `TelegramResponse<bool>`, it tries to parse `{"ok":true,"result":true}` as `TelegramResponse<TelegramResponse<bool>>` — which fails because `result: true` is not an object.
-- Since `start()` always calls `delete_webhook()` in polling mode (the default), Telegram startup fails with a JSON parse error whenever a bot token is configured.
-- Fix: change the type parameter in `set_webhook` and `delete_webhook` to `bool` instead of `TelegramResponse<bool>`.
+40) Fix Telegram double-deserialization bug ✅
+- `set_webhook()` and `delete_webhook()` were using `T = TelegramResponse<bool>` with `post()`, which already unwraps the envelope — causing double-wrapping that always failed on parse.
+- Fix: removed the redundant `TelegramResponse` wrapper; both methods now let `post()` return `bool` directly.
 - **Owners:** Atlas
 
 41) Fix scheduler sleep calculation (MEDIUM)

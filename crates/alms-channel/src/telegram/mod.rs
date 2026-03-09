@@ -141,8 +141,7 @@ impl TelegramChannel {
             url: url.into(),
             secret_token,
         };
-        let result: TelegramResponse<bool> = self.post("setWebhook", &request).await?;
-        Ok(result.ok)
+        self.post("setWebhook", &request).await
     }
 
     /// Delete webhook (switch to polling)
@@ -154,8 +153,7 @@ impl TelegramChannel {
         let request = DeleteWebhookRequest {
             drop_pending_updates: true,
         };
-        let result: TelegramResponse<bool> = self.post("deleteWebhook", &request).await?;
-        Ok(result.ok)
+        self.post("deleteWebhook", &request).await
     }
 
     /// Convert a Telegram Update to an IncomingMessage
