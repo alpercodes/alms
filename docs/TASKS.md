@@ -11,6 +11,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-09:** Background subagents + parallel tool execution (#28, #29): invoke_agent(background=true) fires non-blocking and returns task_id; get_task_result tool polls result; agent_loop uses join_all for concurrent tool calls; Coordinator fully wired with real AgentRuntime loops.
 - **2026-03-09:** Extended tools (#23): shell_exec + fs_read/write/list builtins; per-run temperature/max_tokens/posture overrides via API; Settings UI and Audit panel extended; posture badge in header.
 - **2026-03-09:** Fix #38 (CRITICAL): session context_id mismatch — `execute_run()` was creating shadow sessions by passing session UUID as context_id. Threaded `session.context_id` through all callers.
+- **2026-03-09:** Fix #39 (HIGH): persisted AgentId via sidecar file `./data/agent_id`. Restarts no longer orphan workspace files, sessions, or jobs.
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -312,11 +313,11 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: threaded `session.context_id` through `execute_run()` from all three callers (`create_run`, `stream_run_legacy`, `fire_job_run`). Runtime now finds the correct session.
 - **Owners:** Atlas
 
-39) Persist AgentId across restarts (HIGH)
-- `Gateway::new()` calls `AgentId::new()` on every process start. On restart: agent_id changes, workspace files (keyed by agent_id on disk) become unreachable, all sessions in SQLite under the old agent_id are orphaned, bootstrap re-triggers as if it's a new agent.
-- This is more fundamental than task #31 (UI/server alignment) — the server itself is the source of the instability.
-- Fix: persist the agent_id to SQLite (or a sidecar file in the workspace dir) on first boot, reload it on subsequent starts.
-- Related to #31 — once the server persists a stable ID, the UI can reliably use it.
+39) Persist AgentId across restarts ✅
+- `Gateway::new()` was generating a fresh `AgentId` on every boot, orphaning workspace files, sessions, and jobs.
+- Fix: sidecar file `./data/agent_id` stores the UUID. Precedence: `ALMS_AGENT_ID` env var > sidecar file > generate new. Self-heals on garbage input. `Display`/`FromStr` added to `AgentId`.
+- Recovery for existing data: `echo "<uuid>" > ./data/agent_id`
+- 5 new tests covering create/load/stability/invalid/config-passthrough.
 - **Owners:** Atlas
 
 40) Fix Telegram double-deserialization bug (HIGH)

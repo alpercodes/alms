@@ -7,9 +7,11 @@ use alms_channel::{Channel, ChannelConfig};
 use alms_core::{AgentId, AlmsConfig, AlmsResult};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
 use alms_session::{SessionConfig, SessionManager};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 /// Gateway configuration
 #[derive(Debug, Clone)]
@@ -26,6 +28,8 @@ pub struct GatewayConfig {
     pub db_path: Option<String>,
     /// Base directory for agent workspace files (None = workspace API disabled)
     pub workspace_dir: Option<std::path::PathBuf>,
+    /// Explicit agent ID (None = resolve from sidecar file or generate new)
+    pub agent_id: Option<AgentId>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -38,6 +42,7 @@ impl Default for GatewayConfig {
             session_config: SessionConfig::default(),
             db_path: None,
             workspace_dir: None,
+            agent_id: None,
         }
     }
 }
@@ -65,6 +70,7 @@ impl GatewayConfig {
             session_config: SessionConfig::default(),
             db_path: None,
             workspace_dir: None,
+            agent_id: None,
         }
     }
 
@@ -90,8 +96,53 @@ impl GatewayConfig {
             tracing::warn!("Could not create ./data directory: {}", e);
         }
 
+        gateway_config.agent_id = Some(resolve_default_agent_id(Path::new("./data")));
+
         Ok(gateway_config)
     }
+}
+
+/// Resolve the default agent ID: env var > sidecar file > generate new.
+///
+/// The sidecar file is `<data_dir>/agent_id` — a plain-text UUID.
+/// If the file is missing or contains garbage, a new ID is generated and
+/// persisted (self-healing). Write failures are non-fatal warnings.
+fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
+    // 1. Env var override takes highest precedence
+    if let Ok(val) = std::env::var("ALMS_AGENT_ID") {
+        if let Ok(uuid) = Uuid::parse_str(val.trim()) {
+            info!("Using agent ID from ALMS_AGENT_ID: {}", uuid);
+            return AgentId(uuid);
+        }
+        warn!("Invalid ALMS_AGENT_ID '{}', ignoring", val);
+    }
+
+    let id_file = data_dir.join("agent_id");
+
+    // 2. Try to load from sidecar file
+    if let Ok(contents) = std::fs::read_to_string(&id_file) {
+        if let Ok(uuid) = Uuid::parse_str(contents.trim()) {
+            info!("Loaded persisted agent ID: {}", uuid);
+            return AgentId(uuid);
+        }
+        warn!(
+            "Invalid agent_id file contents '{}', generating new ID",
+            contents.trim()
+        );
+    }
+
+    // 3. Generate new and persist
+    let agent_id = AgentId::new();
+    if let Err(e) = std::fs::write(&id_file, agent_id.0.to_string()) {
+        warn!(
+            "Failed to persist agent_id to {}: {}",
+            id_file.display(),
+            e
+        );
+    } else {
+        info!("Generated and persisted new agent ID: {}", agent_id.0);
+    }
+    agent_id
 }
 
 /// Active channel connections
@@ -125,12 +176,14 @@ impl Gateway {
         };
         let llm = LlmClient::new(config.llm_config.clone())?;
 
+        let agent_id = config.agent_id.unwrap_or_default();
+
         Ok(Self {
             config,
             session_manager,
             channels: Channels { telegram: None },
             llm,
-            agent_id: AgentId::new(),
+            agent_id,
         })
     }
 
@@ -337,5 +390,51 @@ mod tests {
         let config = GatewayConfig::new().with_telegram_token("test_token");
 
         assert_eq!(config.telegram_token, Some("test_token".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_agent_id_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = resolve_default_agent_id(dir.path());
+        let file_contents = std::fs::read_to_string(dir.path().join("agent_id")).unwrap();
+        assert_eq!(file_contents, id.0.to_string());
+    }
+
+    #[test]
+    fn test_resolve_agent_id_loads_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let known_uuid = Uuid::new_v4();
+        std::fs::write(dir.path().join("agent_id"), known_uuid.to_string()).unwrap();
+        let id = resolve_default_agent_id(dir.path());
+        assert_eq!(id.0, known_uuid);
+    }
+
+    #[test]
+    fn test_resolve_agent_id_stable_across_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = resolve_default_agent_id(dir.path());
+        let second = resolve_default_agent_id(dir.path());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_resolve_agent_id_overwrites_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent_id"), "not-a-uuid").unwrap();
+        let id = resolve_default_agent_id(dir.path());
+        // Should have generated a valid ID and overwritten the file
+        let file_contents = std::fs::read_to_string(dir.path().join("agent_id")).unwrap();
+        assert_eq!(file_contents, id.0.to_string());
+    }
+
+    #[test]
+    fn test_gateway_uses_config_agent_id() {
+        let expected = AgentId::new();
+        let config = GatewayConfig {
+            agent_id: Some(expected),
+            ..GatewayConfig::default()
+        };
+        let gateway = Gateway::new(config).unwrap();
+        assert_eq!(*gateway.agent_id(), expected);
     }
 }
