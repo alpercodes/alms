@@ -160,13 +160,19 @@ impl Scheduler {
     async fn run_loop(&self) {
         loop {
             // Find the earliest pending (non-cancelled) job's run time.
+            // Drain cancelled entries from the heap top so peek() returns
+            // the true earliest non-cancelled job.
             let next_at = {
-                let pending = self.pending.lock().await;
+                let mut pending = self.pending.lock().await;
                 let cancelled = self.cancelled.lock().await;
-                pending
-                    .iter()
-                    .find(|Reverse(j)| !cancelled.contains(&j.id))
-                    .map(|Reverse(j)| j.run_at)
+                while let Some(Reverse(top)) = pending.peek() {
+                    if cancelled.contains(&top.id) {
+                        pending.pop();
+                    } else {
+                        break;
+                    }
+                }
+                pending.peek().map(|Reverse(j)| j.run_at)
             };
 
             match next_at {
@@ -220,11 +226,14 @@ impl Scheduler {
             }
         }
         drop(pending);
-        drop(cancelled);
+        // Keep `cancelled` alive through the firing loop so we can filter.
 
         let ran_at = Instant::now();
         let mut history = self.history.lock().await;
         for job in due {
+            if cancelled.contains(&job.id) {
+                continue;
+            }
             info!(job_id = %job.id, "Scheduled job fired");
             history.push(JobRun {
                 job_id: job.id,
@@ -387,6 +396,115 @@ mod tests {
         let ids: Vec<JobId> = runs.iter().map(|r| r.job_id).collect();
         assert!(ids.contains(&id_a));
         assert!(ids.contains(&id_b));
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_head_does_not_delay_other_jobs() {
+        tokio::time::pause();
+
+        let scheduler = Scheduler::new();
+        let handle = scheduler.start();
+        let now = Instant::now();
+
+        let id_early = JobId::new(); // will be cancelled
+        let id_middle = JobId::new(); // should fire at T+50
+        let id_late = JobId::new(); // fires at T+100
+
+        // Insert in order that may place id_late before id_middle in the
+        // heap's backing array (children of root are unordered).
+        scheduler
+            .schedule_once(id_early, now + Duration::from_secs(10))
+            .await;
+        scheduler
+            .schedule_once(id_late, now + Duration::from_secs(100))
+            .await;
+        scheduler
+            .schedule_once(id_middle, now + Duration::from_secs(50))
+            .await;
+
+        scheduler.cancel(id_early).await;
+
+        // Advance to T+51 — id_middle MUST have fired.
+        advance(Duration::from_secs(51)).await;
+
+        let runs = scheduler.completed_runs().await;
+        let fired_ids: Vec<JobId> = runs.iter().map(|r| r.job_id).collect();
+        assert!(
+            fired_ids.contains(&id_middle),
+            "middle job must fire on time"
+        );
+        assert!(
+            !fired_ids.contains(&id_early),
+            "cancelled job must not fire"
+        );
+        assert!(
+            !fired_ids.contains(&id_late),
+            "late job must not fire yet"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_job_not_sent_on_fire_channel() {
+        tokio::time::pause();
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let scheduler = Scheduler::new().with_fire_channel(tx);
+        let handle = scheduler.start();
+        let now = Instant::now();
+
+        let id_a = JobId::new();
+        let id_b = JobId::new();
+
+        scheduler
+            .schedule_once(id_a, now + Duration::from_secs(10))
+            .await;
+        scheduler
+            .schedule_once(id_b, now + Duration::from_secs(10))
+            .await;
+
+        scheduler.cancel(id_a).await;
+
+        advance(Duration::from_secs(11)).await;
+
+        let fired = rx.try_recv().expect("should receive id_b");
+        assert_eq!(fired, id_b);
+        assert!(
+            rx.try_recv().is_err(),
+            "cancelled job must not appear on fire channel"
+        );
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_all_cancelled_no_spurious_firing() {
+        tokio::time::pause();
+
+        let scheduler = Scheduler::new();
+        let handle = scheduler.start();
+
+        let id = JobId::new();
+        scheduler
+            .schedule_once(id, Instant::now() + Duration::from_secs(10))
+            .await;
+        scheduler.cancel(id).await;
+
+        advance(Duration::from_secs(20)).await;
+
+        assert_eq!(
+            scheduler.completed_runs().await.len(),
+            0,
+            "cancelled job must not fire"
+        );
+        assert_eq!(
+            scheduler.pending_count().await,
+            0,
+            "cancelled job should be drained from heap"
+        );
 
         handle.abort();
     }

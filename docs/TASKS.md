@@ -13,6 +13,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-09:** Fix #38 (CRITICAL): session context_id mismatch — `execute_run()` was creating shadow sessions by passing session UUID as context_id. Threaded `session.context_id` through all callers.
 - **2026-03-09:** Fix #39 (HIGH): persisted AgentId via sidecar file `./data/agent_id`. Restarts no longer orphan workspace files, sessions, or jobs.
 - **2026-03-09:** Fix #40 (HIGH): Telegram double-deserialization — `set_webhook`/`delete_webhook` used `TelegramResponse<bool>` as type param to `post()` which already unwraps the envelope.
+- **2026-03-09:** Fix #41 (MEDIUM): scheduler sleep calculation — replaced `iter().find()` with peek-and-drain; filter cancelled jobs before firing.
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -326,10 +327,10 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: removed the redundant `TelegramResponse` wrapper; both methods now let `post()` return `bool` directly.
 - **Owners:** Atlas
 
-41) Fix scheduler sleep calculation (MEDIUM)
-- `run_loop()` uses `BinaryHeap::iter().find(...)` to find the next job's run_at time. `BinaryHeap::iter()` is unordered — it may skip over the earliest job and return a later one, causing jobs to fire late.
-- `process_due_jobs()` correctly uses `peek()`/`pop()` (ordered), so no jobs are lost, only potentially delayed.
-- Fix: replace `iter().find(...)` with the heap's `peek()` and filter cancelled IDs from there, or maintain a secondary sorted structure.
+41) Fix scheduler sleep calculation ✅
+- `run_loop()` was using `iter().find()` (unordered) to find the next job — could oversleep and delay jobs. `process_due_jobs()` was firing cancelled jobs on the channel.
+- Fix: peek-and-drain cancelled entries from heap top in `run_loop()`; filter cancelled jobs before firing in `process_due_jobs()`.
+- 3 new tests: cancelled-head-delay, cancelled-not-on-channel, all-cancelled-no-fire.
 - **Owners:** Atlas
 
 ---
