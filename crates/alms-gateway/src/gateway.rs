@@ -30,6 +30,8 @@ pub struct GatewayConfig {
     pub workspace_dir: Option<std::path::PathBuf>,
     /// Explicit agent ID (None = resolve from sidecar file or generate new)
     pub agent_id: Option<AgentId>,
+    /// Bearer token for API authentication (None = auth disabled)
+    pub auth_token: Option<String>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -43,6 +45,7 @@ impl Default for GatewayConfig {
             db_path: None,
             workspace_dir: None,
             agent_id: None,
+            auth_token: None,
         }
     }
 }
@@ -71,6 +74,7 @@ impl GatewayConfig {
             db_path: None,
             workspace_dir: None,
             agent_id: None,
+            auth_token: config.server.auth_token.clone(),
         }
     }
 
@@ -372,6 +376,11 @@ impl Gateway {
     /// Get SQLite database path (None = in-memory only)
     pub fn db_path(&self) -> Option<&str> {
         self.config.db_path.as_deref()
+    }
+
+    /// Get auth token (None = auth disabled)
+    pub fn auth_token(&self) -> Option<&str> {
+        self.config.auth_token.as_deref()
     }
 }
 

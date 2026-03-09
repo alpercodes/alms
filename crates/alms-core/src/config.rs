@@ -117,6 +117,9 @@ impl AlmsConfig {
         if let Ok(bind) = std::env::var("ALMS_BIND") {
             self.server.bind = bind;
         }
+        if let Ok(token) = std::env::var("ALMS_AUTH_TOKEN") {
+            self.server.auth_token = Some(token);
+        }
 
         // Channels
         if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
@@ -186,12 +189,16 @@ impl AlmsConfig {
 #[serde(default)]
 pub struct ServerConfig {
     pub bind: String,
+    /// Bearer token for API authentication — loaded from env only
+    #[serde(skip)]
+    pub auth_token: Option<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8080".into(),
+            auth_token: None,
         }
     }
 }

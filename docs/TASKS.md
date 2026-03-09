@@ -14,6 +14,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-09:** Fix #39 (HIGH): persisted AgentId via sidecar file `./data/agent_id`. Restarts no longer orphan workspace files, sessions, or jobs.
 - **2026-03-09:** Fix #40 (HIGH): Telegram double-deserialization — `set_webhook`/`delete_webhook` used `TelegramResponse<bool>` as type param to `post()` which already unwraps the envelope.
 - **2026-03-09:** Fix #41 (MEDIUM): scheduler sleep calculation — replaced `iter().find()` with peek-and-drain; filter cancelled jobs before firing.
+- **2026-03-09:** Bearer auth (#42): `ALMS_AUTH_TOKEN` env var enables auth middleware on all routes except `/health`. Supports `?token=` query param for SSE.
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -337,11 +338,11 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ## P9 — Deployment hardening (required before VPS goes public)
 
-42) Bearer token authentication
-- Every HTTP endpoint is currently open to any network client, including `shell_exec` and `fs_write`.
-- Add an Axum middleware that checks `Authorization: Bearer <token>` against `ALMS_AUTH_TOKEN` env var.
-- Skip auth for `GET /health` only. Return 401 for missing/wrong token.
-- ~50 lines in `alms-gateway/src/server.rs`. High security impact, low effort.
+42) Bearer token authentication ✅
+- Axum middleware in `auth.rs` checks `Authorization: Bearer <token>` against `ALMS_AUTH_TOKEN` env var.
+- Also accepts `?token=<token>` query param for SSE EventSource (browser can't set headers).
+- `/health` is public; all other routes require auth. If `ALMS_AUTH_TOKEN` is unset, auth is disabled (dev mode, logs warning).
+- 7 unit tests covering valid/invalid/missing/malformed/query-param cases.
 - **Owners:** Atlas
 
 43) Graceful shutdown

@@ -21,12 +21,13 @@ use alms_runtime::Scheduler;
 use alms_session::{Content, Role};
 use alms_session::{JobStore, SessionManager};
 use axum::{
-    Json, Router,
+    Extension, Json, Router, middleware,
     extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
 };
+use crate::auth::{AuthToken, require_auth};
 use dashmap::DashMap;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -185,13 +186,16 @@ impl AppState {
 // Re-export SSE types
 pub use crate::sse::{RunEventStream, event_channel};
 
-/// Create the gateway router (per docs/api.md)
-pub fn router() -> Router<AppState> {
+/// Routes that do NOT require authentication
+fn public_router() -> Router<AppState> {
+    Router::new().route("/health", get(health_check))
+}
+
+/// Routes that require authentication (all except /health)
+fn protected_router() -> Router<AppState> {
     Router::new()
         // Web UI
         .route("/", get(serve_ui))
-        // Health
-        .route("/health", get(health_check))
         // Sessions
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{session_id}/messages", get(get_session_messages))
@@ -428,7 +432,26 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
         }
     });
 
-    let app = router().with_state(state);
+    let auth_token = {
+        let gateway = state.gateway.lock().await;
+        AuthToken(gateway.auth_token().map(String::from))
+    };
+    if auth_token.0.is_none() {
+        tracing::warn!(
+            "ALMS_AUTH_TOKEN is not set — API authentication is DISABLED. \
+             Set it before exposing to the network."
+        );
+    } else {
+        info!("API authentication enabled");
+    }
+
+    let app = public_router()
+        .merge(
+            protected_router()
+                .layer(middleware::from_fn(require_auth))
+                .layer(Extension(auth_token)),
+        )
+        .with_state(state);
 
     info!("Starting ALMS Gateway HTTP server on {}", bind_addr);
 
