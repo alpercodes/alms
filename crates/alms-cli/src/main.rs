@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand};
-use tracing::info;
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "alms")]
@@ -17,6 +17,9 @@ enum Commands {
         /// Bind address
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         bind: String,
+        /// OpenRouter/OpenAI API key (overrides OPENROUTER_API_KEY env var)
+        #[arg(long, env = "OPENROUTER_API_KEY")]
+        api_key: Option<String>,
     },
     /// Check system health
     Health {
@@ -30,13 +33,41 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Gateway { bind } => {
+        Commands::Gateway { bind, api_key } => {
             info!("Starting ALMS Gateway...");
+            match &api_key {
+                Some(k) => info!("API key provided ({} chars)", k.len()),
+                None => {
+                    // Dump any key-like env vars to help diagnose missing key issues.
+                    let found: Vec<String> = std::env::vars()
+                        .filter(|(k, _)| k.contains("API_KEY") || k.contains("OPENROUTER"))
+                        .map(|(k, v)| format!("{}=({} chars)", k, v.len()))
+                        .collect();
+                    if found.is_empty() {
+                        error!(
+                            "No API key found. Pass --api-key sk-or-... or set OPENROUTER_API_KEY."
+                        );
+                    } else {
+                        warn!("API key env vars visible to process: {}", found.join(", "));
+                    }
+                }
+            }
+            if let Some(key) = api_key {
+                // Ensure the key is in the env so AlmsConfig::load() picks it up.
+                unsafe {
+                    std::env::set_var("OPENROUTER_API_KEY", key);
+                }
+            }
             alms_gateway::serve(&bind).await?;
         }
         Commands::Health { url } => {

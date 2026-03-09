@@ -4,7 +4,6 @@
 
 use alms_core::RunId;
 use axum::response::sse::{Event, Sse};
-use tracing::error;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
@@ -12,6 +11,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
+use tracing::error;
 use uuid::Uuid;
 
 /// Unique identifier for a tool invocation
@@ -205,7 +205,10 @@ impl RunEventStream {
                     .unwrap_or_else(|| Uuid::new_v4().to_string()))
                 .json_data(&data.data)
                 .unwrap_or_else(|e| {
-                    error!("Failed to serialize SSE replay event '{}': {}", data.event_type, e);
+                    error!(
+                        "Failed to serialize SSE replay event '{}': {}",
+                        data.event_type, e
+                    );
                     Event::default().data("{}")
                 });
             Ok::<_, Infallible>(event)
@@ -220,7 +223,10 @@ impl RunEventStream {
                     .unwrap_or_else(|| Uuid::new_v4().to_string()))
                 .json_data(&data.data)
                 .unwrap_or_else(|e| {
-                    error!("Failed to serialize SSE live event '{}': {}", data.event_type, e);
+                    error!(
+                        "Failed to serialize SSE live event '{}': {}",
+                        data.event_type, e
+                    );
                     Event::default().data("{}")
                 });
             Ok::<_, Infallible>(event)

@@ -238,7 +238,10 @@ mod tests {
     fn test_personality_writable() {
         // personality.md is agent-writable so the bootstrap interview can save it.
         let (_dir, ws) = test_workspace();
-        let result = ws.write_file(WorkspaceFile::Personality, "I am a concise coding assistant.");
+        let result = ws.write_file(
+            WorkspaceFile::Personality,
+            "I am a concise coding assistant.",
+        );
         assert!(result.is_ok());
         assert_eq!(
             ws.read_file(WorkspaceFile::Personality).unwrap(),

@@ -166,7 +166,10 @@ mod tests {
         }))
         .await
         .unwrap();
-        let content = tool.workspace.read_file(WorkspaceFile::Personality).unwrap();
+        let content = tool
+            .workspace
+            .read_file(WorkspaceFile::Personality)
+            .unwrap();
         assert!(content.contains("helpful assistant"));
     }
 

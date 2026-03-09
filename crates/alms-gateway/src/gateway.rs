@@ -77,9 +77,8 @@ impl GatewayConfig {
         let config = AlmsConfig::load()?;
         let mut gateway_config = Self::from_alms_config(&config);
 
-        gateway_config.db_path = Some(
-            std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| "./data/alms.db".to_string()),
-        );
+        gateway_config.db_path =
+            Some(std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| "./data/alms.db".to_string()));
         gateway_config.workspace_dir = Some(
             std::env::var("ALMS_WORKSPACE_DIR")
                 .map(Into::into)

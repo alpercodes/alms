@@ -20,7 +20,9 @@ impl LlmClient {
 
         info!("LLM client initialized with base URL: {}", config.base_url);
         if config.api_key.is_empty() {
-            error!("LLM api_key is empty — calls will fail with 401. Set OPENROUTER_API_KEY or OPENAI_API_KEY.");
+            error!(
+                "LLM api_key is empty — calls will fail with 401. Set OPENROUTER_API_KEY or OPENAI_API_KEY."
+            );
         } else {
             info!("LLM api_key loaded ({} chars)", config.api_key.len());
         }

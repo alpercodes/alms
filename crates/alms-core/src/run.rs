@@ -172,7 +172,9 @@ impl From<Run> for RunStatusResponse {
             started_at: run.started_at,
             ended_at: run.ended_at,
             usage: run.usage,
-            ts: run.ended_at.unwrap_or_else(|| run.started_at.unwrap_or(run.created_at)),
+            ts: run
+                .ended_at
+                .unwrap_or_else(|| run.started_at.unwrap_or(run.created_at)),
             job_id: run.job_id,
         }
     }

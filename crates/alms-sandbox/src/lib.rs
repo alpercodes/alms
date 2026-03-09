@@ -7,7 +7,10 @@ pub mod error;
 pub mod registry;
 pub mod sandbox;
 
-pub use builtin::{BuiltinTool, EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool, ShellExecTool};
+pub use builtin::{
+    BuiltinTool, EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
+    ShellExecTool,
+};
 pub use error::{SandboxError, SandboxResult};
 pub use registry::ToolRegistry;
 pub use sandbox::{Sandbox, SandboxConfig};

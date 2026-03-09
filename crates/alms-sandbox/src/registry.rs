@@ -152,7 +152,9 @@ impl ToolRegistry {
 
     /// Register all built-in tools
     pub fn register_builtin_tools(&self) {
-        use crate::builtin::{EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool, ShellExecTool};
+        use crate::builtin::{
+            EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool, ShellExecTool,
+        };
 
         // Register echo tool
         if let Err(e) = self.register(Arc::new(EchoTool::new())) {

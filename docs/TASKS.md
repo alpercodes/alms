@@ -10,6 +10,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-09:** Sliding-summary context strategy (#22): rolling summary persisted per session in SQLite; LLM summarization call at configurable intervals; ContextBuilder.build() gains existing_summary param; falls back to truncation with warning on failure.
 - **2026-03-09:** Background subagents + parallel tool execution (#28, #29): invoke_agent(background=true) fires non-blocking and returns task_id; get_task_result tool polls result; agent_loop uses join_all for concurrent tool calls; Coordinator fully wired with real AgentRuntime loops.
 - **2026-03-09:** Extended tools (#23): shell_exec + fs_read/write/list builtins; per-run temperature/max_tokens/posture overrides via API; Settings UI and Audit panel extended; posture badge in header.
+- **2026-03-09:** Fix #38 (CRITICAL): session context_id mismatch — `execute_run()` was creating shadow sessions by passing session UUID as context_id. Threaded `session.context_id` through all callers.
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -306,11 +307,9 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ## P8 — Correctness bugs (breaks core promises today)
 
-38) Fix session context_id mismatch in execute_run (CRITICAL)
-- `execute_run()` calls `runtime.run(session_manager, &session_id.0.to_string(), input)` — passing the session UUID string as the context_id.
-- `AgentRuntime::run()` then calls `get_or_create(agent_id, UUID-string)`, looking up key `(agent_id, "uuid-string")`.
-- But the original session was stored under `(agent_id, original-context-id)` — a different key. Every run silently creates a shadow session. History never accumulates in the session the caller selected.
-- Fix: pass the session's actual `context_id` field through to `execute_run()` and use it as the context_id argument to `runtime.run()`. The session object is already resolved in `create_run()` — just thread `session.context_id` through.
+38) Fix session context_id mismatch in execute_run ✅
+- `execute_run()` was calling `runtime.run(session_manager, &session_id.0.to_string(), input)` — passing the session UUID as context_id, which caused `get_or_create()` to create shadow sessions instead of using the original.
+- Fix: threaded `session.context_id` through `execute_run()` from all three callers (`create_run`, `stream_run_legacy`, `fire_job_run`). Runtime now finds the correct session.
 - **Owners:** Atlas
 
 39) Persist AgentId across restarts (HIGH)

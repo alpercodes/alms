@@ -82,6 +82,7 @@ pub async fn create_run(
     let run_id = run.run_id;
     let session_id = run.session_id;
     let agent_id = run.agent_id;
+    let context_id = session.context_id.clone();
 
     info!("Creating run {} for session {}", run_id.0, session_id.0);
 
@@ -96,6 +97,7 @@ pub async fn create_run(
             agent_id,
             run.input,
             overrides,
+            context_id,
         )
         .await;
     });
@@ -119,6 +121,7 @@ async fn execute_run(
     agent_id: alms_core::AgentId,
     input: String,
     overrides: RunOverrides,
+    context_id: String,
 ) {
     // Events are persisted to the event log regardless of whether an SSE
     // client is connected. The SSE client registers its own sender when it
@@ -245,7 +248,7 @@ async fn execute_run(
     ));
 
     let result = runtime
-        .run(&state.session_manager, &session_id.0.to_string(), input)
+        .run(&state.session_manager, &context_id, input)
         .await;
 
     // Drop `runtime` explicitly to close `runtime_tx` and signal EOF to the
@@ -352,6 +355,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
         job.agent_id,
         run.input,
         RunOverrides::default(),
+        context_id,
     )
     .await;
 
@@ -551,6 +555,7 @@ pub async fn stream_run_legacy(
     let run_id = run.run_id;
     let session_id = run.session_id;
     let agent_id = run.agent_id;
+    let context_id = session.context_id.clone();
 
     info!(
         "Creating run {} for session {} (legacy /agent/run/stream)",
@@ -572,6 +577,7 @@ pub async fn stream_run_legacy(
             agent_id,
             run.input,
             RunOverrides::default(),
+            context_id,
         )
         .await;
     });

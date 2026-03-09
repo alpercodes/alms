@@ -9,9 +9,10 @@ fn check_no_traversal(path: &str) -> SandboxResult<()> {
     let p = std::path::Path::new(path);
     for component in p.components() {
         if component == std::path::Component::ParentDir {
-            return Err(SandboxError::SandboxViolation(
-                format!("Path traversal not allowed: '{}'", path),
-            ));
+            return Err(SandboxError::SandboxViolation(format!(
+                "Path traversal not allowed: '{}'",
+                path
+            )));
         }
     }
     Ok(())
@@ -28,7 +29,11 @@ fn safe_truncate(s: &str, max_bytes: usize) -> String {
         .rev()
         .find(|&i| s.is_char_boundary(i))
         .unwrap_or(0);
-    format!("{}…[truncated, {} bytes omitted]", &s[..boundary], s.len() - boundary)
+    format!(
+        "{}…[truncated, {} bytes omitted]",
+        &s[..boundary],
+        s.len() - boundary
+    )
 }
 
 /// Echo tool - returns the input unchanged
@@ -386,12 +391,16 @@ impl BuiltinTool for HttpGetTool {}
 pub struct ShellExecTool;
 
 impl ShellExecTool {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait::async_trait]
 impl Tool for ShellExecTool {
-    fn name(&self) -> &str { "shell_exec" }
+    fn name(&self) -> &str {
+        "shell_exec"
+    }
 
     fn description(&self) -> &str {
         "Run an external program via argv array (no shell — safe from injection). \
@@ -399,7 +408,9 @@ impl Tool for ShellExecTool {
         running scripts, checking system state, etc."
     }
 
-    fn is_builtin(&self) -> bool { true }
+    fn is_builtin(&self) -> bool {
+        true
+    }
 
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -433,15 +444,19 @@ impl Tool for ShellExecTool {
         let argv = params
             .get("argv")
             .and_then(|v| v.as_array())
-            .ok_or_else(|| SandboxError::InvalidParameters("'argv' must be an array".to_string()))?;
+            .ok_or_else(|| {
+                SandboxError::InvalidParameters("'argv' must be an array".to_string())
+            })?;
 
         if argv.is_empty() {
-            return Err(SandboxError::InvalidParameters("'argv' must not be empty".to_string()));
+            return Err(SandboxError::InvalidParameters(
+                "'argv' must not be empty".to_string(),
+            ));
         }
 
-        let program = argv[0]
-            .as_str()
-            .ok_or_else(|| SandboxError::InvalidParameters("argv[0] must be a string".to_string()))?;
+        let program = argv[0].as_str().ok_or_else(|| {
+            SandboxError::InvalidParameters("argv[0] must be a string".to_string())
+        })?;
 
         let args = argv[1..]
             .iter()
@@ -517,18 +532,24 @@ impl BuiltinTool for ShellExecTool {}
 pub struct FsReadTool;
 
 impl FsReadTool {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait::async_trait]
 impl Tool for FsReadTool {
-    fn name(&self) -> &str { "fs_read" }
+    fn name(&self) -> &str {
+        "fs_read"
+    }
 
     fn description(&self) -> &str {
         "Read the text content of a file. Returns the file's content as a string."
     }
 
-    fn is_builtin(&self) -> bool { true }
+    fn is_builtin(&self) -> bool {
+        true
+    }
 
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -569,18 +590,24 @@ impl BuiltinTool for FsReadTool {}
 pub struct FsWriteTool;
 
 impl FsWriteTool {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait::async_trait]
 impl Tool for FsWriteTool {
-    fn name(&self) -> &str { "fs_write" }
+    fn name(&self) -> &str {
+        "fs_write"
+    }
 
     fn description(&self) -> &str {
         "Write or append text content to a file. Creates the file and parent directories if needed."
     }
 
-    fn is_builtin(&self) -> bool { true }
+    fn is_builtin(&self) -> bool {
+        true
+    }
 
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -626,9 +653,9 @@ impl Tool for FsWriteTool {
         if let Some(parent) = std::path::Path::new(path).parent()
             && !parent.as_os_str().is_empty()
         {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| SandboxError::Io(format!("Failed to create dirs for '{}': {}", path, e)))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                SandboxError::Io(format!("Failed to create dirs for '{}': {}", path, e))
+            })?;
         }
 
         match mode {
@@ -645,9 +672,9 @@ impl Tool for FsWriteTool {
                     .open(path)
                     .await
                     .map_err(|e| SandboxError::Io(format!("Failed to open '{}': {}", path, e)))?;
-                file.write_all(content.as_bytes())
-                    .await
-                    .map_err(|e| SandboxError::Io(format!("Failed to append to '{}': {}", path, e)))?;
+                file.write_all(content.as_bytes()).await.map_err(|e| {
+                    SandboxError::Io(format!("Failed to append to '{}': {}", path, e))
+                })?;
             }
             other => {
                 return Err(SandboxError::InvalidParameters(format!(
@@ -668,18 +695,24 @@ impl BuiltinTool for FsWriteTool {}
 pub struct FsListTool;
 
 impl FsListTool {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 #[async_trait::async_trait]
 impl Tool for FsListTool {
-    fn name(&self) -> &str { "fs_list" }
+    fn name(&self) -> &str {
+        "fs_list"
+    }
 
     fn description(&self) -> &str {
         "List the contents of a directory. Returns filenames and whether each entry is a directory."
     }
 
-    fn is_builtin(&self) -> bool { true }
+    fn is_builtin(&self) -> bool {
+        true
+    }
 
     fn parameters(&self) -> Value {
         serde_json::json!({
@@ -694,10 +727,7 @@ impl Tool for FsListTool {
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         check_no_traversal(path)?;
 
@@ -720,11 +750,7 @@ impl Tool for FsListTool {
                 break;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            let is_dir = entry
-                .file_type()
-                .await
-                .map(|t| t.is_dir())
-                .unwrap_or(false);
+            let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
             entries.push(serde_json::json!({ "name": name, "is_dir": is_dir }));
         }
 
@@ -733,7 +759,10 @@ impl Tool for FsListTool {
             let a_dir = a["is_dir"].as_bool().unwrap_or(false);
             let b_dir = b["is_dir"].as_bool().unwrap_or(false);
             b_dir.cmp(&a_dir).then_with(|| {
-                a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or(""))
+                a["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .cmp(b["name"].as_str().unwrap_or(""))
             })
         });
 
@@ -890,7 +919,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_shell_exec_empty_argv() {
-        let result = ShellExecTool::new().execute(serde_json::json!({"argv": []})).await;
+        let result = ShellExecTool::new()
+            .execute(serde_json::json!({"argv": []}))
+            .await;
         assert!(result.is_err());
     }
 
@@ -924,7 +955,12 @@ mod tests {
             .await
             .unwrap();
         // With env_clear(), no OPENROUTER_API_KEY should leak.
-        assert!(!result["stdout"].as_str().unwrap().contains("OPENROUTER_API_KEY"));
+        assert!(
+            !result["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("OPENROUTER_API_KEY")
+        );
     }
 
     // ── FsReadTool ────────────────────────────────────────────────────────────
