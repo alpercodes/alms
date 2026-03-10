@@ -255,11 +255,9 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
   e) `needs_bootstrap()`: still keyed to absence of `personality.md` — no change needed
 - **Owners:** Atlas
 
-31) Fix agent ID mismatch (UI / server alignment)
-- The web UI generates its own random UUID for the agent and stores it in localStorage.
-- The server has its own AgentId (generated at startup, exposed via `GET /settings` as `agent_id`).
-- These are different — workspace files are keyed to the server ID, so the UI is siloed from them.
-- Fix: UI boot sequence should read `agent_id` from `GET /settings` and use it as the default agent ID instead of generating one. The fix is already half-done — `GET /settings` returns `agent_id`.
+31) Fix agent ID mismatch (UI / server alignment) ✅
+- The web UI was generating random UUIDs for new agents via `crypto.randomUUID()` instead of using the server's configured agent ID.
+- Fix: `newAgent()` now reads `serverDefaults.agent_id` (from `GET /settings`) and falls back to `crypto.randomUUID()` only if unavailable. Boot sequence already used `serverDefaults.agent_id`.
 - **Owners:** Atlas
 
 44) SSE single-subscriber limitation
@@ -276,20 +274,18 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - 3 new integration tests: persist_last_activity, persist_idle_status, delete_from_sqlite.
 - **Owners:** Atlas
 
-32) Clean up dead coordinator scaffolding
-- `AgentMessage` enum, `process_messages()` method, `message_tx`/`message_rx` in Coordinator are unused since the peer-mesh design was rejected.
-- Leaving unused concurrent code in place creates confusion (is it intentionally inactive? a bug?).
-- Delete these; if peer-to-peer messaging is added later it should be designed fresh.
+32) Clean up dead coordinator scaffolding ✅
+- Removed `AgentMessage` enum, `ProgressUpdate` struct, `message_tx`/`message_rx` fields, `message_sender()`/`process_messages()` methods, and fire-and-forget `message_tx.send()` calls from `run_subagent`.
+- The message bus was scaffolding for a peer-mesh design that was rejected; no code consumed the messages.
 - **Owners:** Atlas
 
-33) Fix Span::enter() across .await in coordinator
-- Any `Span::enter()` guard held across an `.await` point is incorrect per tracing docs — can cause wrong span attribution and memory leaks.
-- Audit `run_subagent` in `alms-coordinator/src/lib.rs` for sync span guards held across awaits; replace with `.instrument(span)`.
+33) Fix Span::enter() across .await in coordinator ✅
+- Audited: the coordinator already uses `.instrument(span)` correctly on all spawned tasks. No `Span::enter()` guards are held across `.await` points. No fix needed.
 - **Owners:** Atlas
 
-34) Fix CreateSessionResponse.created always true
-- `create_session` uses `get_or_create` semantics but always returns `"created": true`, even for existing sessions. Misleading for clients.
-- Either track whether the session was newly created and return the correct value, or remove the field.
+34) Fix CreateSessionResponse.created always true ✅
+- `create_session` now checks `has_session()` before `get_or_create()` and returns the correct `created` value.
+- Added `SessionManager::has_session()` method.
 - **Owners:** Atlas
 
 28) invoke_agent tool (agent-to-agent delegation) ✅

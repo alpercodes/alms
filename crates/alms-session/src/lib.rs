@@ -92,6 +92,11 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Check if a session exists for the given (agent_id, context_id) key.
+    pub fn has_session(&self, key: &(AgentId, String)) -> bool {
+        self.sessions.contains_key(key)
+    }
+
     /// Get or create a session
     pub fn get_or_create(&self, agent_id: AgentId, context_id: impl Into<String>) -> Session {
         let context_id = context_id.into();

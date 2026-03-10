@@ -14,7 +14,7 @@ use std::time::Duration;
 /// and also how long its result is kept in memory after completion so that
 /// background callers can poll via `get_task_result`.
 const SUBAGENT_TTL_SECS: u64 = 300;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::{Instrument, debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -109,16 +109,6 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-/// Progress update from a subagent
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgressUpdate {
-    pub task_id: TaskId,
-    pub status: TaskStatus,
-    pub progress_percent: u8,
-    pub message: String,
-    pub partial_result: Option<serde_json::Value>,
-}
-
 /// Final result from a subagent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
@@ -127,23 +117,6 @@ pub struct TaskResult {
     pub result: serde_json::Value,
     pub execution_time_ms: u64,
     pub tokens_used: Option<usize>,
-}
-
-/// Message types for inter-agent communication
-#[derive(Debug)]
-pub enum AgentMessage {
-    /// Spawn a new subagent
-    SpawnSubagent(SubagentRequest, oneshot::Sender<TaskId>),
-    /// Progress update from subagent
-    Progress(ProgressUpdate),
-    /// Task completed
-    Complete(TaskResult),
-    /// Cancel a running task
-    Cancel(TaskId),
-    /// Request subagent to do something
-    Request(TaskId, String),
-    /// Response from subagent
-    Response(TaskId, serde_json::Value),
 }
 
 /// Handle to a running subagent
@@ -174,9 +147,6 @@ pub struct Coordinator {
     main_agent: AgentId,
     /// Active subagents: TaskId -> SubagentHandle
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
-    /// Message bus
-    message_tx: mpsc::UnboundedSender<AgentMessage>,
-    message_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<AgentMessage>>>,
     /// Shared session manager — used to give each subagent its own context
     session_manager: Arc<SessionManager>,
     /// LLM client — cloned for each subagent runtime
@@ -185,12 +155,9 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub fn new(main_agent: AgentId, session_manager: Arc<SessionManager>, llm: LlmClient) -> Self {
-        let (message_tx, message_rx) = mpsc::unbounded_channel();
         Self {
             main_agent,
             subagents: Arc::new(DashMap::new()),
-            message_tx,
-            message_rx: Arc::new(tokio::sync::Mutex::new(message_rx)),
             session_manager,
             llm,
         }
@@ -242,7 +209,6 @@ impl Coordinator {
         );
 
         let subagents = self.subagents.clone();
-        let message_tx = self.message_tx.clone();
         let session_manager = self.session_manager.clone();
         let llm = self.llm.clone();
 
@@ -257,7 +223,6 @@ impl Coordinator {
                     task_id,
                     request,
                     subagents,
-                    message_tx,
                     cancel_rx,
                     result_tx,
                     session_manager,
@@ -311,16 +276,6 @@ impl Coordinator {
             .collect()
     }
 
-    /// Get message sender (for agents to send messages)
-    pub fn message_sender(&self) -> mpsc::UnboundedSender<AgentMessage> {
-        self.message_tx.clone()
-    }
-
-    /// Process incoming messages (call this in a loop)
-    pub async fn process_messages(&self) -> Option<AgentMessage> {
-        let mut rx = self.message_rx.lock().await;
-        rx.recv().await
-    }
 }
 
 #[async_trait]
@@ -454,7 +409,6 @@ async fn run_subagent(
     task_id: TaskId,
     request: SubagentRequest,
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
-    message_tx: mpsc::UnboundedSender<AgentMessage>,
     mut cancel_rx: oneshot::Receiver<()>,
     result_tx: oneshot::Sender<TaskResult>,
     session_manager: Arc<SessionManager>,
@@ -474,17 +428,6 @@ async fn run_subagent(
         subagent_type = ?request.agent_type,
         "Subagent execution started"
     );
-
-    let _ = message_tx.send(AgentMessage::Progress(ProgressUpdate {
-        task_id,
-        status: TaskStatus::Running,
-        progress_percent: 0,
-        message: format!(
-            "Starting {:?} subagent for: {}",
-            request.agent_type, request.task
-        ),
-        partial_result: None,
-    }));
 
     let (new_status, result_value, tokens_used) = tokio::select! {
         _ = tokio::time::sleep(request.timeout) => {
@@ -553,9 +496,7 @@ async fn run_subagent(
     }
 
     // Deliver result to dispatch() caller (foreground mode — may already be dropped)
-    let _ = result_tx.send(task_result.clone());
-    // Also publish on the message bus for any other listeners
-    let _ = message_tx.send(AgentMessage::Complete(task_result));
+    let _ = result_tx.send(task_result);
 
     // Keep the handle long enough for background callers to poll the result.
     tokio::time::sleep(Duration::from_secs(SUBAGENT_TTL_SECS)).await;

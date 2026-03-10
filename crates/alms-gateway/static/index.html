@@ -729,7 +729,7 @@ async function newAgent() {
   if (activeEs) return;
   const name = prompt('Agent name:');
   if (!name || !name.trim()) return;
-  const agentId = crypto.randomUUID();
+  const agentId = serverDefaults.agent_id || crypto.randomUUID();
   const contextId = 'web-chat';
   try {
     const res = await fetch('/sessions', {

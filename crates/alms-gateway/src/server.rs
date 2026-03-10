@@ -311,13 +311,15 @@ async fn create_session(
     State(state): State<AppState>,
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
+    let key = (req.agent_id, req.context_id.clone());
+    let existed = state.session_manager.has_session(&key);
     let session = state
         .session_manager
-        .get_or_create(req.agent_id, req.context_id);
+        .get_or_create(key.0, key.1);
 
     Json(CreateSessionResponse {
         session_id: session.id,
-        created: true,
+        created: !existed,
     })
 }
 
