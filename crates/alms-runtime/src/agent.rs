@@ -40,6 +40,10 @@ pub struct AgentConfig {
     pub context_config: ContextConfig,
     /// Execution posture (full_control or guarded)
     pub posture: Posture,
+    /// Filesystem sandbox root (default "."). Empty string = unrestricted.
+    pub sandbox_root: String,
+    /// Shell execution policy: "sandboxed" or "unrestricted".
+    pub shell_policy: String,
 }
 
 impl Default for AgentConfig {
@@ -51,6 +55,8 @@ impl Default for AgentConfig {
             max_tokens: 4096,
             context_config: ContextConfig::default(),
             posture: Posture::FullControl,
+            sandbox_root: ".".into(),
+            shell_policy: "sandboxed".into(),
         }
     }
 }
@@ -79,11 +85,30 @@ pub struct AgentRuntime {
 impl AgentRuntime {
     /// Create new agent runtime
     pub fn new(agent_id: AgentId, config: AgentConfig, llm: LlmClient) -> Self {
+        // Resolve sandbox root: empty string = unrestricted, otherwise canonicalize.
+        let sandbox_root = if config.sandbox_root.is_empty() {
+            None
+        } else {
+            let path = std::path::PathBuf::from(&config.sandbox_root);
+            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|e| {
+                let fallback = std::env::current_dir().unwrap_or_else(|_| path.clone());
+                warn!(
+                    configured = %path.display(),
+                    fallback = %fallback.display(),
+                    error = %e,
+                    "tools.sandbox_root cannot be resolved, falling back to current directory"
+                );
+                fallback
+            });
+            Some(canonical)
+        };
+        let shell_unrestricted = config.shell_policy == "unrestricted";
+
         Self {
             agent_id,
             config,
             llm,
-            tools: ToolRegistry::with_builtins(),
+            tools: ToolRegistry::with_builtins_sandboxed(sandbox_root, shell_unrestricted),
             workspace: None,
             event_sender: None,
             run_id: None,
@@ -162,7 +187,9 @@ impl AgentRuntime {
         span.record("input_len", input.len());
 
         let session = session_manager.get_or_create(self.agent_id, context_id);
-        let history = self.build_context(session_manager, &session.id, &input).await?;
+        let history = self
+            .build_context(session_manager, &session.id, &input)
+            .await?;
         let (response, usage) = self
             .agent_loop(session_manager, session.id, history)
             .await?;
@@ -248,9 +275,7 @@ impl AgentRuntime {
         // On failure we log a warning and fall back (None summary → truncate behaviour).
         let summary_text: Option<String> =
             if self.config.context_config.strategy == "sliding-summary" {
-                let current = session_manager
-                    .get_summary(*session_id)
-                    .unwrap_or_default();
+                let current = session_manager.get_summary(*session_id).unwrap_or_default();
                 match self
                     .maybe_summarize(session_manager, *session_id, &history, current)
                     .await

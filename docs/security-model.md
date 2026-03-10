@@ -144,26 +144,45 @@ Expose a `shell_exec` tool that is policy-gated.
 
 ### 4.2 Minimal contract for `shell_exec`
 Request fields:
-- `cmd`: array of strings (no shell interpolation), e.g. `["git","status"]`
-- `cwd`: workspace-relative path
-- `timeout_ms`
-- `env`: allowlist keys only
+- `argv`: array of strings (no shell interpolation), e.g. `["git","status"]`
+- `cwd`: workspace-relative path (validated against sandbox_root in sandboxed mode)
+- `timeout_secs`
+- `env`: extra key-value pairs (daemon env is cleared via `env_clear()` — secrets never leak)
 
 Response fields:
 - `exit_code`
-- `stdout` (truncated)
-- `stderr` (truncated)
-- `duration_ms`
+- `stdout` (truncated to 8KB)
+- `stderr` (truncated to 8KB)
 
-### 4.3 Workspace sandboxing
-- Default cwd is workspace
-- Disallow `..` escapes unless explicitly permitted
-- Optional: per-session temp workspace
+### 4.3 Filesystem sandboxing (implemented)
+
+**Config** (`alms.toml` or env vars):
+- `tools.sandbox_root` (default `"."` = cwd) — all `fs_read`/`fs_write`/`fs_list` paths must resolve within this directory after symlink resolution. Set to `""` for unrestricted access.
+- `tools.shell_policy` (default `"sandboxed"`) — controls `shell_exec` cwd restriction:
+  - `"sandboxed"`: cwd forced to `sandbox_root`; explicit `cwd` param validated against it.
+  - `"unrestricted"`: no cwd restriction (power-user / full root access).
+
+**How it works:**
+1. Relative paths are joined to `sandbox_root`, absolute paths are checked directly.
+2. `std::fs::canonicalize()` follows symlinks to get the real path.
+3. The canonical path must `starts_with(sandbox_root)` — rejects symlink escapes, `..` traversal, and absolute paths outside the root.
+4. For new files (fs_write), the nearest existing ancestor is canonicalized and remaining components are appended.
+
+**Known limitation:** `shell_exec` sandboxing only restricts the cwd. The executed command itself (e.g. `cat /etc/passwd`) can still access any file the process user can read. Application-level command denylists are fundamentally bypassable — there are infinite ways to read files or exfiltrate data. True shell isolation requires OS-level mechanisms (see §4.4).
 
 ### 4.4 Isolation roadmap
-- MVP: `Command` + strict limits
-- Next: `bubblewrap`/`nsjail`/containers for the tool process
-- Later: microVMs for high-risk environments
+
+**Current (MVP):** `Command` + argv array (no shell injection) + `env_clear()` + `sandbox_root` path prefix enforcement for fs tools + cwd restriction for shell.
+
+**Next — OS-level isolation:**
+- **Landlock** (Linux 5.13+): kernel LSM that lets an unprivileged process restrict its own filesystem access before exec. The `landlock` crate makes this ~30 lines of Rust. Would make `shell_exec` truly sandboxed on Linux. No root required. Cross-platform story: Linux-only; Windows/macOS need alternative approaches.
+- **Restricted OS user**: run the daemon (or just tool execution) as a low-privilege OS user with filesystem ACLs limiting access to the workspace. Battle-tested, simple, works on all platforms. Requires deployment-time setup (create user, set permissions).
+- **`bubblewrap`/`nsjail`**: lightweight containers — new mount namespace with only the workspace visible. Linux-only, external dependency.
+
+**Later:**
+- Per-session temp workspaces (ephemeral sandboxes)
+- MicroVMs for high-risk environments
+- Platform-specific alternatives: Windows Job Objects, macOS Sandbox profiles
 
 ---
 
@@ -239,12 +258,14 @@ Suggested table/event fields:
 ## 9) Secure defaults (v1)
 
 Default posture recommendations:
-- Workspace-only file access
-- No `sudo`
-- Network allowlist empty by default (or OpenAI/OpenRouter only)
-- Cronjob creation requires approval
-- Shell commands must be argv array, not raw shell
-- Strict output truncation
+- Workspace-only file access — **implemented**: `sandbox_root = "."` confines fs tools to cwd
+- Shell commands use argv array, not raw shell — **implemented**: `shell_exec` uses `Command::new()` with args, no shell interpolation
+- Shell env cleared — **implemented**: `env_clear()` prevents secret leakage to child processes
+- Shell cwd restricted — **implemented**: `shell_policy = "sandboxed"` restricts cwd to sandbox_root
+- Strict output truncation — **implemented**: 8KB stdout/stderr cap, 32KB fs_read cap, UTF-8 safe truncation
+- No `sudo` — not yet enforced (command denylist not implemented; use OS-level restrictions)
+- Network allowlist empty by default — not yet implemented
+- Cronjob creation requires approval — implemented via Guarded posture
 
 ---
 
@@ -253,19 +274,25 @@ Default posture recommendations:
 P0 (before public use):
 - [ ] Single capability model, used everywhere
 - [ ] Tool registry enforces capability checks
-- [ ] Shell tool uses argv (no `bash -lc` by default)
-- [ ] Audit log for tool runs + job runs
+- [x] Shell tool uses argv (no `bash -lc` by default) — `shell_exec` uses `Command::new()` + args
+- [x] Audit log for tool runs + job runs — SQLite-backed audit events
 - [ ] Job principal + capability scoping
-- [ ] Output truncation + sanitization
+- [x] Output truncation + sanitization — safe UTF-8 truncation on all tool outputs
+- [x] Filesystem sandbox — `canonicalize()` + prefix check, configurable `sandbox_root`
+- [x] Shell env isolation — `env_clear()` prevents secret leakage
+- [x] Shell cwd restriction — sandboxed mode restricts cwd to `sandbox_root`
 
 P1:
-- [ ] Container/jail execution for shell tools
+- [ ] Landlock integration (Linux) — kernel-level filesystem restriction for `shell_exec`
+- [ ] Restricted OS user deployment guide — document setup for sandboxed daemon user
+- [ ] Container/jail execution for shell tools (`bubblewrap`/`nsjail`)
 - [ ] Secrets store + redaction
 - [ ] Per-domain network allowlists
 
 P2:
 - [ ] MicroVM execution for high-risk tools
 - [ ] Signed tool/plugin bundles
+- [ ] Platform-specific sandboxing (Windows Job Objects, macOS Sandbox profiles)
 
 ---
 

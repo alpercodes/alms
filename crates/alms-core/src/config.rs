@@ -126,6 +126,14 @@ impl AlmsConfig {
             self.channels.telegram_token = Some(token);
         }
 
+        // Tools / sandbox settings
+        if let Ok(val) = std::env::var("ALMS_SANDBOX_ROOT") {
+            self.tools.sandbox_root = val;
+        }
+        if let Ok(val) = std::env::var("ALMS_SHELL_POLICY") {
+            self.tools.shell_policy = val;
+        }
+
         // Context settings
         if let Ok(val) = std::env::var("ALMS_CONTEXT_STRATEGY") {
             self.context.strategy = val;
@@ -178,6 +186,14 @@ impl AlmsConfig {
             return Err(AlmsError::InvalidConfig(
                 "tools.timeout_secs must be > 0".into(),
             ));
+        }
+
+        let valid_policies = ["sandboxed", "unrestricted"];
+        if !valid_policies.contains(&self.tools.shell_policy.as_str()) {
+            return Err(AlmsError::InvalidConfig(format!(
+                "tools.shell_policy must be one of {:?}, got '{}'",
+                valid_policies, self.tools.shell_policy
+            )));
         }
 
         Ok(())
@@ -296,6 +312,16 @@ pub struct ToolsConfig {
     pub enabled: Vec<String>,
     pub timeout_secs: u64,
     pub max_output_bytes: usize,
+    /// Filesystem sandbox root. Relative paths are resolved from cwd.
+    /// Default: "." (current directory — safe by default).
+    /// Set to "" for unrestricted filesystem access.
+    pub sandbox_root: String,
+    /// Shell execution policy: "sandboxed" (default) or "unrestricted".
+    /// In sandboxed mode, shell_exec cwd is restricted to sandbox_root.
+    /// Note: sandboxed mode restricts cwd but cannot prevent the executed
+    /// command from accessing files outside the sandbox. For true shell
+    /// isolation, use a restricted OS user or Landlock (see security-model.md §4.4).
+    pub shell_policy: String,
 }
 
 impl Default for ToolsConfig {
@@ -304,6 +330,8 @@ impl Default for ToolsConfig {
             enabled: vec!["echo".into(), "math".into(), "http_get".into()],
             timeout_secs: 30,
             max_output_bytes: 65536,
+            sandbox_root: ".".into(),
+            shell_policy: "sandboxed".into(),
         }
     }
 }

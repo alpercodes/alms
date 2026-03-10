@@ -151,6 +151,8 @@ pub struct Coordinator {
     session_manager: Arc<SessionManager>,
     /// LLM client — cloned for each subagent runtime
     llm: LlmClient,
+    /// Base agent config — subagents inherit sandbox settings from this
+    base_agent_config: AgentConfig,
 }
 
 impl Coordinator {
@@ -160,6 +162,23 @@ impl Coordinator {
             subagents: Arc::new(DashMap::new()),
             session_manager,
             llm,
+            base_agent_config: AgentConfig::default(),
+        }
+    }
+
+    /// Create a coordinator that inherits sandbox settings from the given config.
+    pub fn with_agent_config(
+        main_agent: AgentId,
+        session_manager: Arc<SessionManager>,
+        llm: LlmClient,
+        base_agent_config: AgentConfig,
+    ) -> Self {
+        Self {
+            main_agent,
+            subagents: Arc::new(DashMap::new()),
+            session_manager,
+            llm,
+            base_agent_config,
         }
     }
 
@@ -211,6 +230,7 @@ impl Coordinator {
         let subagents = self.subagents.clone();
         let session_manager = self.session_manager.clone();
         let llm = self.llm.clone();
+        let base_agent_config = self.base_agent_config.clone();
 
         let span = tracing::info_span!(
             "subagent::execute",
@@ -228,6 +248,7 @@ impl Coordinator {
                     session_manager,
                     llm,
                     parent_event_tx,
+                    base_agent_config,
                 )
                 .await;
             }
@@ -413,6 +434,7 @@ async fn run_subagent(
     session_manager: Arc<SessionManager>,
     llm: LlmClient,
     parent_event_tx: Option<RuntimeEventSender>,
+    base_agent_config: AgentConfig,
 ) {
     let start = std::time::Instant::now();
 
@@ -446,7 +468,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None)
         }
-        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx) => {
+        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -504,9 +526,11 @@ async fn run_subagent(
 }
 
 /// Build an `AgentConfig` appropriate for the given subagent type.
+/// Inherits sandbox settings from `base` so subagents respect the same policy.
 fn agent_config_for_type(
     agent_type: SubagentType,
     system_prompt_override: Option<String>,
+    base: &AgentConfig,
 ) -> AgentConfig {
     let default_prompt = match agent_type {
         SubagentType::Research => {
@@ -536,6 +560,8 @@ fn agent_config_for_type(
     };
     AgentConfig {
         system_prompt: system_prompt_override.unwrap_or_else(|| default_prompt.to_string()),
+        sandbox_root: base.sandbox_root.clone(),
+        shell_policy: base.shell_policy.clone(),
         ..AgentConfig::default()
     }
 }
@@ -550,9 +576,14 @@ async fn run_agent_loop(
     session_manager: &Arc<SessionManager>,
     llm: &LlmClient,
     parent_event_tx: Option<RuntimeEventSender>,
+    base_agent_config: &AgentConfig,
 ) -> AlmsResult<RunOutput> {
     let agent_id = AgentId::new();
-    let config = agent_config_for_type(request.agent_type, request.system_prompt.clone());
+    let config = agent_config_for_type(
+        request.agent_type,
+        request.system_prompt.clone(),
+        base_agent_config,
+    );
 
     // Create a per-subagent event channel
     let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
@@ -586,9 +617,7 @@ mod tests {
 
     /// Build a Coordinator wired to the mock LLM and an in-memory SessionManager.
     fn test_coordinator() -> Coordinator {
-        let session_manager = Arc::new(SessionManager::new(
-            alms_session::SessionConfig::default(),
-        ));
+        let session_manager = Arc::new(SessionManager::new(alms_session::SessionConfig::default()));
         let llm_config = LlmConfig {
             mock: true,
             ..LlmConfig::default()
@@ -607,13 +636,7 @@ mod tests {
     async fn test_dispatch_foreground_success() {
         let coord = test_coordinator();
         let result = coord
-            .dispatch(
-                "Say hello".to_string(),
-                None,
-                test_session_id(),
-                None,
-                None,
-            )
+            .dispatch("Say hello".to_string(), None, test_session_id(), None, None)
             .await;
 
         let response = result.expect("dispatch should succeed");
@@ -644,7 +667,10 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_ok(), "dispatch with system prompt should not error");
+        assert!(
+            result.is_ok(),
+            "dispatch with system prompt should not error"
+        );
     }
 
     // -- (c) dispatch_background + poll_task lifecycle --------------------------
@@ -745,8 +771,7 @@ mod tests {
 
         let task_result = result_rx.await.expect("should receive result");
         assert!(
-            task_result.status == TaskStatus::Failed
-                || task_result.status == TaskStatus::Completed,
+            task_result.status == TaskStatus::Failed || task_result.status == TaskStatus::Completed,
             "Expected Failed or Completed, got: {:?}",
             task_result.status
         );

@@ -92,7 +92,7 @@ impl AgentWorkspace {
         }
     }
 
-    /// Write a workspace file. Only goals.md and memories.md are agent-writable.
+    /// Write a workspace file. Checks `agent_writable()` before writing.
     pub fn write_file(&self, file: WorkspaceFile, content: &str) -> AlmsResult<()> {
         if !file.agent_writable() {
             return Err(AlmsError::InvalidConfig(format!(

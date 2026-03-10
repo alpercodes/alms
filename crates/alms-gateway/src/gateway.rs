@@ -68,6 +68,8 @@ impl GatewayConfig {
             llm_config: config.llm.clone().into(),
             agent_config: AgentConfig {
                 context_config: config.context.clone(),
+                sandbox_root: config.tools.sandbox_root.clone(),
+                shell_policy: config.tools.shell_policy.clone(),
                 ..AgentConfig::default()
             },
             session_config: SessionConfig::default(),
@@ -138,11 +140,7 @@ fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
     // 3. Generate new and persist
     let agent_id = AgentId::new();
     if let Err(e) = std::fs::write(&id_file, agent_id.0.to_string()) {
-        warn!(
-            "Failed to persist agent_id to {}: {}",
-            id_file.display(),
-            e
-        );
+        warn!("Failed to persist agent_id to {}: {}", id_file.display(), e);
     } else {
         info!("Generated and persisted new agent ID: {}", agent_id.0);
     }

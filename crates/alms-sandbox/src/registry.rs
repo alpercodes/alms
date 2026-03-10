@@ -143,15 +143,31 @@ impl ToolRegistry {
         self.default_config = config;
     }
 
-    /// Create a registry with all built-in tools registered
+    /// Create a registry with all built-in tools registered (unrestricted).
     pub fn with_builtin_tools() -> Self {
+        Self::with_builtin_tools_sandboxed(None, false)
+    }
+
+    /// Create a registry with all built-in tools registered and optional sandbox.
+    ///
+    /// `sandbox_root` — when `Some`, fs tools and shell cwd are restricted to
+    /// this directory (canonicalized). When `None`, no path restriction.
+    /// `shell_unrestricted` — when `true`, shell_exec ignores sandbox_root for cwd.
+    pub fn with_builtin_tools_sandboxed(
+        sandbox_root: Option<std::path::PathBuf>,
+        shell_unrestricted: bool,
+    ) -> Self {
         let registry = Self::new();
-        registry.register_builtin_tools();
+        registry.register_builtin_tools_sandboxed(sandbox_root, shell_unrestricted);
         registry
     }
 
-    /// Register all built-in tools
-    pub fn register_builtin_tools(&self) {
+    /// Register all built-in tools with optional sandbox configuration.
+    pub fn register_builtin_tools_sandboxed(
+        &self,
+        sandbox_root: Option<std::path::PathBuf>,
+        shell_unrestricted: bool,
+    ) {
         use crate::builtin::{
             EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool, ShellExecTool,
         };
@@ -172,18 +188,27 @@ impl ToolRegistry {
         }
 
         // Register shell_exec tool
-        if let Err(e) = self.register(Arc::new(ShellExecTool::new())) {
+        let shell_tool = ShellExecTool::with_policy(sandbox_root.clone(), shell_unrestricted);
+        if let Err(e) = self.register(Arc::new(shell_tool)) {
             error!("Failed to register shell_exec tool: {}", e);
         }
 
         // Register filesystem tools
-        if let Err(e) = self.register(Arc::new(FsReadTool::new())) {
+        let (fs_read, fs_write, fs_list) = match sandbox_root {
+            Some(ref root) => (
+                FsReadTool::sandboxed(root.clone()),
+                FsWriteTool::sandboxed(root.clone()),
+                FsListTool::sandboxed(root.clone()),
+            ),
+            None => (FsReadTool::new(), FsWriteTool::new(), FsListTool::new()),
+        };
+        if let Err(e) = self.register(Arc::new(fs_read)) {
             error!("Failed to register fs_read tool: {}", e);
         }
-        if let Err(e) = self.register(Arc::new(FsWriteTool::new())) {
+        if let Err(e) = self.register(Arc::new(fs_write)) {
             error!("Failed to register fs_write tool: {}", e);
         }
-        if let Err(e) = self.register(Arc::new(FsListTool::new())) {
+        if let Err(e) = self.register(Arc::new(fs_list)) {
             error!("Failed to register fs_list tool: {}", e);
         }
 

@@ -23,10 +23,23 @@ impl ToolRegistry {
         }
     }
 
-    /// Create registry with sandbox built-in tools
+    /// Create registry with sandbox built-in tools (unrestricted).
     pub fn with_builtins() -> Self {
         Self {
             registry: SandboxRegistry::with_builtin_tools(),
+        }
+    }
+
+    /// Create registry with sandbox-aware built-in tools.
+    pub fn with_builtins_sandboxed(
+        sandbox_root: Option<std::path::PathBuf>,
+        shell_unrestricted: bool,
+    ) -> Self {
+        Self {
+            registry: SandboxRegistry::with_builtin_tools_sandboxed(
+                sandbox_root,
+                shell_unrestricted,
+            ),
         }
     }
 

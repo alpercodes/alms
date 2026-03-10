@@ -18,6 +18,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-09:** Fix #45 (MEDIUM): session `last_activity` and `status` now write-through to SQLite on every `append_message()` and `archive_idle()`. `delete()` cascades to SQLite (messages, audit, summaries, session row). `SessionManager::with_store()` constructor for test injection.
 - **2026-03-10:** Graceful shutdown (#43): CancellationToken-based shutdown. 6-phase sequence: stop HTTP → stop scheduler → abort fire loop → stop channel adapters → drain in-flight runs (30s timeout) → flush SQLite WAL. New runs rejected with 503 during shutdown.
 - **2026-03-10:** Quick fixes (#31, #32, #33, #34): CreateSessionResponse.created now correct, dead coordinator message bus removed, Span::enter confirmed correct, UI agent ID aligned with server. Coordinator integration tests (#30): 8 tests covering dispatch, background lifecycle, cancel, timeout, poll.
+- **2026-03-10:** Symlink bypass hardening (#25): `check_no_traversal()` replaced with `check_sandbox_path()` using `canonicalize()` + prefix check. New config: `tools.sandbox_root` (default "." = safe), `tools.shell_policy` ("sandboxed"/"unrestricted"). 7 new sandbox tests (165 total).
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -227,10 +228,12 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ## P6 — Quality of life
 
-25) Symlink bypass hardening for fs tools
-- check_no_traversal() rejects .. components but a symlink (e.g. ln -s /etc ./safe-link) bypasses it.
-- Use std::fs::canonicalize() to resolve the real path, then check it is within an allowed root.
-- Requires a configurable workspace root in GatewayConfig / alms.toml.
+25) ~~Symlink bypass hardening for fs tools~~ ✅ DONE (2026-03-10)
+- Replaced `check_no_traversal()` with `check_sandbox_path()` using `canonicalize()` + prefix check.
+- New config: `tools.sandbox_root` (default ".") and `tools.shell_policy` ("sandboxed"/"unrestricted").
+- Safe by default — fs tools sandboxed to cwd, shell_exec cwd restricted to sandbox_root.
+- Set `sandbox_root = ""` or `shell_policy = "unrestricted"` for full access.
+- Future: Landlock (Linux) or restricted OS user for true shell isolation (see security-model.md §4.4).
 - **Owners:** Atlas
 
 26) Context window visibility in UI

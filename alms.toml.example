@@ -52,6 +52,19 @@ enabled = ["echo", "math", "http_get"]
 timeout_secs = 30
 # max output size from a tool (bytes)
 max_output_bytes = 65536
+# Filesystem sandbox root — fs_read/fs_write/fs_list paths must resolve within
+# this directory. Default: "." (safe — restricts to current working directory).
+# Set to "" for unrestricted filesystem access.
+# Override with: ALMS_SANDBOX_ROOT=/custom/path
+sandbox_root = "."
+# Shell execution policy: "sandboxed" (default) or "unrestricted".
+# "sandboxed" — shell_exec cwd is restricted to sandbox_root.
+# "unrestricted" — no cwd restriction (power-user / full root access).
+# Note: sandboxed mode restricts cwd but cannot prevent the command itself
+# from accessing files outside the sandbox. For true shell isolation, use
+# a restricted OS user or Landlock (see docs/security-model.md §4.4).
+# Override with: ALMS_SHELL_POLICY=unrestricted
+shell_policy = "sandboxed"
 
 # Telegram channel (optional)
 # Set token via: export TELEGRAM_BOT_TOKEN=...

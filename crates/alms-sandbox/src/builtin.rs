@@ -1,21 +1,54 @@
 use crate::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 /// Built-in tool trait marker
 pub trait BuiltinTool: Tool {}
 
-/// Reject paths that contain `..` components to prevent directory traversal.
-fn check_no_traversal(path: &str) -> SandboxResult<()> {
-    let p = std::path::Path::new(path);
-    for component in p.components() {
-        if component == std::path::Component::ParentDir {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Path traversal not allowed: '{}'",
-                path
-            )));
-        }
+/// Resolve a path and verify it falls within the sandbox root.
+///
+/// Relative paths are joined to `sandbox_root`. Absolute paths are checked
+/// directly. Symlinks are followed via `canonicalize()` to prevent escapes.
+/// For non-existent paths (e.g. fs_write targets) the nearest existing
+/// ancestor is canonicalized and the remaining components are appended.
+/// Returns the resolved path on success so callers can use it for I/O
+/// (avoids re-resolving relative paths against a different base).
+fn check_sandbox_path(path: &str, sandbox_root: &Path) -> SandboxResult<PathBuf> {
+    let p = Path::new(path);
+
+    // Resolve: relative paths join to sandbox_root, absolute stay as-is
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        sandbox_root.join(p)
+    };
+
+    // Canonicalize to follow symlinks. Walk up for non-existent paths.
+    let canonical = canonicalize_best_effort(&resolved)
+        .map_err(|e| SandboxError::SandboxViolation(format!("Cannot resolve '{}': {}", path, e)))?;
+
+    if !canonical.starts_with(sandbox_root) {
+        return Err(SandboxError::SandboxViolation(format!(
+            "Path '{}' is outside sandbox root",
+            path
+        )));
     }
-    Ok(())
+
+    Ok(resolved)
+}
+
+/// Canonicalize a path, walking up to the nearest existing ancestor if the
+/// full path does not yet exist (handles fs_write for new files/dirs).
+fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path);
+    }
+    if let Some(parent) = path.parent() {
+        let canonical_parent = canonicalize_best_effort(parent)?;
+        Ok(canonical_parent.join(path.file_name().unwrap_or_default()))
+    } else {
+        Ok(path.to_path_buf())
+    }
 }
 
 /// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
@@ -387,12 +420,43 @@ impl BuiltinTool for HttpGetTool {}
 ///   cwd      : string?         — working directory (default: current dir)
 ///   env      : {string: string}? — extra environment variables
 ///   timeout_secs : number?    — max wait time in seconds (default: 30, max: 120)
-#[derive(Debug, Clone, Default)]
-pub struct ShellExecTool;
+#[derive(Debug, Clone)]
+pub struct ShellExecTool {
+    /// When Some, cwd is validated against this root in sandboxed mode.
+    sandbox_root: Option<PathBuf>,
+    /// When true, no cwd restriction is applied (power-user mode).
+    unrestricted: bool,
+}
+
+impl Default for ShellExecTool {
+    fn default() -> Self {
+        Self {
+            sandbox_root: None,
+            unrestricted: true,
+        }
+    }
+}
 
 impl ShellExecTool {
+    /// Create an unrestricted shell_exec tool.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Create a sandboxed shell_exec tool. The cwd is restricted to `root`.
+    pub fn sandboxed(root: PathBuf) -> Self {
+        Self {
+            sandbox_root: Some(root),
+            unrestricted: false,
+        }
+    }
+
+    /// Create with explicit policy.
+    pub fn with_policy(sandbox_root: Option<PathBuf>, unrestricted: bool) -> Self {
+        Self {
+            sandbox_root,
+            unrestricted,
+        }
     }
 }
 
@@ -481,7 +545,17 @@ impl Tool for ShellExecTool {
         cmd.kill_on_drop(true);
 
         if let Some(cwd) = params.get("cwd").and_then(|v| v.as_str()) {
+            if !self.unrestricted
+                && let Some(ref root) = self.sandbox_root
+            {
+                check_sandbox_path(cwd, root)?;
+            }
             cmd.current_dir(cwd);
+        } else if !self.unrestricted
+            && let Some(ref root) = self.sandbox_root
+        {
+            // In sandboxed mode, default cwd to the sandbox root
+            cmd.current_dir(root);
         }
 
         // Clear the daemon's environment (which holds API keys, tokens, etc.)
@@ -529,11 +603,21 @@ impl BuiltinTool for ShellExecTool {}
 
 /// Read a file from the filesystem.
 #[derive(Debug, Clone, Default)]
-pub struct FsReadTool;
+pub struct FsReadTool {
+    sandbox_root: Option<PathBuf>,
+}
 
 impl FsReadTool {
+    /// Create an unrestricted fs_read tool (no sandbox check).
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Create a sandboxed fs_read tool. Paths must resolve within `root`.
+    pub fn sandboxed(root: PathBuf) -> Self {
+        Self {
+            sandbox_root: Some(root),
+        }
     }
 }
 
@@ -570,9 +654,13 @@ impl Tool for FsReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
-        check_no_traversal(path)?;
+        let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
+            check_sandbox_path(path, root)?
+        } else {
+            PathBuf::from(path)
+        };
 
-        let content = tokio::fs::read_to_string(path)
+        let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
 
@@ -587,11 +675,19 @@ impl BuiltinTool for FsReadTool {}
 
 /// Write (or append to) a file on the filesystem.
 #[derive(Debug, Clone, Default)]
-pub struct FsWriteTool;
+pub struct FsWriteTool {
+    sandbox_root: Option<PathBuf>,
+}
 
 impl FsWriteTool {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn sandboxed(root: PathBuf) -> Self {
+        Self {
+            sandbox_root: Some(root),
+        }
     }
 }
 
@@ -637,7 +733,11 @@ impl Tool for FsWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
-        check_no_traversal(path)?;
+        let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
+            check_sandbox_path(path, root)?
+        } else {
+            PathBuf::from(path)
+        };
 
         let content = params
             .get("content")
@@ -650,7 +750,7 @@ impl Tool for FsWriteTool {
             .unwrap_or("write");
 
         // Create parent directories if needed.
-        if let Some(parent) = std::path::Path::new(path).parent()
+        if let Some(parent) = resolved.parent()
             && !parent.as_os_str().is_empty()
         {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -660,7 +760,7 @@ impl Tool for FsWriteTool {
 
         match mode {
             "write" => {
-                tokio::fs::write(path, content)
+                tokio::fs::write(&resolved, content)
                     .await
                     .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", path, e)))?;
             }
@@ -669,7 +769,7 @@ impl Tool for FsWriteTool {
                 let mut file = tokio::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
-                    .open(path)
+                    .open(&resolved)
                     .await
                     .map_err(|e| SandboxError::Io(format!("Failed to open '{}': {}", path, e)))?;
                 file.write_all(content.as_bytes()).await.map_err(|e| {
@@ -692,11 +792,19 @@ impl BuiltinTool for FsWriteTool {}
 
 /// List directory contents.
 #[derive(Debug, Clone, Default)]
-pub struct FsListTool;
+pub struct FsListTool {
+    sandbox_root: Option<PathBuf>,
+}
 
 impl FsListTool {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn sandboxed(root: PathBuf) -> Self {
+        Self {
+            sandbox_root: Some(root),
+        }
     }
 }
 
@@ -729,9 +837,13 @@ impl Tool for FsListTool {
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
         let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        check_no_traversal(path)?;
+        let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
+            check_sandbox_path(path, root)?
+        } else {
+            PathBuf::from(path)
+        };
 
-        let mut read_dir = tokio::fs::read_dir(path)
+        let mut read_dir = tokio::fs::read_dir(&resolved)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to list '{}': {}", path, e)))?;
 
@@ -892,21 +1004,55 @@ mod tests {
         assert!(result.contains("truncated"));
     }
 
-    // ── check_no_traversal ────────────────────────────────────────────────────
+    // ── check_sandbox_path ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_traversal_rejected() {
-        assert!(check_no_traversal("../etc/passwd").is_err());
-        assert!(check_no_traversal("foo/../../secret").is_err());
-        assert!(check_no_traversal("..").is_err());
+    fn test_sandbox_relative_inside_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // Create a file so canonicalize succeeds
+        std::fs::write(root.join("data.txt"), "").unwrap();
+        assert!(check_sandbox_path("data.txt", &root).is_ok());
     }
 
     #[test]
-    fn test_traversal_allowed() {
-        assert!(check_no_traversal("data/logs/app.log").is_ok());
-        assert!(check_no_traversal("/absolute/path").is_ok());
-        assert!(check_no_traversal("relative").is_ok());
-        assert!(check_no_traversal(".").is_ok());
+    fn test_sandbox_traversal_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(check_sandbox_path("../etc/passwd", &root).is_err());
+        assert!(check_sandbox_path("foo/../../secret", &root).is_err());
+    }
+
+    #[test]
+    fn test_sandbox_absolute_outside_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // An absolute path outside the sandbox root should be rejected
+        #[cfg(unix)]
+        assert!(check_sandbox_path("/etc/passwd", &root).is_err());
+        #[cfg(windows)]
+        assert!(check_sandbox_path("C:\\Windows\\System32", &root).is_err());
+    }
+
+    #[test]
+    fn test_sandbox_new_file_allowed() {
+        // Writing a new file inside sandbox root should work even though
+        // the file doesn't exist yet — canonicalize_best_effort walks up.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(check_sandbox_path("new_file.txt", &root).is_ok());
+        assert!(check_sandbox_path("subdir/new_file.txt", &root).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_sandbox_symlink_escape_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // Create a symlink inside sandbox pointing outside
+        let link_path = root.join("escape");
+        std::os::unix::fs::symlink("/etc", &link_path).unwrap();
+        assert!(check_sandbox_path("escape/passwd", &root).is_err());
     }
 
     // ── ShellExecTool ─────────────────────────────────────────────────────────
@@ -963,15 +1109,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_sandboxed_cwd_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = ShellExecTool::sandboxed(root);
+        let result = tool
+            .execute(serde_json::json!({"argv": ["ls"], "cwd": "/etc"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("outside sandbox"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_sandboxed_default_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        // Create a marker file so we can verify cwd
+        std::fs::write(root.join("marker.txt"), "found").unwrap();
+        let tool = ShellExecTool::sandboxed(root);
+        let result = tool
+            .execute(serde_json::json!({"argv": ["cat", "marker.txt"]}))
+            .await
+            .unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert!(result["stdout"].as_str().unwrap().contains("found"));
+    }
+
     // ── FsReadTool ────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_fs_read_traversal_rejected() {
-        let result = FsReadTool::new()
+    async fn test_fs_read_sandbox_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = FsReadTool::sandboxed(root);
+        let result = tool
             .execute(serde_json::json!({"path": "../../../etc/passwd"}))
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("traversal"));
+        assert!(result.unwrap_err().to_string().contains("outside sandbox"));
     }
 
     #[tokio::test]
@@ -991,12 +1169,15 @@ mod tests {
     // ── FsWriteTool ───────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_fs_write_traversal_rejected() {
-        let result = FsWriteTool::new()
+    async fn test_fs_write_sandbox_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = FsWriteTool::sandboxed(root);
+        let result = tool
             .execute(serde_json::json!({"path": "../../evil.sh", "content": "rm -rf /"}))
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("traversal"));
+        assert!(result.unwrap_err().to_string().contains("outside sandbox"));
     }
 
     #[tokio::test]
@@ -1054,10 +1235,11 @@ mod tests {
     // ── FsListTool ────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_fs_list_traversal_rejected() {
-        let result = FsListTool::new()
-            .execute(serde_json::json!({"path": "../../"}))
-            .await;
+    async fn test_fs_list_sandbox_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = FsListTool::sandboxed(root);
+        let result = tool.execute(serde_json::json!({"path": "../../"})).await;
         assert!(result.is_err());
     }
 

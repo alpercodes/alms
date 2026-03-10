@@ -71,7 +71,7 @@ Unified config in `alms-core/src/config.rs` (`AlmsConfig`):
 - **Layered precedence**: compiled defaults → `alms.toml` config file → env var overrides
 - **Secrets** (API keys, tokens) are ONLY loaded from env vars, never from config files (`#[serde(skip)]`)
 - See `alms.toml.example` for all options with documentation
-- Key env vars: `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `ALMS_LLM_MOCK=1`, `DEFAULT_MODEL`, `LLM_BASE_URL`, `ALMS_AGENT_ID`, `ALMS_AUTH_TOKEN`
+- Key env vars: `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `ALMS_LLM_MOCK=1`, `DEFAULT_MODEL`, `LLM_BASE_URL`, `ALMS_AGENT_ID`, `ALMS_AUTH_TOKEN`, `ALMS_SANDBOX_ROOT`, `ALMS_SHELL_POLICY`
 - `GatewayConfig::from_env()` uses `AlmsConfig::load()` internally — single source of truth
 - **Agent ID persistence**: the default agent UUID is stored in `./data/agent_id` (plain-text sidecar file). Precedence: `ALMS_AGENT_ID` env var > sidecar file > generate new. To reconnect existing data after a migration: `echo "<uuid>" > ./data/agent_id`
 
@@ -124,7 +124,7 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 ## Known Issues
 
 - 4 sandbox/wasmtime tests fail with "must use async instantiation when async support is enabled" — pre-existing wasmtime config issue
-- `shell_exec` / `fs_*` tools have no path-prefix or command allowlist beyond `..` traversal rejection — treat these as power-user features; use `Guarded` posture in shared environments
+- `fs_*` tools are sandboxed via `canonicalize()` + prefix check against `tools.sandbox_root` (default: cwd). `shell_exec` cwd is restricted in sandboxed mode, but the executed command itself can still access files outside the sandbox — for true shell isolation, use a restricted OS user or Landlock (future task)
 - Guarded posture + parallel tool calls: when the LLM issues multiple tool calls in one response, all approval requests fire simultaneously (join_all) rather than sequentially
 
 ## Current State (as of 2026-03-10)

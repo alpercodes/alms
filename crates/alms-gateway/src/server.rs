@@ -3,6 +3,7 @@
 //! Provides REST API endpoints per docs/api.md specification.
 
 use crate::approvals::{ApprovalStore, list_approvals, resolve_approval};
+use crate::auth::{AuthToken, require_auth};
 use crate::cron_utils;
 use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
@@ -21,13 +22,13 @@ use alms_runtime::Scheduler;
 use alms_session::{Content, Role};
 use alms_session::{JobStore, SessionManager};
 use axum::{
-    Extension, Json, Router, middleware,
+    Extension, Json, Router,
     extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::{get, post},
 };
-use crate::auth::{AuthToken, require_auth};
 use dashmap::DashMap;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -213,7 +214,12 @@ impl AppState {
             }
             None => Arc::new(JobStore::new()),
         };
-        let coordinator = Arc::new(Coordinator::new(agent_id, session_manager.clone(), llm));
+        let coordinator = Arc::new(Coordinator::with_agent_config(
+            agent_id,
+            session_manager.clone(),
+            llm,
+            gateway.agent_config().clone(),
+        ));
         Ok(Self {
             session_manager,
             gateway: Arc::new(tokio::sync::Mutex::new(gateway)),
@@ -300,9 +306,8 @@ async fn health_check() -> impl IntoResponse {
 /// scheduler (job_*) — these are implementation details not shown in the UI.
 async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
     let mut sessions = state.session_manager.list_all();
-    sessions.retain(|s| {
-        !s.context_id.starts_with("subagent_") && !s.context_id.starts_with("job_")
-    });
+    sessions
+        .retain(|s| !s.context_id.starts_with("subagent_") && !s.context_id.starts_with("job_"));
     Json(serde_json::json!({ "sessions": sessions }))
 }
 
@@ -313,9 +318,7 @@ async fn create_session(
 ) -> impl IntoResponse {
     let key = (req.agent_id, req.context_id.clone());
     let existed = state.session_manager.has_session(&key);
-    let session = state
-        .session_manager
-        .get_or_create(key.0, key.1);
+    let session = state.session_manager.get_or_create(key.0, key.1);
 
     Json(CreateSessionResponse {
         session_id: session.id,
@@ -581,9 +584,7 @@ async fn shutdown_signal(token: CancellationToken) {
 
     #[cfg(not(unix))]
     {
-        ctrl_c
-            .await
-            .expect("failed to install Ctrl+C handler");
+        ctrl_c.await.expect("failed to install Ctrl+C handler");
         info!("Received Ctrl+C, initiating graceful shutdown");
     }
 
