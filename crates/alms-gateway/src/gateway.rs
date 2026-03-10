@@ -279,6 +279,57 @@ impl Gateway {
         Ok(())
     }
 
+    /// Run the message processing loop until the shutdown token is cancelled.
+    ///
+    /// This variant is used by `serve_with_gateway()` so the message loop
+    /// exits cooperatively without requiring an external mutex lock.
+    pub async fn run_until_shutdown(
+        &mut self,
+        token: tokio_util::sync::CancellationToken,
+    ) -> AlmsResult<()> {
+        info!("Starting message processing loop (shutdown-aware)");
+
+        let mut telegram_rx: Option<mpsc::Receiver<alms_channel::IncomingMessage>> = None;
+        if let Some(ref telegram) = self.channels.telegram {
+            telegram_rx = Some(telegram.receive_updates().await?);
+        }
+
+        let runtime = AgentRuntime::new(
+            self.agent_id,
+            self.config.agent_config.clone(),
+            self.llm.clone(),
+        );
+
+        loop {
+            tokio::select! {
+                Some(msg) = async {
+                    if let Some(ref mut rx) = telegram_rx {
+                        rx.recv().await
+                    } else {
+                        None
+                    }
+                } => {
+                    if let Err(e) = self.handle_message(&runtime, msg).await {
+                        error!("Error handling message: {}", e);
+                    }
+                }
+                _ = token.cancelled() => {
+                    info!("Shutdown signal received, stopping message loop");
+                    break;
+                }
+                else => {
+                    break;
+                }
+            }
+        }
+
+        // Stop channel adapters (Telegram polling)
+        self.stop().await?;
+
+        info!("Message processing loop ended");
+        Ok(())
+    }
+
     /// Handle an incoming message
     async fn handle_message(
         &self,

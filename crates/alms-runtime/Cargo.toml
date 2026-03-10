@@ -12,6 +12,7 @@ alms-sandbox = { path = "../alms-sandbox" }
 
 # Async runtime
 tokio.workspace = true
+tokio-util.workspace = true
 
 # Serialization
 serde.workspace = true

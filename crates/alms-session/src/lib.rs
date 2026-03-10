@@ -310,6 +310,14 @@ impl SessionManager {
     pub fn config(&self) -> &SessionConfig {
         &self.config
     }
+
+    /// Flush the SQLite WAL to disk. No-op if no SQLite store is attached.
+    pub fn flush_wal(&self) -> AlmsResult<()> {
+        if let Some(store) = &self.store {
+            store.flush_wal()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

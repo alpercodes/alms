@@ -31,7 +31,9 @@ use crate::auth::{AuthToken, require_auth};
 use dashmap::DashMap;
 use serde::Deserialize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 /// Run manager for tracking runs and their event streams
@@ -41,6 +43,10 @@ pub struct RunManager {
     pub runs: Arc<DashMap<RunId, Run>>,
     /// Persistent event log for reconnect-after-restart support
     pub event_log: EventLogManager,
+    /// Counter of in-flight (spawned but not yet finished) run tasks.
+    in_flight: Arc<AtomicUsize>,
+    /// Notified when an in-flight run completes (counter reaches zero).
+    drain_notify: Arc<tokio::sync::Notify>,
 }
 
 impl RunManager {
@@ -49,6 +55,40 @@ impl RunManager {
             event_senders: Arc::new(DashMap::new()),
             runs: Arc::new(DashMap::new()),
             event_log: EventLogManager::new(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Increment the in-flight counter. Call when spawning a run task.
+    pub fn track_in_flight(&self) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Decrement the in-flight counter and wake drain waiters.
+    pub fn untrack_in_flight(&self) {
+        let prev = self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        if prev == 1 {
+            self.drain_notify.notify_waiters();
+        }
+    }
+
+    /// Wait until all in-flight runs complete, or timeout expires.
+    /// Returns `true` if drained, `false` on timeout.
+    pub async fn wait_drain(&self, timeout: std::time::Duration) -> bool {
+        if self.in_flight.load(Ordering::Relaxed) == 0 {
+            return true;
+        }
+        tokio::select! {
+            _ = async {
+                loop {
+                    self.drain_notify.notified().await;
+                    if self.in_flight.load(Ordering::Relaxed) == 0 {
+                        break;
+                    }
+                }
+            } => true,
+            _ = tokio::time::sleep(timeout) => false,
         }
     }
 
@@ -154,10 +194,16 @@ pub struct AppState {
     pub scheduler: Arc<Scheduler>,
     /// Coordinator for subagent lifecycle management
     pub coordinator: Arc<Coordinator>,
+    /// Token cancelled during graceful shutdown.
+    pub shutdown_token: CancellationToken,
 }
 
 impl AppState {
-    pub fn new(gateway: Gateway, scheduler: Arc<Scheduler>) -> AlmsResult<Self> {
+    pub fn new(
+        gateway: Gateway,
+        scheduler: Arc<Scheduler>,
+        shutdown_token: CancellationToken,
+    ) -> AlmsResult<Self> {
         let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
         let session_manager = gateway.session_manager().clone();
         let llm = gateway.llm().clone();
@@ -179,6 +225,7 @@ impl AppState {
             job_store,
             scheduler,
             coordinator,
+            shutdown_token,
         })
     }
 }
@@ -400,12 +447,14 @@ pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
 }
 
 pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult<()> {
+    let shutdown_token = CancellationToken::new();
+
     // Create the scheduler with a fire channel so job IDs are forwarded to
     // the gateway for actual agent-run dispatch.
     let (fire_tx, fire_rx) = tokio::sync::mpsc::unbounded_channel::<alms_core::JobId>();
     let scheduler = Arc::new(Scheduler::new().with_fire_channel(fire_tx));
 
-    let state = AppState::new(gateway, scheduler)?;
+    let state = AppState::new(gateway, scheduler, shutdown_token.clone())?;
 
     {
         let mut gateway = state.gateway.lock().await;
@@ -417,17 +466,21 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     // populated before the first sleep.
     bootstrap_scheduler(&state).await?;
 
-    // Start the background scheduler runner.
-    let _scheduler_handle = state.scheduler.start();
+    // Start the background scheduler runner (shutdown-aware).
+    let scheduler_handle = state.scheduler.start_with_shutdown(shutdown_token.clone());
 
     // Spawn the fire-receiver: turns fired JobIds into real agent runs.
     let fire_state = state.clone();
-    tokio::spawn(scheduler_fire_loop(fire_rx, fire_state));
+    let fire_handle = tokio::spawn(scheduler_fire_loop(fire_rx, fire_state));
 
+    // Spawn the channel message loop (Telegram polling, etc.).
+    // The loop selects on the shutdown token so it exits cooperatively
+    // without requiring us to lock the gateway mutex from outside.
     let background_gateway = state.gateway.clone();
-    tokio::spawn(async move {
+    let gateway_token = shutdown_token.clone();
+    let gateway_handle = tokio::spawn(async move {
         let mut gateway = background_gateway.lock().await;
-        if let Err(e) = gateway.run().await {
+        if let Err(e) = gateway.run_until_shutdown(gateway_token).await {
             tracing::error!("Gateway message loop exited: {}", e);
         }
     });
@@ -451,14 +504,82 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
                 .layer(middleware::from_fn(require_auth))
                 .layer(Extension(auth_token)),
         )
-        .with_state(state);
+        .with_state(state.clone());
 
     info!("Starting ALMS Gateway HTTP server on {}", bind_addr);
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
 
+    // === Graceful shutdown sequence ===
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_token))
+        .await?;
+
+    // Phase 1: Signal received. Axum stopped accepting new connections.
+    info!("HTTP server stopped accepting connections, draining...");
+
+    // Phase 2: Scheduler loop already exiting (token cancelled).
+    scheduler_handle.await.ok();
+    info!("Scheduler stopped");
+
+    // Phase 3: Abort the fire loop. The scheduler is stopped so no new
+    // job IDs will arrive. The fire_tx is kept alive by Arc inside the
+    // fire loop's AppState clone, so rx.recv() would hang — abort instead.
+    // Any in-flight runs spawned by fire_job_run are tracked by the
+    // in-flight counter and will be drained in phase 5.
+    fire_handle.abort();
+    fire_handle.await.ok();
+    info!("Scheduler fire loop stopped");
+
+    // Phase 4: Gateway message loop already exiting (token cancelled).
+    gateway_handle.await.ok();
+    info!("Channel adapters stopped");
+
+    // Phase 5: Wait for in-flight runs to complete (with timeout).
+    let drain_timeout = std::time::Duration::from_secs(30);
+    let drained = state.run_manager.wait_drain(drain_timeout).await;
+    if drained {
+        info!("All in-flight runs completed");
+    } else {
+        tracing::warn!("Shutdown timeout: some runs did not finish within 30s");
+    }
+
+    // Phase 6: Flush SQLite WAL.
+    if let Err(e) = state.session_manager.flush_wal() {
+        tracing::error!("Failed to flush session WAL: {}", e);
+    }
+    if let Err(e) = state.job_store.flush_wal() {
+        tracing::error!("Failed to flush job WAL: {}", e);
+    }
+    info!("SQLite WAL flushed");
+
+    info!("ALMS Gateway shut down cleanly");
     Ok(())
+}
+
+/// Returns a future that completes when a shutdown signal is received.
+async fn shutdown_signal(token: CancellationToken) {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => { info!("Received Ctrl+C, initiating graceful shutdown"); }
+            _ = sigterm.recv() => { info!("Received SIGTERM, initiating graceful shutdown"); }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c
+            .await
+            .expect("failed to install Ctrl+C handler");
+        info!("Received Ctrl+C, initiating graceful shutdown");
+    }
+
+    token.cancel();
 }
 
 /// Re-register all non-cancelled persisted jobs with the scheduler on startup.
@@ -512,4 +633,37 @@ struct RunAgentRequest {
 struct AuditQuery {
     session_id: alms_core::SessionId,
     limit: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_drain_immediate_when_no_in_flight() {
+        let rm = RunManager::new();
+        assert!(rm.wait_drain(std::time::Duration::from_millis(100)).await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_waits_for_in_flight() {
+        let rm = RunManager::new();
+        rm.track_in_flight();
+
+        let rm2 = rm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            rm2.untrack_in_flight();
+        });
+
+        assert!(rm.wait_drain(std::time::Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_times_out() {
+        let rm = RunManager::new();
+        rm.track_in_flight();
+        // Never untrack — should time out.
+        assert!(!rm.wait_drain(std::time::Duration::from_millis(50)).await);
+    }
 }

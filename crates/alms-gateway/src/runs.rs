@@ -86,8 +86,19 @@ pub async fn create_run(
 
     info!("Creating run {} for session {}", run_id.0, session_id.0);
 
+    // Reject new runs during shutdown.
+    if state.shutdown_token.is_cancelled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": { "code": "SHUTTING_DOWN", "message": "Server is shutting down" }
+            })),
+        ));
+    }
+
     state.run_manager.insert_run(run.clone());
 
+    state.run_manager.track_in_flight();
     let state_clone = state.clone();
     tokio::spawn(async move {
         execute_run(
@@ -301,6 +312,8 @@ async fn execute_run(
     state.run_manager.remove_sender(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
+    // Signal drain waiters that this run is done.
+    state.run_manager.untrack_in_flight();
 }
 
 // ---------------------------------------------------------------------------
@@ -568,6 +581,7 @@ pub async fn stream_run_legacy(
     let (tx, rx) = event_channel();
     state.run_manager.register_sender(run_id, tx);
 
+    state.run_manager.track_in_flight();
     let state_clone = state.clone();
     tokio::spawn(async move {
         execute_run(

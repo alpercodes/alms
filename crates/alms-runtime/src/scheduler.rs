@@ -155,6 +155,15 @@ impl Scheduler {
         tokio::spawn(async move { s.run_loop().await })
     }
 
+    /// Spawn the background runner loop, stopping when `token` is cancelled.
+    pub fn start_with_shutdown(
+        &self,
+        token: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
+        let s = self.clone();
+        tokio::spawn(async move { s.run_loop_cancellable(token).await })
+    }
+
     // ── Internal ─────────────────────────────────────────────────────────────
 
     async fn run_loop(&self) {
@@ -191,6 +200,46 @@ impl Scheduler {
                         }
                     }
 
+                    self.process_due_jobs().await;
+                }
+            }
+        }
+    }
+
+    async fn run_loop_cancellable(&self, token: tokio_util::sync::CancellationToken) {
+        loop {
+            let next_at = {
+                let mut pending = self.pending.lock().await;
+                let cancelled = self.cancelled.lock().await;
+                while let Some(Reverse(top)) = pending.peek() {
+                    if cancelled.contains(&top.id) {
+                        pending.pop();
+                    } else {
+                        break;
+                    }
+                }
+                pending.peek().map(|Reverse(j)| j.run_at)
+            };
+
+            match next_at {
+                None => {
+                    tokio::select! {
+                        _ = self.notify.notified() => {}
+                        _ = token.cancelled() => {
+                            info!("Scheduler shutting down");
+                            return;
+                        }
+                    }
+                }
+                Some(run_at) => {
+                    tokio::select! {
+                        _ = time::sleep_until(run_at) => {}
+                        _ = self.notify.notified() => { continue; }
+                        _ = token.cancelled() => {
+                            info!("Scheduler shutting down");
+                            return;
+                        }
+                    }
                     self.process_due_jobs().await;
                 }
             }
@@ -507,6 +556,34 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_stops_scheduler() {
+        tokio::time::pause();
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let scheduler = Scheduler::new();
+        let handle = scheduler.start_with_shutdown(token.clone());
+
+        let id = JobId::new();
+        scheduler
+            .schedule_once(id, Instant::now() + Duration::from_secs(60))
+            .await;
+
+        // Cancel the token — scheduler should exit
+        token.cancel();
+
+        advance(Duration::from_millis(10)).await;
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(
+            result.is_ok(),
+            "scheduler should exit after token cancellation"
+        );
+
+        // Job should NOT have fired (it was scheduled 60s out)
+        assert_eq!(scheduler.completed_runs().await.len(), 0);
     }
 
     #[tokio::test]

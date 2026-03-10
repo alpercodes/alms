@@ -16,6 +16,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-09:** Fix #41 (MEDIUM): scheduler sleep calculation — replaced `iter().find()` with peek-and-drain; filter cancelled jobs before firing.
 - **2026-03-09:** Bearer auth (#42): `ALMS_AUTH_TOKEN` env var enables auth middleware on all routes except `/health`. Supports `?token=` query param for SSE.
 - **2026-03-09:** Fix #45 (MEDIUM): session `last_activity` and `status` now write-through to SQLite on every `append_message()` and `archive_idle()`. `delete()` cascades to SQLite (messages, audit, summaries, session row). `SessionManager::with_store()` constructor for test injection.
+- **2026-03-10:** Graceful shutdown (#43): CancellationToken-based shutdown. 6-phase sequence: stop HTTP → stop scheduler → abort fire loop → stop channel adapters → drain in-flight runs (30s timeout) → flush SQLite WAL. New runs rejected with 503 during shutdown.
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -348,13 +349,12 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - 7 unit tests covering valid/invalid/missing/malformed/query-param cases.
 - **Owners:** Atlas
 
-43) Graceful shutdown
-- SIGTERM currently kills in-flight LLM calls, background subagents, the scheduler loop, and the Telegram polling loop abruptly.
-- Use `tokio::signal::ctrl_c()` (and SIGTERM on Unix) + a `CancellationToken` to coordinate shutdown:
-  a) Stop accepting new requests
-  b) Signal scheduler and channel adapter to stop
-  c) Wait for in-flight runs to complete (with a timeout, e.g. 30s)
-  d) Flush SQLite WAL
+43) Graceful shutdown ✅
+- `CancellationToken` threaded through `AppState`, scheduler, and gateway message loop.
+- 6-phase shutdown: stop HTTP (axum `with_graceful_shutdown`) → stop scheduler (`start_with_shutdown` exits cooperatively) → abort fire loop → stop channel adapters (`run_until_shutdown` selects on token, calls `stop()`) → drain in-flight runs (`RunManager` AtomicUsize counter + Notify, 30s timeout) → flush SQLite WAL (`PRAGMA wal_checkpoint(TRUNCATE)`).
+- New runs rejected with 503 `SHUTTING_DOWN` during drain.
+- Ctrl+C on all platforms, SIGTERM on Unix.
+- 7 new tests: drain_immediate, drain_waits, drain_timeout, shutdown_stops_scheduler, flush_wal.
 - **Owners:** Atlas
 
 ---

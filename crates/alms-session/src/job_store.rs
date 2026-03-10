@@ -177,6 +177,14 @@ impl JobStore {
         info!("Cancelled job {}", id.0);
         Ok(Some(true))
     }
+
+    /// Flush the SQLite WAL to disk. No-op if no SQLite store is attached.
+    pub fn flush_wal(&self) -> AlmsResult<()> {
+        if let Some(store) = &self.store {
+            store.flush_wal()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

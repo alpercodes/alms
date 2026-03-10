@@ -155,6 +155,18 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Flush the WAL to the main database file.
+    ///
+    /// Called during graceful shutdown to ensure all buffered writes are
+    /// durable before the process exits.
+    pub fn flush_wal(&self) -> AlmsResult<()> {
+        self.conn
+            .lock()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| AlmsError::Runtime(format!("SQLite WAL flush: {e}")))?;
+        Ok(())
+    }
+
     /// Load every session row, oldest first.
     pub fn load_all_sessions(&self) -> AlmsResult<Vec<Session>> {
         let conn = self.conn.lock();
@@ -703,5 +715,14 @@ mod tests {
 
         assert_eq!(store.load_messages(s1.id).unwrap().len(), 1);
         assert_eq!(store.load_messages(s2.id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_flush_wal() {
+        // In-memory DB uses journal_mode=memory, not WAL, but the
+        // pragma still succeeds — verifies the method doesn't error.
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.save_session(&new_session()).unwrap();
+        store.flush_wal().unwrap();
     }
 }
