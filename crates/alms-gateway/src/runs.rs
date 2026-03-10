@@ -98,7 +98,6 @@ pub async fn create_run(
 
     state.run_manager.insert_run(run.clone());
 
-    state.run_manager.track_in_flight();
     let state_clone = state.clone();
     tokio::spawn(async move {
         execute_run(
@@ -134,6 +133,9 @@ async fn execute_run(
     overrides: RunOverrides,
     context_id: String,
 ) {
+    // Track this run for graceful shutdown drain.
+    state.run_manager.track_in_flight();
+
     // Events are persisted to the event log regardless of whether an SSE
     // client is connected. The SSE client registers its own sender when it
     // calls GET /runs/{id}/events (or via the legacy stream endpoint which
@@ -575,13 +577,22 @@ pub async fn stream_run_legacy(
         run_id.0, session_id.0
     );
 
+    // Reject new runs during shutdown.
+    if state.shutdown_token.is_cancelled() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": { "code": "SHUTTING_DOWN", "message": "Server is shutting down" }
+            })),
+        ));
+    }
+
     state.run_manager.insert_run(run.clone());
 
     // Register SSE channel before spawning so early events aren't missed
     let (tx, rx) = event_channel();
     state.run_manager.register_sender(run_id, tx);
 
-    state.run_manager.track_in_flight();
     let state_clone = state.clone();
     tokio::spawn(async move {
         execute_run(

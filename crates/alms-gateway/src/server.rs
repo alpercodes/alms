@@ -62,12 +62,12 @@ impl RunManager {
 
     /// Increment the in-flight counter. Call when spawning a run task.
     pub fn track_in_flight(&self) {
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Decrement the in-flight counter and wake drain waiters.
     pub fn untrack_in_flight(&self) {
-        let prev = self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let prev = self.in_flight.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             self.drain_notify.notify_waiters();
         }
@@ -76,19 +76,17 @@ impl RunManager {
     /// Wait until all in-flight runs complete, or timeout expires.
     /// Returns `true` if drained, `false` on timeout.
     pub async fn wait_drain(&self, timeout: std::time::Duration) -> bool {
-        if self.in_flight.load(Ordering::Relaxed) == 0 {
-            return true;
-        }
-        tokio::select! {
-            _ = async {
-                loop {
-                    self.drain_notify.notified().await;
-                    if self.in_flight.load(Ordering::Relaxed) == 0 {
-                        break;
-                    }
-                }
-            } => true,
-            _ = tokio::time::sleep(timeout) => false,
+        loop {
+            // Register the notification future BEFORE checking the counter
+            // to avoid lost wakeups.
+            let notified = self.drain_notify.notified();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep(timeout) => return false,
+            }
         }
     }
 
@@ -403,6 +401,14 @@ async fn run_agent(
     State(state): State<AppState>,
     Json(req): Json<RunAgentRequest>,
 ) -> impl IntoResponse {
+    // Reject during shutdown.
+    if state.shutdown_token.is_cancelled() {
+        return Json(serde_json::json!({
+            "success": false,
+            "error": "Server is shutting down",
+        }));
+    }
+
     // Extract what we need, then drop the lock before the LLM call
     let (agent_id, agent_config, llm) = {
         let gateway = state.gateway.lock().await;
