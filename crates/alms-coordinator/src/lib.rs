@@ -583,7 +583,6 @@ async fn run_agent_loop(
 mod tests {
     use super::*;
     use alms_runtime::llm_types::LlmConfig;
-    use alms_runtime::subagent::SubagentDispatcher;
 
     /// Build a Coordinator wired to the mock LLM and an in-memory SessionManager.
     fn test_coordinator() -> Coordinator {
@@ -626,10 +625,14 @@ mod tests {
         );
     }
 
-    // -- (b) dispatch foreground — custom system prompt -------------------------
+    // -- (b) smoke test: dispatch with system_prompt does not error -------------
 
     #[tokio::test]
-    async fn test_dispatch_foreground_with_system_prompt() {
+    async fn test_dispatch_with_system_prompt_smoke() {
+        // Smoke test only: verifies that providing a system_prompt does not
+        // cause an error.  The mock LLM does not vary its response based on
+        // system prompt content, so we cannot assert the prompt was threaded
+        // through without an injectable mock.
         let coord = test_coordinator();
         let result = coord
             .dispatch(
@@ -641,7 +644,7 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_ok(), "dispatch with system prompt should succeed");
+        assert!(result.is_ok(), "dispatch with system prompt should not error");
     }
 
     // -- (c) dispatch_background + poll_task lifecycle --------------------------
@@ -684,14 +687,18 @@ mod tests {
         }
     }
 
-    // -- (d) cancel_subagent — status becomes Cancelled -------------------------
+    // -- (d) cancel_subagent removes handle from DashMap -----------------------
+    //
+    // NOTE: The mock LLM completes synchronously, so by the time we call
+    // cancel_subagent the subagent has likely already finished.  This test
+    // verifies the DashMap removal path, not true mid-execution cancellation.
+    // Testing real cancellation would require a mock LLM with injected latency.
 
     #[tokio::test]
-    async fn test_cancel_subagent() {
+    async fn test_cancel_subagent_removes_handle() {
         let coord = test_coordinator();
         let session_id = test_session_id();
 
-        // Spawn a subagent with a long timeout so it doesn't finish before we cancel.
         let request = SubagentRequest {
             task: "Long running task".to_string(),
             agent_type: SubagentType::General,
@@ -703,22 +710,27 @@ mod tests {
         };
         let task_id = coord.spawn_subagent(request, None).await.unwrap();
 
-        // Cancel immediately — the mock LLM may or may not have finished yet,
-        // but cancel_subagent should succeed regardless.
         let cancel_result = coord.cancel_subagent(task_id);
         assert!(cancel_result.is_ok(), "cancel should succeed");
+
+        // cancel_subagent removes the handle from the DashMap.
+        assert!(
+            coord.get_status(task_id).is_none(),
+            "Handle should be removed after cancel"
+        );
     }
 
-    // -- (e) timeout — very short timeout → Failed ------------------------------
+    // -- (e) very short timeout — race between timeout and mock completion ------
+    //
+    // NOTE: The mock LLM's complete() returns without yielding, so
+    // tokio::select! may resolve the agent-loop branch before the 1ns timer.
+    // This test accepts both Failed (timeout won) and Completed (mock won).
 
     #[tokio::test]
-    async fn test_timeout_produces_failed() {
+    async fn test_very_short_timeout() {
         let coord = test_coordinator();
         let session_id = test_session_id();
 
-        // Use an extremely short timeout.  The mock LLM is fast but still goes
-        // through runtime.run() which does async work — a 1-nanosecond timeout
-        // should reliably beat it.
         let request = SubagentRequest {
             task: "Will timeout".to_string(),
             agent_type: SubagentType::General,
@@ -732,8 +744,6 @@ mod tests {
         let result_rx = coord.take_result_rx(task_id).unwrap();
 
         let task_result = result_rx.await.expect("should receive result");
-        // Could be Failed (timeout) or Completed (mock was faster).  Both are
-        // valid outcomes depending on scheduling.  At minimum, we got a result.
         assert!(
             task_result.status == TaskStatus::Failed
                 || task_result.status == TaskStatus::Completed,
@@ -783,5 +793,41 @@ mod tests {
         let coord = test_coordinator();
         let result = coord.cancel_subagent(TaskId::new());
         assert!(result.is_err(), "cancelling unknown task should return Err");
+    }
+
+    // -- (i) take_result_rx — second call returns None --------------------------
+
+    #[tokio::test]
+    async fn test_take_result_rx_only_once() {
+        let coord = test_coordinator();
+        let session_id = test_session_id();
+
+        let request = SubagentRequest {
+            task: "Take rx test".to_string(),
+            agent_type: SubagentType::General,
+            timeout: Duration::from_secs(300),
+            capabilities: SubagentType::General.default_capabilities(),
+            parent_session: session_id,
+            parent_run_id: None,
+            system_prompt: None,
+        };
+        let task_id = coord.spawn_subagent(request, None).await.unwrap();
+
+        let first = coord.take_result_rx(task_id);
+        assert!(first.is_some(), "first take should return the receiver");
+
+        let second = coord.take_result_rx(task_id);
+        assert!(second.is_none(), "second take should return None");
+    }
+
+    // -- (j) get_completed_result on unknown task → None ------------------------
+
+    #[tokio::test]
+    async fn test_get_completed_result_unknown() {
+        let coord = test_coordinator();
+        assert!(
+            coord.get_completed_result(TaskId::new()).is_none(),
+            "Unknown task should return None"
+        );
     }
 }
