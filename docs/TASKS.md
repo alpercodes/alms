@@ -245,16 +245,14 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Chat UI already consumes token_delta events — backend just needs to produce them.
 - **Owners:** Atlas
 
-37) Add user.md to agent workspace
-- Current workspace files (personality.md, goals.md, memories.md) conflate agent identity with user identity. memories.md is supposed to hold "user preferences" alongside agent learnings — these should be separated.
-- Add `user.md` as a fourth workspace file: describes the human the agent is working with (name, working style, preferences, background, communication preferences).
-- `personality.md` → describes the *agent* (tone, role, constraints). `user.md` → describes the *user*.
-- Changes required:
-  a) `AgentWorkspace`: add `user.md` to the file set, read it in `build_system_prompt_prefix()`
-  b) `workspace_write` tool: add `"user"` as a valid file target (alongside goals/memories)
-  c) Workspace HTTP API: include `user.md` in `GET /agents/{id}/workspace` response and `PUT` handler
-  d) Bootstrap prompt: rewrite to fill out both `personality.md` (agent self-description) and `user.md` (user info) — "What should I call you?", "What's your background?", "How do you prefer to communicate?" → user.md
-  e) `needs_bootstrap()`: still keyed to absence of `personality.md` — no change needed
+37) Add user.md to agent workspace ✅
+- Added `user.md` as a fourth workspace file describing the user (name, preferences, background).
+- `WorkspaceFile::User` variant added; included in `all()`, `build_system_prompt_prefix()` (as "## About the User"), and `agent_writable()`.
+- `workspace_write` tool: `"user"` is a valid file target alongside personality/goals/memories.
+- Workspace HTTP API: `GET` returns user.md content; `PUT .../workspace/user` accepted.
+- Bootstrap prompt updated to collect user info and save to user.md.
+- `needs_bootstrap()` unchanged — still keyed to absence of personality.md.
+- 2 new tests: `test_write_and_read_user`, `test_write_user` (tool).
 - **Owners:** Atlas
 
 31) Fix agent ID mismatch (UI / server alignment) ✅

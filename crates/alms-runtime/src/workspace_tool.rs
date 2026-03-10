@@ -23,8 +23,8 @@ impl Tool for WorkspaceWriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write or append to the agent's own workspace files (personality.md, goals.md, memories.md). \
-         Use this to persist identity, goals, and memories across conversations."
+        "Write or append to the agent's own workspace files (personality.md, goals.md, memories.md, user.md). \
+         Use this to persist identity, goals, memories, and user info across conversations."
     }
 
     fn parameters(&self) -> Value {
@@ -33,11 +33,12 @@ impl Tool for WorkspaceWriteTool {
             "properties": {
                 "file": {
                     "type": "string",
-                    "enum": ["personality", "goals", "memories"],
+                    "enum": ["personality", "goals", "memories", "user"],
                     "description": "Which workspace file to write. \
-                                    'personality' for tone/style/role, \
+                                    'personality' for the agent's tone/style/role, \
                                     'goals' for current objectives, \
-                                    'memories' for learned facts and preferences."
+                                    'memories' for learned facts and domain knowledge, \
+                                    'user' for who the user is (name, preferences, background)."
                 },
                 "content": {
                     "type": "string",
@@ -64,9 +65,10 @@ impl Tool for WorkspaceWriteTool {
             "personality" => WorkspaceFile::Personality,
             "goals" => WorkspaceFile::Goals,
             "memories" => WorkspaceFile::Memories,
+            "user" => WorkspaceFile::User,
             other => {
                 return Err(SandboxError::InvalidParameters(format!(
-                    "Unknown file '{}': must be 'personality', 'goals', or 'memories'",
+                    "Unknown file '{}': must be 'personality', 'goals', 'memories', or 'user'",
                     other
                 )));
             }
@@ -194,6 +196,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, SandboxError::InvalidParameters(_)));
+    }
+
+    #[tokio::test]
+    async fn test_write_user() {
+        let (_dir, tool) = test_tool();
+        let result = tool
+            .execute(serde_json::json!({
+                "file": "user",
+                "content": "Name: Alper. Prefers concise answers."
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["file"], "user");
+
+        let content = tool.workspace.read_file(WorkspaceFile::User).unwrap();
+        assert!(content.contains("Alper"));
     }
 
     #[test]

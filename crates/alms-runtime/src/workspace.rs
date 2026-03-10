@@ -1,12 +1,13 @@
 //! Agent workspace — persistent identity files.
 //!
 //! Each agent has a workspace directory containing:
-//! - personality.md — tone, style, constraints (user-editable)
+//! - personality.md — tone, style, constraints (describes the *agent*)
 //! - goals.md — current objectives (agent + user editable)
-//! - memories.md — learned facts, preferences (agent + user editable)
+//! - memories.md — learned facts, domain knowledge (agent + user editable)
+//! - user.md — who the user is: name, preferences, background (agent + user editable)
 //!
 //! These are read at the start of each run and injected into the system prompt.
-//! The agent can update goals.md and memories.md via the workspace_write tool.
+//! The agent can update goals.md, memories.md, and user.md via the workspace_write tool.
 
 use alms_core::{AgentId, AlmsError, AlmsResult};
 use std::path::PathBuf;
@@ -27,6 +28,7 @@ pub enum WorkspaceFile {
     Personality,
     Goals,
     Memories,
+    User,
 }
 
 impl WorkspaceFile {
@@ -35,6 +37,7 @@ impl WorkspaceFile {
             WorkspaceFile::Personality => "personality.md",
             WorkspaceFile::Goals => "goals.md",
             WorkspaceFile::Memories => "memories.md",
+            WorkspaceFile::User => "user.md",
         }
     }
 
@@ -44,6 +47,7 @@ impl WorkspaceFile {
             WorkspaceFile::Personality => true,
             WorkspaceFile::Goals => true,
             WorkspaceFile::Memories => true,
+            WorkspaceFile::User => true,
         }
     }
 
@@ -52,6 +56,7 @@ impl WorkspaceFile {
             WorkspaceFile::Personality,
             WorkspaceFile::Goals,
             WorkspaceFile::Memories,
+            WorkspaceFile::User,
         ]
     }
 }
@@ -155,6 +160,10 @@ impl AgentWorkspace {
             parts.push(format!("## Current Goals\n{}", goals));
         }
 
+        if let Some(user) = self.read_file(WorkspaceFile::User) {
+            parts.push(format!("## About the User\n{}", user));
+        }
+
         if let Some(memories) = self.read_file(WorkspaceFile::Memories) {
             // Truncate memories if too long (will be properly budgeted by ContextBuilder)
             let memories = if memories.len() > 4000 {
@@ -183,12 +192,14 @@ impl AgentWorkspace {
 Ask the user the following (naturally, in conversation — not as a rigid list):
 1. What is your primary purpose/role?
 2. How should you communicate? (formal/casual, concise/detailed, etc.)
-3. What name should you use for the user?
-4. Any specific constraints or things to avoid?
+3. What should you call the user? What is their background?
+4. How does the user prefer to work? (e.g. concise vs detailed, proactive vs ask-first)
+5. Any specific constraints or things to avoid?
 
 After gathering this information, use the workspace_write tool to save:
-- personality.md: Your personality, tone, role, and constraints
+- personality.md: Your personality, tone, role, and constraints (describes *you*, the agent)
 - goals.md: Your initial objectives based on what the user described
+- user.md: Who the user is — their name, background, working style, and communication preferences
 
 Keep files concise — a few paragraphs at most. You can always update them later."#
     }
@@ -276,9 +287,22 @@ mod tests {
         .unwrap();
         ws.write_file(WorkspaceFile::Goals, "Help with Rust")
             .unwrap();
+        ws.write_file(WorkspaceFile::User, "Name: Alper. Prefers concise answers.")
+            .unwrap();
 
         let prefix = ws.build_system_prompt_prefix();
         assert!(prefix.contains("concise and technical"));
         assert!(prefix.contains("Help with Rust"));
+        assert!(prefix.contains("About the User"));
+        assert!(prefix.contains("Alper"));
+    }
+
+    #[test]
+    fn test_write_and_read_user() {
+        let (_dir, ws) = test_workspace();
+        ws.write_file(WorkspaceFile::User, "Name: Alper\nStyle: concise")
+            .unwrap();
+        let content = ws.read_file(WorkspaceFile::User).unwrap();
+        assert!(content.contains("Alper"));
     }
 }

@@ -28,7 +28,7 @@ crates/
   alms-gateway/      # Axum HTTP server, SSE streaming, run lifecycle, event log
   alms-runtime/      # Agent loop, LLM client (OpenAI-compat), tool execution, audit
                      #   context.rs — ContextBuilder (token-budgeted context window)
-                     #   workspace.rs — AgentWorkspace (personality/goals/memories files)
+                     #   workspace.rs — AgentWorkspace (personality/goals/memories/user files)
   alms-coordinator/  # Multi-agent orchestration — pure hierarchy, real AgentRuntime loops
   alms-session/      # Session store, JSON snapshot persistence (atomic + rotation + checksums)
   alms-sandbox/      # WASM tool sandbox, builtin tools (echo, math, http_get), registry
@@ -85,7 +85,7 @@ The agent runtime (`alms-runtime`) has three key subsystems:
    - `personality.md` — the *agent's* tone, style, role, constraints (agent + user editable; agent writes during bootstrap)
    - `goals.md` — the agent's current objectives (agent + user editable)
    - `memories.md` — what the agent has learned: domain facts, past decisions, accumulated knowledge (agent + user editable)
-   - `user.md` — who the *user* is: name, working style, preferences, background (agent + user editable; filled during bootstrap interview) — **not yet implemented, see task #37**
+   - `user.md` — who the *user* is: name, working style, preferences, background (agent + user editable; filled during bootstrap interview)
    - Prepended to system prompt when workspace is attached to runtime
    - `needs_bootstrap()` detects first-time agents (no `personality.md`)
 
