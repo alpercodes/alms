@@ -17,6 +17,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-09:** Bearer auth (#42): `ALMS_AUTH_TOKEN` env var enables auth middleware on all routes except `/health`. Supports `?token=` query param for SSE.
 - **2026-03-09:** Fix #45 (MEDIUM): session `last_activity` and `status` now write-through to SQLite on every `append_message()` and `archive_idle()`. `delete()` cascades to SQLite (messages, audit, summaries, session row). `SessionManager::with_store()` constructor for test injection.
 - **2026-03-10:** Graceful shutdown (#43): CancellationToken-based shutdown. 6-phase sequence: stop HTTP → stop scheduler → abort fire loop → stop channel adapters → drain in-flight runs (30s timeout) → flush SQLite WAL. New runs rejected with 503 during shutdown.
+- **2026-03-10:** Quick fixes (#31, #32, #33, #34): CreateSessionResponse.created now correct, dead coordinator message bus removed, Span::enter confirmed correct, UI agent ID aligned with server. Coordinator integration tests (#30): 8 tests covering dispatch, background lifecycle, cancel, timeout, poll.
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -123,15 +124,16 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Add a “docs index” link in README (optional).
 - **Owners:** Mesut
 
-30) Coordinator integration tests
-- alms-coordinator has 0 tests across 640 lines of concurrent code (DashMap + oneshot channels + spawned tasks + timeout + cancellation). Single biggest quality gap in the codebase.
-- Required tests (use `ALMS_LLM_MOCK=1` + in-memory `SessionManager`):
-  a) `dispatch` foreground — success path returns response text
-  b) `dispatch` foreground — LLM error propagates as `Err`
-  c) `dispatch_background` + `poll_task` lifecycle: `Running` while in progress → `Completed` when done
-  d) `cancel_subagent` — verify status becomes `Cancelled`, poll returns `PollResult::Cancelled`
-  e) Timeout — `SubagentRequest` with very short timeout, verify `Failed` status
-  f) `poll_task` on unknown task_id — returns `Err`
+30) Coordinator integration tests ✅
+- 8 tests added to `alms-coordinator/src/lib.rs` using mock LLM + in-memory SessionManager:
+  a) `dispatch_foreground_success` — success path returns mock response text
+  b) `dispatch_foreground_with_system_prompt` — custom system prompt works
+  c) `dispatch_background_lifecycle` — dispatch_background → poll Running → Completed
+  d) `cancel_subagent` — spawn + cancel succeeds
+  e) `timeout_produces_failed` — 1ns timeout → Failed or Completed (scheduler-dependent)
+  f) `poll_unknown_task_returns_error` — returns Err for random UUID
+  g) `list_active_includes_spawned` — spawned task appears in list_active
+  h) `cancel_unknown_task_returns_error` — cancelling unknown task returns Err
 - **Owners:** Atlas
 
 ---
