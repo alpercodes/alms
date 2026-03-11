@@ -1,11 +1,10 @@
 //! Bearer token authentication middleware.
 
 use axum::{
-    Extension,
+    Extension, Json,
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    Json,
 };
 use tracing::warn;
 

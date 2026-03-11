@@ -429,6 +429,13 @@ model = "claude-sonnet"
     }
 
     #[test]
+    fn test_validation_bad_shell_policy() {
+        let mut config = AlmsConfig::default();
+        config.tools.shell_policy = "yolo".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn test_validation_good() {
         let config = AlmsConfig::default();
         assert!(config.validate().is_ok());

@@ -92,6 +92,7 @@ impl AgentRuntime {
             let path = std::path::PathBuf::from(&config.sandbox_root);
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|e| {
                 let fallback = std::env::current_dir().unwrap_or_else(|_| path.clone());
+                let fallback = std::fs::canonicalize(&fallback).unwrap_or(fallback);
                 warn!(
                     configured = %path.display(),
                     fallback = %fallback.display(),
@@ -100,6 +101,7 @@ impl AgentRuntime {
                 );
                 fallback
             });
+            info!(sandbox_root = %canonical.display(), "Filesystem sandbox active");
             Some(canonical)
         };
         let shell_unrestricted = config.shell_policy == "unrestricted";

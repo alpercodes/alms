@@ -144,12 +144,21 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let id_str = session_id.0.to_string();
         // Delete dependent rows first (foreign key order)
-        conn.execute("DELETE FROM context_summaries WHERE session_id = ?1", params![&id_str])
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete summaries: {e}")))?;
-        conn.execute("DELETE FROM audit_events WHERE session_id = ?1", params![&id_str])
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit: {e}")))?;
-        conn.execute("DELETE FROM messages WHERE session_id = ?1", params![&id_str])
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete messages: {e}")))?;
+        conn.execute(
+            "DELETE FROM context_summaries WHERE session_id = ?1",
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete summaries: {e}")))?;
+        conn.execute(
+            "DELETE FROM audit_events WHERE session_id = ?1",
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit: {e}")))?;
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete messages: {e}")))?;
         conn.execute("DELETE FROM sessions WHERE id = ?1", params![&id_str])
             .map_err(|e| AlmsError::Runtime(format!("SQLite delete session: {e}")))?;
         Ok(())
@@ -483,10 +492,7 @@ impl SqliteStore {
                     session_id.0.to_string(),
                     &summary.text,
                     summary.messages_covered as i64,
-                    summary
-                        .updated_at
-                        .as_ref()
-                        .map(|t| t.0.to_rfc3339()),
+                    summary.updated_at.as_ref().map(|t| t.0.to_rfc3339()),
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_summary: {e}")))?;

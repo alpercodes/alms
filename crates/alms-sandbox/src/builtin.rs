@@ -34,7 +34,7 @@ fn check_sandbox_path(path: &str, sandbox_root: &Path) -> SandboxResult<PathBuf>
         )));
     }
 
-    Ok(resolved)
+    Ok(canonical)
 }
 
 /// Canonicalize a path, walking up to the nearest existing ancestor if the

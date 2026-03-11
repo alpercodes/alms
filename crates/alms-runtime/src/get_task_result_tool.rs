@@ -82,9 +82,9 @@ impl Tool for GetTaskResultTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::RuntimeEventSender;
     use alms_core::{AlmsResult, RunId, SessionId};
     use async_trait::async_trait;
-    use crate::events::RuntimeEventSender;
 
     #[derive(Debug)]
     struct MockDispatcher(PollResult);

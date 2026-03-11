@@ -271,7 +271,10 @@ mod tests {
 
         // Must have a "task_id" field and no "response" field
         assert!(result.get("task_id").is_some(), "missing task_id field");
-        assert!(result.get("response").is_none(), "unexpected response field");
+        assert!(
+            result.get("response").is_none(),
+            "unexpected response field"
+        );
         assert_eq!(result["task_id"], expected.to_string());
     }
 

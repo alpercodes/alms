@@ -53,7 +53,12 @@ impl ContextBuilder {
                 self.build_truncate(history, history_budget, &mut messages);
             }
             "sliding-summary" => {
-                self.build_sliding_summary(history, history_budget, &mut messages, existing_summary);
+                self.build_sliding_summary(
+                    history,
+                    history_budget,
+                    &mut messages,
+                    existing_summary,
+                );
             }
             _ => {
                 warn!(
@@ -369,15 +374,23 @@ mod tests {
             .map(|i| make_msg(Role::User, &format!("msg {i}")))
             .collect();
 
-        let messages =
-            builder.build("System", &history, "current", Some("Earlier the user greeted."));
+        let messages = builder.build(
+            "System",
+            &history,
+            "current",
+            Some("Earlier the user greeted."),
+        );
 
         // system + summary_block + 3 recent + current = 6
         assert_eq!(messages.len(), 6);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "system"); // summary injected as second system message
         assert!(messages[1].content_str().contains("[Context summary"));
-        assert!(messages[1].content_str().contains("Earlier the user greeted."));
+        assert!(
+            messages[1]
+                .content_str()
+                .contains("Earlier the user greeted.")
+        );
     }
 
     #[test]

@@ -81,9 +81,7 @@ impl SessionManager {
             self.history
                 .insert(session_id, store.load_messages(session_id)?);
             self.audit.insert(session_id, store.load_audit(session_id)?);
-            let summary = store
-                .load_summary(session_id)?
-                .unwrap_or_default();
+            let summary = store.load_summary(session_id)?.unwrap_or_default();
             self.summaries.insert(session_id, summary);
         }
         if count > 0 {
@@ -113,9 +111,7 @@ impl SessionManager {
         self.sessions.insert(key, session.clone());
         self.history.insert(session.id, Vec::new());
         self.audit.insert(session.id, Vec::new());
-        self.summaries
-            .entry(session.id)
-            .or_default();
+        self.summaries.entry(session.id).or_default();
 
         if let Some(store) = &self.store
             && let Err(e) = store.save_session(&session)

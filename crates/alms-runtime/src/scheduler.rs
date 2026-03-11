@@ -488,10 +488,7 @@ mod tests {
             !fired_ids.contains(&id_early),
             "cancelled job must not fire"
         );
-        assert!(
-            !fired_ids.contains(&id_late),
-            "late job must not fire yet"
-        );
+        assert!(!fired_ids.contains(&id_late), "late job must not fire yet");
 
         handle.abort();
     }

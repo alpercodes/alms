@@ -245,7 +245,9 @@ async fn execute_run(
             Some(run_id),
             Some(invoke_agent_tx),
         );
-        runtime = runtime.with_invoke_agent(invoke_tool).with_get_task_result(get_task_tool);
+        runtime = runtime
+            .with_invoke_agent(invoke_tool)
+            .with_get_task_result(get_task_tool);
     }
 
     // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals).
