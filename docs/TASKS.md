@@ -19,6 +19,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-10:** Graceful shutdown (#43): CancellationToken-based shutdown. 6-phase sequence: stop HTTP → stop scheduler → abort fire loop → stop channel adapters → drain in-flight runs (30s timeout) → flush SQLite WAL. New runs rejected with 503 during shutdown.
 - **2026-03-10:** Quick fixes (#31, #32, #33, #34): CreateSessionResponse.created now correct, dead coordinator message bus removed, Span::enter confirmed correct, UI agent ID aligned with server. Coordinator integration tests (#30): 8 tests covering dispatch, background lifecycle, cancel, timeout, poll.
 - **2026-03-10:** Symlink bypass hardening (#25): `check_no_traversal()` replaced with `check_sandbox_path()` using `canonicalize()` + prefix check. New config: `tools.sandbox_root` (default "." = safe), `tools.shell_policy` ("sandboxed"/"unrestricted"). 7 new sandbox tests (165 total).
+- **2026-03-11:** SSE multi-subscriber (#44): `event_senders` changed from single sender to `Vec<Sender>` per run. Dead senders pruned via `retain()` on every broadcast. Register-before-replay eliminates snapshot→live gap; dedup filter on `max_replay_id`. 4 new tests (170 total).
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -263,10 +264,11 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: `newAgent()` now reads `serverDefaults.agent_id` (from `GET /settings`) and falls back to `crypto.randomUUID()` only if unavailable. Boot sequence already used `serverDefaults.agent_id`.
 - **Owners:** Atlas
 
-44) SSE single-subscriber limitation
-- `RunManager` stores one `mpsc::Sender` per run. A second browser tab connecting to the same run's event stream replaces the first subscriber's sender, cutting it off.
-- There is also a narrow race window in `stream_run_events()` between `events_from()` (snapshot) and `register_sender()` (live channel) — events in that gap are missed. Last-Event-ID reconnect partially mitigates this.
-- Fix: store a `Vec` of senders per run and broadcast to all; eliminate the snapshot→register gap by registering first, then replaying.
+44) ~~SSE single-subscriber limitation~~ ✅ DONE (2026-03-11)
+- `event_senders` changed from `DashMap<RunId, Sender>` to `DashMap<RunId, Vec<Sender>>` — multiple tabs/clients receive events simultaneously.
+- Dead senders pruned automatically via `retain()` on every `send_event()` broadcast.
+- Race fix: `stream_run_events()` now registers the live channel BEFORE snapshotting the event log. Overlap deduplication via `max_replay_id` filter on the live stream.
+- 4 new tests: multi_subscriber_broadcast, dead_subscriber_pruned, remove_senders_cleans_all, dedup_filters_replayed_events.
 - **Owners:** Atlas
 
 45) Session last_activity and status not persisted to SQLite ✅

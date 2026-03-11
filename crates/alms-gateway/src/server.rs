@@ -40,7 +40,7 @@ use tracing::info;
 /// Run manager for tracking runs and their event streams
 #[derive(Debug, Clone)]
 pub struct RunManager {
-    pub event_senders: Arc<DashMap<RunId, mpsc::UnboundedSender<SseEventData>>>,
+    pub event_senders: Arc<DashMap<RunId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
     pub runs: Arc<DashMap<RunId, Run>>,
     /// Persistent event log for reconnect-after-restart support
     pub event_log: EventLogManager,
@@ -92,14 +92,10 @@ impl RunManager {
     }
 
     pub fn register_sender(&self, run_id: RunId, sender: mpsc::UnboundedSender<SseEventData>) {
-        self.event_senders.insert(run_id, sender);
+        self.event_senders.entry(run_id).or_default().push(sender);
     }
 
-    pub fn get_sender(&self, run_id: RunId) -> Option<mpsc::UnboundedSender<SseEventData>> {
-        self.event_senders.get(&run_id).map(|s| s.value().clone())
-    }
-
-    pub fn remove_sender(&self, run_id: RunId) {
+    pub fn remove_senders(&self, run_id: RunId) {
         self.event_senders.remove(&run_id);
     }
 
@@ -152,7 +148,8 @@ impl RunManager {
         runs
     }
 
-    /// Send event to active subscribers AND persist to event log
+    /// Send event to all active subscribers AND persist to event log.
+    /// Dead subscribers (closed channels) are pruned automatically.
     pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
         let event_id = self
             .event_log
@@ -161,8 +158,13 @@ impl RunManager {
 
         event.event_id = Some(event_id);
 
-        if let Some(sender) = self.get_sender(run_id) {
-            let _ = sender.send(event);
+        if let Some(mut senders) = self.event_senders.get_mut(&run_id) {
+            let before = senders.len();
+            senders.retain(|sender| sender.send(event.clone()).is_ok());
+            let pruned = before - senders.len();
+            if pruned > 0 {
+                tracing::debug!(run_id = %run_id.0, pruned, "Pruned dead SSE subscriber(s)");
+            }
         }
     }
 
@@ -674,5 +676,69 @@ mod tests {
         rm.track_in_flight();
         // Never untrack — should time out.
         assert!(!rm.wait_drain(std::time::Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn test_multi_subscriber_broadcast() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+        let session_id = SessionId::new();
+
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        rm.register_sender(run_id, tx1);
+        rm.register_sender(run_id, tx2);
+
+        rm.send_event(run_id, session_id, SseEventData::connected(run_id))
+            .await;
+
+        let e1 = rx1.recv().await.expect("subscriber 1 should receive");
+        let e2 = rx2.recv().await.expect("subscriber 2 should receive");
+        assert_eq!(e1.event_type, "connected");
+        assert_eq!(e2.event_type, "connected");
+    }
+
+    #[tokio::test]
+    async fn test_dead_subscriber_pruned() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+        let session_id = SessionId::new();
+
+        let (tx_alive, mut rx_alive) = mpsc::unbounded_channel();
+        let (tx_dead, rx_dead) = mpsc::unbounded_channel();
+        rm.register_sender(run_id, tx_alive);
+        rm.register_sender(run_id, tx_dead);
+
+        // Drop the dead receiver so its sender becomes closed
+        drop(rx_dead);
+
+        rm.send_event(run_id, session_id, SseEventData::connected(run_id))
+            .await;
+
+        // Alive subscriber still gets the event
+        let e = rx_alive
+            .recv()
+            .await
+            .expect("alive subscriber should receive");
+        assert_eq!(e.event_type, "connected");
+
+        // Dead sender should have been pruned — only 1 sender left
+        let senders = rm.event_senders.get(&run_id).unwrap();
+        assert_eq!(senders.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_senders_cleans_all() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        rm.register_sender(run_id, tx1);
+        rm.register_sender(run_id, tx2);
+
+        assert!(rm.event_senders.contains_key(&run_id));
+        rm.remove_senders(run_id);
+        assert!(!rm.event_senders.contains_key(&run_id));
     }
 }

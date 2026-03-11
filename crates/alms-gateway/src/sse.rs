@@ -196,6 +196,11 @@ impl RunEventStream {
         receiver: mpsc::UnboundedReceiver<SseEventData>,
         replay: Vec<SseEventData>,
     ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+        // Track the highest event_id in the replay set so we can deduplicate
+        // events that arrive on both the replay snapshot and the live channel
+        // (possible because we register-before-replay to close the race gap).
+        let max_replay_id = replay.iter().filter_map(|e| e.event_id).max().unwrap_or(0);
+
         let replay_stream = tokio_stream::iter(replay.into_iter().map(|data| {
             let event = Event::default()
                 .event(&data.event_type)
@@ -214,23 +219,28 @@ impl RunEventStream {
             Ok::<_, Infallible>(event)
         }));
 
-        let live_stream = UnboundedReceiverStream::new(receiver).map(|data| {
-            let event = Event::default()
-                .event(&data.event_type)
-                .id(data
-                    .event_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| Uuid::new_v4().to_string()))
-                .json_data(&data.data)
-                .unwrap_or_else(|e| {
-                    error!(
-                        "Failed to serialize SSE live event '{}': {}",
-                        data.event_type, e
-                    );
-                    Event::default().data("{}")
-                });
-            Ok::<_, Infallible>(event)
-        });
+        let live_stream = UnboundedReceiverStream::new(receiver)
+            .filter(move |data| {
+                // Skip events already delivered during replay
+                !matches!(data.event_id, Some(id) if id <= max_replay_id)
+            })
+            .map(|data| {
+                let event = Event::default()
+                    .event(&data.event_type)
+                    .id(data
+                        .event_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| Uuid::new_v4().to_string()))
+                    .json_data(&data.data)
+                    .unwrap_or_else(|e| {
+                        error!(
+                            "Failed to serialize SSE live event '{}': {}",
+                            data.event_type, e
+                        );
+                        Event::default().data("{}")
+                    });
+                Ok::<_, Infallible>(event)
+            });
 
         let stream = replay_stream.chain(live_stream);
 
@@ -355,5 +365,31 @@ mod tests {
             SseEventData::tool_end(run_id, tool_id, true, serde_json::json!({"output": "test"}));
 
         assert_eq!(event.event_type, "tool_end");
+    }
+
+    #[tokio::test]
+    async fn test_dedup_filters_replayed_events() {
+        use tokio_stream::StreamExt as _;
+
+        let run_id = RunId::new();
+
+        // Simulate: replay has max event_id = 3. Live channel receives ids 2,3,4.
+        // The dedup filter should drop ids 2 and 3 from live, passing only id 4.
+        let max_replay_id: u64 = 3;
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        for id in 2..=4 {
+            let mut e = SseEventData::connected(run_id);
+            e.event_id = Some(id);
+            tx.send(e).unwrap();
+        }
+        drop(tx);
+
+        let live_stream = UnboundedReceiverStream::new(rx)
+            .filter(move |data| !matches!(data.event_id, Some(id) if id <= max_replay_id));
+
+        let events: Vec<_> = live_stream.collect().await;
+        assert_eq!(events.len(), 1, "only event_id=4 should pass dedup filter");
+        assert_eq!(events[0].event_id, Some(4));
     }
 }

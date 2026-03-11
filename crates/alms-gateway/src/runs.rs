@@ -313,7 +313,7 @@ async fn execute_run(
         }
     }
 
-    state.run_manager.remove_sender(run_id);
+    state.run_manager.remove_senders(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
     // Signal drain waiters that this run is done.
@@ -521,6 +521,14 @@ pub async fn stream_run_events(
         .and_then(|v| v.parse::<u64>().ok());
 
     let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
+
+    // Register the live channel BEFORE snapshotting the event log.
+    // This closes the race where events produced between snapshot and
+    // registration would be lost. The overlap (events in both replay
+    // and live channel) is deduplicated by stream_with_replay.
+    let (tx, rx) = event_channel();
+    state.run_manager.register_sender(run_id, tx);
+
     let logged_events = state.run_manager.events_from(run_id, from_id).await;
     let replay_events: Vec<SseEventData> = logged_events
         .into_iter()
@@ -539,9 +547,6 @@ pub async fn stream_run_events(
             run_id.0
         );
     }
-
-    let (tx, rx) = event_channel();
-    state.run_manager.register_sender(run_id, tx);
 
     Ok(RunEventStream::stream_with_replay(rx, replay_events))
 }
