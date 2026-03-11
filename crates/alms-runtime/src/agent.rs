@@ -545,19 +545,21 @@ impl AgentRuntime {
             }
         }
 
-        // Build final tool_calls from accumulated deltas
-        let tool_calls = if tool_call_acc.is_empty() {
+        // Build final tool_calls from accumulated deltas.
+        // Filter out ghost entries (empty id) that can appear if the
+        // accumulator was grown by index but no actual data arrived.
+        let tool_calls: Vec<ToolCall> = tool_call_acc
+            .into_iter()
+            .filter(|(id, _, _)| !id.is_empty())
+            .map(|(id, name, arguments)| ToolCall {
+                id,
+                function: FunctionCall { name, arguments },
+            })
+            .collect();
+        let tool_calls = if tool_calls.is_empty() {
             None
         } else {
-            Some(
-                tool_call_acc
-                    .into_iter()
-                    .map(|(id, name, arguments)| ToolCall {
-                        id,
-                        function: FunctionCall { name, arguments },
-                    })
-                    .collect(),
-            )
+            Some(tool_calls)
         };
 
         let content = if content.is_empty() {
@@ -776,6 +778,45 @@ mod tests {
         assert_eq!(config.temperature, 0.7);
         assert!(!config.system_prompt.is_empty());
         assert_eq!(config.posture, Posture::FullControl);
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_call_emits_token_deltas() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let runtime = AgentRuntime {
+            agent_id: AgentId::new(),
+            config: AgentConfig::default(),
+            llm: LlmClient::new(config).unwrap(),
+            tools: ToolRegistry::new(),
+            workspace: None,
+            event_sender: Some(tx),
+            run_id: None,
+        };
+
+        let request =
+            CompletionRequest::new("test").with_messages(vec![LlmMessage::user("hello world")]);
+
+        let (content, tool_calls, _usage) = runtime.stream_llm_call(request).await.unwrap();
+
+        // Content should be the reassembled mock response
+        assert_eq!(content.as_deref(), Some("[mock] hello world"));
+        // No tool calls from mock
+        assert!(tool_calls.is_none());
+
+        // Verify TokenDelta events were emitted (one per word chunk)
+        let mut deltas = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let RuntimeEvent::TokenDelta { delta } = event {
+                deltas.push(delta);
+            }
+        }
+        assert!(deltas.len() >= 2, "should emit multiple token deltas");
+        let reassembled: String = deltas.concat();
+        assert_eq!(reassembled, "[mock] hello world");
     }
 
     #[tokio::test]

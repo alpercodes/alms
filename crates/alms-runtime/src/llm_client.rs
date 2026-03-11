@@ -155,7 +155,10 @@ impl LlmClient {
                     // Need more data from the network
                     match bytes.next().await {
                         Some(Ok(b)) => {
-                            buf.push_str(&String::from_utf8_lossy(&b));
+                            // Normalize \r\n → \n so the \n\n event separator works
+                            // regardless of whether the upstream sends CRLF or LF.
+                            let text = String::from_utf8_lossy(&b).replace("\r\n", "\n");
+                            buf.push_str(&text);
                         }
                         Some(Err(e)) => {
                             return Some((
