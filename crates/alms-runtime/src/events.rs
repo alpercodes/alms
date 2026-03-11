@@ -21,6 +21,8 @@ pub enum RuntimeEvent {
         ok: bool,
         result: Value,
     },
+    /// A chunk of text from the LLM response, for real-time streaming to the UI.
+    TokenDelta { delta: String },
     /// Approval is required before executing a tool (guarded posture).
     ///
     /// The gateway stores the `decision_tx` and emits an `approval_required`

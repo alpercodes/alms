@@ -223,27 +223,6 @@ impl AgentRuntime {
         Ok(RunOutput { response, usage })
     }
 
-    /// Run with streaming response
-    pub async fn run_stream(
-        &self,
-        session_manager: &SessionManager,
-        context_id: impl AsRef<str>,
-        input: impl Into<String>,
-    ) -> AlmsResult<impl futures::Stream<Item = AlmsResult<String>>> {
-        let context_id = context_id.as_ref();
-        let input = input.into();
-
-        info!(
-            "Running agent {} (streaming) for context {}",
-            self.agent_id.0, context_id
-        );
-
-        let output = self.run(session_manager, context_id, input).await?;
-
-        use futures::stream;
-        Ok(stream::once(async move { Ok(output.response) }))
-    }
-
     /// Build context window for LLM using ContextBuilder.
     ///
     /// For the `sliding-summary` strategy this is async because it may call the
@@ -448,25 +427,31 @@ impl AgentRuntime {
                 .with_temperature(self.config.temperature)
                 .with_max_tokens(self.config.max_tokens);
 
-            let response = self.llm.complete(request).await?;
+            // Stream the LLM call, emitting token_delta events as chunks arrive.
+            // Falls back to buffered mode if streaming fails.
+            let (content, tool_calls, usage) = match self.stream_llm_call(request.clone()).await {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!("Streaming failed, falling back to buffered: {}", e);
+                    let response = self.llm.complete(request).await?;
+                    let usage = response.usage.clone();
+                    let choice = response.choices.into_iter().next().ok_or_else(|| {
+                        alms_core::AlmsError::Runtime("No response from LLM".to_string())
+                    })?;
+                    (choice.message.content, choice.message.tool_calls, usage)
+                }
+            };
 
             // Accumulate token usage from this LLM call
-            if let Some(usage) = &response.usage {
+            if let Some(ref usage) = usage {
                 total_usage.prompt_tokens += usage.prompt_tokens;
                 total_usage.completion_tokens += usage.completion_tokens;
             }
 
-            let choice =
-                response.choices.into_iter().next().ok_or_else(|| {
-                    alms_core::AlmsError::Runtime("No response from LLM".to_string())
-                })?;
-
-            let message = choice.message;
-
-            if let Some(tool_calls) = message.tool_calls {
+            if let Some(tool_calls) = tool_calls {
                 messages.push(LlmMessage {
                     role: "assistant".to_string(),
-                    content: message.content.clone(),
+                    content: content.clone(),
                     tool_calls: Some(tool_calls.clone()),
                     tool_call_id: None,
                 });
@@ -495,8 +480,93 @@ impl AgentRuntime {
                 continue;
             }
 
-            return Ok((message.content.unwrap_or_default(), total_usage));
+            return Ok((content.unwrap_or_default(), total_usage));
         }
+    }
+
+    /// Stream an LLM call, emitting `TokenDelta` events as text chunks arrive.
+    ///
+    /// Accumulates the full response (content + tool calls + usage) from the
+    /// streaming chunks and returns them in the same shape as `complete()`.
+    async fn stream_llm_call(
+        &self,
+        request: CompletionRequest,
+    ) -> AlmsResult<(Option<String>, Option<Vec<ToolCall>>, Option<Usage>)> {
+        use futures::StreamExt;
+
+        let mut stream = self.llm.complete_stream(request).await?;
+
+        let mut content = String::new();
+        let mut tool_call_acc: Vec<(String, String, String)> = Vec::new(); // (id, name, arguments)
+        let mut usage: Option<Usage> = None;
+
+        while let Some(result) = stream.next().await {
+            let chunk = result?;
+
+            // Capture usage from final chunk
+            if chunk.usage.is_some() {
+                usage = chunk.usage;
+            }
+
+            let Some(choice) = chunk.choices.into_iter().next() else {
+                continue;
+            };
+
+            // Accumulate text content and emit token_delta events
+            if let Some(text) = choice.delta.content
+                && !text.is_empty()
+            {
+                content.push_str(&text);
+                if let Some(ref sender) = self.event_sender {
+                    let _ = sender.send(RuntimeEvent::TokenDelta { delta: text });
+                }
+            }
+
+            // Accumulate tool call deltas
+            if let Some(deltas) = choice.delta.tool_calls {
+                for delta in deltas {
+                    let idx = delta.index as usize;
+                    // Grow the accumulator if needed
+                    while tool_call_acc.len() <= idx {
+                        tool_call_acc.push((String::new(), String::new(), String::new()));
+                    }
+                    if let Some(id) = delta.id {
+                        tool_call_acc[idx].0 = id;
+                    }
+                    if let Some(ref func) = delta.function {
+                        if let Some(ref name) = func.name {
+                            tool_call_acc[idx].1 = name.clone();
+                        }
+                        if let Some(ref args) = func.arguments {
+                            tool_call_acc[idx].2.push_str(args);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build final tool_calls from accumulated deltas
+        let tool_calls = if tool_call_acc.is_empty() {
+            None
+        } else {
+            Some(
+                tool_call_acc
+                    .into_iter()
+                    .map(|(id, name, arguments)| ToolCall {
+                        id,
+                        function: FunctionCall { name, arguments },
+                    })
+                    .collect(),
+            )
+        };
+
+        let content = if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        };
+
+        Ok((content, tool_calls, usage))
     }
 
     /// Execute a tool call, emitting tool_start/tool_end events and handling approvals.

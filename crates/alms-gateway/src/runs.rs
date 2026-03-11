@@ -274,14 +274,7 @@ async fn execute_run(
 
     match result {
         Ok(output) => {
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::token_delta(run_id, &output.response),
-                )
-                .await;
+            // token_delta events already emitted during streaming in the agent loop
             state
                 .run_manager
                 .send_event(
@@ -427,6 +420,15 @@ async fn forward_runtime_events(
 ) {
     while let Some(event) = rx.recv().await {
         match event {
+            RuntimeEvent::TokenDelta { delta } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::token_delta(run_id, &delta),
+                    )
+                    .await;
+            }
             RuntimeEvent::ToolStart {
                 invocation_id,
                 tool,

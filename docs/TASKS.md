@@ -20,6 +20,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-10:** Quick fixes (#31, #32, #33, #34): CreateSessionResponse.created now correct, dead coordinator message bus removed, Span::enter confirmed correct, UI agent ID aligned with server. Coordinator integration tests (#30): 8 tests covering dispatch, background lifecycle, cancel, timeout, poll.
 - **2026-03-10:** Symlink bypass hardening (#25): `check_no_traversal()` replaced with `check_sandbox_path()` using `canonicalize()` + prefix check. New config: `tools.sandbox_root` (default "." = safe), `tools.shell_policy` ("sandboxed"/"unrestricted"). 7 new sandbox tests (165 total).
 - **2026-03-11:** SSE multi-subscriber (#44): `event_senders` changed from single sender to `Vec<Sender>` per run. Dead senders pruned via `retain()` on every broadcast. Register-before-replay eliminates snapshot→live gap; dedup filter on `max_replay_id`. 4 new tests (170 total).
+- **2026-03-11:** Token-by-token SSE streaming (#27): `agent_loop` now uses `complete_stream` (SSE) instead of buffered `complete`. Token deltas emitted via `RuntimeEvent::TokenDelta` as chunks arrive. Proper SSE line-buffer parser handles TCP chunk boundaries. Tool call deltas accumulated incrementally. Falls back to buffered on streaming failure. Mock produces word-level chunks. 5 new tests (175 total).
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
 
 ---
@@ -243,10 +244,15 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Optional: "Clear context" button that sends a sentinel message to reset the rolling summary.
 - **Owners:** Atlas
 
-27) True token-by-token SSE streaming
-- agent_loop currently buffers the full LLM response then emits run_finished.
-- Implement streaming via the LLM client's streaming API and emit token_delta events per chunk.
-- Chat UI already consumes token_delta events — backend just needs to produce them.
+27) ~~True token-by-token SSE streaming~~ ✅ DONE (2026-03-11)
+- `agent_loop` now calls `complete_stream` (OpenAI SSE streaming) instead of buffered `complete`.
+- `RuntimeEvent::TokenDelta` emitted per chunk; forwarded to SSE via `forward_runtime_events`.
+- SSE line-buffer parser: handles TCP chunk boundaries via `futures::stream::unfold` accumulator.
+- Streaming tool calls: `ToolCallDelta` accumulated incrementally by `index` across chunks.
+- `stream_options: { include_usage: true }` requests usage in the final streaming chunk.
+- Fallback: if streaming fails, falls back to buffered `complete()` with a warning.
+- Mock mode: produces word-level chunks for realistic streaming behavior in dev/test.
+- 5 new tests: SSE event parsing (content, [DONE], tool_call_delta, usage), mock multi-chunk stream.
 - **Owners:** Atlas
 
 37) Add user.md to agent workspace ✅

@@ -128,6 +128,8 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
 }
 
 impl CompletionRequest {
@@ -139,6 +141,7 @@ impl CompletionRequest {
             temperature: None,
             max_tokens: None,
             stream: None,
+            stream_options: None,
         }
     }
 
@@ -205,6 +208,8 @@ pub struct StreamChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<StreamChoice>,
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 /// Streaming choice
@@ -222,7 +227,34 @@ pub struct Delta {
     pub role: Option<String>,
     pub content: Option<String>,
     #[serde(default)]
-    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+/// Incremental tool call in streaming responses.
+/// Unlike `ToolCall`, all fields except `index` are optional because they
+/// arrive piece-by-piece across multiple chunks.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub function: Option<FunctionCallDelta>,
+}
+
+/// Incremental function call data in streaming responses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionCallDelta {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+}
+
+/// Request `stream_options` to include usage in streaming responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 /// Configuration for LLM client.

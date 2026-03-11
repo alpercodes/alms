@@ -91,7 +91,11 @@ impl LlmClient {
         Ok(completion)
     }
 
-    /// Send a streaming completion request
+    /// Send a streaming completion request.
+    ///
+    /// Returns a stream of `StreamChunk`s. The stream ends naturally when the
+    /// LLM sends `[DONE]`. TCP chunk boundaries are handled by an internal
+    /// line buffer so SSE events split across packets are reassembled correctly.
     pub async fn complete_stream(
         &self,
         request: CompletionRequest,
@@ -99,12 +103,15 @@ impl LlmClient {
         use futures::{StreamExt, stream};
 
         if self.config.mock {
-            let chunk = self.mock_stream_chunk(&request);
-            return Ok(stream::once(async move { Ok(chunk) }).boxed());
+            let chunks = self.mock_stream_chunks(&request);
+            return Ok(stream::iter(chunks.into_iter().map(Ok)).boxed());
         }
 
         let mut request = request;
         request.stream = Some(true);
+        request.stream_options = Some(StreamOptions {
+            include_usage: true,
+        });
 
         let req = self.build_request(&request)?;
 
@@ -127,34 +134,71 @@ impl LlmClient {
             )));
         }
 
-        let stream = response.bytes_stream().map(|result| {
-            result
-                .map_err(|e| AlmsError::Runtime(format!("Stream error: {}", e)))
-                .and_then(|bytes| {
-                    let text = String::from_utf8_lossy(&bytes);
-                    Self::parse_sse_chunk(&text)
-                })
-        });
+        // Buffer raw bytes into complete SSE events. TCP chunks don't align
+        // with SSE event boundaries, so we accumulate lines and yield parsed
+        // StreamChunks only when we see a blank-line separator.
+        let byte_stream = response.bytes_stream();
+        let stream = futures::stream::unfold(
+            (byte_stream, String::new()),
+            |(mut bytes, mut buf)| async move {
+                use futures::StreamExt as _;
+                loop {
+                    // Try to extract a complete SSE event from the buffer
+                    if let Some(pos) = buf.find("\n\n") {
+                        let event_text = buf[..pos].to_string();
+                        buf = buf[pos + 2..].to_string();
+                        if let Some(chunk) = Self::parse_sse_event(&event_text) {
+                            return Some((Ok(chunk), (bytes, buf)));
+                        }
+                        continue; // skip non-data events (comments, [DONE])
+                    }
+                    // Need more data from the network
+                    match bytes.next().await {
+                        Some(Ok(b)) => {
+                            buf.push_str(&String::from_utf8_lossy(&b));
+                        }
+                        Some(Err(e)) => {
+                            return Some((
+                                Err(AlmsError::Runtime(format!("Stream error: {}", e))),
+                                (bytes, buf),
+                            ));
+                        }
+                        None => {
+                            // Stream ended — try to parse any remaining buffered data
+                            if !buf.trim().is_empty() {
+                                let remaining = std::mem::take(&mut buf);
+                                if let Some(chunk) = Self::parse_sse_event(remaining.trim()) {
+                                    return Some((Ok(chunk), (bytes, buf)));
+                                }
+                            }
+                            return None; // stream complete
+                        }
+                    }
+                }
+            },
+        );
 
         Ok(stream.boxed())
     }
 
-    /// Parse a Server-Sent Events chunk
-    fn parse_sse_chunk(chunk: &str) -> AlmsResult<StreamChunk> {
-        for line in chunk.lines() {
+    /// Parse a single SSE event block (one or more `data:` lines) into a StreamChunk.
+    /// Returns `None` for `[DONE]` sentinels and comment-only events.
+    fn parse_sse_event(event: &str) -> Option<StreamChunk> {
+        for line in event.lines() {
             let line = line.trim();
-
-            if line.is_empty() || line.starts_with(":") {
+            if line.is_empty() || line.starts_with(':') {
                 continue;
             }
-
-            if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(data) = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+            {
+                let data = data.trim();
                 if data == "[DONE]" {
-                    return Err(AlmsError::Runtime("Stream complete".to_string()));
+                    return None;
                 }
-
                 match serde_json::from_str::<StreamChunk>(data) {
-                    Ok(chunk) => return Ok(chunk),
+                    Ok(chunk) => return Some(chunk),
                     Err(e) => {
                         warn!("Failed to parse SSE chunk: {} - data: {}", e, data);
                         continue;
@@ -162,8 +206,7 @@ impl LlmClient {
                 }
             }
         }
-
-        Err(AlmsError::Runtime("No valid SSE data found".to_string()))
+        None
     }
 
     /// Quick completion with default model
@@ -207,7 +250,8 @@ impl LlmClient {
         }
     }
 
-    fn mock_stream_chunk(&self, request: &CompletionRequest) -> StreamChunk {
+    /// Produce multiple mock stream chunks (word-by-word) to simulate real streaming.
+    fn mock_stream_chunks(&self, request: &CompletionRequest) -> Vec<StreamChunk> {
         let content = request
             .messages
             .iter()
@@ -216,21 +260,47 @@ impl LlmClient {
             .and_then(|msg| msg.content.clone())
             .unwrap_or_else(|| "(no user input)".to_string());
 
-        StreamChunk {
-            id: "mock-stream".to_string(),
-            object: "chat.completion.chunk".to_string(),
-            created: 0,
-            model: request.model.clone(),
-            choices: vec![StreamChoice {
-                index: 0,
-                delta: Delta {
-                    role: Some("assistant".to_string()),
-                    content: Some(format!("[mock] {}", content)),
-                    tool_calls: None,
+        let full_text = format!("[mock] {}", content);
+        let words: Vec<&str> = full_text.split_inclusive(' ').collect();
+        let mut chunks = Vec::new();
+
+        for (i, word) in words.iter().enumerate() {
+            let is_last = i == words.len() - 1;
+            chunks.push(StreamChunk {
+                id: "mock-stream".to_string(),
+                object: "chat.completion.chunk".to_string(),
+                created: 0,
+                model: request.model.clone(),
+                choices: vec![StreamChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: if i == 0 {
+                            Some("assistant".to_string())
+                        } else {
+                            None
+                        },
+                        content: Some(word.to_string()),
+                        tool_calls: None,
+                    },
+                    finish_reason: if is_last {
+                        Some("stop".to_string())
+                    } else {
+                        None
+                    },
+                }],
+                usage: if is_last {
+                    Some(Usage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                    })
+                } else {
+                    None
                 },
-                finish_reason: Some("stop".to_string()),
-            }],
+            });
         }
+
+        chunks
     }
 
     /// Override the default model, returning a new client.
@@ -284,5 +354,76 @@ mod tests {
         assert_eq!(tool.function.name, "calculator");
         assert_eq!(tool.function.description, "Perform arithmetic operations");
         assert_eq!(tool.tool_type, "function");
+    }
+
+    #[test]
+    fn test_parse_sse_event_content() {
+        let event = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
+        let chunk = LlmClient::parse_sse_event(event).expect("should parse");
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello"));
+    }
+
+    #[test]
+    fn test_parse_sse_event_done() {
+        assert!(LlmClient::parse_sse_event("data: [DONE]").is_none());
+    }
+
+    #[test]
+    fn test_parse_sse_event_tool_call_delta() {
+        let event = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{\"te"}}]},"finish_reason":null}]}"#;
+        let chunk = LlmClient::parse_sse_event(event).expect("should parse");
+        let tc = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
+        assert_eq!(tc[0].index, 0);
+        assert_eq!(tc[0].id.as_deref(), Some("call_1"));
+        assert_eq!(
+            tc[0].function.as_ref().unwrap().name.as_deref(),
+            Some("echo")
+        );
+        assert_eq!(
+            tc[0].function.as_ref().unwrap().arguments.as_deref(),
+            Some("{\"te")
+        );
+    }
+
+    #[test]
+    fn test_parse_sse_event_with_usage() {
+        let event = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        let chunk = LlmClient::parse_sse_event(event).expect("should parse");
+        let usage = chunk.usage.expect("should have usage");
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn test_mock_stream_produces_multiple_chunks() {
+        use futures::StreamExt;
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+        let request =
+            CompletionRequest::new("test").with_messages(vec![LlmMessage::user("hello world")]);
+        let mut stream = client.complete_stream(request).await.unwrap();
+
+        let mut chunks = Vec::new();
+        while let Some(result) = stream.next().await {
+            chunks.push(result.unwrap());
+        }
+
+        // "[mock] hello world" split by words = ["[mock] ", "hello ", "world"]
+        assert!(chunks.len() >= 2, "mock should produce multiple chunks");
+
+        // Reassemble content
+        let full: String = chunks
+            .iter()
+            .filter_map(|c| c.choices.first()?.delta.content.as_deref())
+            .collect();
+        assert_eq!(full, "[mock] hello world");
+
+        // Last chunk should have finish_reason and usage
+        let last = chunks.last().unwrap();
+        assert_eq!(last.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert!(last.usage.is_some());
     }
 }
