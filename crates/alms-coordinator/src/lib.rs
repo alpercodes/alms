@@ -546,16 +546,39 @@ async fn run_subagent(
 const DEFAULT_SUBAGENT_PROMPT: &str =
     "You are a general-purpose assistant. Complete the given task thoroughly and accurately.";
 
+/// Config extracted from an agent registry record for a named subagent.
+struct SubagentRecordConfig {
+    system_prompt: Option<String>,
+    model: Option<String>,
+    posture: Option<String>,
+}
+
 /// Build an `AgentConfig` for a subagent. Named subagents get their config
 /// from the agent registry; ephemeral subagents use a default prompt.
 /// Both inherit sandbox settings from the parent's base config.
-fn agent_config_for_subagent(system_prompt: Option<String>, base: &AgentConfig) -> AgentConfig {
-    AgentConfig {
+fn agent_config_for_subagent(
+    record: Option<SubagentRecordConfig>,
+    base: &AgentConfig,
+) -> (AgentConfig, Option<String>) {
+    let (system_prompt, model, posture_str) = match record {
+        Some(r) => (r.system_prompt, r.model, r.posture),
+        None => (None, None, None),
+    };
+
+    let posture = match posture_str.as_deref() {
+        Some("guarded") => alms_runtime::Posture::Guarded,
+        Some("full_control") => alms_runtime::Posture::FullControl,
+        _ => alms_runtime::Posture::FullControl,
+    };
+
+    let config = AgentConfig {
         system_prompt: system_prompt.unwrap_or_else(|| DEFAULT_SUBAGENT_PROMPT.to_string()),
+        posture,
         sandbox_root: base.sandbox_root.clone(),
         shell_policy: base.shell_policy.clone(),
         ..AgentConfig::default()
-    }
+    };
+    (config, model)
 }
 
 /// Run the actual agent loop for a subagent.
@@ -580,7 +603,7 @@ async fn run_agent_loop(
     workspace_dir: Option<&std::path::Path>,
 ) -> AlmsResult<RunOutput> {
     // Derive identity and config based on whether the subagent is named
-    let (agent_id, context_id, config, attach_workspace) =
+    let (agent_id, context_id, config, model_override, attach_workspace) =
         if let Some(ref name) = request.subagent_name {
             // Named: deterministic identity, look up agent registry for config
             let parent_as_agent = AgentId(request.parent_session.0);
@@ -588,21 +611,36 @@ async fn run_agent_loop(
             let stable_ctx = format!("subagent_{}_{}", request.parent_session.0, name);
 
             // Look up agent record in registry for system_prompt/model/posture
-            let agent_system_prompt = session_manager
+            let record_config = session_manager
                 .store()
                 .and_then(|store| store.load_agent_by_name(name).ok())
                 .flatten()
-                .and_then(|record| record.system_prompt);
+                .map(|record| {
+                    debug!("Loaded agent record for named subagent '{name}'");
+                    SubagentRecordConfig {
+                        system_prompt: record.system_prompt,
+                        model: record.model,
+                        posture: record.posture,
+                    }
+                })
+                .or_else(|| {
+                    warn!(
+                        "Named subagent '{name}' not found in agent registry — using defaults. \
+                         Create it with: alms agent create --name {name}"
+                    );
+                    None
+                });
 
-            let config = agent_config_for_subagent(agent_system_prompt, base_agent_config);
-            (stable_id, stable_ctx, config, true)
+            let (config, model) = agent_config_for_subagent(record_config, base_agent_config);
+            (stable_id, stable_ctx, config, model, true)
         } else {
             // Ephemeral: fresh each invocation
-            let config = agent_config_for_subagent(None, base_agent_config);
+            let (config, _) = agent_config_for_subagent(None, base_agent_config);
             (
                 AgentId::new(),
                 format!("subagent_{}", task_id.0),
                 config,
+                None,
                 false,
             )
         };
@@ -610,13 +648,21 @@ async fn run_agent_loop(
     // Create a per-subagent event channel
     let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
 
-    let mut runtime = AgentRuntime::new(agent_id, config, llm.clone()).with_event_sender(sub_tx);
+    // Apply model override from agent registry
+    let subagent_llm = if let Some(model) = model_override {
+        info!("Named subagent using model override: {model}");
+        llm.clone().with_model(model)
+    } else {
+        llm.clone()
+    };
+
+    let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm).with_event_sender(sub_tx);
 
     // Attach workspace for named subagents: {workspace_dir}/{name}/
     if attach_workspace && let (Some(ws_dir), Some(name)) = (workspace_dir, &request.subagent_name)
     {
         let subagent_ws_dir = ws_dir.join(name);
-        let workspace = alms_runtime::AgentWorkspace::new(subagent_ws_dir, agent_id);
+        let workspace = alms_runtime::AgentWorkspace::with_dir(subagent_ws_dir);
         runtime = runtime.with_workspace(workspace);
     }
 

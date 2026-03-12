@@ -565,15 +565,42 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 ## P13 — Autonomous Subagents
 
 > Design doc: `docs/autonomous-subagents-design.md`
-> Goal: subagents that behave like autonomous colleagues — own workspace, recursive spawning, event-driven completion notification, progress reporting.
-> Logical implementation order: 70 → 71 → 72 → 73 → 74.
+> Goal: subagents that behave like autonomous colleagues — own workspace, registry-based config, context isolation, recursive spawning.
+
+### Phase 1 — Complete the autonomous flow
 
 70) ~~Subagent workspaces + registry lookup~~ ✅ DONE
-- `system_prompt` removed from `invoke_agent` tool and `SubagentDispatcher` trait.
-- Named subagents looked up in agent registry (`load_agent_by_name`) for config.
-- Workspace attached at `{workspace_dir}/{name}/` via `Coordinator.with_workspace_dir()`.
+- `system_prompt` removed from `invoke_agent` tool parameters.
+- Named subagents looked up in agent registry for config (system_prompt, model, posture).
+- Workspace attached at `{workspace_dir}/{name}/` via `AgentWorkspace::with_dir()`.
+- Model override applied via `llm.with_model()`. Posture from agent record respected.
 - Ephemeral (unnamed) subagents: default config, no workspace.
 - **Owners:** Atlas
+
+81) ~~`read_subagent_session` tool~~ ✅ DONE
+- Tool: `read_subagent_session(name, last_n?, summary_only?)`.
+- Derives deterministic session ID, reads from `SessionManager`. 8 tests.
+- **Owners:** Atlas
+
+84) `alms agent create` creates workspace directory
+- When an agent is created via CLI or API, create `{workspace_dir}/{name}/` so parent can write workspace files (personality.md, goals.md, etc.) before the first invocation.
+- **Owners:** Atlas
+
+82) Truncate `invoke_agent` tool_results in parent session
+- When `invoke_agent` returns, store a short summary in the parent's tool_result (not the full subagent response).
+- Full response stays in the subagent's own session, accessible via `read_subagent_session`.
+- Short responses (< 500 tokens) pass through unsummarized.
+- **Owners:** Atlas
+
+83) System prompt addition for subagent context model
+- When subagent tools are registered, add instructions to parent's system prompt explaining the context model: invoke_agent returns summaries, read_subagent_session for full details.
+- **Owners:** Atlas
+
+75) Validate `name` in invoke_agent against `validate_agent_name()` rules
+- Prevent invalid names from silently creating broken sessions.
+- **Owners:** Atlas
+
+### Phase 2 — Autonomous polish
 
 71) Recursive subagent spawning — subagents can spawn sub-subagents
 - Wire `invoke_agent` and `get_task_result` tools into subagent runtimes in `run_agent_loop`.
@@ -587,10 +614,15 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - `get_task_result` tool remains as explicit fallback.
 - **Owners:** Atlas
 
+77) Guard concurrent invocations of same named subagent
+- Reject or queue if the same named subagent is already running.
+- **Owners:** Atlas
+
+### Phase 3 — Advanced orchestration
+
 73) `report_progress` tool for intermediate status updates
 - Named subagents can call `report_progress(status, progress_pct?)` during their loop.
-- Progress stored on `SubagentHandle`. Retrievable via `poll_task` or auto-injected into parent context.
-- Emit `RuntimeEvent::SubagentProgress` for UI display.
+- Progress stored on `SubagentHandle`. Emit `RuntimeEvent::SubagentProgress` for UI.
 - **Owners:** Atlas
 
 74) SubagentProgress SSE event type
@@ -598,19 +630,13 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - UI shows inline subagent status (e.g., "reviewer: analyzing file 3/7").
 - **Owners:** Atlas
 
-81) ~~`read_subagent_session` tool~~ ✅ DONE
-- Tool: `read_subagent_session(name, last_n?, summary_only?)`.
-- Derives deterministic session ID, reads from `SessionManager`. 8 tests.
+78) Task decomposition — parent LLM emits plans, coordinator breaks into subtasks
 - **Owners:** Atlas
 
-82) Truncate `invoke_agent` tool_results in parent session
-- When `invoke_agent` returns, store a short summary in the parent's tool_result (not the full subagent response).
-- Full response stays in the subagent's own session, accessible via `read_subagent_session`.
-- Short responses (< 500 tokens) pass through unsummarized.
+79) Subagent clarification requests — subagent can ask parent questions mid-loop
 - **Owners:** Atlas
 
-83) System prompt addition for subagent context model
-- When subagent tools are registered, add instructions to parent's system prompt explaining the context model: invoke_agent returns summaries, read_subagent_session for full details.
+80) Cost budget per subagent tree — token budget enforcement across hierarchy
 - **Owners:** Atlas
 
 ---

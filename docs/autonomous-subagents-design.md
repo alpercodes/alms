@@ -305,34 +305,34 @@ The session persistence means the reviewer remembers everything from previous co
 
 ## Implementation Plan
 
-### Phase 1 — Autonomous Foundation (minimal viable)
+### Phase 1 — Complete the autonomous flow
 
-| # | Task | Effort | Depends on |
-|---|------|--------|------------|
-| 70 | Subagent workspaces — agent registry lookup + workspace attach in `run_agent_loop` | **Done** | — |
-| 71 | Recursive subagent spawning — wire `invoke_agent`/`get_task_result` into subagent runtimes, add `max_depth` guard | Medium | — |
-| 72 | Auto-inject completed background results — check pending results at top of `agent_loop` iteration, inject as system messages | Medium | — |
-| 81 | `read_subagent_session` tool — on-demand read of a named subagent's conversation history | **Done** | — |
-| 82 | Truncate `invoke_agent` tool_results to short summaries in parent session (full response stays in subagent session only) | Small | 81 |
-| 83 | System prompt addition — instruct parent LLM about subagent context model (summaries in context, read_subagent_session for details) | Small | 81, 82 |
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 70 | Registry lookup + workspace attach | **Done** | system_prompt/model/posture from registry, workspace at `{workspace_dir}/{name}/` |
+| 81 | `read_subagent_session` tool | **Done** | On-demand context retrieval, 8 tests |
+| 84 | `alms agent create` creates workspace dir | Todo | Parent can write files before first invocation |
+| 82 | Truncate invoke_agent results in parent | Todo | Short summary in parent, full in subagent session |
+| 83 | System prompt addition for context model | Todo | Instruct parent LLM about read_subagent_session |
+| 75 | Validate `name` in invoke_agent | Todo | Validate against `validate_agent_name()` rules |
 
-### Phase 2 — UX Polish
+### Phase 2 — Autonomous polish
 
-| # | Task | Effort | Depends on |
-|---|------|--------|------------|
-| 73 | `report_progress` tool for intermediate status updates | Small | — |
-| 74 | `SubagentProgress` SSE event type — UI shows subagent status inline | Small | 73 |
-| 75 | Validate `name` param against `validate_agent_name()` rules | Small | — |
-| ~~76~~ | ~~Warn on `system_prompt` drift~~ — N/A, system_prompt removed from invoke_agent | — | — |
-| 77 | Guard against concurrent invocations of the same named subagent | Small | — |
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 71 | Recursive subagent spawning + max_depth | Todo | Subagents spawn sub-subagents |
+| 72 | Auto-inject completed background results | Todo | Event-driven completion, replace polling |
+| 77 | Guard concurrent same-name invocations | Todo | Reject/queue duplicate invocations |
 
-### Phase 3 — Advanced Orchestration (future)
+### Phase 3 — Advanced orchestration (future)
 
-| # | Task | Effort | Depends on |
-|---|------|--------|------------|
-| 78 | Task decomposition — parent LLM can emit a "plan" that the coordinator breaks into subtasks | Large | 70, 71 |
-| 79 | Subagent-to-parent clarification requests — subagent can "ask" the parent a question mid-loop | Large | 72 |
-| 80 | Cost budget per subagent tree — parent sets a token budget, coordinator enforces it across the tree | Medium | 71 |
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 73 | `report_progress` tool | Todo | Intermediate status updates |
+| 74 | SubagentProgress SSE event | Todo | UI shows subagent activity inline |
+| 78 | Task decomposition | Todo | Plans → subtasks |
+| 79 | Subagent clarification requests | Todo | Subagent asks parent mid-loop |
+| 80 | Cost budget per tree | Todo | Token budget enforcement |
 
 ---
 
@@ -342,12 +342,12 @@ The session persistence means the reviewer remembers everything from previous co
 |---|---|---|---|
 | Subagent runs full multi-step loop | Yes | Yes (agent_loop) | Yes |
 | Persistent session across invocations | N/A (ephemeral) | Yes (name param) | Yes |
-| Subagent has own workspace/memory | No | No | Yes (#70) |
+| Subagent has own workspace/memory | No | Yes (#70) | Yes |
 | Recursive subagents | Yes (agents spawn agents) | No | Yes (#71) |
 | Completion notification | Automatic (foreground block) | Polling (background) | Auto-inject (#72) |
 | Progress reporting | Via SSE events | Tool events forwarded | Structured progress (#73) |
 | Parent-subagent multi-turn | No (one-shot) | Yes (via name param) | Yes |
-| Context isolation | Implicit (ephemeral) | No (full results in parent) | Yes — summaries in parent, `read_subagent_session` for detail (#81-83) |
+| Context isolation | Implicit (ephemeral) | Partial (#81 done, #82-83 todo) | Yes — summaries + `read_subagent_session` |
 | Task decomposition | Manual (parent decides) | Manual | Manual (Phase 3) |
 
 ALMS's model is actually more capable than Claude Code's in two respects:
@@ -366,12 +366,12 @@ ALMS's model is actually more capable than Claude Code's in two respects:
 
 4. **Same `agent_loop` for all levels.** No special "orchestrator loop" vs "worker loop". Every agent — top-level, subagent, sub-subagent — runs the same `agent_loop` with the same tool execution pipeline. This is the current design and it's correct.
 
-5. **Workspace directory derives from parent.** Subagent workspaces live under the parent's workspace directory. This creates a natural tree that mirrors the agent hierarchy and makes cleanup straightforward (delete parent workspace → delete all subagent workspaces).
+5. **Workspace directory is name-based, not UUID-based.** Named subagent workspaces live at `{workspace_dir}/{name}/` — a human-readable path the parent can write to via `fs_write` or `shell_exec`. The `AgentWorkspace::with_dir()` constructor skips the UUID subdirectory that top-level agents use.
 
 6. **Context isolation by default, detail on demand.** The parent's context window contains only summaries of subagent results, not full transcripts. The `read_subagent_session` tool lets the parent pull in full context from any named subagent when it decides it needs it. This keeps the parent's context lean while preserving access to everything. Short responses (< 500 tokens) pass through unsummarized.
 
 ---
 
 *Design Date: 2026-03-12*
-*Status: In progress — #70 (workspaces) and #81 (read_subagent_session) done*
+*Status: In progress — Phase 1: #70 and #81 done, #84/#82/#83/#75 remaining*
 *Author: Atlas + Alper*

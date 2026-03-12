@@ -62,6 +62,10 @@ impl WorkspaceFile {
 }
 
 impl AgentWorkspace {
+    /// Create a workspace rooted at `{base_dir}/{agent_id}/`.
+    ///
+    /// This is the standard constructor used for top-level agents where the
+    /// workspace base directory is shared and each agent gets a UUID subdir.
     pub fn new(base_dir: impl Into<PathBuf>, agent_id: AgentId) -> Self {
         Self {
             base_dir: base_dir.into(),
@@ -69,9 +73,31 @@ impl AgentWorkspace {
         }
     }
 
-    /// Get the workspace directory for this agent
+    /// Create a workspace that uses `dir` directly — no UUID subdirectory.
+    ///
+    /// Used for named subagents whose workspace lives at a human-readable
+    /// path like `{workspace_dir}/{name}/` so the parent agent can write
+    /// files via `fs_write` or `shell_exec` without knowing the UUID.
+    pub fn with_dir(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            base_dir: dir.into(),
+            // Sentinel: agent_id is unused since dir() is overridden by
+            // the fact that base_dir IS the final directory. We use a nil
+            // UUID so join("00000...") is never called — see dir() below.
+            agent_id: AgentId(uuid::Uuid::nil()),
+        }
+    }
+
+    /// Get the workspace directory for this agent.
+    ///
+    /// For standard workspaces (`new`): `{base_dir}/{agent_id}`.
+    /// For direct workspaces (`with_dir`): `{base_dir}` as-is.
     pub fn dir(&self) -> PathBuf {
-        self.base_dir.join(self.agent_id.0.to_string())
+        if self.agent_id.0.is_nil() {
+            self.base_dir.clone()
+        } else {
+            self.base_dir.join(self.agent_id.0.to_string())
+        }
     }
 
     /// Ensure the workspace directory exists
@@ -295,6 +321,19 @@ mod tests {
         assert!(prefix.contains("Help with Rust"));
         assert!(prefix.contains("About the User"));
         assert!(prefix.contains("Alper"));
+    }
+
+    #[test]
+    fn test_with_dir_uses_path_directly() {
+        let dir = TempDir::new().unwrap();
+        let ws_dir = dir.path().join("reviewer");
+        let ws = AgentWorkspace::with_dir(&ws_dir);
+        // dir() should return the exact path, no UUID appended
+        assert_eq!(ws.dir(), ws_dir);
+        ws.write_file(WorkspaceFile::Goals, "Review code").unwrap();
+        // File should be at {ws_dir}/goals.md, not {ws_dir}/{uuid}/goals.md
+        assert!(ws_dir.join("goals.md").exists());
+        assert_eq!(ws.read_file(WorkspaceFile::Goals).unwrap(), "Review code");
     }
 
     #[test]

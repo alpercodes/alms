@@ -94,6 +94,24 @@ All critical and medium bugs from that review were fixed in commit 437de9b. Rema
 
 - **Guarded posture + parallel tool calls** — All approval requests fire simultaneously via `join_all` rather than sequentially. UX issue when LLM issues multiple tool calls.
 
+## From review of #70 (subagent workspaces + registry lookup) — 2026-03-12
+
+- ~~**[coordinator/lib.rs] C1 Critical** — Workspace path includes hidden UUID subdirectory. `AgentWorkspace::dir()` always appends `{agent_id}`, so path becomes `{workspace_dir}/{name}/{uuid}/` instead of `{workspace_dir}/{name}/`.~~ **Fixed**: Added `AgentWorkspace::with_dir()` constructor that uses the path directly, no UUID subdirectory.
+
+- ~~**[coordinator/lib.rs] C2 Critical** — Registry lookup only extracts `system_prompt` — `model` and `posture` from `AgentRecord` are silently discarded.~~ **Fixed**: Now extracts full record; model applied via `llm.with_model()`, posture applied to `AgentConfig`.
+
+- **[coordinator/lib.rs] S1 Medium** — No test covers the registry lookup path. `test_coordinator()` uses in-memory `SessionManager` with no SQLite store, so `store()` returns `None` and the lookup is never exercised. *Deferred: needs test with `SessionManager::with_sqlite` and inserted agent record.*
+
+- **[coordinator/lib.rs] S2 Low** — `agent_config_for_subagent` uses `..AgentConfig::default()` for non-inherited fields (temperature, max_tokens, max_iterations, context_config). Subagents get hardcoded defaults regardless of parent config. *Deferred: intentional safe defaults for now. May revisit when per-agent temperature/max_tokens are added to `AgentRecord`.*
+
+- **[invoke_agent_tool.rs] S4 Low** — Test `test_system_prompt_optional` name is stale after `system_prompt` removal. Body is still valid. *Deferred: rename next time file is touched.*
+
+- **[TASKS.md] S5 Low** — #70 description inaccurately says `system_prompt` was removed from `SubagentDispatcher` trait. It was removed from the `invoke_agent` tool's JSON schema parameters; the trait never had it as a parameter. *Deferred: doc-only fix.*
+
+- **[CLAUDE.md] N1 Low** — Line 124 "Pure hierarchy multi-agent" bullet is extremely long. Should split into sub-bullets. *Deferred: cosmetic.*
+
+- **[coordinator/lib.rs] N3 Low** — Test `test_named_subagent_persistent_session` doesn't verify workspace attachment (test coordinator has `workspace_dir: None`). Comment could note this limitation. *Deferred: cosmetic.*
+
 ## From review of named subagent sessions (persistent invoke_agent) — 2026-03-12
 
 - **[lib.rs] S2 Medium** — Race condition with concurrent named subagent invocations. If the same named subagent is invoked twice in parallel (e.g., via `join_all` tool calls), both derive the same `(agent_id, context_id)` and write to the same session concurrently. Could corrupt session history. *Deferred: would require a `DashSet<String>` of active named subagents or documenting as unsupported. No user-facing scenario triggers this today.*
