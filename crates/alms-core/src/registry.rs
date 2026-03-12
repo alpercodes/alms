@@ -79,6 +79,14 @@ pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
         }
     }
 
+    // Reserved names that collide with API sub-route segments
+    const RESERVED_NAMES: &[&str] = &["default", "workspace"];
+    if RESERVED_NAMES.contains(&name) {
+        return Err(AlmsError::InvalidConfig(format!(
+            "agent name '{name}' is reserved (conflicts with API routes)"
+        )));
+    }
+
     Ok(())
 }
 
@@ -88,12 +96,19 @@ mod tests {
 
     #[test]
     fn test_valid_names() {
-        assert!(validate_agent_name("default").is_ok());
         assert!(validate_agent_name("atlas").is_ok());
         assert!(validate_agent_name("my-agent-1").is_ok());
         assert!(validate_agent_name("a").is_ok());
         assert!(validate_agent_name("agent-v2").is_ok());
         assert!(validate_agent_name("a1b2c3").is_ok());
+    }
+
+    #[test]
+    fn test_reserved_names() {
+        let err = validate_agent_name("default").unwrap_err();
+        assert!(err.to_string().contains("reserved"));
+        let err = validate_agent_name("workspace").unwrap_err();
+        assert!(err.to_string().contains("reserved"));
     }
 
     #[test]

@@ -459,7 +459,7 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
     let now = chrono::Utc::now();
     let record = AgentRecord {
         id: agent_id,
-        name: "default".to_string(),
+        name: "main".to_string(),
         description: "Auto-migrated default agent".to_string(),
         model: None,
         system_prompt: None,
@@ -550,7 +550,7 @@ mod tests {
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].id, agent_id);
-        assert_eq!(agents[0].name, "default");
+        assert_eq!(agents[0].name, "main");
         assert!(agents[0].is_default);
     }
 

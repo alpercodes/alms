@@ -3,7 +3,7 @@ use alms_core::{
     AgentId, AgentRecord, CreateJobRequest, CreateRunRequest, CreateRunResponse, RunInput,
     RunStatusResponse, SessionId, validate_agent_name,
 };
-use alms_session::{Session, SessionStatus, SqliteStore};
+use alms_session::{Session, SqliteStore};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{error, info, warn};
@@ -31,7 +31,12 @@ enum Commands {
     /// Check system health
     Health {
         /// Gateway URL to check
-        #[arg(short, long, default_value = "http://127.0.0.1:8080")]
+        #[arg(
+            short,
+            long,
+            default_value = "http://127.0.0.1:8080",
+            env = "ALMS_GATEWAY_URL"
+        )]
         url: String,
         /// Output as JSON instead of human-readable text
         #[arg(long)]
@@ -287,6 +292,12 @@ fn fmt_time(dt: &chrono::DateTime<chrono::Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M UTC").to_string()
 }
 
+/// Truncate a UUID string to the first 8 characters for display.
+fn short_id(id: &impl std::fmt::Display) -> String {
+    let s = id.to_string();
+    s.get(..8).unwrap_or(&s).to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Agent command handlers
 // ---------------------------------------------------------------------------
@@ -306,7 +317,7 @@ fn agent_list(store: &SqliteStore, json: bool) -> anyhow::Result<()> {
         "NAME", "ID", "MODEL", "DEFAULT"
     );
     for a in &agents {
-        let id_short = &a.id.to_string()[..8];
+        let id_short = short_id(&a.id);
         let model = a.model.as_deref().unwrap_or("(server default)");
         let default = if a.is_default { "*" } else { "" };
         println!(
@@ -513,20 +524,14 @@ fn session_list(store: &SqliteStore, agent: Option<String>, json: bool) -> anyho
         "SESSION", "AGENT", "STATUS", "MSGS", "CREATED"
     );
     for s in &sessions {
-        let id_str = s.id.0.to_string();
-        let id_short = &id_str[..8];
-        let agent_short = &s.agent_id.to_string()[..8];
-        let status = match s.status {
-            SessionStatus::Active => "active",
-            SessionStatus::Idle => "idle",
-            SessionStatus::Archived => "archived",
-        };
+        let id_short = short_id(&s.id.0);
+        let agent_short = short_id(&s.agent_id);
         let msg_count = store.message_count(s.id).unwrap_or(0);
         println!(
             "{:<12} {:<12} {:<10} {:<8} {:<22} {}",
             id_short,
             agent_short,
-            status,
+            s.status,
             msg_count,
             fmt_time(&s.created_at.0),
             fmt_time(&s.last_activity.0),
@@ -554,24 +559,16 @@ fn session_show(store: &SqliteStore, session_id_str: &str, json: bool) -> anyhow
         return Ok(());
     }
 
-    let status = match session.status {
-        SessionStatus::Active => "active",
-        SessionStatus::Idle => "idle",
-        SessionStatus::Archived => "archived",
-    };
-
     println!("Session:       {}", session.id.0);
     println!("Agent:         {}", session.agent_id);
-    println!("Context:       {}", session.context_id);
-    println!("Status:        {}", status);
-    println!("Messages:      {}", msg_count);
-    println!("Created:       {}", fmt_time(&session.created_at.0));
-    println!("Last Activity: {}", fmt_time(&session.last_activity.0));
-
-    // Try to resolve agent name for a friendlier display
     if let Ok(Some(agent)) = store.load_agent_by_id(session.agent_id) {
         println!("Agent Name:    {}", agent.name);
     }
+    println!("Context:       {}", session.context_id);
+    println!("Status:        {}", session.status);
+    println!("Messages:      {}", msg_count);
+    println!("Created:       {}", fmt_time(&session.created_at.0));
+    println!("Last Activity: {}", fmt_time(&session.last_activity.0));
     Ok(())
 }
 
@@ -612,16 +609,16 @@ fn api_url(base: &str, path: &str) -> String {
 }
 
 /// Build a reqwest client with optional auth token.
-fn api_client() -> reqwest::Client {
+fn api_client() -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
     if let Ok(token) = std::env::var("ALMS_AUTH_TOKEN") {
         let mut headers = reqwest::header::HeaderMap::new();
-        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
-            headers.insert(reqwest::header::AUTHORIZATION, val);
-        }
+        let val = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|_| anyhow::anyhow!("ALMS_AUTH_TOKEN contains invalid characters for an HTTP header"))?;
+        headers.insert(reqwest::header::AUTHORIZATION, val);
         builder = builder.default_headers(headers);
     }
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    Ok(builder.build().unwrap_or_else(|_| reqwest::Client::new()))
 }
 
 /// Parse an HTTP error response body into a user-friendly message.
@@ -639,7 +636,7 @@ fn parse_api_error(status: reqwest::StatusCode, body: &str) -> String {
 
 /// Send a GET request and return the response body as JSON Value.
 async fn api_get(base_url: &str, path: &str) -> anyhow::Result<serde_json::Value> {
-    let client = api_client();
+    let client = api_client()?;
     let url = api_url(base_url, path);
     let resp = client.get(&url).send().await.map_err(|e| {
         if e.is_connect() {
@@ -664,7 +661,7 @@ async fn api_post(
     path: &str,
     body: &impl serde::Serialize,
 ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
-    let client = api_client();
+    let client = api_client()?;
     let url = api_url(base_url, path);
     let resp = client.post(&url).json(body).send().await.map_err(|e| {
         if e.is_connect() {
@@ -685,7 +682,7 @@ async fn api_post(
 
 /// Send a DELETE request and return the status code.
 async fn api_delete(base_url: &str, path: &str) -> anyhow::Result<reqwest::StatusCode> {
-    let client = api_client();
+    let client = api_client()?;
     let url = api_url(base_url, path);
     let resp = client.delete(&url).send().await.map_err(|e| {
         if e.is_connect() {
@@ -768,9 +765,9 @@ async fn run_list(url: &str, session: &str, limit: usize, json: bool) -> anyhow:
         "RUN", "SESSION", "AGENT", "STATUS"
     );
     for r in &runs {
-        let run_short = &r.run_id.0.to_string()[..8];
-        let sess_short = &r.session_id.0.to_string()[..8];
-        let agent_short = &r.agent_id.to_string()[..8];
+        let run_short = short_id(&r.run_id.0);
+        let sess_short = short_id(&r.session_id.0);
+        let agent_short = short_id(&r.agent_id);
         let status = format!("{:?}", r.status).to_lowercase();
         let started = r
             .started_at
@@ -848,8 +845,8 @@ fn job_list(store: &SqliteStore, agent: Option<String>, json: bool) -> anyhow::R
         "JOB", "AGENT", "SCHEDULE", "STATUS", "NEXT RUN"
     );
     for j in &jobs {
-        let id_short = &j.id.to_string()[..8];
-        let agent_short = &j.agent_id.to_string()[..8];
+        let id_short = short_id(&j.id);
+        let agent_short = short_id(&j.agent_id);
         let schedule = match &j.schedule {
             JobSchedule::Once { run_at } => format!("once:{}", fmt_time(run_at)),
             JobSchedule::Recurring { cron } => format!("cron:{cron}"),
@@ -936,8 +933,7 @@ async fn job_create(
 }
 
 async fn job_cancel(url: &str, job_id_str: &str, json: bool) -> anyhow::Result<()> {
-    let _uuid =
-        uuid::Uuid::parse_str(job_id_str).map_err(|_| anyhow::anyhow!("Invalid job UUID"))?;
+    uuid::Uuid::parse_str(job_id_str).map_err(|_| anyhow::anyhow!("Invalid job UUID"))?;
     api_delete(url, &format!("jobs/{job_id_str}")).await?;
     if json {
         println!(
@@ -959,11 +955,14 @@ fn parse_schedule(s: &str) -> anyhow::Result<JobSchedule> {
         return Ok(JobSchedule::Once { run_at });
     }
     if let Some(rest) = s.strip_prefix("cron:") {
-        let cron = rest.trim().to_string();
-        if cron.split_whitespace().count() != 5 {
-            anyhow::bail!("Cron expression must have exactly 5 fields");
-        }
-        return Ok(JobSchedule::Recurring { cron });
+        let cron_str = rest.trim().to_string();
+        // Validate by parsing with the cron crate (6-field: sec prepended).
+        // This matches what the gateway scheduler does in cron_utils.rs.
+        let six_field = format!("0 {cron_str}");
+        six_field.parse::<cron::Schedule>().map_err(|e| {
+            anyhow::anyhow!("Invalid cron expression '{cron_str}': {e}")
+        })?;
+        return Ok(JobSchedule::Recurring { cron: cron_str });
     }
     anyhow::bail!("Invalid schedule format. Use 'once:2026-03-15T09:00:00Z' or 'cron:0 9 * * 1-5'");
 }
@@ -1023,7 +1022,12 @@ async fn main() -> anyhow::Result<()> {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await?;
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&body)?);
+                        // Wrap with "ok" key for consistent envelope across success/error
+                        let mut envelope = body;
+                        if let Some(obj) = envelope.as_object_mut() {
+                            obj.insert("ok".into(), serde_json::json!(true));
+                        }
+                        println!("{}", serde_json::to_string_pretty(&envelope)?);
                     } else {
                         println!("ALMS Gateway is healthy");
                         if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
@@ -1036,7 +1040,7 @@ async fn main() -> anyhow::Result<()> {
                     if json {
                         println!(
                             "{}",
-                            serde_json::json!({ "error": format!("HTTP {status}") })
+                            serde_json::json!({ "ok": false, "error": format!("HTTP {status}") })
                         );
                     } else {
                         eprintln!("Health check failed: HTTP {}", status);
@@ -1047,7 +1051,7 @@ async fn main() -> anyhow::Result<()> {
                     if json {
                         println!(
                             "{}",
-                            serde_json::json!({ "error": format!("Cannot reach gateway: {e}") })
+                            serde_json::json!({ "ok": false, "error": format!("Cannot reach gateway: {e}") })
                         );
                     } else {
                         eprintln!("Cannot reach gateway at {}: {}", health_url, e);
@@ -1465,6 +1469,34 @@ mod tests {
         assert!(err.to_string().contains("not found"));
     }
 
+    #[test]
+    fn test_session_list_json() {
+        let store = new_store();
+        let agent = make_agent(&store, "json-agent");
+        make_session(&store, agent.id);
+        // Just verify it doesn't panic — JSON serialization works
+        session_list(&store, None, true).unwrap();
+    }
+
+    #[test]
+    fn test_session_show_json() {
+        let store = new_store();
+        let agent = make_agent(&store, "json-show-agent");
+        let session = make_session(&store, agent.id);
+        // Exercises the as_object_mut().unwrap() path — verifies Session
+        // serializes to a JSON object (not array/primitive)
+        session_show(&store, &session.id.0.to_string(), true).unwrap();
+    }
+
+    #[test]
+    fn test_session_delete_json() {
+        let store = new_store();
+        let agent = make_agent(&store, "json-del-agent");
+        let session = make_session(&store, agent.id);
+        session_delete(&store, &session.id.0.to_string(), true).unwrap();
+        assert!(store.load_session_by_id(session.id).unwrap().is_none());
+    }
+
     // ── Schedule parsing tests ───────────────────────────────────────────
 
     #[test]
@@ -1498,7 +1530,13 @@ mod tests {
     #[test]
     fn test_parse_schedule_invalid_cron_fields() {
         let err = parse_schedule("cron:* *").unwrap_err();
-        assert!(err.to_string().contains("5 fields"));
+        assert!(err.to_string().contains("Invalid cron expression"));
+    }
+
+    #[test]
+    fn test_parse_schedule_garbage_cron_rejected() {
+        let err = parse_schedule("cron:abc def ghi jkl mno").unwrap_err();
+        assert!(err.to_string().contains("Invalid cron expression"));
     }
 
     #[test]
@@ -1610,5 +1648,60 @@ mod tests {
         let mut buf = Vec::new();
         generate(Shell::PowerShell, &mut cmd, "alms", &mut buf);
         assert!(!buf.is_empty());
+    }
+
+    // ── HTTP helper tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_api_url_basic() {
+        assert_eq!(
+            api_url("http://localhost:8080", "agents"),
+            "http://localhost:8080/agents"
+        );
+    }
+
+    #[test]
+    fn test_api_url_trailing_slash() {
+        assert_eq!(
+            api_url("http://localhost:8080/", "/agents"),
+            "http://localhost:8080/agents"
+        );
+    }
+
+    #[test]
+    fn test_api_url_no_double_slash() {
+        assert_eq!(
+            api_url("http://localhost:8080/", "agents"),
+            "http://localhost:8080/agents"
+        );
+    }
+
+    #[test]
+    fn test_parse_api_error_json() {
+        let body = r#"{"error":{"code":"not_found","message":"Agent not found"}}"#;
+        let msg = parse_api_error(reqwest::StatusCode::NOT_FOUND, body);
+        assert!(msg.contains("Agent not found"));
+        assert!(msg.contains("404"));
+    }
+
+    #[test]
+    fn test_parse_api_error_plain_text() {
+        let msg = parse_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom");
+        assert!(msg.contains("500"));
+        assert!(msg.contains("boom"));
+    }
+
+    #[test]
+    fn test_short_id_normal_uuid() {
+        let id = uuid::Uuid::new_v4();
+        let s = short_id(&id);
+        assert_eq!(s.len(), 8);
+    }
+
+    #[test]
+    fn test_short_id_short_string() {
+        // Verify it doesn't panic on strings shorter than 8
+        let s = short_id(&"abc");
+        assert_eq!(s, "abc");
     }
 }

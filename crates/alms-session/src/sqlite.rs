@@ -21,6 +21,7 @@ use std::sync::Arc;
 const SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=5000;
 
 CREATE TABLE IF NOT EXISTS sessions (
     id            TEXT PRIMARY KEY,
@@ -153,28 +154,44 @@ impl SqliteStore {
     }
 
     /// Delete a session and all its related data (messages, audit, summaries).
+    ///
+    /// Wrapped in a transaction so a crash mid-delete cannot leave orphaned rows.
     pub fn delete_session(&self, session_id: SessionId) -> AlmsResult<()> {
         let conn = self.conn.lock();
         let id_str = session_id.0.to_string();
-        // Delete dependent rows first (foreign key order)
-        conn.execute(
-            "DELETE FROM context_summaries WHERE session_id = ?1",
-            params![&id_str],
-        )
-        .map_err(|e| AlmsError::Runtime(format!("SQLite delete summaries: {e}")))?;
-        conn.execute(
-            "DELETE FROM audit_events WHERE session_id = ?1",
-            params![&id_str],
-        )
-        .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit: {e}")))?;
-        conn.execute(
-            "DELETE FROM messages WHERE session_id = ?1",
-            params![&id_str],
-        )
-        .map_err(|e| AlmsError::Runtime(format!("SQLite delete messages: {e}")))?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", params![&id_str])
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete session: {e}")))?;
-        Ok(())
+        conn.execute_batch("BEGIN")
+            .map_err(|e| AlmsError::Runtime(format!("SQLite begin delete_session: {e}")))?;
+        let result = (|| -> AlmsResult<()> {
+            // Delete dependent rows first (foreign key order)
+            conn.execute(
+                "DELETE FROM context_summaries WHERE session_id = ?1",
+                params![&id_str],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete summaries: {e}")))?;
+            conn.execute(
+                "DELETE FROM audit_events WHERE session_id = ?1",
+                params![&id_str],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit: {e}")))?;
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ?1",
+                params![&id_str],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete messages: {e}")))?;
+            conn.execute("DELETE FROM sessions WHERE id = ?1", params![&id_str])
+                .map_err(|e| AlmsError::Runtime(format!("SQLite delete session: {e}")))?;
+            Ok(())
+        })();
+        match &result {
+            Ok(()) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite commit delete_session: {e}")))?;
+            }
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+        }
+        result
     }
 
     /// Flush the WAL to the main database file.
@@ -200,34 +217,15 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare sessions: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })
+            .query_map([], parse_session_row)
             .map_err(|e| AlmsError::Runtime(format!("SQLite query sessions: {e}")))?
-            .filter_map(|r| r.ok())
-            .filter_map(
-                |(id, agent_id, context_id, created_at, last_activity, status)| {
-                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
-                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
-                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
-                    let last = chrono::DateTime::parse_from_rfc3339(&last_activity).ok()?;
-                    Some(Session {
-                        id: SessionId(id_uuid),
-                        agent_id: AgentId(agent_uuid),
-                        context_id,
-                        created_at: Timestamp(created.with_timezone(&chrono::Utc)),
-                        last_activity: Timestamp(last.with_timezone(&chrono::Utc)),
-                        status: str_to_status(&status),
-                    })
-                },
-            )
+            .filter_map(|r| match r {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable session row: {e}");
+                    None
+                }
+            })
             .collect();
 
         Ok(rows)
@@ -240,36 +238,10 @@ impl SqliteStore {
             "SELECT id, agent_id, context_id, created_at, last_activity, status \
              FROM sessions WHERE id = ?1",
             params![id.0.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
+            parse_session_row,
         );
         match result {
-            Ok((id_str, agent_id, context_id, created_at, last_activity, status)) => {
-                let id_uuid = uuid::Uuid::parse_str(&id_str)
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse session id: {e}")))?;
-                let agent_uuid = uuid::Uuid::parse_str(&agent_id)
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse agent id: {e}")))?;
-                let created = chrono::DateTime::parse_from_rfc3339(&created_at)
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse created_at: {e}")))?;
-                let last = chrono::DateTime::parse_from_rfc3339(&last_activity)
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse last_activity: {e}")))?;
-                Ok(Some(Session {
-                    id: SessionId(id_uuid),
-                    agent_id: AgentId(agent_uuid),
-                    context_id,
-                    created_at: Timestamp(created.with_timezone(&chrono::Utc)),
-                    last_activity: Timestamp(last.with_timezone(&chrono::Utc)),
-                    status: str_to_status(&status),
-                }))
-            }
+            Ok(session) => Ok(Some(session)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AlmsError::Runtime(format!(
                 "SQLite load_session_by_id: {e}"
@@ -288,34 +260,15 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare sessions_by_agent: {e}")))?;
 
         let rows = stmt
-            .query_map([agent_id.0.to_string()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })
+            .query_map([agent_id.0.to_string()], parse_session_row)
             .map_err(|e| AlmsError::Runtime(format!("SQLite query sessions_by_agent: {e}")))?
-            .filter_map(|r| r.ok())
-            .filter_map(
-                |(id, agent_id, context_id, created_at, last_activity, status)| {
-                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
-                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
-                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
-                    let last = chrono::DateTime::parse_from_rfc3339(&last_activity).ok()?;
-                    Some(Session {
-                        id: SessionId(id_uuid),
-                        agent_id: AgentId(agent_uuid),
-                        context_id,
-                        created_at: Timestamp(created.with_timezone(&chrono::Utc)),
-                        last_activity: Timestamp(last.with_timezone(&chrono::Utc)),
-                        status: str_to_status(&status),
-                    })
-                },
-            )
+            .filter_map(|r| match r {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable session row: {e}");
+                    None
+                }
+            })
             .collect();
 
         Ok(rows)
@@ -332,34 +285,15 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare list_sessions: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })
+            .query_map([], parse_session_row)
             .map_err(|e| AlmsError::Runtime(format!("SQLite query list_sessions: {e}")))?
-            .filter_map(|r| r.ok())
-            .filter_map(
-                |(id, agent_id, context_id, created_at, last_activity, status)| {
-                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
-                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
-                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
-                    let last = chrono::DateTime::parse_from_rfc3339(&last_activity).ok()?;
-                    Some(Session {
-                        id: SessionId(id_uuid),
-                        agent_id: AgentId(agent_uuid),
-                        context_id,
-                        created_at: Timestamp(created.with_timezone(&chrono::Utc)),
-                        last_activity: Timestamp(last.with_timezone(&chrono::Utc)),
-                        status: str_to_status(&status),
-                    })
-                },
-            )
+            .filter_map(|r| match r {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable session row: {e}");
+                    None
+                }
+            })
             .collect();
 
         Ok(rows)
@@ -575,65 +509,10 @@ impl SqliteStore {
 
     /// Load all non-cancelled jobs, oldest first.
     pub fn load_all_jobs(&self) -> AlmsResult<Vec<Job>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
-                 FROM jobs WHERE status != 'cancelled' ORDER BY rowid",
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare jobs: {e}")))?;
-
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                ))
-            })
-            .map_err(|e| AlmsError::Runtime(format!("SQLite query jobs: {e}")))?
-            .filter_map(|r| r.ok())
-            .filter_map(
-                |(
-                    id,
-                    agent_id,
-                    prompt,
-                    schedule_json,
-                    status,
-                    created_at,
-                    next_run_at,
-                    last_run_at,
-                )| {
-                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
-                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
-                    let schedule: JobSchedule = serde_json::from_str(&schedule_json).ok()?;
-                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
-                    let next_run = next_run_at
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&chrono::Utc));
-                    let last_run = last_run_at
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&chrono::Utc));
-                    Some(Job {
-                        id: JobId(id_uuid),
-                        agent_id: AgentId(agent_uuid),
-                        prompt,
-                        schedule,
-                        status: str_to_job_status(&status),
-                        created_at: created.with_timezone(&chrono::Utc),
-                        next_run_at: next_run,
-                        last_run_at: last_run,
-                    })
-                },
-            )
-            .collect();
-
-        Ok(rows)
+        self.query_jobs(
+            "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
+             FROM jobs WHERE status != 'cancelled' ORDER BY rowid",
+        )
     }
 
     /// Load a single job by ID.
@@ -643,55 +522,10 @@ impl SqliteStore {
             "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
              FROM jobs WHERE id = ?1",
             params![id.0.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                ))
-            },
+            parse_job_row,
         );
         match result {
-            Ok((
-                id_str,
-                agent_id,
-                prompt,
-                schedule_json,
-                status,
-                created_at,
-                next_run_at,
-                last_run_at,
-            )) => {
-                let id_uuid = uuid::Uuid::parse_str(&id_str)
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse job id: {e}")))?;
-                let agent_uuid = uuid::Uuid::parse_str(&agent_id)
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse agent id: {e}")))?;
-                let schedule: JobSchedule = serde_json::from_str(&schedule_json)
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse schedule: {e}")))?;
-                let created = chrono::DateTime::parse_from_rfc3339(&created_at)
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse created_at: {e}")))?;
-                let next_run = next_run_at
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc));
-                let last_run = last_run_at
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                    .map(|dt| dt.with_timezone(&chrono::Utc));
-                Ok(Some(Job {
-                    id: JobId(id_uuid),
-                    agent_id: AgentId(agent_uuid),
-                    prompt,
-                    schedule,
-                    status: str_to_job_status(&status),
-                    created_at: created.with_timezone(&chrono::Utc),
-                    next_run_at: next_run,
-                    last_run_at: last_run,
-                }))
-            }
+            Ok(job) => Ok(Some(job)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(AlmsError::Runtime(format!("SQLite load_job_by_id: {e}"))),
         }
@@ -699,62 +533,29 @@ impl SqliteStore {
 
     /// Load all jobs including cancelled, ordered by created_at DESC.
     pub fn load_all_jobs_unfiltered(&self) -> AlmsResult<Vec<Job>> {
+        self.query_jobs(
+            "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
+             FROM jobs ORDER BY created_at DESC",
+        )
+    }
+
+    /// Shared helper for job list queries.
+    fn query_jobs(&self, sql: &str) -> AlmsResult<Vec<Job>> {
         let conn = self.conn.lock();
         let mut stmt = conn
-            .prepare(
-                "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
-                 FROM jobs ORDER BY created_at DESC",
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare jobs_unfiltered: {e}")))?;
+            .prepare(sql)
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare jobs: {e}")))?;
 
         let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                ))
+            .query_map([], parse_job_row)
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query jobs: {e}")))?
+            .filter_map(|r| match r {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable job row: {e}");
+                    None
+                }
             })
-            .map_err(|e| AlmsError::Runtime(format!("SQLite query jobs_unfiltered: {e}")))?
-            .filter_map(|r| r.ok())
-            .filter_map(
-                |(
-                    id,
-                    agent_id,
-                    prompt,
-                    schedule_json,
-                    status,
-                    created_at,
-                    next_run_at,
-                    last_run_at,
-                )| {
-                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
-                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
-                    let schedule: JobSchedule = serde_json::from_str(&schedule_json).ok()?;
-                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
-                    let next_run = next_run_at
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&chrono::Utc));
-                    let last_run = last_run_at
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                        .map(|dt| dt.with_timezone(&chrono::Utc));
-                    Some(Job {
-                        id: JobId(id_uuid),
-                        agent_id: AgentId(agent_uuid),
-                        prompt,
-                        schedule,
-                        status: str_to_job_status(&status),
-                        created_at: created.with_timezone(&chrono::Utc),
-                        next_run_at: next_run,
-                        last_run_at: last_run,
-                    })
-                },
-            )
             .collect();
 
         Ok(rows)
@@ -1046,6 +847,78 @@ fn str_to_job_status(s: &str) -> JobStatus {
 }
 
 /// Parse an agent row from a SELECT query.
+fn parse_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
+    let id_str: String = row.get(0)?;
+    let agent_id_str: String = row.get(1)?;
+    let prompt: String = row.get(2)?;
+    let schedule_json: String = row.get(3)?;
+    let status_str: String = row.get(4)?;
+    let created_at_str: String = row.get(5)?;
+    let next_run_at_str: Option<String> = row.get(6)?;
+    let last_run_at_str: Option<String> = row.get(7)?;
+
+    let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let agent_uuid = uuid::Uuid::parse_str(&agent_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let schedule: JobSchedule = serde_json::from_str(&schedule_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let next_run_at = next_run_at_str
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let last_run_at = last_run_at_str
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+
+    Ok(Job {
+        id: JobId(id_uuid),
+        agent_id: AgentId(agent_uuid),
+        prompt,
+        schedule,
+        status: str_to_job_status(&status_str),
+        created_at: created_at.with_timezone(&chrono::Utc),
+        next_run_at,
+        last_run_at,
+    })
+}
+
+fn parse_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
+    let id_str: String = row.get(0)?;
+    let agent_id_str: String = row.get(1)?;
+    let context_id: String = row.get(2)?;
+    let created_at_str: String = row.get(3)?;
+    let last_activity_str: String = row.get(4)?;
+    let status_str: String = row.get(5)?;
+
+    let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let agent_uuid = uuid::Uuid::parse_str(&agent_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let last_activity = chrono::DateTime::parse_from_rfc3339(&last_activity_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+
+    Ok(Session {
+        id: SessionId(id_uuid),
+        agent_id: AgentId(agent_uuid),
+        context_id,
+        created_at: Timestamp(created_at.with_timezone(&chrono::Utc)),
+        last_activity: Timestamp(last_activity.with_timezone(&chrono::Utc)),
+        status: str_to_status(&status_str),
+    })
+}
+
 fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let id_str: String = row.get(0)?;
     let name: String = row.get(1)?;

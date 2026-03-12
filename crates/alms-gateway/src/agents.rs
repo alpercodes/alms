@@ -24,6 +24,22 @@ use axum::{
 };
 use chrono::Utc;
 
+/// Valid posture values.
+const VALID_POSTURES: &[&str] = &["full_control", "guarded"];
+
+/// Validate a posture string. Empty string is allowed (means "clear override").
+fn validate_posture(posture: &str) -> Result<(), String> {
+    if posture.is_empty() || VALID_POSTURES.contains(&posture) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid posture '{}'. Must be one of: {}",
+            posture,
+            VALID_POSTURES.join(", ")
+        ))
+    }
+}
+
 /// Helper: get the SqliteStore from app state, or return 503.
 fn get_store(
     state: &AppState,
@@ -111,15 +127,31 @@ pub async fn create_agent(
         )
     })?;
 
+    let wants_default = req.is_default.unwrap_or(false);
+
+    // Validate posture if provided
+    if let Some(ref p) = req.posture {
+        validate_posture(p).map_err(|msg| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "code": "INVALID_POSTURE", "message": msg }
+                })),
+            )
+        })?;
+    }
+
     let now = Utc::now();
-    let agent = AgentRecord {
+    let mut agent = AgentRecord {
         id: AgentId::new(),
         name: req.name,
         description: req.description.unwrap_or_default(),
         model: req.model,
         system_prompt: req.system_prompt,
         posture: req.posture,
-        is_default: req.is_default.unwrap_or(false),
+        // Always INSERT with is_default=false; set_default_agent atomically
+        // clears old default + sets new one in a single transaction.
+        is_default: false,
         created_at: now,
         last_active: now,
     };
@@ -143,7 +175,7 @@ pub async fn create_agent(
         }
     })?;
 
-    if agent.is_default {
+    if wants_default {
         store.set_default_agent(agent.id).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -152,6 +184,7 @@ pub async fn create_agent(
                 })),
             )
         })?;
+        agent.is_default = true;
     }
 
     Ok((StatusCode::CREATED, Json(agent)))
@@ -187,6 +220,14 @@ pub async fn update_agent(
         agent.system_prompt = if sp.is_empty() { None } else { Some(sp) };
     }
     if let Some(posture) = req.posture {
+        validate_posture(&posture).map_err(|msg| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": { "code": "INVALID_POSTURE", "message": msg }
+                })),
+            )
+        })?;
         agent.posture = if posture.is_empty() {
             None
         } else {

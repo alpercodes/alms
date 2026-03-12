@@ -52,6 +52,16 @@ pub enum SessionStatus {
     Archived,
 }
 
+impl std::fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Idle => write!(f, "idle"),
+            Self::Archived => write!(f, "archived"),
+        }
+    }
+}
+
 /// Message in a session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
