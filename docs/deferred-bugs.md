@@ -62,6 +62,20 @@ All critical and medium bugs from that review were fixed in commit 437de9b. Rema
 
 - **Guarded posture + parallel tool calls** — All approval requests fire simultaneously via `join_all` rather than sequentially. UX issue when LLM issues multiple tool calls.
 
+## From review of #54 (UI agent selector & management) — 2026-03-12
+
+- **[index.html] S2 Medium** — Session filtering uses client-side `===` comparison between `s.agent_id` (serde-serialized) and `S.activeAgentId` (from settings endpoint). Works today, but fragile if UUID serialization format changes. Should add `?agent_id=` query param to `GET /sessions` for server-side filtering. *Deferred: works correctly today, needs server-side change.*
+
+- **[index.html] S3 Medium** — `checkBootstrapStatus()` fires N sequential requests (one per agent) to check workspace files. Slow at 10+ agents. Should use `Promise.allSettled()`. *Deferred: acceptable at current scale (1-3 agents).*
+
+- **[index.html] S3 Medium** — `refreshAgents()` calls render functions, then `checkBootstrapStatus()` calls them again — double render on every agent CRUD operation. *Deferred: cosmetic.*
+
+- **[index.html] S3 Low** — No client-side agent name format validation. Users typing "My Agent" get a server error (which is displayed). Could add `pattern` attribute to input. *Deferred: server error message surfaces correctly.*
+
+- **[index.html] S4 Low** — `newSession()` uses `'web-chat-' + Date.now()` as context_id. Shows raw timestamp in sidebar (e.g. "web-chat-1741785123456"). *Deferred: functional, not pretty.*
+
+- **[index.html] S4 Low** — Delete and set-default agent buttons silently swallow network errors (catch blocks are empty). *Deferred: edge case.*
+
 ---
 
 # Accepted Findings
@@ -113,3 +127,9 @@ Observations noted during reviews that are not bugs — correct by design, cosme
 - **S6 Low** — `String::from_utf8_lossy` replaces invalid bytes with U+FFFD. Would corrupt JSON and cause downstream parse failure, which is the right failure mode.
 
 - **S7 None** — Test coverage adequate: 5 parse tests + 1 mock stream integration test.
+
+## From review of #54 (UI agent selector & management)
+
+- **S4 Nit** — Duplicate `!agent.is_default` guard for set-default and delete buttons. Could consolidate into single block. Style preference only.
+
+- **S4 Nit** — Missing `aria-label` on agent selector `<select>`. Has `title` attribute but not fully accessible. Accessibility improvement, no functional impact.

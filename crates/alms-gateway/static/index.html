@@ -889,6 +889,9 @@ function selectSession(sessionId) {
   renderSessions();
   loadRuns();
   loadSessionHistory(sessionId);
+  enableInput();
+  const agent = S.agents.find(a => a.id === S.activeAgentId);
+  setStatus(agent ? agent.name : 'ready', 'ok');
   if (S.activePanel === 'audit') { S.auditEvents = null; loadAudit(); }
 }
 
@@ -1127,9 +1130,11 @@ async function boot() {
 
   if (S.activeSessionId) {
     await Promise.all([loadRuns(), loadSessionHistory(S.activeSessionId)]);
+    enableInput();
+    setStatus(`${activeAgent.name}`, 'ok');
+  } else {
+    setStatus('no session — click "+ New session"', 'error');
   }
-  enableInput();
-  setStatus(`${activeAgent.name}`, 'ok');
   promptEl.focus();
 }
 
