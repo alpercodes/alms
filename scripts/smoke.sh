@@ -8,10 +8,10 @@
 # What it tests:
 #   1. Health endpoint
 #   2. Session creation
-#   3. Legacy /agent/run (simple request → response)
-#   4. POST /runs (canonical async API)
-#   5. GET /runs/:id (status polling)
-#   6. GET /runs/:id/events (SSE stream)
+#   3. POST /runs (canonical async API)
+#   4. GET /runs/:id (status polling)
+#   5. GET /runs/:id/events (SSE stream)
+#   6. Tool execution via /runs (real LLM only)
 
 set -uo pipefail
 
@@ -145,25 +145,9 @@ else
 fi
 
 # ============================================================
-# Test 3: Legacy /agent/run
+# Test 3: POST /runs (canonical API)
 # ============================================================
-echo "Test 3: Legacy /agent/run"
-RUN_RESULT=$(curl -s -X POST "${BASE}/agent/run" \
-    -H "Content-Type: application/json" \
-    -d '{"context_id":"smoke-ctx-1","message":"Say hello"}' \
-    --max-time 30)
-if echo "$RUN_RESULT" | grep -q '"success":true'; then
-    RESPONSE=$(json_field "response" "$RUN_RESULT")
-    log_pass "POST /agent/run → success"
-    log_pass "Response: $(echo "$RESPONSE" | head -c 100)"
-else
-    log_fail "POST /agent/run" "$RUN_RESULT"
-fi
-
-# ============================================================
-# Test 4: POST /runs (canonical API)
-# ============================================================
-echo "Test 4: Canonical /runs endpoint"
+echo "Test 3: Canonical /runs endpoint"
 if [ -n "$SESSION_ID" ]; then
     RUN_CREATE=$(curl -s -X POST "${BASE}/runs" \
         -H "Content-Type: application/json" \
@@ -181,9 +165,9 @@ else
 fi
 
 # ============================================================
-# Test 5: GET /runs/:id (poll for completion)
+# Test 4: GET /runs/:id (poll for completion)
 # ============================================================
-echo "Test 5: Run status polling"
+echo "Test 4: Run status polling"
 if [ -n "${RUN_ID:-}" ]; then
     # Poll up to 10s for completion
     for i in $(seq 1 20); do
@@ -207,9 +191,9 @@ else
 fi
 
 # ============================================================
-# Test 6: SSE event stream (replay via Last-Event-ID)
+# Test 5: SSE event stream (replay via Last-Event-ID)
 # ============================================================
-echo "Test 6: SSE event stream"
+echo "Test 5: SSE event stream"
 if [ -n "${RUN_ID:-}" ]; then
     SSE_RESULT=$(curl -s "${BASE}/runs/${RUN_ID}/events" \
         -H "Accept: text/event-stream" \
@@ -225,26 +209,38 @@ else
 fi
 
 # ============================================================
-# Test 7: Tool execution via agent loop
+# Test 6: Tool execution via canonical /runs
 # ============================================================
-echo "Test 7: Tool execution (math builtin)"
-if [ "$REAL_LLM" = true ]; then
-    TOOL_RESULT=$(curl -s -X POST "${BASE}/agent/run" \
+echo "Test 6: Tool execution (math builtin)"
+if [ "$REAL_LLM" = true ] && [ -n "${SESSION_ID:-}" ]; then
+    TOOL_RUN=$(curl -s -X POST "${BASE}/runs" \
         -H "Content-Type: application/json" \
-        -d '{"context_id":"smoke-ctx-tools","message":"Use the math tool to calculate 15 * 7"}' \
-        --max-time 60)
-    if echo "$TOOL_RESULT" | grep -q '"success":true'; then
-        TOOL_RESP=$(json_field "response" "$TOOL_RESULT")
-        if echo "$TOOL_RESP" | grep -qi "105"; then
-            log_pass "Tool execution: math(15*7) → contains 105"
+        -d "{\"session_id\":\"${SESSION_ID}\",\"input\":{\"type\":\"text\",\"text\":\"Use the math tool to calculate 15 * 7\"}}" \
+        --max-time 30)
+    TOOL_RUN_ID=$(json_field "run_id" "$TOOL_RUN")
+    if [ -n "$TOOL_RUN_ID" ]; then
+        # Poll up to 60s for completion (tool calls take longer)
+        TOOL_STATUS=""
+        for i in $(seq 1 120); do
+            sleep 0.5
+            TOOL_STATUS_RESP=$(curl -s "${BASE}/runs/${TOOL_RUN_ID}" --max-time 5)
+            TOOL_STATUS=$(json_field "status" "$TOOL_STATUS_RESP")
+            if [ "$TOOL_STATUS" = "completed" ] || [ "$TOOL_STATUS" = "failed" ]; then
+                break
+            fi
+        done
+        if [ "$TOOL_STATUS" = "completed" ]; then
+            log_pass "Tool execution: math run completed"
         else
-            log_pass "Tool execution returned (may not have used tool): $(echo "$TOOL_RESP" | head -c 100)"
+            log_fail "Tool execution" "status=$TOOL_STATUS"
         fi
     else
-        log_fail "Tool execution" "$TOOL_RESULT"
+        log_fail "Tool execution" "$TOOL_RUN"
     fi
-else
+elif [ "$REAL_LLM" != true ]; then
     log_pass "Tool execution: skipped in mock mode (mock doesn't trigger tool calls)"
+else
+    echo "  (skipped — no session_id)"
 fi
 
 # ============================================================

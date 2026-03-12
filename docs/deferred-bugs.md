@@ -50,7 +50,7 @@ All findings were fixed.
 
 ## From review of #49 (Per-agent config overrides) — 2026-03-12
 
-- **[runs.rs] S3 Medium** — Legacy `run_agent` endpoint (`POST /agent/run`) bypasses per-agent config overrides entirely. It calls `execute_run` with `RunOverrides::default()`, which is correct, but the endpoint doesn't go through the same session/agent resolution as the canonical `/runs` path. Pre-existing issue, predates task #49. *Deferred: legacy endpoint — deprecate or remove.*
+- ~~**[runs.rs] S3 Medium** — Legacy `run_agent` endpoint (`POST /agent/run`) bypasses per-agent config overrides entirely.~~ **Fixed**: Removed both legacy endpoints (`POST /agent/run` and `POST /agent/run/stream`). All callers use canonical `POST /runs`.
 
 - ~~**[runs.rs] S3 Medium** — Zero test coverage for the three-layer config merging logic.~~ **Fixed**: Extracted `apply_overrides()` pure function + 7 unit tests covering all precedence layers, clamping, and edge cases.
 

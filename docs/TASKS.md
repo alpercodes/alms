@@ -44,9 +44,9 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **Owners:** Mustafa (infra), Atlas
 
 2) Real LLM end-to-end smoke ✅
-- `scripts/smoke.sh` — tests health, sessions, /agent/run, /runs, SSE events, tool execution.
+- `scripts/smoke.sh` — tests health, sessions, /runs, SSE events, tool execution.
 - `make smoke` (mock LLM) and `make smoke-real` (real LLM via OpenRouter).
-- Covers: health check, session creation, legacy + canonical run APIs, status polling, SSE replay.
+- Covers: health check, session creation, canonical run API, status polling, SSE replay.
 - **Owners:** Zeki (script), Atlas/Mustafa (run on build machine)
 
 ---
@@ -83,7 +83,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 8) Canonical Run API (introduce without breaking MVP compatibility) ✅
 - `POST /runs` + `GET /runs/{run_id}` + `GET /runs/{run_id}/events` implemented.
-- `/agent/run` + `/agent/run/stream` kept as deprecated compatibility aliases.
+- Legacy `/agent/run` + `/agent/run/stream` removed (all callers migrated to canonical API).
 - Tool events (`tool_start`, `tool_end`) wired via RuntimeEvent channel.
 - **Owners:** Atlas, Mustafa
 

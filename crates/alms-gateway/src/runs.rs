@@ -198,9 +198,7 @@ async fn execute_run(
 
     // Events are persisted to the event log regardless of whether an SSE
     // client is connected. The SSE client registers its own sender when it
-    // calls GET /runs/{id}/events (or via the legacy stream endpoint which
-    // pre-registers before spawning). No placeholder sender here — avoids
-    // overwriting a real sender from stream_run_legacy.
+    // calls GET /runs/{id}/events.
 
     state
         .run_manager
@@ -610,72 +608,6 @@ pub async fn stream_run_events(
     }
 
     Ok(RunEventStream::stream_with_replay(rx, replay_events))
-}
-
-/// POST /agent/run/stream - Legacy compatibility endpoint
-#[instrument(level = "info", skip(state, req))]
-pub async fn stream_run_legacy(
-    State(state): State<AppState>,
-    Json(req): Json<CreateRunRequest>,
-) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
-    let session = match state.session_manager.get(req.session_id) {
-        Ok(session) => session,
-        Err(_) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": { "code": "NOT_FOUND", "message": "Session not found" }
-                })),
-            ));
-        }
-    };
-
-    let input_text = match req.input {
-        RunInput::Text { text } => text,
-    };
-
-    let run = Run::new(session.id, session.agent_id, input_text);
-    let run_id = run.run_id;
-    let session_id = run.session_id;
-    let agent_id = run.agent_id;
-    let context_id = session.context_id.clone();
-
-    info!(
-        "Creating run {} for session {} (legacy /agent/run/stream)",
-        run_id.0, session_id.0
-    );
-
-    // Reject new runs during shutdown.
-    if state.shutdown_token.is_cancelled() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": { "code": "SHUTTING_DOWN", "message": "Server is shutting down" }
-            })),
-        ));
-    }
-
-    state.run_manager.insert_run(run.clone());
-
-    // Register SSE channel before spawning so early events aren't missed
-    let (tx, rx) = event_channel();
-    state.run_manager.register_sender(run_id, tx);
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        execute_run(
-            state_clone,
-            run_id,
-            session_id,
-            agent_id,
-            run.input,
-            RunOverrides::default(),
-            context_id,
-        )
-        .await;
-    });
-
-    Ok(RunEventStream::stream(rx))
 }
 
 #[cfg(test)]

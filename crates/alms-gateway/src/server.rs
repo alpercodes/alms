@@ -9,10 +9,7 @@ use crate::cron_utils;
 use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
-use crate::runs::{
-    create_run, get_run_status, list_runs, scheduler_fire_loop, stream_run_events,
-    stream_run_legacy,
-};
+use crate::runs::{create_run, get_run_status, list_runs, scheduler_fire_loop, stream_run_events};
 use crate::settings::get_settings;
 use crate::sse::SseEventData;
 use crate::tasks::{get_task, list_tasks};
@@ -289,9 +286,6 @@ fn protected_router() -> Router<AppState> {
         // Coordinator tasks (active subagents)
         .route("/tasks", get(list_tasks))
         .route("/tasks/{task_id}", get(get_task))
-        // Legacy (deprecated) - kept for MVP compatibility
-        .route("/agent/run", post(run_agent))
-        .route("/agent/run/stream", post(stream_run_legacy))
         .route("/ws", get(websocket_handler))
 }
 
@@ -413,46 +407,6 @@ async fn get_audit(
             })),
         )
             .into_response(),
-    }
-}
-
-/// Legacy: Run agent on a message (HTTP API) -- deprecated, use POST /runs
-async fn run_agent(
-    State(state): State<AppState>,
-    Json(req): Json<RunAgentRequest>,
-) -> impl IntoResponse {
-    // Reject during shutdown.
-    if state.shutdown_token.is_cancelled() {
-        return Json(serde_json::json!({
-            "success": false,
-            "error": "Server is shutting down",
-        }));
-    }
-
-    // Extract what we need, then drop the lock before the LLM call
-    let (agent_id, agent_config, llm) = {
-        let gateway = state.gateway.lock().await;
-        (
-            *gateway.agent_id(),
-            gateway.agent_config().clone(),
-            gateway.llm().clone(),
-        )
-    };
-
-    let runtime = alms_runtime::AgentRuntime::new(agent_id, agent_config, llm);
-
-    match runtime
-        .run(&state.session_manager, &req.context_id, &req.message)
-        .await
-    {
-        Ok(output) => Json(serde_json::json!({
-            "success": true,
-            "response": output.response,
-        })),
-        Err(e) => Json(serde_json::json!({
-            "success": false,
-            "error": e.to_string(),
-        })),
     }
 }
 
@@ -645,12 +599,6 @@ struct CreateSessionRequest {
 struct CreateSessionResponse {
     session_id: alms_core::SessionId,
     created: bool,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct RunAgentRequest {
-    context_id: String,
-    message: String,
 }
 
 #[derive(Debug, Deserialize)]
