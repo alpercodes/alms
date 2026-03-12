@@ -25,6 +25,7 @@ make clippy      # cargo clippy -- -D warnings
 crates/
   alms-core/         # Core types (IDs, Capability, AuditEvent, Channel trait, errors)
                      #   config.rs — unified AlmsConfig (layered: defaults → TOML → env vars)
+                     #   registry.rs — AgentRecord, CreateAgentRequest, validate_agent_name
   alms-gateway/      # Axum HTTP server, SSE streaming, run lifecycle, event log
   alms-runtime/      # Agent loop, LLM client (OpenAI-compat), tool execution, audit
                      #   context.rs — ContextBuilder (token-budgeted context window)
@@ -127,9 +128,9 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 - `fs_*` tools are sandboxed via `canonicalize()` + prefix check against `tools.sandbox_root` (default: cwd). `shell_exec` cwd is restricted in sandboxed mode, but the executed command itself can still access files outside the sandbox — for true shell isolation, use a restricted OS user or Landlock (future task)
 - Guarded posture + parallel tool calls: when the LLM issues multiple tool calls in one response, all approval requests fire simultaneously (join_all) rather than sequentially
 
-## Current State (as of 2026-03-10)
+## Current State (as of 2026-03-12)
 
-**Working**: core types, unified config, session management, agent runtime with tool loop + context builder + workspace integration, HTTP gateway with SSE, Telegram adapter, SQLite persistence (`./data/alms.db`), agent workspace files (personality/goals/memories), bootstrap interview, builtin tools (echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, get_task_result), per-run overrides (model, temperature, max_tokens, posture), approval workflow (guarded posture), cron/scheduler, scheduled jobs (SQLite-backed), audit log, web UI with agent management/settings/workspace/jobs/audit panels, multi-agent (pure hierarchy — foreground and background subagents via invoke_agent; parallel tool execution via join_all; sliding-summary context compression), bearer auth (`ALMS_AUTH_TOKEN`), graceful shutdown (Ctrl+C / SIGTERM → drain in-flight runs → flush WAL).
+**Working**: core types, unified config, session management, agent runtime with tool loop + context builder + workspace integration, HTTP gateway with SSE, Telegram adapter, SQLite persistence (`./data/alms.db`), agent workspace files (personality/goals/memories), bootstrap interview, builtin tools (echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, get_task_result), per-run overrides (model, temperature, max_tokens, posture), approval workflow (guarded posture), cron/scheduler, scheduled jobs (SQLite-backed), audit log, web UI with agent management/settings/workspace/jobs/audit panels, multi-agent (pure hierarchy — foreground and background subagents via invoke_agent; parallel tool execution via join_all; sliding-summary context compression), bearer auth (`ALMS_AUTH_TOKEN`), graceful shutdown (Ctrl+C / SIGTERM → drain in-flight runs → flush WAL), agent registry (named persistent agents with SQLite CRUD + auto-migration from sidecar `./data/agent_id`).
 
 **Not yet real**: multi-turn orchestration / task decomposition (coordinator spawns single-turn subagents only).
 

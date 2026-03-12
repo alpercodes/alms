@@ -5,6 +5,7 @@
 
 use crate::types::{Content, ContextSummary, Message, Role, Session, SessionStatus};
 use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
+use alms_core::registry::AgentRecord;
 use alms_core::{
     AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, RunId, SessionId, Timestamp,
 };
@@ -67,6 +68,18 @@ CREATE TABLE IF NOT EXISTS context_summaries (
     text             TEXT NOT NULL DEFAULT '',
     messages_covered INTEGER NOT NULL DEFAULT 0,
     updated_at       TEXT
+);
+
+CREATE TABLE IF NOT EXISTS agents (
+    id            TEXT PRIMARY KEY,
+    name          TEXT NOT NULL UNIQUE,
+    description   TEXT NOT NULL DEFAULT '',
+    model         TEXT,
+    system_prompt TEXT,
+    posture       TEXT,
+    is_default    INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    last_active   TEXT NOT NULL
 );
 ";
 
@@ -530,6 +543,168 @@ impl SqliteStore {
             Err(e) => Err(AlmsError::Runtime(format!("SQLite load_summary: {e}"))),
         }
     }
+
+    // ── Agents ────────────────────────────────────────────────────────────────
+
+    /// Insert a new agent record. Fails if the name or id already exists.
+    pub fn create_agent(&self, agent: &AgentRecord) -> AlmsResult<()> {
+        self.conn
+            .lock()
+            .execute(
+                "INSERT INTO agents \
+                 (id, name, description, model, system_prompt, posture, is_default, created_at, last_active) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    agent.id.0.to_string(),
+                    &agent.name,
+                    &agent.description,
+                    agent.model.as_deref(),
+                    agent.system_prompt.as_deref(),
+                    agent.posture.as_deref(),
+                    agent.is_default as i32,
+                    agent.created_at.to_rfc3339(),
+                    agent.last_active.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite create_agent: {e}")))?;
+        Ok(())
+    }
+
+    /// Update an existing agent record (matched by id).
+    pub fn update_agent(&self, agent: &AgentRecord) -> AlmsResult<()> {
+        self.conn
+            .lock()
+            .execute(
+                "UPDATE agents SET name = ?1, description = ?2, model = ?3, system_prompt = ?4, \
+                 posture = ?5, is_default = ?6, last_active = ?7 WHERE id = ?8",
+                params![
+                    &agent.name,
+                    &agent.description,
+                    agent.model.as_deref(),
+                    agent.system_prompt.as_deref(),
+                    agent.posture.as_deref(),
+                    agent.is_default as i32,
+                    agent.last_active.to_rfc3339(),
+                    agent.id.0.to_string(),
+                ],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite update_agent: {e}")))?;
+        Ok(())
+    }
+
+    /// Load an agent by its UUID.
+    pub fn load_agent_by_id(&self, id: AgentId) -> AlmsResult<Option<AgentRecord>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT id, name, description, model, system_prompt, posture, is_default, created_at, last_active \
+             FROM agents WHERE id = ?1",
+            params![id.0.to_string()],
+            parse_agent_row,
+        );
+        match result {
+            Ok(agent) => Ok(Some(agent)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AlmsError::Runtime(format!("SQLite load_agent_by_id: {e}"))),
+        }
+    }
+
+    /// Load an agent by its unique name slug.
+    pub fn load_agent_by_name(&self, name: &str) -> AlmsResult<Option<AgentRecord>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT id, name, description, model, system_prompt, posture, is_default, created_at, last_active \
+             FROM agents WHERE name = ?1",
+            params![name],
+            parse_agent_row,
+        );
+        match result {
+            Ok(agent) => Ok(Some(agent)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AlmsError::Runtime(format!(
+                "SQLite load_agent_by_name: {e}"
+            ))),
+        }
+    }
+
+    /// Load the default agent, if one exists.
+    pub fn get_default_agent(&self) -> AlmsResult<Option<AgentRecord>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT id, name, description, model, system_prompt, posture, is_default, created_at, last_active \
+             FROM agents WHERE is_default = 1 LIMIT 1",
+            [],
+            parse_agent_row,
+        );
+        match result {
+            Ok(agent) => Ok(Some(agent)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AlmsError::Runtime(format!("SQLite get_default_agent: {e}"))),
+        }
+    }
+
+    /// List all agents, ordered by creation time.
+    pub fn list_agents(&self) -> AlmsResult<Vec<AgentRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, description, model, system_prompt, posture, is_default, created_at, last_active \
+                 FROM agents ORDER BY created_at",
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
+
+        let rows = stmt
+            .query_map([], parse_agent_row)
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query agents: {e}")))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Delete an agent by ID. Returns true if a row was deleted.
+    pub fn delete_agent(&self, id: AgentId) -> AlmsResult<bool> {
+        let affected = self
+            .conn
+            .lock()
+            .execute(
+                "DELETE FROM agents WHERE id = ?1",
+                params![id.0.to_string()],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete_agent: {e}")))?;
+        Ok(affected > 0)
+    }
+
+    /// Set an agent as the default, clearing any previous default.
+    ///
+    /// Returns `AgentNotFound` if the given ID does not exist in the table
+    /// (prevents silently ending up with no default agent).
+    pub fn set_default_agent(&self, id: AgentId) -> AlmsResult<()> {
+        let conn = self.conn.lock();
+        conn.execute("UPDATE agents SET is_default = 0 WHERE is_default = 1", [])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite clear_default: {e}")))?;
+        let affected = conn
+            .execute(
+                "UPDATE agents SET is_default = 1 WHERE id = ?1",
+                params![id.0.to_string()],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite set_default: {e}")))?;
+        if affected == 0 {
+            return Err(AlmsError::AgentNotFound(id.0.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Update an agent's `last_active` timestamp.
+    pub fn touch_agent(&self, id: AgentId) -> AlmsResult<()> {
+        self.conn
+            .lock()
+            .execute(
+                "UPDATE agents SET last_active = ?1 WHERE id = ?2",
+                params![chrono::Utc::now().to_rfc3339(), id.0.to_string()],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite touch_agent: {e}")))?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +759,41 @@ fn str_to_job_status(s: &str) -> JobStatus {
         "cancelled" => JobStatus::Cancelled,
         _ => JobStatus::Pending,
     }
+}
+
+/// Parse an agent row from a SELECT query.
+fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
+    let id_str: String = row.get(0)?;
+    let name: String = row.get(1)?;
+    let description: String = row.get(2)?;
+    let model: Option<String> = row.get(3)?;
+    let system_prompt: Option<String> = row.get(4)?;
+    let posture: Option<String> = row.get(5)?;
+    let is_default: i32 = row.get(6)?;
+    let created_at_str: String = row.get(7)?;
+    let last_active_str: String = row.get(8)?;
+
+    let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let last_active = chrono::DateTime::parse_from_rfc3339(&last_active_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+
+    Ok(AgentRecord {
+        id: AgentId(id_uuid),
+        name,
+        description,
+        model,
+        system_prompt,
+        posture,
+        is_default: is_default != 0,
+        created_at: created_at.with_timezone(&chrono::Utc),
+        last_active: last_active.with_timezone(&chrono::Utc),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -730,5 +940,153 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         store.save_session(&new_session()).unwrap();
         store.flush_wal().unwrap();
+    }
+
+    // ── Agent registry tests ──────────────────────────────────────────────
+
+    fn new_agent(name: &str) -> AgentRecord {
+        AgentRecord {
+            id: AgentId::new(),
+            name: name.to_string(),
+            description: String::new(),
+            model: None,
+            system_prompt: None,
+            posture: None,
+            is_default: false,
+            created_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_agent_create_and_load_by_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent = new_agent("atlas");
+        store.create_agent(&agent).unwrap();
+
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.id, agent.id);
+        assert_eq!(loaded.name, "atlas");
+        assert!(!loaded.is_default);
+        assert!(loaded.model.is_none());
+    }
+
+    #[test]
+    fn test_agent_load_by_name() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent = new_agent("researcher");
+        store.create_agent(&agent).unwrap();
+
+        let loaded = store.load_agent_by_name("researcher").unwrap().unwrap();
+        assert_eq!(loaded.id, agent.id);
+
+        // Non-existent name returns None
+        assert!(store.load_agent_by_name("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_agent_list_ordered() {
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let mut a1 = new_agent("alpha");
+        a1.created_at = chrono::Utc::now() - chrono::Duration::seconds(10);
+        store.create_agent(&a1).unwrap();
+
+        let a2 = new_agent("beta");
+        store.create_agent(&a2).unwrap();
+
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 2);
+        assert_eq!(agents[0].name, "alpha");
+        assert_eq!(agents[1].name, "beta");
+    }
+
+    #[test]
+    fn test_agent_delete() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent = new_agent("doomed");
+        store.create_agent(&agent).unwrap();
+
+        assert!(store.delete_agent(agent.id).unwrap());
+        assert!(store.load_agent_by_id(agent.id).unwrap().is_none());
+
+        // Deleting again returns false
+        assert!(!store.delete_agent(agent.id).unwrap());
+    }
+
+    #[test]
+    fn test_agent_set_default_clears_previous() {
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let mut a1 = new_agent("first");
+        a1.is_default = true;
+        store.create_agent(&a1).unwrap();
+
+        let a2 = new_agent("second");
+        store.create_agent(&a2).unwrap();
+
+        // Set second as default
+        store.set_default_agent(a2.id).unwrap();
+
+        let default = store.get_default_agent().unwrap().unwrap();
+        assert_eq!(default.id, a2.id);
+
+        // First should no longer be default
+        let first = store.load_agent_by_id(a1.id).unwrap().unwrap();
+        assert!(!first.is_default);
+    }
+
+    #[test]
+    fn test_agent_unique_name_constraint() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let a1 = new_agent("unique");
+        store.create_agent(&a1).unwrap();
+
+        // Different ID, same name — should fail (UNIQUE constraint)
+        let mut a2 = new_agent("unique");
+        a2.id = AgentId::new(); // different UUID
+        // INSERT OR REPLACE keys on PRIMARY KEY (id), not name.
+        // A different id with the same name should violate UNIQUE.
+        let result = store.create_agent(&a2);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_agent_touch_updates_last_active() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("touchme");
+        agent.last_active = chrono::Utc::now() - chrono::Duration::seconds(100);
+        store.create_agent(&agent).unwrap();
+
+        let before = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        store.touch_agent(agent.id).unwrap();
+        let after = store.load_agent_by_id(agent.id).unwrap().unwrap();
+
+        assert!(after.last_active > before.last_active);
+    }
+
+    #[test]
+    fn test_agent_with_overrides() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("custom");
+        agent.model = Some("anthropic/claude-sonnet-4-20250514".to_string());
+        agent.posture = Some("guarded".to_string());
+        agent.description = "A custom agent".to_string();
+        store.create_agent(&agent).unwrap();
+
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(
+            loaded.model.as_deref(),
+            Some("anthropic/claude-sonnet-4-20250514")
+        );
+        assert_eq!(loaded.posture.as_deref(), Some("guarded"));
+        assert_eq!(loaded.description, "A custom agent");
+        assert!(loaded.system_prompt.is_none());
+    }
+
+    #[test]
+    fn test_agent_get_default_none() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(store.get_default_agent().unwrap().is_none());
     }
 }

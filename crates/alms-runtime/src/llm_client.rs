@@ -3,6 +3,16 @@ use alms_core::{AlmsError, AlmsResult};
 use reqwest::{Client, RequestBuilder};
 use tracing::{debug, error, info, warn};
 
+/// Result of parsing a single SSE event block.
+enum SseParseResult {
+    /// A valid data chunk was parsed.
+    Chunk(StreamChunk),
+    /// The `[DONE]` sentinel was received — stream is complete.
+    Done,
+    /// Comment, empty event, or unparseable data — skip and continue.
+    Skip,
+}
+
 /// LLM client for making API calls
 #[derive(Debug, Clone)]
 pub struct LlmClient {
@@ -137,44 +147,62 @@ impl LlmClient {
         // Buffer raw bytes into complete SSE events. TCP chunks don't align
         // with SSE event boundaries, so we accumulate lines and yield parsed
         // StreamChunks only when we see a blank-line separator.
+        //
+        // Per-chunk read timeout: if no data arrives for 60 seconds, we treat the
+        // stream as stalled and terminate it. This prevents indefinite hangs when
+        // the LLM server stops sending data without closing the connection.
         let byte_stream = response.bytes_stream();
+        let chunk_timeout = std::time::Duration::from_secs(60);
         let stream = futures::stream::unfold(
             (byte_stream, String::new()),
-            |(mut bytes, mut buf)| async move {
+            move |(mut bytes, mut buf)| async move {
                 use futures::StreamExt as _;
                 loop {
                     // Try to extract a complete SSE event from the buffer
                     if let Some(pos) = buf.find("\n\n") {
                         let event_text = buf[..pos].to_string();
                         buf = buf[pos + 2..].to_string();
-                        if let Some(chunk) = Self::parse_sse_event(&event_text) {
-                            return Some((Ok(chunk), (bytes, buf)));
+                        match Self::parse_sse_event(&event_text) {
+                            SseParseResult::Chunk(chunk) => {
+                                return Some((Ok(chunk), (bytes, buf)));
+                            }
+                            SseParseResult::Done => {
+                                return None; // [DONE] — stream complete
+                            }
+                            SseParseResult::Skip => {
+                                continue; // comment or empty event
+                            }
                         }
-                        continue; // skip non-data events (comments, [DONE])
                     }
-                    // Need more data from the network
-                    match bytes.next().await {
-                        Some(Ok(b)) => {
+                    // Need more data from the network (with timeout)
+                    match tokio::time::timeout(chunk_timeout, bytes.next()).await {
+                        Ok(Some(Ok(b))) => {
                             // Normalize \r\n → \n so the \n\n event separator works
                             // regardless of whether the upstream sends CRLF or LF.
                             let text = String::from_utf8_lossy(&b).replace("\r\n", "\n");
                             buf.push_str(&text);
                         }
-                        Some(Err(e)) => {
+                        Ok(Some(Err(e))) => {
                             return Some((
                                 Err(AlmsError::Runtime(format!("Stream error: {}", e))),
                                 (bytes, buf),
                             ));
                         }
-                        None => {
+                        Ok(None) => {
                             // Stream ended — try to parse any remaining buffered data
                             if !buf.trim().is_empty() {
                                 let remaining = std::mem::take(&mut buf);
-                                if let Some(chunk) = Self::parse_sse_event(remaining.trim()) {
+                                if let SseParseResult::Chunk(chunk) =
+                                    Self::parse_sse_event(remaining.trim())
+                                {
                                     return Some((Ok(chunk), (bytes, buf)));
                                 }
                             }
                             return None; // stream complete
+                        }
+                        Err(_) => {
+                            warn!("LLM stream stalled (no data for {}s), terminating", chunk_timeout.as_secs());
+                            return None; // timeout — treat as stream end
                         }
                     }
                 }
@@ -185,8 +213,7 @@ impl LlmClient {
     }
 
     /// Parse a single SSE event block (one or more `data:` lines) into a StreamChunk.
-    /// Returns `None` for `[DONE]` sentinels and comment-only events.
-    fn parse_sse_event(event: &str) -> Option<StreamChunk> {
+    fn parse_sse_event(event: &str) -> SseParseResult {
         for line in event.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with(':') {
@@ -198,10 +225,10 @@ impl LlmClient {
             {
                 let data = data.trim();
                 if data == "[DONE]" {
-                    return None;
+                    return SseParseResult::Done;
                 }
                 match serde_json::from_str::<StreamChunk>(data) {
-                    Ok(chunk) => return Some(chunk),
+                    Ok(chunk) => return SseParseResult::Chunk(chunk),
                     Err(e) => {
                         warn!("Failed to parse SSE chunk: {} - data: {}", e, data);
                         continue;
@@ -209,7 +236,7 @@ impl LlmClient {
                 }
             }
         }
-        None
+        SseParseResult::Skip
     }
 
     /// Quick completion with default model
@@ -362,19 +389,34 @@ mod tests {
     #[test]
     fn test_parse_sse_event_content() {
         let event = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let chunk = LlmClient::parse_sse_event(event).expect("should parse");
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+            panic!("expected Chunk");
+        };
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello"));
     }
 
     #[test]
     fn test_parse_sse_event_done() {
-        assert!(LlmClient::parse_sse_event("data: [DONE]").is_none());
+        assert!(matches!(
+            LlmClient::parse_sse_event("data: [DONE]"),
+            SseParseResult::Done
+        ));
+    }
+
+    #[test]
+    fn test_parse_sse_event_comment_is_skip() {
+        assert!(matches!(
+            LlmClient::parse_sse_event(": comment"),
+            SseParseResult::Skip
+        ));
     }
 
     #[test]
     fn test_parse_sse_event_tool_call_delta() {
         let event = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{\"te"}}]},"finish_reason":null}]}"#;
-        let chunk = LlmClient::parse_sse_event(event).expect("should parse");
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+            panic!("expected Chunk");
+        };
         let tc = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
         assert_eq!(tc[0].index, 0);
         assert_eq!(tc[0].id.as_deref(), Some("call_1"));
@@ -391,7 +433,9 @@ mod tests {
     #[test]
     fn test_parse_sse_event_with_usage() {
         let event = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
-        let chunk = LlmClient::parse_sse_event(event).expect("should parse");
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+            panic!("expected Chunk");
+        };
         let usage = chunk.usage.expect("should have usage");
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 5);

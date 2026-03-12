@@ -4,6 +4,7 @@ pub mod channel;
 pub mod config;
 pub mod error;
 pub mod job;
+pub mod registry;
 pub mod run;
 
 pub use channel::{Channel, ChannelConfig, ChannelMessage, IncomingMessage, OutgoingMessage};
@@ -12,6 +13,7 @@ pub use audit::{AuditDecision, AuditEvent};
 pub use config::AlmsConfig;
 pub use error::{AlmsError, AlmsResult};
 pub use job::{CreateJobRequest, Job, JobId, JobSchedule, JobStatus};
+pub use registry::{AgentRecord, CreateAgentRequest, validate_agent_name};
 pub use run::{
     CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
     TokenUsage,

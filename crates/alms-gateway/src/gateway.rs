@@ -4,9 +4,9 @@
 
 use alms_channel::telegram::TelegramChannel;
 use alms_channel::{Channel, ChannelConfig};
-use alms_core::{AgentId, AlmsConfig, AlmsResult};
+use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
-use alms_session::{SessionConfig, SessionManager};
+use alms_session::{SessionConfig, SessionManager, SqliteStore};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -166,19 +166,22 @@ pub struct Gateway {
 impl Gateway {
     /// Create a new gateway
     pub fn new(config: GatewayConfig) -> AlmsResult<Self> {
+        let agent_id = config.agent_id.unwrap_or_default();
+
         let session_manager = match &config.db_path {
             Some(path) => {
                 info!("Opening SQLite session store at {}", path);
-                Arc::new(SessionManager::with_sqlite(
+                let store = SqliteStore::open(path)?;
+                // Auto-migrate sidecar agent into the agents registry
+                migrate_sidecar_agent(&store, agent_id);
+                Arc::new(SessionManager::with_store(
                     config.session_config.clone(),
-                    path,
+                    store,
                 )?)
             }
             None => Arc::new(SessionManager::new(config.session_config.clone())),
         };
         let llm = LlmClient::new(config.llm_config.clone())?;
-
-        let agent_id = config.agent_id.unwrap_or_default();
 
         Ok(Self {
             config,
@@ -433,6 +436,52 @@ impl Gateway {
     }
 }
 
+/// Migrate the sidecar agent ID into the `agents` SQLite table.
+///
+/// This is a one-time, idempotent migration for existing deployments that used
+/// `./data/agent_id` (a plain-text UUID) before multi-agent support was added.
+/// If the agents table already has entries, this is a no-op.
+///
+/// All errors are non-fatal (`warn!` only) — migration must never block startup.
+fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
+    // If agents table already has entries, skip (already migrated or manually created)
+    match store.list_agents() {
+        Ok(agents) if !agents.is_empty() => {
+            return;
+        }
+        Err(e) => {
+            warn!("Failed to check agents table during migration: {}", e);
+            return;
+        }
+        _ => {}
+    }
+
+    let now = chrono::Utc::now();
+    let record = AgentRecord {
+        id: agent_id,
+        name: "default".to_string(),
+        description: "Auto-migrated default agent".to_string(),
+        model: None,
+        system_prompt: None,
+        posture: None,
+        is_default: true,
+        created_at: now,
+        last_active: now,
+    };
+
+    if let Err(e) = store.create_agent(&record) {
+        warn!("Failed to migrate sidecar agent to registry: {}", e);
+        return;
+    }
+
+    if let Err(e) = store.set_default_agent(agent_id) {
+        warn!("Failed to set migrated agent as default: {}", e);
+        return;
+    }
+
+    info!("Migrated sidecar agent to registry: {}", agent_id.0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +543,68 @@ mod tests {
         };
         let gateway = Gateway::new(config).unwrap();
         assert_eq!(*gateway.agent_id(), expected);
+    }
+
+    #[test]
+    fn test_migrate_creates_default_agent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent_id = AgentId::new();
+        migrate_sidecar_agent(&store, agent_id);
+
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, agent_id);
+        assert_eq!(agents[0].name, "default");
+        assert!(agents[0].is_default);
+    }
+
+    #[test]
+    fn test_migrate_idempotent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent_id = AgentId::new();
+        migrate_sidecar_agent(&store, agent_id);
+        migrate_sidecar_agent(&store, agent_id);
+
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+    }
+
+    #[test]
+    fn test_migrate_preserves_agent_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent_id = AgentId::new();
+        migrate_sidecar_agent(&store, agent_id);
+
+        let loaded = store.load_agent_by_id(agent_id).unwrap();
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap().id, agent_id);
+    }
+
+    #[test]
+    fn test_migrate_skips_when_agents_exist() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // Pre-populate with an agent
+        let existing_id = AgentId::new();
+        let now = chrono::Utc::now();
+        let existing = AgentRecord {
+            id: existing_id,
+            name: "atlas".to_string(),
+            description: String::new(),
+            model: None,
+            system_prompt: None,
+            posture: None,
+            is_default: true,
+            created_at: now,
+            last_active: now,
+        };
+        store.create_agent(&existing).unwrap();
+
+        // Migration with a different agent_id should be a no-op
+        let sidecar_id = AgentId::new();
+        migrate_sidecar_agent(&store, sidecar_id);
+
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, existing_id);
     }
 }

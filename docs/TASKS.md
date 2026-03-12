@@ -22,6 +22,10 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-11:** SSE multi-subscriber (#44): `event_senders` changed from single sender to `Vec<Sender>` per run. Dead senders pruned via `retain()` on every broadcast. Register-before-replay eliminates snapshot→live gap; dedup filter on `max_replay_id`. 4 new tests (170 total).
 - **2026-03-11:** Token-by-token SSE streaming (#27): `agent_loop` now uses `complete_stream` (SSE) instead of buffered `complete`. Token deltas emitted via `RuntimeEvent::TokenDelta` as chunks arrive. Proper SSE line-buffer parser handles TCP chunk boundaries. Tool call deltas accumulated incrementally. Falls back to buffered on streaming failure. Mock produces word-level chunks. 5 new tests (175 total).
 - **2026-03-08:** Token usage logging (#16) implemented: `prompt_tokens` + `completion_tokens` accumulated per run, surfaced in `run_finished` SSE and `GET /runs/{id}`. All pre-existing clippy warnings fixed — `make ci` now passes cleanly across all crates.
+- **2026-03-11:** Persistent named agents & CLI system design doc written (`docs/persistent-agents-cli-design.md`). Tasks #46–#54 formulated covering: agent registry, auto-migration, HTTP API, per-agent config, CLI commands (agent/session/run/job/dashboard), UI agent switching.
+- **2026-03-12:** Agent registry (#46): `agents` table + `AgentRecord` in alms-core + `validate_agent_name` + CRUD on SqliteStore (`create_agent`, load/list/update/delete, `set_default_agent`, `touch_agent`). 9 store tests + 8 validation tests.
+- **2026-03-12:** Agent auto-migration (#47): `migrate_sidecar_agent()` in Gateway::new() auto-registers sidecar agent ID into `agents` table on first boot. Idempotent, non-fatal. `SessionManager::store()` accessor added. 4 migration tests. Review fixes: `save_agent` renamed to `create_agent` (INSERT-only semantics); `set_default_agent` now errors on nonexistent ID.
+- **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 
 ---
 
@@ -366,6 +370,79 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ---
 
+## P10 — Persistent Named Agents & CLI System
+
+> Design doc: `docs/persistent-agents-cli-design.md`
+> Goal: multiple named, persistent agents per deployment + full CLI for managing agents, sessions, runs, jobs.
+> Logical implementation order: 46 → 47 → 48 → 49 → 50 → 51 → 52 → 53 → 54.
+
+46) Agent registry — data model + SQLite persistence ✅
+- New `agents` table in `SqliteStore` SCHEMA: `id` (UUID PK), `name` (unique slug), `description`, `model`/`system_prompt`/`posture` (nullable overrides), `is_default` flag, `created_at`, `last_active`.
+- `AgentRecord` struct in `alms-core/src/registry.rs`. `CreateAgentRequest` + `validate_agent_name()`.
+- CRUD methods on `SqliteStore`: `create_agent`, `load_agent_by_id`, `load_agent_by_name`, `get_default_agent`, `list_agents`, `update_agent`, `delete_agent`, `set_default_agent` (errors on nonexistent ID), `touch_agent`.
+- 9 store tests + 8 name validation tests (179+ total).
+- **Owners:** Atlas
+
+47) Agent auto-migration (single-agent → multi-agent) ✅
+- `migrate_sidecar_agent()` in `Gateway::new()`: if `agents` table empty → auto-create `{ name: "default", id: <sidecar-uuid>, is_default: true }`.
+- Idempotent (skips if agents table non-empty), non-fatal (all errors are `warn!` only).
+- `resolve_default_agent_id()` still resolves the UUID; migration just registers it in SQLite.
+- `SessionManager::store()` accessor added for downstream crate access.
+- 4 migration tests (183+ total).
+- **Owners:** Atlas
+
+48) Agent HTTP API (`/agents` CRUD)
+- New route group in `protected_router()`: `GET /agents`, `POST /agents`, `GET /agents/{id_or_name}`, `PUT /agents/{id_or_name}`, `DELETE /agents/{id_or_name}`, `POST /agents/{id_or_name}/default`.
+- Path parameter accepts UUID or name slug (try UUID parse first, then name lookup).
+- `GET /settings` expanded to include `agents` array: `[{ name, id, is_default, model }]`.
+- New `agents.rs` module in `alms-gateway`; `SqliteStore` (or agent store ref) added to `AppState`.
+- Cannot delete default agent without `--force` or setting another default first.
+- Integration tests for CRUD + name/UUID resolution + default management.
+- **Owners:** Atlas
+
+49) Per-agent config overrides in run execution
+- `execute_run()` in `runs.rs`: look up agent's `AgentRecord`, merge per-agent `model`/`system_prompt`/`posture` with server defaults when building `AgentConfig`.
+- Precedence: per-run override > per-agent override > server default.
+- Update `last_active` on the agent record when a run completes.
+- **Owners:** Atlas
+
+50) CLI — agent management commands
+- Expand `Commands` enum in `alms-cli/main.rs` with `Agent { #[command(subcommand)] cmd: AgentCommands }`.
+- `AgentCommands`: `List`, `Create`, `Show`, `Delete`, `SetDefault`, `Config`.
+- Read-only commands (`list`, `show`) open `./data/alms.db` directly via `SqliteStore` — no running gateway needed.
+- `Create` and `Delete` also direct SQLite (no runtime needed).
+- Default output: human-readable table. `--json` flag for machine-readable.
+- Tests: create + list + show + delete + set-default round-trip.
+- **Owners:** Atlas
+
+51) CLI — session management commands
+- `Session { #[command(subcommand)] cmd: SessionCommands }`: `List`, `Show`, `Delete`.
+- `list --agent NAME` filters by agent.
+- Direct SQLite access (no gateway needed).
+- **Owners:** Atlas
+
+52) CLI — run and job commands
+- `Run { #[command(subcommand)] cmd: RunCommands }`: `Create`, `List`, `Show`.
+- `run create --session ID --input "text"` — calls HTTP API on running gateway. Clear error if gateway not running.
+- `Job { #[command(subcommand)] cmd: JobCommands }`: `List`, `Create`, `Cancel`, `Show`.
+- `job list --agent NAME` filters by agent. `job create` and `job cancel` via HTTP API.
+- **Owners:** Atlas
+
+53) CLI — dashboard + polish
+- `alms dashboard` — opens `http://127.0.0.1:8080` in system browser (`xdg-open` / `open` / `start`).
+- Shell completions generation (clap's built-in `generate` support).
+- Consistent `--json` flag across all list/show commands.
+- **Owners:** Atlas
+
+54) UI — agent selector and management
+- Agent selector dropdown in the header (next to posture badge).
+- Switching agents filters sessions and shows that agent's workspace.
+- Agent management section in settings drawer: create/delete/configure agents.
+- Each agent shows workspace bootstrap status (`needs_bootstrap()`).
+- **Owners:** Atlas
+
+---
+
 ## Docs index
 Start here:
 - `docs/index.md`
@@ -384,6 +461,9 @@ Spine:
 
 UX requirements:
 - `docs/agent-ux-requirements.md`
+
+Design:
+- `docs/persistent-agents-cli-design.md`
 
 Execution plan:
 - `docs/mvp-plan.md`

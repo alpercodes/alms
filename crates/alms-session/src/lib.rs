@@ -312,6 +312,11 @@ impl SessionManager {
         &self.config
     }
 
+    /// Get the underlying SQLite store (if any).
+    pub fn store(&self) -> Option<&Arc<SqliteStore>> {
+        self.store.as_ref()
+    }
+
     /// Flush the SQLite WAL to disk. No-op if no SQLite store is attached.
     pub fn flush_wal(&self) -> AlmsResult<()> {
         if let Some(store) = &self.store {
