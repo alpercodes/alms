@@ -636,6 +636,130 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Load a single job by ID.
+    pub fn load_job_by_id(&self, id: JobId) -> AlmsResult<Option<Job>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
+             FROM jobs WHERE id = ?1",
+            params![id.0.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        );
+        match result {
+            Ok((
+                id_str,
+                agent_id,
+                prompt,
+                schedule_json,
+                status,
+                created_at,
+                next_run_at,
+                last_run_at,
+            )) => {
+                let id_uuid = uuid::Uuid::parse_str(&id_str)
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse job id: {e}")))?;
+                let agent_uuid = uuid::Uuid::parse_str(&agent_id)
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse agent id: {e}")))?;
+                let schedule: JobSchedule = serde_json::from_str(&schedule_json)
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse schedule: {e}")))?;
+                let created = chrono::DateTime::parse_from_rfc3339(&created_at)
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse created_at: {e}")))?;
+                let next_run = next_run_at
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                let last_run = last_run_at
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                Ok(Some(Job {
+                    id: JobId(id_uuid),
+                    agent_id: AgentId(agent_uuid),
+                    prompt,
+                    schedule,
+                    status: str_to_job_status(&status),
+                    created_at: created.with_timezone(&chrono::Utc),
+                    next_run_at: next_run,
+                    last_run_at: last_run,
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AlmsError::Runtime(format!("SQLite load_job_by_id: {e}"))),
+        }
+    }
+
+    /// Load all jobs including cancelled, ordered by created_at DESC.
+    pub fn load_all_jobs_unfiltered(&self) -> AlmsResult<Vec<Job>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, prompt, schedule, status, created_at, next_run_at, last_run_at \
+                 FROM jobs ORDER BY created_at DESC",
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare jobs_unfiltered: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            })
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query jobs_unfiltered: {e}")))?
+            .filter_map(|r| r.ok())
+            .filter_map(
+                |(
+                    id,
+                    agent_id,
+                    prompt,
+                    schedule_json,
+                    status,
+                    created_at,
+                    next_run_at,
+                    last_run_at,
+                )| {
+                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
+                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
+                    let schedule: JobSchedule = serde_json::from_str(&schedule_json).ok()?;
+                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
+                    let next_run = next_run_at
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc));
+                    let last_run = last_run_at
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                        .map(|dt| dt.with_timezone(&chrono::Utc));
+                    Some(Job {
+                        id: JobId(id_uuid),
+                        agent_id: AgentId(agent_uuid),
+                        prompt,
+                        schedule,
+                        status: str_to_job_status(&status),
+                        created_at: created.with_timezone(&chrono::Utc),
+                        next_run_at: next_run,
+                        last_run_at: last_run,
+                    })
+                },
+            )
+            .collect();
+
+        Ok(rows)
+    }
+
     // ── Context summaries ─────────────────────────────────────────────────────
 
     /// Upsert the rolling context summary for a session.

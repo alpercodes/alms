@@ -1,4 +1,8 @@
-use alms_core::{AgentId, AgentRecord, SessionId, validate_agent_name};
+use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
+use alms_core::{
+    AgentId, AgentRecord, CreateJobRequest, CreateRunRequest, CreateRunResponse, RunInput,
+    RunStatusResponse, SessionId, validate_agent_name,
+};
 use alms_session::{Session, SessionStatus, SqliteStore};
 use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
@@ -44,6 +48,38 @@ enum Commands {
         /// Output as JSON instead of human-readable text
         #[arg(long, global = true)]
         json: bool,
+    },
+    /// Manage runs (requires running gateway)
+    Run {
+        #[command(subcommand)]
+        cmd: RunCommands,
+        /// Output as JSON instead of human-readable text
+        #[arg(long, global = true)]
+        json: bool,
+        /// Gateway URL
+        #[arg(
+            long,
+            global = true,
+            default_value = "http://127.0.0.1:8080",
+            env = "ALMS_GATEWAY_URL"
+        )]
+        url: String,
+    },
+    /// Manage scheduled jobs
+    Job {
+        #[command(subcommand)]
+        cmd: JobCommands,
+        /// Output as JSON instead of human-readable text
+        #[arg(long, global = true)]
+        json: bool,
+        /// Gateway URL (used by create/cancel)
+        #[arg(
+            long,
+            global = true,
+            default_value = "http://127.0.0.1:8080",
+            env = "ALMS_GATEWAY_URL"
+        )]
+        url: String,
     },
 }
 
@@ -125,6 +161,77 @@ enum SessionCommands {
     Delete {
         /// Session UUID
         session_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RunCommands {
+    /// Create a new run (requires running gateway)
+    Create {
+        /// Session UUID
+        #[arg(long)]
+        session: String,
+        /// Input text for the agent
+        #[arg(long)]
+        input: String,
+        /// Model override
+        #[arg(long)]
+        model: Option<String>,
+        /// Temperature override (0.0-2.0)
+        #[arg(long)]
+        temperature: Option<f32>,
+        /// Max tokens override
+        #[arg(long)]
+        max_tokens: Option<u32>,
+        /// Posture override ("guarded" or "full_control")
+        #[arg(long)]
+        posture: Option<String>,
+    },
+    /// List runs for a session (requires running gateway)
+    List {
+        /// Session UUID
+        #[arg(long)]
+        session: String,
+        /// Max results
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Show details of a run (requires running gateway)
+    Show {
+        /// Run UUID
+        run_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum JobCommands {
+    /// List all jobs
+    List {
+        /// Filter by agent name or UUID
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Show details of a job
+    Show {
+        /// Job UUID
+        job_id: String,
+    },
+    /// Create a new job (requires running gateway)
+    Create {
+        /// Agent name or UUID
+        #[arg(long)]
+        agent: String,
+        /// Prompt text for the agent
+        #[arg(long)]
+        prompt: String,
+        /// Schedule: "once:2026-03-15T09:00:00Z" or "cron:0 9 * * 1-5"
+        #[arg(long)]
+        schedule: String,
+    },
+    /// Cancel a job (requires running gateway)
+    Cancel {
+        /// Job UUID
+        job_id: String,
     },
 }
 
@@ -472,6 +579,384 @@ fn session_delete(store: &SqliteStore, session_id_str: &str, json: bool) -> anyh
 }
 
 // ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+/// Build a full URL from base and path.
+fn api_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+/// Build a reqwest client with optional auth token.
+fn api_client() -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Ok(token) = std::env::var("ALMS_AUTH_TOKEN") {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, val);
+        }
+        builder = builder.default_headers(headers);
+    }
+    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// Parse an HTTP error response body into a user-friendly message.
+fn parse_api_error(status: reqwest::StatusCode, body: &str) -> String {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body)
+        && let Some(msg) = val
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+    {
+        return format!("HTTP {status}: {msg}");
+    }
+    format!("HTTP {status}: {body}")
+}
+
+/// Send a GET request and return the response body as JSON Value.
+async fn api_get(base_url: &str, path: &str) -> anyhow::Result<serde_json::Value> {
+    let client = api_client();
+    let url = api_url(base_url, path);
+    let resp = client.get(&url).send().await.map_err(|e| {
+        if e.is_connect() {
+            anyhow::anyhow!(
+                "Cannot connect to gateway at {base_url}. Is it running? Start with: alms gateway"
+            )
+        } else {
+            anyhow::anyhow!("Request failed: {e}")
+        }
+    })?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("{}", parse_api_error(status, &body));
+    }
+    Ok(serde_json::from_str(&body)?)
+}
+
+/// Send a POST request with JSON body and return the response.
+async fn api_post(
+    base_url: &str,
+    path: &str,
+    body: &impl serde::Serialize,
+) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+    let client = api_client();
+    let url = api_url(base_url, path);
+    let resp = client.post(&url).json(body).send().await.map_err(|e| {
+        if e.is_connect() {
+            anyhow::anyhow!(
+                "Cannot connect to gateway at {base_url}. Is it running? Start with: alms gateway"
+            )
+        } else {
+            anyhow::anyhow!("Request failed: {e}")
+        }
+    })?;
+    let status = resp.status();
+    let body_text = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("{}", parse_api_error(status, &body_text));
+    }
+    Ok((status, serde_json::from_str(&body_text)?))
+}
+
+/// Send a DELETE request and return the status code.
+async fn api_delete(base_url: &str, path: &str) -> anyhow::Result<reqwest::StatusCode> {
+    let client = api_client();
+    let url = api_url(base_url, path);
+    let resp = client.delete(&url).send().await.map_err(|e| {
+        if e.is_connect() {
+            anyhow::anyhow!(
+                "Cannot connect to gateway at {base_url}. Is it running? Start with: alms gateway"
+            )
+        } else {
+            anyhow::anyhow!("Request failed: {e}")
+        }
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await?;
+        anyhow::bail!("{}", parse_api_error(status, &body));
+    }
+    Ok(status)
+}
+
+// ---------------------------------------------------------------------------
+// Run command handlers
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn run_create(
+    url: &str,
+    session: &str,
+    input: &str,
+    model: Option<String>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    posture: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
+    let session_uuid =
+        uuid::Uuid::parse_str(session).map_err(|_| anyhow::anyhow!("Invalid session UUID"))?;
+    let req = CreateRunRequest {
+        session_id: SessionId(session_uuid),
+        input: RunInput::Text {
+            text: input.to_string(),
+        },
+        model,
+        temperature,
+        max_tokens,
+        posture,
+    };
+    let (_status, val) = api_post(url, "runs", &req).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&val)?);
+    } else {
+        let resp: CreateRunResponse = serde_json::from_value(val)?;
+        println!("Created run {} (status: {:?})", resp.run_id.0, resp.status);
+    }
+    Ok(())
+}
+
+async fn run_list(url: &str, session: &str, limit: usize, json: bool) -> anyhow::Result<()> {
+    let _uuid =
+        uuid::Uuid::parse_str(session).map_err(|_| anyhow::anyhow!("Invalid session UUID"))?;
+    let path = format!("runs?session_id={session}&limit={limit}");
+    let val = api_get(url, &path).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&val)?);
+        return Ok(());
+    }
+
+    let runs: Vec<RunStatusResponse> = serde_json::from_value(
+        val.get("runs")
+            .cloned()
+            .unwrap_or(serde_json::Value::Array(vec![])),
+    )?;
+
+    if runs.is_empty() {
+        println!("No runs found for session {session}.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:<12} {:<12} {:<12} STARTED",
+        "RUN", "SESSION", "AGENT", "STATUS"
+    );
+    for r in &runs {
+        let run_short = &r.run_id.0.to_string()[..8];
+        let sess_short = &r.session_id.0.to_string()[..8];
+        let agent_short = &r.agent_id.to_string()[..8];
+        let status = format!("{:?}", r.status).to_lowercase();
+        let started = r
+            .started_at
+            .map(|t| fmt_time(&t))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<12} {:<12} {:<12} {:<12} {}",
+            run_short, sess_short, agent_short, status, started
+        );
+    }
+    Ok(())
+}
+
+async fn run_show(url: &str, run_id: &str, json: bool) -> anyhow::Result<()> {
+    let _uuid = uuid::Uuid::parse_str(run_id).map_err(|_| anyhow::anyhow!("Invalid run UUID"))?;
+    let val = api_get(url, &format!("runs/{run_id}")).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&val)?);
+        return Ok(());
+    }
+
+    let r: RunStatusResponse = serde_json::from_value(val)?;
+    let status = format!("{:?}", r.status).to_lowercase();
+    println!("Run:         {}", r.run_id.0);
+    println!("Session:     {}", r.session_id.0);
+    println!("Agent:       {}", r.agent_id);
+    println!("Status:      {}", status);
+    if let Some(t) = r.started_at {
+        println!("Started:     {}", fmt_time(&t));
+    }
+    if let Some(t) = r.ended_at {
+        println!("Ended:       {}", fmt_time(&t));
+    }
+    if let Some(u) = r.usage {
+        println!(
+            "Tokens:      prompt={}, completion={}",
+            u.prompt_tokens, u.completion_tokens
+        );
+    }
+    if let Some(jid) = r.job_id {
+        println!("Job:         {}", jid);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Job command handlers
+// ---------------------------------------------------------------------------
+
+fn job_list(store: &SqliteStore, agent: Option<String>, json: bool) -> anyhow::Result<()> {
+    let mut jobs = store.load_all_jobs_unfiltered()?;
+
+    if let Some(ref name_or_id) = agent {
+        let agent = resolve_agent(store, name_or_id)?;
+        jobs.retain(|j| j.agent_id == agent.id);
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&jobs)?);
+        return Ok(());
+    }
+
+    if jobs.is_empty() {
+        if let Some(ref a) = agent {
+            println!("No jobs found for agent '{a}'.");
+        } else {
+            println!("No jobs found.");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:<12} {:<22} {:<12} {:<22} LAST RUN",
+        "JOB", "AGENT", "SCHEDULE", "STATUS", "NEXT RUN"
+    );
+    for j in &jobs {
+        let id_short = &j.id.to_string()[..8];
+        let agent_short = &j.agent_id.to_string()[..8];
+        let schedule = match &j.schedule {
+            JobSchedule::Once { run_at } => format!("once:{}", fmt_time(run_at)),
+            JobSchedule::Recurring { cron } => format!("cron:{cron}"),
+        };
+        let status = fmt_job_status(j.status);
+        let next = j
+            .next_run_at
+            .map(|t| fmt_time(&t))
+            .unwrap_or_else(|| "-".to_string());
+        let last = j
+            .last_run_at
+            .map(|t| fmt_time(&t))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<12} {:<12} {:<22} {:<12} {:<22} {}",
+            id_short, agent_short, schedule, status, next, last
+        );
+    }
+    Ok(())
+}
+
+fn job_show(store: &SqliteStore, job_id_str: &str, json: bool) -> anyhow::Result<()> {
+    let uuid =
+        uuid::Uuid::parse_str(job_id_str).map_err(|_| anyhow::anyhow!("Invalid job UUID"))?;
+    let job = store
+        .load_job_by_id(JobId(uuid))?
+        .ok_or_else(|| anyhow::anyhow!("Job not found: {job_id_str}"))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&job)?);
+        return Ok(());
+    }
+
+    let schedule = match &job.schedule {
+        JobSchedule::Once { run_at } => format!("once ({})", fmt_time(run_at)),
+        JobSchedule::Recurring { cron } => format!("recurring ({cron})"),
+    };
+
+    println!("Job:         {}", job.id);
+    println!("Agent:       {}", job.agent_id);
+    println!("Prompt:      {}", job.prompt);
+    println!("Schedule:    {}", schedule);
+    println!("Status:      {}", fmt_job_status(job.status));
+    println!("Created:     {}", fmt_time(&job.created_at));
+    if let Some(t) = job.next_run_at {
+        println!("Next Run:    {}", fmt_time(&t));
+    }
+    if let Some(t) = job.last_run_at {
+        println!("Last Run:    {}", fmt_time(&t));
+    }
+
+    // Try to resolve agent name
+    if let Ok(Some(agent)) = store.load_agent_by_id(job.agent_id) {
+        println!("Agent Name:  {}", agent.name);
+    }
+    Ok(())
+}
+
+async fn job_create(
+    url: &str,
+    store: &SqliteStore,
+    agent_name_or_id: &str,
+    prompt: &str,
+    schedule_str: &str,
+    json: bool,
+) -> anyhow::Result<()> {
+    let agent = resolve_agent(store, agent_name_or_id)?;
+    let schedule = parse_schedule(schedule_str)?;
+
+    let req = CreateJobRequest {
+        agent_id: agent.id,
+        prompt: prompt.to_string(),
+        schedule,
+    };
+    let (_status, val) = api_post(url, "jobs", &req).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&val)?);
+    } else {
+        let created: Job = serde_json::from_value(val)?;
+        println!("Created job {} for agent '{}'", created.id, agent.name);
+    }
+    Ok(())
+}
+
+async fn job_cancel(url: &str, job_id_str: &str, json: bool) -> anyhow::Result<()> {
+    let _uuid =
+        uuid::Uuid::parse_str(job_id_str).map_err(|_| anyhow::anyhow!("Invalid job UUID"))?;
+    api_delete(url, &format!("jobs/{job_id_str}")).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": true, "cancelled": job_id_str })
+        );
+    } else {
+        println!("Cancelled job {job_id_str}");
+    }
+    Ok(())
+}
+
+/// Parse a schedule string: "once:2026-03-15T09:00:00Z" or "cron:0 9 * * 1-5"
+fn parse_schedule(s: &str) -> anyhow::Result<JobSchedule> {
+    if let Some(rest) = s.strip_prefix("once:") {
+        let run_at = chrono::DateTime::parse_from_rfc3339(rest)
+            .map_err(|e| anyhow::anyhow!("Invalid once timestamp (must be RFC 3339): {e}"))?
+            .with_timezone(&chrono::Utc);
+        return Ok(JobSchedule::Once { run_at });
+    }
+    if let Some(rest) = s.strip_prefix("cron:") {
+        let cron = rest.trim().to_string();
+        if cron.split_whitespace().count() != 5 {
+            anyhow::bail!("Cron expression must have exactly 5 fields");
+        }
+        return Ok(JobSchedule::Recurring { cron });
+    }
+    anyhow::bail!("Invalid schedule format. Use 'once:2026-03-15T09:00:00Z' or 'cron:0 9 * * 1-5'");
+}
+
+fn fmt_job_status(s: JobStatus) -> &'static str {
+    match s {
+        JobStatus::Pending => "pending",
+        JobStatus::Active => "active",
+        JobStatus::Cancelled => "cancelled",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -593,6 +1078,55 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Run { cmd, json, url } => match cmd {
+            RunCommands::Create {
+                session,
+                input,
+                model,
+                temperature,
+                max_tokens,
+                posture,
+            } => {
+                run_create(
+                    &url,
+                    &session,
+                    &input,
+                    model,
+                    temperature,
+                    max_tokens,
+                    posture,
+                    json,
+                )
+                .await?;
+            }
+            RunCommands::List { session, limit } => {
+                run_list(&url, &session, limit, json).await?;
+            }
+            RunCommands::Show { run_id } => {
+                run_show(&url, &run_id, json).await?;
+            }
+        },
+        Commands::Job { cmd, json, url } => match cmd {
+            JobCommands::List { agent } => {
+                let store = open_db()?;
+                job_list(&store, agent, json)?;
+            }
+            JobCommands::Show { job_id } => {
+                let store = open_db()?;
+                job_show(&store, &job_id, json)?;
+            }
+            JobCommands::Create {
+                agent,
+                prompt,
+                schedule,
+            } => {
+                let store = open_db()?;
+                job_create(&url, &store, &agent, &prompt, &schedule, json).await?;
+            }
+            JobCommands::Cancel { job_id } => {
+                job_cancel(&url, &job_id, json).await?;
+            }
+        },
     }
 
     Ok(())
@@ -877,5 +1411,132 @@ mod tests {
         let store = new_store();
         let err = session_delete(&store, &uuid::Uuid::new_v4().to_string(), false).unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    // ── Schedule parsing tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_parse_schedule_once() {
+        let s = parse_schedule("once:2026-03-15T09:00:00Z").unwrap();
+        match s {
+            JobSchedule::Once { run_at } => {
+                assert_eq!(run_at.to_rfc3339(), "2026-03-15T09:00:00+00:00");
+            }
+            _ => panic!("Expected Once schedule"),
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_cron() {
+        let s = parse_schedule("cron:0 9 * * 1-5").unwrap();
+        match s {
+            JobSchedule::Recurring { cron } => {
+                assert_eq!(cron, "0 9 * * 1-5");
+            }
+            _ => panic!("Expected Recurring schedule"),
+        }
+    }
+
+    #[test]
+    fn test_parse_schedule_invalid_prefix() {
+        let err = parse_schedule("every:5m").unwrap_err();
+        assert!(err.to_string().contains("Invalid schedule format"));
+    }
+
+    #[test]
+    fn test_parse_schedule_invalid_cron_fields() {
+        let err = parse_schedule("cron:* *").unwrap_err();
+        assert!(err.to_string().contains("5 fields"));
+    }
+
+    #[test]
+    fn test_parse_schedule_invalid_once_timestamp() {
+        let err = parse_schedule("once:not-a-date").unwrap_err();
+        assert!(err.to_string().contains("RFC 3339"));
+    }
+
+    // ── Job tests (SQLite-direct) ────────────────────────────────────────
+
+    fn make_job(store: &SqliteStore, agent_id: AgentId, prompt: &str) -> Job {
+        let req = CreateJobRequest {
+            agent_id,
+            prompt: prompt.to_string(),
+            schedule: JobSchedule::Once {
+                run_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        };
+        // Use the job_store methods indirectly via store
+        let job = Job {
+            id: JobId::new(),
+            agent_id: req.agent_id,
+            prompt: req.prompt,
+            schedule: req.schedule,
+            status: JobStatus::Pending,
+            created_at: chrono::Utc::now(),
+            next_run_at: None,
+            last_run_at: None,
+        };
+        store.save_job(&job).unwrap();
+        job
+    }
+
+    #[test]
+    fn test_job_list_empty() {
+        let store = new_store();
+        job_list(&store, None, false).unwrap();
+    }
+
+    #[test]
+    fn test_job_list_filters_by_agent() {
+        let store = new_store();
+        let a1 = make_agent(&store, "job-agent-a");
+        let a2 = make_agent(&store, "job-agent-b");
+        make_job(&store, a1.id, "prompt A");
+        make_job(&store, a1.id, "prompt A2");
+        make_job(&store, a2.id, "prompt B");
+
+        let all = store.load_all_jobs_unfiltered().unwrap();
+        assert_eq!(all.len(), 3);
+
+        let filtered: Vec<_> = all.into_iter().filter(|j| j.agent_id == a1.id).collect();
+        assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_job_show_found() {
+        let store = new_store();
+        let agent = make_agent(&store, "job-show-agent");
+        let job = make_job(&store, agent.id, "test prompt");
+        job_show(&store, &job.id.to_string(), false).unwrap();
+    }
+
+    #[test]
+    fn test_job_show_not_found() {
+        let store = new_store();
+        let err = job_show(&store, &uuid::Uuid::new_v4().to_string(), false).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_job_show_invalid_uuid() {
+        let store = new_store();
+        let err = job_show(&store, "not-a-uuid", false).unwrap_err();
+        assert!(err.to_string().contains("Invalid job UUID"));
+    }
+
+    #[test]
+    fn test_load_job_by_id() {
+        let store = new_store();
+        let agent = make_agent(&store, "load-job-agent");
+        let job = make_job(&store, agent.id, "test");
+        let loaded = store.load_job_by_id(job.id).unwrap().unwrap();
+        assert_eq!(loaded.prompt, "test");
+        assert_eq!(loaded.agent_id, agent.id);
+    }
+
+    #[test]
+    fn test_load_job_by_id_not_found() {
+        let store = new_store();
+        assert!(store.load_job_by_id(JobId::new()).unwrap().is_none());
     }
 }

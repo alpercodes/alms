@@ -29,6 +29,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-12:** Per-agent config overrides (#49): `execute_run()` merges per-agent model/system_prompt/posture from AgentRecord. Three-layer precedence: per-run > per-agent > server default. `touch_agent()` updates `last_active` after every run.
 - **2026-03-12:** Agent HTTP API (#48): `/agents` CRUD endpoints (list, create, get, update, delete, set-default). `UpdateAgentRequest` type. `GET /settings` includes agents array. Path params accept UUID or name slug. 6 handler tests.
 - **2026-03-12:** CLI session commands (#51): `alms session {list, show, delete}`. `list --agent NAME` filters by agent. `show` displays session details + message count + agent name. Direct SQLite access. `list_sessions()` + `load_session_by_id()` + `load_sessions_by_agent()` + `message_count()` on SqliteStore. 8 CLI tests + 4 store tests.
+- **2026-03-12:** CLI run and job commands (#52): `alms run {create, list, show}` via HTTP API; `alms job {list, show}` via SQLite, `alms job {create, cancel}` via HTTP API. `--url` / `ALMS_GATEWAY_URL` for gateway address. Auth token forwarding. Schedule parsing ("once:"/"cron:"). `load_job_by_id()` + `load_all_jobs_unfiltered()`. 12 new tests (31 CLI total).
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 
 ---
@@ -432,11 +433,17 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - 8 CLI tests + 4 store tests (19 CLI total, 35 session total).
 - **Owners:** Atlas
 
-52) CLI — run and job commands
-- `Run { #[command(subcommand)] cmd: RunCommands }`: `Create`, `List`, `Show`.
-- `run create --session ID --input "text"` — calls HTTP API on running gateway. Clear error if gateway not running.
-- `Job { #[command(subcommand)] cmd: JobCommands }`: `List`, `Create`, `Cancel`, `Show`.
-- `job list --agent NAME` filters by agent. `job create` and `job cancel` via HTTP API.
+52) CLI — run and job commands ✅
+- `alms run {create, list, show}` — all via HTTP API (runs are in-memory only, no SQLite table).
+- `run create --session ID --input "text" [--model M] [--temperature T] [--max-tokens N] [--posture P]` — calls POST /runs.
+- `alms job {list, show}` — direct SQLite access (no gateway needed).
+- `alms job {create, cancel}` — via HTTP API (gateway must be running for scheduler registration).
+- `--url` / `ALMS_GATEWAY_URL` env var for gateway address. Auth token forwarded from `ALMS_AUTH_TOKEN`.
+- `job list --agent NAME` filters by agent. `parse_schedule()` for "once:" and "cron:" formats.
+- HTTP helpers: `api_get`, `api_post`, `api_delete` with auth + connection error handling.
+- New SqliteStore methods: `load_job_by_id()`, `load_all_jobs_unfiltered()`.
+- `Serialize` added to `CreateRunRequest`, `Deserialize` added to response types.
+- 12 new tests (31 CLI total).
 - **Owners:** Atlas
 
 53) CLI — dashboard + polish

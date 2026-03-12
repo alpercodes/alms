@@ -113,7 +113,7 @@ impl Run {
 }
 
 /// Request to create a run
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRunRequest {
     pub session_id: SessionId,
     pub input: RunInput,
@@ -139,7 +139,7 @@ pub enum RunInput {
 }
 
 /// Response when creating a run
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRunResponse {
     pub run_id: RunId,
     pub session_id: SessionId,
@@ -148,7 +148,7 @@ pub struct CreateRunResponse {
 }
 
 /// Run status response
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RunStatusResponse {
     pub run_id: RunId,
     pub session_id: SessionId,
