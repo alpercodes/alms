@@ -798,4 +798,25 @@ mod tests {
         // Unknown posture keeps server default
         assert!(matches!(merged.agent_config.posture, Posture::FullControl));
     }
+
+    #[test]
+    fn test_negative_temperature_clamped() {
+        let overrides = RunOverrides {
+            temperature: Some(-1.0),
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(base_config(), None, &overrides);
+        assert_eq!(merged.agent_config.temperature, 0.0);
+    }
+
+    #[test]
+    fn test_unknown_posture_per_run_ignored() {
+        let overrides = RunOverrides {
+            posture: Some("yolo".to_string()),
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(base_config(), None, &overrides);
+        // Unknown per-run posture keeps server default
+        assert!(matches!(merged.agent_config.posture, Posture::FullControl));
+    }
 }

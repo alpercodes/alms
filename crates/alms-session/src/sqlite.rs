@@ -1223,7 +1223,11 @@ mod tests {
         // INSERT OR REPLACE keys on PRIMARY KEY (id), not name.
         // A different id with the same name should violate UNIQUE.
         let result = store.create_agent(&a2);
-        assert!(result.is_err());
+        assert!(
+            matches!(result, Err(alms_core::AlmsError::DuplicateName(ref name)) if name == "unique"),
+            "Expected DuplicateName error, got: {:?}",
+            result,
+        );
     }
 
     #[test]
