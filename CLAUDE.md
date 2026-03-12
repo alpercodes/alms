@@ -34,7 +34,7 @@ crates/
   alms-session/      # Session store, JSON snapshot persistence (atomic + rotation + checksums)
   alms-sandbox/      # WASM tool sandbox, builtin tools (echo, math, http_get), registry
   alms-channel/      # Channel adapters (Telegram polling implemented)
-  alms-cli/          # Thin CLI entrypoint (clap)
+  alms-cli/          # CLI entrypoint (clap) — gateway, health, agent management
 docs/                # Design docs — api.md, architecture.md, security-model.md, etc.
                      #   agent-runtime-design.md — detailed design for config/context/workspace
                      #   agent-ux-requirements.md — Alper's UX requirements
@@ -46,6 +46,7 @@ research/            # Competitive analysis and tech-stack decisions
 
 ```
 alms-cli → alms-gateway → alms-runtime    → alms-core
+         → alms-session → alms-core
                         → alms-coordinator → alms-core
                                            → alms-session
                                            → alms-runtime
