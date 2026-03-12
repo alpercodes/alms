@@ -235,7 +235,8 @@ async fn execute_run(
         cfg
     };
 
-    // Override system prompt with bootstrap prompt for first-time agents
+    // Override system prompt with bootstrap prompt for first-time agents.
+    // Must come after per-agent overrides so bootstrap takes precedence.
     let agent_config = if let Some(ref workspace_dir) = state.workspace_dir {
         let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, agent_id);
         if workspace.needs_bootstrap() {
