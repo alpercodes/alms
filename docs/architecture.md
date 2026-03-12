@@ -104,7 +104,7 @@ LLM call → ... → emit result → stop
 
 Isolated tool execution used by every agent regardless of hierarchy level.
 
-**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list`, `workspace_write`, `invoke_agent`, `get_task_result`
+**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list`, `workspace_write`, `invoke_agent`, `get_task_result`, `read_subagent_session`
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 
@@ -178,10 +178,13 @@ Token cost is a first-class constraint:
 ### Completed ✅
 - Core types, session manager, agent runtime, WASM sandbox
 - HTTP gateway with SSE streaming, approval workflow, audit log
-- Built-in tools: echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, get_task_result
+- Built-in tools: echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, get_task_result, read_subagent_session
 - Cron/scheduler, SQLite persistence, web UI with agent selector
 - Coordinator with real AgentRuntime loops, foreground + background subagents
 - `invoke_agent` tool with `name` param for persistent subagent sessions (UUID v5 deterministic identity)
+- Named subagent workspaces with registry-based config (system_prompt, model, posture)
+- `alms agent create` initializes workspace directory with empty identity files
+- Default system prompt includes CLI awareness (`alms --help` via shell_exec)
 - Subagent SSE events forwarded into parent run stream
 - `GET /tasks`, `GET /tasks/{id}` HTTP endpoints
 - Agent registry with named persistent agents, per-agent config overrides

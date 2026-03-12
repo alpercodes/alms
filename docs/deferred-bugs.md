@@ -112,6 +112,14 @@ All critical and medium bugs from that review were fixed in commit 437de9b. Rema
 
 - **[coordinator/lib.rs] N3 Low** — Test `test_named_subagent_persistent_session` doesn't verify workspace attachment (test coordinator has `workspace_dir: None`). Comment could note this limitation. *Deferred: cosmetic.*
 
+## From review of #84 (agent create workspace + CLI awareness) — 2026-03-12
+
+- **[main.rs] S3 Low** — Duplicated default workspace path `"./data/workspace"` hardcoded in both `main.rs` (CLI) and `gateway.rs` (gateway). If the default changes, two call sites must be updated. *Deferred: only 2 sites, low risk. Extract a shared constant in `alms-core` when config is next refactored.*
+
+- **[main.rs] S4 Low** — `agent_create` has 9 positional parameters. Should group into an `AgentCreateOpts` struct for readability, especially at test call sites with many `None` arguments. *Deferred: cleanup task, no functional impact.*
+
+- **[agents.rs] S5 Low** — No gateway-side test for workspace file creation. The HTTP `create_agent` handler calls `init_workspace_files`, but no test in `agents.rs` exercises this. Core function and CLI path are tested. *Deferred: needs test infrastructure (mock AppState with workspace_dir).*
+
 ## From review of named subagent sessions (persistent invoke_agent) — 2026-03-12
 
 - **[lib.rs] S2 Medium** — Race condition with concurrent named subagent invocations. If the same named subagent is invoked twice in parallel (e.g., via `join_all` tool calls), both derive the same `(agent_id, context_id)` and write to the same session concurrently. Could corrupt session history. *Deferred: would require a `DashSet<String>` of active named subagents or documenting as unsupported. No user-facing scenario triggers this today.*

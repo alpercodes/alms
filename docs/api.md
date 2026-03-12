@@ -394,6 +394,8 @@ Named agents are persistent entities stored in SQLite. Each agent has a unique s
 
 **Response 201** — returns the created `AgentRecord`.
 
+Side effects: creates the agent's workspace directory at `{workspace_dir}/{name}/` with empty identity files (personality.md, goals.md, memories.md, user.md).
+
 Errors:
 - `400 INVALID_NAME` — name fails validation (1–64 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphens)
 - `409 DUPLICATE_NAME` — name already exists

@@ -7,6 +7,7 @@
 use crate::{AgentId, AlmsError, AlmsResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// A persistent agent registered in the system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +100,24 @@ pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
     Ok(())
 }
 
+/// Workspace file names created for every new agent.
+pub const WORKSPACE_FILENAMES: &[&str] = &["personality.md", "goals.md", "memories.md", "user.md"];
+
+/// Create empty workspace files in a directory.
+///
+/// Skips files that already exist so the function is idempotent.
+/// The directory is created if it doesn't exist.
+pub fn init_workspace_files(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for filename in WORKSPACE_FILENAMES {
+        let path = dir.join(filename);
+        if !path.exists() {
+            std::fs::write(&path, "")?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +188,24 @@ mod tests {
         // Also test a v4-style UUID
         let err = validate_agent_name("550e8400-e29b-41d4-a716-446655440000").unwrap_err();
         assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn test_init_workspace_files_creates_all() {
+        let tmp = std::env::temp_dir().join(format!("alms-test-{}", uuid::Uuid::new_v4()));
+        let dir = tmp.join("my-agent");
+        init_workspace_files(&dir).unwrap();
+        for filename in WORKSPACE_FILENAMES {
+            assert!(dir.join(filename).exists(), "{filename} should exist");
+        }
+        // Idempotent — writing content then calling again should not overwrite
+        std::fs::write(dir.join("goals.md"), "Keep this").unwrap();
+        init_workspace_files(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("goals.md")).unwrap(),
+            "Keep this"
+        );
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

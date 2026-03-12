@@ -34,7 +34,7 @@ What already works in our favor:
 | System | Multi-agent ready? | Details |
 |--------|-------------------|---------|
 | Sessions | Yes | Keyed by `(AgentId, context_id)` — `sessions` table has `agent_id` column |
-| Workspace | Yes | Per-agent directory: `data/workspace/{agent_id}/` |
+| Workspace | Yes | Per-agent directory: `data/workspace/{name}/` (name-based, not UUID-based) |
 | Jobs | Yes | `jobs` table has `agent_id` column |
 | Agent identity | No | Single UUID from sidecar file, no registry |
 | Config | No | Single `LlmConfig`, single `AgentConfig` — no per-agent overrides |
@@ -114,7 +114,7 @@ fn set_default_agent(&self, id: AgentId) -> AlmsResult<()>;
 
 1. User runs `alms agent create --name atlas --description "Code assistant"` or `POST /agents`
 2. System generates a UUID, inserts into `agents` table
-3. Workspace directory `data/workspace/{uuid}/` is created
+3. Workspace directory `data/workspace/{name}/` is created with empty identity files (personality.md, goals.md, memories.md, user.md). CLI outputs the workspace path.
 4. If `--default` flag (or first agent), set `is_default = 1` (unset any previous default)
 5. On first interaction, bootstrap interview runs (existing `needs_bootstrap()` logic)
 

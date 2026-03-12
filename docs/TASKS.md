@@ -37,6 +37,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-12:** `read_subagent_session` tool (#81): on-demand read of named subagent conversation history. Derives deterministic session ID, returns messages + summary. 8 tests.
 - **2026-03-12:** Subagent workspaces + registry lookup (#70): `system_prompt` removed from `invoke_agent` tool. Named subagents looked up in agent registry for config. Workspace attached at `{workspace_dir}/{name}/`. `Coordinator.with_workspace_dir()` wired in gateway.
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
+- **2026-03-12:** Agent create workspace + CLI awareness (#84): CLI `alms agent create` and HTTP `POST /agents` now create workspace directory with empty identity files (personality.md, goals.md, memories.md, user.md). CLI outputs workspace path. Default system prompt tells agents they can run `alms --help` via shell_exec to discover CLI commands.
 
 ---
 
@@ -582,7 +583,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Derives deterministic session ID, reads from `SessionManager`. 8 tests.
 - **Owners:** Atlas
 
-84) `alms agent create` creates workspace directory
+84) ~~`alms agent create` creates workspace directory~~ ✅ DONE
 - When an agent is created via CLI or API, create `{workspace_dir}/{name}/` so parent can write workspace files (personality.md, goals.md, etc.) before the first invocation.
 - **Owners:** Atlas
 

@@ -183,6 +183,18 @@ pub async fn create_agent(
         agent.is_default = true;
     }
 
+    // Create workspace directory and initial files
+    if let Some(ref workspace_dir) = state.workspace_dir {
+        let agent_ws_dir = workspace_dir.join(&agent.name);
+        if let Err(e) = alms_core::init_workspace_files(&agent_ws_dir) {
+            tracing::warn!(
+                "Could not create workspace files in {}: {}",
+                agent_ws_dir.display(),
+                e
+            );
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(agent)))
 }
 

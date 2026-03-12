@@ -50,7 +50,10 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            system_prompt: "You are a helpful assistant. Use tools when appropriate.".to_string(),
+            system_prompt: "You are a helpful assistant. Use tools when appropriate. \
+                You can run `alms --help` via shell_exec to discover CLI commands \
+                for managing agents, sessions, and runs."
+                .to_string(),
             max_iterations: 10,
             temperature: 0.7,
             max_tokens: 4096,

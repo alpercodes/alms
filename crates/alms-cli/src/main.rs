@@ -342,6 +342,7 @@ fn agent_create(
     system_prompt: Option<String>,
     default: bool,
     json: bool,
+    workspace_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     validate_agent_name(&name)?;
 
@@ -369,10 +370,30 @@ fn agent_create(
         store.set_default_agent(agent.id)?;
     }
 
+    // Create workspace directory and initial files
+    if let Some(ws_dir) = workspace_dir {
+        let agent_ws_dir = ws_dir.join(&agent.name);
+        if let Err(e) = alms_core::init_workspace_files(&agent_ws_dir) {
+            eprintln!(
+                "Warning: could not create workspace files in {}: {}",
+                agent_ws_dir.display(),
+                e
+            );
+        }
+    }
+
     if json {
-        println!("{}", serde_json::to_string_pretty(&agent)?);
+        let mut val = serde_json::to_value(&agent)?;
+        if let Some(ws_dir) = workspace_dir {
+            val["workspace_path"] =
+                serde_json::Value::String(ws_dir.join(&agent.name).display().to_string());
+        }
+        println!("{}", serde_json::to_string_pretty(&val)?);
     } else {
         println!("Created agent '{}' ({})", agent.name, agent.id);
+        if let Some(ws_dir) = workspace_dir {
+            println!("  Workspace: {}", ws_dir.join(&agent.name).display());
+        }
     }
     Ok(())
 }
@@ -612,8 +633,10 @@ fn api_client() -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder();
     if let Ok(token) = std::env::var("ALMS_AUTH_TOKEN") {
         let mut headers = reqwest::header::HeaderMap::new();
-        let val = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| anyhow::anyhow!("ALMS_AUTH_TOKEN contains invalid characters for an HTTP header"))?;
+        let val =
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+                anyhow::anyhow!("ALMS_AUTH_TOKEN contains invalid characters for an HTTP header")
+            })?;
         headers.insert(reqwest::header::AUTHORIZATION, val);
         builder = builder.default_headers(headers);
     }
@@ -958,9 +981,9 @@ fn parse_schedule(s: &str) -> anyhow::Result<JobSchedule> {
         // Validate by parsing with the cron crate (6-field: sec prepended).
         // This matches what the gateway scheduler does in cron_utils.rs.
         let six_field = format!("0 {cron_str}");
-        six_field.parse::<cron::Schedule>().map_err(|e| {
-            anyhow::anyhow!("Invalid cron expression '{cron_str}': {e}")
-        })?;
+        six_field
+            .parse::<cron::Schedule>()
+            .map_err(|e| anyhow::anyhow!("Invalid cron expression '{cron_str}': {e}"))?;
         return Ok(JobSchedule::Recurring { cron: cron_str });
     }
     anyhow::bail!("Invalid schedule format. Use 'once:2026-03-15T09:00:00Z' or 'cron:0 9 * * 1-5'");
@@ -1096,6 +1119,9 @@ async fn main() -> anyhow::Result<()> {
                     system_prompt,
                     default,
                 } => {
+                    let workspace_dir: std::path::PathBuf = std::env::var("ALMS_WORKSPACE_DIR")
+                        .unwrap_or_else(|_| "./data/workspace".to_string())
+                        .into();
                     agent_create(
                         &store,
                         name,
@@ -1105,6 +1131,7 @@ async fn main() -> anyhow::Result<()> {
                         system_prompt,
                         default,
                         json,
+                        Some(&workspace_dir),
                     )?;
                 }
                 AgentCommands::Show { name_or_id } => agent_show(&store, &name_or_id, json)?,
@@ -1248,6 +1275,7 @@ mod tests {
             None,
             false,
             false,
+            None,
         )
         .unwrap();
 
@@ -1269,9 +1297,30 @@ mod tests {
     #[test]
     fn test_create_duplicate_name_fails() {
         let store = new_store();
-        agent_create(&store, "dup".into(), None, None, None, None, false, false).unwrap();
-        let err =
-            agent_create(&store, "dup".into(), None, None, None, None, false, false).unwrap_err();
+        agent_create(
+            &store,
+            "dup".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+        let err = agent_create(
+            &store,
+            "dup".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("already exists"));
     }
 
@@ -1287,9 +1336,40 @@ mod tests {
             None,
             false,
             false,
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("lowercase"));
+    }
+
+    #[test]
+    fn test_create_creates_workspace_dir() {
+        let store = new_store();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws_dir = tmp.path().join("workspace");
+
+        agent_create(
+            &store,
+            "reviewer".into(),
+            None,
+            None,
+            None,
+            None,
+            false,
+            false,
+            Some(&ws_dir),
+        )
+        .unwrap();
+
+        // Workspace directory and files should exist at {workspace_dir}/{name}/
+        let agent_dir = ws_dir.join("reviewer");
+        assert!(agent_dir.is_dir());
+        for filename in alms_core::WORKSPACE_FILENAMES {
+            assert!(
+                agent_dir.join(filename).exists(),
+                "Expected workspace file {filename} to exist"
+            );
+        }
     }
 
     #[test]

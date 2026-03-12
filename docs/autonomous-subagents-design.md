@@ -35,9 +35,9 @@ This is autonomous multi-step execution. The subagent decides what tools to use 
 
 **Design:**
 
-Subagents are created via the CLI (`alms agent create --name reviewer`), which registers them in the agent registry (SQLite `agents` table) and creates their workspace directory. The parent agent then calls `invoke_agent(name="reviewer", task="...")` — the coordinator looks up the agent record for config (system_prompt, model, posture) and attaches the workspace.
+Subagents are created via the CLI (`alms agent create --name reviewer`), which registers them in the agent registry (SQLite `agents` table), creates their workspace directory, and initializes empty workspace files (personality.md, goals.md, memories.md, user.md). The CLI outputs the workspace path so the parent knows where to write. The parent agent then calls `invoke_agent(name="reviewer", task="...")` — the coordinator looks up the agent record for config (system_prompt, model, posture) and attaches the workspace.
 
-The parent can write to the subagent's workspace files (personality.md, goals.md, etc.) using `fs_write` or `shell_exec` — no special tools needed. The workspace path is `{workspace_dir}/{name}/`.
+Agents are told in their default system prompt that they can run `alms --help` via `shell_exec` to discover CLI commands — including `alms agent create`. This means a parent agent can autonomously create subagents, write their workspace files via `fs_write`, and then invoke them. The workspace path is `{workspace_dir}/{name}/`.
 
 When `invoke_agent(name="reviewer")` is called, the coordinator:
 
@@ -311,7 +311,7 @@ The session persistence means the reviewer remembers everything from previous co
 |---|------|--------|-------|
 | 70 | Registry lookup + workspace attach | **Done** | system_prompt/model/posture from registry, workspace at `{workspace_dir}/{name}/` |
 | 81 | `read_subagent_session` tool | **Done** | On-demand context retrieval, 8 tests |
-| 84 | `alms agent create` creates workspace dir | Todo | Parent can write files before first invocation |
+| 84 | `alms agent create` creates workspace dir + files | **Done** | CLI/API create dir + empty workspace files, output path |
 | 82 | Truncate invoke_agent results in parent | Todo | Short summary in parent, full in subagent session |
 | 83 | System prompt addition for context model | Todo | Instruct parent LLM about read_subagent_session |
 | 75 | Validate `name` in invoke_agent | Todo | Validate against `validate_agent_name()` rules |
