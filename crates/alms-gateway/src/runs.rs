@@ -153,12 +153,23 @@ async fn execute_run(
 
     state.run_manager.mark_run_as_running(run_id);
 
+    // Look up per-agent config overrides from the agent registry.
+    // Errors are absorbed — agent lookup failure should not block the run.
+    let agent_record = state
+        .session_manager
+        .store()
+        .and_then(|store| store.load_agent_by_id(agent_id).ok().flatten());
+
     // Build runtime — drop gateway lock before running to avoid blocking other requests
     let (agent_config, llm) = {
         let gateway = state.gateway.lock().await;
         let llm = gateway.llm().clone();
+        // Resolve model: per-run > per-agent > server default
         let llm = if let Some(model) = overrides.model {
-            info!("Run {} using model override: {}", run_id.0, model);
+            info!("Run {} using per-run model override: {}", run_id.0, model);
+            llm.with_model(model)
+        } else if let Some(model) = agent_record.as_ref().and_then(|r| r.model.clone()) {
+            info!("Run {} using per-agent model override: {}", run_id.0, model);
             llm.with_model(model)
         } else {
             llm
@@ -172,11 +183,30 @@ async fn execute_run(
     let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
     let invoke_agent_tx = runtime_tx.clone();
 
-    // Apply per-run overrides (temperature, max_tokens, posture).
+    // Apply overrides: per-agent (middle layer), then per-run (highest precedence).
     let agent_config = {
         let mut cfg = agent_config;
+
+        // Per-agent overrides (from AgentRecord)
+        if let Some(ref record) = agent_record {
+            if let Some(ref sp) = record.system_prompt {
+                info!("Run {} using per-agent system_prompt override", run_id.0);
+                cfg.system_prompt = sp.clone();
+            }
+            if let Some(ref p) = record.posture {
+                match p.as_str() {
+                    "guarded" => cfg.posture = alms_runtime::Posture::Guarded,
+                    "full_control" => cfg.posture = alms_runtime::Posture::FullControl,
+                    other => warn!(
+                        "Agent {}: unknown posture '{}', keeping server default",
+                        agent_id.0, other
+                    ),
+                }
+            }
+        }
+
+        // Per-run overrides (highest precedence)
         if let Some(t) = overrides.temperature {
-            // Clamp to the range LLMs accept; values outside 0.0–2.0 are rejected by most providers.
             cfg.temperature = t.clamp(0.0, 2.0);
         }
         if let Some(m) = overrides.max_tokens {
@@ -195,7 +225,7 @@ async fn execute_run(
                 "full_control" => alms_runtime::Posture::FullControl,
                 other => {
                     warn!(
-                        "Run {}: unknown posture '{}', keeping server default",
+                        "Run {}: unknown posture '{}', keeping current",
                         run_id.0, other
                     );
                     cfg.posture
@@ -304,6 +334,13 @@ async fn execute_run(
 
             error!("Run {} failed: {}", run_id.0, e);
         }
+    }
+
+    // Update last_active on the agent record (non-fatal).
+    if let Some(store) = state.session_manager.store()
+        && let Err(e) = store.touch_agent(agent_id)
+    {
+        warn!("Failed to update last_active for agent {}: {}", agent_id, e);
     }
 
     state.run_manager.remove_senders(run_id);

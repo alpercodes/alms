@@ -25,6 +25,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-11:** Persistent named agents & CLI system design doc written (`docs/persistent-agents-cli-design.md`). Tasks #46–#54 formulated covering: agent registry, auto-migration, HTTP API, per-agent config, CLI commands (agent/session/run/job/dashboard), UI agent switching.
 - **2026-03-12:** Agent registry (#46): `agents` table + `AgentRecord` in alms-core + `validate_agent_name` + CRUD on SqliteStore (`create_agent`, load/list/update/delete, `set_default_agent`, `touch_agent`). 9 store tests + 8 validation tests.
 - **2026-03-12:** Agent auto-migration (#47): `migrate_sidecar_agent()` in Gateway::new() auto-registers sidecar agent ID into `agents` table on first boot. Idempotent, non-fatal. `SessionManager::store()` accessor added. 4 migration tests. Review fixes: `save_agent` renamed to `create_agent` (INSERT-only semantics); `set_default_agent` now errors on nonexistent ID.
+- **2026-03-12:** Per-agent config overrides (#49): `execute_run()` merges per-agent model/system_prompt/posture from AgentRecord. Three-layer precedence: per-run > per-agent > server default. `touch_agent()` updates `last_active` after every run.
 - **2026-03-12:** Agent HTTP API (#48): `/agents` CRUD endpoints (list, create, get, update, delete, set-default). `UpdateAgentRequest` type. `GET /settings` includes agents array. Path params accept UUID or name slug. 6 handler tests.
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 
@@ -403,10 +404,11 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - 6 unit tests for resolve_agent (by UUID, by name, not-found, preference) + validation.
 - **Owners:** Atlas
 
-49) Per-agent config overrides in run execution
-- `execute_run()` in `runs.rs`: look up agent's `AgentRecord`, merge per-agent `model`/`system_prompt`/`posture` with server defaults when building `AgentConfig`.
-- Precedence: per-run override > per-agent override > server default.
-- Update `last_active` on the agent record when a run completes.
+49) Per-agent config overrides in run execution ✅
+- `execute_run()` looks up agent's `AgentRecord` from SQLite and merges per-agent `model`/`system_prompt`/`posture` with server defaults.
+- Three-layer precedence: per-run override > per-agent override > server default.
+- `touch_agent(agent_id)` called after every run completion to update `last_active`.
+- Agent lookup is fail-safe — errors absorbed, falls back to server defaults.
 - **Owners:** Atlas
 
 50) CLI — agent management commands
