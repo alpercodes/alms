@@ -261,7 +261,7 @@ The `{id_or_name}` path parameter accepts either a UUID or a name slug. Resoluti
 
 ### `alms-core`
 - Add `AgentRecord` struct (see above)
-- Validate agent name slug: `^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$`
+- Validate agent name slug: 1–64 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphens
 
 ### `alms-session` (`SqliteStore`)
 - Add `agents` table to SCHEMA constant

@@ -353,7 +353,92 @@ Audit records should align with `docs/security-model.md`.
 
 ---
 
-## 9) Auth (optional MVP)
+## 9) Agents (named persistent agents)
+
+Named agents are persistent entities stored in SQLite. Each agent has a unique slug name, optional per-agent config overrides (model, system_prompt, posture), and a default flag.
+
+### 9.1 List agents
+`GET /agents`
+
+**Response 200**
+```json
+{
+  "agents": [
+    {
+      "id": "<uuid>",
+      "name": "default",
+      "description": "",
+      "model": null,
+      "system_prompt": null,
+      "posture": null,
+      "is_default": true,
+      "created_at": "2026-03-12T...",
+      "last_active": "2026-03-12T..."
+    }
+  ]
+}
+```
+
+### 9.2 Create agent
+`POST /agents`
+
+**Request**
+```json
+{
+  "name": "researcher",
+  "description": "Researches topics",
+  "model": "anthropic/claude-sonnet-4-20250514",
+  "is_default": false
+}
+```
+
+**Response 201** — returns the created `AgentRecord`.
+
+Errors:
+- `400 INVALID_NAME` — name fails validation (1–64 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphens)
+- `409 DUPLICATE_NAME` — name already exists
+
+### 9.3 Get agent
+`GET /agents/{id_or_name}`
+
+Path parameter accepts either a UUID or a name slug. UUID is tried first.
+
+**Response 200** — `AgentRecord`
+**Response 404** — agent not found
+
+### 9.4 Update agent
+`PUT /agents/{id_or_name}`
+
+**Request** — all fields optional, only provided fields are updated:
+```json
+{
+  "description": "Updated description",
+  "model": "new-model",
+  "system_prompt": "You are a researcher.",
+  "posture": "guarded"
+}
+```
+
+To clear an override, pass an empty string: `"model": ""`.
+
+**Response 200** — updated `AgentRecord`
+
+### 9.5 Delete agent
+`DELETE /agents/{id_or_name}`
+
+**Response 200** — `{ "ok": true, "deleted": "<uuid>" }`
+**Response 409 CANNOT_DELETE_DEFAULT** — cannot delete the default agent; set another default first.
+
+### 9.6 Set default agent
+`POST /agents/{id_or_name}/default`
+
+**Response 200** — `{ "ok": true, "default_agent": "<name>" }`
+
+Note: clears the previous default agent atomically (SQLite transaction).
+
+---
+
+## 10) Auth (optional MVP)
 
 If ALMS is local-only, auth may be omitted.
 
@@ -363,7 +448,7 @@ If exposed beyond localhost, add:
 
 ---
 
-## 10) Open questions (to resolve early)
+## 11) Open questions (to resolve early)
 
 1) Do we commit to `POST /runs` + `GET /runs/{id}/events` for MVP, or keep a shorter `/agent/run/stream` and alias it?
 2) What is the canonical `agent_key` set (e.g. `main`, `planner`, …)?

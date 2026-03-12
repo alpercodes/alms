@@ -20,6 +20,7 @@
 //! }
 //! ```
 
+pub mod agents;
 pub mod approvals;
 pub mod auth;
 pub mod cron_utils;

@@ -2,6 +2,7 @@
 //!
 //! Provides REST API endpoints per docs/api.md specification.
 
+use crate::agents;
 use crate::approvals::{ApprovalStore, list_approvals, resolve_approval};
 use crate::auth::{AuthToken, require_auth};
 use crate::cron_utils;
@@ -262,6 +263,18 @@ fn protected_router() -> Router<AppState> {
         .route("/approvals/{approval_id}", post(resolve_approval))
         // Audit
         .route("/audit", get(get_audit))
+        // Agent registry CRUD
+        .route(
+            "/agents",
+            get(agents::list_agents).post(agents::create_agent),
+        )
+        .route(
+            "/agents/{id_or_name}",
+            get(agents::get_agent)
+                .put(agents::update_agent)
+                .delete(agents::delete_agent),
+        )
+        .route("/agents/{id_or_name}/default", post(agents::set_default))
         // Workspace (agent identity files)
         .route("/agents/{agent_id}/workspace", get(get_workspace))
         .route(

@@ -676,22 +676,37 @@ impl SqliteStore {
 
     /// Set an agent as the default, clearing any previous default.
     ///
-    /// Returns `AgentNotFound` if the given ID does not exist in the table
-    /// (prevents silently ending up with no default agent).
+    /// Wrapped in a transaction so a crash between the two UPDATEs cannot
+    /// leave the system with zero default agents.
+    ///
+    /// Returns `AgentNotFound` if the given ID does not exist in the table.
     pub fn set_default_agent(&self, id: AgentId) -> AlmsResult<()> {
         let conn = self.conn.lock();
-        conn.execute("UPDATE agents SET is_default = 0 WHERE is_default = 1", [])
-            .map_err(|e| AlmsError::Runtime(format!("SQLite clear_default: {e}")))?;
-        let affected = conn
-            .execute(
-                "UPDATE agents SET is_default = 1 WHERE id = ?1",
-                params![id.0.to_string()],
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite set_default: {e}")))?;
-        if affected == 0 {
-            return Err(AlmsError::AgentNotFound(id.0.to_string()));
+        conn.execute_batch("BEGIN")
+            .map_err(|e| AlmsError::Runtime(format!("SQLite begin: {e}")))?;
+        let result = (|| -> AlmsResult<()> {
+            conn.execute("UPDATE agents SET is_default = 0 WHERE is_default = 1", [])
+                .map_err(|e| AlmsError::Runtime(format!("SQLite clear_default: {e}")))?;
+            let affected = conn
+                .execute(
+                    "UPDATE agents SET is_default = 1 WHERE id = ?1",
+                    params![id.0.to_string()],
+                )
+                .map_err(|e| AlmsError::Runtime(format!("SQLite set_default: {e}")))?;
+            if affected == 0 {
+                return Err(AlmsError::AgentNotFound(id.0.to_string()));
+            }
+            Ok(())
+        })();
+        match &result {
+            Ok(()) => conn
+                .execute_batch("COMMIT")
+                .map_err(|e| AlmsError::Runtime(format!("SQLite commit: {e}")))?,
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
         }
-        Ok(())
+        result
     }
 
     /// Update an agent's `last_active` timestamp.
@@ -1088,5 +1103,39 @@ mod tests {
     fn test_agent_get_default_none() {
         let store = SqliteStore::open_in_memory().unwrap();
         assert!(store.get_default_agent().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_agent_update_roundtrip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("mutable");
+        store.create_agent(&agent).unwrap();
+
+        agent.description = "Updated description".to_string();
+        agent.model = Some("new-model".to_string());
+        agent.posture = Some("guarded".to_string());
+        store.update_agent(&agent).unwrap();
+
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.description, "Updated description");
+        assert_eq!(loaded.model.as_deref(), Some("new-model"));
+        assert_eq!(loaded.posture.as_deref(), Some("guarded"));
+    }
+
+    #[test]
+    fn test_agent_set_default_nonexistent_errors() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("exists");
+        agent.is_default = true;
+        store.create_agent(&agent).unwrap();
+
+        // Setting a nonexistent agent as default should error
+        let fake_id = AgentId::new();
+        let result = store.set_default_agent(fake_id);
+        assert!(result.is_err());
+
+        // The existing agent should still be default (rollback undid the clear)
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(loaded.is_default);
     }
 }

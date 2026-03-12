@@ -38,6 +38,18 @@ pub struct CreateAgentRequest {
     pub is_default: Option<bool>,
 }
 
+/// Request body for updating an existing agent.
+///
+/// All fields are optional — only non-`None` fields are applied.
+/// To clear an override, pass an empty string (handler treats `""` as `None`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAgentRequest {
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
+    pub posture: Option<String>,
+}
+
 /// Validate an agent name slug.
 ///
 /// Rules: 1–64 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphens.

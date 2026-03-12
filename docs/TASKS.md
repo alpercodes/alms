@@ -25,6 +25,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-11:** Persistent named agents & CLI system design doc written (`docs/persistent-agents-cli-design.md`). Tasks #46–#54 formulated covering: agent registry, auto-migration, HTTP API, per-agent config, CLI commands (agent/session/run/job/dashboard), UI agent switching.
 - **2026-03-12:** Agent registry (#46): `agents` table + `AgentRecord` in alms-core + `validate_agent_name` + CRUD on SqliteStore (`create_agent`, load/list/update/delete, `set_default_agent`, `touch_agent`). 9 store tests + 8 validation tests.
 - **2026-03-12:** Agent auto-migration (#47): `migrate_sidecar_agent()` in Gateway::new() auto-registers sidecar agent ID into `agents` table on first boot. Idempotent, non-fatal. `SessionManager::store()` accessor added. 4 migration tests. Review fixes: `save_agent` renamed to `create_agent` (INSERT-only semantics); `set_default_agent` now errors on nonexistent ID.
+- **2026-03-12:** Agent HTTP API (#48): `/agents` CRUD endpoints (list, create, get, update, delete, set-default). `UpdateAgentRequest` type. `GET /settings` includes agents array. Path params accept UUID or name slug. 6 handler tests.
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 
 ---
@@ -391,13 +392,15 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - 4 migration tests (183+ total).
 - **Owners:** Atlas
 
-48) Agent HTTP API (`/agents` CRUD)
-- New route group in `protected_router()`: `GET /agents`, `POST /agents`, `GET /agents/{id_or_name}`, `PUT /agents/{id_or_name}`, `DELETE /agents/{id_or_name}`, `POST /agents/{id_or_name}/default`.
+48) Agent HTTP API (`/agents` CRUD) ✅
+- New `agents.rs` module in `alms-gateway` with 6 handler functions.
+- Routes: `GET /agents`, `POST /agents`, `GET /agents/{id_or_name}`, `PUT /agents/{id_or_name}`, `DELETE /agents/{id_or_name}`, `POST /agents/{id_or_name}/default`.
 - Path parameter accepts UUID or name slug (try UUID parse first, then name lookup).
 - `GET /settings` expanded to include `agents` array: `[{ name, id, is_default, model }]`.
-- New `agents.rs` module in `alms-gateway`; `SqliteStore` (or agent store ref) added to `AppState`.
-- Cannot delete default agent without `--force` or setting another default first.
-- Integration tests for CRUD + name/UUID resolution + default management.
+- `UpdateAgentRequest` in `alms-core/src/registry.rs` (flat optionals; empty string = clear override).
+- Cannot delete default agent (409 Conflict). Name validation via `validate_agent_name()`.
+- Coexists with existing `/agents/{agent_id}/workspace` routes (Axum 0.8 disambiguates by static segment).
+- 6 unit tests for resolve_agent (by UUID, by name, not-found, preference) + validation.
 - **Owners:** Atlas
 
 49) Per-agent config overrides in run execution
@@ -439,6 +442,90 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Switching agents filters sessions and shows that agent's workspace.
 - Agent management section in settings drawer: create/delete/configure agents.
 - Each agent shows workspace bootstrap status (`needs_bootstrap()`).
+- **Owners:** Atlas
+
+---
+
+## P11 — Telegram Adapter Rework
+
+> Findings from end-to-end Telegram workflow review (2026-03-12).
+> The adapter works for basic demo but has 4 critical correctness bugs and several reliability gaps.
+> Logical implementation order: 56 → 57 → 58 → 59 → 60 → 61 → 62 → 63.
+
+56) Fix Telegram shutdown — stop signal never reaches polling task (CRITICAL)
+- `receive_updates()` clones the `TelegramChannel` with a **new** `AtomicBool`. `stop()` sets `running=false` on the original instance, but the spawned polling task checks its own copy. Polling continues until process exit.
+- Fix: replace `AtomicBool`/`AtomicI64` with `Arc<AtomicBool>`/`Arc<AtomicI64>` shared between original and clone, or replace with `CancellationToken`.
+- **Owners:** Atlas
+
+57) Fix serial message processing — head-of-line blocking (CRITICAL)
+- `handle_message().await` in `run_until_shutdown()` blocks the `tokio::select!` loop. A 10s+ agent run blocks all incoming messages. The mpsc buffer (100) fills, polling stalls, Telegram may redeliver.
+- Fix: spawn each `handle_message` as a separate `tokio::spawn` task. Requires `Arc`-wrapping dependencies instead of `&self`.
+- **Owners:** Atlas
+
+58) Fix polling latency — remove unnecessary interval ticker (CRITICAL)
+- `interval(5s)` wraps a 30s long-poll `getUpdates`. After the HTTP call returns, the loop waits an extra 5 seconds before re-polling. Messages sit undelivered during the gap.
+- Fix: loop directly on `get_updates()` — the 30s Telegram timeout IS the wait mechanism. Add short sleep (1-5s with backoff) on error only.
+- **Owners:** Atlas
+
+59) Fix update offset desync — shared state between original and clone (CRITICAL)
+- Cloned `AtomicI64` for `last_update_id` is disconnected from the original. If `receive_updates()` were called twice, the second clone starts from a stale offset → message duplication.
+- Fix: use `Arc<AtomicI64>` shared between instances, or enforce single-call with a guard.
+- Related to #56 — can be fixed together.
+- **Owners:** Atlas
+
+60) Handle Telegram 4096-character message limit
+- `sendMessage` rejects text >4096 chars. LLM responses (especially with tool output) regularly exceed this. User gets no reply; error is only logged.
+- Fix: split long responses at sentence/paragraph boundaries into multiple messages.
+- **Owners:** Atlas
+
+61) Fix HTML parse_mode breaking LLM output
+- `send_message()` always sets `parse_mode: "HTML"`. LLM responses containing `<`, `>`, `&` are rejected as malformed HTML.
+- Fix: either escape the text for HTML, use no parse_mode (plain text), or use MarkdownV2 with proper escaping.
+- **Owners:** Atlas
+
+62) Add alms-channel tests
+- Zero tests in the entire crate. Violates project convention of `#[cfg(test)] mod tests` per module.
+- Add unit tests for: `convert_update()`, `parse_command()`, polling offset logic, message splitting (after #60).
+- **Owners:** Atlas
+
+63) Persist Telegram update offset to SQLite
+- If the process crashes after processing an update but before the next `getUpdates` with incremented offset, Telegram redelivers the update → duplicate reply.
+- Fix: persist `last_update_id` to SQLite (or a sidecar file) after processing each batch.
+- **Owners:** Atlas
+
+---
+
+## P12 — Agent Loop UX (dead air elimination + crash safety)
+
+> Findings from agent loop review (2026-03-12).
+> The SSE streaming works correctly, but there are significant dead-air gaps where the user sees nothing.
+> Logical implementation order: 64 → 65 → 66 → 67 → 68.
+
+64) Emit `status` SSE events during dead-air phases
+- New `RuntimeEvent::Status { phase: String }` emitted at key moments so the UI can show what the agent is doing.
+- Phases: `"building_context"` (before context build), `"summarizing"` (during sliding-summary LLM call), `"calling_llm"` (before each LLM call), `"executing_tools"` (before join_all).
+- New `SseEventData::status(run_id, phase)` → SSE event type `status`.
+- UI: show phase text in the chat area or status bar (e.g., "Thinking…", "Summarizing context…", "Running tools…").
+- **Owners:** Atlas
+
+65) Incremental session message persistence (crash safety)
+- Currently, user message + assistant response are appended to session history only AFTER the entire agent loop finishes (`agent.rs:215-216`). Server crash mid-run = lost conversation.
+- Fix: append user message to session BEFORE starting the agent loop. Append assistant message immediately after the loop returns. Consider appending tool-call/tool-result messages incrementally during the loop.
+- **Owners:** Atlas
+
+66) Partial response recovery on mid-loop errors
+- If the agent loop fails on iteration 3 of 10, all accumulated tool results and partial text from iterations 1-2 are discarded. The user sees only `run_error`.
+- Fix: if `agent_loop` fails but has accumulated content or completed tool calls, return partial output alongside the error (or emit a `token_delta` with the partial content before the error event).
+- **Owners:** Atlas
+
+67) UI: listen for `run_started` + show typing indicator
+- `run_started` SSE event is emitted but the UI has no listener for it. Between send and first `token_delta`, the chat area is blank.
+- Fix: on `run_started`, show a typing/thinking indicator in the chat area (pulsing dots or "Agent is thinking…"). Remove it when the first `token_delta` or `tool_start` arrives.
+- **Owners:** Atlas
+
+68) Style max-iterations as a warning, not normal text
+- When `max_iterations` is reached, the agent returns `"[Max iterations reached]"` as a normal response. The user sees it as an ordinary agent message with no visual distinction.
+- Fix: emit a `run_error` or a dedicated `run_warning` event instead, so the UI can style it appropriately.
 - **Owners:** Atlas
 
 ---

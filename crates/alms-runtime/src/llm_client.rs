@@ -201,7 +201,10 @@ impl LlmClient {
                             return None; // stream complete
                         }
                         Err(_) => {
-                            warn!("LLM stream stalled (no data for {}s), terminating", chunk_timeout.as_secs());
+                            warn!(
+                                "LLM stream stalled (no data for {}s), terminating",
+                                chunk_timeout.as_secs()
+                            );
                             return None; // timeout — treat as stream end
                         }
                     }

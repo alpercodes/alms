@@ -32,6 +32,22 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
 
     let agent_id = gateway.agent_id().0.to_string();
 
+    let agents_list = state
+        .session_manager
+        .store()
+        .and_then(|s| s.list_agents().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| {
+            serde_json::json!({
+                "name": a.name,
+                "id": a.id.0.to_string(),
+                "is_default": a.is_default,
+                "model": a.model,
+            })
+        })
+        .collect::<Vec<_>>();
+
     Json(serde_json::json!({
         "model": llm.default_model,
         "base_url": llm.base_url,
@@ -41,5 +57,6 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "context_strategy": agent.context_config.strategy,
         "enabled_tools": tools,
         "agent_id": agent_id,
+        "agents": agents_list,
     }))
 }

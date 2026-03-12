@@ -13,7 +13,7 @@ pub use audit::{AuditDecision, AuditEvent};
 pub use config::AlmsConfig;
 pub use error::{AlmsError, AlmsResult};
 pub use job::{CreateJobRequest, Job, JobId, JobSchedule, JobStatus};
-pub use registry::{AgentRecord, CreateAgentRequest, validate_agent_name};
+pub use registry::{AgentRecord, CreateAgentRequest, UpdateAgentRequest, validate_agent_name};
 pub use run::{
     CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
     TokenUsage,
