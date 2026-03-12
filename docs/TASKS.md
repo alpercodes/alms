@@ -30,6 +30,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-12:** Agent HTTP API (#48): `/agents` CRUD endpoints (list, create, get, update, delete, set-default). `UpdateAgentRequest` type. `GET /settings` includes agents array. Path params accept UUID or name slug. 6 handler tests.
 - **2026-03-12:** CLI session commands (#51): `alms session {list, show, delete}`. `list --agent NAME` filters by agent. `show` displays session details + message count + agent name. Direct SQLite access. `list_sessions()` + `load_session_by_id()` + `load_sessions_by_agent()` + `message_count()` on SqliteStore. 8 CLI tests + 4 store tests.
 - **2026-03-12:** CLI run and job commands (#52): `alms run {create, list, show}` via HTTP API; `alms job {list, show}` via SQLite, `alms job {create, cancel}` via HTTP API. `--url` / `ALMS_GATEWAY_URL` for gateway address. Auth token forwarding. Schedule parsing ("once:"/"cron:"). `load_job_by_id()` + `load_all_jobs_unfiltered()`. 12 new tests (31 CLI total).
+- **2026-03-12:** CLI dashboard + polish (#53): `alms dashboard` opens web UI via `open` crate. `alms completions <shell>` generates shell completions via `clap_complete`. `alms health --json` for machine-readable output. `--json` flag now consistent across all commands. 2 new tests (33 CLI total).
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 
 ---
@@ -446,10 +447,12 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - 12 new tests (31 CLI total).
 - **Owners:** Atlas
 
-53) CLI — dashboard + polish
-- `alms dashboard` — opens `http://127.0.0.1:8080` in system browser (`xdg-open` / `open` / `start`).
-- Shell completions generation (clap's built-in `generate` support).
-- Consistent `--json` flag across all list/show commands.
+53) CLI — dashboard + polish ✅
+- `alms dashboard [--url URL]` — opens web UI in system browser via `open` crate. `ALMS_GATEWAY_URL` env var support.
+- `alms completions <shell>` — generates shell completions (bash/zsh/fish/elvish/powershell) via `clap_complete`.
+- `alms health --json` — machine-readable health output. JSON error objects on failure with exit code 1.
+- `--json` flag now consistent across all list/show commands (Health, Session, Agent, Run, Job).
+- 2 new tests (33 CLI total).
 - **Owners:** Atlas
 
 54) UI — agent selector and management

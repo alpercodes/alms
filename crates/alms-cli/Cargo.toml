@@ -17,6 +17,8 @@ alms-session = { path = "../alms-session" }
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
+open.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

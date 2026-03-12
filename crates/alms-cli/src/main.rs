@@ -4,7 +4,8 @@ use alms_core::{
     RunStatusResponse, SessionId, validate_agent_name,
 };
 use alms_session::{Session, SessionStatus, SqliteStore};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
@@ -32,6 +33,25 @@ enum Commands {
         /// Gateway URL to check
         #[arg(short, long, default_value = "http://127.0.0.1:8080")]
         url: String,
+        /// Output as JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open the ALMS web UI in your browser
+    Dashboard {
+        /// Gateway URL to open
+        #[arg(
+            short,
+            long,
+            default_value = "http://127.0.0.1:8080",
+            env = "ALMS_GATEWAY_URL"
+        )]
+        url: String,
+    },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        shell: Shell,
     },
     /// Manage sessions
     Session {
@@ -997,25 +1017,57 @@ async fn main() -> anyhow::Result<()> {
             }
             alms_gateway::serve(&bind).await?;
         }
-        Commands::Health { url } => {
+        Commands::Health { url, json } => {
             let health_url = format!("{}/health", url.trim_end_matches('/'));
             match reqwest::get(&health_url).await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await?;
-                    println!("ALMS Gateway is healthy");
-                    if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
-                        println!("  version: {}", version);
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&body)?);
+                    } else {
+                        println!("ALMS Gateway is healthy");
+                        if let Some(version) = body.get("version").and_then(|v| v.as_str()) {
+                            println!("  version: {}", version);
+                        }
                     }
                 }
                 Ok(resp) => {
-                    eprintln!("Health check failed: HTTP {}", resp.status());
+                    let status = resp.status();
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "error": format!("HTTP {status}") })
+                        );
+                    } else {
+                        eprintln!("Health check failed: HTTP {}", status);
+                    }
                     std::process::exit(1);
                 }
                 Err(e) => {
-                    eprintln!("Cannot reach gateway at {}: {}", health_url, e);
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({ "error": format!("Cannot reach gateway: {e}") })
+                        );
+                    } else {
+                        eprintln!("Cannot reach gateway at {}: {}", health_url, e);
+                    }
                     std::process::exit(1);
                 }
             }
+        }
+        Commands::Dashboard { url } => {
+            let url = url.trim_end_matches('/').to_string();
+            println!("Opening {url} ...");
+            if let Err(e) = open::that(&url) {
+                eprintln!("Failed to open browser: {e}");
+                eprintln!("Open manually: {url}");
+                std::process::exit(1);
+            }
+        }
+        Commands::Completions { shell } => {
+            let mut cmd = Cli::command();
+            generate(shell, &mut cmd, "alms", &mut std::io::stdout());
         }
         Commands::Session { cmd, json } => {
             let store = open_db()?;
@@ -1538,5 +1590,25 @@ mod tests {
     fn test_load_job_by_id_not_found() {
         let store = new_store();
         assert!(store.load_job_by_id(JobId::new()).unwrap().is_none());
+    }
+
+    // ── Completions tests ────────────────────────────────────────────────
+
+    #[test]
+    fn test_completions_bash() {
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        generate(Shell::Bash, &mut cmd, "alms", &mut buf);
+        assert!(!buf.is_empty());
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("alms"));
+    }
+
+    #[test]
+    fn test_completions_powershell() {
+        let mut cmd = Cli::command();
+        let mut buf = Vec::new();
+        generate(Shell::PowerShell, &mut cmd, "alms", &mut buf);
+        assert!(!buf.is_empty());
     }
 }
