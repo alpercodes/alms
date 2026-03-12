@@ -77,10 +77,7 @@ impl Tool for ReadSubagentSessionTool {
                 SandboxError::InvalidParameters("'name' is required and must be non-empty".into())
             })?;
 
-        let last_n = params
-            .get("last_n")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(20) as usize;
+        let last_n = params.get("last_n").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
 
         let summary_only = params
             .get("summary_only")
@@ -216,7 +213,12 @@ mod tests {
             .execute(serde_json::json!({ "name": "ghost" }))
             .await
             .unwrap();
-        assert!(result["error"].as_str().unwrap().contains("No session found"));
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("No session found")
+        );
         assert_eq!(result["subagent"], "ghost");
     }
 

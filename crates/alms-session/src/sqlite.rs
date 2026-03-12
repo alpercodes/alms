@@ -184,8 +184,9 @@ impl SqliteStore {
         })();
         match &result {
             Ok(()) => {
-                conn.execute_batch("COMMIT")
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite commit delete_session: {e}")))?;
+                conn.execute_batch("COMMIT").map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite commit delete_session: {e}"))
+                })?;
             }
             Err(_) => {
                 let _ = conn.execute_batch("ROLLBACK");

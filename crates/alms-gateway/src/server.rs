@@ -214,12 +214,16 @@ impl AppState {
             }
             None => Arc::new(JobStore::new()),
         };
-        let coordinator = Arc::new(Coordinator::with_agent_config(
+        let mut coord = Coordinator::with_agent_config(
             agent_id,
             session_manager.clone(),
             llm,
             gateway.agent_config().clone(),
-        ));
+        );
+        if let Some(ref ws_dir) = workspace_dir {
+            coord = coord.with_workspace_dir(ws_dir.clone());
+        }
+        let coordinator = Arc::new(coord);
         Ok(Self {
             session_manager,
             gateway: Arc::new(tokio::sync::Mutex::new(gateway)),

@@ -59,16 +59,12 @@ impl Tool for InvokeAgentTool {
                 },
                 "name": {
                     "type": "string",
-                    "description": "Optional persistent name for this subagent (e.g. 'reviewer', \
-                                    'researcher'). When provided, the subagent retains conversation \
-                                    history across invocations — subsequent calls with the same name \
-                                    continue the same session. When omitted, the subagent is ephemeral \
-                                    (fresh session each call)."
-                },
-                "system_prompt": {
-                    "type": "string",
-                    "description": "Optional system prompt override for the subagent. \
-                                    If omitted, the subagent uses a default general-purpose prompt."
+                    "description": "The name of a registered agent to invoke (e.g. 'reviewer', \
+                                    'researcher'). The agent must be pre-created via \
+                                    `alms agent create --name <name>`. Named agents retain \
+                                    conversation history and workspace files across invocations. \
+                                    When omitted, an ephemeral subagent is created (fresh session, \
+                                    no workspace, default config)."
                 },
                 "background": {
                     "type": "boolean",
@@ -94,11 +90,6 @@ impl Tool for InvokeAgentTool {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        let system_prompt = params
-            .get("system_prompt")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
         let background = params
             .get("background")
             .and_then(|v| v.as_bool())
@@ -109,7 +100,6 @@ impl Tool for InvokeAgentTool {
                 .dispatcher
                 .dispatch_background(
                     task,
-                    system_prompt,
                     self.parent_session_id,
                     self.parent_run_id,
                     self.parent_event_tx.clone(),
@@ -125,7 +115,6 @@ impl Tool for InvokeAgentTool {
             .dispatcher
             .dispatch(
                 task,
-                system_prompt,
                 self.parent_session_id,
                 self.parent_run_id,
                 self.parent_event_tx.clone(),
@@ -157,7 +146,6 @@ mod tests {
         async fn dispatch(
             &self,
             _task: String,
-            _system_prompt: Option<String>,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
@@ -213,7 +201,6 @@ mod tests {
             async fn dispatch(
                 &self,
                 _task: String,
-                _system_prompt: Option<String>,
                 _parent_session_id: SessionId,
                 _parent_run_id: Option<RunId>,
                 _parent_event_tx: Option<RuntimeEventSender>,
@@ -249,7 +236,6 @@ mod tests {
         async fn dispatch(
             &self,
             _task: String,
-            _system_prompt: Option<String>,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
@@ -261,7 +247,6 @@ mod tests {
         async fn dispatch_background(
             &self,
             _task: String,
-            _system_prompt: Option<String>,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
@@ -331,7 +316,6 @@ mod tests {
         async fn dispatch(
             &self,
             _task: String,
-            _system_prompt: Option<String>,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
@@ -361,7 +345,10 @@ mod tests {
             .await
             .unwrap();
         let captured = dispatcher.0.lock().unwrap().take().unwrap();
-        assert_eq!(captured, None, "empty name should be treated as None (ephemeral)");
+        assert_eq!(
+            captured, None,
+            "empty name should be treated as None (ephemeral)"
+        );
     }
 
     #[tokio::test]

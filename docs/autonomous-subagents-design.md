@@ -35,30 +35,36 @@ This is autonomous multi-step execution. The subagent decides what tools to use 
 
 **Design:**
 
-When `invoke_agent(name="reviewer")` is called, the coordinator should:
+Subagents are created via the CLI (`alms agent create --name reviewer`), which registers them in the agent registry (SQLite `agents` table) and creates their workspace directory. The parent agent then calls `invoke_agent(name="reviewer", task="...")` — the coordinator looks up the agent record for config (system_prompt, model, posture) and attaches the workspace.
 
-1. Derive a workspace directory: `{parent_workspace}/subagents/{name}/`
-2. Create `AgentWorkspace` pointing at that directory
-3. Call `runtime.with_workspace(workspace)` before running the agent loop
-4. On first invocation, the subagent's `needs_bootstrap()` returns true → the agent bootstraps itself (writes `personality.md` based on its system prompt and initial task)
+The parent can write to the subagent's workspace files (personality.md, goals.md, etc.) using `fs_write` or `shell_exec` — no special tools needed. The workspace path is `{workspace_dir}/{name}/`.
+
+When `invoke_agent(name="reviewer")` is called, the coordinator:
+
+1. Looks up the agent record in the registry (`load_agent_by_name`)
+2. Uses the record's `system_prompt` for config (falls back to default if None)
+3. Derives workspace directory: `{workspace_dir}/{name}/`
+4. Creates `AgentWorkspace` pointing at that directory
+5. Calls `runtime.with_workspace(workspace)` before running the agent loop
+6. On first invocation, `needs_bootstrap()` returns true → the agent bootstraps itself
 
 The workspace is tied to the **name**, not the task ID. Named subagent "reviewer" always uses the same workspace directory and the same session — it accumulates identity across invocations.
 
 Ephemeral (unnamed) subagents do NOT get workspaces. They're one-shot workers.
 
+**Note:** `system_prompt` was removed from the `invoke_agent` tool parameters. Subagent identity is defined at creation time (via CLI/API), not ad-hoc per invocation.
+
 ```
 data/
   workspaces/
-    {parent_agent_id}/
+    reviewer/
+      personality.md   ← "I am a code reviewer..."
+      goals.md         ← "Review for security, correctness..."
+      memories.md      ← "The codebase uses thiserror for errors..."
+    researcher/
       personality.md
       goals.md
       memories.md
-      user.md
-      subagents/
-        reviewer/
-          personality.md   ← "I am a code reviewer..."
-          goals.md         ← "Review for security, correctness..."
-          memories.md      ← "The codebase uses thiserror for errors..."
 ```
 
 ### 2. Recursive Subagent Spawning
@@ -303,10 +309,10 @@ The session persistence means the reviewer remembers everything from previous co
 
 | # | Task | Effort | Depends on |
 |---|------|--------|------------|
-| 70 | Subagent workspaces — derive workspace dir from parent + name, wire into `run_agent_loop` | Medium | — |
+| 70 | Subagent workspaces — agent registry lookup + workspace attach in `run_agent_loop` | **Done** | — |
 | 71 | Recursive subagent spawning — wire `invoke_agent`/`get_task_result` into subagent runtimes, add `max_depth` guard | Medium | — |
 | 72 | Auto-inject completed background results — check pending results at top of `agent_loop` iteration, inject as system messages | Medium | — |
-| 81 | `read_subagent_session` tool — on-demand read of a named subagent's conversation history | Medium | — |
+| 81 | `read_subagent_session` tool — on-demand read of a named subagent's conversation history | **Done** | — |
 | 82 | Truncate `invoke_agent` tool_results to short summaries in parent session (full response stays in subagent session only) | Small | 81 |
 | 83 | System prompt addition — instruct parent LLM about subagent context model (summaries in context, read_subagent_session for details) | Small | 81, 82 |
 
@@ -317,7 +323,7 @@ The session persistence means the reviewer remembers everything from previous co
 | 73 | `report_progress` tool for intermediate status updates | Small | — |
 | 74 | `SubagentProgress` SSE event type — UI shows subagent status inline | Small | 73 |
 | 75 | Validate `name` param against `validate_agent_name()` rules | Small | — |
-| 76 | Warn on `system_prompt` drift for named subagents | Small | — |
+| ~~76~~ | ~~Warn on `system_prompt` drift~~ — N/A, system_prompt removed from invoke_agent | — | — |
 | 77 | Guard against concurrent invocations of the same named subagent | Small | — |
 
 ### Phase 3 — Advanced Orchestration (future)
@@ -367,5 +373,5 @@ ALMS's model is actually more capable than Claude Code's in two respects:
 ---
 
 *Design Date: 2026-03-12*
-*Status: Proposed — Phase 1 tasks not yet started*
+*Status: In progress — #70 (workspaces) and #81 (read_subagent_session) done*
 *Author: Atlas + Alper*

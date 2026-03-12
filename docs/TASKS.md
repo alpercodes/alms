@@ -34,6 +34,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-12:** UI agent selector & management (#54): Agent selector dropdown in header, session sidebar (filtered by active agent), agent management section in settings modal (create/delete/set-default with bootstrap status badges), agents loaded from server API instead of localStorage.
 - **2026-03-12:** Named subagent sessions (#69): `invoke_agent` gains `name` param for persistent subagent sessions. UUID v5 deterministic identity from parent session + name. 8 new tests.
 - **2026-03-12:** Autonomous subagents design doc written (`docs/autonomous-subagents-design.md`). Tasks #70–#74 formulated covering: subagent workspaces, recursive spawning, auto-inject completion, progress reporting, SSE events.
+- **2026-03-12:** `read_subagent_session` tool (#81): on-demand read of named subagent conversation history. Derives deterministic session ID, returns messages + summary. 8 tests.
+- **2026-03-12:** Subagent workspaces + registry lookup (#70): `system_prompt` removed from `invoke_agent` tool. Named subagents looked up in agent registry for config. Workspace attached at `{workspace_dir}/{name}/`. `Coordinator.with_workspace_dir()` wired in gateway.
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 
 ---
@@ -566,11 +568,11 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 > Goal: subagents that behave like autonomous colleagues — own workspace, recursive spawning, event-driven completion notification, progress reporting.
 > Logical implementation order: 70 → 71 → 72 → 73 → 74.
 
-70) Subagent workspaces — persistent identity files for named subagents
-- Named subagents get workspace dir derived from parent: `{parent_workspace}/subagents/{name}/`
-- Wire `AgentWorkspace` into `run_agent_loop` when `subagent_name` is set.
-- `needs_bootstrap()` triggers on first invocation — agent writes own personality.md.
-- Ephemeral (unnamed) subagents do NOT get workspaces.
+70) ~~Subagent workspaces + registry lookup~~ ✅ DONE
+- `system_prompt` removed from `invoke_agent` tool and `SubagentDispatcher` trait.
+- Named subagents looked up in agent registry (`load_agent_by_name`) for config.
+- Workspace attached at `{workspace_dir}/{name}/` via `Coordinator.with_workspace_dir()`.
+- Ephemeral (unnamed) subagents: default config, no workspace.
 - **Owners:** Atlas
 
 71) Recursive subagent spawning — subagents can spawn sub-subagents
@@ -596,11 +598,9 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - UI shows inline subagent status (e.g., "reviewer: analyzing file 3/7").
 - **Owners:** Atlas
 
-81) `read_subagent_session` tool — on-demand subagent context retrieval
-- New tool: `read_subagent_session(name, last_n?, summary_only?)`.
-- Derives deterministic session ID (same UUID v5 logic as `invoke_agent`), reads from `SessionManager`.
-- Returns messages + optional rolling summary. No LLM call — just a session read.
-- Lets parent selectively pull in subagent context instead of carrying it all in its own context window.
+81) ~~`read_subagent_session` tool~~ ✅ DONE
+- Tool: `read_subagent_session(name, last_n?, summary_only?)`.
+- Derives deterministic session ID, reads from `SessionManager`. 8 tests.
 - **Owners:** Atlas
 
 82) Truncate `invoke_agent` tool_results in parent session

@@ -164,12 +164,10 @@ mod tests {
 
     #[test]
     fn test_uuid_shaped_name_rejected() {
-        let err =
-            validate_agent_name("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap_err();
+        let err = validate_agent_name("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap_err();
         assert!(err.to_string().contains("UUID"));
         // Also test a v4-style UUID
-        let err =
-            validate_agent_name("550e8400-e29b-41d4-a716-446655440000").unwrap_err();
+        let err = validate_agent_name("550e8400-e29b-41d4-a716-446655440000").unwrap_err();
         assert!(err.to_string().contains("UUID"));
     }
 }

@@ -95,10 +95,9 @@ pub struct SubagentRequest {
     pub capabilities: Vec<Capability>,
     pub parent_session: SessionId,
     pub parent_run_id: Option<RunId>,
-    /// Optional system prompt override for the subagent.
-    pub system_prompt: Option<String>,
-    /// Optional persistent name. When provided, the subagent reuses the same
-    /// session across invocations (conversation history preserved).
+    /// Optional persistent name. When provided, the subagent must be
+    /// pre-registered in the agent registry (`alms agent create --name ...`).
+    /// Its config and workspace files are loaded from the registry.
     pub subagent_name: Option<String>,
 }
 
@@ -140,8 +139,9 @@ pub struct SubagentHandle {
 
 /// Coordinator manages subagent lifecycle in a pure hierarchy.
 ///
-/// Any agent can spawn subagents by calling `dispatch()`. Subagents are
-/// ephemeral — they complete their task and return a result to the parent.
+/// Any agent can spawn subagents by calling `dispatch()`. Named subagents
+/// must be pre-registered in the agent registry (`alms agent create`);
+/// ephemeral (unnamed) subagents use default config.
 /// There is no peer-to-peer communication between agents.
 #[derive(Debug)]
 pub struct Coordinator {
@@ -156,6 +156,8 @@ pub struct Coordinator {
     llm: LlmClient,
     /// Base agent config — subagents inherit sandbox settings from this
     base_agent_config: AgentConfig,
+    /// Workspace base directory — named subagents get workspaces under this dir
+    workspace_dir: Option<std::path::PathBuf>,
 }
 
 impl Coordinator {
@@ -166,6 +168,7 @@ impl Coordinator {
             session_manager,
             llm,
             base_agent_config: AgentConfig::default(),
+            workspace_dir: None,
         }
     }
 
@@ -182,7 +185,15 @@ impl Coordinator {
             session_manager,
             llm,
             base_agent_config,
+            workspace_dir: None,
         }
+    }
+
+    /// Set the workspace base directory. Named subagents will get workspaces
+    /// under `{workspace_dir}/{agent_name}/`.
+    pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.workspace_dir = Some(dir);
+        self
     }
 
     /// Spawn a new subagent for a task.
@@ -234,6 +245,7 @@ impl Coordinator {
         let session_manager = self.session_manager.clone();
         let llm = self.llm.clone();
         let base_agent_config = self.base_agent_config.clone();
+        let workspace_dir = self.workspace_dir.clone();
 
         let span = tracing::info_span!(
             "subagent::execute",
@@ -252,6 +264,7 @@ impl Coordinator {
                     llm,
                     parent_event_tx,
                     base_agent_config,
+                    workspace_dir,
                 )
                 .await;
             }
@@ -306,7 +319,6 @@ impl SubagentDispatcher for Coordinator {
     async fn dispatch(
         &self,
         task: String,
-        system_prompt: Option<String>,
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<RuntimeEventSender>,
@@ -319,7 +331,6 @@ impl SubagentDispatcher for Coordinator {
             capabilities: SubagentType::General.default_capabilities(),
             parent_session: parent_session_id,
             parent_run_id,
-            system_prompt,
             subagent_name,
         };
 
@@ -358,13 +369,12 @@ impl SubagentDispatcher for Coordinator {
 
     #[instrument(
         level = "info",
-        skip(self, task, system_prompt, parent_event_tx),
+        skip(self, task, parent_event_tx),
         fields(parent_session = %parent_session_id.0)
     )]
     async fn dispatch_background(
         &self,
         task: String,
-        system_prompt: Option<String>,
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<RuntimeEventSender>,
@@ -377,7 +387,6 @@ impl SubagentDispatcher for Coordinator {
             capabilities: SubagentType::General.default_capabilities(),
             parent_session: parent_session_id,
             parent_run_id,
-            system_prompt,
             subagent_name,
         };
         let task_id = self.spawn_subagent(request, parent_event_tx).await?;
@@ -442,6 +451,7 @@ async fn run_subagent(
     llm: LlmClient,
     parent_event_tx: Option<RuntimeEventSender>,
     base_agent_config: AgentConfig,
+    workspace_dir: Option<std::path::PathBuf>,
 ) {
     let start = std::time::Instant::now();
 
@@ -475,7 +485,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None)
         }
-        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config) => {
+        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref()) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -532,41 +542,16 @@ async fn run_subagent(
     debug!("Cleaned up subagent {:?}", task_id);
 }
 
-/// Build an `AgentConfig` appropriate for the given subagent type.
-/// Inherits sandbox settings from `base` so subagents respect the same policy.
-fn agent_config_for_type(
-    agent_type: SubagentType,
-    system_prompt_override: Option<String>,
-    base: &AgentConfig,
-) -> AgentConfig {
-    let default_prompt = match agent_type {
-        SubagentType::Research => {
-            "You are a research specialist. Gather information, analyse sources, \
-             and provide comprehensive, well-structured summaries."
-        }
-        SubagentType::Code => {
-            "You are a code specialist. Generate, review, and debug code with \
-             precision, following best practices for the language in use."
-        }
-        SubagentType::Data => {
-            "You are a data analysis specialist. Process, transform, and analyse \
-             data to extract actionable insights."
-        }
-        SubagentType::Integration => {
-            "You are an integration specialist. Interact with external APIs and \
-             services efficiently and handle errors gracefully."
-        }
-        SubagentType::Security => {
-            "You are a security analysis specialist. Identify vulnerabilities, \
-             audit systems, and produce clear security reports."
-        }
-        SubagentType::General => {
-            "You are a general-purpose assistant. Complete the given task \
-             thoroughly and accurately."
-        }
-    };
+/// Default system prompt for ephemeral (unnamed) subagents.
+const DEFAULT_SUBAGENT_PROMPT: &str =
+    "You are a general-purpose assistant. Complete the given task thoroughly and accurately.";
+
+/// Build an `AgentConfig` for a subagent. Named subagents get their config
+/// from the agent registry; ephemeral subagents use a default prompt.
+/// Both inherit sandbox settings from the parent's base config.
+fn agent_config_for_subagent(system_prompt: Option<String>, base: &AgentConfig) -> AgentConfig {
     AgentConfig {
-        system_prompt: system_prompt_override.unwrap_or_else(|| default_prompt.to_string()),
+        system_prompt: system_prompt.unwrap_or_else(|| DEFAULT_SUBAGENT_PROMPT.to_string()),
         sandbox_root: base.sandbox_root.clone(),
         shell_policy: base.shell_policy.clone(),
         ..AgentConfig::default()
@@ -578,14 +563,13 @@ fn agent_config_for_type(
 /// Creates a fresh `AgentRuntime`, forwards its events to the parent's
 /// event channel (if provided), then calls `runtime.run()`.
 ///
-/// When `subagent_name` is set on the request, the subagent derives a
-/// deterministic `(agent_id, context_id)` from the parent session +
-/// name. This means `SessionManager::get_or_create` returns the same
-/// session across invocations — conversation history is preserved.
+/// **Named subagents** (`subagent_name` is Some): looked up in the agent
+/// registry for config (system_prompt, model, posture). Workspace is
+/// attached if `workspace_dir` is set. Session identity is deterministic
+/// (UUID v5 from parent session + name) — conversation history preserved.
 ///
-/// Note: `system_prompt` is applied to `AgentConfig` each invocation
-/// (not stored in the session). Callers should pass a consistent
-/// system_prompt across invocations of the same named subagent.
+/// **Ephemeral subagents** (`subagent_name` is None): fresh agent ID,
+/// fresh session, default config, no workspace.
 async fn run_agent_loop(
     task_id: TaskId,
     request: &SubagentRequest,
@@ -593,29 +577,48 @@ async fn run_agent_loop(
     llm: &LlmClient,
     parent_event_tx: Option<RuntimeEventSender>,
     base_agent_config: &AgentConfig,
+    workspace_dir: Option<&std::path::Path>,
 ) -> AlmsResult<RunOutput> {
-    // Derive identity: stable when named, ephemeral when unnamed
-    let (agent_id, context_id) = if let Some(ref name) = request.subagent_name {
-        // Deterministic: same (parent_session, name) → same session
-        let parent_as_agent = AgentId(request.parent_session.0);
-        let stable_id = AgentId::deterministic(parent_as_agent, name);
-        let stable_ctx = format!("subagent_{}_{}", request.parent_session.0, name);
-        (stable_id, stable_ctx)
-    } else {
-        // Ephemeral: fresh each invocation (original behavior)
-        (AgentId::new(), format!("subagent_{}", task_id.0))
-    };
+    // Derive identity and config based on whether the subagent is named
+    let (agent_id, context_id, config, attach_workspace) =
+        if let Some(ref name) = request.subagent_name {
+            // Named: deterministic identity, look up agent registry for config
+            let parent_as_agent = AgentId(request.parent_session.0);
+            let stable_id = AgentId::deterministic(parent_as_agent, name);
+            let stable_ctx = format!("subagent_{}_{}", request.parent_session.0, name);
 
-    let config = agent_config_for_type(
-        request.agent_type,
-        request.system_prompt.clone(),
-        base_agent_config,
-    );
+            // Look up agent record in registry for system_prompt/model/posture
+            let agent_system_prompt = session_manager
+                .store()
+                .and_then(|store| store.load_agent_by_name(name).ok())
+                .flatten()
+                .and_then(|record| record.system_prompt);
+
+            let config = agent_config_for_subagent(agent_system_prompt, base_agent_config);
+            (stable_id, stable_ctx, config, true)
+        } else {
+            // Ephemeral: fresh each invocation
+            let config = agent_config_for_subagent(None, base_agent_config);
+            (
+                AgentId::new(),
+                format!("subagent_{}", task_id.0),
+                config,
+                false,
+            )
+        };
 
     // Create a per-subagent event channel
     let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
 
-    let runtime = AgentRuntime::new(agent_id, config, llm.clone()).with_event_sender(sub_tx);
+    let mut runtime = AgentRuntime::new(agent_id, config, llm.clone()).with_event_sender(sub_tx);
+
+    // Attach workspace for named subagents: {workspace_dir}/{name}/
+    if attach_workspace && let (Some(ws_dir), Some(name)) = (workspace_dir, &request.subagent_name)
+    {
+        let subagent_ws_dir = ws_dir.join(name);
+        let workspace = alms_runtime::AgentWorkspace::new(subagent_ws_dir, agent_id);
+        runtime = runtime.with_workspace(workspace);
+    }
 
     // Forward subagent tool events into the parent run's event stream
     if let Some(parent_tx) = parent_event_tx {
@@ -661,7 +664,7 @@ mod tests {
     async fn test_dispatch_foreground_success() {
         let coord = test_coordinator();
         let result = coord
-            .dispatch("Say hello".to_string(), None, test_session_id(), None, None, None)
+            .dispatch("Say hello".to_string(), test_session_id(), None, None, None)
             .await;
 
         let response = result.expect("dispatch should succeed");
@@ -673,33 +676,7 @@ mod tests {
         );
     }
 
-    // -- (b) smoke test: dispatch with system_prompt does not error -------------
-
-    #[tokio::test]
-    async fn test_dispatch_with_system_prompt_smoke() {
-        // Smoke test only: verifies that providing a system_prompt does not
-        // cause an error.  The mock LLM does not vary its response based on
-        // system prompt content, so we cannot assert the prompt was threaded
-        // through without an injectable mock.
-        let coord = test_coordinator();
-        let result = coord
-            .dispatch(
-                "Do the thing".to_string(),
-                Some("You are a test agent.".to_string()),
-                test_session_id(),
-                None,
-                None,
-                None,
-            )
-            .await;
-
-        assert!(
-            result.is_ok(),
-            "dispatch with system prompt should not error"
-        );
-    }
-
-    // -- (c) dispatch_background + poll_task lifecycle --------------------------
+    // -- (b) dispatch_background + poll_task lifecycle --------------------------
 
     #[tokio::test]
     async fn test_dispatch_background_lifecycle() {
@@ -707,7 +684,6 @@ mod tests {
         let task_uuid = coord
             .dispatch_background(
                 "Background work".to_string(),
-                None,
                 test_session_id(),
                 None,
                 None,
@@ -759,7 +735,6 @@ mod tests {
             capabilities: SubagentType::General.default_capabilities(),
             parent_session: session_id,
             parent_run_id: None,
-            system_prompt: None,
             subagent_name: None,
         };
         let task_id = coord.spawn_subagent(request, None).await.unwrap();
@@ -792,7 +767,6 @@ mod tests {
             capabilities: SubagentType::General.default_capabilities(),
             parent_session: session_id,
             parent_run_id: None,
-            system_prompt: None,
             subagent_name: None,
         };
         let task_id = coord.spawn_subagent(request, None).await.unwrap();
@@ -829,7 +803,6 @@ mod tests {
             capabilities: SubagentType::Research.default_capabilities(),
             parent_session: session_id,
             parent_run_id: None,
-            system_prompt: None,
             subagent_name: None,
         };
         let task_id = coord.spawn_subagent(request, None).await.unwrap();
@@ -864,7 +837,6 @@ mod tests {
             capabilities: SubagentType::General.default_capabilities(),
             parent_session: session_id,
             parent_run_id: None,
-            system_prompt: None,
             subagent_name: None,
         };
         let task_id = coord.spawn_subagent(request, None).await.unwrap();
@@ -898,7 +870,6 @@ mod tests {
         let r1 = coord
             .dispatch(
                 "First task".to_string(),
-                None,
                 parent_session,
                 None,
                 None,
@@ -912,7 +883,6 @@ mod tests {
         let r2 = coord
             .dispatch(
                 "Follow up".to_string(),
-                None,
                 parent_session,
                 None,
                 None,
@@ -946,26 +916,12 @@ mod tests {
 
         // Two invocations without name — each should get a fresh session
         let _r1 = coord
-            .dispatch(
-                "Task one".to_string(),
-                None,
-                parent_session,
-                None,
-                None,
-                None,
-            )
+            .dispatch("Task one".to_string(), parent_session, None, None, None)
             .await
             .expect("first dispatch should succeed");
 
         let _r2 = coord
-            .dispatch(
-                "Task two".to_string(),
-                None,
-                parent_session,
-                None,
-                None,
-                None,
-            )
+            .dispatch("Task two".to_string(), parent_session, None, None, None)
             .await
             .expect("second dispatch should succeed");
 

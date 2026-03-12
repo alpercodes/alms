@@ -28,13 +28,16 @@ pub enum PollResult {
 pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     /// Spawn a subagent, await its completion, and return the response text.
     ///
+    /// Named subagents (`subagent_name` = Some) must be pre-registered in the
+    /// agent registry via `alms agent create`. Their config (system_prompt,
+    /// model, posture) and workspace files are loaded from the registry.
+    ///
     /// `parent_event_tx` is the parent run's runtime event sender. When
     /// provided, the subagent's tool events are forwarded into the parent
     /// run's SSE stream so the UI can show subagent activity inline.
     async fn dispatch(
         &self,
         task: String,
-        system_prompt: Option<String>,
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<RuntimeEventSender>,
@@ -49,7 +52,6 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     async fn dispatch_background(
         &self,
         _task: String,
-        _system_prompt: Option<String>,
         _parent_session_id: SessionId,
         _parent_run_id: Option<RunId>,
         _parent_event_tx: Option<RuntimeEventSender>,

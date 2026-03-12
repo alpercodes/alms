@@ -94,7 +94,6 @@ mod tests {
         async fn dispatch(
             &self,
             _task: String,
-            _system_prompt: Option<String>,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,

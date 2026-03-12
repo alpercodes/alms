@@ -213,18 +213,20 @@ async fn execute_run(
 
     // Look up per-agent config overrides from the agent registry.
     // Errors are absorbed — agent lookup failure should not block the run.
-    let agent_record = state.session_manager.store().and_then(|store| {
-        match store.load_agent_by_id(agent_id) {
-            Ok(record) => record,
-            Err(e) => {
-                warn!(
-                    "Failed to load agent record for {}, using server defaults: {}",
-                    agent_id, e
-                );
-                None
-            }
-        }
-    });
+    let agent_record =
+        state
+            .session_manager
+            .store()
+            .and_then(|store| match store.load_agent_by_id(agent_id) {
+                Ok(record) => record,
+                Err(e) => {
+                    warn!(
+                        "Failed to load agent record for {}, using server defaults: {}",
+                        agent_id, e
+                    );
+                    None
+                }
+            });
 
     // Build runtime — drop gateway lock before running to avoid blocking other requests
     let merged = apply_overrides(
@@ -295,10 +297,8 @@ async fn execute_run(
             Some(run_id),
             Some(invoke_agent_tx),
         );
-        let read_session_tool = alms_runtime::ReadSubagentSessionTool::new(
-            state.session_manager.clone(),
-            session_id,
-        );
+        let read_session_tool =
+            alms_runtime::ReadSubagentSessionTool::new(state.session_manager.clone(), session_id);
         runtime = runtime
             .with_invoke_agent(invoke_tool)
             .with_get_task_result(get_task_tool)
@@ -632,7 +632,11 @@ mod tests {
         }
     }
 
-    fn test_agent(model: Option<&str>, system_prompt: Option<&str>, posture: Option<&str>) -> AgentRecord {
+    fn test_agent(
+        model: Option<&str>,
+        system_prompt: Option<&str>,
+        posture: Option<&str>,
+    ) -> AgentRecord {
         let now = Utc::now();
         AgentRecord {
             id: AgentId::new(),
