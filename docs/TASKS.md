@@ -31,6 +31,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-12:** CLI session commands (#51): `alms session {list, show, delete}`. `list --agent NAME` filters by agent. `show` displays session details + message count + agent name. Direct SQLite access. `list_sessions()` + `load_session_by_id()` + `load_sessions_by_agent()` + `message_count()` on SqliteStore. 8 CLI tests + 4 store tests.
 - **2026-03-12:** CLI run and job commands (#52): `alms run {create, list, show}` via HTTP API; `alms job {list, show}` via SQLite, `alms job {create, cancel}` via HTTP API. `--url` / `ALMS_GATEWAY_URL` for gateway address. Auth token forwarding. Schedule parsing ("once:"/"cron:"). `load_job_by_id()` + `load_all_jobs_unfiltered()`. 12 new tests (31 CLI total).
 - **2026-03-12:** CLI dashboard + polish (#53): `alms dashboard` opens web UI via `open` crate. `alms completions <shell>` generates shell completions via `clap_complete`. `alms health --json` for machine-readable output. `--json` flag now consistent across all commands. 2 new tests (33 CLI total).
+- **2026-03-12:** UI agent selector & management (#54): Agent selector dropdown in header, session sidebar (filtered by active agent), agent management section in settings modal (create/delete/set-default with bootstrap status badges), agents loaded from server API instead of localStorage.
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 
 ---
@@ -455,11 +456,13 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - 2 new tests (33 CLI total).
 - **Owners:** Atlas
 
-54) UI — agent selector and management
+54) UI — agent selector and management ✅
 - Agent selector dropdown in the header (next to posture badge).
 - Switching agents filters sessions and shows that agent's workspace.
 - Agent management section in settings drawer: create/delete/configure agents.
 - Each agent shows workspace bootstrap status (`needs_bootstrap()`).
+- Session sidebar replaces old agent sidebar — shows sessions for active agent with new-session button.
+- Agents loaded from server (`GET /settings` agents array) instead of localStorage.
 - **Owners:** Atlas
 
 ---

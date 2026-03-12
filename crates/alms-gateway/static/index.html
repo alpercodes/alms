@@ -44,6 +44,23 @@
     }
     #posture-badge.guarded { color: #d29922; border-color: #d29922; }
 
+    /* ── Agent selector ── */
+    #agent-select {
+      font-size: 11px;
+      font-family: inherit;
+      background: #161b22;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 3px 8px;
+      flex-shrink: 0;
+      cursor: pointer;
+      outline: none;
+      max-width: 180px;
+    }
+    #agent-select:focus { border-color: #388bfd; }
+    #agent-select option { background: #161b22; }
+
     .header-btns { display: flex; gap: 6px; }
     .hbtn {
       padding: 4px 10px;
@@ -486,6 +503,59 @@
     .settings-cancel:hover { color: #e6edf3; }
     #btn-settings.active { color: #d29922; border-color: #d29922; }
 
+    /* ── Agent management in settings ── */
+    .agent-list-container {
+      max-height: 200px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .agent-card {
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      padding: 8px 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .agent-card.default { border-color: #58a6ff; }
+    .agent-card-name { font-size: 12px; color: #e6edf3; font-weight: bold; flex: 1; }
+    .agent-card-badges { display: flex; gap: 4px; align-items: center; }
+    .agent-badge {
+      font-size: 9px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      border: 1px solid #30363d;
+      color: #8b949e;
+    }
+    .agent-badge.default-badge { color: #58a6ff; border-color: #58a6ff; }
+    .agent-badge.bootstrap-badge { color: #d29922; border-color: #d29922; }
+    .agent-card-actions { display: flex; gap: 4px; }
+    .agent-card-btn {
+      font-size: 10px;
+      font-family: inherit;
+      padding: 2px 6px;
+      background: none;
+      border: 1px solid #30363d;
+      border-radius: 3px;
+      color: #8b949e;
+      cursor: pointer;
+    }
+    .agent-card-btn:hover { color: #e6edf3; border-color: #58a6ff; }
+    .agent-card-btn.danger { color: #f85149; border-color: #f85149; }
+    .agent-card-btn.danger:hover { background: #8b1922; }
+    .agent-create-row {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+    }
+    .agent-create-row input {
+      flex: 1;
+    }
+    .agent-error { font-size: 11px; color: #f85149; }
+
     /* ── Audit tab ── */
     .audit-event {
       font-size: 11px;
@@ -509,6 +579,9 @@
 <header>
   <h1>ALMS</h1>
   <span id="build" style="font-size:10px;color:#484f58;flex-shrink:0">v0.2</span>
+  <select id="agent-select" title="Active agent" onchange="onAgentSelectChange(this.value)">
+    <option value="">loading…</option>
+  </select>
   <span id="posture-badge" title="Execution posture">full_control</span>
   <span id="status">connecting…</span>
   <div class="header-btns">
@@ -573,6 +646,18 @@
       <div class="settings-hint" id="settings-server-info">loading…</div>
     </div>
 
+    <div class="settings-row">
+      <div class="settings-label">Agents</div>
+      <div class="agent-list-container" id="settings-agent-list">
+        <!-- populated by renderAgentSettings() -->
+      </div>
+      <div class="agent-create-row" style="margin-top:6px">
+        <input type="text" class="settings-input" id="new-agent-name" placeholder="new-agent-name" spellcheck="false" style="font-size:12px;padding:5px 8px">
+        <button class="settings-save" style="padding:5px 10px;font-size:11px" onclick="createAgentFromSettings()">Create</button>
+      </div>
+      <div class="agent-error" id="agent-create-error"></div>
+    </div>
+
     <div class="settings-footer">
       <button class="settings-cancel" onclick="closeSettings()">Cancel</button>
       <button class="settings-save" onclick="applySettings()">Apply</button>
@@ -586,9 +671,9 @@
   <div id="sidebar">
 
     <div class="sidebar-section" style="flex:0 0 auto">
-      <div class="sidebar-label">Agents</div>
-      <div id="agent-list"></div>
-      <button id="new-agent-btn" onclick="newAgent()">+ New agent</button>
+      <div class="sidebar-label">Sessions</div>
+      <div id="session-list"></div>
+      <button id="new-session-btn" onclick="newSession()">+ New session</button>
     </div>
 
     <div class="sidebar-section" id="run-history-section" style="flex:1">
@@ -643,9 +728,10 @@
 
 // ── State ──────────────────────────────────────────────────────────────────────
 const S = {
-  agents:          [],            // [{ id, name, sessionId }] — managed in localStorage
+  agents:          [],            // [{ id, name, is_default, model, needs_bootstrap }] — from server
   activeAgentId:   null,          // UUID of the active agent
   agentId:         null,          // same — kept for workspace/jobs API calls
+  sessions:        [],            // sessions for active agent
   activeSessionId: null,
   runs:            [],            // runs for active session
   wsFiles:         null,          // { 'personality.md': '...', ... } or null
@@ -662,7 +748,8 @@ const statusEl     = document.getElementById('status');
 const messagesEl   = document.getElementById('messages');
 const promptEl     = document.getElementById('prompt');
 const sendBtn      = document.getElementById('send');
-const agentListEl  = document.getElementById('agent-list');
+const agentSelectEl = document.getElementById('agent-select');
+const sessionListEl = document.getElementById('session-list');
 const runListEl    = document.getElementById('run-list');
 const sessionTokensEl = document.getElementById('session-tokens');
 const panelEl      = document.getElementById('panel');
@@ -692,83 +779,134 @@ function fmtDate(iso) {
   return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-// ── Agent sidebar ──────────────────────────────────────────────────────────────
+// ── Agent selector (header dropdown) ──────────────────────────────────────────
 
-const AGENTS_KEY      = 'alms_agents';
 const ACTIVE_AGENT_KEY = 'alms_active_agent';
 
-function loadAgentsFromStorage() {
-  try { return JSON.parse(localStorage.getItem(AGENTS_KEY)) || []; }
-  catch { return []; }
-}
-
-function saveAgentsToStorage() {
-  localStorage.setItem(AGENTS_KEY, JSON.stringify(S.agents));
-}
-
-function renderAgents() {
-  agentListEl.innerHTML = '';
+function renderAgentSelect() {
+  agentSelectEl.innerHTML = '';
   if (S.agents.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'run-empty';
-    empty.textContent = 'No agents';
-    agentListEl.appendChild(empty);
+    const opt = document.createElement('option');
+    opt.value = '';
+    opt.textContent = 'No agents';
+    agentSelectEl.appendChild(opt);
     return;
   }
   for (const agent of S.agents) {
-    const el = document.createElement('div');
-    el.className = 'session-item' + (agent.id === S.activeAgentId ? ' active' : '');
-    el.title = `ID: ${agent.id}`;
-    el.textContent = agent.name;
-    el.onclick = () => switchAgent(agent.id);
-    agentListEl.appendChild(el);
+    const opt = document.createElement('option');
+    opt.value = agent.id;
+    let label = agent.name;
+    if (agent.is_default) label += ' *';
+    if (agent.needs_bootstrap) label += ' (setup needed)';
+    opt.textContent = label;
+    opt.selected = agent.id === S.activeAgentId;
+    agentSelectEl.appendChild(opt);
   }
 }
 
-async function newAgent() {
-  if (activeEs) return;
-  const name = prompt('Agent name:');
-  if (!name || !name.trim()) return;
-  const agentId = serverDefaults.agent_id || crypto.randomUUID();
-  const contextId = 'web-chat';
+function onAgentSelectChange(agentId) {
+  if (!agentId || agentId === S.activeAgentId) return;
+  if (activeEs) { agentSelectEl.value = S.activeAgentId; return; }
+  switchAgent(agentId);
+}
+
+async function switchAgent(agentId) {
+  const agent = S.agents.find(a => a.id === agentId);
+  if (!agent) return;
+
+  S.activeAgentId = agentId;
+  S.agentId = agentId;
+  S.activeSessionId = null;
+  S.sessions = [];
+  S.runs = [];
+  S.wsFiles = null;
+  S.auditEvents = null;
+  localStorage.setItem(ACTIVE_AGENT_KEY, agentId);
+
+  messagesEl.innerHTML = '';
+  renderAgentSelect();
+
+  // Load sessions for this agent, pick the most recent one
+  await loadSessions();
+  loadRuns();
+  if (S.activeSessionId) loadSessionHistory(S.activeSessionId);
+  enableInput();
+  setStatus(`${agent.name}`, 'ok');
+  promptEl.focus();
+  // Reload workspace panel if open
+  if (S.activePanel === 'workspace') { S.wsFiles = null; loadWorkspace(); }
+  if (S.activePanel === 'jobs') loadJobs();
+  if (S.activePanel === 'audit') { S.auditEvents = null; loadAudit(); }
+}
+
+// ── Session sidebar ───────────────────────────────────────────────────────────
+
+async function loadSessions() {
+  if (!S.activeAgentId) { renderSessions(); return; }
+  try {
+    const res = await fetch('/sessions');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    // Filter to current agent's sessions only
+    S.sessions = (data.sessions || []).filter(s => s.agent_id === S.activeAgentId);
+  } catch {
+    S.sessions = [];
+  }
+  // Select most recent session or none
+  if (S.sessions.length > 0) {
+    S.activeSessionId = S.sessions[0].id;
+  } else {
+    S.activeSessionId = null;
+  }
+  renderSessions();
+}
+
+function renderSessions() {
+  sessionListEl.innerHTML = '';
+  if (S.sessions.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'run-empty';
+    empty.textContent = 'No sessions';
+    sessionListEl.appendChild(empty);
+    return;
+  }
+  for (const sess of S.sessions) {
+    const el = document.createElement('div');
+    el.className = 'session-item' + (sess.id === S.activeSessionId ? ' active' : '');
+    el.title = `ID: ${sess.id}\nContext: ${sess.context_id}`;
+    el.textContent = sess.context_id || sess.id.slice(0, 8);
+    el.onclick = () => selectSession(sess.id);
+    sessionListEl.appendChild(el);
+  }
+}
+
+function selectSession(sessionId) {
+  if (sessionId === S.activeSessionId || activeEs) return;
+  S.activeSessionId = sessionId;
+  S.runs = [];
+  S.auditEvents = null;
+  messagesEl.innerHTML = '';
+  renderSessions();
+  loadRuns();
+  loadSessionHistory(sessionId);
+  if (S.activePanel === 'audit') { S.auditEvents = null; loadAudit(); }
+}
+
+async function newSession() {
+  if (activeEs || !S.activeAgentId) return;
   try {
     const res = await fetch('/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent_id: agentId, context_id: contextId }),
+      body: JSON.stringify({ agent_id: S.activeAgentId, context_id: 'web-chat-' + Date.now() }),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    const agent = { id: agentId, name: name.trim(), sessionId: data.session_id };
-    S.agents.push(agent);
-    saveAgentsToStorage();
-    renderAgents();
-    switchAgent(agentId);
+    await loadSessions();
+    selectSession(data.session_id);
   } catch {
-    setStatus('failed to create agent', 'error');
+    setStatus('failed to create session', 'error');
   }
-}
-
-function switchAgent(agentId) {
-  const agent = S.agents.find(a => a.id === agentId);
-  if (!agent || agentId === S.activeAgentId) return;
-  if (activeEs) return;
-
-  S.activeAgentId = agentId;
-  S.agentId = agentId;
-  S.activeSessionId = agent.sessionId;
-  localStorage.setItem(ACTIVE_AGENT_KEY, agentId);
-  S.runs = [];
-  S.wsFiles = null;
-  S.auditEvents = null;
-
-  messagesEl.innerHTML = '';
-  renderAgents();
-  loadRuns();
-  if (agent.sessionId) loadSessionHistory(agent.sessionId);
-  enableInput();
-  setStatus(`agent ${agentId.slice(0, 8)}…`, 'ok');
-  promptEl.focus();
 }
 
 
@@ -937,64 +1075,78 @@ async function loadSessionHistory(sessionId) {
 async function boot() {
   setStatus('connecting…');
 
-  // Fetch server defaults first — we need agent_id for the default agent.
+  // Fetch server defaults — includes agent list from /settings.
   await fetchServerDefaults();
 
-  // Load agents from localStorage.
-  S.agents = loadAgentsFromStorage();
+  // Load agents from server (already fetched in serverDefaults.agents).
+  S.agents = (serverDefaults.agents || []).map(a => ({
+    id: a.id,
+    name: a.name,
+    is_default: a.is_default,
+    model: a.model,
+  }));
 
   if (S.agents.length === 0) {
-    // First run: create the default "Main Agent" using the server's configured agent_id.
-    const serverAgentId = serverDefaults.agent_id || crypto.randomUUID();
-    try {
-      const res = await fetch('/sessions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agent_id: serverAgentId, context_id: 'web-chat' }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      S.agents = [{ id: serverAgentId, name: 'Main Agent', sessionId: data.session_id }];
-      saveAgentsToStorage();
-    } catch {
-      setStatus('server offline', 'error');
-      setTimeout(boot, 4000);
-      return;
-    }
+    setStatus('no agents configured', 'error');
+    renderAgentSelect();
+    return;
   }
 
-  // Restore the last active agent, falling back to the first.
-  const savedAgentId = localStorage.getItem(ACTIVE_AGENT_KEY);
-  let activeAgent = S.agents.find(a => a.id === savedAgentId) || S.agents[0];
+  // Check bootstrap status for each agent (async, non-blocking).
+  checkBootstrapStatus();
 
-  // If the agent has no session yet (e.g. created offline), create one now.
-  if (!activeAgent.sessionId) {
+  // Restore the last active agent, falling back to the default or first.
+  const savedAgentId = localStorage.getItem(ACTIVE_AGENT_KEY);
+  let activeAgent = S.agents.find(a => a.id === savedAgentId)
+    || S.agents.find(a => a.is_default)
+    || S.agents[0];
+
+  S.activeAgentId = activeAgent.id;
+  S.agentId = activeAgent.id;
+  localStorage.setItem(ACTIVE_AGENT_KEY, activeAgent.id);
+  renderAgentSelect();
+
+  // Load sessions for active agent, pick most recent.
+  await loadSessions();
+
+  // If no session exists, create one automatically.
+  if (!S.activeSessionId) {
     try {
       const res = await fetch('/sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agent_id: activeAgent.id, context_id: 'web-chat' }),
+        body: JSON.stringify({ agent_id: S.activeAgentId, context_id: 'web-chat' }),
       });
       if (res.ok) {
         const data = await res.json();
-        activeAgent.sessionId = data.session_id;
-        saveAgentsToStorage();
+        S.activeSessionId = data.session_id;
+        await loadSessions();
       }
     } catch { /* ignore — will retry on next message */ }
   }
 
-  S.activeAgentId = activeAgent.id;
-  S.agentId = activeAgent.id;
-  S.activeSessionId = activeAgent.sessionId;
-  localStorage.setItem(ACTIVE_AGENT_KEY, activeAgent.id);
-
-  renderAgents();
   if (S.activeSessionId) {
     await Promise.all([loadRuns(), loadSessionHistory(S.activeSessionId)]);
   }
   enableInput();
-  setStatus(`agent ${activeAgent.id.slice(0, 8)}…`, 'ok');
+  setStatus(`${activeAgent.name}`, 'ok');
   promptEl.focus();
+}
+
+async function checkBootstrapStatus() {
+  for (const agent of S.agents) {
+    try {
+      const res = await fetch(`/agents/${agent.id}/workspace`);
+      if (res.ok) {
+        const data = await res.json();
+        const files = data.files || {};
+        agent.needs_bootstrap = !files['personality.md'];
+      }
+    } catch { /* ignore */ }
+  }
+  // Re-render agent selector with bootstrap indicators
+  renderAgentSelect();
+  renderAgentSettings();
 }
 
 function enableInput() {
@@ -1040,7 +1192,6 @@ async function sendMessage() {
     if (!res.ok) {
       if (res.status === 404 || res.status === 400) {
         // Session expired (server restart without SQLite). Recreate.
-        localStorage.removeItem('alms_session_id');
         S.activeSessionId = null;
         S.sessions = [];
         enableInput();
@@ -1082,7 +1233,8 @@ function openEventStream(runId) {
   function done() {
     es.close();
     activeEs = null;
-    setStatus(`session ${S.activeSessionId.slice(0, 8)}…`, 'ok');
+    const agent = S.agents.find(a => a.id === S.activeAgentId);
+    setStatus(agent ? agent.name : 'ready', 'ok');
     enableInput();
     promptEl.focus();
     // Refresh run history and audit log after completion.
@@ -1630,6 +1782,7 @@ function openSettings() {
   if (serverDefaults.enabled_tools)    infoLines.push(`Tools: ${serverDefaults.enabled_tools.join(', ')}`);
   settingsServerInfo.textContent = infoLines.join(' · ') || '—';
 
+  renderAgentSettings();
   settingsOverlay.classList.add('open');
   settingsModelIn.focus();
 }
@@ -1665,6 +1818,146 @@ function updateSettingsBtn() {
   btn.title = parts.length ? parts.join(', ') : 'Settings';
 }
 
+// ── Agent management in settings ────────────────────────────────────────────
+function renderAgentSettings() {
+  const container = document.getElementById('settings-agent-list');
+  if (!container) return;
+  container.innerHTML = '';
+
+  if (S.agents.length === 0) {
+    container.innerHTML = '<div class="settings-hint">No agents registered.</div>';
+    return;
+  }
+
+  for (const agent of S.agents) {
+    const card = document.createElement('div');
+    card.className = 'agent-card' + (agent.is_default ? ' default' : '');
+
+    const name = document.createElement('span');
+    name.className = 'agent-card-name';
+    name.textContent = agent.name;
+
+    const badges = document.createElement('span');
+    badges.className = 'agent-card-badges';
+    if (agent.is_default) {
+      const b = document.createElement('span');
+      b.className = 'agent-badge default-badge';
+      b.textContent = 'default';
+      badges.appendChild(b);
+    }
+    if (agent.needs_bootstrap) {
+      const b = document.createElement('span');
+      b.className = 'agent-badge bootstrap-badge';
+      b.textContent = 'needs setup';
+      b.title = 'Agent has not completed bootstrap interview';
+      badges.appendChild(b);
+    }
+    if (agent.model) {
+      const b = document.createElement('span');
+      b.className = 'agent-badge';
+      b.textContent = agent.model;
+      badges.appendChild(b);
+    }
+
+    const actions = document.createElement('span');
+    actions.className = 'agent-card-actions';
+
+    if (!agent.is_default) {
+      const defBtn = document.createElement('button');
+      defBtn.className = 'agent-card-btn';
+      defBtn.textContent = 'default';
+      defBtn.title = 'Set as default agent';
+      defBtn.onclick = async () => {
+        defBtn.disabled = true;
+        try {
+          const res = await fetch(`/agents/${agent.id}/default`, { method: 'POST' });
+          if (res.ok) await refreshAgents();
+        } catch { /* ignore */ }
+        defBtn.disabled = false;
+      };
+      actions.appendChild(defBtn);
+    }
+
+    if (!agent.is_default) {
+      const delBtn = document.createElement('button');
+      delBtn.className = 'agent-card-btn danger';
+      delBtn.textContent = 'delete';
+      delBtn.title = 'Delete agent';
+      delBtn.onclick = async () => {
+        if (!confirm(`Delete agent "${agent.name}"? This cannot be undone.`)) return;
+        delBtn.disabled = true;
+        try {
+          const res = await fetch(`/agents/${agent.id}`, { method: 'DELETE' });
+          if (res.ok) {
+            // If we deleted the active agent, switch to default
+            const wasActive = agent.id === S.activeAgentId;
+            await refreshAgents();
+            if (wasActive && S.agents.length > 0) {
+              const def = S.agents.find(a => a.is_default) || S.agents[0];
+              switchAgent(def.id);
+            }
+          } else {
+            const body = await res.json();
+            alert(body?.error?.message || 'Delete failed');
+          }
+        } catch { /* ignore */ }
+        delBtn.disabled = false;
+      };
+      actions.appendChild(delBtn);
+    }
+
+    card.appendChild(name);
+    card.appendChild(badges);
+    card.appendChild(actions);
+    container.appendChild(card);
+  }
+}
+
+async function createAgentFromSettings() {
+  const input = document.getElementById('new-agent-name');
+  const errorEl = document.getElementById('agent-create-error');
+  const name = input.value.trim();
+  errorEl.textContent = '';
+  if (!name) { errorEl.textContent = 'Name is required.'; return; }
+
+  try {
+    const res = await fetch('/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) {
+      const body = await res.json();
+      errorEl.textContent = body?.error?.message || `Error ${res.status}`;
+      return;
+    }
+    input.value = '';
+    await refreshAgents();
+  } catch {
+    errorEl.textContent = 'Request failed.';
+  }
+}
+
+async function refreshAgents() {
+  try {
+    const res = await fetch('/settings');
+    if (!res.ok) return;
+    const data = await res.json();
+    serverDefaults = data;
+    const oldAgents = S.agents;
+    S.agents = (data.agents || []).map(a => ({
+      id: a.id,
+      name: a.name,
+      is_default: a.is_default,
+      model: a.model,
+      needs_bootstrap: oldAgents.find(x => x.id === a.id)?.needs_bootstrap,
+    }));
+  } catch { /* ignore */ }
+  renderAgentSelect();
+  renderAgentSettings();
+  checkBootstrapStatus();
+}
+
 // Close modal on Escape
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && settingsOverlay.classList.contains('open')) closeSettings();
@@ -1685,7 +1978,6 @@ promptEl.addEventListener('input', () => {
 });
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
-// fetchServerDefaults is called inside boot() so the agent_id is available.
 boot().then(updateSettingsBtn);
 </script>
 </body>
