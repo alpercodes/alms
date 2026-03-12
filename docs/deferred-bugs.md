@@ -52,7 +52,7 @@ All findings were fixed.
 
 - **[runs.rs] S3 Medium** — Legacy `run_agent` endpoint (`POST /agent/run`) bypasses per-agent config overrides entirely. It calls `execute_run` with `RunOverrides::default()`, which is correct, but the endpoint doesn't go through the same session/agent resolution as the canonical `/runs` path. Pre-existing issue, predates task #49. *Deferred: legacy endpoint — deprecate or remove.*
 
-- **[runs.rs] S3 Medium** — Zero test coverage for the three-layer config merging logic. Should extract into a pure function `merge_agent_config(base, agent_record, overrides)` and add unit tests. *Deferred: needs refactor to make testable.*
+- ~~**[runs.rs] S3 Medium** — Zero test coverage for the three-layer config merging logic.~~ **Fixed**: Extracted `apply_overrides()` pure function + 7 unit tests covering all precedence layers, clamping, and edge cases.
 
 - **[runs.rs] S4 Low** — `system_prompt` per-agent override is a full replacement, not an append. If agent has a system_prompt override, the server default system prompt is entirely replaced. This is by design but not documented. *Deferred: document behavior.*
 
