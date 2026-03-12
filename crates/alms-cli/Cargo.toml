@@ -12,11 +12,14 @@ path = "src/main.rs"
 [dependencies]
 alms-core = { path = "../alms-core" }
 alms-gateway = { path = "../alms-gateway" }
+alms-session = { path = "../alms-session" }
 
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
