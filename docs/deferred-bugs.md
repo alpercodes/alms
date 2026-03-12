@@ -6,17 +6,37 @@ Bugs found during code reviews that were not fixed immediately. Tracked here so 
 
 ---
 
+## From review of #46 (Agent registry — data model) — 2026-03-12
+
+- **[sqlite.rs] S3 Medium** — `delete_agent` orphans sessions and jobs. Neither `sessions.agent_id` nor `jobs.agent_id` has a FK constraint to `agents.id`. Deleting an agent leaves orphaned rows. *Deferred: design decision — need to decide cascade behavior.*
+
+- **[sqlite.rs] S4 Low** — `touch_agent` silently succeeds on nonexistent agent (doesn't check affected row count). Fire-and-forget on hot path, so acceptable. *Deferred: defense-in-depth.*
+
+- **[sqlite.rs] S4 Low** — No index on `agents.is_default`. Not needed at MVP scale. *Deferred: performance improvement if agent count grows.*
+
+- **[sqlite.rs] S4 Low** — `set_default_agent` uses manual `BEGIN`/`COMMIT`/`ROLLBACK` instead of `conn.transaction()`. Current code is correct and tested (including rollback on nonexistent ID). *Deferred: style improvement.*
+
+## From review of #47 (Agent auto-migration) — 2026-03-12
+
+- **[gateway.rs] S3 Medium** — Migration hardcodes `name: "main"` without calling `validate_agent_name`. Safe today since "main" passes validation. If "main" is ever reserved, migration would insert an invalid name. *Deferred: add validation call if reserved list expands.*
+
+- **[gateway.rs] S4 Low** — TOCTOU race between `list_agents().is_empty()` and `create_agent()` — two concurrent callers could both see empty and attempt INSERT. Harmless in single-process daemon; `create_agent` fails on UNIQUE/PK constraint, caught by `warn!`. *Deferred: single-process only.*
+
+- **[gateway.rs] S4 Low** — `is_default: true` set via INSERT without going through `set_default_agent()`. Correct since table is empty (no existing defaults to clear). *Deferred: no action unless empty-table guard is relaxed.*
+
+- **[gateway.rs] Nit** — Missing `#[instrument]` on `migrate_sidecar_agent`. *Deferred: add next time file is touched.*
+
 ## From review of #48 (Agent HTTP API) — 2026-03-12
 
 - **[agents.rs] S2 Medium** — Migration comment in `gateway.rs` is misleading about why removing `set_default_agent()` is safe. The real reason is the `agents.is_empty()` early-return guard, not because `create_agent` handles default clearing. *Deferred: comment-only fix, low risk.*
 
-- **[agents.rs] S4 Low** — `update_agent` SQL overwrites `name` field from the existing record. Safe today since `UpdateAgentRequest` has no `name` field, but fragile if name is added later without validation. *Deferred: hypothetical future issue.*
+- ~~**[agents.rs] S4 Low** — `update_agent` SQL overwrites `name` field from the existing record.~~ **Fixed** in P10 review fixes commit.
 
-- **[sqlite.rs] S5 Medium** — `list_agents` silently drops rows with parse errors via `filter_map(|r| r.ok())`. Same pattern we fixed in sessions/jobs but not yet applied to agents. *Fix next time agents code is touched.*
+- ~~**[sqlite.rs] S5 Medium** — `list_agents` silently drops rows with parse errors.~~ **Fixed** in P10 review fixes commit.
 
 - **[settings.rs] S6 Medium** — `GET /settings` double-swallows errors when listing agents (`.ok()` + `.unwrap_or_default()`). Returns empty agents array even if DB is corrupted. *Deferred: settings is a convenience endpoint, not critical path.*
 
-- **[sqlite.rs] S9 Low** — `update_agent` doesn't check affected row count. If agent ID doesn't match, silently succeeds. Callers verify existence first, so no current bug. *Deferred: defense-in-depth improvement.*
+- ~~**[sqlite.rs] S9 Low** — `update_agent` doesn't check affected row count.~~ **Fixed** in P10 review fixes commit (now returns `AgentNotFound`).
 
 - **[agents.rs] S10 Low** — No integration tests for HTTP handlers. Only `resolve_agent` and store-layer unit tests exist. *Deferred: needs test infrastructure (TestClient setup).*
 
@@ -27,6 +47,18 @@ Bugs found during code reviews that were not fixed immediately. Tracked here so 
 ## From review of #51 (CLI session commands) — 2026-03-12
 
 All findings were fixed.
+
+## From review of #49 (Per-agent config overrides) — 2026-03-12
+
+- **[runs.rs] S3 Medium** — Legacy `run_agent` endpoint (`POST /agent/run`) bypasses per-agent config overrides entirely. It calls `execute_run` with `RunOverrides::default()`, which is correct, but the endpoint doesn't go through the same session/agent resolution as the canonical `/runs` path. Pre-existing issue, predates task #49. *Deferred: legacy endpoint — deprecate or remove.*
+
+- **[runs.rs] S3 Medium** — Zero test coverage for the three-layer config merging logic. Should extract into a pure function `merge_agent_config(base, agent_record, overrides)` and add unit tests. *Deferred: needs refactor to make testable.*
+
+- **[runs.rs] S4 Low** — `system_prompt` per-agent override is a full replacement, not an append. If agent has a system_prompt override, the server default system prompt is entirely replaced. This is by design but not documented. *Deferred: document behavior.*
+
+- **[runs.rs] S4 Low** — Per-agent `temperature` and `max_tokens` overrides are not supported — only per-run overrides exist. Adding them to `AgentRecord` would require schema migration. *Deferred: future enhancement.*
+
+- **[runs.rs] S4 Low** — Posture string parsing (`"guarded"` / `"full_control"`) is duplicated between `runs.rs` (lines 197-204, 223-234) and `agents.rs` (validate_posture). Should extract a shared `Posture::from_str` impl. *Deferred: cleanup task.*
 
 ## From review of #52 (CLI run/job commands) — 2026-03-12
 
@@ -133,3 +165,19 @@ Observations noted during reviews that are not bugs — correct by design, cosme
 - **S4 Nit** — Duplicate `!agent.is_default` guard for set-default and delete buttons. Could consolidate into single block. Style preference only.
 
 - **S4 Nit** — Missing `aria-label` on agent selector `<select>`. Has `title` attribute but not fully accessible. Accessibility improvement, no functional impact.
+
+## From review of #46 (Agent registry — data model)
+
+- **Convention** — 9 store tests + 8 validation tests. Coverage is adequate for CRUD operations and name validation.
+
+## From review of #47 (Agent auto-migration)
+
+- **None** — Migration is truly idempotent. Sidecar file reading handles missing/corrupt/permission cases. No race between migration and first API request (migration runs synchronously in `Gateway::new()` before HTTP listener starts). `store()` accessor returning `Option<&Arc<SqliteStore>>` is fine — callers don't clone the Arc.
+
+## From review of #49 (Per-agent config overrides)
+
+- **Info** — `touch_agent` is correctly placed after both success and failure paths in `execute_run`. Runs regardless of outcome.
+
+- **Info** — Concurrent `touch_agent` vs `update_agent` is safe — SQLite mutex serializes access, and both set `last_active` to "now" so timestamps are within milliseconds.
+
+- **Info** — `fire_job_run` and `stream_run_legacy` pass `RunOverrides::default()`, meaning no per-run overrides. Correct — jobs use agent config, legacy has no override fields.

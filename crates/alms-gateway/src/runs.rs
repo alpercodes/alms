@@ -155,10 +155,18 @@ async fn execute_run(
 
     // Look up per-agent config overrides from the agent registry.
     // Errors are absorbed — agent lookup failure should not block the run.
-    let agent_record = state
-        .session_manager
-        .store()
-        .and_then(|store| store.load_agent_by_id(agent_id).ok().flatten());
+    let agent_record = state.session_manager.store().and_then(|store| {
+        match store.load_agent_by_id(agent_id) {
+            Ok(record) => record,
+            Err(e) => {
+                warn!(
+                    "Failed to load agent record for {}, using server defaults: {}",
+                    agent_id, e
+                );
+                None
+            }
+        }
+    });
 
     // Build runtime — drop gateway lock before running to avoid blocking other requests
     let (agent_config, llm) = {

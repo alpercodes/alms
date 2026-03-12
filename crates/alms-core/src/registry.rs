@@ -53,6 +53,7 @@ pub struct UpdateAgentRequest {
 /// Validate an agent name slug.
 ///
 /// Rules: 1–64 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphens.
+/// Must not be a valid UUID (would collide with UUID-first resolve_agent lookup).
 pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
     if name.is_empty() || name.len() > 64 {
         return Err(AlmsError::InvalidConfig(format!(
@@ -84,6 +85,14 @@ pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
     if RESERVED_NAMES.contains(&name) {
         return Err(AlmsError::InvalidConfig(format!(
             "agent name '{name}' is reserved (conflicts with API routes)"
+        )));
+    }
+
+    // Reject names that parse as UUIDs — resolve_agent uses UUID-first lookup,
+    // so a UUID-shaped name would be unreachable by name.
+    if uuid::Uuid::parse_str(name).is_ok() {
+        return Err(AlmsError::InvalidConfig(format!(
+            "agent name '{name}' looks like a UUID (conflicts with ID-based lookup)"
         )));
     }
 
@@ -151,5 +160,16 @@ mod tests {
     fn test_max_length_ok() {
         let name = "a".repeat(64);
         assert!(validate_agent_name(&name).is_ok());
+    }
+
+    #[test]
+    fn test_uuid_shaped_name_rejected() {
+        let err =
+            validate_agent_name("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap_err();
+        assert!(err.to_string().contains("UUID"));
+        // Also test a v4-style UUID
+        let err =
+            validate_agent_name("550e8400-e29b-41d4-a716-446655440000").unwrap_err();
+        assert!(err.to_string().contains("UUID"));
     }
 }

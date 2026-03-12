@@ -640,25 +640,30 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Update an existing agent record (matched by id).
+    /// Update an existing agent's mutable config fields (matched by id).
+    ///
+    /// Does NOT update `name` or `is_default` — use `set_default_agent()` for
+    /// default changes, and name is immutable after creation.
     pub fn update_agent(&self, agent: &AgentRecord) -> AlmsResult<()> {
-        self.conn
+        let affected = self
+            .conn
             .lock()
             .execute(
-                "UPDATE agents SET name = ?1, description = ?2, model = ?3, system_prompt = ?4, \
-                 posture = ?5, is_default = ?6, last_active = ?7 WHERE id = ?8",
+                "UPDATE agents SET description = ?1, model = ?2, system_prompt = ?3, \
+                 posture = ?4, last_active = ?5 WHERE id = ?6",
                 params![
-                    &agent.name,
                     &agent.description,
                     agent.model.as_deref(),
                     agent.system_prompt.as_deref(),
                     agent.posture.as_deref(),
-                    agent.is_default as i32,
                     agent.last_active.to_rfc3339(),
                     agent.id.0.to_string(),
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite update_agent: {e}")))?;
+        if affected == 0 {
+            return Err(AlmsError::AgentNotFound(agent.id.0.to_string()));
+        }
         Ok(())
     }
 
@@ -725,7 +730,13 @@ impl SqliteStore {
         let rows = stmt
             .query_map([], parse_agent_row)
             .map_err(|e| AlmsError::Runtime(format!("SQLite query agents: {e}")))?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(agent) => Some(agent),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable agent row: {}", e);
+                    None
+                }
+            })
             .collect();
 
         Ok(rows)
