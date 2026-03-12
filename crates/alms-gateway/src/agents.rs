@@ -156,23 +156,19 @@ pub async fn create_agent(
         last_active: now,
     };
 
-    store.create_agent(&agent).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("UNIQUE") {
-            (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": { "code": "DUPLICATE_NAME", "message": format!("Agent name '{}' already exists", agent.name) }
-                })),
-            )
-        } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": { "code": "INTERNAL", "message": msg }
-                })),
-            )
-        }
+    store.create_agent(&agent).map_err(|e| match &e {
+        alms_core::AlmsError::DuplicateName(name) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "code": "DUPLICATE_NAME", "message": format!("Agent name '{name}' already exists") }
+            })),
+        ),
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": { "code": "INTERNAL", "message": e.to_string() }
+            })),
+        ),
     })?;
 
     if wants_default {

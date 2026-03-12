@@ -636,7 +636,14 @@ impl SqliteStore {
                     agent.last_active.to_rfc3339(),
                 ],
             )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite create_agent: {e}")))?;
+            .map_err(|e| match &e {
+                rusqlite::Error::SqliteFailure(err, _)
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    AlmsError::DuplicateName(agent.name.clone())
+                }
+                _ => AlmsError::Runtime(format!("SQLite create_agent: {e}")),
+            })?;
         Ok(())
     }
 

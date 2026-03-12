@@ -8,6 +8,9 @@ pub enum AlmsError {
     #[error("Agent not found: {0}")]
     AgentNotFound(String),
 
+    #[error("Duplicate agent name: {0}")]
+    DuplicateName(String),
+
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
 

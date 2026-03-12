@@ -40,7 +40,7 @@ Bugs found during code reviews that were not fixed immediately. Tracked here so 
 
 - **[agents.rs] S10 Low** — No integration tests for HTTP handlers. Only `resolve_agent` and store-layer unit tests exist. *Deferred: needs test infrastructure (TestClient setup).*
 
-- **[agents.rs] S11 Low** — Duplicate name detection relies on error string matching (`msg.contains("UNIQUE")`). Fragile across SQLite versions. Should match on `rusqlite::ErrorCode::ConstraintViolation`. *Deferred: works today, needs AlmsError refactor to expose rusqlite error codes.*
+- ~~**[agents.rs] S11 Low** — Duplicate name detection relies on error string matching (`msg.contains("UNIQUE")`).~~ **Fixed**: Added `AlmsError::DuplicateName` variant; `create_agent` matches on `rusqlite::ErrorCode::ConstraintViolation`; HTTP handler and CLI match on the typed error.
 
 - **[agents.rs] S12 Low** — Repetitive error-mapping boilerplate (~10 sites mapping to `(StatusCode, Json<Value>)`). Could extract `internal_error()`, `not_found()`, `conflict()` helpers. *Deferred: cleanup task.*
 

@@ -359,8 +359,7 @@ fn agent_create(
     };
 
     if let Err(e) = store.create_agent(&agent) {
-        let msg = e.to_string();
-        if msg.contains("UNIQUE") {
+        if matches!(&e, alms_core::AlmsError::DuplicateName(_)) {
             anyhow::bail!("Agent name '{}' already exists", agent.name);
         }
         return Err(e.into());
