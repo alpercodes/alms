@@ -98,6 +98,7 @@ mod tests {
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
+            _subagent_name: Option<String>,
         ) -> AlmsResult<String> {
             Ok("ok".to_string())
         }

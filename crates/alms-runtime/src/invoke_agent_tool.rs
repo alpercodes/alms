@@ -57,6 +57,14 @@ impl Tool for InvokeAgentTool {
                     "type": "string",
                     "description": "The task description for the subagent to complete."
                 },
+                "name": {
+                    "type": "string",
+                    "description": "Optional persistent name for this subagent (e.g. 'reviewer', \
+                                    'researcher'). When provided, the subagent retains conversation \
+                                    history across invocations — subsequent calls with the same name \
+                                    continue the same session. When omitted, the subagent is ephemeral \
+                                    (fresh session each call)."
+                },
                 "system_prompt": {
                     "type": "string",
                     "description": "Optional system prompt override for the subagent. \
@@ -80,6 +88,12 @@ impl Tool for InvokeAgentTool {
             .ok_or_else(|| SandboxError::InvalidParameters("'task' is required".to_string()))?
             .to_string();
 
+        let subagent_name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
         let system_prompt = params
             .get("system_prompt")
             .and_then(|v| v.as_str())
@@ -99,6 +113,7 @@ impl Tool for InvokeAgentTool {
                     self.parent_session_id,
                     self.parent_run_id,
                     self.parent_event_tx.clone(),
+                    subagent_name,
                 )
                 .await
                 .map_err(|e| SandboxError::Io(format!("Subagent error: {}", e)))?;
@@ -114,6 +129,7 @@ impl Tool for InvokeAgentTool {
                 self.parent_session_id,
                 self.parent_run_id,
                 self.parent_event_tx.clone(),
+                subagent_name,
             )
             .await
             .map_err(|e| SandboxError::Io(format!("Subagent error: {}", e)))?;
@@ -145,6 +161,7 @@ mod tests {
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
+            _subagent_name: Option<String>,
         ) -> AlmsResult<String> {
             Ok(self.0.clone())
         }
@@ -200,6 +217,7 @@ mod tests {
                 _parent_session_id: SessionId,
                 _parent_run_id: Option<RunId>,
                 _parent_event_tx: Option<RuntimeEventSender>,
+                _subagent_name: Option<String>,
             ) -> AlmsResult<String> {
                 Err(alms_core::AlmsError::Runtime("subagent failed".to_string()))
             }
@@ -235,6 +253,7 @@ mod tests {
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
+            _subagent_name: Option<String>,
         ) -> AlmsResult<String> {
             Ok("foreground".to_string())
         }
@@ -246,6 +265,7 @@ mod tests {
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
+            _subagent_name: Option<String>,
         ) -> AlmsResult<Uuid> {
             Ok(self.0)
         }
@@ -298,5 +318,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["response"], "default result");
+    }
+
+    // ── name parameter tests ────────────────────────────────────────────────
+
+    /// A dispatcher that captures the subagent_name it receives.
+    #[derive(Debug)]
+    struct NameCapturingDispatcher(std::sync::Mutex<Option<Option<String>>>);
+
+    #[async_trait]
+    impl SubagentDispatcher for NameCapturingDispatcher {
+        async fn dispatch(
+            &self,
+            _task: String,
+            _system_prompt: Option<String>,
+            _parent_session_id: SessionId,
+            _parent_run_id: Option<RunId>,
+            _parent_event_tx: Option<RuntimeEventSender>,
+            subagent_name: Option<String>,
+        ) -> AlmsResult<String> {
+            *self.0.lock().unwrap() = Some(subagent_name);
+            Ok("ok".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_name_passed_to_dispatcher() {
+        let dispatcher = Arc::new(NameCapturingDispatcher(std::sync::Mutex::new(None)));
+        let tool = InvokeAgentTool::new(dispatcher.clone(), SessionId::new(), None, None);
+        tool.execute(serde_json::json!({ "task": "x", "name": "reviewer" }))
+            .await
+            .unwrap();
+        let captured = dispatcher.0.lock().unwrap().take().unwrap();
+        assert_eq!(captured, Some("reviewer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_empty_name_treated_as_none() {
+        let dispatcher = Arc::new(NameCapturingDispatcher(std::sync::Mutex::new(None)));
+        let tool = InvokeAgentTool::new(dispatcher.clone(), SessionId::new(), None, None);
+        tool.execute(serde_json::json!({ "task": "x", "name": "" }))
+            .await
+            .unwrap();
+        let captured = dispatcher.0.lock().unwrap().take().unwrap();
+        assert_eq!(captured, None, "empty name should be treated as None (ephemeral)");
+    }
+
+    #[tokio::test]
+    async fn test_missing_name_is_none() {
+        let dispatcher = Arc::new(NameCapturingDispatcher(std::sync::Mutex::new(None)));
+        let tool = InvokeAgentTool::new(dispatcher.clone(), SessionId::new(), None, None);
+        tool.execute(serde_json::json!({ "task": "x" }))
+            .await
+            .unwrap();
+        let captured = dispatcher.0.lock().unwrap().take().unwrap();
+        assert_eq!(captured, None);
     }
 }

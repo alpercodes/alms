@@ -38,6 +38,7 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<RuntimeEventSender>,
+        subagent_name: Option<String>,
     ) -> AlmsResult<String>;
 
     /// Fire a subagent in the background and return its task ID immediately.
@@ -52,6 +53,7 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
         _parent_session_id: SessionId,
         _parent_run_id: Option<RunId>,
         _parent_event_tx: Option<RuntimeEventSender>,
+        _subagent_name: Option<String>,
     ) -> AlmsResult<Uuid> {
         Err(AlmsError::Runtime(
             "dispatch_background not supported by this dispatcher".to_string(),

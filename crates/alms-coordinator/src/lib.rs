@@ -97,6 +97,9 @@ pub struct SubagentRequest {
     pub parent_run_id: Option<RunId>,
     /// Optional system prompt override for the subagent.
     pub system_prompt: Option<String>,
+    /// Optional persistent name. When provided, the subagent reuses the same
+    /// session across invocations (conversation history preserved).
+    pub subagent_name: Option<String>,
 }
 
 /// Status of a subagent task
@@ -307,6 +310,7 @@ impl SubagentDispatcher for Coordinator {
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<RuntimeEventSender>,
+        subagent_name: Option<String>,
     ) -> AlmsResult<String> {
         let request = SubagentRequest {
             task,
@@ -316,6 +320,7 @@ impl SubagentDispatcher for Coordinator {
             parent_session: parent_session_id,
             parent_run_id,
             system_prompt,
+            subagent_name,
         };
 
         let task_id = self.spawn_subagent(request, parent_event_tx).await?;
@@ -363,6 +368,7 @@ impl SubagentDispatcher for Coordinator {
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<RuntimeEventSender>,
+        subagent_name: Option<String>,
     ) -> alms_core::AlmsResult<Uuid> {
         let request = SubagentRequest {
             task,
@@ -372,6 +378,7 @@ impl SubagentDispatcher for Coordinator {
             parent_session: parent_session_id,
             parent_run_id,
             system_prompt,
+            subagent_name,
         };
         let task_id = self.spawn_subagent(request, parent_event_tx).await?;
 
@@ -570,6 +577,15 @@ fn agent_config_for_type(
 ///
 /// Creates a fresh `AgentRuntime`, forwards its events to the parent's
 /// event channel (if provided), then calls `runtime.run()`.
+///
+/// When `subagent_name` is set on the request, the subagent derives a
+/// deterministic `(agent_id, context_id)` from the parent session +
+/// name. This means `SessionManager::get_or_create` returns the same
+/// session across invocations — conversation history is preserved.
+///
+/// Note: `system_prompt` is applied to `AgentConfig` each invocation
+/// (not stored in the session). Callers should pass a consistent
+/// system_prompt across invocations of the same named subagent.
 async fn run_agent_loop(
     task_id: TaskId,
     request: &SubagentRequest,
@@ -578,7 +594,18 @@ async fn run_agent_loop(
     parent_event_tx: Option<RuntimeEventSender>,
     base_agent_config: &AgentConfig,
 ) -> AlmsResult<RunOutput> {
-    let agent_id = AgentId::new();
+    // Derive identity: stable when named, ephemeral when unnamed
+    let (agent_id, context_id) = if let Some(ref name) = request.subagent_name {
+        // Deterministic: same (parent_session, name) → same session
+        let parent_as_agent = AgentId(request.parent_session.0);
+        let stable_id = AgentId::deterministic(parent_as_agent, name);
+        let stable_ctx = format!("subagent_{}_{}", request.parent_session.0, name);
+        (stable_id, stable_ctx)
+    } else {
+        // Ephemeral: fresh each invocation (original behavior)
+        (AgentId::new(), format!("subagent_{}", task_id.0))
+    };
+
     let config = agent_config_for_type(
         request.agent_type,
         request.system_prompt.clone(),
@@ -603,8 +630,6 @@ async fn run_agent_loop(
         drop(sub_rx);
     }
 
-    // Each subagent gets its own context so it doesn't share history with the parent
-    let context_id = format!("subagent_{}", task_id.0);
     runtime
         .run(session_manager, &context_id, &request.task)
         .await
@@ -636,7 +661,7 @@ mod tests {
     async fn test_dispatch_foreground_success() {
         let coord = test_coordinator();
         let result = coord
-            .dispatch("Say hello".to_string(), None, test_session_id(), None, None)
+            .dispatch("Say hello".to_string(), None, test_session_id(), None, None, None)
             .await;
 
         let response = result.expect("dispatch should succeed");
@@ -664,6 +689,7 @@ mod tests {
                 test_session_id(),
                 None,
                 None,
+                None,
             )
             .await;
 
@@ -683,6 +709,7 @@ mod tests {
                 "Background work".to_string(),
                 None,
                 test_session_id(),
+                None,
                 None,
                 None,
             )
@@ -733,6 +760,7 @@ mod tests {
             parent_session: session_id,
             parent_run_id: None,
             system_prompt: None,
+            subagent_name: None,
         };
         let task_id = coord.spawn_subagent(request, None).await.unwrap();
 
@@ -765,6 +793,7 @@ mod tests {
             parent_session: session_id,
             parent_run_id: None,
             system_prompt: None,
+            subagent_name: None,
         };
         let task_id = coord.spawn_subagent(request, None).await.unwrap();
         let result_rx = coord.take_result_rx(task_id).unwrap();
@@ -801,6 +830,7 @@ mod tests {
             parent_session: session_id,
             parent_run_id: None,
             system_prompt: None,
+            subagent_name: None,
         };
         let task_id = coord.spawn_subagent(request, None).await.unwrap();
 
@@ -835,6 +865,7 @@ mod tests {
             parent_session: session_id,
             parent_run_id: None,
             system_prompt: None,
+            subagent_name: None,
         };
         let task_id = coord.spawn_subagent(request, None).await.unwrap();
 
@@ -854,5 +885,92 @@ mod tests {
             coord.get_completed_result(TaskId::new()).is_none(),
             "Unknown task should return None"
         );
+    }
+
+    // -- (k) named subagent reuses session across invocations --------------------
+
+    #[tokio::test]
+    async fn test_named_subagent_persistent_session() {
+        let coord = test_coordinator();
+        let parent_session = test_session_id();
+
+        // First invocation with name "reviewer"
+        let r1 = coord
+            .dispatch(
+                "First task".to_string(),
+                None,
+                parent_session,
+                None,
+                None,
+                Some("reviewer".to_string()),
+            )
+            .await
+            .expect("first dispatch should succeed");
+        assert!(r1.contains("mock"), "Expected mock response: {r1}");
+
+        // Second invocation with same name — should reuse session (history preserved)
+        let r2 = coord
+            .dispatch(
+                "Follow up".to_string(),
+                None,
+                parent_session,
+                None,
+                None,
+                Some("reviewer".to_string()),
+            )
+            .await
+            .expect("second dispatch should succeed");
+        assert!(r2.contains("mock"), "Expected mock response: {r2}");
+
+        // Verify session was reused: the session manager should have exactly one
+        // session for the derived (agent_id, context_id) pair
+        let parent_as_agent = AgentId(parent_session.0);
+        let stable_id = AgentId::deterministic(parent_as_agent, "reviewer");
+        let stable_ctx = format!("subagent_{}_{}", parent_session.0, "reviewer");
+        let session = coord.session_manager.get_or_create(stable_id, &stable_ctx);
+
+        // Should have 4 messages: user1, assistant1, user2, assistant2
+        let messages = coord.session_manager.get_history(session.id).unwrap();
+        assert_eq!(
+            messages.len(),
+            4,
+            "Named subagent should have 4 messages (2 turns), got {}",
+            messages.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unnamed_subagent_ephemeral_session() {
+        let coord = test_coordinator();
+        let parent_session = test_session_id();
+
+        // Two invocations without name — each should get a fresh session
+        let _r1 = coord
+            .dispatch(
+                "Task one".to_string(),
+                None,
+                parent_session,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("first dispatch should succeed");
+
+        let _r2 = coord
+            .dispatch(
+                "Task two".to_string(),
+                None,
+                parent_session,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("second dispatch should succeed");
+
+        // Each ephemeral invocation creates its own session, so we can't
+        // look up a single session with all 4 messages. This test verifies
+        // that the calls succeed independently (no shared state).
     }
 }

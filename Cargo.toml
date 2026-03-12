@@ -69,7 +69,7 @@ chrono = { version = "0.4", features = ["serde"] }
 cron = "0.15"
 
 # UUID
-uuid = { version = "1.13", features = ["v4", "serde"] }
+uuid = { version = "1.13", features = ["v4", "v5", "serde"] }
 
 # Async traits
 async-trait = "0.1"
