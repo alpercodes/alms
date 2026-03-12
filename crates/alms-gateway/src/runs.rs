@@ -295,9 +295,14 @@ async fn execute_run(
             Some(run_id),
             Some(invoke_agent_tx),
         );
+        let read_session_tool = alms_runtime::ReadSubagentSessionTool::new(
+            state.session_manager.clone(),
+            session_id,
+        );
         runtime = runtime
             .with_invoke_agent(invoke_tool)
-            .with_get_task_result(get_task_tool);
+            .with_get_task_result(get_task_tool)
+            .with_read_subagent_session(read_session_tool);
     }
 
     // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals).

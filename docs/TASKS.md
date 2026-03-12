@@ -32,6 +32,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-12:** CLI run and job commands (#52): `alms run {create, list, show}` via HTTP API; `alms job {list, show}` via SQLite, `alms job {create, cancel}` via HTTP API. `--url` / `ALMS_GATEWAY_URL` for gateway address. Auth token forwarding. Schedule parsing ("once:"/"cron:"). `load_job_by_id()` + `load_all_jobs_unfiltered()`. 12 new tests (31 CLI total).
 - **2026-03-12:** CLI dashboard + polish (#53): `alms dashboard` opens web UI via `open` crate. `alms completions <shell>` generates shell completions via `clap_complete`. `alms health --json` for machine-readable output. `--json` flag now consistent across all commands. 2 new tests (33 CLI total).
 - **2026-03-12:** UI agent selector & management (#54): Agent selector dropdown in header, session sidebar (filtered by active agent), agent management section in settings modal (create/delete/set-default with bootstrap status badges), agents loaded from server API instead of localStorage.
+- **2026-03-12:** Named subagent sessions (#69): `invoke_agent` gains `name` param for persistent subagent sessions. UUID v5 deterministic identity from parent session + name. 8 new tests.
+- **2026-03-12:** Autonomous subagents design doc written (`docs/autonomous-subagents-design.md`). Tasks #70–#74 formulated covering: subagent workspaces, recursive spawning, auto-inject completion, progress reporting, SSE events.
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 
 ---
@@ -321,6 +323,13 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ## P7 — Multi-agent (Coordinator)
 
+69) Named subagent sessions (persistent invoke_agent) ✅
+- `invoke_agent` gains optional `name` parameter. When provided, subagent derives deterministic `(agent_id, context_id)` from parent session + name using UUID v5 (`AgentId::deterministic()`). `SessionManager::get_or_create` returns the same session across invocations — conversation history preserved.
+- Empty name treated as None (ephemeral). `ALMS_NAMESPACE` constant for UUID v5 derivation.
+- `SubagentDispatcher` trait gains `subagent_name: Option<String>` parameter on `dispatch` and `dispatch_background`.
+- 8 new tests: deterministic ID properties, persistent session message count, ephemeral independence, name parameter threading.
+- **Owners:** Atlas
+
 29) Coordinator — wire execute_task to real AgentRuntime ✅
 - Real `AgentRuntime::run()` call in `run_agent_loop()`; subagent gets own AgentId, session context, system prompt.
 - Coordinator wired into AppState as `Arc<Coordinator>`; `execute_run()` registers both invoke_agent and get_task_result tools.
@@ -551,6 +560,61 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ---
 
+## P13 — Autonomous Subagents
+
+> Design doc: `docs/autonomous-subagents-design.md`
+> Goal: subagents that behave like autonomous colleagues — own workspace, recursive spawning, event-driven completion notification, progress reporting.
+> Logical implementation order: 70 → 71 → 72 → 73 → 74.
+
+70) Subagent workspaces — persistent identity files for named subagents
+- Named subagents get workspace dir derived from parent: `{parent_workspace}/subagents/{name}/`
+- Wire `AgentWorkspace` into `run_agent_loop` when `subagent_name` is set.
+- `needs_bootstrap()` triggers on first invocation — agent writes own personality.md.
+- Ephemeral (unnamed) subagents do NOT get workspaces.
+- **Owners:** Atlas
+
+71) Recursive subagent spawning — subagents can spawn sub-subagents
+- Wire `invoke_agent` and `get_task_result` tools into subagent runtimes in `run_agent_loop`.
+- Add `max_depth: u32` to `SubagentRequest` (default 3). Decrement on spawn, reject at 0.
+- Requires `Arc<Coordinator>` threaded into `run_subagent`.
+- **Owners:** Atlas
+
+72) Auto-inject completed background results
+- At top of each `agent_loop` iteration, check `Coordinator` for pending completed background tasks.
+- Inject results as system messages before the LLM call — parent learns of completion without polling.
+- `get_task_result` tool remains as explicit fallback.
+- **Owners:** Atlas
+
+73) `report_progress` tool for intermediate status updates
+- Named subagents can call `report_progress(status, progress_pct?)` during their loop.
+- Progress stored on `SubagentHandle`. Retrievable via `poll_task` or auto-injected into parent context.
+- Emit `RuntimeEvent::SubagentProgress` for UI display.
+- **Owners:** Atlas
+
+74) SubagentProgress SSE event type
+- New SSE event type forwarded from subagent → parent run stream → UI.
+- UI shows inline subagent status (e.g., "reviewer: analyzing file 3/7").
+- **Owners:** Atlas
+
+81) `read_subagent_session` tool — on-demand subagent context retrieval
+- New tool: `read_subagent_session(name, last_n?, summary_only?)`.
+- Derives deterministic session ID (same UUID v5 logic as `invoke_agent`), reads from `SessionManager`.
+- Returns messages + optional rolling summary. No LLM call — just a session read.
+- Lets parent selectively pull in subagent context instead of carrying it all in its own context window.
+- **Owners:** Atlas
+
+82) Truncate `invoke_agent` tool_results in parent session
+- When `invoke_agent` returns, store a short summary in the parent's tool_result (not the full subagent response).
+- Full response stays in the subagent's own session, accessible via `read_subagent_session`.
+- Short responses (< 500 tokens) pass through unsummarized.
+- **Owners:** Atlas
+
+83) System prompt addition for subagent context model
+- When subagent tools are registered, add instructions to parent's system prompt explaining the context model: invoke_agent returns summaries, read_subagent_session for full details.
+- **Owners:** Atlas
+
+---
+
 ## Docs index
 Start here:
 - `docs/index.md`
@@ -572,6 +636,7 @@ UX requirements:
 
 Design:
 - `docs/persistent-agents-cli-design.md`
+- `docs/autonomous-subagents-design.md`
 
 Execution plan:
 - `docs/mvp-plan.md`

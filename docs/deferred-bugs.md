@@ -94,6 +94,16 @@ All critical and medium bugs from that review were fixed in commit 437de9b. Rema
 
 - **Guarded posture + parallel tool calls** — All approval requests fire simultaneously via `join_all` rather than sequentially. UX issue when LLM issues multiple tool calls.
 
+## From review of named subagent sessions (persistent invoke_agent) — 2026-03-12
+
+- **[lib.rs] S2 Medium** — Race condition with concurrent named subagent invocations. If the same named subagent is invoked twice in parallel (e.g., via `join_all` tool calls), both derive the same `(agent_id, context_id)` and write to the same session concurrently. Could corrupt session history. *Deferred: would require a `DashSet<String>` of active named subagents or documenting as unsupported. No user-facing scenario triggers this today.*
+
+- **[lib.rs] S3 Low** — Silent `system_prompt` drift on named subagents. When a named subagent is re-invoked with a different `system_prompt` than last time, there is no warning. The system prompt is config (applied each invocation), not session state, so the old prompt is silently replaced. *Deferred: add a `warn!` log when prompt changes for an existing named subagent.*
+
+- **[lib.rs] S4 Low** — `ALMS_NAMESPACE` UUID constant has no stability comment. If this value is ever changed, all existing deterministic subagent IDs break. *Deferred: doc comment only.*
+
+- **[invoke_agent_tool.rs] N3 Low** — `name` field in `invoke_agent` is unsanitized LLM input that goes directly into context_id strings (`subagent_{parent}_{name}`). Should validate against `validate_agent_name()` rules or at least trim/normalize to prevent edge cases with special characters. *Deferred: no security impact (context_id is an internal key), cosmetic.*
+
 ## From review of #54 (UI agent selector & management) — 2026-03-12
 
 - **[index.html] S2 Medium** — Session filtering uses client-side `===` comparison between `s.agent_id` (serde-serialized) and `S.activeAgentId` (from settings endpoint). Works today, but fragile if UUID serialization format changes. Should add `?agent_id=` query param to `GET /sessions` for server-side filtering. *Deferred: works correctly today, needs server-side change.*

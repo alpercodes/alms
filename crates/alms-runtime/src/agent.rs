@@ -2,6 +2,7 @@ use crate::context::{ContextBuilder, content_to_string};
 use crate::events::{RuntimeEvent, RuntimeEventSender};
 use crate::get_task_result_tool::GetTaskResultTool;
 use crate::invoke_agent_tool::InvokeAgentTool;
+use crate::read_subagent_session_tool::ReadSubagentSessionTool;
 use crate::llm_client::LlmClient;
 use crate::llm_types::*;
 use crate::tools::ToolRegistry;
@@ -142,6 +143,12 @@ impl AgentRuntime {
 
     /// Register the `get_task_result` tool for polling background subagents.
     pub fn with_get_task_result(self, tool: GetTaskResultTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
+    /// Register the `read_subagent_session` tool for on-demand subagent context retrieval.
+    pub fn with_read_subagent_session(self, tool: ReadSubagentSessionTool) -> Self {
         self.tools.register(std::sync::Arc::new(tool));
         self
     }
