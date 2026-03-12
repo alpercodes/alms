@@ -1,5 +1,5 @@
-use alms_core::{AgentId, AgentRecord, validate_agent_name};
-use alms_session::SqliteStore;
+use alms_core::{AgentId, AgentRecord, SessionId, validate_agent_name};
+use alms_session::{Session, SessionStatus, SqliteStore};
 use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
 
@@ -30,7 +30,13 @@ enum Commands {
         url: String,
     },
     /// Manage sessions
-    Sessions,
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCommands,
+        /// Output as JSON instead of human-readable text
+        #[arg(long, global = true)]
+        json: bool,
+    },
     /// Manage agents
     Agent {
         #[command(subcommand)]
@@ -99,6 +105,26 @@ enum AgentCommands {
         /// Description
         #[arg(long)]
         description: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionCommands {
+    /// List sessions (optionally filtered by agent)
+    List {
+        /// Filter by agent name or UUID
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Show details of a specific session
+    Show {
+        /// Session UUID
+        session_id: String,
+    },
+    /// Delete a session and all its messages
+    Delete {
+        /// Session UUID
+        session_id: String,
     },
 }
 
@@ -331,6 +357,121 @@ fn agent_config(
 }
 
 // ---------------------------------------------------------------------------
+// Session command handlers
+// ---------------------------------------------------------------------------
+
+fn session_list(store: &SqliteStore, agent: Option<String>, json: bool) -> anyhow::Result<()> {
+    let sessions: Vec<Session> = if let Some(ref name_or_id) = agent {
+        let agent = resolve_agent(store, name_or_id)?;
+        store.load_sessions_by_agent(agent.id)?
+    } else {
+        store.list_sessions()?
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
+    if sessions.is_empty() {
+        if let Some(ref a) = agent {
+            println!("No sessions found for agent '{a}'.");
+        } else {
+            println!("No sessions found.");
+        }
+        return Ok(());
+    }
+
+    println!(
+        "{:<12} {:<12} {:<10} {:<8} {:<22} LAST ACTIVITY",
+        "SESSION", "AGENT", "STATUS", "MSGS", "CREATED"
+    );
+    for s in &sessions {
+        let id_str = s.id.0.to_string();
+        let id_short = &id_str[..8];
+        let agent_short = &s.agent_id.to_string()[..8];
+        let status = match s.status {
+            SessionStatus::Active => "active",
+            SessionStatus::Idle => "idle",
+            SessionStatus::Archived => "archived",
+        };
+        let msg_count = store.message_count(s.id).unwrap_or(0);
+        println!(
+            "{:<12} {:<12} {:<10} {:<8} {:<22} {}",
+            id_short,
+            agent_short,
+            status,
+            msg_count,
+            fmt_time(&s.created_at.0),
+            fmt_time(&s.last_activity.0),
+        );
+    }
+    Ok(())
+}
+
+fn session_show(store: &SqliteStore, session_id_str: &str, json: bool) -> anyhow::Result<()> {
+    let uuid =
+        uuid::Uuid::parse_str(session_id_str).map_err(|_| anyhow::anyhow!("Invalid UUID"))?;
+    let sid = SessionId(uuid);
+    let session = store
+        .load_session_by_id(sid)?
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id_str}"))?;
+
+    let msg_count = store.message_count(sid).unwrap_or(0);
+
+    if json {
+        let mut val = serde_json::to_value(&session)?;
+        val.as_object_mut()
+            .unwrap()
+            .insert("message_count".into(), serde_json::json!(msg_count));
+        println!("{}", serde_json::to_string_pretty(&val)?);
+        return Ok(());
+    }
+
+    let status = match session.status {
+        SessionStatus::Active => "active",
+        SessionStatus::Idle => "idle",
+        SessionStatus::Archived => "archived",
+    };
+
+    println!("Session:       {}", session.id.0);
+    println!("Agent:         {}", session.agent_id);
+    println!("Context:       {}", session.context_id);
+    println!("Status:        {}", status);
+    println!("Messages:      {}", msg_count);
+    println!("Created:       {}", fmt_time(&session.created_at.0));
+    println!("Last Activity: {}", fmt_time(&session.last_activity.0));
+
+    // Try to resolve agent name for a friendlier display
+    if let Ok(Some(agent)) = store.load_agent_by_id(session.agent_id) {
+        println!("Agent Name:    {}", agent.name);
+    }
+    Ok(())
+}
+
+fn session_delete(store: &SqliteStore, session_id_str: &str, json: bool) -> anyhow::Result<()> {
+    let uuid =
+        uuid::Uuid::parse_str(session_id_str).map_err(|_| anyhow::anyhow!("Invalid UUID"))?;
+    let sid = SessionId(uuid);
+
+    // Verify session exists before deleting
+    store
+        .load_session_by_id(sid)?
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {session_id_str}"))?;
+
+    store.delete_session(sid)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": true, "deleted": session_id_str })
+        );
+    } else {
+        println!("Deleted session {session_id_str}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -391,8 +532,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Sessions => {
-            println!("Session management not yet implemented");
+        Commands::Session { cmd, json } => {
+            let store = open_db()?;
+            match cmd {
+                SessionCommands::List { agent } => session_list(&store, agent, json)?,
+                SessionCommands::Show { session_id } => {
+                    session_show(&store, &session_id, json)?;
+                }
+                SessionCommands::Delete { session_id } => {
+                    session_delete(&store, &session_id, json)?;
+                }
+            }
         }
         Commands::Agent { cmd, json } => {
             let store = open_db()?;
@@ -647,5 +797,85 @@ mod tests {
         assert!(updated.model.is_none());
         // Posture untouched
         assert_eq!(updated.posture.as_deref(), Some("guarded"));
+    }
+
+    // ── Session tests ────────────────────────────────────────────────────
+
+    fn make_session(store: &SqliteStore, agent_id: AgentId) -> Session {
+        let session = Session::new(agent_id, "default");
+        store.save_session(&session).unwrap();
+        session
+    }
+
+    #[test]
+    fn test_session_list_empty() {
+        let store = new_store();
+        session_list(&store, None, false).unwrap();
+    }
+
+    #[test]
+    fn test_session_list_all() {
+        let store = new_store();
+        let agent = make_agent(&store, "sess-agent");
+        make_session(&store, agent.id);
+        make_session(&store, agent.id);
+
+        let sessions = store.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_session_list_by_agent() {
+        let store = new_store();
+        let a1 = make_agent(&store, "agent-a");
+        let a2 = make_agent(&store, "agent-b");
+        make_session(&store, a1.id);
+        make_session(&store, a1.id);
+        make_session(&store, a2.id);
+
+        let s1 = store.load_sessions_by_agent(a1.id).unwrap();
+        assert_eq!(s1.len(), 2);
+        let s2 = store.load_sessions_by_agent(a2.id).unwrap();
+        assert_eq!(s2.len(), 1);
+    }
+
+    #[test]
+    fn test_session_show() {
+        let store = new_store();
+        let agent = make_agent(&store, "show-agent");
+        let session = make_session(&store, agent.id);
+
+        session_show(&store, &session.id.0.to_string(), false).unwrap();
+    }
+
+    #[test]
+    fn test_session_show_not_found() {
+        let store = new_store();
+        let err = session_show(&store, &uuid::Uuid::new_v4().to_string(), false).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_session_show_invalid_uuid() {
+        let store = new_store();
+        let err = session_show(&store, "not-a-uuid", false).unwrap_err();
+        assert!(err.to_string().contains("Invalid UUID"));
+    }
+
+    #[test]
+    fn test_session_delete() {
+        let store = new_store();
+        let agent = make_agent(&store, "del-agent");
+        let session = make_session(&store, agent.id);
+
+        session_delete(&store, &session.id.0.to_string(), false).unwrap();
+        assert!(store.load_session_by_id(session.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_session_delete_not_found() {
+        let store = new_store();
+        let err = session_delete(&store, &uuid::Uuid::new_v4().to_string(), false).unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 }

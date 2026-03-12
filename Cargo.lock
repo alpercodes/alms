@@ -59,13 +59,16 @@ version = "0.1.0"
 dependencies = [
  "alms-core",
  "alms-gateway",
+ "alms-session",
  "anyhow",
+ "chrono",
  "clap",
  "reqwest",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -28,6 +28,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-12:** CLI agent commands (#50): `alms agent {list, create, show, delete, set-default, config}`. Direct SQLite access, `--json` flag, name validation, delete guards. 11 tests.
 - **2026-03-12:** Per-agent config overrides (#49): `execute_run()` merges per-agent model/system_prompt/posture from AgentRecord. Three-layer precedence: per-run > per-agent > server default. `touch_agent()` updates `last_active` after every run.
 - **2026-03-12:** Agent HTTP API (#48): `/agents` CRUD endpoints (list, create, get, update, delete, set-default). `UpdateAgentRequest` type. `GET /settings` includes agents array. Path params accept UUID or name slug. 6 handler tests.
+- **2026-03-12:** CLI session commands (#51): `alms session {list, show, delete}`. `list --agent NAME` filters by agent. `show` displays session details + message count + agent name. Direct SQLite access. `list_sessions()` + `load_session_by_id()` + `load_sessions_by_agent()` + `message_count()` on SqliteStore. 8 CLI tests + 4 store tests.
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 
 ---
@@ -421,10 +422,14 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - 11 unit tests covering resolve, CRUD roundtrip, duplicate/invalid name, set-default, delete guards, config update/clear.
 - **Owners:** Atlas
 
-51) CLI — session management commands
-- `Session { #[command(subcommand)] cmd: SessionCommands }`: `List`, `Show`, `Delete`.
-- `list --agent NAME` filters by agent.
-- Direct SQLite access (no gateway needed).
+51) CLI — session management commands ✅
+- `alms session {list, show, delete}` — 3 subcommands via clap.
+- `list --agent NAME` filters by agent (resolves by UUID or name slug).
+- `show` displays session details (ID, agent, context, status, message count, timestamps) + agent name lookup.
+- `delete` verifies session exists before deleting, cascades to messages/audit/summaries.
+- Direct SQLite access (no gateway needed). `--json` flag for machine-readable output.
+- New SqliteStore methods: `list_sessions()`, `load_session_by_id()`, `load_sessions_by_agent()`, `message_count()`.
+- 8 CLI tests + 4 store tests (19 CLI total, 35 session total).
 - **Owners:** Atlas
 
 52) CLI — run and job commands

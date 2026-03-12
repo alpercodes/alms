@@ -233,6 +233,151 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Load a single session by its UUID.
+    pub fn load_session_by_id(&self, id: SessionId) -> AlmsResult<Option<Session>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT id, agent_id, context_id, created_at, last_activity, status \
+             FROM sessions WHERE id = ?1",
+            params![id.0.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        );
+        match result {
+            Ok((id_str, agent_id, context_id, created_at, last_activity, status)) => {
+                let id_uuid = uuid::Uuid::parse_str(&id_str)
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse session id: {e}")))?;
+                let agent_uuid = uuid::Uuid::parse_str(&agent_id)
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse agent id: {e}")))?;
+                let created = chrono::DateTime::parse_from_rfc3339(&created_at)
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse created_at: {e}")))?;
+                let last = chrono::DateTime::parse_from_rfc3339(&last_activity)
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite parse last_activity: {e}")))?;
+                Ok(Some(Session {
+                    id: SessionId(id_uuid),
+                    agent_id: AgentId(agent_uuid),
+                    context_id,
+                    created_at: Timestamp(created.with_timezone(&chrono::Utc)),
+                    last_activity: Timestamp(last.with_timezone(&chrono::Utc)),
+                    status: str_to_status(&status),
+                }))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AlmsError::Runtime(format!(
+                "SQLite load_session_by_id: {e}"
+            ))),
+        }
+    }
+
+    /// Load sessions for a specific agent, most recent first.
+    pub fn load_sessions_by_agent(&self, agent_id: AgentId) -> AlmsResult<Vec<Session>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, context_id, created_at, last_activity, status \
+                 FROM sessions WHERE agent_id = ?1 ORDER BY last_activity DESC",
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare sessions_by_agent: {e}")))?;
+
+        let rows = stmt
+            .query_map([agent_id.0.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query sessions_by_agent: {e}")))?
+            .filter_map(|r| r.ok())
+            .filter_map(
+                |(id, agent_id, context_id, created_at, last_activity, status)| {
+                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
+                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
+                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
+                    let last = chrono::DateTime::parse_from_rfc3339(&last_activity).ok()?;
+                    Some(Session {
+                        id: SessionId(id_uuid),
+                        agent_id: AgentId(agent_uuid),
+                        context_id,
+                        created_at: Timestamp(created.with_timezone(&chrono::Utc)),
+                        last_activity: Timestamp(last.with_timezone(&chrono::Utc)),
+                        status: str_to_status(&status),
+                    })
+                },
+            )
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// List all sessions, ordered by last activity (newest first).
+    pub fn list_sessions(&self) -> AlmsResult<Vec<Session>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, agent_id, context_id, created_at, last_activity, status \
+                 FROM sessions ORDER BY last_activity DESC",
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare list_sessions: {e}")))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query list_sessions: {e}")))?
+            .filter_map(|r| r.ok())
+            .filter_map(
+                |(id, agent_id, context_id, created_at, last_activity, status)| {
+                    let id_uuid = uuid::Uuid::parse_str(&id).ok()?;
+                    let agent_uuid = uuid::Uuid::parse_str(&agent_id).ok()?;
+                    let created = chrono::DateTime::parse_from_rfc3339(&created_at).ok()?;
+                    let last = chrono::DateTime::parse_from_rfc3339(&last_activity).ok()?;
+                    Some(Session {
+                        id: SessionId(id_uuid),
+                        agent_id: AgentId(agent_uuid),
+                        context_id,
+                        created_at: Timestamp(created.with_timezone(&chrono::Utc)),
+                        last_activity: Timestamp(last.with_timezone(&chrono::Utc)),
+                        status: str_to_status(&status),
+                    })
+                },
+            )
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Count messages in a session without loading them.
+    pub fn message_count(&self, session_id: SessionId) -> AlmsResult<usize> {
+        let conn = self.conn.lock();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params![session_id.0.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite message_count: {e}")))?;
+        Ok(count as usize)
+    }
+
     // ── Messages ─────────────────────────────────────────────────────────────
 
     /// Upsert a single message row.
@@ -1137,5 +1282,63 @@ mod tests {
         // The existing agent should still be default (rollback undid the clear)
         let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
         assert!(loaded.is_default);
+    }
+
+    // ── Session query tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_load_session_by_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        let loaded = store.load_session_by_id(session.id).unwrap().unwrap();
+        assert_eq!(loaded.id, session.id);
+        assert_eq!(loaded.context_id, "test-ctx");
+    }
+
+    #[test]
+    fn test_load_session_by_id_not_found() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        assert!(
+            store
+                .load_session_by_id(SessionId::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_load_sessions_by_agent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent1 = AgentId::new();
+        let agent2 = AgentId::new();
+
+        let s1 = Session::new(agent1, "ctx-a");
+        let s2 = Session::new(agent1, "ctx-b");
+        let s3 = Session::new(agent2, "ctx-c");
+        store.save_session(&s1).unwrap();
+        store.save_session(&s2).unwrap();
+        store.save_session(&s3).unwrap();
+
+        let agent1_sessions = store.load_sessions_by_agent(agent1).unwrap();
+        assert_eq!(agent1_sessions.len(), 2);
+
+        let agent2_sessions = store.load_sessions_by_agent(agent2).unwrap();
+        assert_eq!(agent2_sessions.len(), 1);
+        assert_eq!(agent2_sessions[0].context_id, "ctx-c");
+    }
+
+    #[test]
+    fn test_message_count() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        assert_eq!(store.message_count(session.id).unwrap(), 0);
+
+        store.save_message(session.id, &new_message("one")).unwrap();
+        store.save_message(session.id, &new_message("two")).unwrap();
+        assert_eq!(store.message_count(session.id).unwrap(), 2);
     }
 }
