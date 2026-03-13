@@ -159,18 +159,13 @@ pub async fn create_run(
     state.run_manager.insert_run(run.clone());
 
     let state_clone = state.clone();
-    tokio::spawn(async move {
-        execute_run(
-            state_clone,
-            run_id,
-            session_id,
-            agent_id,
-            run.input,
-            overrides,
-            context_id,
-        )
-        .await;
-    });
+    state.session_queue.enqueue(
+        session_id,
+        Box::pin(async move {
+            execute_run(state_clone, run_id, session_id, agent_id, run.input, overrides, context_id)
+                .await;
+        }),
+    );
 
     let response = CreateRunResponse {
         run_id,
@@ -385,12 +380,27 @@ async fn execute_run(
 /// block the fire loop from processing subsequent firings.
 pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, state: AppState) {
     while let Some(job_id) = rx.recv().await {
+        // Resolve session for queue keying so jobs on the same session
+        // don't race with each other or with interactive runs.
+        let Some(job) = state.job_store.get(job_id) else {
+            continue;
+        };
+        if job.status == JobStatus::Cancelled {
+            continue;
+        }
+        let context_id = format!("job_{}", job_id.0);
+        let session = state
+            .session_manager
+            .get_or_create(job.agent_id, &context_id);
         let state_clone = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = fire_job_run(state_clone, job_id).await {
-                error!("Job {} run dispatch failed: {}", job_id, e);
-            }
-        });
+        state.session_queue.enqueue(
+            session.id,
+            Box::pin(async move {
+                if let Err(e) = fire_job_run(state_clone, job_id).await {
+                    error!("Job {} run dispatch failed: {}", job_id, e);
+                }
+            }),
+        );
     }
 }
 

@@ -29,6 +29,7 @@ pub mod gateway;
 pub mod jobs;
 pub mod runs;
 pub mod server;
+pub mod session_queue;
 pub mod settings;
 pub mod sse;
 pub mod tasks;
