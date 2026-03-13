@@ -162,8 +162,16 @@ pub async fn create_run(
     state.session_queue.enqueue(
         session_id,
         Box::pin(async move {
-            execute_run(state_clone, run_id, session_id, agent_id, run.input, overrides, context_id)
-                .await;
+            execute_run(
+                state_clone,
+                run_id,
+                session_id,
+                agent_id,
+                run.input,
+                overrides,
+                context_id,
+            )
+            .await;
         }),
     );
 
