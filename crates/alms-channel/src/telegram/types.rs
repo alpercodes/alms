@@ -151,3 +151,89 @@ impl GetUpdatesRequest {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Builder tests --
+
+    #[test]
+    fn send_message_request_new() {
+        let req = SendMessageRequest::new(123, "hello");
+        assert_eq!(req.chat_id, 123);
+        assert_eq!(req.text, "hello");
+        assert!(req.reply_to_message_id.is_none());
+        assert!(req.parse_mode.is_none());
+        assert!(req.disable_web_page_preview.is_none());
+    }
+
+    #[test]
+    fn send_message_request_reply_to() {
+        let req = SendMessageRequest::new(1, "hi").reply_to(456);
+        assert_eq!(req.reply_to_message_id, Some(456));
+    }
+
+    #[test]
+    fn send_message_request_parse_mode() {
+        let req = SendMessageRequest::new(1, "hi").parse_mode("HTML");
+        assert_eq!(req.parse_mode.as_deref(), Some("HTML"));
+    }
+
+    #[test]
+    fn get_updates_defaults() {
+        let req = GetUpdatesRequest::new();
+        assert!(req.offset.is_none());
+        assert_eq!(req.limit, Some(100));
+        assert_eq!(req.timeout, Some(30));
+    }
+
+    #[test]
+    fn get_updates_offset() {
+        let req = GetUpdatesRequest::new().offset(42);
+        assert_eq!(req.offset, Some(42));
+    }
+
+    // -- Serde tests --
+
+    #[test]
+    fn deserialize_update_with_message() {
+        let json = r#"{
+            "update_id": 100,
+            "message": {
+                "message_id": 1,
+                "date": 1700000000,
+                "chat": {"id": 55, "type": "private"},
+                "text": "hello",
+                "from": {"id": 10, "is_bot": false, "first_name": "Test"}
+            }
+        }"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        assert_eq!(update.update_id, 100);
+        assert!(update.message.is_some());
+        let msg = update.message.unwrap();
+        assert_eq!(msg.message_id, 1);
+        assert_eq!(msg.text.as_deref(), Some("hello"));
+        assert_eq!(msg.chat.id, 55);
+        assert_eq!(msg.chat.chat_type, "private");
+    }
+
+    #[test]
+    fn deserialize_update_minimal() {
+        let json = r#"{"update_id": 1}"#;
+        let update: Update = serde_json::from_str(json).unwrap();
+        assert_eq!(update.update_id, 1);
+        assert!(update.message.is_none());
+        assert!(update.edited_message.is_none());
+        assert!(update.callback_query.is_none());
+    }
+
+    #[test]
+    fn deserialize_telegram_response() {
+        let json = r#"{"ok": true, "result": true}"#;
+        let resp: TelegramResponse<bool> = serde_json::from_str(json).unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.result, Some(true));
+        assert!(resp.description.is_none());
+    }
+}

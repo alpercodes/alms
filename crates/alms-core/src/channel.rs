@@ -195,3 +195,68 @@ pub trait Channel: Send + Sync {
 
 /// A boxed channel for dynamic dispatch
 pub type BoxedChannel = Box<dyn Channel>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple_command() {
+        let cmd = Command::parse("/start").unwrap();
+        assert_eq!(cmd.name, "start");
+        assert!(cmd.args.is_empty());
+    }
+
+    #[test]
+    fn parse_command_with_args() {
+        let cmd = Command::parse("/run a b").unwrap();
+        assert_eq!(cmd.name, "run");
+        assert_eq!(cmd.args, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_non_command() {
+        assert!(Command::parse("hello").is_none());
+    }
+
+    #[test]
+    fn parse_empty() {
+        assert!(Command::parse("").is_none());
+    }
+
+    #[test]
+    fn parse_slash_only() {
+        // "/" splits into one part "/", strip_prefix yields ""
+        let cmd = Command::parse("/").unwrap();
+        assert_eq!(cmd.name, "");
+    }
+
+    #[test]
+    fn parse_command_full_text() {
+        let cmd = Command::parse("/deploy prod --force").unwrap();
+        assert_eq!(cmd.full_text, "/deploy prod --force");
+    }
+
+    #[test]
+    fn parse_command_extra_spaces() {
+        let cmd = Command::parse("  /start  arg1  ").unwrap();
+        assert_eq!(cmd.name, "start");
+        assert_eq!(cmd.args, vec!["arg1"]);
+        assert_eq!(cmd.full_text, "/start  arg1");
+    }
+
+    #[test]
+    fn incoming_parse_command_sets_field() {
+        let mut msg = IncomingMessage::new(ChatId(1), UserId(2), "/start");
+        msg.parse_command();
+        assert!(msg.command.is_some());
+        assert_eq!(msg.command.unwrap().name, "start");
+    }
+
+    #[test]
+    fn incoming_parse_no_command() {
+        let mut msg = IncomingMessage::new(ChatId(1), UserId(2), "hello");
+        msg.parse_command();
+        assert!(msg.command.is_none());
+    }
+}
