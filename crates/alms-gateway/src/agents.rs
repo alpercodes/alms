@@ -180,6 +180,7 @@ pub async fn create_agent(
                 })),
             )
         })?;
+        *state.default_agent_id.write().unwrap() = agent.id;
         agent.is_default = true;
     }
 
