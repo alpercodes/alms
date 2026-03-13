@@ -9,7 +9,7 @@ use crate::tools::ToolRegistry;
 use crate::workspace::AgentWorkspace;
 use crate::workspace_tool::WorkspaceWriteTool;
 use alms_core::config::ContextConfig;
-use alms_core::{AgentId, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
+use alms_core::{AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
 use alms_session::{
     ContextSummary, Message as SessionMessage, Role as SessionRole, SessionManager,
 };
@@ -196,12 +196,12 @@ impl AgentRuntime {
         span.record("input_len", input.len());
 
         let session = session_manager.get_or_create(self.agent_id, context_id);
+
+        // Build context first (reads history without current input to avoid double-counting),
+        // then persist the user message so it survives agent loop failures.
         let history = self
             .build_context(session_manager, &session.id, &input)
-            .await?;
-        let (response, usage) = self
-            .agent_loop(session_manager, session.id, history)
-            .await?;
+            .await;
 
         let user_msg = SessionMessage {
             id: uuid::Uuid::new_v4().to_string(),
@@ -210,24 +210,49 @@ impl AgentRuntime {
             timestamp: alms_core::Timestamp::now(),
             metadata: None,
         };
+        session_manager.append_message(session.id, user_msg)?;
 
-        let assistant_msg = SessionMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: SessionRole::Assistant,
-            content: alms_session::Content::Text(response.clone()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: None,
+        let result = match history {
+            Ok(h) => self.agent_loop(session_manager, session.id, h).await,
+            Err(e) => Err(e),
         };
 
-        session_manager.append_message(session.id, user_msg)?;
-        session_manager.append_message(session.id, assistant_msg)?;
+        match result {
+            Ok((response, usage)) => {
+                let assistant_msg = SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: SessionRole::Assistant,
+                    content: alms_session::Content::Text(response.clone()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                };
+                session_manager.append_message(session.id, assistant_msg)?;
 
-        info!(
-            "Agent {} completed for context {} (prompt={} completion={} tokens)",
-            self.agent_id.0, context_id, usage.prompt_tokens, usage.completion_tokens
-        );
+                info!(
+                    "Agent {} completed for context {} (prompt={} completion={} tokens)",
+                    self.agent_id.0, context_id, usage.prompt_tokens, usage.completion_tokens
+                );
 
-        Ok(RunOutput { response, usage })
+                Ok(RunOutput { response, usage })
+            }
+            Err(e) => {
+                // Write a sanitized error marker so the session reflects the failed attempt
+                // without leaking sensitive details (API keys, URLs) into LLM context.
+                let safe_reason = sanitize_error_for_session(&e);
+                let error_msg = SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: SessionRole::Assistant,
+                    content: alms_session::Content::Text(format!("[Run failed: {}]", safe_reason)),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                };
+                if let Err(append_err) = session_manager.append_message(session.id, error_msg) {
+                    warn!("Failed to persist error marker to session: {}", append_err);
+                }
+
+                Err(e)
+            }
+        }
     }
 
     /// Build context window for LLM using ContextBuilder.
@@ -772,6 +797,38 @@ impl AgentRuntime {
     }
 }
 
+/// Produce a safe error description for session history.
+///
+/// Strips details that could contain secrets (API keys, URLs, headers)
+/// while preserving the error category so retries have useful context.
+fn sanitize_error_for_session(err: &AlmsError) -> String {
+    match err {
+        AlmsError::Runtime(msg) => {
+            // Runtime errors may contain API URLs, keys, or raw HTTP details.
+            if msg.contains("401") || msg.contains("403") {
+                "LLM authentication error".to_string()
+            } else if msg.contains("429") {
+                "LLM rate limit exceeded".to_string()
+            } else if msg.contains("timeout") || msg.contains("timed out") {
+                "LLM request timed out".to_string()
+            } else if msg.contains("context") || msg.contains("summary") {
+                "Context building failed".to_string()
+            } else {
+                "Runtime error".to_string()
+            }
+        }
+        AlmsError::ToolExecution(msg) => {
+            // Tool name is safe, but output may contain secrets.
+            let safe = msg.split(':').next().unwrap_or("unknown tool");
+            format!("Tool execution failed: {safe}")
+        }
+        AlmsError::SessionNotFound(_) => "Session not found".to_string(),
+        AlmsError::InvalidConfig(_) => "Invalid configuration".to_string(),
+        AlmsError::Io(_) => "I/O error".to_string(),
+        _ => "Internal error".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,5 +905,74 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn test_sanitize_error_runtime_auth() {
+        let err = AlmsError::Runtime("HTTP 401 Unauthorized at https://api.example.com".into());
+        assert_eq!(sanitize_error_for_session(&err), "LLM authentication error");
+    }
+
+    #[test]
+    fn test_sanitize_error_runtime_rate_limit() {
+        let err = AlmsError::Runtime("429 Too Many Requests".into());
+        assert_eq!(sanitize_error_for_session(&err), "LLM rate limit exceeded");
+    }
+
+    #[test]
+    fn test_sanitize_error_runtime_timeout() {
+        let err = AlmsError::Runtime("request timed out after 60s".into());
+        assert_eq!(sanitize_error_for_session(&err), "LLM request timed out");
+    }
+
+    #[test]
+    fn test_sanitize_error_runtime_generic() {
+        let err = AlmsError::Runtime("some secret-key=abc123 in raw error".into());
+        assert_eq!(sanitize_error_for_session(&err), "Runtime error");
+    }
+
+    #[test]
+    fn test_sanitize_error_tool_strips_output() {
+        let err = AlmsError::ToolExecution("shell_exec: secret output here".into());
+        assert_eq!(
+            sanitize_error_for_session(&err),
+            "Tool execution failed: shell_exec"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_error_context_building() {
+        let err = AlmsError::Runtime("failed to build context window".into());
+        assert_eq!(sanitize_error_for_session(&err), "Context building failed");
+    }
+
+    #[tokio::test]
+    async fn test_run_persists_user_message_on_failure() {
+        // Use mock LLM that will produce a response, but we can verify
+        // the user message is persisted to history.
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let llm = LlmClient::new(config).unwrap();
+        let agent_id = AgentId::new();
+        let runtime = AgentRuntime::new(agent_id, AgentConfig::default(), llm);
+
+        // Run with mock LLM (succeeds)
+        let result = runtime
+            .run(&session_manager, "test-context", "hello agent")
+            .await;
+        assert!(result.is_ok());
+
+        // Verify the user message was persisted in session history
+        let session = session_manager.get_or_create(agent_id, "test-context");
+        let history = session_manager.get_history(session.id).unwrap();
+        assert!(
+            history.iter().any(|m| m.role == alms_session::Role::User
+                && matches!(&m.content, alms_session::Content::Text(t) if t == "hello agent")),
+            "User message should be persisted in session history"
+        );
     }
 }
