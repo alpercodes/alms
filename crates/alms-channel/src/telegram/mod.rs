@@ -8,7 +8,7 @@ use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::mpsc;
-use tokio::time::{Duration, interval};
+use tokio::time::Duration;
 use tracing::{error, info, warn};
 use types::*;
 
@@ -190,24 +190,19 @@ impl TelegramChannel {
     /// Run the polling loop
     async fn run_polling(&self, tx: mpsc::Sender<IncomingMessage>) -> AlmsResult<()> {
         info!("Starting Telegram polling loop");
-        let mut ticker = interval(Duration::from_secs(self.poll_interval_secs));
 
         while self.running.load(Ordering::Relaxed) {
-            ticker.tick().await;
-
             let offset = self.last_update_id.load(Ordering::Relaxed);
             let offset_param = if offset > 0 { Some(offset + 1) } else { None };
 
             match self.get_updates(offset_param).await {
                 Ok(updates) => {
                     for update in updates {
-                        // Update the last update ID
                         if update.update_id > self.last_update_id.load(Ordering::Relaxed) {
                             self.last_update_id
                                 .store(update.update_id, Ordering::Relaxed);
                         }
 
-                        // Convert and send the update
                         if let Some(message) = self.convert_update(update)
                             && tx.send(message).await.is_err()
                         {
