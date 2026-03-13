@@ -196,12 +196,12 @@ impl AgentRuntime {
         span.record("input_len", input.len());
 
         let session = session_manager.get_or_create(self.agent_id, context_id);
+
+        // Build context first (reads history without current input to avoid double-counting),
+        // then persist the user message so it survives agent loop failures.
         let history = self
             .build_context(session_manager, &session.id, &input)
-            .await?;
-        let (response, usage) = self
-            .agent_loop(session_manager, session.id, history)
-            .await?;
+            .await;
 
         let user_msg = SessionMessage {
             id: uuid::Uuid::new_v4().to_string(),
@@ -210,24 +210,47 @@ impl AgentRuntime {
             timestamp: alms_core::Timestamp::now(),
             metadata: None,
         };
+        session_manager.append_message(session.id, user_msg)?;
 
-        let assistant_msg = SessionMessage {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: SessionRole::Assistant,
-            content: alms_session::Content::Text(response.clone()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: None,
+        let result = match history {
+            Ok(h) => self.agent_loop(session_manager, session.id, h).await,
+            Err(e) => Err(e),
         };
 
-        session_manager.append_message(session.id, user_msg)?;
-        session_manager.append_message(session.id, assistant_msg)?;
+        match result {
+            Ok((response, usage)) => {
+                let assistant_msg = SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: SessionRole::Assistant,
+                    content: alms_session::Content::Text(response.clone()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                };
+                session_manager.append_message(session.id, assistant_msg)?;
 
-        info!(
-            "Agent {} completed for context {} (prompt={} completion={} tokens)",
-            self.agent_id.0, context_id, usage.prompt_tokens, usage.completion_tokens
-        );
+                info!(
+                    "Agent {} completed for context {} (prompt={} completion={} tokens)",
+                    self.agent_id.0, context_id, usage.prompt_tokens, usage.completion_tokens
+                );
 
-        Ok(RunOutput { response, usage })
+                Ok(RunOutput { response, usage })
+            }
+            Err(e) => {
+                // Write an error marker so the session history reflects the failed attempt.
+                let error_msg = SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: SessionRole::Assistant,
+                    content: alms_session::Content::Text(format!("[Run failed: {}]", e)),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                };
+                if let Err(append_err) = session_manager.append_message(session.id, error_msg) {
+                    warn!("Failed to persist error marker to session: {}", append_err);
+                }
+
+                Err(e)
+            }
+        }
     }
 
     /// Build context window for LLM using ContextBuilder.
