@@ -284,16 +284,8 @@ async fn main() -> anyhow::Result<()> {
                 max_tokens,
                 posture,
             } => {
-                cmd_run::run_create(
-                    &url,
-                    &session,
-                    &input,
-                    model,
-                    max_tokens,
-                    posture,
-                    json,
-                )
-                .await?;
+                cmd_run::run_create(&url, &session, &input, model, max_tokens, posture, json)
+                    .await?;
             }
             RunCommands::List { session, limit } => {
                 cmd_run::run_list(&url, &session, limit, json).await?;
