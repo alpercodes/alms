@@ -24,6 +24,10 @@ pub struct TelegramChannel {
     running: Arc<AtomicBool>,
     use_webhook: bool,
     webhook_url: Option<String>,
+    /// Currently unused after removing the interval ticker (long-poll timeout
+    /// is the wait mechanism). Retained for config API compatibility; may be
+    /// repurposed as error backoff duration.
+    #[allow(dead_code)]
     poll_interval_secs: u64,
 }
 

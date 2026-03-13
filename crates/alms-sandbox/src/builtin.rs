@@ -45,7 +45,16 @@ fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
     }
     if let Some(parent) = path.parent() {
         let canonical_parent = canonicalize_best_effort(parent)?;
-        Ok(canonical_parent.join(path.file_name().unwrap_or_default()))
+        let tail = path.file_name().unwrap_or_default();
+        if tail == ".." {
+            // Resolve ".." by walking up instead of appending it literally
+            Ok(canonical_parent
+                .parent()
+                .unwrap_or(&canonical_parent)
+                .to_path_buf())
+        } else {
+            Ok(canonical_parent.join(tail))
+        }
     } else {
         Ok(path.to_path_buf())
     }
