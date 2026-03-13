@@ -363,10 +363,28 @@ impl SqliteStore {
                 ))
             })
             .map_err(|e| AlmsError::Runtime(format!("SQLite query messages: {e}")))?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable message row: {e}");
+                    None
+                }
+            })
             .filter_map(|(id, role_str, content_json, ts_str, metadata_str)| {
-                let content: Content = serde_json::from_str(&content_json).ok()?;
-                let ts = chrono::DateTime::parse_from_rfc3339(&ts_str).ok()?;
+                let content: Content = match serde_json::from_str(&content_json) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("Skipping message {id}: bad content JSON: {e}");
+                        return None;
+                    }
+                };
+                let ts = match chrono::DateTime::parse_from_rfc3339(&ts_str) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("Skipping message {id}: bad timestamp: {e}");
+                        return None;
+                    }
+                };
                 let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
                 Some(Message {
                     id,
@@ -440,7 +458,13 @@ impl SqliteStore {
                 ))
             })
             .map_err(|e| AlmsError::Runtime(format!("SQLite query audit: {e}")))?
-            .filter_map(|r| r.ok())
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable audit row: {e}");
+                    None
+                }
+            })
             .filter_map(
                 |(
                     sid,
@@ -606,7 +630,7 @@ impl SqliteStore {
                     .map(|dt| Timestamp(dt.with_timezone(&chrono::Utc)));
                 Ok(Some(ContextSummary {
                     text,
-                    messages_covered: messages_covered as usize,
+                    messages_covered: messages_covered.max(0) as usize,
                     updated_at,
                 }))
             }

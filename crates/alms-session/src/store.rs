@@ -33,7 +33,11 @@ struct SnapshotEnvelope {
     snapshot: Snapshot,
 }
 
-/// In-memory store with snapshot persistence
+/// In-memory store with snapshot persistence.
+///
+/// **Note**: Uses blocking file I/O (`std::fs`) — suitable for tests and
+/// small single-user deployments. For production use, prefer
+/// [`crate::sqlite::SqliteStore`].
 #[derive(Debug)]
 pub struct MemoryStore {
     snapshot_path: Option<PathBuf>,
