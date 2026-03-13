@@ -41,6 +41,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-13:** Fix #56 (CRITICAL): Telegram shutdown — `AtomicBool`/`AtomicI64` replaced with `Arc<Atomic*>` so `stop()` propagates to polling task. Also fixes #59 (offset desync).
 - **2026-03-13:** Fix #57 (CRITICAL): Serial message processing — `handle_message().await` replaced with `tokio::spawn` per message. `SessionQueue<K>` added (`session_queue.rs`): per-session FIFO work queue backed by `DashMap<SessionId, UnboundedSender>`. Routes Telegram messages, HTTP `POST /runs`, and scheduler fire loop through the queue. 5 new tests (61 gateway total). `Gateway::run()` refactored to delegate to `run_until_shutdown()`.
 - **2026-03-13:** Codex codebase review (`docs/codex-review-1303.md`): 6 findings — workspace identity split (#98), failed runs lose history (#99), default-agent not live (#100), config partially wired (#101), SSE subscription leak (#102), event log durability comments (#103), query-string auth scope (#104). Tasks added as P16.
+- **2026-03-14:** Cancel button for in-progress runs (#91): `CancellationToken` per run, 4 cancellation checkpoints (loop top, LLM streaming, tool execution, approval wait), `POST /runs/{run_id}/cancel` endpoint, `run_cancelled` SSE event, UI stop button. PR #65.
+- **2026-03-14:** Fixes #98 ✅, #99 ✅, #100 ✅ all merged. Channel tests (#62) already complete (29 tests exist). #91 ✅ merged.
 
 ---
 
@@ -325,6 +327,12 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Parallel tool execution: agent_loop uses `join_all` so multiple tool calls run concurrently.
 - **Owners:** Atlas
 
+110) Replace `fs_write` with search-and-replace edit tool
+- Current `fs_write` overwrites the entire file, which is error-prone for small edits and wastes tokens sending full file contents.
+- Should support targeted edits via old_string → new_string replacement (like Claude Code's Edit tool), so agents can make surgical changes without rewriting the whole file.
+- Keep `fs_write` for full-file creates/overwrites; add a new `fs_edit` tool for partial edits.
+- **Owners:** Atlas
+
 ---
 
 ## P7 — Multi-agent (Coordinator)
@@ -516,14 +524,27 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: either escape the text for HTML, use no parse_mode (plain text), or use MarkdownV2 with proper escaping.
 - **Owners:** Atlas
 
-62) Add alms-channel tests
-- Zero tests in the entire crate. Violates project convention of `#[cfg(test)] mod tests` per module.
-- Add unit tests for: `convert_update()`, `parse_command()`, polling offset logic, message splitting (after #60).
+62) Add alms-channel tests ✅
+- Added 29 tests across 3 files: `telegram/mod.rs` (convert_update, api_url, polling offset), `telegram/types.rs` (builder + serde), `alms-core/channel.rs` (Command::parse, IncomingMessage). Total: 37 tests in alms-channel.
 - **Owners:** Atlas
 
 63) Persist Telegram update offset to SQLite
 - If the process crashes after processing an update but before the next `getUpdates` with incremented offset, Telegram redelivers the update → duplicate reply.
 - Fix: persist `last_update_id` to SQLite (or a sidecar file) after processing each batch.
+- **Owners:** Atlas
+
+106) Telegram message loop ignores per-agent config overrides
+- The Telegram message handler in `gateway.rs` creates `AgentRuntime` with the server-default `agent_config` and `llm` client. It does not look up per-agent overrides (model, system_prompt, posture) from the agent registry.
+- The HTTP run path (`runs.rs` `execute_run()`) correctly loads per-agent config via `apply_overrides()` and swaps the LLM model via `llm.with_model()`. The Telegram path bypasses this entirely.
+- Effect: switching the default agent correctly changes workspace/sessions for Telegram, but the runtime still uses the server-default model and system prompt — not the per-agent overrides.
+- Fix: extract the per-agent override logic from `execute_run()` into a shared helper. Call it in the Telegram message handler before creating the `AgentRuntime`.
+- **Evidence:** `gateway.rs:279-282` vs `runs.rs:214-245`
+- **Owners:** Atlas
+
+105) Per-agent Telegram chat routing
+- Currently all Telegram messages go to whichever agent is set as "default". There's no way to route specific chats to specific agents.
+- Fix: allow configuring a Telegram chat ID → agent mapping in the agent registry or config. Each registered agent can optionally be bound to one or more Telegram chat IDs. Messages from those chats route to that agent; unmatched chats fall back to the default agent.
+- This enables multi-agent setups where e.g. a "support" agent handles one group chat and a "dev" agent handles a private chat, each with their own workspace and personality.
 - **Owners:** Atlas
 
 ---
@@ -683,9 +704,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: make each audit row expandable to show full JSON payload. Add filter controls (by event type, time range). Support loading older events beyond the initial batch.
 - **Owners:** Atlas
 
-91) Cancel button for in-progress runs (IMPORTANT)
-- There is no way to cancel a run once started. The user must wait for the agent loop to finish or kill the process.
-- Fix: add a "Cancel" / "Stop" button in the chat area (visible during active runs). Wire it to `DELETE /runs/{id}` or a new `POST /runs/{id}/cancel` endpoint. Backend: set a cancellation flag on the run that the agent loop checks between iterations, and drop the LLM call / tool execution.
+91) Cancel button for in-progress runs ✅
+- Per-run `CancellationToken` with 4 checkpoints (iteration boundary, LLM streaming, tool execution, approval wait). `POST /runs/{run_id}/cancel` endpoint, `run_cancelled` SSE event, UI Stop button. PR #65.
 - **Owners:** Atlas
 
 92) General UI improvements
@@ -693,10 +713,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Specific known gaps: no visual feedback when saving agent model, no confirmation on destructive actions beyond browser confirm(), chat scroll behavior on long responses, no way to copy agent/session/run IDs.
 - **Owners:** Atlas
 
-93) Agent workspace dirs created in wrong location
-- Agent workspace directories are being created in the codebase root folder instead of under the configured workspace directory (e.g. `./data/workspace/{agent-name}/`).
-- Investigate: check `create_agent` in `agents.rs` and `init_workspace_files()` — likely the workspace base path is not being prepended, or the path resolution is relative to cwd instead of the configured `workspace_dir`.
-- **Owners:** Atlas
+~~93) Duplicate of #98 — removed.~~
 
 94) Tool calls not persisted in session history
 - Tool call messages (tool_call + tool_result) do not appear to be saved in session history. When reloading a session, only user and assistant text messages are visible — tool interactions are lost.
@@ -726,26 +743,16 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 > Findings from the 2026-03-13 codebase review (`docs/codex-review-1303.md`).
 > These address structural correctness issues that cause confusing runtime behavior.
 
-98) HIGH: Workspace identity split — agent files created under name, read under UUID
-- `agents.rs` creates workspace files at `workspace_dir/<agent-name>/`, but `AgentWorkspace::new()` in runs.rs and workspace.rs resolves paths as `workspace_dir/<agent-id>/`.
-- A newly created agent looks "uninitialized" to the runtime, re-triggering bootstrap even though files exist under the wrong path.
-- Fix: standardize on name-based workspace paths everywhere (human-readable, agent name is already unique/slug-safe). Update `AgentWorkspace::new()` to accept name instead of UUID. Add one-time migration for existing UUID-based directories.
-- Related: #93 (same root cause, noted independently).
-- **Evidence:** `agents.rs:186-189`, `workspace.rs:65-69`, `runs.rs:255-279`
+98) HIGH: Workspace identity split — agent files created under name, read under UUID ✅
+- Standardized on name-based workspace paths. `AgentWorkspace::new()` accepts name instead of UUID. One-time migration `migrate_workspace_dirs()` renames UUID dirs to name dirs on startup. PR #60.
 - **Owners:** Atlas
 
-99) HIGH: Failed runs lose user message and leave no session trace
-- `agent.rs:206-223` appends user and assistant messages only after `agent_loop()` returns `Ok(...)`. Any error before that point skips history persistence entirely.
-- The user's input disappears from session context on failure. Retrying after a failure exhibits "amnesia" — the agent has no record of what was attempted.
-- Fix: append the user message to session history *before* entering the agent loop. On failure, append a synthetic error marker message. Keep run record and session transcript aligned.
-- **Evidence:** `agent.rs:198-223`
+99) HIGH: Failed runs lose user message and leave no session trace ✅
+- User message now appended to session history *before* entering the agent loop. On failure, a synthetic error marker message is appended. PR #61.
 - **Owners:** Atlas
 
-100) HIGH: Changing the default agent does not affect live gateway behavior
-- `AppState` snapshots `default_agent_id` once at startup from the sidecar file / env var. `POST /agents/{id}/default` updates SQLite but not the running gateway.
-- Telegram/channel traffic is especially affected — it uses the gateway's fixed `self.agent_id`, which never updates.
-- Fix: make `default_agent_id` in AppState a shared mutable cell (`Arc<ArcSwap<AgentId>>` or similar). The set-default handler updates both SQLite and the live cell. Channel adapter reads the live value per message. Sidecar file becomes bootstrap-only fallback when registry is empty.
-- **Evidence:** `gateway.rs:90-107`, `agents.rs:295-310`, `server.rs:243-257`
+100) HIGH: Changing the default agent does not affect live gateway behavior ✅
+- `default_agent_id` in AppState changed to `Arc<ArcSwap<AgentId>>`. Set-default handler updates both SQLite and live cell. Channel adapter reads live value. PR #64.
 - **Owners:** Atlas
 
 101) MEDIUM: Unified config partially wired — session config and bind address ignored
@@ -774,6 +781,25 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Bearer tokens in URLs leak into server logs, browser history, and HTTP Referer headers.
 - Fix: restrict `?token=` query auth to SSE endpoints only (where `Authorization` headers aren't available from `EventSource`). All other routes require the `Authorization: Bearer` header.
 - **Evidence:** `auth.rs:19-20`, `auth.rs:40-45`
+- **Owners:** Atlas
+
+---
+
+## P-URGENT — User-reported bugs
+
+107) URGENT: New agent session unresponsive until page reload
+- After creating a new agent and switching to its session via the top-left navbar dropdown, the send button and Enter key do not work. Messages cannot be sent.
+- Only a full page reload fixes the input.
+- Likely cause: switching agents creates/selects a new session but the chat input event listeners or `activeRunId`/session state are not properly re-initialized.
+- **Owners:** Atlas
+
+108) URGENT: Agents start with cwd set to project root instead of workspace
+- `shell_exec` cwd defaults to the alms binary's working directory (project root), not the agent's workspace directory.
+- Agents should start in their own workspace dir (`{workspace_dir}/{name}/`) so file operations are scoped to their workspace by default.
+- **Owners:** Atlas
+
+109) URGENT: Cannot schedule messages/jobs from the UI
+- The Jobs panel and create-job form exist in the UI, but scheduling does not work in practice. Needs investigation — could be a frontend form submission issue, backend endpoint error, or schedule parsing failure.
 - **Owners:** Atlas
 
 ---
