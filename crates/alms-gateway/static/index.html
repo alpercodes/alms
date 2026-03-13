@@ -1352,11 +1352,13 @@ function openEventStream(runId) {
 
   let agentWrap = null;
   let agentBody = null;
+  let hadToolSinceText = false;
   function getAgentBody() {
-    if (!agentBody) {
+    if (!agentBody || hadToolSinceText) {
       const r = appendMsg('agent', '');
       agentWrap = r.wrap;
       agentBody = r.body;
+      hadToolSinceText = false;
     }
     return agentBody;
   }
@@ -1382,6 +1384,7 @@ function openEventStream(runId) {
   });
 
   es.addEventListener('tool_start', e => {
+    hadToolSinceText = true;
     const { tool_invocation_id, tool, params } = JSON.parse(e.data);
     toolRows[tool_invocation_id] = appendToolRow(`▶ ${tool}(${JSON.stringify(params)})`);
   });
