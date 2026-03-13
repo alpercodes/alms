@@ -1,6 +1,6 @@
 use crate::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Built-in tool trait marker
 pub trait BuiltinTool: Tool {}
@@ -49,7 +49,6 @@ fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
     // intermediate directories (e.g. `foo/../../secret`) are handled correctly.
     // `Path::file_name()` returns `None` for `..`, which caused the previous
     // recursive approach to silently skip `..` resolution.
-    use std::path::Component;
     let mut resolved = PathBuf::new();
     for component in path.components() {
         match component {
