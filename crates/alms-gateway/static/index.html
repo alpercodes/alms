@@ -503,9 +503,9 @@
     .settings-cancel:hover { color: #e6edf3; }
     #btn-settings.active { color: #d29922; border-color: #d29922; }
 
-    /* ── Agent management in settings ── */
+    /* ── Agent management panel ── */
     .agent-list-container {
-      max-height: 200px;
+      flex: 1;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
@@ -636,10 +636,11 @@
   <span id="posture-badge" title="Execution posture">full_control</span>
   <span id="status">connecting…</span>
   <div class="header-btns">
+    <button class="hbtn" id="btn-agents" onclick="togglePanel('agents')">Agents</button>
     <button class="hbtn" id="btn-workspace" onclick="togglePanel('workspace')">Workspace</button>
     <button class="hbtn" id="btn-jobs" onclick="togglePanel('jobs')">Jobs</button>
     <button class="hbtn" id="btn-audit" onclick="togglePanel('audit')">Audit</button>
-    <button class="hbtn" id="btn-settings" onclick="openSettings()">⚙ Settings</button>
+    <button class="hbtn" id="btn-settings" onclick="openSettings()">Settings</button>
   </div>
 </header>
 
@@ -695,18 +696,6 @@
     <div class="settings-row">
       <div class="settings-label">Server info</div>
       <div class="settings-hint" id="settings-server-info">loading…</div>
-    </div>
-
-    <div class="settings-row">
-      <div class="settings-label">Agents</div>
-      <div class="agent-list-container" id="settings-agent-list">
-        <!-- populated by renderAgentSettings() -->
-      </div>
-      <div class="agent-create-row" style="margin-top:6px">
-        <input type="text" class="settings-input" id="new-agent-name" placeholder="new-agent-name" spellcheck="false" style="font-size:12px;padding:5px 8px">
-        <button class="settings-save" style="padding:5px 10px;font-size:11px" onclick="createAgentFromSettings()">Create</button>
-      </div>
-      <div class="agent-error" id="agent-create-error"></div>
     </div>
 
     <div class="settings-footer">
@@ -768,9 +757,22 @@
   <div id="panel">
 
     <div class="panel-tabs">
+      <button class="panel-tab" id="tab-agents" onclick="switchPanelTab('agents')">Agents</button>
       <button class="panel-tab" id="tab-workspace" onclick="switchPanelTab('workspace')">Workspace</button>
       <button class="panel-tab" id="tab-jobs" onclick="switchPanelTab('jobs')">Jobs</button>
       <button class="panel-tab" id="tab-audit" onclick="switchPanelTab('audit')">Audit</button>
+    </div>
+
+    <!-- Agents tab -->
+    <div class="panel-body" id="panel-agents" style="display:none">
+      <div class="agent-list-container" id="panel-agent-list">
+        <!-- populated by renderAgentPanel() -->
+      </div>
+      <div class="agent-create-row" style="margin-top:8px">
+        <input type="text" class="settings-input" id="new-agent-name" placeholder="new-agent-name" spellcheck="false" style="font-size:12px;padding:5px 8px">
+        <button class="settings-save" style="padding:5px 10px;font-size:11px" onclick="createAgentFromPanel()">Create</button>
+      </div>
+      <div class="agent-error" id="agent-create-error"></div>
     </div>
 
     <!-- Workspace tab -->
@@ -821,10 +823,11 @@ const agentSelectEl = document.getElementById('agent-select');
 const sessionListEl = document.getElementById('session-list');
 const runListEl    = document.getElementById('run-list');
 const sessionTokensEl = document.getElementById('session-tokens');
-const panelEl      = document.getElementById('panel');
-const wsBodyEl     = document.getElementById('panel-workspace');
-const jobsBodyEl   = document.getElementById('panel-jobs');
-const auditBodyEl  = document.getElementById('panel-audit');
+const panelEl       = document.getElementById('panel');
+const agentsBodyEl  = document.getElementById('panel-agents');
+const wsBodyEl      = document.getElementById('panel-workspace');
+const jobsBodyEl    = document.getElementById('panel-jobs');
+const auditBodyEl   = document.getElementById('panel-audit');
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 function setStatus(text, cls) {
@@ -1276,7 +1279,7 @@ async function checkBootstrapStatus() {
   }
   // Re-render agent selector with bootstrap indicators
   renderAgentSelect();
-  renderAgentSettings();
+  renderAgentPanel();
 }
 
 function enableInput() {
@@ -1455,13 +1458,13 @@ function togglePanel(tab) {
     // Close panel.
     S.activePanel = null;
     panelEl.classList.remove('open');
-    ['workspace', 'jobs', 'audit'].forEach(t =>
+    ['agents', 'workspace', 'jobs', 'audit'].forEach(t =>
       document.getElementById('btn-' + t)?.classList.remove('active')
     );
   } else {
     S.activePanel = tab;
     panelEl.classList.add('open');
-    ['workspace', 'jobs', 'audit'].forEach(t =>
+    ['agents', 'workspace', 'jobs', 'audit'].forEach(t =>
       document.getElementById('btn-' + t)?.classList.toggle('active', t === tab)
     );
     switchPanelTab(tab);
@@ -1470,13 +1473,15 @@ function togglePanel(tab) {
 
 function switchPanelTab(tab) {
   S.activePanelTab = tab;
-  ['workspace', 'jobs', 'audit'].forEach(t => {
+  ['agents', 'workspace', 'jobs', 'audit'].forEach(t => {
     document.getElementById('tab-' + t)?.classList.toggle('active', t === tab);
   });
-  wsBodyEl.style.display    = tab === 'workspace' ? 'flex' : 'none';
-  jobsBodyEl.style.display  = tab === 'jobs'      ? 'flex' : 'none';
-  auditBodyEl.style.display = tab === 'audit'     ? 'flex' : 'none';
+  agentsBodyEl.style.display = tab === 'agents'    ? 'flex' : 'none';
+  wsBodyEl.style.display     = tab === 'workspace' ? 'flex' : 'none';
+  jobsBodyEl.style.display   = tab === 'jobs'      ? 'flex' : 'none';
+  auditBodyEl.style.display  = tab === 'audit'     ? 'flex' : 'none';
 
+  if (tab === 'agents')    renderAgentPanel();
   if (tab === 'workspace') loadWorkspace();
   if (tab === 'jobs')      loadJobs();
   if (tab === 'audit')     loadAudit();
@@ -1912,7 +1917,7 @@ function openSettings() {
   if (serverDefaults.enabled_tools)    infoLines.push(`Tools: ${serverDefaults.enabled_tools.join(', ')}`);
   settingsServerInfo.textContent = infoLines.join(' · ') || '—';
 
-  renderAgentSettings();
+  renderAgentPanel();
   settingsOverlay.classList.add('open');
   settingsModelIn.focus();
 }
@@ -1949,8 +1954,8 @@ function updateSettingsBtn() {
 }
 
 // ── Agent management in settings ────────────────────────────────────────────
-function renderAgentSettings() {
-  const container = document.getElementById('settings-agent-list');
+function renderAgentPanel() {
+  const container = document.getElementById('panel-agent-list');
   if (!container) return;
   container.innerHTML = '';
 
@@ -2043,7 +2048,7 @@ function renderAgentSettings() {
   }
 }
 
-async function createAgentFromSettings() {
+async function createAgentFromPanel() {
   const input = document.getElementById('new-agent-name');
   const errorEl = document.getElementById('agent-create-error');
   const name = input.value.trim();
@@ -2084,7 +2089,7 @@ async function refreshAgents() {
     }));
   } catch { /* ignore */ }
   renderAgentSelect();
-  renderAgentSettings();
+  renderAgentPanel();
   checkBootstrapStatus();
 }
 
