@@ -5,6 +5,7 @@ use alms_core::channel::{ChatId, MessageId, UserId};
 use alms_core::{AlmsResult, Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
 use async_trait::async_trait;
 use reqwest::Client;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
@@ -19,8 +20,8 @@ pub struct TelegramChannel {
     token: String,
     client: Client,
     base_url: String,
-    last_update_id: AtomicI64,
-    running: AtomicBool,
+    last_update_id: Arc<AtomicI64>,
+    running: Arc<AtomicBool>,
     use_webhook: bool,
     webhook_url: Option<String>,
     poll_interval_secs: u64,
@@ -33,8 +34,8 @@ impl TelegramChannel {
             token: String::new(),
             client: Client::new(),
             base_url: String::new(),
-            last_update_id: AtomicI64::new(0),
-            running: AtomicBool::new(false),
+            last_update_id: Arc::new(AtomicI64::new(0)),
+            running: Arc::new(AtomicBool::new(false)),
             use_webhook: false,
             webhook_url: None,
             poll_interval_secs: 5,
@@ -284,8 +285,8 @@ impl Channel for TelegramChannel {
             token: self.token.clone(),
             client: self.client.clone(),
             base_url: self.base_url.clone(),
-            last_update_id: AtomicI64::new(self.last_update_id.load(Ordering::Relaxed)),
-            running: AtomicBool::new(true),
+            last_update_id: Arc::clone(&self.last_update_id),
+            running: Arc::clone(&self.running),
             use_webhook: self.use_webhook,
             webhook_url: self.webhook_url.clone(),
             poll_interval_secs: self.poll_interval_secs,
