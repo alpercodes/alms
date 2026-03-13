@@ -667,6 +667,33 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ---
 
+## P15 — Web UI Polish
+
+> The web UI is functional but needs significant UX work to be usable for real workflows.
+> These tasks address the most pressing gaps identified during manual testing (2026-03-13).
+
+89) Expandable tool calls in chat
+- Tool call rows in the chat are truncated to a single line. Long tool names, params, or results are cut off with no way to see the full content.
+- Fix: make tool rows expandable — click to reveal full params and result JSON. Consider a collapsible card layout similar to how Claude Code renders tool calls (summary line with expand toggle, syntax-highlighted detail on expand).
+- **Owners:** Atlas
+
+90) Full audit log viewer
+- The Audit panel shows a compact list of recent events but offers no way to view the full event payload, filter by type, or paginate through history.
+- Fix: make each audit row expandable to show full JSON payload. Add filter controls (by event type, time range). Support loading older events beyond the initial batch.
+- **Owners:** Atlas
+
+91) Cancel button for in-progress runs (IMPORTANT)
+- There is no way to cancel a run once started. The user must wait for the agent loop to finish or kill the process.
+- Fix: add a "Cancel" / "Stop" button in the chat area (visible during active runs). Wire it to `DELETE /runs/{id}` or a new `POST /runs/{id}/cancel` endpoint. Backend: set a cancellation flag on the run that the agent loop checks between iterations, and drop the LLM call / tool execution.
+- **Owners:** Atlas
+
+92) General UI improvements
+- Overall polish pass on the web UI: better spacing, responsive layout, keyboard shortcuts, loading states, error toasts, empty states, mobile-friendliness.
+- Specific known gaps: no visual feedback when saving agent model, no confirmation on destructive actions beyond browser confirm(), chat scroll behavior on long responses, no way to copy agent/session/run IDs.
+- **Owners:** Atlas
+
+---
+
 ## Docs index
 Start here:
 - `docs/index.md`
