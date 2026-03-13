@@ -40,24 +40,40 @@ fn check_sandbox_path(path: &str, sandbox_root: &Path) -> SandboxResult<PathBuf>
 /// Canonicalize a path, walking up to the nearest existing ancestor if the
 /// full path does not yet exist (handles fs_write for new files/dirs).
 fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
+    // Fast path: if the whole path exists, let the OS resolve it.
     if path.exists() {
         return std::fs::canonicalize(path);
     }
-    if let Some(parent) = path.parent() {
-        let canonical_parent = canonicalize_best_effort(parent)?;
-        let tail = path.file_name().unwrap_or_default();
-        if tail == ".." {
-            // Resolve ".." by walking up instead of appending it literally
-            Ok(canonical_parent
-                .parent()
-                .unwrap_or(&canonical_parent)
-                .to_path_buf())
-        } else {
-            Ok(canonical_parent.join(tail))
+
+    // Walk components and resolve `.` / `..` manually so that non-existent
+    // intermediate directories (e.g. `foo/../../secret`) are handled correctly.
+    // `Path::file_name()` returns `None` for `..`, which caused the previous
+    // recursive approach to silently skip `..` resolution.
+    use std::path::Component;
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(p) => resolved.push(p.as_os_str()),
+            Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {} // skip `.`
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    // Already at root or empty — push `..` so the caller sees it
+                    resolved.push("..");
+                }
+            }
+            Component::Normal(c) => {
+                let candidate = resolved.join(c);
+                if candidate.exists() {
+                    // Resolve symlinks for the segment that exists
+                    resolved = std::fs::canonicalize(&candidate)?;
+                } else {
+                    resolved = candidate;
+                }
+            }
         }
-    } else {
-        Ok(path.to_path_buf())
     }
+    Ok(resolved)
 }
 
 /// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
