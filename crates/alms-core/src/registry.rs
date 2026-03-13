@@ -103,6 +103,28 @@ pub fn validate_agent_name(name: &str) -> AlmsResult<()> {
 /// Workspace file names created for every new agent.
 pub const WORKSPACE_FILENAMES: &[&str] = &["personality.md", "goals.md", "memories.md", "user.md"];
 
+/// Migrate workspace directories from UUID-based to name-based paths.
+///
+/// For each `(uuid, name)` pair, renames `{workspace_dir}/{uuid}/` to
+/// `{workspace_dir}/{name}/` if the UUID directory exists and the name
+/// directory does not. Idempotent and non-destructive — skips if both
+/// exist or neither exists.
+pub fn migrate_workspace_dirs(
+    workspace_dir: &Path,
+    agents: &[(uuid::Uuid, String)],
+) -> std::io::Result<usize> {
+    let mut migrated = 0;
+    for (uuid, name) in agents {
+        let uuid_dir = workspace_dir.join(uuid.to_string());
+        let name_dir = workspace_dir.join(name);
+        if uuid_dir.is_dir() && !name_dir.exists() {
+            std::fs::rename(&uuid_dir, &name_dir)?;
+            migrated += 1;
+        }
+    }
+    Ok(migrated)
+}
+
 /// Create empty workspace files in a directory.
 ///
 /// Skips files that already exist so the function is idempotent.
@@ -188,6 +210,70 @@ mod tests {
         // Also test a v4-style UUID
         let err = validate_agent_name("550e8400-e29b-41d4-a716-446655440000").unwrap_err();
         assert!(err.to_string().contains("UUID"));
+    }
+
+    #[test]
+    fn test_migrate_workspace_dirs_renames_uuid_to_name() {
+        let tmp = std::env::temp_dir().join(format!("alms-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let uuid = uuid::Uuid::new_v4();
+        let uuid_dir = tmp.join(uuid.to_string());
+        init_workspace_files(&uuid_dir).unwrap();
+        std::fs::write(uuid_dir.join("personality.md"), "hello").unwrap();
+
+        let migrated = migrate_workspace_dirs(&tmp, &[(uuid, "atlas".to_string())]).unwrap();
+        assert_eq!(migrated, 1);
+        assert!(!uuid_dir.exists(), "UUID dir should be gone");
+        assert!(
+            tmp.join("atlas").join("personality.md").exists(),
+            "name dir should have files"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.join("atlas").join("personality.md")).unwrap(),
+            "hello"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_migrate_workspace_dirs_skips_when_name_exists() {
+        let tmp = std::env::temp_dir().join(format!("alms-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let uuid = uuid::Uuid::new_v4();
+        let uuid_dir = tmp.join(uuid.to_string());
+        let name_dir = tmp.join("atlas");
+        init_workspace_files(&uuid_dir).unwrap();
+        init_workspace_files(&name_dir).unwrap();
+
+        // Both exist — migration should skip (no overwrite)
+        let migrated = migrate_workspace_dirs(&tmp, &[(uuid, "atlas".to_string())]).unwrap();
+        assert_eq!(migrated, 0);
+        assert!(uuid_dir.exists(), "UUID dir should still exist");
+        assert!(name_dir.exists(), "name dir should still exist");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_migrate_workspace_dirs_idempotent() {
+        let tmp = std::env::temp_dir().join(format!("alms-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let uuid = uuid::Uuid::new_v4();
+        let uuid_dir = tmp.join(uuid.to_string());
+        init_workspace_files(&uuid_dir).unwrap();
+
+        let agents = vec![(uuid, "atlas".to_string())];
+        let m1 = migrate_workspace_dirs(&tmp, &agents).unwrap();
+        assert_eq!(m1, 1);
+        // Second call — UUID dir is gone, name dir exists, should return 0
+        let m2 = migrate_workspace_dirs(&tmp, &agents).unwrap();
+        assert_eq!(m2, 0);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

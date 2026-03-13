@@ -110,12 +110,11 @@ impl Tool for WorkspaceWriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alms_core::AgentId;
     use tempfile::TempDir;
 
     fn test_tool() -> (TempDir, WorkspaceWriteTool) {
         let dir = TempDir::new().unwrap();
-        let workspace = AgentWorkspace::new(dir.path(), AgentId::new());
+        let workspace = AgentWorkspace::new(dir.path(), "test-agent");
         let tool = WorkspaceWriteTool::new(workspace);
         (dir, tool)
     }

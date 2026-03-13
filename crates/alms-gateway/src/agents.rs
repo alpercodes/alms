@@ -55,7 +55,7 @@ fn get_store(
 }
 
 /// Helper: resolve an agent by UUID or name slug.
-fn resolve_agent(
+pub(crate) fn resolve_agent(
     store: &SqliteStore,
     id_or_name: &str,
 ) -> Result<AgentRecord, (StatusCode, Json<serde_json::Value>)> {

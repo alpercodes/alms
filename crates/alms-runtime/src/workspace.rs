@@ -9,17 +9,15 @@
 //! These are read at the start of each run and injected into the system prompt.
 //! The agent can update goals.md, memories.md, and user.md via the workspace_write tool.
 
-use alms_core::{AgentId, AlmsError, AlmsResult};
+use alms_core::{AlmsError, AlmsResult};
 use std::path::PathBuf;
 use tracing::{debug, info};
 
 /// Agent workspace — reads and manages persistent agent identity files.
 #[derive(Debug, Clone)]
 pub struct AgentWorkspace {
-    /// Root directory for all agent workspaces
-    base_dir: PathBuf,
-    /// This agent's ID
-    agent_id: AgentId,
+    /// Resolved workspace directory for this agent.
+    dir: PathBuf,
 }
 
 /// Files that can be read/written in the workspace
@@ -62,42 +60,26 @@ impl WorkspaceFile {
 }
 
 impl AgentWorkspace {
-    /// Create a workspace rooted at `{base_dir}/{agent_id}/`.
+    /// Create a workspace at `{base_dir}/{agent_name}/`.
     ///
-    /// This is the standard constructor used for top-level agents where the
-    /// workspace base directory is shared and each agent gets a UUID subdir.
-    pub fn new(base_dir: impl Into<PathBuf>, agent_id: AgentId) -> Self {
+    /// Standard constructor for top-level agents. Agent names are unique
+    /// slug-safe identifiers, giving human-readable workspace paths.
+    pub fn new(base_dir: impl Into<PathBuf>, agent_name: &str) -> Self {
         Self {
-            base_dir: base_dir.into(),
-            agent_id,
+            dir: base_dir.into().join(agent_name),
         }
     }
 
-    /// Create a workspace that uses `dir` directly — no UUID subdirectory.
+    /// Create a workspace that uses `dir` directly as the workspace path.
     ///
-    /// Used for named subagents whose workspace lives at a human-readable
-    /// path like `{workspace_dir}/{name}/` so the parent agent can write
-    /// files via `fs_write` or `shell_exec` without knowing the UUID.
+    /// Used for subagents whose workspace path is already fully resolved.
     pub fn with_dir(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            base_dir: dir.into(),
-            // Sentinel: agent_id is unused since dir() is overridden by
-            // the fact that base_dir IS the final directory. We use a nil
-            // UUID so join("00000...") is never called — see dir() below.
-            agent_id: AgentId(uuid::Uuid::nil()),
-        }
+        Self { dir: dir.into() }
     }
 
     /// Get the workspace directory for this agent.
-    ///
-    /// For standard workspaces (`new`): `{base_dir}/{agent_id}`.
-    /// For direct workspaces (`with_dir`): `{base_dir}` as-is.
     pub fn dir(&self) -> PathBuf {
-        if self.agent_id.0.is_nil() {
-            self.base_dir.clone()
-        } else {
-            self.base_dir.join(self.agent_id.0.to_string())
-        }
+        self.dir.clone()
     }
 
     /// Ensure the workspace directory exists
@@ -238,7 +220,7 @@ mod tests {
 
     fn test_workspace() -> (TempDir, AgentWorkspace) {
         let dir = TempDir::new().unwrap();
-        let ws = AgentWorkspace::new(dir.path(), AgentId::new());
+        let ws = AgentWorkspace::new(dir.path(), "test-agent");
         (dir, ws)
     }
 

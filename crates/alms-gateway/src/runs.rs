@@ -226,6 +226,9 @@ async fn execute_run(
                 }
             });
 
+    // Agent name for workspace path resolution (name-based, not UUID-based).
+    let agent_name = agent_record.as_ref().map(|r| r.name.clone());
+
     // Use AppState snapshots — no gateway lock needed.
     let merged = apply_overrides(
         state.agent_config.clone(),
@@ -252,30 +255,31 @@ async fn execute_run(
 
     // Override system prompt with bootstrap prompt for first-time agents.
     // Must come after per-agent overrides so bootstrap takes precedence.
-    let agent_config = if let Some(ref workspace_dir) = state.workspace_dir {
-        let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, agent_id);
-        if workspace.needs_bootstrap() {
-            info!(
-                "Agent {} has no personality.md — using bootstrap prompt",
-                agent_id.0
-            );
-            let mut cfg = agent_config;
-            cfg.system_prompt = alms_runtime::AgentWorkspace::bootstrap_prompt().to_string();
-            cfg
+    let agent_config =
+        if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
+            let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);
+            if workspace.needs_bootstrap() {
+                info!(
+                    "Agent {} ({}) has no personality.md — using bootstrap prompt",
+                    name, agent_id.0
+                );
+                let mut cfg = agent_config;
+                cfg.system_prompt = alms_runtime::AgentWorkspace::bootstrap_prompt().to_string();
+                cfg
+            } else {
+                agent_config
+            }
         } else {
             agent_config
-        }
-    } else {
-        agent_config
-    };
+        };
 
     let mut runtime = alms_runtime::AgentRuntime::new(agent_id, agent_config, llm)
         .with_event_sender(runtime_tx)
         .with_run_id(run_id);
 
     // Attach workspace if configured — registers the workspace_write tool for this run
-    if let Some(ref workspace_dir) = state.workspace_dir {
-        let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, agent_id);
+    if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
+        let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);
         runtime = runtime.with_workspace(workspace);
     }
 

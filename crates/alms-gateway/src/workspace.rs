@@ -1,10 +1,10 @@
 //! Workspace HTTP API
 //!
-//! GET  /agents/{agent_id}/workspace          — read all workspace files
-//! PUT  /agents/{agent_id}/workspace/{file}   — overwrite a workspace file (user-facing)
+//! GET  /agents/{id_or_name}/workspace          — read all workspace files
+//! PUT  /agents/{id_or_name}/workspace/{file}   — overwrite a workspace file (user-facing)
 
+use crate::agents::resolve_agent;
 use crate::server::AppState;
-use alms_core::AgentId;
 use alms_runtime::{AgentWorkspace, WorkspaceFile};
 use axum::{
     Json,
@@ -14,14 +14,14 @@ use axum::{
 };
 use serde::Deserialize;
 
-/// GET /agents/{agent_id}/workspace
+/// GET /agents/{id_or_name}/workspace
 ///
 /// Returns all workspace file contents for the given agent.
 /// Files that don't exist yet are returned as empty strings.
 /// Returns 503 if `ALMS_WORKSPACE_DIR` is not configured.
 pub async fn get_workspace(
     State(state): State<AppState>,
-    Path(agent_id): Path<AgentId>,
+    Path(id_or_name): Path<String>,
 ) -> impl IntoResponse {
     let Some(ref workspace_dir) = state.workspace_dir else {
         return (
@@ -33,7 +33,25 @@ pub async fn get_workspace(
             .into_response();
     };
 
-    let workspace = AgentWorkspace::new(workspace_dir, agent_id);
+    let store = match state.session_manager.store() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": { "code": "NO_STORE", "message": "Store not available" }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let agent = match resolve_agent(store, &id_or_name) {
+        Ok(a) => a,
+        Err(resp) => return resp.into_response(),
+    };
+
+    let workspace = AgentWorkspace::new(workspace_dir, &agent.name);
     let mut files = serde_json::Map::new();
     for file in WorkspaceFile::all() {
         let content = workspace.read_file(*file).unwrap_or_default();
@@ -44,13 +62,13 @@ pub async fn get_workspace(
     }
 
     Json(serde_json::json!({
-        "agent_id": agent_id.0,
+        "agent_id": agent.id.0,
         "files": files,
     }))
     .into_response()
 }
 
-/// PUT /agents/{agent_id}/workspace/{file}
+/// PUT /agents/{id_or_name}/workspace/{file}
 ///
 /// Overwrites a workspace file. `{file}` must be one of:
 /// `personality`, `goals`, `memories`, `user` (without the `.md` extension).
@@ -60,7 +78,7 @@ pub async fn get_workspace(
 /// Returns 503 if workspace is not configured, 404 for unknown file names.
 pub async fn update_workspace_file(
     State(state): State<AppState>,
-    Path((agent_id, file)): Path<(AgentId, String)>,
+    Path((id_or_name, file)): Path<(String, String)>,
     Json(body): Json<UpdateWorkspaceFileRequest>,
 ) -> impl IntoResponse {
     let Some(ref workspace_dir) = state.workspace_dir else {
@@ -92,7 +110,25 @@ pub async fn update_workspace_file(
         }
     };
 
-    let workspace = AgentWorkspace::new(workspace_dir, agent_id);
+    let store = match state.session_manager.store() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": { "code": "NO_STORE", "message": "Store not available" }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let agent = match resolve_agent(store, &id_or_name) {
+        Ok(a) => a,
+        Err(resp) => return resp.into_response(),
+    };
+
+    let workspace = AgentWorkspace::new(workspace_dir, &agent.name);
 
     // Write directly using the filesystem path — user API allows all files including personality.
     if let Err(e) = workspace.ensure_dir() {
