@@ -40,6 +40,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-12:** Agent create workspace + CLI awareness (#84): CLI `alms agent create` and HTTP `POST /agents` now create workspace directory with empty identity files (personality.md, goals.md, memories.md, user.md). CLI outputs workspace path. Default system prompt tells agents they can run `alms --help` via shell_exec to discover CLI commands.
 - **2026-03-13:** Fix #56 (CRITICAL): Telegram shutdown — `AtomicBool`/`AtomicI64` replaced with `Arc<Atomic*>` so `stop()` propagates to polling task. Also fixes #59 (offset desync).
 - **2026-03-13:** Fix #57 (CRITICAL): Serial message processing — `handle_message().await` replaced with `tokio::spawn` per message. `SessionQueue<K>` added (`session_queue.rs`): per-session FIFO work queue backed by `DashMap<SessionId, UnboundedSender>`. Routes Telegram messages, HTTP `POST /runs`, and scheduler fire loop through the queue. 5 new tests (61 gateway total). `Gateway::run()` refactored to delegate to `run_until_shutdown()`.
+- **2026-03-13:** Codex codebase review (`docs/codex-review-1303.md`): 6 findings — workspace identity split (#98), failed runs lose history (#99), default-agent not live (#100), config partially wired (#101), SSE subscription leak (#102), event log durability comments (#103), query-string auth scope (#104). Tasks added as P16.
 
 ---
 
@@ -716,6 +717,63 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - An empty agent speech bubble sometimes appears in the chat with no text content.
 - Likely cause: `getAgentBody()` creates a new bubble on `token_delta` but the LLM response starts with tool calls (no text), or a bubble is created after a tool but no subsequent text follows.
 - Fix: suppress empty bubbles — don't create an agent bubble until there's actual text content, or remove empty bubbles on `run_finished`.
+- **Owners:** Atlas
+
+---
+
+## P16 — Codex Review Findings (2026-03-13)
+
+> Findings from the 2026-03-13 codebase review (`docs/codex-review-1303.md`).
+> These address structural correctness issues that cause confusing runtime behavior.
+
+98) HIGH: Workspace identity split — agent files created under name, read under UUID
+- `agents.rs` creates workspace files at `workspace_dir/<agent-name>/`, but `AgentWorkspace::new()` in runs.rs and workspace.rs resolves paths as `workspace_dir/<agent-id>/`.
+- A newly created agent looks "uninitialized" to the runtime, re-triggering bootstrap even though files exist under the wrong path.
+- Fix: standardize on name-based workspace paths everywhere (human-readable, agent name is already unique/slug-safe). Update `AgentWorkspace::new()` to accept name instead of UUID. Add one-time migration for existing UUID-based directories.
+- Related: #93 (same root cause, noted independently).
+- **Evidence:** `agents.rs:186-189`, `workspace.rs:65-69`, `runs.rs:255-279`
+- **Owners:** Atlas
+
+99) HIGH: Failed runs lose user message and leave no session trace
+- `agent.rs:206-223` appends user and assistant messages only after `agent_loop()` returns `Ok(...)`. Any error before that point skips history persistence entirely.
+- The user's input disappears from session context on failure. Retrying after a failure exhibits "amnesia" — the agent has no record of what was attempted.
+- Fix: append the user message to session history *before* entering the agent loop. On failure, append a synthetic error marker message. Keep run record and session transcript aligned.
+- **Evidence:** `agent.rs:198-223`
+- **Owners:** Atlas
+
+100) HIGH: Changing the default agent does not affect live gateway behavior
+- `AppState` snapshots `default_agent_id` once at startup from the sidecar file / env var. `POST /agents/{id}/default` updates SQLite but not the running gateway.
+- Telegram/channel traffic is especially affected — it uses the gateway's fixed `self.agent_id`, which never updates.
+- Fix: make `default_agent_id` in AppState a shared mutable cell (`Arc<ArcSwap<AgentId>>` or similar). The set-default handler updates both SQLite and the live cell. Channel adapter reads the live value per message. Sidecar file becomes bootstrap-only fallback when registry is empty.
+- **Evidence:** `gateway.rs:90-107`, `agents.rs:295-310`, `server.rs:243-257`
+- **Owners:** Atlas
+
+101) MEDIUM: Unified config partially wired — session config and bind address ignored
+- `AlmsConfig.session` is defined and loaded but `gateway.rs:67-82` hard-resets to `SessionConfig::default()`.
+- `server.bind` / `ALMS_BIND` is loaded into config but the CLI startup path ignores it unless `--bind` is passed manually.
+- This undermines the "single source of truth" config model — some sections look real but have no effect.
+- Fix: plumb `config.session` into `GatewayConfig`. Make CLI `--bind` default to the loaded config value instead of hardcoded `127.0.0.1:8080`. Remove any config sections that aren't actually used.
+- **Evidence:** `config.rs:18-24`, `gateway.rs:67-82`, `main.rs:29-32`, `main.rs:129-152`
+- **Owners:** Atlas
+
+102) MEDIUM: SSE subscription leak — subscribe to nonexistent/finished runs without error
+- `runs.rs:598-605` always registers a live sender before checking run state. Subscribing to a nonexistent or already-finished run gets an open SSE stream instead of a 404.
+- Post-completion subscriptions leave stale `event_senders` entries that are never pruned (no future events to trigger cleanup).
+- Fix: check run existence and status *before* registering a sender. Return 404 for nonexistent runs, return the historical event log for finished runs (then close), only register a live sender for active runs. Add periodic or disconnect-aware cleanup for orphaned entries.
+- **Evidence:** `runs.rs:598-605`, `server.rs:93-99`, `server.rs:150-164`
+- **Owners:** Atlas
+
+103) LOW: Event log comments overstate durability
+- `event_log.rs:1` says "durable SSE event storage" and `server.rs:44-45` says "persistent event log for reconnect-after-restart support", but storage is `Arc<RwLock<Vec<LoggedEvent>>>` — purely in-memory.
+- Fix (short-term): downgrade comments to "in-memory replay during current process lifetime". Fix (long-term): persist replayable events to SQLite for actual cross-restart replay.
+- **Evidence:** `event_log.rs:1`, `event_log.rs:21-23`, `event_log.rs:57-64`
+- **Owners:** Atlas
+
+104) LOW: Query-string auth token on all routes leaks credentials
+- `auth.rs:19-20` and `auth.rs:40-45` allow `?token=...` query auth on every protected route, not just SSE.
+- Bearer tokens in URLs leak into server logs, browser history, and HTTP Referer headers.
+- Fix: restrict `?token=` query auth to SSE endpoints only (where `Authorization` headers aren't available from `EventSource`). All other routes require the `Authorization: Bearer` header.
+- **Evidence:** `auth.rs:19-20`, `auth.rs:40-45`
 - **Owners:** Atlas
 
 ---
