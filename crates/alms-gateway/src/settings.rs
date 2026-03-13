@@ -29,7 +29,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         tools.push("workspace_write");
     }
 
-    let agent_id = state.default_agent_id.0.to_string();
+    let agent_id = state.default_agent_id.read().unwrap().0.to_string();
 
     let agents_list = state
         .session_manager

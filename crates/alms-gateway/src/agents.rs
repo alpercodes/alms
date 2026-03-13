@@ -180,6 +180,7 @@ pub async fn create_agent(
                 })),
             )
         })?;
+        *state.default_agent_id.write().unwrap() = agent.id;
         agent.is_default = true;
     }
 
@@ -308,6 +309,9 @@ pub async fn set_default(
             })),
         )
     })?;
+
+    // Update the live default agent ID so the running gateway uses it immediately.
+    *state.default_agent_id.write().unwrap() = agent.id;
 
     Ok(Json(
         serde_json::json!({ "ok": true, "default_agent": agent.name }),

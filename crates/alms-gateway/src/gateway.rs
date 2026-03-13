@@ -9,7 +9,7 @@ use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult, SessionId};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
 use alms_session::{SessionConfig, SessionManager, SqliteStore};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -162,20 +162,21 @@ pub struct Gateway {
     session_manager: Arc<SessionManager>,
     channels: Channels,
     llm: LlmClient,
-    agent_id: AgentId,
+    /// Shared default agent ID — updated live when the default agent changes.
+    agent_id: Arc<RwLock<AgentId>>,
 }
 
 impl Gateway {
     /// Create a new gateway
     pub fn new(config: GatewayConfig) -> AlmsResult<Self> {
-        let agent_id = config.agent_id.unwrap_or_default();
+        let agent_id = Arc::new(RwLock::new(config.agent_id.unwrap_or_default()));
 
         let session_manager = match &config.db_path {
             Some(path) => {
                 info!("Opening SQLite session store at {}", path);
                 let store = SqliteStore::open(path)?;
                 // Auto-migrate sidecar agent into the agents registry
-                migrate_sidecar_agent(&store, agent_id);
+                migrate_sidecar_agent(&store, *agent_id.read().unwrap());
                 Arc::new(SessionManager::with_store(
                     config.session_config.clone(),
                     store,
@@ -262,12 +263,6 @@ impl Gateway {
             telegram_rx = Some(telegram.receive_updates().await?);
         }
 
-        let runtime = Arc::new(AgentRuntime::new(
-            self.agent_id,
-            self.config.agent_config.clone(),
-            self.llm.clone(),
-        ));
-
         loop {
             tokio::select! {
                 Some(msg) = async {
@@ -278,15 +273,22 @@ impl Gateway {
                     }
                 } => {
                     if let Some(ref telegram) = self.channels.telegram {
+                        // Read the live default agent ID per message so
+                        // set-default changes take effect immediately.
+                        let agent_id = self.agent_id();
+                        let runtime = Arc::new(AgentRuntime::new(
+                            agent_id,
+                            self.config.agent_config.clone(),
+                            self.llm.clone(),
+                        ));
                         let context_id = format!("telegram_{}", msg.chat_id.0);
-                        let session = self.session_manager.get_or_create(self.agent_id, &context_id);
-                        let rt = Arc::clone(&runtime);
+                        let session = self.session_manager.get_or_create(agent_id, &context_id);
                         let sm = Arc::clone(&self.session_manager);
                         let tg = Arc::clone(telegram);
                         session_queue.enqueue(
                             session.id,
                             Box::pin(async move {
-                                process_telegram_message(rt, sm, tg, msg).await;
+                                process_telegram_message(runtime, sm, tg, msg).await;
                             }),
                         );
                     }
@@ -325,8 +327,14 @@ impl Gateway {
     }
 
     /// Get agent ID
-    pub fn agent_id(&self) -> &AgentId {
-        &self.agent_id
+    /// Get a clone of the shared default agent ID handle.
+    pub fn agent_id_handle(&self) -> Arc<RwLock<AgentId>> {
+        Arc::clone(&self.agent_id)
+    }
+
+    /// Read the current default agent ID.
+    pub fn agent_id(&self) -> AgentId {
+        *self.agent_id.read().unwrap()
     }
 
     /// Get LLM client reference
@@ -506,7 +514,7 @@ mod tests {
             ..GatewayConfig::default()
         };
         let gateway = Gateway::new(config).unwrap();
-        assert_eq!(*gateway.agent_id(), expected);
+        assert_eq!(gateway.agent_id(), expected);
     }
 
     #[test]
