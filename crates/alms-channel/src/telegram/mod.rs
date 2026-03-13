@@ -13,6 +13,11 @@ use tracing::{error, info, warn};
 use types::*;
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org/bot";
+/// Telegram's hard limit for sendMessage text.
+// NOTE: Telegram counts UTF-16 code units, but we split on UTF-8 bytes.
+// This is conservative — we may over-split (send shorter chunks than needed)
+// but will never exceed the limit.
+const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
 /// Telegram Bot API client
 #[derive(Debug, Clone)]
@@ -117,7 +122,10 @@ impl TelegramChannel {
         self.get("getMe").await
     }
 
-    /// Send a raw message via the API
+    /// Send a raw message via the API.
+    ///
+    /// **Warning**: bypasses `split_message` — caller must ensure `text` fits
+    /// within [`TELEGRAM_MAX_MESSAGE_LEN`] or handle splitting themselves.
     pub async fn send_raw_message(
         &self,
         chat_id: i64,
@@ -191,6 +199,22 @@ impl TelegramChannel {
         Some(incoming)
     }
 
+    /// Send a single chunk via sendMessage, returning the sent message ID.
+    #[tracing::instrument(skip(self, text), fields(chat_id, text_len = text.len()))]
+    async fn send_chunk(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_to: Option<i64>,
+    ) -> AlmsResult<MessageId> {
+        let mut request = SendMessageRequest::new(chat_id, text);
+        if let Some(id) = reply_to {
+            request = request.reply_to(id);
+        }
+        let sent: SentMessage = self.post("sendMessage", &request).await?;
+        Ok(MessageId(sent.message_id))
+    }
+
     /// Run the polling loop
     async fn run_polling(&self, tx: mpsc::Sender<IncomingMessage>) -> AlmsResult<()> {
         info!("Starting Telegram polling loop");
@@ -226,6 +250,59 @@ impl TelegramChannel {
         info!("Telegram polling loop stopped");
         Ok(())
     }
+}
+
+/// Split `text` into chunks that each fit within `max_len` bytes.
+///
+/// Tries to break at paragraph boundaries (`\n\n`), then line boundaries (`\n`),
+/// and falls back to a hard char-boundary split as a last resort.
+fn split_message(text: &str, max_len: usize) -> Vec<&str> {
+    debug_assert!(max_len > 0);
+    if text.len() <= max_len {
+        return vec![text];
+    }
+
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        if remaining.len() <= max_len {
+            chunks.push(remaining);
+            break;
+        }
+
+        // Search window: the first `max_len` bytes (must land on a char boundary).
+        let window = &remaining[..floor_char_boundary(remaining, max_len)];
+
+        // Try paragraph break.
+        let split_at = window
+            .rfind("\n\n")
+            .map(|pos| pos + 2) // include the delimiter in the first chunk
+            // Try line break.
+            .or_else(|| window.rfind('\n').map(|pos| pos + 1))
+            // Hard split at char boundary.
+            .unwrap_or_else(|| floor_char_boundary(remaining, max_len));
+
+        let (chunk, rest) = remaining.split_at(split_at);
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+        remaining = rest;
+    }
+
+    chunks
+}
+
+/// Find the largest byte index ≤ `max` that falls on a UTF-8 char boundary.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    let mut idx = max;
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
 }
 
 impl Default for TelegramChannel {
@@ -265,16 +342,16 @@ impl Channel for TelegramChannel {
     }
 
     async fn send_message(&self, message: OutgoingMessage) -> AlmsResult<MessageId> {
-        let request = SendMessageRequest::new(message.chat_id.0, message.text).parse_mode("HTML");
+        let chunks = split_message(&message.text, TELEGRAM_MAX_MESSAGE_LEN);
+        let reply_to = message.reply_to.map(|id| id.0);
 
-        let request = if let Some(reply_to) = message.reply_to {
-            request.reply_to(reply_to.0)
-        } else {
-            request
-        };
-
-        let sent: SentMessage = self.post("sendMessage", &request).await?;
-        Ok(MessageId(sent.message_id))
+        let mut last_id = MessageId(0);
+        for (i, chunk) in chunks.iter().enumerate() {
+            // Only the first chunk replies to the original message.
+            let reply = if i == 0 { reply_to } else { None };
+            last_id = self.send_chunk(message.chat_id.0, chunk, reply).await?;
+        }
+        Ok(last_id)
     }
 
     async fn receive_updates(&self) -> AlmsResult<mpsc::Receiver<IncomingMessage>> {
@@ -321,3 +398,84 @@ impl Channel for TelegramChannel {
 }
 
 use serde::Serialize;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_message_unchanged() {
+        let text = "Hello, world!";
+        let chunks = split_message(text, 4096);
+        assert_eq!(chunks, vec!["Hello, world!"]);
+    }
+
+    #[test]
+    fn splits_at_paragraph_boundary() {
+        let a = "a".repeat(100);
+        let b = "b".repeat(100);
+        let text = format!("{}\n\n{}", a, b);
+        let chunks = split_message(&text, 150);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], format!("{}\n\n", a));
+        assert_eq!(chunks[1], b.as_str());
+    }
+
+    #[test]
+    fn splits_at_line_boundary() {
+        let a = "a".repeat(100);
+        let b = "b".repeat(100);
+        let text = format!("{}\n{}", a, b);
+        let chunks = split_message(&text, 150);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], format!("{}\n", a));
+        assert_eq!(chunks[1], b.as_str());
+    }
+
+    #[test]
+    fn hard_split_on_long_line() {
+        let text = "x".repeat(300);
+        let chunks = split_message(&text, 100);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 100);
+        assert_eq!(chunks[1].len(), 100);
+        assert_eq!(chunks[2].len(), 100);
+    }
+
+    #[test]
+    fn respects_utf8_char_boundaries() {
+        // Each emoji is 4 bytes. 10 emojis = 40 bytes.
+        let text = "😀".repeat(10);
+        let chunks = split_message(&text, 13); // 3 emojis = 12 bytes fits, 4th would be 16
+        // Should split at 12 bytes (3 emojis), not mid-emoji.
+        for chunk in &chunks {
+            assert!(chunk.len() <= 13);
+            // Verify valid UTF-8 (implicit since &str)
+            assert!(!chunk.is_empty());
+        }
+        let reassembled: String = chunks.concat();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn exact_boundary_no_split() {
+        let text = "a".repeat(4096);
+        let chunks = split_message(&text, 4096);
+        assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn prefers_paragraph_over_line() {
+        // Both \n\n and \n are present; should split at \n\n.
+        let text = "aaaa\nbbbb\n\ncccc";
+        let chunks = split_message(text, 12);
+        assert_eq!(chunks[0], "aaaa\nbbbb\n\n");
+        assert_eq!(chunks[1], "cccc");
+    }
+
+    #[test]
+    fn empty_message() {
+        let chunks = split_message("", 100);
+        assert_eq!(chunks, vec![""]);
+    }
+}
