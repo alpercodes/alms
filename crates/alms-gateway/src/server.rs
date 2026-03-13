@@ -10,6 +10,7 @@ use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{create_run, get_run_status, list_runs, scheduler_fire_loop, stream_run_events};
+use crate::session_queue::SessionQueue;
 use crate::settings::get_settings;
 use crate::sse::SseEventData;
 use crate::tasks::{get_task, list_tasks};
@@ -195,6 +196,8 @@ pub struct AppState {
     pub coordinator: Arc<Coordinator>,
     /// Token cancelled during graceful shutdown.
     pub shutdown_token: CancellationToken,
+    /// Per-session work queue — serializes runs within a session.
+    pub session_queue: Arc<SessionQueue<SessionId>>,
 }
 
 impl AppState {
@@ -233,7 +236,8 @@ impl AppState {
             job_store,
             scheduler,
             coordinator,
-            shutdown_token,
+            shutdown_token: shutdown_token.clone(),
+            session_queue: Arc::new(SessionQueue::new(shutdown_token)),
         })
     }
 }
@@ -462,9 +466,13 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     // without requiring us to lock the gateway mutex from outside.
     let background_gateway = state.gateway.clone();
     let gateway_token = shutdown_token.clone();
+    let gateway_session_queue = state.session_queue.clone();
     let gateway_handle = tokio::spawn(async move {
         let mut gateway = background_gateway.lock().await;
-        if let Err(e) = gateway.run_until_shutdown(gateway_token).await {
+        if let Err(e) = gateway
+            .run_until_shutdown(gateway_token, gateway_session_queue)
+            .await
+        {
             tracing::error!("Gateway message loop exited: {}", e);
         }
     });

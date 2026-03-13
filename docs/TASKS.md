@@ -38,6 +38,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-12:** Subagent workspaces + registry lookup (#70): `system_prompt` removed from `invoke_agent` tool. Named subagents looked up in agent registry for config. Workspace attached at `{workspace_dir}/{name}/`. `Coordinator.with_workspace_dir()` wired in gateway.
 - **2026-03-12:** Fix #55 (CRITICAL): LLM streaming hang — two bugs in `llm_client.rs` SSE parser. (1) `[DONE]` sentinel didn't terminate the stream; `parse_sse_event` returned `None` which hit `continue` → fell through to `bytes.next().await`, hanging if server doesn't close connection (HTTP/2, OpenRouter proxy). Fix: tri-state `SseParseResult` enum (Chunk/Done/Skip); `Done` terminates the unfold immediately. (2) No per-chunk read timeout; `reqwest::Client::timeout` only covers initial `send()`, not body reads. Fix: `tokio::time::timeout(60s)` on each `bytes.next().await`. 1 new test.
 - **2026-03-12:** Agent create workspace + CLI awareness (#84): CLI `alms agent create` and HTTP `POST /agents` now create workspace directory with empty identity files (personality.md, goals.md, memories.md, user.md). CLI outputs workspace path. Default system prompt tells agents they can run `alms --help` via shell_exec to discover CLI commands.
+- **2026-03-13:** Fix #56 (CRITICAL): Telegram shutdown — `AtomicBool`/`AtomicI64` replaced with `Arc<Atomic*>` so `stop()` propagates to polling task. Also fixes #59 (offset desync).
+- **2026-03-13:** Fix #57 (CRITICAL): Serial message processing — `handle_message().await` replaced with `tokio::spawn` per message. `SessionQueue<K>` added (`session_queue.rs`): per-session FIFO work queue backed by `DashMap<SessionId, UnboundedSender>`. Routes Telegram messages, HTTP `POST /runs`, and scheduler fire loop through the queue. 5 new tests (61 gateway total). `Gateway::run()` refactored to delegate to `run_until_shutdown()`.
 
 ---
 
@@ -485,14 +487,13 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 > The adapter works for basic demo but has 4 critical correctness bugs and several reliability gaps.
 > Logical implementation order: 56 → 57 → 58 → 59 → 60 → 61 → 62 → 63.
 
-56) Fix Telegram shutdown — stop signal never reaches polling task (CRITICAL)
-- `receive_updates()` clones the `TelegramChannel` with a **new** `AtomicBool`. `stop()` sets `running=false` on the original instance, but the spawned polling task checks its own copy. Polling continues until process exit.
-- Fix: replace `AtomicBool`/`AtomicI64` with `Arc<AtomicBool>`/`Arc<AtomicI64>` shared between original and clone, or replace with `CancellationToken`.
+56) Fix Telegram shutdown — stop signal never reaches polling task ✅
+- `receive_updates()` cloned `TelegramChannel` with independent `AtomicBool`/`AtomicI64`. `stop()` on original never reached polling task.
+- Fixed: replaced with `Arc<AtomicBool>`/`Arc<AtomicI64>` shared between original and clone.
 - **Owners:** Atlas
 
-57) Fix serial message processing — head-of-line blocking (CRITICAL)
-- `handle_message().await` in `run_until_shutdown()` blocks the `tokio::select!` loop. A 10s+ agent run blocks all incoming messages. The mpsc buffer (100) fills, polling stalls, Telegram may redeliver.
-- Fix: spawn each `handle_message` as a separate `tokio::spawn` task. Requires `Arc`-wrapping dependencies instead of `&self`.
+57) Fix serial message processing — head-of-line blocking ✅
+- `handle_message().await` blocked the `tokio::select!` loop. Fixed by spawning each message as a `tokio::spawn` task with `Arc`-wrapped dependencies. Per-session FIFO ordering added via `SessionQueue` — messages to the same session execute sequentially, different sessions concurrently. Same queue used for HTTP `POST /runs` and scheduler fire loop.
 - **Owners:** Atlas
 
 58) Fix polling latency — remove unnecessary interval ticker (CRITICAL)
@@ -500,10 +501,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: loop directly on `get_updates()` — the 30s Telegram timeout IS the wait mechanism. Add short sleep (1-5s with backoff) on error only.
 - **Owners:** Atlas
 
-59) Fix update offset desync — shared state between original and clone (CRITICAL)
-- Cloned `AtomicI64` for `last_update_id` is disconnected from the original. If `receive_updates()` were called twice, the second clone starts from a stale offset → message duplication.
-- Fix: use `Arc<AtomicI64>` shared between instances, or enforce single-call with a guard.
-- Related to #56 — can be fixed together.
+59) Fix update offset desync — shared state between original and clone ✅
+- Cloned `AtomicI64` for `last_update_id` was disconnected from the original. Fixed by #56's `Arc<AtomicI64>` change.
 - **Owners:** Atlas
 
 60) Handle Telegram 4096-character message limit

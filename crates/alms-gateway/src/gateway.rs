@@ -2,14 +2,16 @@
 //!
 //! Connects channels (Telegram, etc.) to agent runtimes with session management.
 
+use crate::session_queue::SessionQueue;
 use alms_channel::telegram::TelegramChannel;
 use alms_channel::{Channel, ChannelConfig};
-use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult};
+use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult, SessionId};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
 use alms_session::{SessionConfig, SessionManager, SqliteStore};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -235,63 +237,21 @@ impl Gateway {
         Ok(())
     }
 
-    /// Run the main message processing loop
+    /// Run the main message processing loop (standalone, no shutdown signal).
     pub async fn run(&mut self) -> AlmsResult<()> {
-        info!("Starting message processing loop");
-
-        // Start receiving messages from Telegram
-        let mut telegram_rx: Option<mpsc::Receiver<alms_channel::IncomingMessage>> = None;
-        if let Some(ref telegram) = self.channels.telegram {
-            telegram_rx = Some(telegram.receive_updates().await?);
-        }
-
-        // Create agent runtime (Arc-wrapped for concurrent message handling)
-        let runtime = Arc::new(AgentRuntime::new(
-            self.agent_id,
-            self.config.agent_config.clone(),
-            self.llm.clone(),
-        ));
-
-        loop {
-            tokio::select! {
-                // Handle Telegram messages
-                Some(msg) = async {
-                    if let Some(ref mut rx) = telegram_rx {
-                        rx.recv().await
-                    } else {
-                        None
-                    }
-                } => {
-                    if let Some(ref telegram) = self.channels.telegram {
-                        tokio::spawn(process_telegram_message(
-                            Arc::clone(&runtime),
-                            Arc::clone(&self.session_manager),
-                            Arc::clone(telegram),
-                            msg,
-                        ));
-                    }
-                }
-
-                // Add other channel handlers here as needed
-
-                else => {
-                    // All channels closed
-                    break;
-                }
-            }
-        }
-
-        info!("Message processing loop ended");
-        Ok(())
+        let token = CancellationToken::new();
+        let queue = Arc::new(SessionQueue::new(token.clone()));
+        self.run_until_shutdown(token, queue).await
     }
 
     /// Run the message processing loop until the shutdown token is cancelled.
     ///
-    /// This variant is used by `serve_with_gateway()` so the message loop
-    /// exits cooperatively without requiring an external mutex lock.
+    /// Messages to the same session are serialized via `session_queue` (FIFO).
+    /// Messages to different sessions process concurrently.
     pub async fn run_until_shutdown(
         &mut self,
-        token: tokio_util::sync::CancellationToken,
+        token: CancellationToken,
+        session_queue: Arc<SessionQueue<SessionId>>,
     ) -> AlmsResult<()> {
         info!("Starting message processing loop (shutdown-aware)");
 
@@ -316,12 +276,17 @@ impl Gateway {
                     }
                 } => {
                     if let Some(ref telegram) = self.channels.telegram {
-                        tokio::spawn(process_telegram_message(
-                            Arc::clone(&runtime),
-                            Arc::clone(&self.session_manager),
-                            Arc::clone(telegram),
-                            msg,
-                        ));
+                        let context_id = format!("telegram_{}", msg.chat_id.0);
+                        let session = self.session_manager.get_or_create(self.agent_id, &context_id);
+                        let rt = Arc::clone(&runtime);
+                        let sm = Arc::clone(&self.session_manager);
+                        let tg = Arc::clone(telegram);
+                        session_queue.enqueue(
+                            session.id,
+                            Box::pin(async move {
+                                process_telegram_message(rt, sm, tg, msg).await;
+                            }),
+                        );
                     }
                 }
                 _ = token.cancelled() => {
