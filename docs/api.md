@@ -282,11 +282,23 @@ data: {"run_id":"...","session_id":"...","ts":"..."}
 { "run_id": "<uuid>", "error": {"code":"INTERNAL","message":"..."} }
 ```
 
+`run_cancelled`
+```json
+{ "run_id": "<uuid>", "ts": "..." }
+```
+
 #### Reconnect (post-MVP)
 Support `Last-Event-ID` to resume streaming without losing events.
 
-### 5.4 Cancel a run (optional MVP)
-`POST /runs/{run_id}:cancel`
+### 5.4 Cancel a run
+`POST /runs/{run_id}/cancel`
+
+Cancels a running or queued run. Returns 200 with `{"run_id":"...","status":"cancelling"}`.
+Returns 404 if run not found, 409 if already finished.
+
+Cancellation is cooperative — the agent loop checks a `CancellationToken` at four points
+(iteration boundary, LLM call, tool execution, approval wait). The run transitions to
+`cancelled` status and emits a `run_cancelled` SSE event.
 
 ---
 

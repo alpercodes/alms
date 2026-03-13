@@ -170,6 +170,7 @@
     .run-item .run-tokens { flex-shrink: 0; font-size: 10px; color: #484f58; }
     .run-item.completed .run-status { color: #3fb950; }
     .run-item.failed    .run-status { color: #f85149; }
+    .run-item.cancelled .run-status { color: #484f58; }
     .run-item.running   .run-status { color: #d29922; }
     .run-empty { padding: 8px 10px; font-size: 11px; color: #484f58; font-style: italic; }
 
@@ -308,6 +309,21 @@
     }
     #send:not(:disabled):hover { background: #2ea043; }
     #send:disabled { opacity: 0.5; cursor: default; }
+
+    #cancel-run {
+      background: #da3633;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 8px 16px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 14px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    #cancel-run:hover { background: #f85149; }
+    #cancel-run:disabled { opacity: 0.5; cursor: default; }
 
     /* ── Right panel ── */
     #panel {
@@ -722,6 +738,7 @@
     <div id="input-area">
       <textarea id="prompt" rows="2" placeholder="Send a message… (Enter to send, Shift+Enter for newline)" disabled></textarea>
       <button id="send" disabled>Send</button>
+      <button id="cancel-run" style="display:none" title="Cancel run">Stop</button>
     </div>
   </div>
 
@@ -797,12 +814,14 @@ const S = {
 };
 
 let activeEs = null;  // current EventSource
+let activeRunId = null;  // run ID for in-flight cancel
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
 const statusEl     = document.getElementById('status');
 const messagesEl   = document.getElementById('messages');
 const promptEl     = document.getElementById('prompt');
 const sendBtn      = document.getElementById('send');
+const cancelBtn    = document.getElementById('cancel-run');
 const agentSelectEl = document.getElementById('agent-select');
 const sessionListEl = document.getElementById('session-list');
 const runListEl    = document.getElementById('run-list');
@@ -1017,6 +1036,7 @@ function renderRuns() {
 
     const icon = st === 'completed' ? '✓'
                : st === 'failed'    ? '✗'
+               : st === 'cancelled' ? '⊘'
                : st === 'running'   ? '⋯'
                : '·';
 
@@ -1318,6 +1338,9 @@ async function sendMessage() {
     }
     const data = await res.json();
     runId = data.run_id;
+    activeRunId = runId;
+    cancelBtn.style.display = '';
+    cancelBtn.disabled = false;
   } catch {
     setStatus('failed to start run', 'error');
     enableInput();
@@ -1350,6 +1373,8 @@ function openEventStream(runId) {
   function done() {
     es.close();
     activeEs = null;
+    activeRunId = null;
+    cancelBtn.style.display = 'none';
     const agent = S.agents.find(a => a.id === S.activeAgentId);
     setStatus(agent ? agent.name : 'ready', 'ok');
     enableInput();
@@ -1414,6 +1439,12 @@ function openEventStream(runId) {
     done();
     appendMsg('agent', `Error: ${error?.message ?? JSON.stringify(error)}`);
     setStatus('error', 'error');
+  });
+
+  es.addEventListener('run_cancelled', () => {
+    appendMsg('agent', '(run cancelled)');
+    done();
+    setStatus('cancelled', 'ok');
   });
 
   es.onerror = () => {
@@ -2145,6 +2176,15 @@ promptEl.addEventListener('keydown', e => {
   }
 });
 sendBtn.addEventListener('click', sendMessage);
+cancelBtn.addEventListener('click', async () => {
+  if (!activeRunId) return;
+  cancelBtn.disabled = true;
+  try {
+    await fetch(`/runs/${activeRunId}/cancel`, { method: 'POST' });
+  } catch { /* ignore — SSE event will handle UI */ }
+  // Re-enable after 3s if run_cancelled SSE hasn't fired yet (e.g. network issue).
+  setTimeout(() => { if (activeRunId) cancelBtn.disabled = false; }, 3000);
+});
 
 promptEl.addEventListener('input', () => {
   promptEl.style.height = 'auto';

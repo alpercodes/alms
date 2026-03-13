@@ -9,7 +9,9 @@ use crate::cron_utils;
 use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
-use crate::runs::{create_run, get_run_status, list_runs, scheduler_fire_loop, stream_run_events};
+use crate::runs::{
+    cancel_run, create_run, get_run_status, list_runs, scheduler_fire_loop, stream_run_events,
+};
 use crate::session_queue::SessionQueue;
 use crate::settings::get_settings;
 use crate::sse::SseEventData;
@@ -47,6 +49,8 @@ pub struct RunManager {
     in_flight: Arc<AtomicUsize>,
     /// Notified when an in-flight run completes (counter reaches zero).
     drain_notify: Arc<tokio::sync::Notify>,
+    /// Per-run cancellation tokens for cooperative cancellation.
+    cancel_tokens: Arc<DashMap<RunId, CancellationToken>>,
 }
 
 impl RunManager {
@@ -57,6 +61,7 @@ impl RunManager {
             event_log: EventLogManager::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
+            cancel_tokens: Arc::new(DashMap::new()),
         }
     }
 
@@ -132,6 +137,31 @@ impl RunManager {
         self.runs
             .entry(run_id)
             .and_modify(|r| r.mark_failed(error.clone()));
+    }
+
+    /// Atomically transition a run to Cancelled state.
+    pub fn mark_run_as_cancelled(&self, run_id: RunId) {
+        self.runs.entry(run_id).and_modify(|r| r.mark_cancelled());
+    }
+
+    /// Store a per-run cancellation token.
+    pub fn register_cancel_token(&self, run_id: RunId, token: CancellationToken) {
+        self.cancel_tokens.insert(run_id, token);
+    }
+
+    /// Trigger cancellation for a run. Returns true if the token was found.
+    pub fn cancel_run(&self, run_id: RunId) -> bool {
+        if let Some(entry) = self.cancel_tokens.get(&run_id) {
+            entry.value().cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a per-run cancellation token (cleanup after run ends).
+    pub fn remove_cancel_token(&self, run_id: RunId) {
+        self.cancel_tokens.remove(&run_id);
     }
 
     /// List runs for a session, newest first, up to `limit`.
@@ -298,6 +328,7 @@ fn protected_router() -> Router<AppState> {
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{run_id}", get(get_run_status))
         .route("/runs/{run_id}/events", get(stream_run_events))
+        .route("/runs/{run_id}/cancel", post(cancel_run))
         // Approvals
         .route("/approvals", get(list_approvals))
         .route("/approvals/{approval_id}", post(resolve_approval))
@@ -781,5 +812,49 @@ mod tests {
         assert!(rm.event_senders.contains_key(&run_id));
         rm.remove_senders(run_id);
         assert!(!rm.event_senders.contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_run_triggers_token() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token.clone());
+
+        assert!(!token.is_cancelled());
+        assert!(rm.cancel_run(run_id));
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_unknown_run_returns_false() {
+        let rm = RunManager::new();
+        assert!(!rm.cancel_run(RunId::new()));
+    }
+
+    #[tokio::test]
+    async fn test_remove_cancel_token_cleanup() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token);
+
+        rm.remove_cancel_token(run_id);
+        // After removal, cancel_run should return false
+        assert!(!rm.cancel_run(run_id));
+    }
+
+    #[tokio::test]
+    async fn test_mark_run_as_cancelled() {
+        let rm = RunManager::new();
+        let run = Run::new(SessionId::new(), AgentId::new(), "test".to_string());
+        let run_id = run.run_id;
+        rm.insert_run(run);
+        rm.mark_run_as_running(run_id);
+        rm.mark_run_as_cancelled(run_id);
+
+        let r = rm.get_run(run_id).unwrap();
+        assert_eq!(r.status, alms_core::RunStatus::Cancelled);
+        assert!(r.ended_at.is_some());
     }
 }

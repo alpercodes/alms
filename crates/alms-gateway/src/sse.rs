@@ -180,6 +180,16 @@ impl SseEventData {
             },
         )
     }
+
+    pub fn run_cancelled(run_id: RunId) -> Self {
+        Self::new(
+            "run_cancelled",
+            RunCancelledData {
+                run_id: run_id.0.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
 }
 
 /// SSE event stream wrapper
@@ -337,6 +347,12 @@ struct RunErrorData {
 struct ErrorData {
     code: String,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RunCancelledData {
+    run_id: String,
+    ts: DateTime<Utc>,
 }
 
 #[cfg(test)]

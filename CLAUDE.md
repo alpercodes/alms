@@ -129,6 +129,7 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 - 4 sandbox/wasmtime tests fail with "must use async instantiation when async support is enabled" — pre-existing wasmtime config issue
 - `fs_*` tools are sandboxed via `canonicalize()` + prefix check against `tools.sandbox_root` (default: cwd). `shell_exec` cwd is restricted in sandboxed mode, but the executed command itself can still access files outside the sandbox — for true shell isolation, use a restricted OS user or Landlock (future task)
 - Guarded posture + parallel tool calls: when the LLM issues multiple tool calls in one response, all approval requests fire simultaneously (join_all) rather than sequentially
+- Run cancellation does not propagate to active subagents — cancelling a parent run drops the `join_all` future but subagent tasks in the Coordinator continue running to completion (or timeout). This means subagent LLM calls keep burning tokens after the user cancels. Fix requires threading the parent's `CancellationToken` into `spawn_subagent`.
 
 ## Current State (as of 2026-03-12)
 

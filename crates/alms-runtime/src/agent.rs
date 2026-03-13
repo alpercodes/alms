@@ -13,6 +13,7 @@ use alms_core::{AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, Token
 use alms_session::{
     ContextSummary, Message as SessionMessage, Role as SessionRole, SessionManager,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{Span, debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -81,6 +82,8 @@ pub struct AgentRuntime {
     event_sender: Option<RuntimeEventSender>,
     /// Run ID for audit event correlation (set by gateway before execution).
     run_id: Option<alms_core::RunId>,
+    /// Per-run cancellation token for cooperative cancellation.
+    cancel_token: Option<CancellationToken>,
 }
 
 impl AgentRuntime {
@@ -115,6 +118,7 @@ impl AgentRuntime {
             workspace: None,
             event_sender: None,
             run_id: None,
+            cancel_token: None,
         }
     }
 
@@ -156,6 +160,12 @@ impl AgentRuntime {
     /// Set the run ID for audit event correlation.
     pub fn with_run_id(mut self, run_id: alms_core::RunId) -> Self {
         self.run_id = Some(run_id);
+        self
+    }
+
+    /// Attach a cancellation token for cooperative run cancellation.
+    pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
+        self.cancel_token = Some(token);
         self
     }
 
@@ -234,6 +244,22 @@ impl AgentRuntime {
                 );
 
                 Ok(RunOutput { response, usage })
+            }
+            Err(AlmsError::Cancelled) => {
+                let cancel_msg = SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: SessionRole::Assistant,
+                    content: alms_session::Content::Text("[Run cancelled by user]".to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                };
+                if let Err(append_err) = session_manager.append_message(session.id, cancel_msg) {
+                    warn!(
+                        "Failed to persist cancellation marker to session: {}",
+                        append_err
+                    );
+                }
+                Err(AlmsError::Cancelled)
             }
             Err(e) => {
                 // Write a sanitized error marker so the session reflects the failed attempt
@@ -434,6 +460,14 @@ impl AgentRuntime {
         let mut total_usage = TokenUsage::default();
 
         loop {
+            // Checkpoint A: check cancellation between iterations.
+            if let Some(ref token) = self.cancel_token
+                && token.is_cancelled()
+            {
+                info!(agent_id = %self.agent_id.0, "Run cancelled by user");
+                return Err(AlmsError::Cancelled);
+            }
+
             if iterations >= self.config.max_iterations {
                 warn!(
                     target: "agent::loop",
@@ -458,13 +492,31 @@ impl AgentRuntime {
                 .with_tools(self.tools.to_definitions())
                 .with_max_tokens(self.config.max_tokens);
 
+            // Checkpoint B: LLM call with cancellation support.
             // Stream the LLM call, emitting token_delta events as chunks arrive.
             // Falls back to buffered mode if streaming fails.
-            let (content, tool_calls, usage) = match self.stream_llm_call(request.clone()).await {
+            let streaming_future = self.stream_llm_call(request.clone());
+            let stream_result = if let Some(ref token) = self.cancel_token {
+                tokio::select! {
+                    result = streaming_future => result,
+                    _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                }
+            } else {
+                streaming_future.await
+            };
+            let (content, tool_calls, usage) = match stream_result {
                 Ok(result) => result,
                 Err(e) => {
                     warn!("Streaming failed, falling back to buffered: {}", e);
-                    let response = self.llm.complete(request).await?;
+                    let buffered_future = self.llm.complete(request);
+                    let response = if let Some(ref token) = self.cancel_token {
+                        tokio::select! {
+                            result = buffered_future => result?,
+                            _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                        }
+                    } else {
+                        buffered_future.await?
+                    };
                     let usage = response.usage.clone();
                     let choice = response.choices.into_iter().next().ok_or_else(|| {
                         alms_core::AlmsError::Runtime("No response from LLM".to_string())
@@ -487,18 +539,26 @@ impl AgentRuntime {
                     tool_call_id: None,
                 });
 
+                // Checkpoint C: tool execution with cancellation support.
                 // Run all tool calls concurrently so background invoke_agent calls
                 // don't block each other, and independent tools finish in parallel.
                 //
                 // NOTE — Guarded posture: when multiple tool calls arrive in a single
                 // LLM response, all approval requests are emitted concurrently. The UI
                 // will show them simultaneously rather than one at a time.
-                let results = futures::future::join_all(
+                let tool_future = futures::future::join_all(
                     tool_calls
                         .iter()
                         .map(|tc| self.execute_tool_call(tc, session_manager, session_id)),
-                )
-                .await;
+                );
+                let results = if let Some(ref token) = self.cancel_token {
+                    tokio::select! {
+                        r = tool_future => r,
+                        _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                    }
+                } else {
+                    tool_future.await
+                };
 
                 for (tool_call, result) in tool_calls.iter().zip(results) {
                     let content = match result {
@@ -699,24 +759,32 @@ impl AgentRuntime {
                 params: args.clone(),
                 decision_tx,
             });
-            match decision_rx.await {
-                Ok(true) => {} // approved — proceed
-                Ok(false) => {
-                    let _ = sender.send(RuntimeEvent::ToolEnd {
-                        invocation_id,
-                        ok: false,
-                        result: serde_json::json!({"error": "denied by user"}),
-                    });
-                    return Err(alms_core::AlmsError::ToolExecution(format!(
-                        "Tool '{}' denied by user",
-                        name
-                    )));
+            // Checkpoint D: approval wait with cancellation support.
+            let approved = if let Some(ref token) = self.cancel_token {
+                tokio::select! {
+                    result = decision_rx => result.unwrap_or(false),
+                    _ = token.cancelled() => return Err(AlmsError::Cancelled),
                 }
-                Err(_) => {
-                    return Err(alms_core::AlmsError::ToolExecution(
-                        "Approval channel closed".to_string(),
-                    ));
+            } else {
+                match decision_rx.await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(alms_core::AlmsError::ToolExecution(
+                            "Approval channel closed".to_string(),
+                        ));
+                    }
                 }
+            };
+            if !approved {
+                let _ = sender.send(RuntimeEvent::ToolEnd {
+                    invocation_id,
+                    ok: false,
+                    result: serde_json::json!({"error": "denied by user"}),
+                });
+                return Err(alms_core::AlmsError::ToolExecution(format!(
+                    "Tool '{}' denied by user",
+                    name
+                )));
             }
         }
 
@@ -824,6 +892,7 @@ fn sanitize_error_for_session(err: &AlmsError) -> String {
         }
         AlmsError::SessionNotFound(_) => "Session not found".to_string(),
         AlmsError::InvalidConfig(_) => "Invalid configuration".to_string(),
+        AlmsError::Cancelled => "Run cancelled by user".to_string(),
         AlmsError::Io(_) => "I/O error".to_string(),
         _ => "Internal error".to_string(),
     }
@@ -857,6 +926,7 @@ mod tests {
             workspace: None,
             event_sender: Some(tx),
             run_id: None,
+            cancel_token: None,
         };
 
         let request =
@@ -891,6 +961,7 @@ mod tests {
             workspace: None,
             event_sender: None,
             run_id: None,
+            cancel_token: None,
         };
 
         let session_config = SessionConfig::default();
