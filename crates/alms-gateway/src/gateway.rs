@@ -150,7 +150,7 @@ fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
 /// Active channel connections
 #[derive(Debug)]
 struct Channels {
-    telegram: Option<TelegramChannel>,
+    telegram: Option<Arc<TelegramChannel>>,
 }
 
 /// The ALMS Gateway - orchestrates channels, sessions, and agents
@@ -213,7 +213,7 @@ impl Gateway {
             };
 
             telegram.initialize(channel_config).await?;
-            self.channels.telegram = Some(telegram);
+            self.channels.telegram = Some(Arc::new(telegram));
             info!("Telegram channel initialized");
         } else {
             warn!("No Telegram token configured, skipping Telegram channel");
@@ -245,12 +245,12 @@ impl Gateway {
             telegram_rx = Some(telegram.receive_updates().await?);
         }
 
-        // Create agent runtime
-        let runtime = AgentRuntime::new(
+        // Create agent runtime (Arc-wrapped for concurrent message handling)
+        let runtime = Arc::new(AgentRuntime::new(
             self.agent_id,
             self.config.agent_config.clone(),
             self.llm.clone(),
-        );
+        ));
 
         loop {
             tokio::select! {
@@ -262,8 +262,13 @@ impl Gateway {
                         None
                     }
                 } => {
-                    if let Err(e) = self.handle_message(&runtime, msg).await {
-                        error!("Error handling message: {}", e);
+                    if let Some(ref telegram) = self.channels.telegram {
+                        tokio::spawn(process_telegram_message(
+                            Arc::clone(&runtime),
+                            Arc::clone(&self.session_manager),
+                            Arc::clone(telegram),
+                            msg,
+                        ));
                     }
                 }
 
@@ -295,11 +300,11 @@ impl Gateway {
             telegram_rx = Some(telegram.receive_updates().await?);
         }
 
-        let runtime = AgentRuntime::new(
+        let runtime = Arc::new(AgentRuntime::new(
             self.agent_id,
             self.config.agent_config.clone(),
             self.llm.clone(),
-        );
+        ));
 
         loop {
             tokio::select! {
@@ -310,8 +315,13 @@ impl Gateway {
                         None
                     }
                 } => {
-                    if let Err(e) = self.handle_message(&runtime, msg).await {
-                        error!("Error handling message: {}", e);
+                    if let Some(ref telegram) = self.channels.telegram {
+                        tokio::spawn(process_telegram_message(
+                            Arc::clone(&runtime),
+                            Arc::clone(&self.session_manager),
+                            Arc::clone(telegram),
+                            msg,
+                        ));
                     }
                 }
                 _ = token.cancelled() => {
@@ -328,59 +338,6 @@ impl Gateway {
         self.stop().await?;
 
         info!("Message processing loop ended");
-        Ok(())
-    }
-
-    /// Handle an incoming message
-    async fn handle_message(
-        &self,
-        runtime: &AgentRuntime,
-        msg: alms_channel::IncomingMessage,
-    ) -> AlmsResult<()> {
-        info!("Received message from chat {}: {}", msg.chat_id.0, msg.text);
-
-        // Use chat_id as context_id for session management
-        let context_id = format!("telegram_{}", msg.chat_id.0);
-
-        // Run the agent
-        match runtime
-            .run(&self.session_manager, &context_id, &msg.text)
-            .await
-        {
-            Ok(output) => {
-                // Send response back via Telegram
-                if let Some(ref telegram) = self.channels.telegram {
-                    let outgoing = alms_channel::OutgoingMessage {
-                        chat_id: msg.chat_id,
-                        text: output.response,
-                        reply_to: Some(msg.message_id),
-                        options: Default::default(),
-                    };
-
-                    if let Err(e) = telegram.send_message(outgoing).await {
-                        error!("Failed to send response: {}", e);
-                    } else {
-                        info!("Response sent successfully");
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Agent error: {}", e);
-
-                // Send error message back to user
-                if let Some(ref telegram) = self.channels.telegram {
-                    let outgoing = alms_channel::OutgoingMessage {
-                        chat_id: msg.chat_id,
-                        text: "Sorry, I encountered an error processing your message.".to_string(),
-                        reply_to: Some(msg.message_id),
-                        options: Default::default(),
-                    };
-
-                    let _ = telegram.send_message(outgoing).await;
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -433,6 +390,50 @@ impl Gateway {
     /// Get auth token (None = auth disabled)
     pub fn auth_token(&self) -> Option<&str> {
         self.config.auth_token.as_deref()
+    }
+}
+
+/// Handle a single Telegram message in its own spawned task.
+///
+/// Takes owned `Arc`s so each message is processed concurrently without
+/// blocking the select loop (fixes head-of-line blocking).
+async fn process_telegram_message(
+    runtime: Arc<AgentRuntime>,
+    session_manager: Arc<SessionManager>,
+    telegram: Arc<TelegramChannel>,
+    msg: alms_channel::IncomingMessage,
+) {
+    info!("Received message from chat {}: {}", msg.chat_id.0, msg.text);
+
+    let context_id = format!("telegram_{}", msg.chat_id.0);
+
+    match runtime.run(&session_manager, &context_id, &msg.text).await {
+        Ok(output) => {
+            let outgoing = alms_channel::OutgoingMessage {
+                chat_id: msg.chat_id,
+                text: output.response,
+                reply_to: Some(msg.message_id),
+                options: Default::default(),
+            };
+
+            if let Err(e) = telegram.send_message(outgoing).await {
+                error!("Failed to send response: {}", e);
+            } else {
+                info!("Response sent successfully");
+            }
+        }
+        Err(e) => {
+            error!("Agent error: {}", e);
+
+            let outgoing = alms_channel::OutgoingMessage {
+                chat_id: msg.chat_id,
+                text: "Sorry, I encountered an error processing your message.".to_string(),
+                reply_to: Some(msg.message_id),
+                options: Default::default(),
+            };
+
+            let _ = telegram.send_message(outgoing).await;
+        }
     }
 }
 
