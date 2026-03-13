@@ -805,7 +805,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 111) URGENT: Message ordering / context assembly issues
 - Something is wrong with the order messages get sent to the model, or how session context is assembled. Manifests as the agent appearing confused about conversation flow or missing context.
 - Needs investigation: check how `ContextBuilder.build()` orders history messages, whether the session `append_message()` timestamps are reliable, and whether the sliding-summary strategy preserves ordering. Also check if tool_call/tool_result pairs stay adjacent.
-- Related: token defaults are reasonable (32k input budget, 4k output per iteration), so this is likely an ordering/assembly bug rather than truncation.
+- Related: default `max_input_tokens` is 32k which is likely **too low** for tool-using agents. A few tool call + result pairs (especially `fs_read`, `shell_exec`) can burn through 32k in 3-4 iterations, causing the agent to lose earlier conversation context. Modern models support 128k-200k — the default should be raised significantly (e.g. 100k+) so the agent isn't artificially starved of context.
 - Note: `max_tokens_per_run` config exists but is never enforced — cumulative token budget across iterations is not checked.
 - **Owners:** Atlas
 
