@@ -241,7 +241,9 @@ impl Gateway {
     pub async fn run(&mut self) -> AlmsResult<()> {
         let token = CancellationToken::new();
         let queue = Arc::new(SessionQueue::new(token.clone()));
-        self.run_until_shutdown(token, queue).await
+        let result = self.run_until_shutdown(token.clone(), queue).await;
+        token.cancel();
+        result
     }
 
     /// Run the message processing loop until the shutdown token is cancelled.

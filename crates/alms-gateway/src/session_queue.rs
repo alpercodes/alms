@@ -110,6 +110,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
                     Ok(None) => {
                         // All senders dropped — channel closed.
                         debug!(key = ?key, "Session queue handler exiting: channel closed");
+                        senders.remove(&key);
                         break;
                     }
                     Err(_) => {
