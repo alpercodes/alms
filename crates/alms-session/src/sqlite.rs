@@ -385,7 +385,13 @@ impl SqliteStore {
                         return None;
                     }
                 };
-                let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+                let metadata = metadata_str.and_then(|s| match serde_json::from_str(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::debug!("Message {id}: ignoring bad metadata JSON: {e}");
+                        None
+                    }
+                });
                 Some(Message {
                     id,
                     role: str_to_role(&role_str),
@@ -476,13 +482,43 @@ impl SqliteStore {
                     error_str,
                     ts_str,
                 )| {
-                    let session_uuid = uuid::Uuid::parse_str(&sid).ok()?;
+                    let session_uuid = match uuid::Uuid::parse_str(&sid) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            tracing::warn!("Skipping audit row: bad session UUID {sid}: {e}");
+                            return None;
+                        }
+                    };
                     let run_id = run_id_str
-                        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+                        .and_then(|s| match uuid::Uuid::parse_str(&s) {
+                            Ok(u) => Some(u),
+                            Err(e) => {
+                                tracing::debug!("Audit row {sid}: ignoring bad run_id UUID: {e}");
+                                None
+                            }
+                        })
                         .map(RunId);
-                    let params = serde_json::from_str(&params_str).ok()?;
-                    let result = result_str.and_then(|s| serde_json::from_str(&s).ok());
-                    let ts = chrono::DateTime::parse_from_rfc3339(&ts_str).ok()?;
+                    let params = match serde_json::from_str(&params_str) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!("Skipping audit row {sid}: bad params JSON: {e}");
+                            return None;
+                        }
+                    };
+                    let result = result_str.and_then(|s| match serde_json::from_str(&s) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::debug!("Audit row {sid}: ignoring bad result JSON: {e}");
+                            None
+                        }
+                    });
+                    let ts = match chrono::DateTime::parse_from_rfc3339(&ts_str) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!("Skipping audit row {sid}: bad timestamp: {e}");
+                            return None;
+                        }
+                    };
                     let decision = if decision_str == "allow" {
                         AuditDecision::Allow
                     } else {
