@@ -231,20 +231,16 @@ async fn execute_run(
                 }
             });
 
-    // Build runtime — drop gateway lock before running to avoid blocking other requests
+    // Use AppState snapshots — no gateway lock needed.
     let merged = apply_overrides(
-        {
-            let gateway = state.gateway.lock().await;
-            gateway.agent_config().clone()
-        },
+        state.agent_config.clone(),
         agent_record.as_ref(),
         &overrides,
     );
     let agent_config = merged.agent_config;
 
     let llm = {
-        let gateway = state.gateway.lock().await;
-        let llm = gateway.llm().clone();
+        let llm = state.llm.clone();
         if let Some(model) = merged.model_override {
             info!("Run {} using model override: {}", run_id.0, model);
             llm.with_model(model)

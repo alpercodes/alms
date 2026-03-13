@@ -198,6 +198,16 @@ pub struct AppState {
     pub shutdown_token: CancellationToken,
     /// Per-session work queue — serializes runs within a session.
     pub session_queue: Arc<SessionQueue<SessionId>>,
+    /// Snapshot of LLM config — read once at startup so handlers avoid locking the gateway.
+    pub llm_config: alms_runtime::LlmConfig,
+    /// Snapshot of agent config — read once at startup so handlers avoid locking the gateway.
+    pub agent_config: alms_runtime::AgentConfig,
+    /// Default agent ID — read once at startup.
+    pub default_agent_id: AgentId,
+    /// LLM client clone — read once at startup so run execution avoids locking the gateway.
+    pub llm: alms_runtime::LlmClient,
+    /// Auth token — read once at startup.
+    pub auth_token_value: Option<String>,
 }
 
 impl AppState {
@@ -210,6 +220,9 @@ impl AppState {
         let session_manager = gateway.session_manager().clone();
         let llm = gateway.llm().clone();
         let agent_id = *gateway.agent_id();
+        let llm_config = gateway.llm_config().clone();
+        let agent_config = gateway.agent_config().clone();
+        let auth_token_value = gateway.auth_token().map(String::from);
         let job_store = match gateway.db_path() {
             Some(path) => {
                 tracing::info!("Opening SQLite job store at {}", path);
@@ -220,8 +233,8 @@ impl AppState {
         let mut coord = Coordinator::with_agent_config(
             agent_id,
             session_manager.clone(),
-            llm,
-            gateway.agent_config().clone(),
+            llm.clone(),
+            agent_config.clone(),
         );
         if let Some(ref ws_dir) = workspace_dir {
             coord = coord.with_workspace_dir(ws_dir.clone());
@@ -238,6 +251,11 @@ impl AppState {
             coordinator,
             shutdown_token: shutdown_token.clone(),
             session_queue: Arc::new(SessionQueue::new(shutdown_token)),
+            llm_config,
+            agent_config,
+            default_agent_id: agent_id,
+            llm,
+            auth_token_value,
         })
     }
 }
@@ -492,13 +510,8 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let fire_state = state.clone();
     let fire_handle = tokio::spawn(scheduler_fire_loop(fire_rx, fire_state));
 
-    // Read auth token BEFORE spawning the gateway message loop.
-    // The message loop holds the gateway mutex for its entire lifetime,
-    // so reading it after spawning would race and sometimes deadlock.
-    let auth_token = {
-        let gateway = state.gateway.lock().await;
-        AuthToken(gateway.auth_token().map(String::from))
-    };
+    // Use the auth token snapshot from AppState — no mutex lock needed.
+    let auth_token = AuthToken(state.auth_token_value.clone());
 
     // Spawn the channel message loop (Telegram polling, etc.).
     // The loop selects on the shutdown token so it exits cooperatively
