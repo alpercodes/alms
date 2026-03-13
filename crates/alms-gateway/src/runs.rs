@@ -26,7 +26,6 @@ use tracing::{error, info, instrument, warn};
 #[derive(Debug, Default)]
 struct RunOverrides {
     model: Option<String>,
-    temperature: Option<f32>,
     max_tokens: Option<u32>,
     posture: Option<String>,
 }
@@ -71,9 +70,6 @@ fn apply_overrides(
     }
 
     // ── Per-run overrides (highest precedence) ──
-    if let Some(t) = overrides.temperature {
-        cfg.temperature = t.clamp(0.0, 2.0);
-    }
     if let Some(m) = overrides.max_tokens.filter(|&m| m > 0) {
         cfg.max_tokens = m;
     }
@@ -134,7 +130,6 @@ pub async fn create_run(
 
     let overrides = RunOverrides {
         model: req.model.clone(),
-        temperature: req.temperature,
         max_tokens: req.max_tokens,
         posture: req.posture.clone(),
     };
@@ -639,7 +634,6 @@ mod tests {
     fn base_config() -> AgentConfig {
         AgentConfig {
             system_prompt: "server default prompt".into(),
-            temperature: 0.7,
             max_tokens: 4096,
             posture: Posture::FullControl,
             ..AgentConfig::default()
@@ -670,7 +664,6 @@ mod tests {
         let base = base_config();
         let merged = apply_overrides(base.clone(), None, &RunOverrides::default());
         assert_eq!(merged.agent_config.system_prompt, "server default prompt");
-        assert_eq!(merged.agent_config.temperature, 0.7);
         assert_eq!(merged.agent_config.max_tokens, 4096);
         assert!(matches!(merged.agent_config.posture, Posture::FullControl));
         assert!(merged.model_override.is_none());
@@ -683,8 +676,7 @@ mod tests {
         assert_eq!(merged.agent_config.system_prompt, "agent prompt");
         assert!(matches!(merged.agent_config.posture, Posture::Guarded));
         assert_eq!(merged.model_override.as_deref(), Some("custom-model"));
-        // Temperature and max_tokens not overridden by agent
-        assert_eq!(merged.agent_config.temperature, 0.7);
+        // max_tokens not overridden by agent
         assert_eq!(merged.agent_config.max_tokens, 4096);
     }
 
@@ -693,7 +685,6 @@ mod tests {
         let agent = test_agent(Some("agent-model"), Some("agent prompt"), Some("guarded"));
         let overrides = RunOverrides {
             model: Some("run-model".into()),
-            temperature: Some(1.5),
             max_tokens: Some(8192),
             posture: Some("full_control".into()),
         };
@@ -702,8 +693,7 @@ mod tests {
         assert_eq!(merged.model_override.as_deref(), Some("run-model"));
         // Per-run posture wins over per-agent
         assert!(matches!(merged.agent_config.posture, Posture::FullControl));
-        // Per-run temperature and max_tokens applied
-        assert_eq!(merged.agent_config.temperature, 1.5);
+        // Per-run max_tokens applied
         assert_eq!(merged.agent_config.max_tokens, 8192);
         // system_prompt still comes from agent (no per-run system_prompt override)
         assert_eq!(merged.agent_config.system_prompt, "agent prompt");
@@ -713,27 +703,15 @@ mod tests {
     fn test_per_run_only() {
         let overrides = RunOverrides {
             model: Some("run-model".into()),
-            temperature: Some(0.0),
             max_tokens: Some(256),
             posture: Some("guarded".into()),
         };
         let merged = apply_overrides(base_config(), None, &overrides);
         assert_eq!(merged.model_override.as_deref(), Some("run-model"));
-        assert_eq!(merged.agent_config.temperature, 0.0);
         assert_eq!(merged.agent_config.max_tokens, 256);
         assert!(matches!(merged.agent_config.posture, Posture::Guarded));
         // system_prompt stays as server default
         assert_eq!(merged.agent_config.system_prompt, "server default prompt");
-    }
-
-    #[test]
-    fn test_temperature_clamped() {
-        let overrides = RunOverrides {
-            temperature: Some(5.0),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(base_config(), None, &overrides);
-        assert_eq!(merged.agent_config.temperature, 2.0);
     }
 
     #[test]
@@ -752,16 +730,6 @@ mod tests {
         let merged = apply_overrides(base_config(), Some(&agent), &RunOverrides::default());
         // Unknown posture keeps server default
         assert!(matches!(merged.agent_config.posture, Posture::FullControl));
-    }
-
-    #[test]
-    fn test_negative_temperature_clamped() {
-        let overrides = RunOverrides {
-            temperature: Some(-1.0),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(base_config(), None, &overrides);
-        assert_eq!(merged.agent_config.temperature, 0.0);
     }
 
     #[test]

@@ -55,7 +55,6 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "model": llm.default_model,
         "base_url": llm.base_url,
-        "temperature": agent.temperature,
         "max_tokens": agent.max_tokens,
         "posture": posture_str,
         "context_strategy": agent.context_config.strategy,

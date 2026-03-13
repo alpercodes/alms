@@ -517,8 +517,7 @@
       border-radius: 4px;
       padding: 8px 10px;
       display: flex;
-      align-items: center;
-      gap: 8px;
+      flex-direction: column;
     }
     .agent-card.default { border-color: #58a6ff; }
     .agent-card-name { font-size: 12px; color: #e6edf3; font-weight: bold; flex: 1; }
@@ -650,37 +649,10 @@
     <h2>Settings</h2>
 
     <div class="settings-row">
-      <div class="settings-label">Model</div>
-      <input type="text" class="settings-input" id="settings-model"
-             list="model-suggestions" placeholder="server default"
-             autocomplete="off" spellcheck="false">
-      <datalist id="model-suggestions">
-        <option value="moonshotai/kimi-k2.5">
-        <option value="anthropic/claude-3.5-haiku">
-        <option value="anthropic/claude-3.5-sonnet">
-        <option value="anthropic/claude-3-opus">
-        <option value="openai/gpt-4o">
-        <option value="openai/gpt-4o-mini">
-        <option value="google/gemini-flash-1.5">
-        <option value="meta-llama/llama-3.1-8b-instruct:free">
-        <option value="mistralai/mistral-7b-instruct:free">
-      </datalist>
-      <div class="settings-hint" id="settings-model-hint"></div>
-    </div>
-
-    <div class="settings-grid">
-      <div class="settings-row">
-        <div class="settings-label">Temperature</div>
-        <input type="number" class="settings-input" id="settings-temperature"
-               min="0" max="2" step="0.05" placeholder="server default">
-        <div class="settings-hint">0.0–2.0 · creativity</div>
-      </div>
-      <div class="settings-row">
-        <div class="settings-label">Max tokens</div>
-        <input type="number" class="settings-input" id="settings-max-tokens"
-               min="256" max="32768" step="256" placeholder="server default">
-        <div class="settings-hint">max response length</div>
-      </div>
+      <div class="settings-label">Max tokens</div>
+      <input type="number" class="settings-input" id="settings-max-tokens"
+             min="256" max="32768" step="256" placeholder="server default">
+      <div class="settings-hint">max response length</div>
     </div>
 
     <div class="settings-row">
@@ -762,6 +734,18 @@
       <button class="panel-tab" id="tab-jobs" onclick="switchPanelTab('jobs')">Jobs</button>
       <button class="panel-tab" id="tab-audit" onclick="switchPanelTab('audit')">Audit</button>
     </div>
+
+    <datalist id="agent-model-suggestions">
+      <option value="moonshotai/kimi-k2.5">
+      <option value="anthropic/claude-3.5-haiku">
+      <option value="anthropic/claude-3.5-sonnet">
+      <option value="anthropic/claude-3-opus">
+      <option value="openai/gpt-4o">
+      <option value="openai/gpt-4o-mini">
+      <option value="google/gemini-flash-1.5">
+      <option value="meta-llama/llama-3.1-8b-instruct:free">
+      <option value="mistralai/mistral-7b-instruct:free">
+    </datalist>
 
     <!-- Agents tab -->
     <div class="panel-body" id="panel-agents" style="display:none">
@@ -1312,8 +1296,6 @@ async function sendMessage() {
       input: { type: 'text', text },
     };
     const local = loadLocalSettings();
-    if (local.model)       runBody.model       = local.model;
-    if (local.temperature != null) runBody.temperature = local.temperature;
     if (local.max_tokens  != null) runBody.max_tokens  = local.max_tokens;
     if (local.posture)     runBody.posture      = local.posture;
 
@@ -1863,9 +1845,6 @@ const SETTINGS_KEY = 'alms_settings';
 let serverDefaults = {};
 
 const settingsOverlay    = document.getElementById('settings-overlay');
-const settingsModelIn    = document.getElementById('settings-model');
-const settingsModelHint  = document.getElementById('settings-model-hint');
-const settingsTempIn     = document.getElementById('settings-temperature');
 const settingsMaxTokIn   = document.getElementById('settings-max-tokens');
 const settingsPostureSel = document.getElementById('settings-posture');
 const settingsServerInfo = document.getElementById('settings-server-info');
@@ -1879,7 +1858,6 @@ function saveLocalSettings(obj) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(obj));
 }
 
-function getActiveModel()    { return loadLocalSettings().model       || null; }
 function getActivePosture()  { return loadLocalSettings().posture     || null; }
 
 async function fetchServerDefaults() {
@@ -1901,28 +1879,20 @@ function updatePostureBadge() {
 
 function openSettings() {
   const local = loadLocalSettings();
-  settingsModelIn.value    = local.model       || '';
-  settingsTempIn.value     = local.temperature != null ? local.temperature : '';
   settingsMaxTokIn.value   = local.max_tokens  != null ? local.max_tokens  : '';
   settingsPostureSel.value = local.posture     || '';
 
-  settingsModelIn.placeholder = serverDefaults.model || 'server default';
-  settingsTempIn.placeholder  = serverDefaults.temperature != null ? String(serverDefaults.temperature) : 'server default';
   settingsMaxTokIn.placeholder = serverDefaults.max_tokens != null ? String(serverDefaults.max_tokens) : 'server default';
 
-  settingsModelHint.textContent = serverDefaults.model
-    ? `Server default: ${serverDefaults.model}`
-    : 'Leave blank to use the server default';
-
   const infoLines = [];
+  if (serverDefaults.model)            infoLines.push(`Default model: ${serverDefaults.model}`);
   if (serverDefaults.base_url)         infoLines.push(`URL: ${serverDefaults.base_url}`);
   if (serverDefaults.context_strategy) infoLines.push(`Context: ${serverDefaults.context_strategy}`);
   if (serverDefaults.enabled_tools)    infoLines.push(`Tools: ${serverDefaults.enabled_tools.join(', ')}`);
   settingsServerInfo.textContent = infoLines.join(' · ') || '—';
 
-  renderAgentPanel();
   settingsOverlay.classList.add('open');
-  settingsModelIn.focus();
+  settingsMaxTokIn.focus();
 }
 
 function closeSettings() {
@@ -1935,11 +1905,9 @@ function onOverlayClick(e) {
 
 function applySettings() {
   const local = loadLocalSettings();
-  const model       = settingsModelIn.value.trim() || null;
-  const temperature = settingsTempIn.value !== '' ? parseFloat(settingsTempIn.value) : null;
   const max_tokens  = settingsMaxTokIn.value !== '' ? parseInt(settingsMaxTokIn.value, 10) : null;
   const posture     = settingsPostureSel.value || null;
-  saveLocalSettings({ ...local, model, temperature, max_tokens, posture });
+  saveLocalSettings({ ...local, max_tokens, posture });
   updateSettingsBtn();
   updatePostureBadge();
   closeSettings();
@@ -1947,11 +1915,10 @@ function applySettings() {
 
 function updateSettingsBtn() {
   const local = loadLocalSettings();
-  const hasOverride = !!(local.model || local.temperature != null || local.max_tokens != null || local.posture);
+  const hasOverride = !!(local.max_tokens != null || local.posture);
   const btn = document.getElementById('btn-settings');
   btn.classList.toggle('active', hasOverride);
   const parts = [];
-  if (local.model) parts.push(`model: ${local.model}`);
   if (local.posture) parts.push(`posture: ${local.posture}`);
   btn.title = parts.length ? parts.join(', ') : 'Settings';
 }
@@ -1967,9 +1934,16 @@ function renderAgentPanel() {
     return;
   }
 
+  const wsBase = serverDefaults.workspace_dir || './data/workspace';
+
   for (const agent of S.agents) {
     const card = document.createElement('div');
     card.className = 'agent-card' + (agent.is_default ? ' default' : '');
+
+    // ── Header row (clickable to expand) ──
+    const header = document.createElement('div');
+    header.className = 'agent-card-header';
+    header.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;width:100%';
 
     const name = document.createElement('span');
     name.className = 'agent-card-name';
@@ -1997,15 +1971,71 @@ function renderAgentPanel() {
       badges.appendChild(b);
     }
 
-    const actions = document.createElement('span');
+    header.appendChild(name);
+    header.appendChild(badges);
+
+    // ── Expandable detail section ──
+    const detail = document.createElement('div');
+    detail.className = 'agent-card-detail';
+    detail.style.cssText = 'display:none;flex-direction:column;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid #21262d;width:100%';
+
+    // Workspace path
+    const wsRow = document.createElement('div');
+    wsRow.style.cssText = 'font-size:11px;color:#8b949e;word-break:break-all';
+    wsRow.textContent = `Workspace: ${wsBase}/${agent.name}/`;
+    detail.appendChild(wsRow);
+
+    // Model input row
+    const modelRow = document.createElement('div');
+    modelRow.style.cssText = 'display:flex;gap:6px;align-items:center';
+    const modelLabel = document.createElement('span');
+    modelLabel.style.cssText = 'font-size:11px;color:#8b949e;flex-shrink:0';
+    modelLabel.textContent = 'Model:';
+    const modelInput = document.createElement('input');
+    modelInput.type = 'text';
+    modelInput.className = 'settings-input';
+    modelInput.style.cssText = 'font-size:11px;padding:3px 6px;flex:1';
+    modelInput.placeholder = serverDefaults.model || 'server default';
+    modelInput.value = agent.model || '';
+    modelInput.spellcheck = false;
+    modelInput.autocomplete = 'off';
+    modelInput.setAttribute('list', 'agent-model-suggestions');
+    const modelSave = document.createElement('button');
+    modelSave.className = 'agent-card-btn';
+    modelSave.textContent = 'save';
+    modelSave.onclick = async (e) => {
+      e.stopPropagation();
+      modelSave.disabled = true;
+      const newModel = modelInput.value.trim() || null;
+      try {
+        const res = await fetch(`/agents/${agent.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: newModel === null ? '' : newModel }),
+        });
+        if (res.ok) await refreshAgents();
+      } catch { /* ignore */ }
+      modelSave.disabled = false;
+    };
+    modelInput.addEventListener('click', e => e.stopPropagation());
+    modelInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); modelSave.click(); } });
+    modelRow.appendChild(modelLabel);
+    modelRow.appendChild(modelInput);
+    modelRow.appendChild(modelSave);
+    detail.appendChild(modelRow);
+
+    // Action buttons row
+    const actions = document.createElement('div');
     actions.className = 'agent-card-actions';
+    actions.style.marginTop = '4px';
 
     if (!agent.is_default) {
       const defBtn = document.createElement('button');
       defBtn.className = 'agent-card-btn';
-      defBtn.textContent = 'default';
+      defBtn.textContent = 'set default';
       defBtn.title = 'Set as default agent';
-      defBtn.onclick = async () => {
+      defBtn.onclick = async (e) => {
+        e.stopPropagation();
         defBtn.disabled = true;
         try {
           const res = await fetch(`/agents/${agent.id}/default`, { method: 'POST' });
@@ -2021,13 +2051,13 @@ function renderAgentPanel() {
       delBtn.className = 'agent-card-btn danger';
       delBtn.textContent = 'delete';
       delBtn.title = 'Delete agent';
-      delBtn.onclick = async () => {
+      delBtn.onclick = async (e) => {
+        e.stopPropagation();
         if (!confirm(`Delete agent "${agent.name}"? This cannot be undone.`)) return;
         delBtn.disabled = true;
         try {
           const res = await fetch(`/agents/${agent.id}`, { method: 'DELETE' });
           if (res.ok) {
-            // If we deleted the active agent, switch to default
             const wasActive = agent.id === S.activeAgentId;
             await refreshAgents();
             if (wasActive && S.agents.length > 0) {
@@ -2043,10 +2073,16 @@ function renderAgentPanel() {
       };
       actions.appendChild(delBtn);
     }
+    detail.appendChild(actions);
 
-    card.appendChild(name);
-    card.appendChild(badges);
-    card.appendChild(actions);
+    // Toggle expand on header click
+    header.onclick = () => {
+      const open = detail.style.display !== 'none';
+      detail.style.display = open ? 'none' : 'flex';
+    };
+
+    card.appendChild(header);
+    card.appendChild(detail);
     container.appendChild(card);
   }
 }

@@ -281,7 +281,6 @@ async fn main() -> anyhow::Result<()> {
                 session,
                 input,
                 model,
-                temperature,
                 max_tokens,
                 posture,
             } => {
@@ -290,7 +289,6 @@ async fn main() -> anyhow::Result<()> {
                     &session,
                     &input,
                     model,
-                    temperature,
                     max_tokens,
                     posture,
                     json,
