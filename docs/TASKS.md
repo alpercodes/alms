@@ -707,6 +707,11 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Investigate: check `invoke_agent` tool execution path, `Coordinator::run_subagent`, and how subagent events are forwarded to the parent SSE stream.
 - **Owners:** Atlas
 
+97) Dead code audit — thorough review for unused types, modules, and functions
+- The codebase has accumulated scaffolding and speculative abstractions that are never used (e.g. the now-removed `Capability`, `AgentRole`, `SubagentType` enums).
+- Do a systematic pass across all crates: check for unused pub types, unused functions, dead modules, stale imports, and orphaned test helpers. `cargo clippy` catches private dead code but not unused `pub` items.
+- **Owners:** Atlas
+
 96) Empty speech bubbles in chat
 - An empty agent speech bubble sometimes appears in the chat with no text content.
 - Likely cause: `getAgentBody()` creates a new bubble on `token_delta` but the LLM response starts with tool calls (no text), or a bubble is created after a tool but no subsequent text follows.

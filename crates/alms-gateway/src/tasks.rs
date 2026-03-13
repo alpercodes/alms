@@ -17,10 +17,9 @@ pub async fn list_tasks(State(state): State<AppState>) -> impl IntoResponse {
     let tasks = state.coordinator.list_active();
     let items: Vec<serde_json::Value> = tasks
         .into_iter()
-        .map(|(task_id, agent_type, status)| {
+        .map(|(task_id, status)| {
             serde_json::json!({
                 "task_id": task_id.0,
-                "agent_type": format!("{:?}", agent_type),
                 "status": format!("{:?}", status),
             })
         })

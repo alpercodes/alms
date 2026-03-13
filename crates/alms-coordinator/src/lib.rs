@@ -1,4 +1,3 @@
-use alms_core::agent::Capability;
 use alms_core::{AgentId, AlmsResult, RunId, SessionId};
 use alms_runtime::events::RuntimeEventSender;
 use alms_runtime::subagent::{PollResult, SubagentDispatcher};
@@ -34,65 +33,11 @@ impl Default for TaskId {
     }
 }
 
-/// Types of specialized subagents
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SubagentType {
-    /// Research and information gathering
-    Research,
-    /// Code generation and review
-    Code,
-    /// Data processing and analysis
-    Data,
-    /// External API integrations
-    Integration,
-    /// Security analysis
-    Security,
-    /// General purpose (default)
-    General,
-}
-
-impl SubagentType {
-    pub fn default_capabilities(&self) -> Vec<Capability> {
-        match self {
-            SubagentType::Research => vec![
-                Capability::Search,
-                Capability::Read,
-                Capability::Custom("summarize".to_string()),
-            ],
-            SubagentType::Code => vec![
-                Capability::CodeExecution,
-                Capability::Custom("lint".to_string()),
-                Capability::Custom("test_run".to_string()),
-                Capability::Read,
-                Capability::Write,
-            ],
-            SubagentType::Data => vec![
-                Capability::Custom("query".to_string()),
-                Capability::Custom("transform".to_string()),
-                Capability::Custom("visualize".to_string()),
-            ],
-            SubagentType::Integration => vec![
-                Capability::Http,
-                Capability::Custom("webhook".to_string()),
-                Capability::Custom("notify".to_string()),
-            ],
-            SubagentType::Security => vec![
-                Capability::Custom("scan".to_string()),
-                Capability::Custom("audit".to_string()),
-                Capability::Custom("report".to_string()),
-            ],
-            SubagentType::General => vec![Capability::Custom("*".to_string())],
-        }
-    }
-}
-
 /// Request to spawn a subagent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentRequest {
     pub task: String,
-    pub agent_type: SubagentType,
     pub timeout: Duration,
-    pub capabilities: Vec<Capability>,
     pub parent_session: SessionId,
     pub parent_run_id: Option<RunId>,
     /// Optional persistent name. When provided, the subagent must be
@@ -125,7 +70,6 @@ pub struct TaskResult {
 #[derive(Debug)]
 pub struct SubagentHandle {
     pub task_id: TaskId,
-    pub agent_type: SubagentType,
     pub status: TaskStatus,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub cancel_tx: oneshot::Sender<()>,
@@ -204,7 +148,6 @@ impl Coordinator {
         level = "info",
         skip(self, request, parent_event_tx),
         fields(
-            subagent_type = ?request.agent_type,
             parent_session = %request.parent_session.0,
             timeout_secs = %request.timeout.as_secs(),
         )
@@ -215,14 +158,12 @@ impl Coordinator {
         parent_event_tx: Option<RuntimeEventSender>,
     ) -> AlmsResult<TaskId> {
         let task_id = TaskId::new();
-        let agent_type = request.agent_type;
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel::<TaskResult>();
         let parent_run_id = request.parent_run_id;
 
         let handle = SubagentHandle {
             task_id,
-            agent_type,
             status: TaskStatus::Pending,
             started_at: chrono::Utc::now(),
             cancel_tx,
@@ -236,7 +177,6 @@ impl Coordinator {
         info!(
             target: "coordinator::subagent_spawned",
             task_id = %task_id.0,
-            subagent_type = ?agent_type,
             parent_session = %request.parent_session.0,
             "Subagent spawned"
         );
@@ -306,10 +246,10 @@ impl Coordinator {
     }
 
     /// List all active subagents
-    pub fn list_active(&self) -> Vec<(TaskId, SubagentType, TaskStatus)> {
+    pub fn list_active(&self) -> Vec<(TaskId, TaskStatus)> {
         self.subagents
             .iter()
-            .map(|e| (*e.key(), e.value().agent_type, e.value().status))
+            .map(|e| (*e.key(), e.value().status))
             .collect()
     }
 }
@@ -326,9 +266,7 @@ impl SubagentDispatcher for Coordinator {
     ) -> AlmsResult<String> {
         let request = SubagentRequest {
             task,
-            agent_type: SubagentType::General,
             timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
-            capabilities: SubagentType::General.default_capabilities(),
             parent_session: parent_session_id,
             parent_run_id,
             subagent_name,
@@ -382,9 +320,7 @@ impl SubagentDispatcher for Coordinator {
     ) -> alms_core::AlmsResult<Uuid> {
         let request = SubagentRequest {
             task,
-            agent_type: SubagentType::General,
             timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
-            capabilities: SubagentType::General.default_capabilities(),
             parent_session: parent_session_id,
             parent_run_id,
             subagent_name,
@@ -463,7 +399,6 @@ async fn run_subagent(
         target: "subagent::started",
         task_id = %task_id.0,
         task = %request.task,
-        subagent_type = ?request.agent_type,
         "Subagent execution started"
     );
 
@@ -777,9 +712,7 @@ mod tests {
 
         let request = SubagentRequest {
             task: "Long running task".to_string(),
-            agent_type: SubagentType::General,
             timeout: Duration::from_secs(300),
-            capabilities: SubagentType::General.default_capabilities(),
             parent_session: session_id,
             parent_run_id: None,
             subagent_name: None,
@@ -809,9 +742,7 @@ mod tests {
 
         let request = SubagentRequest {
             task: "Will timeout".to_string(),
-            agent_type: SubagentType::General,
             timeout: Duration::from_nanos(1),
-            capabilities: SubagentType::General.default_capabilities(),
             parent_session: session_id,
             parent_run_id: None,
             subagent_name: None,
@@ -845,9 +776,7 @@ mod tests {
 
         let request = SubagentRequest {
             task: "List test".to_string(),
-            agent_type: SubagentType::Research,
             timeout: Duration::from_secs(300),
-            capabilities: SubagentType::Research.default_capabilities(),
             parent_session: session_id,
             parent_run_id: None,
             subagent_name: None,
@@ -856,7 +785,7 @@ mod tests {
 
         let active = coord.list_active();
         assert!(
-            active.iter().any(|(id, _, _)| *id == task_id),
+            active.iter().any(|(id, _)| *id == task_id),
             "Spawned task should appear in list_active"
         );
     }
@@ -879,9 +808,7 @@ mod tests {
 
         let request = SubagentRequest {
             task: "Take rx test".to_string(),
-            agent_type: SubagentType::General,
             timeout: Duration::from_secs(300),
-            capabilities: SubagentType::General.default_capabilities(),
             parent_session: session_id,
             parent_run_id: None,
             subagent_name: None,
