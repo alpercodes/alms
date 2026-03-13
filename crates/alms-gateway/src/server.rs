@@ -492,6 +492,14 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let fire_state = state.clone();
     let fire_handle = tokio::spawn(scheduler_fire_loop(fire_rx, fire_state));
 
+    // Read auth token BEFORE spawning the gateway message loop.
+    // The message loop holds the gateway mutex for its entire lifetime,
+    // so reading it after spawning would race and sometimes deadlock.
+    let auth_token = {
+        let gateway = state.gateway.lock().await;
+        AuthToken(gateway.auth_token().map(String::from))
+    };
+
     // Spawn the channel message loop (Telegram polling, etc.).
     // The loop selects on the shutdown token so it exits cooperatively
     // without requiring us to lock the gateway mutex from outside.
@@ -507,11 +515,6 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
             tracing::error!("Gateway message loop exited: {}", e);
         }
     });
-
-    let auth_token = {
-        let gateway = state.gateway.lock().await;
-        AuthToken(gateway.auth_token().map(String::from))
-    };
     if auth_token.0.is_none() {
         tracing::warn!(
             "ALMS_AUTH_TOKEN is not set — API authentication is DISABLED. \
