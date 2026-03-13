@@ -689,8 +689,8 @@
         <input type="text" id="onboard-name" placeholder="my-agent" spellcheck="false">
       </div>
       <div>
-        <label for="onboard-workspace">Workspace directory</label>
-        <input type="text" id="onboard-workspace" placeholder="./data/workspace" spellcheck="false">
+        <label for="onboard-workspace">Workspace directory (server-configured)</label>
+        <input type="text" id="onboard-workspace" placeholder="./data/workspace" spellcheck="false" readonly style="opacity:0.6;cursor:default">
       </div>
       <div class="onboard-error" id="onboard-error"></div>
       <button class="onboard-btn" id="onboard-create-btn" onclick="onboardCreateAgent()">Create agent</button>

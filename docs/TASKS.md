@@ -451,7 +451,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 52) CLI — run and job commands ✅
 - `alms run {create, list, show}` — all via HTTP API (runs are in-memory only, no SQLite table).
-- `run create --session ID --input "text" [--model M] [--temperature T] [--max-tokens N] [--posture P]` — calls POST /runs.
+- `run create --session ID --input "text" [--model M] [--max-tokens N] [--posture P]` — calls POST /runs.
 - `alms job {list, show}` — direct SQLite access (no gateway needed).
 - `alms job {create, cancel}` — via HTTP API (gateway must be running for scheduler registration).
 - `--url` / `ALMS_GATEWAY_URL` env var for gateway address. Auth token forwarded from `ALMS_AUTH_TOKEN`.
