@@ -202,8 +202,8 @@ pub struct AppState {
     pub llm_config: alms_runtime::LlmConfig,
     /// Snapshot of agent config — read once at startup so handlers avoid locking the gateway.
     pub agent_config: alms_runtime::AgentConfig,
-    /// Default agent ID — read once at startup.
-    pub default_agent_id: AgentId,
+    /// Default agent ID — shared with Gateway, updated live on set-default.
+    pub default_agent_id: Arc<std::sync::RwLock<AgentId>>,
     /// LLM client clone — read once at startup so run execution avoids locking the gateway.
     pub llm: alms_runtime::LlmClient,
     /// Auth token — read once at startup.
@@ -219,7 +219,8 @@ impl AppState {
         let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
         let session_manager = gateway.session_manager().clone();
         let llm = gateway.llm().clone();
-        let agent_id = *gateway.agent_id();
+        let agent_id = gateway.agent_id();
+        let default_agent_id = gateway.agent_id_handle();
         let llm_config = gateway.llm_config().clone();
         let agent_config = gateway.agent_config().clone();
         let auth_token_value = gateway.auth_token().map(String::from);
@@ -269,7 +270,7 @@ impl AppState {
             session_queue: Arc::new(SessionQueue::new(shutdown_token)),
             llm_config,
             agent_config,
-            default_agent_id: agent_id,
+            default_agent_id,
             llm,
             auth_token_value,
         })
