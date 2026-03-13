@@ -240,6 +240,22 @@ impl AppState {
             coord = coord.with_workspace_dir(ws_dir.clone());
         }
         let coordinator = Arc::new(coord);
+
+        // Migrate any legacy UUID-based workspace directories to name-based paths.
+        if let Some(ws_dir) = &workspace_dir
+            && let Some(store) = session_manager.store()
+            && let Ok(agents) = store.list_agents()
+        {
+            let pairs: Vec<_> = agents.iter().map(|a| (a.id.0, a.name.clone())).collect();
+            match alms_core::migrate_workspace_dirs(ws_dir, &pairs) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    "Migrated {n} workspace directories from UUID to name-based paths"
+                ),
+                Err(e) => tracing::warn!("Workspace migration error: {e}"),
+            }
+        }
+
         Ok(Self {
             session_manager,
             gateway: Arc::new(tokio::sync::Mutex::new(gateway)),
@@ -299,9 +315,9 @@ fn protected_router() -> Router<AppState> {
         )
         .route("/agents/{id_or_name}/default", post(agents::set_default))
         // Workspace (agent identity files)
-        .route("/agents/{agent_id}/workspace", get(get_workspace))
+        .route("/agents/{id_or_name}/workspace", get(get_workspace))
         .route(
-            "/agents/{agent_id}/workspace/{file}",
+            "/agents/{id_or_name}/workspace/{file}",
             axum::routing::put(update_workspace_file),
         )
         // Settings (server defaults for UI pre-population)

@@ -14,7 +14,7 @@ pub use error::{AlmsError, AlmsResult};
 pub use job::{CreateJobRequest, Job, JobId, JobSchedule, JobStatus};
 pub use registry::{
     AgentRecord, CreateAgentRequest, UpdateAgentRequest, WORKSPACE_FILENAMES, init_workspace_files,
-    validate_agent_name,
+    migrate_workspace_dirs, validate_agent_name,
 };
 pub use run::{
     CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
