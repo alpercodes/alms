@@ -6,9 +6,8 @@ use axum::{Json, extract::State, response::IntoResponse};
 
 /// GET /settings — returns current server defaults for UI pre-population.
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
-    let gateway = state.gateway.lock().await;
-    let llm = gateway.llm_config();
-    let agent = gateway.agent_config();
+    let llm = &state.llm_config;
+    let agent = &state.agent_config;
     let posture_str = match agent.posture {
         Posture::FullControl => "full_control",
         Posture::Guarded => "guarded",
@@ -30,7 +29,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         tools.push("workspace_write");
     }
 
-    let agent_id = gateway.agent_id().0.to_string();
+    let agent_id = state.default_agent_id.0.to_string();
 
     let agents_list = state
         .session_manager
@@ -48,15 +47,20 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect::<Vec<_>>();
 
+    let workspace_dir = state
+        .workspace_dir
+        .as_ref()
+        .map(|p| p.display().to_string());
+
     Json(serde_json::json!({
         "model": llm.default_model,
         "base_url": llm.base_url,
-        "temperature": agent.temperature,
         "max_tokens": agent.max_tokens,
         "posture": posture_str,
         "context_strategy": agent.context_config.strategy,
         "enabled_tools": tools,
         "agent_id": agent_id,
         "agents": agents_list,
+        "workspace_dir": workspace_dir,
     }))
 }

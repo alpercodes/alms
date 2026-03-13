@@ -33,8 +33,6 @@ pub struct AgentConfig {
     pub system_prompt: String,
     /// Maximum iterations for tool loops
     pub max_iterations: u32,
-    /// Temperature for LLM
-    pub temperature: f32,
     /// Maximum tokens per response
     pub max_tokens: u32,
     /// Context window management config
@@ -55,7 +53,6 @@ impl Default for AgentConfig {
                 for managing agents, sessions, and runs."
                 .to_string(),
             max_iterations: 10,
-            temperature: 0.7,
             max_tokens: 4096,
             context_config: ContextConfig::default(),
             posture: Posture::FullControl,
@@ -434,7 +431,6 @@ impl AgentRuntime {
             let request = CompletionRequest::new(self.llm.default_model())
                 .with_messages(messages.clone())
                 .with_tools(self.tools.to_definitions())
-                .with_temperature(self.config.temperature)
                 .with_max_tokens(self.config.max_tokens);
 
             // Stream the LLM call, emitting token_delta events as chunks arrive.
@@ -785,7 +781,6 @@ mod tests {
     async fn test_agent_config_default() {
         let config = AgentConfig::default();
         assert_eq!(config.max_iterations, 10);
-        assert_eq!(config.temperature, 0.7);
         assert!(!config.system_prompt.is_empty());
         assert_eq!(config.posture, Posture::FullControl);
     }

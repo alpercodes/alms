@@ -16,9 +16,6 @@ pub(crate) enum RunCommands {
         /// Model override
         #[arg(long)]
         model: Option<String>,
-        /// Temperature override (0.0-2.0)
-        #[arg(long)]
-        temperature: Option<f32>,
         /// Max tokens override
         #[arg(long)]
         max_tokens: Option<u32>,
@@ -48,7 +45,6 @@ pub(crate) async fn run_create(
     session: &str,
     input: &str,
     model: Option<String>,
-    temperature: Option<f32>,
     max_tokens: Option<u32>,
     posture: Option<String>,
     json: bool,
@@ -61,7 +57,6 @@ pub(crate) async fn run_create(
             text: input.to_string(),
         },
         model,
-        temperature,
         max_tokens,
         posture,
     };

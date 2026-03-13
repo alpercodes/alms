@@ -198,6 +198,16 @@ pub struct AppState {
     pub shutdown_token: CancellationToken,
     /// Per-session work queue — serializes runs within a session.
     pub session_queue: Arc<SessionQueue<SessionId>>,
+    /// Snapshot of LLM config — read once at startup so handlers avoid locking the gateway.
+    pub llm_config: alms_runtime::LlmConfig,
+    /// Snapshot of agent config — read once at startup so handlers avoid locking the gateway.
+    pub agent_config: alms_runtime::AgentConfig,
+    /// Default agent ID — read once at startup.
+    pub default_agent_id: AgentId,
+    /// LLM client clone — read once at startup so run execution avoids locking the gateway.
+    pub llm: alms_runtime::LlmClient,
+    /// Auth token — read once at startup.
+    pub auth_token_value: Option<String>,
 }
 
 impl AppState {
@@ -210,6 +220,9 @@ impl AppState {
         let session_manager = gateway.session_manager().clone();
         let llm = gateway.llm().clone();
         let agent_id = *gateway.agent_id();
+        let llm_config = gateway.llm_config().clone();
+        let agent_config = gateway.agent_config().clone();
+        let auth_token_value = gateway.auth_token().map(String::from);
         let job_store = match gateway.db_path() {
             Some(path) => {
                 tracing::info!("Opening SQLite job store at {}", path);
@@ -220,8 +233,8 @@ impl AppState {
         let mut coord = Coordinator::with_agent_config(
             agent_id,
             session_manager.clone(),
-            llm,
-            gateway.agent_config().clone(),
+            llm.clone(),
+            agent_config.clone(),
         );
         if let Some(ref ws_dir) = workspace_dir {
             coord = coord.with_workspace_dir(ws_dir.clone());
@@ -238,6 +251,11 @@ impl AppState {
             coordinator,
             shutdown_token: shutdown_token.clone(),
             session_queue: Arc::new(SessionQueue::new(shutdown_token)),
+            llm_config,
+            agent_config,
+            default_agent_id: agent_id,
+            llm,
+            auth_token_value,
         })
     }
 }
@@ -428,6 +446,37 @@ async fn websocket_handler(
     })
 }
 
+/// TCP listener wrapper that sets TCP_NODELAY on every accepted connection.
+///
+/// Nagle's algorithm buffers small writes, which delays SSE events from
+/// reaching the browser.  Disabling it ensures token_delta frames are sent
+/// immediately.
+struct NoDelayListener(tokio::net::TcpListener);
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok((stream, addr)) => {
+                    let _ = stream.set_nodelay(true);
+                    return (stream, addr);
+                }
+                Err(e) => {
+                    tracing::error!("TCP accept error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
 /// Start the gateway HTTP server
 pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
     let gateway = Gateway::from_env()?;
@@ -461,6 +510,9 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let fire_state = state.clone();
     let fire_handle = tokio::spawn(scheduler_fire_loop(fire_rx, fire_state));
 
+    // Use the auth token snapshot from AppState — no mutex lock needed.
+    let auth_token = AuthToken(state.auth_token_value.clone());
+
     // Spawn the channel message loop (Telegram polling, etc.).
     // The loop selects on the shutdown token so it exits cooperatively
     // without requiring us to lock the gateway mutex from outside.
@@ -476,11 +528,6 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
             tracing::error!("Gateway message loop exited: {}", e);
         }
     });
-
-    let auth_token = {
-        let gateway = state.gateway.lock().await;
-        AuthToken(gateway.auth_token().map(String::from))
-    };
     if auth_token.0.is_none() {
         tracing::warn!(
             "ALMS_AUTH_TOKEN is not set — API authentication is DISABLED. \
@@ -503,7 +550,11 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
     // === Graceful shutdown sequence ===
-    axum::serve(listener, app)
+    // Wrap in NoDelayListener so every accepted connection has TCP_NODELAY.
+    // This disables Nagle buffering, which is critical for SSE: without it,
+    // small token_delta events sit in the TCP send buffer and never reach
+    // the browser until the connection closes (observed on Windows).
+    axum::serve(NoDelayListener(listener), app)
         .with_graceful_shutdown(shutdown_signal(shutdown_token))
         .await?;
 

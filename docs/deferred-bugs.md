@@ -56,7 +56,7 @@ All findings were fixed.
 
 - **[runs.rs] S4 Low** — `system_prompt` per-agent override is a full replacement, not an append. If agent has a system_prompt override, the server default system prompt is entirely replaced. This is by design but not documented. *Deferred: document behavior.*
 
-- **[runs.rs] S4 Low** — Per-agent `temperature` and `max_tokens` overrides are not supported — only per-run overrides exist. Adding them to `AgentRecord` would require schema migration. *Deferred: future enhancement.*
+- ~~**[runs.rs] S4 Low** — Per-agent `temperature` and `max_tokens` overrides are not supported — only per-run overrides exist.~~ **Resolved**: Temperature removed from ALMS entirely. Per-agent `max_tokens` remains a future enhancement.
 
 - **[runs.rs] S4 Low** — Posture string parsing (`"guarded"` / `"full_control"`) is duplicated between `runs.rs` (lines 197-204, 223-234) and `agents.rs` (validate_posture). Should extract a shared `Posture::from_str` impl. *Deferred: cleanup task.*
 
@@ -102,7 +102,7 @@ All critical and medium bugs from that review were fixed in commit 437de9b. Rema
 
 - **[coordinator/lib.rs] S1 Medium** — No test covers the registry lookup path. `test_coordinator()` uses in-memory `SessionManager` with no SQLite store, so `store()` returns `None` and the lookup is never exercised. *Deferred: needs test with `SessionManager::with_sqlite` and inserted agent record.*
 
-- **[coordinator/lib.rs] S2 Low** — `agent_config_for_subagent` uses `..AgentConfig::default()` for non-inherited fields (temperature, max_tokens, max_iterations, context_config). Subagents get hardcoded defaults regardless of parent config. *Deferred: intentional safe defaults for now. May revisit when per-agent temperature/max_tokens are added to `AgentRecord`.*
+- **[coordinator/lib.rs] S2 Low** — `agent_config_for_subagent` uses `..AgentConfig::default()` for non-inherited fields (max_tokens, max_iterations, context_config). Subagents get hardcoded defaults regardless of parent config. *Deferred: intentional safe defaults for now.*
 
 - **[invoke_agent_tool.rs] S4 Low** — Test `test_system_prompt_optional` name is stale after `system_prompt` removal. Body is still valid. *Deferred: rename next time file is touched.*
 

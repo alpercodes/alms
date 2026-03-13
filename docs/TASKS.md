@@ -451,7 +451,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 52) CLI — run and job commands ✅
 - `alms run {create, list, show}` — all via HTTP API (runs are in-memory only, no SQLite table).
-- `run create --session ID --input "text" [--model M] [--temperature T] [--max-tokens N] [--posture P]` — calls POST /runs.
+- `run create --session ID --input "text" [--model M] [--max-tokens N] [--posture P]` — calls POST /runs.
 - `alms job {list, show}` — direct SQLite access (no gateway needed).
 - `alms job {create, cancel}` — via HTTP API (gateway must be running for scheduler registration).
 - `--url` / `ALMS_GATEWAY_URL` env var for gateway address. Auth token forwarded from `ALMS_AUTH_TOKEN`.
@@ -637,6 +637,85 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **Owners:** Atlas
 
 80) Cost budget per subagent tree — token budget enforcement across hierarchy
+- **Owners:** Atlas
+
+---
+
+## P14 — Critical bugs (data integrity, security, races)
+
+> These are the highest-priority open issues from the GitHub tracker.
+
+85) Fix `delete_agent` orphaning sessions and jobs (GitHub #11)
+- `delete_agent()` removes the agent row but leaves sessions and jobs pointing at a nonexistent agent ID.
+- Fix: add ON DELETE CASCADE foreign keys, or explicitly delete dependent rows in a transaction before removing the agent.
+- **Owners:** Atlas
+
+86) Harden `shell_exec` sandbox escape (GitHub #32)
+- `shell_exec` cwd is restricted, but the executed command itself can access files outside the sandbox root.
+- Fix: use Landlock (Linux) or a restricted OS user to enforce true filesystem isolation for spawned processes.
+- **Owners:** Atlas, Mustafa
+
+87) Fix race condition with concurrent named subagent invocations (GitHub #37)
+- Two parallel `invoke_agent(name="X")` calls can both try to create/load the same subagent session simultaneously, causing duplicate sessions or lost messages.
+- Fix: per-name lock (or route through `SessionQueue`) so concurrent invocations of the same named subagent are serialized.
+- **Owners:** Atlas
+
+88) Fix SSE stream timeout returning partial content as complete (GitHub #30)
+- When an SSE chunk read times out, the stream terminates silently. The partial response is surfaced to the user as if the LLM finished normally.
+- Fix: emit a `run_error` event on timeout so the UI/caller knows the response was truncated, and consider auto-retry.
+- **Owners:** Atlas
+
+---
+
+## P15 — Web UI Polish
+
+> The web UI is functional but needs significant UX work to be usable for real workflows.
+> These tasks address the most pressing gaps identified during manual testing (2026-03-13).
+
+89) Expandable tool calls in chat
+- Tool call rows in the chat are truncated to a single line. Long tool names, params, or results are cut off with no way to see the full content.
+- Fix: make tool rows expandable — click to reveal full params and result JSON. Consider a collapsible card layout similar to how Claude Code renders tool calls (summary line with expand toggle, syntax-highlighted detail on expand).
+- **Owners:** Atlas
+
+90) Full audit log viewer
+- The Audit panel shows a compact list of recent events but offers no way to view the full event payload, filter by type, or paginate through history.
+- Fix: make each audit row expandable to show full JSON payload. Add filter controls (by event type, time range). Support loading older events beyond the initial batch.
+- **Owners:** Atlas
+
+91) Cancel button for in-progress runs (IMPORTANT)
+- There is no way to cancel a run once started. The user must wait for the agent loop to finish or kill the process.
+- Fix: add a "Cancel" / "Stop" button in the chat area (visible during active runs). Wire it to `DELETE /runs/{id}` or a new `POST /runs/{id}/cancel` endpoint. Backend: set a cancellation flag on the run that the agent loop checks between iterations, and drop the LLM call / tool execution.
+- **Owners:** Atlas
+
+92) General UI improvements
+- Overall polish pass on the web UI: better spacing, responsive layout, keyboard shortcuts, loading states, error toasts, empty states, mobile-friendliness.
+- Specific known gaps: no visual feedback when saving agent model, no confirmation on destructive actions beyond browser confirm(), chat scroll behavior on long responses, no way to copy agent/session/run IDs.
+- **Owners:** Atlas
+
+93) Agent workspace dirs created in wrong location
+- Agent workspace directories are being created in the codebase root folder instead of under the configured workspace directory (e.g. `./data/workspace/{agent-name}/`).
+- Investigate: check `create_agent` in `agents.rs` and `init_workspace_files()` — likely the workspace base path is not being prepended, or the path resolution is relative to cwd instead of the configured `workspace_dir`.
+- **Owners:** Atlas
+
+94) Tool calls not persisted in session history
+- Tool call messages (tool_call + tool_result) do not appear to be saved in session history. When reloading a session, only user and assistant text messages are visible — tool interactions are lost.
+- Investigate: check `agent.rs` session append logic — are tool_call/tool_result `LlmMessage` entries being stored, or only the final text response?
+- **Owners:** Atlas
+
+95) Run loop issues with subagent invocations
+- When the agent invokes subagents via `invoke_agent`, there are issues with the run loop (exact symptoms TBD — may include hangs, duplicate events, or incorrect event routing).
+- Investigate: check `invoke_agent` tool execution path, `Coordinator::run_subagent`, and how subagent events are forwarded to the parent SSE stream.
+- **Owners:** Atlas
+
+97) Dead code audit — thorough review for unused types, modules, and functions
+- The codebase has accumulated scaffolding and speculative abstractions that are never used (e.g. the now-removed `Capability`, `AgentRole`, `SubagentType` enums).
+- Do a systematic pass across all crates: check for unused pub types, unused functions, dead modules, stale imports, and orphaned test helpers. `cargo clippy` catches private dead code but not unused `pub` items.
+- **Owners:** Atlas
+
+96) Empty speech bubbles in chat
+- An empty agent speech bubble sometimes appears in the chat with no text content.
+- Likely cause: `getAgentBody()` creates a new bubble on `token_delta` but the LLM response starts with tool calls (no text), or a bubble is created after a tool but no subsequent text follows.
+- Fix: suppress empty bubbles — don't create an agent bubble until there's actual text content, or remove empty bubbles on `run_finished`.
 - **Owners:** Atlas
 
 ---

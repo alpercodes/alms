@@ -503,9 +503,9 @@
     .settings-cancel:hover { color: #e6edf3; }
     #btn-settings.active { color: #d29922; border-color: #d29922; }
 
-    /* ── Agent management in settings ── */
+    /* ── Agent management panel ── */
     .agent-list-container {
-      max-height: 200px;
+      flex: 1;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
@@ -517,8 +517,7 @@
       border-radius: 4px;
       padding: 8px 10px;
       display: flex;
-      align-items: center;
-      gap: 8px;
+      flex-direction: column;
     }
     .agent-card.default { border-color: #58a6ff; }
     .agent-card-name { font-size: 12px; color: #e6edf3; font-weight: bold; flex: 1; }
@@ -572,6 +571,57 @@
     .audit-time  { color: #484f58; }
     .audit-params { color: #8b949e; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .audit-empty { font-size: 12px; color: #484f58; font-style: italic; padding: 8px 0; }
+
+    /* ── Onboarding (no agents) ── */
+    #onboarding {
+      display: none;
+      position: absolute;
+      inset: 0;
+      background: #0d1117;
+      z-index: 50;
+      justify-content: center;
+      align-items: center;
+    }
+    #onboarding.visible { display: flex; }
+    .onboard-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 28px 32px;
+      width: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .onboard-card h2 { font-size: 16px; color: #58a6ff; font-weight: 600; }
+    .onboard-card p  { font-size: 12px; color: #8b949e; line-height: 1.5; }
+    .onboard-card label { font-size: 11px; color: #8b949e; display: block; margin-bottom: 4px; }
+    .onboard-card input {
+      width: 100%;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 6px 10px;
+      background: #0d1117;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      outline: none;
+    }
+    .onboard-card input:focus { border-color: #388bfd; }
+    .onboard-card .onboard-btn {
+      padding: 8px 16px;
+      font-size: 12px;
+      font-family: inherit;
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .onboard-card .onboard-btn:hover { background: #2ea043; }
+    .onboard-card .onboard-btn:disabled { opacity: 0.5; cursor: default; }
+    .onboard-error { font-size: 11px; color: #f85149; min-height: 16px; }
   </style>
 </head>
 <body>
@@ -585,10 +635,11 @@
   <span id="posture-badge" title="Execution posture">full_control</span>
   <span id="status">connecting…</span>
   <div class="header-btns">
+    <button class="hbtn" id="btn-agents" onclick="togglePanel('agents')">Agents</button>
     <button class="hbtn" id="btn-workspace" onclick="togglePanel('workspace')">Workspace</button>
     <button class="hbtn" id="btn-jobs" onclick="togglePanel('jobs')">Jobs</button>
     <button class="hbtn" id="btn-audit" onclick="togglePanel('audit')">Audit</button>
-    <button class="hbtn" id="btn-settings" onclick="openSettings()">⚙ Settings</button>
+    <button class="hbtn" id="btn-settings" onclick="openSettings()">Settings</button>
   </div>
 </header>
 
@@ -598,37 +649,10 @@
     <h2>Settings</h2>
 
     <div class="settings-row">
-      <div class="settings-label">Model</div>
-      <input type="text" class="settings-input" id="settings-model"
-             list="model-suggestions" placeholder="server default"
-             autocomplete="off" spellcheck="false">
-      <datalist id="model-suggestions">
-        <option value="moonshotai/kimi-k2.5">
-        <option value="anthropic/claude-3.5-haiku">
-        <option value="anthropic/claude-3.5-sonnet">
-        <option value="anthropic/claude-3-opus">
-        <option value="openai/gpt-4o">
-        <option value="openai/gpt-4o-mini">
-        <option value="google/gemini-flash-1.5">
-        <option value="meta-llama/llama-3.1-8b-instruct:free">
-        <option value="mistralai/mistral-7b-instruct:free">
-      </datalist>
-      <div class="settings-hint" id="settings-model-hint"></div>
-    </div>
-
-    <div class="settings-grid">
-      <div class="settings-row">
-        <div class="settings-label">Temperature</div>
-        <input type="number" class="settings-input" id="settings-temperature"
-               min="0" max="2" step="0.05" placeholder="server default">
-        <div class="settings-hint">0.0–2.0 · creativity</div>
-      </div>
-      <div class="settings-row">
-        <div class="settings-label">Max tokens</div>
-        <input type="number" class="settings-input" id="settings-max-tokens"
-               min="256" max="32768" step="256" placeholder="server default">
-        <div class="settings-hint">max response length</div>
-      </div>
+      <div class="settings-label">Max tokens</div>
+      <input type="number" class="settings-input" id="settings-max-tokens"
+             min="256" max="32768" step="256" placeholder="server default">
+      <div class="settings-hint">max response length</div>
     </div>
 
     <div class="settings-row">
@@ -646,18 +670,6 @@
       <div class="settings-hint" id="settings-server-info">loading…</div>
     </div>
 
-    <div class="settings-row">
-      <div class="settings-label">Agents</div>
-      <div class="agent-list-container" id="settings-agent-list">
-        <!-- populated by renderAgentSettings() -->
-      </div>
-      <div class="agent-create-row" style="margin-top:6px">
-        <input type="text" class="settings-input" id="new-agent-name" placeholder="new-agent-name" spellcheck="false" style="font-size:12px;padding:5px 8px">
-        <button class="settings-save" style="padding:5px 10px;font-size:11px" onclick="createAgentFromSettings()">Create</button>
-      </div>
-      <div class="agent-error" id="agent-create-error"></div>
-    </div>
-
     <div class="settings-footer">
       <button class="settings-cancel" onclick="closeSettings()">Cancel</button>
       <button class="settings-save" onclick="applySettings()">Apply</button>
@@ -666,6 +678,24 @@
 </div>
 
 <div id="main">
+
+  <!-- ── Onboarding overlay (shown when no agents exist) ── -->
+  <div id="onboarding">
+    <div class="onboard-card">
+      <h2>Create your first agent</h2>
+      <p>An agent needs a name and a workspace directory where its identity files (personality, goals, memories) will be stored.</p>
+      <div>
+        <label for="onboard-name">Agent name</label>
+        <input type="text" id="onboard-name" placeholder="my-agent" spellcheck="false">
+      </div>
+      <div>
+        <label for="onboard-workspace">Workspace directory (server-configured)</label>
+        <input type="text" id="onboard-workspace" placeholder="./data/workspace" spellcheck="false" readonly style="opacity:0.6;cursor:default">
+      </div>
+      <div class="onboard-error" id="onboard-error"></div>
+      <button class="onboard-btn" id="onboard-create-btn" onclick="onboardCreateAgent()">Create agent</button>
+    </div>
+  </div>
 
   <!-- ── Left sidebar ── -->
   <div id="sidebar">
@@ -699,9 +729,34 @@
   <div id="panel">
 
     <div class="panel-tabs">
+      <button class="panel-tab" id="tab-agents" onclick="switchPanelTab('agents')">Agents</button>
       <button class="panel-tab" id="tab-workspace" onclick="switchPanelTab('workspace')">Workspace</button>
       <button class="panel-tab" id="tab-jobs" onclick="switchPanelTab('jobs')">Jobs</button>
       <button class="panel-tab" id="tab-audit" onclick="switchPanelTab('audit')">Audit</button>
+    </div>
+
+    <datalist id="agent-model-suggestions">
+      <option value="moonshotai/kimi-k2.5">
+      <option value="anthropic/claude-3.5-haiku">
+      <option value="anthropic/claude-3.5-sonnet">
+      <option value="anthropic/claude-3-opus">
+      <option value="openai/gpt-4o">
+      <option value="openai/gpt-4o-mini">
+      <option value="google/gemini-flash-1.5">
+      <option value="meta-llama/llama-3.1-8b-instruct:free">
+      <option value="mistralai/mistral-7b-instruct:free">
+    </datalist>
+
+    <!-- Agents tab -->
+    <div class="panel-body" id="panel-agents" style="display:none">
+      <div class="agent-list-container" id="panel-agent-list">
+        <!-- populated by renderAgentPanel() -->
+      </div>
+      <div class="agent-create-row" style="margin-top:8px">
+        <input type="text" class="settings-input" id="new-agent-name" placeholder="new-agent-name" spellcheck="false" style="font-size:12px;padding:5px 8px">
+        <button class="settings-save" style="padding:5px 10px;font-size:11px" onclick="createAgentFromPanel()">Create</button>
+      </div>
+      <div class="agent-error" id="agent-create-error"></div>
     </div>
 
     <!-- Workspace tab -->
@@ -752,10 +807,11 @@ const agentSelectEl = document.getElementById('agent-select');
 const sessionListEl = document.getElementById('session-list');
 const runListEl    = document.getElementById('run-list');
 const sessionTokensEl = document.getElementById('session-tokens');
-const panelEl      = document.getElementById('panel');
-const wsBodyEl     = document.getElementById('panel-workspace');
-const jobsBodyEl   = document.getElementById('panel-jobs');
-const auditBodyEl  = document.getElementById('panel-audit');
+const panelEl       = document.getElementById('panel');
+const agentsBodyEl  = document.getElementById('panel-agents');
+const wsBodyEl      = document.getElementById('panel-workspace');
+const jobsBodyEl    = document.getElementById('panel-jobs');
+const auditBodyEl   = document.getElementById('panel-audit');
 
 // ── Utilities ──────────────────────────────────────────────────────────────────
 function setStatus(text, cls) {
@@ -1075,6 +1131,59 @@ async function loadSessionHistory(sessionId) {
 }
 
 // ── Agent init ─────────────────────────────────────────────────────────────────
+// ── Onboarding (zero-agent state) ────────────────────────────────────────────
+function showOnboarding() {
+  const el = document.getElementById('onboarding');
+  el.classList.add('visible');
+  // Pre-fill workspace dir from server defaults if available
+  const wsInput = document.getElementById('onboard-workspace');
+  wsInput.value = (serverDefaults && serverDefaults.workspace_dir) || './data/workspace';
+  document.getElementById('onboard-name').focus();
+}
+
+function hideOnboarding() {
+  document.getElementById('onboarding').classList.remove('visible');
+}
+
+async function onboardCreateAgent() {
+  const nameInput = document.getElementById('onboard-name');
+  const errorEl = document.getElementById('onboard-error');
+  const btn = document.getElementById('onboard-create-btn');
+  const name = nameInput.value.trim();
+  errorEl.textContent = '';
+
+  if (!name) { errorEl.textContent = 'Agent name is required.'; return; }
+
+  btn.disabled = true;
+  try {
+    const res = await fetch('/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, is_default: true }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      errorEl.textContent = body?.error?.message || `Error ${res.status}`;
+      btn.disabled = false;
+      return;
+    }
+    hideOnboarding();
+    // Re-run boot now that an agent exists
+    await boot();
+  } catch (e) {
+    errorEl.textContent = 'Request failed.';
+    btn.disabled = false;
+  }
+}
+
+// Allow Enter to submit the onboarding form
+document.getElementById('onboard-name').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); onboardCreateAgent(); }
+});
+document.getElementById('onboard-workspace').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); onboardCreateAgent(); }
+});
+
 async function boot() {
   setStatus('connecting…');
 
@@ -1090,10 +1199,13 @@ async function boot() {
   }));
 
   if (S.agents.length === 0) {
-    setStatus('no agents configured', 'error');
+    setStatus('no agents — create one to get started', 'error');
     renderAgentSelect();
+    showOnboarding();
     return;
   }
+
+  hideOnboarding();
 
   // Check bootstrap status for each agent (async, non-blocking).
   checkBootstrapStatus();
@@ -1151,7 +1263,7 @@ async function checkBootstrapStatus() {
   }
   // Re-render agent selector with bootstrap indicators
   renderAgentSelect();
-  renderAgentSettings();
+  renderAgentPanel();
 }
 
 function enableInput() {
@@ -1184,8 +1296,6 @@ async function sendMessage() {
       input: { type: 'text', text },
     };
     const local = loadLocalSettings();
-    if (local.model)       runBody.model       = local.model;
-    if (local.temperature != null) runBody.temperature = local.temperature;
     if (local.max_tokens  != null) runBody.max_tokens  = local.max_tokens;
     if (local.posture)     runBody.posture      = local.posture;
 
@@ -1224,11 +1334,13 @@ function openEventStream(runId) {
 
   let agentWrap = null;
   let agentBody = null;
+  let hadToolSinceText = false;
   function getAgentBody() {
-    if (!agentBody) {
+    if (!agentBody || hadToolSinceText) {
       const r = appendMsg('agent', '');
       agentWrap = r.wrap;
       agentBody = r.body;
+      hadToolSinceText = false;
     }
     return agentBody;
   }
@@ -1254,6 +1366,7 @@ function openEventStream(runId) {
   });
 
   es.addEventListener('tool_start', e => {
+    hadToolSinceText = true;
     const { tool_invocation_id, tool, params } = JSON.parse(e.data);
     toolRows[tool_invocation_id] = appendToolRow(`▶ ${tool}(${JSON.stringify(params)})`);
   });
@@ -1330,13 +1443,13 @@ function togglePanel(tab) {
     // Close panel.
     S.activePanel = null;
     panelEl.classList.remove('open');
-    ['workspace', 'jobs', 'audit'].forEach(t =>
+    ['agents', 'workspace', 'jobs', 'audit'].forEach(t =>
       document.getElementById('btn-' + t)?.classList.remove('active')
     );
   } else {
     S.activePanel = tab;
     panelEl.classList.add('open');
-    ['workspace', 'jobs', 'audit'].forEach(t =>
+    ['agents', 'workspace', 'jobs', 'audit'].forEach(t =>
       document.getElementById('btn-' + t)?.classList.toggle('active', t === tab)
     );
     switchPanelTab(tab);
@@ -1345,13 +1458,15 @@ function togglePanel(tab) {
 
 function switchPanelTab(tab) {
   S.activePanelTab = tab;
-  ['workspace', 'jobs', 'audit'].forEach(t => {
+  ['agents', 'workspace', 'jobs', 'audit'].forEach(t => {
     document.getElementById('tab-' + t)?.classList.toggle('active', t === tab);
   });
-  wsBodyEl.style.display    = tab === 'workspace' ? 'flex' : 'none';
-  jobsBodyEl.style.display  = tab === 'jobs'      ? 'flex' : 'none';
-  auditBodyEl.style.display = tab === 'audit'     ? 'flex' : 'none';
+  agentsBodyEl.style.display = tab === 'agents'    ? 'flex' : 'none';
+  wsBodyEl.style.display     = tab === 'workspace' ? 'flex' : 'none';
+  jobsBodyEl.style.display   = tab === 'jobs'      ? 'flex' : 'none';
+  auditBodyEl.style.display  = tab === 'audit'     ? 'flex' : 'none';
 
+  if (tab === 'agents')    renderAgentPanel();
   if (tab === 'workspace') loadWorkspace();
   if (tab === 'jobs')      loadJobs();
   if (tab === 'audit')     loadAudit();
@@ -1730,9 +1845,6 @@ const SETTINGS_KEY = 'alms_settings';
 let serverDefaults = {};
 
 const settingsOverlay    = document.getElementById('settings-overlay');
-const settingsModelIn    = document.getElementById('settings-model');
-const settingsModelHint  = document.getElementById('settings-model-hint');
-const settingsTempIn     = document.getElementById('settings-temperature');
 const settingsMaxTokIn   = document.getElementById('settings-max-tokens');
 const settingsPostureSel = document.getElementById('settings-posture');
 const settingsServerInfo = document.getElementById('settings-server-info');
@@ -1746,7 +1858,6 @@ function saveLocalSettings(obj) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(obj));
 }
 
-function getActiveModel()    { return loadLocalSettings().model       || null; }
 function getActivePosture()  { return loadLocalSettings().posture     || null; }
 
 async function fetchServerDefaults() {
@@ -1768,28 +1879,20 @@ function updatePostureBadge() {
 
 function openSettings() {
   const local = loadLocalSettings();
-  settingsModelIn.value    = local.model       || '';
-  settingsTempIn.value     = local.temperature != null ? local.temperature : '';
   settingsMaxTokIn.value   = local.max_tokens  != null ? local.max_tokens  : '';
   settingsPostureSel.value = local.posture     || '';
 
-  settingsModelIn.placeholder = serverDefaults.model || 'server default';
-  settingsTempIn.placeholder  = serverDefaults.temperature != null ? String(serverDefaults.temperature) : 'server default';
   settingsMaxTokIn.placeholder = serverDefaults.max_tokens != null ? String(serverDefaults.max_tokens) : 'server default';
 
-  settingsModelHint.textContent = serverDefaults.model
-    ? `Server default: ${serverDefaults.model}`
-    : 'Leave blank to use the server default';
-
   const infoLines = [];
+  if (serverDefaults.model)            infoLines.push(`Default model: ${serverDefaults.model}`);
   if (serverDefaults.base_url)         infoLines.push(`URL: ${serverDefaults.base_url}`);
   if (serverDefaults.context_strategy) infoLines.push(`Context: ${serverDefaults.context_strategy}`);
   if (serverDefaults.enabled_tools)    infoLines.push(`Tools: ${serverDefaults.enabled_tools.join(', ')}`);
   settingsServerInfo.textContent = infoLines.join(' · ') || '—';
 
-  renderAgentSettings();
   settingsOverlay.classList.add('open');
-  settingsModelIn.focus();
+  settingsMaxTokIn.focus();
 }
 
 function closeSettings() {
@@ -1802,11 +1905,9 @@ function onOverlayClick(e) {
 
 function applySettings() {
   const local = loadLocalSettings();
-  const model       = settingsModelIn.value.trim() || null;
-  const temperature = settingsTempIn.value !== '' ? parseFloat(settingsTempIn.value) : null;
   const max_tokens  = settingsMaxTokIn.value !== '' ? parseInt(settingsMaxTokIn.value, 10) : null;
   const posture     = settingsPostureSel.value || null;
-  saveLocalSettings({ ...local, model, temperature, max_tokens, posture });
+  saveLocalSettings({ ...local, max_tokens, posture });
   updateSettingsBtn();
   updatePostureBadge();
   closeSettings();
@@ -1814,18 +1915,17 @@ function applySettings() {
 
 function updateSettingsBtn() {
   const local = loadLocalSettings();
-  const hasOverride = !!(local.model || local.temperature != null || local.max_tokens != null || local.posture);
+  const hasOverride = !!(local.max_tokens != null || local.posture);
   const btn = document.getElementById('btn-settings');
   btn.classList.toggle('active', hasOverride);
   const parts = [];
-  if (local.model) parts.push(`model: ${local.model}`);
   if (local.posture) parts.push(`posture: ${local.posture}`);
   btn.title = parts.length ? parts.join(', ') : 'Settings';
 }
 
 // ── Agent management in settings ────────────────────────────────────────────
-function renderAgentSettings() {
-  const container = document.getElementById('settings-agent-list');
+function renderAgentPanel() {
+  const container = document.getElementById('panel-agent-list');
   if (!container) return;
   container.innerHTML = '';
 
@@ -1834,9 +1934,16 @@ function renderAgentSettings() {
     return;
   }
 
+  const wsBase = serverDefaults.workspace_dir || './data/workspace';
+
   for (const agent of S.agents) {
     const card = document.createElement('div');
     card.className = 'agent-card' + (agent.is_default ? ' default' : '');
+
+    // ── Header row (clickable to expand) ──
+    const header = document.createElement('div');
+    header.className = 'agent-card-header';
+    header.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;width:100%';
 
     const name = document.createElement('span');
     name.className = 'agent-card-name';
@@ -1864,15 +1971,71 @@ function renderAgentSettings() {
       badges.appendChild(b);
     }
 
-    const actions = document.createElement('span');
+    header.appendChild(name);
+    header.appendChild(badges);
+
+    // ── Expandable detail section ──
+    const detail = document.createElement('div');
+    detail.className = 'agent-card-detail';
+    detail.style.cssText = 'display:none;flex-direction:column;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid #21262d;width:100%';
+
+    // Workspace path
+    const wsRow = document.createElement('div');
+    wsRow.style.cssText = 'font-size:11px;color:#8b949e;word-break:break-all';
+    wsRow.textContent = `Workspace: ${wsBase}/${agent.name}/`;
+    detail.appendChild(wsRow);
+
+    // Model input row
+    const modelRow = document.createElement('div');
+    modelRow.style.cssText = 'display:flex;gap:6px;align-items:center';
+    const modelLabel = document.createElement('span');
+    modelLabel.style.cssText = 'font-size:11px;color:#8b949e;flex-shrink:0';
+    modelLabel.textContent = 'Model:';
+    const modelInput = document.createElement('input');
+    modelInput.type = 'text';
+    modelInput.className = 'settings-input';
+    modelInput.style.cssText = 'font-size:11px;padding:3px 6px;flex:1';
+    modelInput.placeholder = serverDefaults.model || 'server default';
+    modelInput.value = agent.model || '';
+    modelInput.spellcheck = false;
+    modelInput.autocomplete = 'off';
+    modelInput.setAttribute('list', 'agent-model-suggestions');
+    const modelSave = document.createElement('button');
+    modelSave.className = 'agent-card-btn';
+    modelSave.textContent = 'save';
+    modelSave.onclick = async (e) => {
+      e.stopPropagation();
+      modelSave.disabled = true;
+      const newModel = modelInput.value.trim() || null;
+      try {
+        const res = await fetch(`/agents/${agent.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: newModel === null ? '' : newModel }),
+        });
+        if (res.ok) await refreshAgents();
+      } catch { /* ignore */ }
+      modelSave.disabled = false;
+    };
+    modelInput.addEventListener('click', e => e.stopPropagation());
+    modelInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); modelSave.click(); } });
+    modelRow.appendChild(modelLabel);
+    modelRow.appendChild(modelInput);
+    modelRow.appendChild(modelSave);
+    detail.appendChild(modelRow);
+
+    // Action buttons row
+    const actions = document.createElement('div');
     actions.className = 'agent-card-actions';
+    actions.style.marginTop = '4px';
 
     if (!agent.is_default) {
       const defBtn = document.createElement('button');
       defBtn.className = 'agent-card-btn';
-      defBtn.textContent = 'default';
+      defBtn.textContent = 'set default';
       defBtn.title = 'Set as default agent';
-      defBtn.onclick = async () => {
+      defBtn.onclick = async (e) => {
+        e.stopPropagation();
         defBtn.disabled = true;
         try {
           const res = await fetch(`/agents/${agent.id}/default`, { method: 'POST' });
@@ -1888,13 +2051,13 @@ function renderAgentSettings() {
       delBtn.className = 'agent-card-btn danger';
       delBtn.textContent = 'delete';
       delBtn.title = 'Delete agent';
-      delBtn.onclick = async () => {
+      delBtn.onclick = async (e) => {
+        e.stopPropagation();
         if (!confirm(`Delete agent "${agent.name}"? This cannot be undone.`)) return;
         delBtn.disabled = true;
         try {
           const res = await fetch(`/agents/${agent.id}`, { method: 'DELETE' });
           if (res.ok) {
-            // If we deleted the active agent, switch to default
             const wasActive = agent.id === S.activeAgentId;
             await refreshAgents();
             if (wasActive && S.agents.length > 0) {
@@ -1910,15 +2073,21 @@ function renderAgentSettings() {
       };
       actions.appendChild(delBtn);
     }
+    detail.appendChild(actions);
 
-    card.appendChild(name);
-    card.appendChild(badges);
-    card.appendChild(actions);
+    // Toggle expand on header click
+    header.onclick = () => {
+      const open = detail.style.display !== 'none';
+      detail.style.display = open ? 'none' : 'flex';
+    };
+
+    card.appendChild(header);
+    card.appendChild(detail);
     container.appendChild(card);
   }
 }
 
-async function createAgentFromSettings() {
+async function createAgentFromPanel() {
   const input = document.getElementById('new-agent-name');
   const errorEl = document.getElementById('agent-create-error');
   const name = input.value.trim();
@@ -1959,7 +2128,7 @@ async function refreshAgents() {
     }));
   } catch { /* ignore */ }
   renderAgentSelect();
-  renderAgentSettings();
+  renderAgentPanel();
   checkBootstrapStatus();
 }
 
