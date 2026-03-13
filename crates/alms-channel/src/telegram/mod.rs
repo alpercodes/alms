@@ -402,6 +402,202 @@ use serde::Serialize;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    // -- Test helpers --
+
+    fn make_user() -> User {
+        User {
+            id: 12345,
+            is_bot: false,
+            first_name: "Test".to_string(),
+            last_name: None,
+            username: Some("testuser".to_string()),
+            language_code: None,
+        }
+    }
+
+    fn make_chat() -> Chat {
+        Chat {
+            id: 67890,
+            chat_type: "private".to_string(),
+            title: None,
+            username: None,
+            first_name: Some("Test".to_string()),
+            last_name: None,
+        }
+    }
+
+    fn make_message(text: &str) -> Message {
+        Message {
+            message_id: 1,
+            from: Some(make_user()),
+            date: 1700000000,
+            chat: make_chat(),
+            text: Some(text.to_string()),
+            entities: None,
+        }
+    }
+
+    fn make_update(update_id: i64, text: &str) -> Update {
+        Update {
+            update_id,
+            message: Some(make_message(text)),
+            edited_message: None,
+            callback_query: None,
+        }
+    }
+
+    // -- convert_update tests --
+
+    #[test]
+    fn convert_update_text_message() {
+        let channel = TelegramChannel::new();
+        let update = make_update(1, "hello world");
+        let incoming = channel.convert_update(update).unwrap();
+        assert_eq!(incoming.chat_id, ChatId(67890));
+        assert_eq!(incoming.user_id, UserId(12345));
+        assert_eq!(incoming.text, "hello world");
+        assert_eq!(incoming.message_id, MessageId(1));
+    }
+
+    #[test]
+    fn convert_update_edited_message() {
+        let channel = TelegramChannel::new();
+        let update = Update {
+            update_id: 2,
+            message: None,
+            edited_message: Some(make_message("edited text")),
+            callback_query: None,
+        };
+        let incoming = channel.convert_update(update).unwrap();
+        assert_eq!(incoming.text, "edited text");
+    }
+
+    #[test]
+    fn convert_update_no_message() {
+        let channel = TelegramChannel::new();
+        let update = Update {
+            update_id: 3,
+            message: None,
+            edited_message: None,
+            callback_query: None,
+        };
+        assert!(channel.convert_update(update).is_none());
+    }
+
+    #[test]
+    fn convert_update_no_text() {
+        let channel = TelegramChannel::new();
+        let mut msg = make_message("ignored");
+        msg.text = None;
+        let update = Update {
+            update_id: 4,
+            message: Some(msg),
+            edited_message: None,
+            callback_query: None,
+        };
+        assert!(channel.convert_update(update).is_none());
+    }
+
+    #[test]
+    fn convert_update_no_from() {
+        let channel = TelegramChannel::new();
+        let mut msg = make_message("hello");
+        msg.from = None;
+        let update = Update {
+            update_id: 5,
+            message: Some(msg),
+            edited_message: None,
+            callback_query: None,
+        };
+        assert!(channel.convert_update(update).is_none());
+    }
+
+    #[test]
+    fn convert_update_parses_command() {
+        let channel = TelegramChannel::new();
+        let update = make_update(6, "/start arg1");
+        let incoming = channel.convert_update(update).unwrap();
+        assert!(incoming.command.is_some());
+        let cmd = incoming.command.unwrap();
+        assert_eq!(cmd.name, "start");
+        assert_eq!(cmd.args, vec!["arg1"]);
+    }
+
+    #[test]
+    fn convert_update_platform_data() {
+        let channel = TelegramChannel::new();
+        let update = make_update(7, "hi");
+        let incoming = channel.convert_update(update).unwrap();
+        let pd = incoming.platform_data.unwrap();
+        assert_eq!(pd["update_id"], 7);
+        assert_eq!(pd["chat_type"], "private");
+        assert_eq!(pd["username"], "testuser");
+        assert_eq!(pd["first_name"], "Test");
+    }
+
+    // -- api_url test --
+
+    #[test]
+    fn api_url_builds_correctly() {
+        let mut channel = TelegramChannel::new();
+        channel.token = "tok123".to_string();
+        assert_eq!(
+            channel.api_url("sendMessage"),
+            "https://api.telegram.org/bottok123/sendMessage"
+        );
+    }
+
+    // -- Polling offset tests --
+
+    #[test]
+    fn offset_initial_is_none() {
+        let channel = TelegramChannel::new();
+        let offset = channel.last_update_id.load(Ordering::Relaxed);
+        assert_eq!(offset, 0);
+        // Mirrors run_polling logic: offset > 0 → Some(offset+1), else None
+        let offset_param = if offset > 0 { Some(offset + 1) } else { None };
+        assert_eq!(offset_param, None);
+    }
+
+    #[test]
+    fn offset_after_store() {
+        let channel = TelegramChannel::new();
+        channel.last_update_id.store(42, Ordering::Relaxed);
+        let offset = channel.last_update_id.load(Ordering::Relaxed);
+        let offset_param = if offset > 0 { Some(offset + 1) } else { None };
+        assert_eq!(offset_param, Some(43));
+    }
+
+    #[test]
+    fn offset_monotonic() {
+        let channel = TelegramChannel::new();
+        // Mirrors run_polling: only store if update_id > current
+        for id in [10, 5, 20] {
+            let current = channel.last_update_id.load(Ordering::Relaxed);
+            if id > current {
+                channel.last_update_id.store(id, Ordering::Relaxed);
+            }
+        }
+        assert_eq!(channel.last_update_id.load(Ordering::Relaxed), 20);
+    }
+
+    #[test]
+    fn offset_batch() {
+        let channel = TelegramChannel::new();
+        for id in [100, 101, 102] {
+            let current = channel.last_update_id.load(Ordering::Relaxed);
+            if id > current {
+                channel.last_update_id.store(id, Ordering::Relaxed);
+            }
+        }
+        let offset = channel.last_update_id.load(Ordering::Relaxed);
+        let offset_param = if offset > 0 { Some(offset + 1) } else { None };
+        assert_eq!(offset_param, Some(103));
+    }
+
+    // -- split_message tests (existing) --
 
     #[test]
     fn short_message_unchanged() {
