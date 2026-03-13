@@ -31,6 +31,9 @@ pub enum AlmsError {
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("Run cancelled")]
+    Cancelled,
 }
 
 pub type AlmsResult<T> = Result<T, AlmsError>;

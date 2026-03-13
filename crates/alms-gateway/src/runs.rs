@@ -20,6 +20,7 @@ use axum::{
 use chrono::Utc;
 use serde::Deserialize;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument, warn};
 
 /// Per-run overrides that can be sent by the client to customise a single run.
@@ -104,6 +105,50 @@ pub struct ListRunsQuery {
     pub limit: Option<usize>,
 }
 
+/// POST /runs/{run_id}/cancel — cancel a running or queued run.
+pub async fn cancel_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let run = state.run_manager.get_run(run_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": { "code": "NOT_FOUND", "message": "Run not found" }
+            })),
+        )
+    })?;
+
+    match run.status {
+        RunStatus::Queued | RunStatus::Running => {}
+        _ => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": { "code": "ALREADY_FINISHED", "message": "Run already finished" }
+                })),
+            ));
+        }
+    }
+
+    let found = state.run_manager.cancel_run(run_id);
+    if !found {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": { "code": "ALREADY_FINISHED", "message": "Run already finished" }
+            })),
+        ));
+    }
+
+    info!("Cancel requested for run {}", run_id.0);
+
+    Ok(Json(serde_json::json!({
+        "run_id": run_id.0.to_string(),
+        "status": "cancelling",
+    })))
+}
+
 /// POST /runs - Create a new run
 ///
 /// Per API spec: Returns 201 Created with { run_id, session_id, status: "queued", ts }
@@ -153,6 +198,13 @@ pub async fn create_run(
 
     state.run_manager.insert_run(run.clone());
 
+    // Create per-run cancellation token BEFORE enqueue so cancelling a
+    // queued-but-not-yet-started run works.
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
     let state_clone = state.clone();
     state.session_queue.enqueue(
         session_id,
@@ -165,6 +217,7 @@ pub async fn create_run(
                 run.input,
                 overrides,
                 context_id,
+                cancel_token,
             )
             .await;
         }),
@@ -182,6 +235,7 @@ pub async fn create_run(
 
 /// Execute a run in background, forwarding runtime events to SSE.
 #[instrument(level = "info", skip(state, input, overrides), fields(run_id = %run_id.0, session_id = %session_id.0))]
+#[allow(clippy::too_many_arguments)]
 async fn execute_run(
     state: AppState,
     run_id: RunId,
@@ -190,9 +244,24 @@ async fn execute_run(
     input: String,
     overrides: RunOverrides,
     context_id: String,
+    cancel_token: CancellationToken,
 ) {
     // Track this run for graceful shutdown drain.
     state.run_manager.track_in_flight();
+
+    // Early exit if already cancelled (queued-then-cancelled before execution started).
+    if cancel_token.is_cancelled() {
+        state
+            .run_manager
+            .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+            .await;
+        state.run_manager.mark_run_as_cancelled(run_id);
+        state.run_manager.remove_cancel_token(run_id);
+        state.run_manager.remove_senders(run_id);
+        state.run_manager.untrack_in_flight();
+        info!("Run {} was cancelled before starting", run_id.0);
+        return;
+    }
 
     // Events are persisted to the event log regardless of whether an SSE
     // client is connected. The SSE client registers its own sender when it
@@ -275,7 +344,8 @@ async fn execute_run(
 
     let mut runtime = alms_runtime::AgentRuntime::new(agent_id, agent_config, llm)
         .with_event_sender(runtime_tx)
-        .with_run_id(run_id);
+        .with_run_id(run_id)
+        .with_cancel_token(cancel_token);
 
     // Attach workspace if configured — registers the workspace_write tool for this run
     if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
@@ -343,6 +413,16 @@ async fn execute_run(
 
             info!("Run {} completed successfully", run_id.0);
         }
+        Err(alms_core::AlmsError::Cancelled) => {
+            state
+                .run_manager
+                .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+                .await;
+
+            state.run_manager.mark_run_as_cancelled(run_id);
+
+            info!("Run {} cancelled", run_id.0);
+        }
         Err(e) => {
             state
                 .run_manager
@@ -367,6 +447,7 @@ async fn execute_run(
     }
 
     state.run_manager.remove_senders(run_id);
+    state.run_manager.remove_cancel_token(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
     // Signal drain waiters that this run is done.
@@ -433,6 +514,8 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     info!("Job fired → run {}", run_id.0);
 
     // Execute the run (awaits completion; errors are handled inside execute_run).
+    // Scheduled jobs use a fresh token — cancellation is via job-level cancel, not run-level.
+    let cancel_token = CancellationToken::new();
     execute_run(
         state.clone(),
         run_id,
@@ -441,6 +524,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
         run.input,
         RunOverrides::default(),
         context_id,
+        cancel_token,
     )
     .await;
 
