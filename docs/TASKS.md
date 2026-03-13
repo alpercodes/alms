@@ -692,6 +692,27 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Specific known gaps: no visual feedback when saving agent model, no confirmation on destructive actions beyond browser confirm(), chat scroll behavior on long responses, no way to copy agent/session/run IDs.
 - **Owners:** Atlas
 
+93) Agent workspace dirs created in wrong location
+- Agent workspace directories are being created in the codebase root folder instead of under the configured workspace directory (e.g. `./data/workspace/{agent-name}/`).
+- Investigate: check `create_agent` in `agents.rs` and `init_workspace_files()` — likely the workspace base path is not being prepended, or the path resolution is relative to cwd instead of the configured `workspace_dir`.
+- **Owners:** Atlas
+
+94) Tool calls not persisted in session history
+- Tool call messages (tool_call + tool_result) do not appear to be saved in session history. When reloading a session, only user and assistant text messages are visible — tool interactions are lost.
+- Investigate: check `agent.rs` session append logic — are tool_call/tool_result `LlmMessage` entries being stored, or only the final text response?
+- **Owners:** Atlas
+
+95) Run loop issues with subagent invocations
+- When the agent invokes subagents via `invoke_agent`, there are issues with the run loop (exact symptoms TBD — may include hangs, duplicate events, or incorrect event routing).
+- Investigate: check `invoke_agent` tool execution path, `Coordinator::run_subagent`, and how subagent events are forwarded to the parent SSE stream.
+- **Owners:** Atlas
+
+96) Empty speech bubbles in chat
+- An empty agent speech bubble sometimes appears in the chat with no text content.
+- Likely cause: `getAgentBody()` creates a new bubble on `token_delta` but the LLM response starts with tool calls (no text), or a bubble is created after a tool but no subsequent text follows.
+- Fix: suppress empty bubbles — don't create an agent bubble until there's actual text content, or remove empty bubbles on `run_finished`.
+- **Owners:** Atlas
+
 ---
 
 ## Docs index
