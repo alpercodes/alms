@@ -106,6 +106,7 @@ pub struct ListRunsQuery {
 }
 
 /// POST /runs/{run_id}/cancel — cancel a running or queued run.
+#[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
 pub async fn cancel_run(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
@@ -145,7 +146,7 @@ pub async fn cancel_run(
 
     Ok(Json(serde_json::json!({
         "run_id": run_id.0.to_string(),
-        "status": "cancelling",
+        "status": "cancelled",
     })))
 }
 

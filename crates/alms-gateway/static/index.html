@@ -2182,6 +2182,8 @@ cancelBtn.addEventListener('click', async () => {
   try {
     await fetch(`/runs/${activeRunId}/cancel`, { method: 'POST' });
   } catch { /* ignore — SSE event will handle UI */ }
+  // Re-enable after 3s if run_cancelled SSE hasn't fired yet (e.g. network issue).
+  setTimeout(() => { if (activeRunId) cancelBtn.disabled = false; }, 3000);
 });
 
 promptEl.addEventListener('input', () => {
