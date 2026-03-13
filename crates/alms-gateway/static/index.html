@@ -572,6 +572,57 @@
     .audit-time  { color: #484f58; }
     .audit-params { color: #8b949e; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .audit-empty { font-size: 12px; color: #484f58; font-style: italic; padding: 8px 0; }
+
+    /* ── Onboarding (no agents) ── */
+    #onboarding {
+      display: none;
+      position: absolute;
+      inset: 0;
+      background: #0d1117;
+      z-index: 50;
+      justify-content: center;
+      align-items: center;
+    }
+    #onboarding.visible { display: flex; }
+    .onboard-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 28px 32px;
+      width: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .onboard-card h2 { font-size: 16px; color: #58a6ff; font-weight: 600; }
+    .onboard-card p  { font-size: 12px; color: #8b949e; line-height: 1.5; }
+    .onboard-card label { font-size: 11px; color: #8b949e; display: block; margin-bottom: 4px; }
+    .onboard-card input {
+      width: 100%;
+      font-family: inherit;
+      font-size: 12px;
+      padding: 6px 10px;
+      background: #0d1117;
+      color: #e6edf3;
+      border: 1px solid #30363d;
+      border-radius: 4px;
+      outline: none;
+    }
+    .onboard-card input:focus { border-color: #388bfd; }
+    .onboard-card .onboard-btn {
+      padding: 8px 16px;
+      font-size: 12px;
+      font-family: inherit;
+      background: #238636;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .onboard-card .onboard-btn:hover { background: #2ea043; }
+    .onboard-card .onboard-btn:disabled { opacity: 0.5; cursor: default; }
+    .onboard-error { font-size: 11px; color: #f85149; min-height: 16px; }
   </style>
 </head>
 <body>
@@ -666,6 +717,24 @@
 </div>
 
 <div id="main">
+
+  <!-- ── Onboarding overlay (shown when no agents exist) ── -->
+  <div id="onboarding">
+    <div class="onboard-card">
+      <h2>Create your first agent</h2>
+      <p>An agent needs a name and a workspace directory where its identity files (personality, goals, memories) will be stored.</p>
+      <div>
+        <label for="onboard-name">Agent name</label>
+        <input type="text" id="onboard-name" placeholder="my-agent" spellcheck="false">
+      </div>
+      <div>
+        <label for="onboard-workspace">Workspace directory</label>
+        <input type="text" id="onboard-workspace" placeholder="./data/workspace" spellcheck="false">
+      </div>
+      <div class="onboard-error" id="onboard-error"></div>
+      <button class="onboard-btn" id="onboard-create-btn" onclick="onboardCreateAgent()">Create agent</button>
+    </div>
+  </div>
 
   <!-- ── Left sidebar ── -->
   <div id="sidebar">
@@ -1075,6 +1144,59 @@ async function loadSessionHistory(sessionId) {
 }
 
 // ── Agent init ─────────────────────────────────────────────────────────────────
+// ── Onboarding (zero-agent state) ────────────────────────────────────────────
+function showOnboarding() {
+  const el = document.getElementById('onboarding');
+  el.classList.add('visible');
+  // Pre-fill workspace dir from server defaults if available
+  const wsInput = document.getElementById('onboard-workspace');
+  wsInput.value = (serverDefaults && serverDefaults.workspace_dir) || './data/workspace';
+  document.getElementById('onboard-name').focus();
+}
+
+function hideOnboarding() {
+  document.getElementById('onboarding').classList.remove('visible');
+}
+
+async function onboardCreateAgent() {
+  const nameInput = document.getElementById('onboard-name');
+  const errorEl = document.getElementById('onboard-error');
+  const btn = document.getElementById('onboard-create-btn');
+  const name = nameInput.value.trim();
+  errorEl.textContent = '';
+
+  if (!name) { errorEl.textContent = 'Agent name is required.'; return; }
+
+  btn.disabled = true;
+  try {
+    const res = await fetch('/agents', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, is_default: true }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      errorEl.textContent = body?.error?.message || `Error ${res.status}`;
+      btn.disabled = false;
+      return;
+    }
+    hideOnboarding();
+    // Re-run boot now that an agent exists
+    await boot();
+  } catch (e) {
+    errorEl.textContent = 'Request failed.';
+    btn.disabled = false;
+  }
+}
+
+// Allow Enter to submit the onboarding form
+document.getElementById('onboard-name').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); onboardCreateAgent(); }
+});
+document.getElementById('onboard-workspace').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); onboardCreateAgent(); }
+});
+
 async function boot() {
   setStatus('connecting…');
 
@@ -1090,10 +1212,13 @@ async function boot() {
   }));
 
   if (S.agents.length === 0) {
-    setStatus('no agents configured', 'error');
+    setStatus('no agents — create one to get started', 'error');
     renderAgentSelect();
+    showOnboarding();
     return;
   }
+
+  hideOnboarding();
 
   // Check bootstrap status for each agent (async, non-blocking).
   checkBootstrapStatus();

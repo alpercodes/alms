@@ -428,6 +428,37 @@ async fn websocket_handler(
     })
 }
 
+/// TCP listener wrapper that sets TCP_NODELAY on every accepted connection.
+///
+/// Nagle's algorithm buffers small writes, which delays SSE events from
+/// reaching the browser.  Disabling it ensures token_delta frames are sent
+/// immediately.
+struct NoDelayListener(tokio::net::TcpListener);
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.0.accept().await {
+                Ok((stream, addr)) => {
+                    let _ = stream.set_nodelay(true);
+                    return (stream, addr);
+                }
+                Err(e) => {
+                    tracing::error!("TCP accept error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
 /// Start the gateway HTTP server
 pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
     let gateway = Gateway::from_env()?;
@@ -503,7 +534,11 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
     // === Graceful shutdown sequence ===
-    axum::serve(listener, app)
+    // Wrap in NoDelayListener so every accepted connection has TCP_NODELAY.
+    // This disables Nagle buffering, which is critical for SSE: without it,
+    // small token_delta events sit in the TCP send buffer and never reach
+    // the browser until the connection closes (observed on Windows).
+    axum::serve(NoDelayListener(listener), app)
         .with_graceful_shutdown(shutdown_signal(shutdown_token))
         .await?;
 

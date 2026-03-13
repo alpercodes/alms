@@ -641,6 +641,32 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ---
 
+## P14 — Critical bugs (data integrity, security, races)
+
+> These are the highest-priority open issues from the GitHub tracker.
+
+85) Fix `delete_agent` orphaning sessions and jobs (GitHub #11)
+- `delete_agent()` removes the agent row but leaves sessions and jobs pointing at a nonexistent agent ID.
+- Fix: add ON DELETE CASCADE foreign keys, or explicitly delete dependent rows in a transaction before removing the agent.
+- **Owners:** Atlas
+
+86) Harden `shell_exec` sandbox escape (GitHub #32)
+- `shell_exec` cwd is restricted, but the executed command itself can access files outside the sandbox root.
+- Fix: use Landlock (Linux) or a restricted OS user to enforce true filesystem isolation for spawned processes.
+- **Owners:** Atlas, Mustafa
+
+87) Fix race condition with concurrent named subagent invocations (GitHub #37)
+- Two parallel `invoke_agent(name="X")` calls can both try to create/load the same subagent session simultaneously, causing duplicate sessions or lost messages.
+- Fix: per-name lock (or route through `SessionQueue`) so concurrent invocations of the same named subagent are serialized.
+- **Owners:** Atlas
+
+88) Fix SSE stream timeout returning partial content as complete (GitHub #30)
+- When an SSE chunk read times out, the stream terminates silently. The partial response is surfaced to the user as if the LLM finished normally.
+- Fix: emit a `run_error` event on timeout so the UI/caller knows the response was truncated, and consider auto-retry.
+- **Owners:** Atlas
+
+---
+
 ## Docs index
 Start here:
 - `docs/index.md`

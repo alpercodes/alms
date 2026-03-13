@@ -48,6 +48,11 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect::<Vec<_>>();
 
+    let workspace_dir = state
+        .workspace_dir
+        .as_ref()
+        .map(|p| p.display().to_string());
+
     Json(serde_json::json!({
         "model": llm.default_model,
         "base_url": llm.base_url,
@@ -58,5 +63,6 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "enabled_tools": tools,
         "agent_id": agent_id,
         "agents": agents_list,
+        "workspace_dir": workspace_dir,
     }))
 }
