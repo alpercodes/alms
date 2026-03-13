@@ -15,7 +15,7 @@ use types::*;
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org/bot";
 
 /// Telegram Bot API client
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TelegramChannel {
     token: String,
     client: Client,
@@ -218,7 +218,8 @@ impl TelegramChannel {
                 }
                 Err(e) => {
                     error!("Error getting updates: {}", e);
-                    // Continue polling on error
+                    // Back off on error to avoid hammering a down API
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         }
@@ -280,18 +281,7 @@ impl Channel for TelegramChannel {
     async fn receive_updates(&self) -> AlmsResult<mpsc::Receiver<IncomingMessage>> {
         let (tx, rx) = mpsc::channel(100);
 
-        // Start polling in a background task
-        let channel = TelegramChannel {
-            token: self.token.clone(),
-            client: self.client.clone(),
-            base_url: self.base_url.clone(),
-            last_update_id: Arc::clone(&self.last_update_id),
-            running: Arc::clone(&self.running),
-            use_webhook: self.use_webhook,
-            webhook_url: self.webhook_url.clone(),
-            poll_interval_secs: self.poll_interval_secs,
-        };
-
+        let channel = self.clone();
         tokio::spawn(async move {
             if let Err(e) = channel.run_polling(tx).await {
                 error!("Polling error: {}", e);
