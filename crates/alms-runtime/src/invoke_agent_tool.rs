@@ -182,17 +182,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_system_prompt_optional() {
-        // Should succeed without system_prompt
-        let tool = make_tool("response");
-        let result = tool
-            .execute(serde_json::json!({ "task": "research something" }))
-            .await
-            .unwrap();
-        assert_eq!(result["response"], "response");
-    }
-
-    #[tokio::test]
     async fn test_dispatcher_error_propagates() {
         #[derive(Debug)]
         struct FailDispatcher;

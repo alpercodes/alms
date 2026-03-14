@@ -337,8 +337,14 @@ mod tests {
         let messages = builder.build("System prompt", &history, "Input", None);
 
         // system + input = 2 fixed messages; history budget ~93 tokens fits ~4-5 messages
-        assert!(messages.len() >= 3, "should include at least one history message");
-        assert!(messages.len() <= 8, "token budget should limit history to a few messages");
+        assert!(
+            messages.len() >= 3,
+            "should include at least one history message"
+        );
+        assert!(
+            messages.len() <= 8,
+            "token budget should limit history to a few messages"
+        );
     }
 
     #[test]
