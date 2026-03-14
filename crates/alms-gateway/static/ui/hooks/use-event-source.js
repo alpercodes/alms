@@ -4,6 +4,33 @@ import { activeRunId } from '../state/runs.js';
 // Active foreground EventSource reference
 let activeEs = null;
 
+// ── Streaming delta buffer ──
+// Accumulate token deltas and flush to signal at ~30fps max,
+// avoiding a full Preact re-render on every single delta event.
+let deltaBuffer = '';
+let flushTimer = null;
+
+function flushDeltaBuffer() {
+    flushTimer = null;
+    if (!deltaBuffer) return;
+    const pending = deltaBuffer;
+    deltaBuffer = '';
+    const msgs = [...chatMessages.value];
+    const last = msgs[msgs.length - 1];
+    if (last && last.type === 'agent' && !last.sealed) {
+        msgs[msgs.length - 1] = { ...last, text: last.text + pending };
+    } else {
+        msgs.push({ type: 'agent', role: 'assistant', text: pending, sealed: false });
+    }
+    chatMessages.value = msgs;
+}
+
+function scheduleFlush() {
+    if (flushTimer === null) {
+        flushTimer = requestAnimationFrame(flushDeltaBuffer);
+    }
+}
+
 /**
  * Open a foreground SSE stream for a run.
  * Updates chatMessages signal as events arrive.
@@ -25,17 +52,12 @@ export function openForegroundStream(runId, { onDone } = {}) {
 
     es.addEventListener('token_delta', (e) => {
         const { delta } = JSON.parse(e.data);
-        const msgs = [...chatMessages.value];
-        const last = msgs[msgs.length - 1];
-        if (last && last.type === 'agent' && !last.sealed) {
-            msgs[msgs.length - 1] = { ...last, text: last.text + delta };
-        } else {
-            msgs.push({ type: 'agent', role: 'assistant', text: delta, sealed: false });
-        }
-        chatMessages.value = msgs;
+        deltaBuffer += delta;
+        scheduleFlush();
     });
 
     es.addEventListener('tool_start', (e) => {
+        flushDeltaBuffer(); // flush pending text before tool row
         const data = JSON.parse(e.data);
         chatMessages.value = [...chatMessages.value, {
             type: 'tool',
@@ -59,6 +81,7 @@ export function openForegroundStream(runId, { onDone } = {}) {
     });
 
     es.addEventListener('approval_required', (e) => {
+        flushDeltaBuffer();
         const data = JSON.parse(e.data);
         chatMessages.value = [...chatMessages.value, {
             type: 'approval',
@@ -81,6 +104,7 @@ export function openForegroundStream(runId, { onDone } = {}) {
     });
 
     const finishHandler = (status) => (e) => {
+        flushDeltaBuffer(); // flush any remaining text
         sealLastAgent();
         const data = e.data ? JSON.parse(e.data) : {};
         if (status === 'error') {
@@ -130,6 +154,12 @@ function sealLastAgent() {
 }
 
 export function closeActiveStream() {
+    if (flushTimer !== null) {
+        cancelAnimationFrame(flushTimer);
+        flushTimer = null;
+    }
+    flushDeltaBuffer();
+    deltaBuffer = '';
     if (activeEs) {
         activeEs.close();
         activeEs = null;
