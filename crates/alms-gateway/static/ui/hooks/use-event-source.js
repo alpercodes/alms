@@ -5,8 +5,8 @@ import { activeRunId } from '../state/runs.js';
 let activeEs = null;
 
 // ── Streaming delta buffer ──
-// Accumulate token deltas and flush to signal at ~30fps max,
-// avoiding a full Preact re-render on every single delta event.
+// Accumulate token deltas and flush to signal at display refresh rate
+// (~60fps), avoiding a full Preact re-render on every single delta event.
 let deltaBuffer = '';
 let flushTimer = null;
 
@@ -66,7 +66,7 @@ export function openForegroundStream(runId, { onDone } = {}) {
             tool: data.tool,
             params: data.parameters,
             status: 'running',
-            id: data.call_id || data.tool,
+            id: data.tool_invocation_id || data.call_id || data.tool,
         }];
         // Seal the previous agent message so new deltas start a new bubble
         sealLastAgent();
@@ -75,7 +75,10 @@ export function openForegroundStream(runId, { onDone } = {}) {
     es.addEventListener('tool_end', (e) => {
         const data = JSON.parse(e.data);
         const msgs = [...chatMessages.value];
-        const idx = msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
+        const matchId = data.tool_invocation_id;
+        const idx = matchId
+            ? msgs.findLastIndex(m => m.type === 'tool' && m.id === matchId)
+            : msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
         if (idx >= 0) {
             msgs[idx] = { ...msgs[idx], status: data.ok ? 'done' : 'fail', result: data.result };
         }
@@ -169,7 +172,6 @@ export function closeActiveStream() {
         flushTimer = null;
     }
     flushDeltaBuffer();
-    deltaBuffer = '';
     if (activeEs) {
         activeEs.close();
         activeEs = null;
