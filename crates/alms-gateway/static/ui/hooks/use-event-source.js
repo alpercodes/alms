@@ -148,21 +148,17 @@ export function openForegroundStream(runId, { onDone } = {}) {
     return { close: () => closeActiveStream() };
 }
 
-function stripThinking() {
-    const msgs = chatMessages.value;
-    if (msgs.some(m => m.type === 'thinking')) {
-        chatMessages.value = msgs.filter(m => m.type !== 'thinking');
-    }
-}
-
 function sealLastAgent() {
-    stripThinking();
     const msgs = chatMessages.value;
-    const last = msgs[msgs.length - 1];
+    const hasThinking = msgs.some(m => m.type === 'thinking');
+    const filtered = hasThinking ? msgs.filter(m => m.type !== 'thinking') : msgs;
+    const last = filtered[filtered.length - 1];
     if (last && last.type === 'agent' && !last.sealed) {
-        const updated = [...msgs];
+        const updated = [...filtered];
         updated[updated.length - 1] = { ...last, sealed: true };
         chatMessages.value = updated;
+    } else if (hasThinking) {
+        chatMessages.value = filtered;
     }
 }
 

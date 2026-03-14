@@ -52,7 +52,7 @@ function ChatView() {
                     }
                     if (m.type === 'thinking') {
                         return html`
-                            <div key=${i} class="msg agent">
+                            <div key="thinking" class="msg agent">
                                 <div class="msg-label">Agent</div>
                                 <div class="msg-body thinking-indicator">Thinking</div>
                             </div>
