@@ -310,6 +310,49 @@
     #send:not(:disabled):hover { background: #2ea043; }
     #send:disabled { opacity: 0.5; cursor: default; }
 
+    /* ── Message queue above input ── */
+    #message-queue {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 0 12px;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    #message-queue:empty { display: none; }
+    .queued-msg {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 12px;
+      color: #8b949e;
+    }
+    .queued-msg-text {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .queued-msg-label {
+      font-size: 10px;
+      color: #d29922;
+      flex-shrink: 0;
+    }
+    .queued-msg-remove {
+      background: none;
+      border: none;
+      color: #484f58;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 0 2px;
+      flex-shrink: 0;
+    }
+    .queued-msg-remove:hover { color: #f85149; }
+
     #cancel-run {
       background: #da3633;
       color: #fff;
@@ -735,6 +778,7 @@
   <!-- ── Chat area ── -->
   <div id="chat">
     <div id="messages"></div>
+    <div id="message-queue"></div>
     <div id="input-area">
       <textarea id="prompt" rows="2" placeholder="Send a message… (Enter to send, Shift+Enter for newline)" disabled></textarea>
       <button id="send" disabled>Send</button>
@@ -815,6 +859,7 @@ const S = {
 
 let activeEs = null;  // current EventSource
 let activeRunId = null;  // run ID for in-flight cancel
+let messageQueue = [];  // queued messages waiting to be sent
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
 const statusEl     = document.getElementById('status');
@@ -822,6 +867,7 @@ const messagesEl   = document.getElementById('messages');
 const promptEl     = document.getElementById('prompt');
 const sendBtn      = document.getElementById('send');
 const cancelBtn    = document.getElementById('cancel-run');
+const msgQueueEl   = document.getElementById('message-queue');
 const agentSelectEl = document.getElementById('agent-select');
 const sessionListEl = document.getElementById('session-list');
 const runListEl    = document.getElementById('run-list');
@@ -881,7 +927,7 @@ function renderAgentSelect() {
 
 function onAgentSelectChange(agentId) {
   if (!agentId || agentId === S.activeAgentId) return;
-  if (activeEs) { agentSelectEl.value = S.activeAgentId; return; }
+  if (activeEs || messageQueue.length > 0) { agentSelectEl.value = S.activeAgentId; return; }
   switchAgent(agentId);
 }
 
@@ -896,6 +942,7 @@ async function switchAgent(agentId) {
   S.runs = [];
   S.wsFiles = null;
   S.auditEvents = null;
+  clearMessageQueue();
   localStorage.setItem(ACTIVE_AGENT_KEY, agentId);
 
   messagesEl.innerHTML = '';
@@ -956,7 +1003,7 @@ function renderSessions() {
 }
 
 function selectSession(sessionId) {
-  if (sessionId === S.activeSessionId || activeEs) return;
+  if (sessionId === S.activeSessionId || activeEs || messageQueue.length > 0) return;
   S.activeSessionId = sessionId;
   S.runs = [];
   S.auditEvents = null;
@@ -971,7 +1018,7 @@ function selectSession(sessionId) {
 }
 
 async function newSession() {
-  if (activeEs || !S.activeAgentId) return;
+  if (activeEs || messageQueue.length > 0 || !S.activeAgentId) return;
   try {
     const res = await fetch('/sessions', {
       method: 'POST',
@@ -1296,12 +1343,61 @@ function disableInput() {
   sendBtn.disabled = true;
 }
 
+// ── Message queue ──────────────────────────────────────────────────────────────
+function enqueueMessage(text) {
+  const el = document.createElement('div');
+  el.className = 'queued-msg';
+  const label = document.createElement('span');
+  label.className = 'queued-msg-label';
+  label.textContent = 'queued';
+  const body = document.createElement('span');
+  body.className = 'queued-msg-text';
+  body.textContent = text;
+  const removeBtn = document.createElement('button');
+  removeBtn.className = 'queued-msg-remove';
+  removeBtn.textContent = '×';
+  removeBtn.title = 'Remove from queue';
+  removeBtn.onclick = () => {
+    messageQueue = messageQueue.filter(m => m.el !== el);
+    el.remove();
+  };
+  el.appendChild(label);
+  el.appendChild(body);
+  el.appendChild(removeBtn);
+  msgQueueEl.appendChild(el);
+  const entry = { text, el };
+  messageQueue.push(entry);
+}
+
+function clearMessageQueue() {
+  messageQueue = [];
+  msgQueueEl.innerHTML = '';
+}
+
+async function drainNextQueued() {
+  if (messageQueue.length === 0) return;
+  const next = messageQueue.shift();
+  next.el.remove();
+  await startRun(next.text);
+}
+
 // ── Send message ───────────────────────────────────────────────────────────────
 async function sendMessage() {
   const text = promptEl.value.trim();
   if (!text || !S.activeSessionId) return;
-
   promptEl.value = '';
+
+  // If a run is active, queue the message instead of sending immediately
+  if (activeEs) {
+    enqueueMessage(text);
+    promptEl.focus();
+    return;
+  }
+
+  await startRun(text);
+}
+
+async function startRun(text) {
   disableInput();
   setStatus('running…', 'running');
 
@@ -1326,7 +1422,6 @@ async function sendMessage() {
     });
     if (!res.ok) {
       if (res.status === 404 || res.status === 400) {
-        // Session expired (server restart without SQLite). Recreate.
         S.activeSessionId = null;
         S.sessions = [];
         enableInput();
@@ -1375,13 +1470,18 @@ function openEventStream(runId) {
     activeEs = null;
     activeRunId = null;
     cancelBtn.style.display = 'none';
-    const agent = S.agents.find(a => a.id === S.activeAgentId);
-    setStatus(agent ? agent.name : 'ready', 'ok');
-    enableInput();
-    promptEl.focus();
     // Refresh run history and audit log after completion.
     loadRuns();
     if (S.activePanel === 'audit') { S.auditEvents = null; loadAudit(); }
+    // Drain next queued message, or re-enable input if queue is empty
+    if (messageQueue.length > 0) {
+      drainNextQueued();
+    } else {
+      const agent = S.agents.find(a => a.id === S.activeAgentId);
+      setStatus(agent ? agent.name : 'ready', 'ok');
+      enableInput();
+      promptEl.focus();
+    }
   }
 
   es.addEventListener('token_delta', e => {
