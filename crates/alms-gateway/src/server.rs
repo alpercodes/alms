@@ -276,15 +276,25 @@ impl AppState {
         // Migrate any legacy UUID-based workspace directories to name-based paths.
         if let Some(ws_dir) = &workspace_dir
             && let Some(store) = session_manager.store()
-            && let Ok(agents) = store.list_agents()
         {
-            let pairs: Vec<_> = agents.iter().map(|a| (a.id.0, a.name.clone())).collect();
-            match alms_core::migrate_workspace_dirs(ws_dir, &pairs) {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
-                    "Migrated {n} workspace directories from UUID to name-based paths"
-                ),
-                Err(e) => tracing::warn!("Workspace migration error: {e}"),
+            match store.list_agents() {
+                Ok(agents) => {
+                    let pairs: Vec<_> = agents.iter().map(|a| (a.id.0, a.name.clone())).collect();
+                    match alms_core::migrate_workspace_dirs(ws_dir, &pairs) {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(
+                            count = n,
+                            "Migrated workspace directories from UUID to name-based paths"
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "Workspace migration error"),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to list agents for workspace migration — migration skipped"
+                    );
+                }
             }
         }
 
