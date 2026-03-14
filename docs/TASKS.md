@@ -809,6 +809,12 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Note: `max_tokens_per_run` config exists but is never enforced — cumulative token budget across iterations is not checked.
 - **Owners:** Atlas
 
+112) URGENT: UI blocks input while agent is running — no message queuing
+- The UI disables the text input and send button while a run is in progress (`disableInput()`). Users cannot type or queue follow-up messages.
+- The backend `SessionQueue` already supports queuing multiple messages per session (FIFO), so the infrastructure exists — the UI just doesn't use it.
+- Fix: keep the input enabled during active runs. Submitted messages should be queued as new runs via `POST /runs` and processed after the current run finishes. Show queued messages in the chat as pending.
+- **Owners:** Atlas
+
 ---
 
 ## Docs index
