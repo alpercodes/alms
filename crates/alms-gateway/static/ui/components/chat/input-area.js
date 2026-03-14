@@ -14,9 +14,10 @@ export const inputStatus = signal('');
 async function startRun(text) {
     inputStatus.value = 'running';
 
-    chatMessages.value = [...chatMessages.value, {
-        type: 'user', role: 'user', text,
-    }];
+    chatMessages.value = [...chatMessages.value,
+        { type: 'user', role: 'user', text },
+        { type: 'thinking' },
+    ];
 
     closeActiveStream();
 
@@ -48,7 +49,11 @@ async function startRun(text) {
             },
         });
     } catch (err) {
-        inputStatus.value = 'error';
+        // Remove thinking indicator and show error
+        chatMessages.value = chatMessages.value
+            .filter(m => m.type !== 'thinking')
+            .concat([{ type: 'error', text: `Failed to start run: ${err.message || err.status || 'unknown error'}` }]);
+        inputStatus.value = '';
         console.error('[startRun] failed:', err);
     }
 }

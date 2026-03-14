@@ -113,6 +113,14 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+#app {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
 /* ── Scrollbars ── */
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
@@ -1046,6 +1054,23 @@ header h1 {
   content: '\258C';
   animation: blink 1s step-end infinite;
   color: var(--accent);
+}
+
+/* ── Thinking indicator ── */
+@keyframes thinking-dots {
+  0%   { content: ''; }
+  25%  { content: '.'; }
+  50%  { content: '..'; }
+  75%  { content: '...'; }
+}
+
+.thinking-indicator {
+  color: var(--text-muted) !important;
+  font-style: italic;
+}
+.thinking-indicator::after {
+  content: '';
+  animation: thinking-dots 1.5s steps(1) infinite;
 }
 
 /* ══════════════════════════════════════════════════════════════════════

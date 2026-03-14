@@ -50,6 +50,14 @@ function ChatView() {
                     if (m.type === 'tokens') {
                         return html`<${TokenBadge} key=${i} usage=${m.usage} />`;
                     }
+                    if (m.type === 'thinking') {
+                        return html`
+                            <div key="thinking" class="msg agent">
+                                <div class="msg-label">Agent</div>
+                                <div class="msg-body thinking-indicator">Thinking</div>
+                            </div>
+                        `;
+                    }
                     return null;
                 })}
             </div>

@@ -4,6 +4,35 @@ import { activeRunId } from '../state/runs.js';
 // Active foreground EventSource reference
 let activeEs = null;
 
+// ── Streaming delta buffer ──
+// Accumulate token deltas and flush to signal at display refresh rate
+// (~60fps), avoiding a full Preact re-render on every single delta event.
+let deltaBuffer = '';
+let flushTimer = null;
+
+function flushDeltaBuffer() {
+    flushTimer = null;
+    if (!deltaBuffer) return;
+    const pending = deltaBuffer;
+    deltaBuffer = '';
+    // Remove thinking indicator on first real content
+    const msgs = chatMessages.value.filter(m => m.type !== 'thinking');
+    const copy = [...msgs];
+    const last = copy[copy.length - 1];
+    if (last && last.type === 'agent' && !last.sealed) {
+        copy[copy.length - 1] = { ...last, text: last.text + pending };
+    } else {
+        copy.push({ type: 'agent', role: 'assistant', text: pending, sealed: false });
+    }
+    chatMessages.value = copy;
+}
+
+function scheduleFlush() {
+    if (flushTimer === null) {
+        flushTimer = requestAnimationFrame(flushDeltaBuffer);
+    }
+}
+
 /**
  * Open a foreground SSE stream for a run.
  * Updates chatMessages signal as events arrive.
@@ -25,24 +54,19 @@ export function openForegroundStream(runId, { onDone } = {}) {
 
     es.addEventListener('token_delta', (e) => {
         const { delta } = JSON.parse(e.data);
-        const msgs = [...chatMessages.value];
-        const last = msgs[msgs.length - 1];
-        if (last && last.type === 'agent' && !last.sealed) {
-            msgs[msgs.length - 1] = { ...last, text: last.text + delta };
-        } else {
-            msgs.push({ type: 'agent', role: 'assistant', text: delta, sealed: false });
-        }
-        chatMessages.value = msgs;
+        deltaBuffer += delta;
+        scheduleFlush();
     });
 
     es.addEventListener('tool_start', (e) => {
+        flushDeltaBuffer(); // flush pending text before tool row
         const data = JSON.parse(e.data);
         chatMessages.value = [...chatMessages.value, {
             type: 'tool',
             tool: data.tool,
-            params: data.parameters,
+            params: data.params,
             status: 'running',
-            id: data.call_id || data.tool,
+            id: data.tool_invocation_id || data.call_id || data.tool,
         }];
         // Seal the previous agent message so new deltas start a new bubble
         sealLastAgent();
@@ -51,20 +75,24 @@ export function openForegroundStream(runId, { onDone } = {}) {
     es.addEventListener('tool_end', (e) => {
         const data = JSON.parse(e.data);
         const msgs = [...chatMessages.value];
-        const idx = msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
+        const matchId = data.tool_invocation_id;
+        const idx = matchId
+            ? msgs.findLastIndex(m => m.type === 'tool' && m.id === matchId)
+            : msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
         if (idx >= 0) {
-            msgs[idx] = { ...msgs[idx], status: data.error ? 'fail' : 'done', result: data.result || data.error };
+            msgs[idx] = { ...msgs[idx], status: data.ok ? 'done' : 'fail', result: data.result };
         }
         chatMessages.value = msgs;
     });
 
     es.addEventListener('approval_required', (e) => {
+        flushDeltaBuffer();
         const data = JSON.parse(e.data);
         chatMessages.value = [...chatMessages.value, {
             type: 'approval',
             approvalId: data.approval_id,
-            tool: data.tool,
-            params: data.parameters,
+            tool: data.capability,
+            params: data.request,
             resolved: false,
         }];
         sealLastAgent();
@@ -81,12 +109,16 @@ export function openForegroundStream(runId, { onDone } = {}) {
     });
 
     const finishHandler = (status) => (e) => {
+        flushDeltaBuffer(); // flush any remaining text
         sealLastAgent();
         const data = e.data ? JSON.parse(e.data) : {};
         if (status === 'error') {
+            const errMsg = typeof data.error === 'string'
+                ? data.error
+                : (data.error?.message || 'Run failed');
             chatMessages.value = [...chatMessages.value, {
                 type: 'error',
-                text: data.error || 'Run failed',
+                text: errMsg,
             }];
         }
         if (status === 'cancelled') {
@@ -95,11 +127,14 @@ export function openForegroundStream(runId, { onDone } = {}) {
                 text: '(run cancelled)',
             }];
         }
-        // Add token badge if available
-        if (data.usage) {
+        // Add token badge if available (Rust sends flat fields, not nested usage)
+        const usage = (data.prompt_tokens || data.completion_tokens)
+            ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
+            : data.usage;
+        if (usage) {
             chatMessages.value = [...chatMessages.value, {
                 type: 'tokens',
-                usage: data.usage,
+                usage,
             }];
         }
         closeActiveStream();
@@ -121,15 +156,24 @@ export function openForegroundStream(runId, { onDone } = {}) {
 
 function sealLastAgent() {
     const msgs = chatMessages.value;
-    const last = msgs[msgs.length - 1];
+    const hasThinking = msgs.some(m => m.type === 'thinking');
+    const filtered = hasThinking ? msgs.filter(m => m.type !== 'thinking') : msgs;
+    const last = filtered[filtered.length - 1];
     if (last && last.type === 'agent' && !last.sealed) {
-        const updated = [...msgs];
+        const updated = [...filtered];
         updated[updated.length - 1] = { ...last, sealed: true };
         chatMessages.value = updated;
+    } else if (hasThinking) {
+        chatMessages.value = filtered;
     }
 }
 
 export function closeActiveStream() {
+    if (flushTimer !== null) {
+        cancelAnimationFrame(flushTimer);
+        flushTimer = null;
+    }
+    flushDeltaBuffer();
     if (activeEs) {
         activeEs.close();
         activeEs = null;
