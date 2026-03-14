@@ -283,15 +283,16 @@ impl AppState {
                     match alms_core::migrate_workspace_dirs(ws_dir, &pairs) {
                         Ok(0) => {}
                         Ok(n) => tracing::info!(
-                            "Migrated {n} workspace directories from UUID to name-based paths"
+                            count = n,
+                            "Migrated workspace directories from UUID to name-based paths"
                         ),
-                        Err(e) => tracing::warn!("Workspace migration error: {e}"),
+                        Err(e) => tracing::warn!(error = %e, "Workspace migration error"),
                     }
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "Failed to list agents for workspace migration — \
-                         migration skipped: {e}"
+                        error = %e,
+                        "Failed to list agents for workspace migration — migration skipped"
                     );
                 }
             }
