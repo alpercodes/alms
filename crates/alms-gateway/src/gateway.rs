@@ -440,7 +440,7 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         model: None,
         system_prompt: None,
         posture: None,
-        is_default: true,
+        is_default: false,
         created_at: now,
         last_active: now,
     };
@@ -450,7 +450,9 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         return;
     }
 
-    // No separate set_default_agent() needed — record already has is_default: true.
+    if let Err(e) = store.set_default_agent(agent_id) {
+        warn!("Failed to set migrated agent as default: {}", e);
+    }
     info!("Migrated sidecar agent to registry: {}", agent_id.0);
 }
 
