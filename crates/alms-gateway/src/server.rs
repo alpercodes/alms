@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
 /// Run manager for tracking runs and their event streams
@@ -312,7 +313,13 @@ pub use crate::sse::{RunEventStream, event_channel};
 
 /// Routes that do NOT require authentication
 fn public_router() -> Router<AppState> {
-    Router::new().route("/health", get(health_check))
+    Router::new()
+        .route("/health", get(health_check))
+        .nest_service(
+            "/ui",
+            ServeDir::new("crates/alms-gateway/static/ui")
+                .fallback(ServeFile::new("crates/alms-gateway/static/ui/index.html")),
+        )
 }
 
 /// Routes that require authentication (all except /health)
