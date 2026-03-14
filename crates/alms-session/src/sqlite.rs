@@ -810,17 +810,75 @@ impl SqliteStore {
         Ok(rows)
     }
 
-    /// Delete an agent by ID. Returns true if a row was deleted.
+    /// Delete an agent and all its dependent data (sessions, messages, audit
+    /// events, context summaries, jobs).
+    ///
+    /// Wrapped in a transaction so a crash mid-delete cannot leave orphaned
+    /// rows. Returns `true` if the agent existed and was deleted.
     pub fn delete_agent(&self, id: AgentId) -> AlmsResult<bool> {
-        let affected = self
-            .conn
-            .lock()
-            .execute(
-                "DELETE FROM agents WHERE id = ?1",
-                params![id.0.to_string()],
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete_agent: {e}")))?;
-        Ok(affected > 0)
+        let conn = self.conn.lock();
+        let id_str = id.0.to_string();
+
+        conn.execute_batch("BEGIN")
+            .map_err(|e| AlmsError::Runtime(format!("SQLite begin delete_agent: {e}")))?;
+
+        let result = (|| -> AlmsResult<bool> {
+            // 1. Collect session IDs belonging to this agent
+            let mut stmt = conn
+                .prepare("SELECT id FROM sessions WHERE agent_id = ?1")
+                .map_err(|e| AlmsError::Runtime(format!("SQLite prepare session query: {e}")))?;
+            let session_ids: Vec<String> = stmt
+                .query_map(params![&id_str], |row| row.get(0))
+                .map_err(|e| AlmsError::Runtime(format!("SQLite query agent sessions: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            // 2. Delete dependent rows for each session (FK order)
+            for sid in &session_ids {
+                conn.execute(
+                    "DELETE FROM context_summaries WHERE session_id = ?1",
+                    params![sid],
+                )
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite delete summaries for session: {e}"))
+                })?;
+                conn.execute(
+                    "DELETE FROM audit_events WHERE session_id = ?1",
+                    params![sid],
+                )
+                .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit for session: {e}")))?;
+                conn.execute("DELETE FROM messages WHERE session_id = ?1", params![sid])
+                    .map_err(|e| {
+                        AlmsError::Runtime(format!("SQLite delete messages for session: {e}"))
+                    })?;
+            }
+
+            // 3. Delete the sessions themselves
+            conn.execute("DELETE FROM sessions WHERE agent_id = ?1", params![&id_str])
+                .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent sessions: {e}")))?;
+
+            // 4. Delete jobs belonging to this agent
+            conn.execute("DELETE FROM jobs WHERE agent_id = ?1", params![&id_str])
+                .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent jobs: {e}")))?;
+
+            // 5. Delete the agent row
+            let affected = conn
+                .execute("DELETE FROM agents WHERE id = ?1", params![&id_str])
+                .map_err(|e| AlmsError::Runtime(format!("SQLite delete_agent: {e}")))?;
+
+            Ok(affected > 0)
+        })();
+
+        match &result {
+            Ok(_) => {
+                conn.execute_batch("COMMIT")
+                    .map_err(|e| AlmsError::Runtime(format!("SQLite commit delete_agent: {e}")))?;
+            }
+            Err(_) => {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+        }
+        result
     }
 
     /// Set an agent as the default, clearing any previous default.
@@ -1248,6 +1306,105 @@ mod tests {
 
         // Deleting again returns false
         assert!(!store.delete_agent(agent.id).unwrap());
+    }
+
+    #[test]
+    fn test_agent_delete_cascades_sessions_messages_audit_jobs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        // Create two agents — one to delete, one to keep as control
+        let doomed = new_agent("doomed");
+        let survivor = new_agent("survivor");
+        store.create_agent(&doomed).unwrap();
+        store.create_agent(&survivor).unwrap();
+
+        // Create sessions for both agents
+        let ds = Session::new(doomed.id, "ctx-doomed");
+        let ss = Session::new(survivor.id, "ctx-survivor");
+        store.save_session(&ds).unwrap();
+        store.save_session(&ss).unwrap();
+
+        // Add messages to both sessions
+        store
+            .save_message(ds.id, &new_message("doomed msg"))
+            .unwrap();
+        store
+            .save_message(ss.id, &new_message("survivor msg"))
+            .unwrap();
+
+        // Add audit events to both sessions
+        let doomed_audit = AuditEvent::allow(
+            ds.id,
+            "echo",
+            serde_json::json!({"text": "hi"}),
+            serde_json::json!("hi"),
+        );
+        let survivor_audit = AuditEvent::allow(
+            ss.id,
+            "echo",
+            serde_json::json!({"text": "ok"}),
+            serde_json::json!("ok"),
+        );
+        store.save_audit(&doomed_audit).unwrap();
+        store.save_audit(&survivor_audit).unwrap();
+
+        // Add context summaries to both sessions
+        let summary = ContextSummary {
+            text: "test summary".to_string(),
+            messages_covered: 1,
+            updated_at: Some(Timestamp::now()),
+        };
+        store.save_summary(ds.id, &summary).unwrap();
+        store.save_summary(ss.id, &summary).unwrap();
+
+        // Add jobs for both agents
+        let doomed_job = Job {
+            id: JobId::new(),
+            agent_id: doomed.id,
+            prompt: "doomed job".to_string(),
+            schedule: JobSchedule::Once {
+                run_at: chrono::Utc::now(),
+            },
+            status: JobStatus::Pending,
+            created_at: chrono::Utc::now(),
+            next_run_at: None,
+            last_run_at: None,
+        };
+        let survivor_job = Job {
+            id: JobId::new(),
+            agent_id: survivor.id,
+            prompt: "survivor job".to_string(),
+            schedule: JobSchedule::Once {
+                run_at: chrono::Utc::now(),
+            },
+            status: JobStatus::Pending,
+            created_at: chrono::Utc::now(),
+            next_run_at: None,
+            last_run_at: None,
+        };
+        store.save_job(&doomed_job).unwrap();
+        store.save_job(&survivor_job).unwrap();
+
+        // Delete the doomed agent — should cascade
+        assert!(store.delete_agent(doomed.id).unwrap());
+
+        // Doomed agent's data is gone
+        assert!(store.load_agent_by_id(doomed.id).unwrap().is_none());
+        assert!(store.load_sessions_by_agent(doomed.id).unwrap().is_empty());
+        assert!(store.load_messages(ds.id).unwrap().is_empty());
+        assert!(store.load_audit(ds.id).unwrap().is_empty());
+
+        // Survivor agent's data is untouched
+        assert!(store.load_agent_by_id(survivor.id).unwrap().is_some());
+        let survivor_sessions = store.load_sessions_by_agent(survivor.id).unwrap();
+        assert_eq!(survivor_sessions.len(), 1);
+        assert_eq!(store.load_messages(ss.id).unwrap().len(), 1);
+        assert_eq!(store.load_audit(ss.id).unwrap().len(), 1);
+
+        // Survivor's job still exists, doomed's job is gone
+        let all_jobs = store.load_all_jobs_unfiltered().unwrap();
+        assert_eq!(all_jobs.len(), 1);
+        assert_eq!(all_jobs[0].agent_id, survivor.id);
     }
 
     #[test]
