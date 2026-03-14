@@ -1,7 +1,7 @@
 import { html } from '../../deps.js';
 import { post } from '../../api/client.js';
 
-async function resolveApproval(approvalId, decision, chatMessages) {
+async function resolveApproval(approvalId, decision) {
     try {
         await post(`/approvals/${approvalId}`, { decision });
     } catch (err) {
@@ -9,9 +9,9 @@ async function resolveApproval(approvalId, decision, chatMessages) {
     }
 }
 
-export function ApprovalCard({ approvalId, tool, params, resolved, decision, chatMessages }) {
-    const onApprove = () => resolveApproval(approvalId, 'approve', chatMessages);
-    const onDeny = () => resolveApproval(approvalId, 'deny', chatMessages);
+export function ApprovalCard({ approvalId, tool, params, resolved, decision }) {
+    const onApprove = () => resolveApproval(approvalId, 'approve');
+    const onDeny = () => resolveApproval(approvalId, 'deny');
 
     return html`
         <div class="approval-card ${resolved ? 'resolved' : ''}">

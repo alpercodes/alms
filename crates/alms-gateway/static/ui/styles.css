@@ -469,6 +469,13 @@ header h1 {
 .tool-row:hover { border-color: var(--border-default); }
 .tool-row.done { border-left-color: var(--success); color: var(--success); }
 .tool-row.fail { border-left-color: var(--error); color: var(--error); }
+.tool-row-detail {
+  margin-top: var(--space-1);
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 
 /* ── Approval card ── */
 .approval-card {

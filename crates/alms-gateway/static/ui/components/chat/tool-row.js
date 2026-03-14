@@ -1,15 +1,14 @@
-import { html, signal } from '../../deps.js';
+import { html, useSignal } from '../../deps.js';
 
 export function ToolRow({ tool, params, status, result, id }) {
-    // Each tool row has its own expanded state
-    const expanded = signal(false);
+    const expanded = useSignal(false);
 
     const toggle = () => { expanded.value = !expanded.value; };
 
     if (status === 'running') {
         return html`
             <div class="tool-row" onClick=${toggle}>
-                \u25b6 ${tool}${expanded.value ? html`<pre style="margin-top:4px;font-size:var(--text-2xs);color:var(--text-muted);white-space:pre-wrap">${JSON.stringify(params, null, 2)}</pre>` : ''}
+                \u25b6 ${tool}${expanded.value ? html`<pre class="tool-row-detail">${JSON.stringify(params, null, 2)}</pre>` : ''}
             </div>
         `;
     }
@@ -19,7 +18,7 @@ export function ToolRow({ tool, params, status, result, id }) {
     return html`
         <div class="tool-row ${status}" onClick=${toggle}>
             ${icon} ${tool}${expanded.value
-                ? html`<pre style="margin-top:4px;font-size:var(--text-2xs);color:var(--text-muted);white-space:pre-wrap">${summary}</pre>`
+                ? html`<pre class="tool-row-detail">${summary}</pre>`
                 : html` \u2014 ${summary.slice(0, 60)}${summary.length > 60 ? '\u2026' : ''}`
             }
         </div>

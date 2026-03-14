@@ -69,7 +69,7 @@ export function Header({ onOpenSettings, status }) {
                 `)}
             </div>
 
-            <button class="header-icon-btn" title="Settings"
+            <button class="header-icon-btn" title="Settings" aria-label="Settings"
                     onClick=${onOpenSettings}>
                 <${IconGear} />
             </button>

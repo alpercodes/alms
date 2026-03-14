@@ -106,10 +106,10 @@ export function InputArea() {
                           onKeyDown=${onKeyDown}
                           onInput=${onInput}></textarea>
                 ${isRunning
-                    ? html`<button id="cancel-run" title="Stop run"
+                    ? html`<button id="cancel-run" title="Stop run" aria-label="Stop run"
                                    onClick=${cancelCurrentRun}><${IconStop} /></button>`
                     : html`<button id="send" disabled=${!canSend}
-                                   title="Send (Enter)"
+                                   title="Send (Enter)" aria-label="Send message"
                                    onClick=${() => sendMessage(promptRef)}><${IconSend} /></button>`
                 }
             </div>
