@@ -310,16 +310,18 @@ mod tests {
 
     #[test]
     fn test_truncate_respects_token_budget() {
+        // Budget 600 tokens with a 500-token response buffer leaves ~100 for history.
+        // Each message is ~20 tokens at chars/3, so only a few should fit.
         let config = ContextConfig {
             strategy: "truncate".into(),
-            max_input_tokens: 100, // very small budget
-            recent_window: 100,    // allow many messages
+            max_input_tokens: 600,
+            recent_window: 100, // allow many messages
             summary_interval: 30,
             summary_model: None,
         };
         let builder = ContextBuilder::new(config);
 
-        // Create messages with substantial text
+        // Create messages with substantial text (~57 chars each → ~19 tokens at chars/3)
         let history: Vec<Message> = (0..20)
             .map(|i| {
                 make_msg(
@@ -334,8 +336,9 @@ mod tests {
 
         let messages = builder.build("System prompt", &history, "Input", None);
 
-        // Should have fewer than 20 history messages due to token budget
-        assert!(messages.len() < 22); // system + some history + input
+        // system + input = 2 fixed messages; history budget ~93 tokens fits ~4-5 messages
+        assert!(messages.len() >= 3, "should include at least one history message");
+        assert!(messages.len() <= 8, "token budget should limit history to a few messages");
     }
 
     #[test]

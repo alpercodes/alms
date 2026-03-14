@@ -815,6 +815,13 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: keep the input enabled during active runs. Submitted messages should be queued as new runs via `POST /runs` and processed after the current run finishes. Show queued messages in the chat as pending.
 - **Owners:** Atlas
 
+113) MEDIUM: Clarify relationship between `SessionConfig::max_context_tokens` and `ContextConfig::max_input_tokens`
+- Both default to 128000 but serve different purposes: `max_context_tokens` is a session storage limit (max messages/tokens to retain in the session), while `max_input_tokens` is the LLM context window budget (how many tokens to send per request).
+- Their relationship is not documented anywhere. Users could easily confuse the two, set one but not the other, or not understand why changing one doesn't affect the other.
+- Fix: (1) Add doc comments to both config structs explaining the distinction. (2) Add a note in `alms.toml.example` clarifying which controls what. (3) Consider whether `max_context_tokens` should default to something larger than `max_input_tokens` (it's the storage limit, so it could be higher), or whether one should derive from the other. (4) Validate that `max_context_tokens >= max_input_tokens` in `AlmsConfig::validate()` since it makes no sense to store fewer tokens than you'd try to send.
+- **Evidence:** `config.rs:260-261` (`SessionConfig::max_context_tokens`), `config.rs:286` (`ContextConfig::max_input_tokens`)
+- **Owners:** Atlas
+
 ---
 
 ## Docs index
