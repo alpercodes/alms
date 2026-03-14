@@ -119,6 +119,8 @@
     }
 
     .session-item {
+      display: flex;
+      align-items: center;
       padding: 6px 10px;
       font-size: 12px;
       cursor: pointer;
@@ -1397,11 +1399,6 @@ function enableInput() {
   sendBtn.disabled = false;
 }
 
-function disableInput() {
-  promptEl.disabled = true;
-  sendBtn.disabled = true;
-}
-
 // ── Message queue ──────────────────────────────────────────────────────────────
 function enqueueMessage(text) {
   const el = document.createElement('div');
@@ -1418,6 +1415,9 @@ function enqueueMessage(text) {
   removeBtn.title = 'Remove from queue';
   removeBtn.onclick = () => {
     messageQueue = messageQueue.filter(m => m.el !== el);
+    // Also remove from background queue if one exists for this session
+    const bg = bgRuns[S.activeSessionId];
+    if (bg) bg.queue = bg.queue.filter(q => q.text !== text);
     el.remove();
   };
   el.appendChild(label);
@@ -1426,11 +1426,6 @@ function enqueueMessage(text) {
   msgQueueEl.appendChild(el);
   const entry = { text, el };
   messageQueue.push(entry);
-}
-
-function clearMessageQueue() {
-  messageQueue = [];
-  msgQueueEl.innerHTML = '';
 }
 
 async function drainNextQueued() {
