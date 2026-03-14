@@ -297,7 +297,7 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             strategy: "truncate".into(),
-            max_input_tokens: 32000,
+            max_input_tokens: 128_000,
             recent_window: 20,
             summary_interval: 30,
             summary_model: None,

@@ -39,7 +39,7 @@ snapshot_dir = "./data/snapshots"
 # How to manage the context window sent to the LLM
 strategy = "sliding-summary"        # sliding-summary | full | truncate
 # Max tokens to send to LLM (should be < model context window)
-max_input_tokens = 32000
+max_input_tokens = 128000
 # Number of recent messages to always keep in full
 recent_window = 20
 # How often to update the rolling summary (in messages)
@@ -120,7 +120,7 @@ ALMS currently hardcodes `take(50)` messages in `agent.rs:158`. No compression, 
 
 **Strategy: `sliding-summary`** (recommended default):
 
-1. **Token counting**: Approximate token count for each message (`chars / 4` as rough estimate, or `tiktoken`-style BPE if we add the dep). Track cumulative tokens.
+1. **Token counting**: Approximate token count for each message (`chars / 3` as rough estimate for mixed content, or `tiktoken`-style BPE if we add the dep). Track cumulative tokens.
 
 2. **Window management**: Given a budget of `max_input_tokens`:
    - Reserve space for system prompt (~500-2000 tokens depending on workspace)

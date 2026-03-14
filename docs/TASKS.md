@@ -43,6 +43,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-13:** Codex codebase review (`docs/codex-review-1303.md`): 6 findings — workspace identity split (#98), failed runs lose history (#99), default-agent not live (#100), config partially wired (#101), SSE subscription leak (#102), event log durability comments (#103), query-string auth scope (#104). Tasks added as P16.
 - **2026-03-14:** Cancel button for in-progress runs (#91): `CancellationToken` per run, 4 cancellation checkpoints (loop top, LLM streaming, tool execution, approval wait), `POST /runs/{run_id}/cancel` endpoint, `run_cancelled` SSE event, UI stop button. PR #65.
 - **2026-03-14:** Fixes #98 ✅, #99 ✅, #100 ✅ all merged. Channel tests (#62) already complete (29 tests exist). #91 ✅ merged.
+- **2026-03-14:** Fix #111: context token limit + assembly fixes. No ordering bugs found — root causes were `max_input_tokens` too low (32k→128k), token estimation too optimistic (chars/4→chars/3), and silent history load failure (warn→error). PR #71.
 
 ---
 
@@ -802,17 +803,23 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - The Jobs panel and create-job form exist in the UI, but scheduling does not work in practice. Needs investigation — could be a frontend form submission issue, backend endpoint error, or schedule parsing failure.
 - **Owners:** Atlas
 
-111) URGENT: Message ordering / context assembly issues
-- Something is wrong with the order messages get sent to the model, or how session context is assembled. Manifests as the agent appearing confused about conversation flow or missing context.
-- Needs investigation: check how `ContextBuilder.build()` orders history messages, whether the session `append_message()` timestamps are reliable, and whether the sliding-summary strategy preserves ordering. Also check if tool_call/tool_result pairs stay adjacent.
-- Related: default `max_input_tokens` is 32k which is likely **too low** for tool-using agents. A few tool call + result pairs (especially `fs_read`, `shell_exec`) can burn through 32k in 3-4 iterations, causing the agent to lose earlier conversation context. Modern models support 128k-200k — the default should be raised significantly (e.g. 100k+) so the agent isn't artificially starved of context.
-- Note: `max_tokens_per_run` config exists but is never enforced — cumulative token budget across iterations is not checked.
+111) URGENT: Message ordering / context assembly issues ✅
+- **Investigation found no ordering bugs** — context assembly is correctly ordered FIFO throughout (session storage via `rowid`, truncate/sliding-summary both reverse-walk correctly, tool call/result pairs stay adjacent).
+- **Root causes**: (1) `max_input_tokens` defaulted to 32k — burns through in 3-4 tool-heavy iterations, causing context loss. Bumped to 128k. (2) Token estimation (`text.len()/4`) underestimated for JSON tool output. Changed to `div_ceil(3)` (~3 chars/token), safer for mixed content. (3) History load failure silently fell back to empty Vec — upgraded from `warn!` to `error!` with session ID for production visibility.
+- Note: `max_tokens_per_run` config exists but is never enforced — cumulative token budget across iterations is not checked. Deferred.
 - **Owners:** Atlas
 
 112) URGENT: UI blocks input while agent is running — no message queuing
 - The UI disables the text input and send button while a run is in progress (`disableInput()`). Users cannot type or queue follow-up messages.
 - The backend `SessionQueue` already supports queuing multiple messages per session (FIFO), so the infrastructure exists — the UI just doesn't use it.
 - Fix: keep the input enabled during active runs. Submitted messages should be queued as new runs via `POST /runs` and processed after the current run finishes. Show queued messages in the chat as pending.
+- **Owners:** Atlas
+
+113) MEDIUM: Clarify relationship between `SessionConfig::max_context_tokens` and `ContextConfig::max_input_tokens`
+- Both default to 128000 but serve different purposes: `max_context_tokens` is a session storage limit (max messages/tokens to retain in the session), while `max_input_tokens` is the LLM context window budget (how many tokens to send per request).
+- Their relationship is not documented anywhere. Users could easily confuse the two, set one but not the other, or not understand why changing one doesn't affect the other.
+- Fix: (1) Add doc comments to both config structs explaining the distinction. (2) Add a note in `alms.toml.example` clarifying which controls what. (3) Consider whether `max_context_tokens` should default to something larger than `max_input_tokens` (it's the storage limit, so it could be higher), or whether one should derive from the other. (4) Validate that `max_context_tokens >= max_input_tokens` in `AlmsConfig::validate()` since it makes no sense to store fewer tokens than you'd try to send.
+- **Evidence:** `config.rs:260-261` (`SessionConfig::max_context_tokens`), `config.rs:286` (`ContextConfig::max_input_tokens`)
 - **Owners:** Atlas
 
 ---

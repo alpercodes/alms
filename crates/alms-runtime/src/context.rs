@@ -191,12 +191,14 @@ impl ContextBuilder {
     }
 }
 
-/// Rough token estimate: ~4 characters per token for English text.
-/// This is intentionally simple. A proper tokenizer (tiktoken) can be added later
-/// without changing the interface.
+/// Rough token estimate for mixed content (natural language, JSON, code).
+/// ~3 chars/token is a safer approximation than 4 for JSON-heavy tool output.
+/// A proper tokenizer (tiktoken) can be added later without changing the interface.
 pub fn estimate_tokens(text: &str) -> usize {
-    // chars/4 is a reasonable approximation for GPT-style tokenizers
-    text.len().div_ceil(4)
+    // ~3 chars per token: slightly overestimates for pure English (~4 chars/token)
+    // but more accurate for JSON/code (~2-3 chars/token). Overestimating is safer
+    // than underestimating — better to leave headroom than overshoot the context window.
+    text.len().div_ceil(3)
 }
 
 /// Convert session Content to a string for LLM context
@@ -244,8 +246,8 @@ mod tests {
     #[test]
     fn test_estimate_tokens() {
         assert_eq!(estimate_tokens(""), 0);
-        assert_eq!(estimate_tokens("hello"), 2); // (5+3)/4 = 2
-        assert_eq!(estimate_tokens("hello world"), 3); // (11+3)/4 = 3
+        assert_eq!(estimate_tokens("hello"), 2); // ceil(5/3) = 2
+        assert_eq!(estimate_tokens("hello world"), 4); // ceil(11/3) = 4
     }
 
     #[test]
@@ -308,16 +310,18 @@ mod tests {
 
     #[test]
     fn test_truncate_respects_token_budget() {
+        // Budget 600 tokens with a 500-token response buffer leaves ~100 for history.
+        // Each message is ~20 tokens at chars/3, so only a few should fit.
         let config = ContextConfig {
             strategy: "truncate".into(),
-            max_input_tokens: 100, // very small budget
-            recent_window: 100,    // allow many messages
+            max_input_tokens: 600,
+            recent_window: 100, // allow many messages
             summary_interval: 30,
             summary_model: None,
         };
         let builder = ContextBuilder::new(config);
 
-        // Create messages with substantial text
+        // Create messages with substantial text (~57 chars each → ~19 tokens at chars/3)
         let history: Vec<Message> = (0..20)
             .map(|i| {
                 make_msg(
@@ -332,8 +336,9 @@ mod tests {
 
         let messages = builder.build("System prompt", &history, "Input", None);
 
-        // Should have fewer than 20 history messages due to token budget
-        assert!(messages.len() < 22); // system + some history + input
+        // system + input = 2 fixed messages; history budget ~93 tokens fits ~4-5 messages
+        assert!(messages.len() >= 3, "should include at least one history message");
+        assert!(messages.len() <= 8, "token budget should limit history to a few messages");
     }
 
     #[test]
