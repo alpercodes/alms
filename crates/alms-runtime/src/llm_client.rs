@@ -248,12 +248,16 @@ impl LlmClient {
 
         let response = self.complete(request).await?;
 
-        response
+        let choice = response
             .choices
             .into_iter()
             .next()
-            .and_then(|c| c.message.content)
-            .ok_or_else(|| AlmsError::Runtime("No response from LLM".to_string()))
+            .ok_or_else(|| AlmsError::Runtime("LLM returned empty choices array".to_string()))?;
+
+        choice
+            .message
+            .content
+            .ok_or_else(|| AlmsError::Runtime("LLM returned null content (tool-call-only response in non-tool context)".to_string()))
     }
 
     fn mock_response(&self, request: &CompletionRequest) -> CompletionResponse {
