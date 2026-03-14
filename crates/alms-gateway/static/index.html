@@ -878,8 +878,10 @@ let activeEs = null;  // current EventSource (foreground rendering)
 let activeRunId = null;  // run ID for in-flight cancel
 let messageQueue = [];  // queued messages for the current session
 
-// Background runs: per-session state for runs that continue when user navigates away
+// Background runs: per-session state for runs that continue when user navigates away.
 // Key: sessionId → { runId, queue: [{text}], shadowEs: EventSource|null, finished: bool, status: string|null }
+// Note: in-memory only — queued messages are lost on page refresh. Runs themselves survive
+// (backend continues) and boot-time recovery re-attaches, but the queue is not persisted.
 const bgRuns = {};
 
 function hasActiveRun(sessionId) {
@@ -1542,7 +1544,14 @@ async function drainBackgroundQueue(sessionId) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(runBody),
     });
-    if (!res.ok) { delete bgRuns[sessionId]; renderSessions(); return; }
+    if (!res.ok) {
+      console.warn(`[alms] background queue drain failed for session ${sessionId}: HTTP ${res.status}`);
+      bg.queue.unshift(next); // put it back
+      bg.finished = true;
+      bg.status = 'drain_failed';
+      renderSessions();
+      return;
+    }
     const data = await res.json();
     bg.runId = data.run_id;
     bg.finished = false;
@@ -1554,8 +1563,11 @@ async function drainBackgroundQueue(sessionId) {
     } else {
       openShadowEventSource(sessionId, bg.runId);
     }
-  } catch {
-    delete bgRuns[sessionId];
+  } catch (err) {
+    console.warn(`[alms] background queue drain error for session ${sessionId}:`, err);
+    bg.queue.unshift(next); // put it back
+    bg.finished = true;
+    bg.status = 'drain_failed';
     renderSessions();
   }
 }
