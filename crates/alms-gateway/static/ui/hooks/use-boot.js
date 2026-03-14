@@ -18,7 +18,7 @@ const AGENT_KEY = 'alms_active_agent';
 export async function boot() {
     try {
         const data = await fetchSettings();
-        serverDefaults.value = data.defaults || {};
+        serverDefaults.value = data;
         agents.value = data.agents || [];
 
         // Determine active agent: localStorage > default > first
