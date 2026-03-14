@@ -90,6 +90,13 @@ impl Tool for InvokeAgentTool {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
+        // Validate name against agent naming rules to prevent bad filesystem paths
+        if let Some(ref name) = subagent_name {
+            alms_core::validate_agent_name(name).map_err(|e| {
+                SandboxError::InvalidParameters(format!("invalid subagent name: {e}"))
+            })?;
+        }
+
         let background = params
             .get("background")
             .and_then(|v| v.as_bool())
@@ -349,5 +356,25 @@ mod tests {
             .unwrap();
         let captured = dispatcher.0.lock().unwrap().take().unwrap();
         assert_eq!(captured, None);
+    }
+
+    #[tokio::test]
+    async fn test_invalid_name_rejected() {
+        let tool = make_tool("ok");
+        // Uppercase not allowed
+        let err = tool
+            .execute(serde_json::json!({ "task": "x", "name": "Bad Name!" }))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SandboxError::InvalidParameters(_)));
+    }
+
+    #[tokio::test]
+    async fn test_valid_name_accepted() {
+        let tool = make_tool("ok");
+        let result = tool
+            .execute(serde_json::json!({ "task": "x", "name": "my-agent" }))
+            .await;
+        assert!(result.is_ok());
     }
 }
