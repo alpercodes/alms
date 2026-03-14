@@ -3,6 +3,7 @@ import { agents, activeAgentId } from '../state/agents.js';
 import { activePanel, activePanelTab } from '../state/panel.js';
 import { localSettings, serverDefaults } from '../state/settings.js';
 import { switchAgent } from '../hooks/use-boot.js';
+import { IconGear } from '../utils/icons.js';
 
 const TABS = ['agents', 'workspace', 'jobs', 'audit'];
 
@@ -10,11 +11,6 @@ const effectivePosture = computed(() => {
     const local = localSettings.value.posture;
     const server = serverDefaults.value.posture;
     return local || server || 'full_control';
-});
-
-const hasSettingsOverride = computed(() => {
-    const s = localSettings.value;
-    return !!(s.max_tokens != null || s.posture);
 });
 
 function togglePanel(tab) {
@@ -34,11 +30,14 @@ export function Header({ onOpenSettings, status }) {
     };
 
     const posture = effectivePosture.value;
+    const statusClass = status.value === 'connected' ? 'ok'
+        : status.value === 'running' ? 'running'
+        : status.value === 'error' || status.value === 'offline' ? 'error' : '';
 
     return html`
         <header>
             <h1>ALMS</h1>
-            <span style="font-size:10px;color:#484f58;flex-shrink:0">v0.2</span>
+            <span class="header-sep">/</span>
             <select id="agent-select" title="Active agent"
                     value=${activeAgentId.value || ''}
                     onChange=${onAgentChange}>
@@ -46,20 +45,21 @@ export function Header({ onOpenSettings, status }) {
                     ? html`<option value="">No agents</option>`
                     : agents.value.map(a => html`
                         <option value=${a.id}>
-                            ${a.name}${a.is_default ? ' *' : ''}${a.needs_bootstrap ? ' (setup needed)' : ''}
+                            ${a.name}${a.is_default ? ' *' : ''}${a.needs_bootstrap ? ' (setup)' : ''}
                         </option>
                     `)
                 }
             </select>
-            <span id="posture-badge"
-                  title="Execution posture"
-                  class=${posture === 'guarded' ? 'guarded' : ''}
-                  style="display: inline">
-                ${posture}
-            </span>
-            <span id="status" class=${status.value === 'connected' ? 'ok' : status.value === 'running' ? 'running' : status.value === 'error' ? 'error' : ''}>
-                ${status.value}
-            </span>
+
+            ${posture === 'guarded' && html`
+                <span id="posture-badge" class="guarded">guarded</span>
+            `}
+
+            <div class="header-spacer"></div>
+
+            <span class="status-dot ${statusClass}"></span>
+            <span id="status">${status.value}</span>
+
             <div class="header-btns">
                 ${TABS.map(tab => html`
                     <button class="hbtn ${activePanel.value === tab ? 'active' : ''}"
@@ -67,13 +67,12 @@ export function Header({ onOpenSettings, status }) {
                         ${tab.charAt(0).toUpperCase() + tab.slice(1)}
                     </button>
                 `)}
-                <button class="hbtn ${hasSettingsOverride.value ? 'active' : ''}"
-                        id="btn-settings"
-                        title=${localSettings.value.posture ? `posture: ${localSettings.value.posture}` : 'Settings'}
-                        onClick=${onOpenSettings}>
-                    Settings
-                </button>
             </div>
+
+            <button class="header-icon-btn" title="Settings"
+                    onClick=${onOpenSettings}>
+                <${IconGear} />
+            </button>
         </header>
     `;
 }
