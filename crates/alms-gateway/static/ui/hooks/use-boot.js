@@ -1,16 +1,19 @@
 import { fetchSettings } from '../api/settings.js';
-import { listSessions, createSession } from '../api/sessions.js';
-import { getSessionMessages } from '../api/sessions.js';
+import { listSessions, createSession, getSessionMessages } from '../api/sessions.js';
+import { listRuns } from '../api/runs.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
+import { runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
 import { chatMessages } from '../state/chat.js';
+import { messageQueue, bgRuns } from '../state/queue.js';
+import { wsFiles } from '../state/workspace.js';
+import { auditEvents } from '../state/audit.js';
 
 const AGENT_KEY = 'alms_active_agent';
 
 /**
  * Boot sequence: load settings, agents, sessions, and chat history.
- * Called once on app mount.
  */
 export async function boot() {
     try {
@@ -35,24 +38,31 @@ export async function boot() {
 }
 
 /**
- * Load sessions for an agent, select the latest, and load its chat history.
+ * Load sessions for an agent, select the latest, load its history + runs.
  */
-export async function loadAgentSessions(agentId) {
+async function loadAgentSessions(agentId) {
     try {
-        const list = await listSessions(agentId);
-        sessions.value = list;
+        const data = await listSessions();
+        // Server returns all sessions — filter to this agent client-side
+        const agentSessions = (data.sessions || []).filter(s => s.agent_id === agentId);
+        sessions.value = agentSessions;
 
-        if (list.length > 0) {
-            const latest = list[0];
+        if (agentSessions.length > 0) {
+            const latest = agentSessions[0];
             activeSessionId.value = latest.id;
-            await loadHistory(latest.id);
+            await Promise.all([
+                loadHistory(latest.id),
+                loadRunHistory(latest.id),
+            ]);
         } else {
             // Create a first session
-            const ctx = new Date().toISOString().slice(0, 16).replace('T', ' ');
-            const sess = await createSession(agentId, ctx);
-            sessions.value = [sess];
-            activeSessionId.value = sess.id;
+            const ctx = 'web-chat-' + Date.now();
+            const resp = await createSession(agentId, ctx);
+            const reloaded = await listSessions();
+            sessions.value = (reloaded.sessions || []).filter(s => s.agent_id === agentId);
+            activeSessionId.value = resp.session_id;
             chatMessages.value = [];
+            runs.value = [];
         }
     } catch (err) {
         console.error('[loadAgentSessions] failed:', err);
@@ -60,12 +70,13 @@ export async function loadAgentSessions(agentId) {
 }
 
 /**
- * Load chat history for a session into chatMessages.
+ * Load chat history for a session.
  */
 async function loadHistory(sessionId) {
     try {
-        const msgs = await getSessionMessages(sessionId);
-        chatMessages.value = (msgs || []).map(m => ({
+        const data = await getSessionMessages(sessionId);
+        const msgs = data.messages || [];
+        chatMessages.value = msgs.map(m => ({
             type: m.role === 'user' ? 'user' : 'agent',
             role: m.role,
             text: m.content || '',
@@ -77,11 +88,35 @@ async function loadHistory(sessionId) {
 }
 
 /**
- * Switch to a different agent: update state, load sessions.
+ * Load run history for a session.
+ */
+async function loadRunHistory(sessionId) {
+    try {
+        const data = await listRuns(sessionId);
+        runs.value = data.runs || [];
+    } catch {
+        runs.value = [];
+    }
+}
+
+/**
+ * Switch to a different agent: reset state, load sessions.
  */
 export async function switchAgent(agentId) {
+    const agent = agents.value.find(a => a.id === agentId);
+    if (!agent) return;
+
     activeAgentId.value = agentId;
     localStorage.setItem(AGENT_KEY, agentId);
+
+    // Reset all state
+    activeSessionId.value = null;
+    sessions.value = [];
+    runs.value = [];
     chatMessages.value = [];
+    messageQueue.value = [];
+    wsFiles.value = null;
+    auditEvents.value = null;
+
     await loadAgentSessions(agentId);
 }

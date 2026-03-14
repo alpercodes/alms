@@ -1,56 +1,18 @@
 import { h, render } from 'https://esm.sh/preact@10.24.3';
 import { signal } from 'https://esm.sh/@preact/signals@1.3.0';
 import htm from 'https://esm.sh/htm@3.1.1';
-import { boot, switchAgent } from './hooks/use-boot.js';
-import { agents, activeAgentId, activeAgent } from './state/agents.js';
-import { sessions, activeSessionId } from './state/sessions.js';
-import { serverDefaults } from './state/settings.js';
+import { boot } from './hooks/use-boot.js';
+import { Header } from './components/header.js';
+import { Sidebar } from './components/sidebar/index.js';
 import { chatMessages } from './state/chat.js';
+import { activePanel } from './state/panel.js';
 
 const html = htm.bind(h);
-
-// Re-export for components to import from app.js
-export { h, html, render, signal };
 
 // ── App status ──
 const status = signal('connecting...');
 
-function Header() {
-    const onAgentChange = (e) => switchAgent(e.target.value);
-
-    return html`
-        <header>
-            <h1>ALMS</h1>
-            <select id="agent-select" onChange=${onAgentChange} value=${activeAgentId.value || ''}>
-                ${agents.value.map(a => html`
-                    <option value=${a.id}>${a.name}${a.is_default ? ' *' : ''}</option>
-                `)}
-            </select>
-            <span id="status" class=${status.value === 'connected' ? 'ok' : ''}>
-                ${status.value}
-            </span>
-        </header>
-    `;
-}
-
-function Sidebar() {
-    return html`
-        <div id="sidebar">
-            <div class="sidebar-section">
-                <div class="sidebar-label">Sessions</div>
-                <div id="session-list">
-                    ${sessions.value.map(s => html`
-                        <div class="session-item ${s.id === activeSessionId.value ? 'active' : ''}"
-                             onClick=${() => { activeSessionId.value = s.id; }}>
-                            ${s.context_id || s.id.slice(0, 8)}
-                        </div>
-                    `)}
-                </div>
-            </div>
-        </div>
-    `;
-}
-
+// ── Chat view (Phase 3 will extract this to its own component) ──
 function ChatView() {
     return html`
         <div id="chat">
@@ -77,17 +39,43 @@ function ChatView() {
                         `;
                     }
                     if (m.type === 'error') {
-                        return html`<div class="msg agent"><div class="msg-body" style="border-color: #f85149; color: #f85149;">${m.text}</div></div>`;
+                        return html`
+                            <div class="msg agent">
+                                <div class="msg-body" style="border-color: #f85149; color: #f85149;">
+                                    ${m.text}
+                                </div>
+                            </div>
+                        `;
                     }
                     if (m.type === 'system') {
-                        return html`<div style="font-size: 11px; color: #484f58; text-align: center;">${m.text}</div>`;
+                        return html`
+                            <div style="font-size: 11px; color: #484f58; text-align: center;">
+                                ${m.text}
+                            </div>
+                        `;
                     }
                     return null;
                 })}
             </div>
             <div id="input-area">
-                <textarea id="prompt" rows="1" placeholder="Message..." disabled></textarea>
+                <textarea id="prompt" rows="2"
+                          placeholder="Send a message... (Enter to send, Shift+Enter for newline)"
+                          disabled></textarea>
                 <button id="send" disabled>Send</button>
+            </div>
+        </div>
+    `;
+}
+
+// ── Panel placeholder (Phase 4 will replace with real tabs) ──
+function Panel() {
+    if (!activePanel.value) return null;
+    return html`
+        <div id="panel" class="open">
+            <div class="panel-body" style="display:flex">
+                <div style="color: #484f58; font-style: italic;">
+                    Panel: ${activePanel.value} (coming in Phase 4)
+                </div>
             </div>
         </div>
     `;
@@ -95,10 +83,11 @@ function ChatView() {
 
 function App() {
     return html`
-        <${Header} />
+        <${Header} status=${status} onOpenSettings=${() => {/* Phase 5 */}} />
         <div id="main">
             <${Sidebar} />
             <${ChatView} />
+            <${Panel} />
         </div>
     `;
 }

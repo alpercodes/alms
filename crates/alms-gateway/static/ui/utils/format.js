@@ -8,11 +8,13 @@ export function fmtTime(iso) {
 }
 
 /**
- * Format an ISO timestamp to a short date string.
+ * Format an ISO timestamp: time if today, short date otherwise.
  */
 export function fmtDate(iso) {
     if (!iso) return '';
     const d = new Date(iso);
+    const today = new Date();
+    if (d.toDateString() === today.toDateString()) return fmtTime(iso);
     return d.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
