@@ -15,14 +15,16 @@ function flushDeltaBuffer() {
     if (!deltaBuffer) return;
     const pending = deltaBuffer;
     deltaBuffer = '';
-    const msgs = [...chatMessages.value];
-    const last = msgs[msgs.length - 1];
+    // Remove thinking indicator on first real content
+    const msgs = chatMessages.value.filter(m => m.type !== 'thinking');
+    const copy = [...msgs];
+    const last = copy[copy.length - 1];
     if (last && last.type === 'agent' && !last.sealed) {
-        msgs[msgs.length - 1] = { ...last, text: last.text + pending };
+        copy[copy.length - 1] = { ...last, text: last.text + pending };
     } else {
-        msgs.push({ type: 'agent', role: 'assistant', text: pending, sealed: false });
+        copy.push({ type: 'agent', role: 'assistant', text: pending, sealed: false });
     }
-    chatMessages.value = msgs;
+    chatMessages.value = copy;
 }
 
 function scheduleFlush() {
@@ -143,7 +145,15 @@ export function openForegroundStream(runId, { onDone } = {}) {
     return { close: () => closeActiveStream() };
 }
 
+function stripThinking() {
+    const msgs = chatMessages.value;
+    if (msgs.some(m => m.type === 'thinking')) {
+        chatMessages.value = msgs.filter(m => m.type !== 'thinking');
+    }
+}
+
 function sealLastAgent() {
+    stripThinking();
     const msgs = chatMessages.value;
     const last = msgs[msgs.length - 1];
     if (last && last.type === 'agent' && !last.sealed) {

@@ -1056,6 +1056,23 @@ header h1 {
   color: var(--accent);
 }
 
+/* ── Thinking indicator ── */
+@keyframes thinking-dots {
+  0%   { content: ''; }
+  25%  { content: '.'; }
+  50%  { content: '..'; }
+  75%  { content: '...'; }
+}
+
+.thinking-indicator {
+  color: var(--text-muted) !important;
+  font-style: italic;
+}
+.thinking-indicator::after {
+  content: '';
+  animation: thinking-dots 1.5s steps(1) infinite;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
    Reduced Motion
    ══════════════════════════════════════════════════════════════════════ */

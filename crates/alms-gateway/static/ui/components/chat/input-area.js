@@ -14,9 +14,10 @@ export const inputStatus = signal('');
 async function startRun(text) {
     inputStatus.value = 'running';
 
-    chatMessages.value = [...chatMessages.value, {
-        type: 'user', role: 'user', text,
-    }];
+    chatMessages.value = [...chatMessages.value,
+        { type: 'user', role: 'user', text },
+        { type: 'thinking' },
+    ];
 
     closeActiveStream();
 
