@@ -130,6 +130,21 @@
     }
     .session-item:hover { background: #161b22; color: #e6edf3; }
     .session-item.active { color: #58a6ff; border-left-color: #58a6ff; background: #0d1117; }
+    .session-item.has-run::after {
+      content: '';
+      display: inline-block;
+      width: 6px;
+      height: 6px;
+      background: #d29922;
+      border-radius: 50%;
+      margin-left: auto;
+      flex-shrink: 0;
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
 
     #new-session-btn {
       flex-shrink: 0;
@@ -857,9 +872,19 @@ const S = {
   activePanelTab:  'workspace',   // which tab is shown when panel is open
 };
 
-let activeEs = null;  // current EventSource
+let activeEs = null;  // current EventSource (foreground rendering)
 let activeRunId = null;  // run ID for in-flight cancel
-let messageQueue = [];  // queued messages waiting to be sent
+let messageQueue = [];  // queued messages for the current session
+
+// Background runs: per-session state for runs that continue when user navigates away
+// Key: sessionId → { runId, queue: [{text}], shadowEs: EventSource|null, finished: bool, status: string|null }
+const bgRuns = {};
+
+function hasActiveRun(sessionId) {
+  if (sessionId === S.activeSessionId && activeEs) return true;
+  const bg = bgRuns[sessionId];
+  return bg && !bg.finished;
+}
 
 // ── DOM refs ───────────────────────────────────────────────────────────────────
 const statusEl     = document.getElementById('status');
@@ -927,13 +952,15 @@ function renderAgentSelect() {
 
 function onAgentSelectChange(agentId) {
   if (!agentId || agentId === S.activeAgentId) return;
-  if (activeEs || messageQueue.length > 0) { agentSelectEl.value = S.activeAgentId; return; }
   switchAgent(agentId);
 }
 
 async function switchAgent(agentId) {
   const agent = S.agents.find(a => a.id === agentId);
   if (!agent) return;
+
+  // Detach from current session if run is active
+  if (S.activeSessionId && activeEs) detachFromSession(S.activeSessionId);
 
   S.activeAgentId = agentId;
   S.agentId = agentId;
@@ -942,7 +969,8 @@ async function switchAgent(agentId) {
   S.runs = [];
   S.wsFiles = null;
   S.auditEvents = null;
-  clearMessageQueue();
+  messageQueue = [];
+  msgQueueEl.innerHTML = '';
   localStorage.setItem(ACTIVE_AGENT_KEY, agentId);
 
   messagesEl.innerHTML = '';
@@ -951,11 +979,16 @@ async function switchAgent(agentId) {
   // Load sessions for this agent, pick the most recent one
   await loadSessions();
   loadRuns();
-  if (S.activeSessionId) loadSessionHistory(S.activeSessionId);
+  if (S.activeSessionId) {
+    if (bgRuns[S.activeSessionId]) {
+      await reattachToSession(S.activeSessionId);
+    } else {
+      loadSessionHistory(S.activeSessionId);
+    }
+  }
   enableInput();
   setStatus(`${agent.name}`, 'ok');
   promptEl.focus();
-  // Reload workspace panel if open
   if (S.activePanel === 'workspace') { S.wsFiles = null; loadWorkspace(); }
   if (S.activePanel === 'jobs') loadJobs();
   if (S.activePanel === 'audit') { S.auditEvents = null; loadAudit(); }
@@ -994,7 +1027,9 @@ function renderSessions() {
   }
   for (const sess of S.sessions) {
     const el = document.createElement('div');
-    el.className = 'session-item' + (sess.id === S.activeSessionId ? ' active' : '');
+    let cls = 'session-item' + (sess.id === S.activeSessionId ? ' active' : '');
+    if (hasActiveRun(sess.id)) cls += ' has-run';
+    el.className = cls;
     el.title = `ID: ${sess.id}\nContext: ${sess.context_id}`;
     el.textContent = sess.context_id || sess.id.slice(0, 8);
     el.onclick = () => selectSession(sess.id);
@@ -1002,23 +1037,38 @@ function renderSessions() {
   }
 }
 
-function selectSession(sessionId) {
-  if (sessionId === S.activeSessionId || activeEs || messageQueue.length > 0) return;
+async function selectSession(sessionId) {
+  if (sessionId === S.activeSessionId) return;
+
+  // Detach from current session if run is active
+  if (S.activeSessionId && activeEs) detachFromSession(S.activeSessionId);
+  // Clear foreground queue (saved by detach if needed)
+  messageQueue = [];
+  msgQueueEl.innerHTML = '';
+
   S.activeSessionId = sessionId;
   S.runs = [];
   S.auditEvents = null;
   messagesEl.innerHTML = '';
   renderSessions();
   loadRuns();
-  loadSessionHistory(sessionId);
+
+  // Check if new session has a background run
+  if (bgRuns[sessionId]) {
+    await reattachToSession(sessionId);
+  } else {
+    loadSessionHistory(sessionId);
+    const agent = S.agents.find(a => a.id === S.activeAgentId);
+    setStatus(agent ? agent.name : 'ready', 'ok');
+  }
   enableInput();
-  const agent = S.agents.find(a => a.id === S.activeAgentId);
-  setStatus(agent ? agent.name : 'ready', 'ok');
   if (S.activePanel === 'audit') { S.auditEvents = null; loadAudit(); }
 }
 
 async function newSession() {
-  if (activeEs || messageQueue.length > 0 || !S.activeAgentId) return;
+  if (!S.activeAgentId) return;
+  // Detach from current session if run is active
+  if (S.activeSessionId && activeEs) detachFromSession(S.activeSessionId);
   try {
     const res = await fetch('/sessions', {
       method: 'POST',
@@ -1028,7 +1078,7 @@ async function newSession() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     await loadSessions();
-    selectSession(data.session_id);
+    await selectSession(data.session_id);
   } catch {
     setStatus('failed to create session', 'error');
   }
@@ -1311,6 +1361,15 @@ async function boot() {
     await Promise.all([loadRuns(), loadSessionHistory(S.activeSessionId)]);
     enableInput();
     setStatus(`${activeAgent.name}`, 'ok');
+    // Check for in-flight runs on the active session (e.g. after page refresh)
+    const runningRun = S.runs.find(r => r.status === 'running' || r.status === 'queued');
+    if (runningRun) {
+      activeRunId = runningRun.run_id;
+      cancelBtn.style.display = '';
+      cancelBtn.disabled = false;
+      setStatus('running\u2026', 'running');
+      openEventStream(runningRun.run_id);
+    }
   } else {
     setStatus('no session — click "+ New session"', 'error');
   }
@@ -1381,15 +1440,149 @@ async function drainNextQueued() {
   await startRun(next.text);
 }
 
+// ── Background run management ─────────────────────────────────────────────────
+
+function detachFromSession(sessionId) {
+  if (!activeEs || !activeRunId) return;
+  activeEs.close();
+  bgRuns[sessionId] = {
+    runId: activeRunId,
+    queue: messageQueue.map(m => ({ text: m.text })),
+    shadowEs: null,
+    finished: false,
+    status: null,
+  };
+  activeEs = null;
+  activeRunId = null;
+  messageQueue = [];
+  msgQueueEl.innerHTML = '';
+  cancelBtn.style.display = 'none';
+  openShadowEventSource(sessionId, bgRuns[sessionId].runId);
+}
+
+function openShadowEventSource(sessionId, runId) {
+  const bg = bgRuns[sessionId];
+  if (!bg) return;
+  const es = new EventSource(`/runs/${runId}/events`);
+  bg.shadowEs = es;
+
+  function shadowDone(status) {
+    es.close();
+    bg.shadowEs = null;
+    bg.finished = true;
+    bg.status = status;
+    renderSessions();
+    // If user is currently viewing this session, reattach
+    if (S.activeSessionId === sessionId && !activeEs) {
+      reattachToSession(sessionId);
+      return;
+    }
+    // If queue has items, drain in background
+    if (bg.queue.length > 0) {
+      drainBackgroundQueue(sessionId);
+    }
+  }
+
+  es.addEventListener('run_finished', () => shadowDone('completed'));
+  es.addEventListener('run_error', () => shadowDone('failed'));
+  es.addEventListener('run_cancelled', () => shadowDone('cancelled'));
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED) return;
+    es.close();
+    bg.shadowEs = null;
+    bg.finished = true;
+    bg.status = 'unknown';
+    renderSessions();
+  };
+}
+
+async function reattachToSession(sessionId) {
+  const bg = bgRuns[sessionId];
+  if (!bg) return;
+
+  if (bg.finished) {
+    // Run completed while we were away — history includes the response
+    messagesEl.innerHTML = '';
+    await loadSessionHistory(sessionId);
+    loadRuns();
+    if (bg.queue.length > 0) {
+      for (const item of bg.queue) enqueueMessage(item.text);
+      delete bgRuns[sessionId];
+      drainNextQueued();
+    } else {
+      delete bgRuns[sessionId];
+      const agent = S.agents.find(a => a.id === S.activeAgentId);
+      setStatus(agent ? agent.name : 'ready', 'ok');
+    }
+  } else {
+    // Run still in progress — reconnect with full EventSource (replay catches up)
+    if (bg.shadowEs) { bg.shadowEs.close(); bg.shadowEs = null; }
+    messageQueue = [];
+    msgQueueEl.innerHTML = '';
+    for (const item of bg.queue) enqueueMessage(item.text);
+    messagesEl.innerHTML = '';
+    await loadSessionHistory(sessionId);
+    activeRunId = bg.runId;
+    cancelBtn.style.display = '';
+    cancelBtn.disabled = false;
+    setStatus('running\u2026', 'running');
+    delete bgRuns[sessionId];
+    openEventStream(bg.runId);
+    loadRuns();
+  }
+  renderSessions();
+}
+
+async function drainBackgroundQueue(sessionId) {
+  const bg = bgRuns[sessionId];
+  if (!bg || bg.queue.length === 0) { delete bgRuns[sessionId]; renderSessions(); return; }
+  const next = bg.queue.shift();
+  try {
+    const runBody = { session_id: sessionId, input: { type: 'text', text: next.text } };
+    const local = loadLocalSettings();
+    if (local.max_tokens != null) runBody.max_tokens = local.max_tokens;
+    if (local.posture) runBody.posture = local.posture;
+    const res = await fetch('/runs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(runBody),
+    });
+    if (!res.ok) { delete bgRuns[sessionId]; renderSessions(); return; }
+    const data = await res.json();
+    bg.runId = data.run_id;
+    bg.finished = false;
+    bg.status = null;
+    renderSessions();
+    // If user switched back to this session, reattach to foreground
+    if (S.activeSessionId === sessionId && !activeEs) {
+      reattachToSession(sessionId);
+    } else {
+      openShadowEventSource(sessionId, bg.runId);
+    }
+  } catch {
+    delete bgRuns[sessionId];
+    renderSessions();
+  }
+}
+
 // ── Send message ───────────────────────────────────────────────────────────────
 async function sendMessage() {
   const text = promptEl.value.trim();
   if (!text || !S.activeSessionId) return;
   promptEl.value = '';
 
-  // If a run is active, queue the message instead of sending immediately
+  // If a foreground run is active, queue the message
   if (activeEs) {
     enqueueMessage(text);
+    promptEl.focus();
+    return;
+  }
+  // If a background run exists for this session, queue the message
+  const bg = bgRuns[S.activeSessionId];
+  if (bg && !bg.finished) {
+    enqueueMessage(text);
+    // Also save to bg queue so it persists across switches
+    bg.queue.push({ text });
     promptEl.focus();
     return;
   }
@@ -1398,7 +1591,6 @@ async function sendMessage() {
 }
 
 async function startRun(text) {
-  disableInput();
   setStatus('running…', 'running');
 
   appendMsg('user', text);
@@ -1424,7 +1616,6 @@ async function startRun(text) {
       if (res.status === 404 || res.status === 400) {
         S.activeSessionId = null;
         S.sessions = [];
-        enableInput();
         setStatus('session expired — reconnecting…', 'running');
         await boot();
         promptEl.value = text;
@@ -1438,7 +1629,6 @@ async function startRun(text) {
     cancelBtn.disabled = false;
   } catch {
     setStatus('failed to start run', 'error');
-    enableInput();
     return;
   }
 
@@ -1467,21 +1657,22 @@ function openEventStream(runId) {
 
   function done() {
     es.close();
+    // Guard: if user already switched away, detachFromSession handled cleanup
+    if (activeEs !== es) return;
     activeEs = null;
     activeRunId = null;
     cancelBtn.style.display = 'none';
-    // Refresh run history and audit log after completion.
     loadRuns();
     if (S.activePanel === 'audit') { S.auditEvents = null; loadAudit(); }
-    // Drain next queued message, or re-enable input if queue is empty
+    // Drain next queued message, or set status to ready
     if (messageQueue.length > 0) {
       drainNextQueued();
     } else {
       const agent = S.agents.find(a => a.id === S.activeAgentId);
       setStatus(agent ? agent.name : 'ready', 'ok');
-      enableInput();
       promptEl.focus();
     }
+    renderSessions();
   }
 
   es.addEventListener('token_delta', e => {
