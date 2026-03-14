@@ -2434,8 +2434,13 @@ async function createAgentFromPanel() {
       errorEl.textContent = body?.error?.message || `Error ${res.status}`;
       return;
     }
+    const data = await res.json();
     input.value = '';
     await refreshAgents();
+    // Switch to the newly created agent (loads session + enables input)
+    if (data.id) {
+      await switchAgent(data.id);
+    }
   } catch {
     errorEl.textContent = 'Request failed.';
   }
