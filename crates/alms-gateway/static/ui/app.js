@@ -9,6 +9,7 @@ import { MessageQueue } from './components/chat/message-queue.js';
 import { InputArea } from './components/chat/input-area.js';
 import { chatMessages } from './state/chat.js';
 import { activePanel } from './state/panel.js';
+import { scrollToBottom } from './utils/format.js';
 
 // ── App status ──
 export const status = signal('connecting...');
@@ -19,8 +20,7 @@ function ChatView() {
 
     // Auto-scroll when messages change
     useEffect(() => {
-        const el = messagesRef.current;
-        if (el) el.scrollTop = el.scrollHeight;
+        scrollToBottom(messagesRef.current);
     }, [chatMessages.value]);
 
     return html`
