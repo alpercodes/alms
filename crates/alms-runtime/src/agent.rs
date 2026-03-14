@@ -305,7 +305,7 @@ impl AgentRuntime {
         let history = match session_manager.get_history(*session_id) {
             Ok(h) => h,
             Err(e) => {
-                warn!("Failed to get history: {}", e);
+                error!(session_id = ?session_id, error = %e, "Failed to load session history — running without context");
                 Vec::new()
             }
         };

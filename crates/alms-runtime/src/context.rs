@@ -191,12 +191,14 @@ impl ContextBuilder {
     }
 }
 
-/// Rough token estimate: ~4 characters per token for English text.
-/// This is intentionally simple. A proper tokenizer (tiktoken) can be added later
-/// without changing the interface.
+/// Rough token estimate for mixed content (natural language, JSON, code).
+/// ~3 chars/token is a safer approximation than 4 for JSON-heavy tool output.
+/// A proper tokenizer (tiktoken) can be added later without changing the interface.
 pub fn estimate_tokens(text: &str) -> usize {
-    // chars/4 is a reasonable approximation for GPT-style tokenizers
-    text.len().div_ceil(4)
+    // ~3 chars per token: slightly overestimates for pure English (~4 chars/token)
+    // but more accurate for JSON/code (~2-3 chars/token). Overestimating is safer
+    // than underestimating — better to leave headroom than overshoot the context window.
+    text.len().div_ceil(3)
 }
 
 /// Convert session Content to a string for LLM context
@@ -244,8 +246,8 @@ mod tests {
     #[test]
     fn test_estimate_tokens() {
         assert_eq!(estimate_tokens(""), 0);
-        assert_eq!(estimate_tokens("hello"), 2); // (5+3)/4 = 2
-        assert_eq!(estimate_tokens("hello world"), 3); // (11+3)/4 = 3
+        assert_eq!(estimate_tokens("hello"), 2); // ceil(5/3) = 2
+        assert_eq!(estimate_tokens("hello world"), 4); // ceil(11/3) = 4
     }
 
     #[test]

@@ -39,7 +39,7 @@ snapshot_dir = "./data/snapshots"
 #   "full"            - send everything (for small conversations)
 strategy = "truncate"
 # max tokens to send to the LLM per request
-max_input_tokens = 32000
+max_input_tokens = 128000
 # number of recent messages to always keep in full
 recent_window = 20
 # how often to update rolling summary (in messages, for sliding-summary)
