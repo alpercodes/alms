@@ -64,7 +64,7 @@ export function openForegroundStream(runId, { onDone } = {}) {
         chatMessages.value = [...chatMessages.value, {
             type: 'tool',
             tool: data.tool,
-            params: data.parameters,
+            params: data.params,
             status: 'running',
             id: data.tool_invocation_id || data.call_id || data.tool,
         }];
@@ -91,8 +91,8 @@ export function openForegroundStream(runId, { onDone } = {}) {
         chatMessages.value = [...chatMessages.value, {
             type: 'approval',
             approvalId: data.approval_id,
-            tool: data.tool,
-            params: data.parameters,
+            tool: data.capability,
+            params: data.request,
             resolved: false,
         }];
         sealLastAgent();
@@ -113,9 +113,12 @@ export function openForegroundStream(runId, { onDone } = {}) {
         sealLastAgent();
         const data = e.data ? JSON.parse(e.data) : {};
         if (status === 'error') {
+            const errMsg = typeof data.error === 'string'
+                ? data.error
+                : (data.error?.message || 'Run failed');
             chatMessages.value = [...chatMessages.value, {
                 type: 'error',
-                text: data.error || 'Run failed',
+                text: errMsg,
             }];
         }
         if (status === 'cancelled') {
@@ -124,11 +127,14 @@ export function openForegroundStream(runId, { onDone } = {}) {
                 text: '(run cancelled)',
             }];
         }
-        // Add token badge if available
-        if (data.usage) {
+        // Add token badge if available (Rust sends flat fields, not nested usage)
+        const usage = (data.prompt_tokens || data.completion_tokens)
+            ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
+            : data.usage;
+        if (usage) {
             chatMessages.value = [...chatMessages.value, {
                 type: 'tokens',
-                usage: data.usage,
+                usage,
             }];
         }
         closeActiveStream();
