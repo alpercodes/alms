@@ -99,11 +99,25 @@ The agent runtime (`alms-runtime`) has three key subsystems:
 - `LlmMessage.content` is `Option<String>` (null when LLM returns tool calls only)
 - Two `LlmConfig` types exist: `alms_core::config::LlmConfig` (canonical) and `alms_runtime::llm_types::LlmConfig` (legacy, with `From` bridge). Prefer the core one for new code.
 
+## Claude Code Agent Team
+
+Three agents work in parallel using git worktree isolation (`.claude/agents/`):
+
+| Agent | Role | Worktree | Co-Authored-By | Can Edit Code |
+|-------|------|----------|----------------|---------------|
+| **Atlas** | Main developer | Main repo | `Atlas <noreply@anthropic.com>` | Yes |
+| **Tim** (`alms-dev-guardian`) | Code reviewer | Isolated | `Tim <noreply@anthropic.com>` | No (read-only) |
+| **Larry** (`larry-bug-fix`) | Bug fixer | Isolated | `Larry <noreply@anthropic.com>` | Yes |
+
+- All agents use `isolation: "worktree"` so they never interfere with each other
+- Tim posts reviews as GitHub PR comments with `## Review by Tim (automated)` header
+- Larry creates branches, fixes bugs, pushes, creates PRs, and comments on GitHub issues
+- Atlas coordinates, plans, implements features, and posts Tim's reviews when Bash is blocked in worktrees
+
 ## Git Workflow
 
-- Feature branches: `feature/<name>`
-- PRs target `main`
-- Commit directly to `main` (pre-commit hook removed)
+- Feature branches: `fix/<name>` or `feature/<name>`
+- PRs target `main` — always use branches + PRs, never commit directly to main
 - Run `make ci` before pushing
 
 ### VPS & Remotes
