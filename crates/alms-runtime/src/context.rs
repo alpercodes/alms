@@ -86,7 +86,9 @@ impl ContextBuilder {
     fn build_full(&self, history: &[Message], budget: usize, messages: &mut Vec<LlmMessage>) {
         let mut used = 0;
         for msg in history {
-            let llm_msg = self.session_msg_to_llm(msg);
+            let Some(llm_msg) = self.session_msg_to_llm(msg) else {
+                continue;
+            };
             let tokens = estimate_tokens(llm_msg.content_str());
             if used + tokens > budget {
                 warn!(
@@ -113,7 +115,9 @@ impl ContextBuilder {
             if selected.len() >= max_messages {
                 break;
             }
-            let llm_msg = self.session_msg_to_llm(msg);
+            let Some(llm_msg) = self.session_msg_to_llm(msg) else {
+                continue;
+            };
             let tokens = estimate_tokens(llm_msg.content_str());
             if used + tokens > budget {
                 break;
@@ -160,7 +164,9 @@ impl ContextBuilder {
             if selected.len() >= max_messages {
                 break;
             }
-            let llm_msg = self.session_msg_to_llm(msg);
+            let Some(llm_msg) = self.session_msg_to_llm(msg) else {
+                continue;
+            };
             let tokens = estimate_tokens(llm_msg.content_str()) + 4;
             if msg_used + tokens > remaining {
                 break;
@@ -173,13 +179,21 @@ impl ContextBuilder {
         messages.extend(selected);
     }
 
-    /// Convert a session Message to an LlmMessage
-    fn session_msg_to_llm(&self, msg: &Message) -> LlmMessage {
-        match msg.role {
-            Role::System => LlmMessage::system(content_to_string(&msg.content)),
-            Role::User => LlmMessage::user(content_to_string(&msg.content)),
-            Role::Assistant => LlmMessage::assistant(content_to_string(&msg.content)),
-            Role::Tool => LlmMessage::tool_result(msg.id.clone(), content_to_string(&msg.content)),
+    /// Convert a session Message to an LlmMessage.
+    /// Returns None for ToolCall/ToolResult content — these are persisted for UI
+    /// display but should not be fed back to the LLM (the agent loop manages its
+    /// own in-memory tool call context during execution).
+    fn session_msg_to_llm(&self, msg: &Message) -> Option<LlmMessage> {
+        match (&msg.role, &msg.content) {
+            // Skip persisted tool calls/results — they exist for UI history only
+            (_, Content::ToolCall { .. }) | (_, Content::ToolResult { .. }) => None,
+            (Role::System, _) => Some(LlmMessage::system(content_to_string(&msg.content))),
+            (Role::User, _) => Some(LlmMessage::user(content_to_string(&msg.content))),
+            (Role::Assistant, _) => Some(LlmMessage::assistant(content_to_string(&msg.content))),
+            (Role::Tool, _) => Some(LlmMessage::tool_result(
+                msg.id.clone(),
+                content_to_string(&msg.content),
+            )),
         }
     }
 
