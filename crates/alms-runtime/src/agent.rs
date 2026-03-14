@@ -540,7 +540,9 @@ impl AgentRuntime {
                     };
                     let usage = response.usage.clone();
                     let choice = response.choices.into_iter().next().ok_or_else(|| {
-                        alms_core::AlmsError::Runtime("LLM returned empty choices array".to_string())
+                        alms_core::AlmsError::Runtime(
+                            "LLM returned empty choices array".to_string(),
+                        )
                     })?;
                     (choice.message.content, choice.message.tool_calls, usage)
                 }
