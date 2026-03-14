@@ -1,12 +1,8 @@
-import { h } from 'https://esm.sh/preact@10.24.3';
-import { computed } from 'https://esm.sh/@preact/signals@1.3.0';
-import htm from 'https://esm.sh/htm@3.1.1';
+import { h, html, computed } from '../deps.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { activePanel, activePanelTab } from '../state/panel.js';
 import { localSettings, serverDefaults } from '../state/settings.js';
 import { switchAgent } from '../hooks/use-boot.js';
-
-const html = htm.bind(h);
 
 const TABS = ['agents', 'workspace', 'jobs', 'audit'];
 

@@ -14,7 +14,12 @@ let activeEs = null;
 export function openForegroundStream(runId, { onDone } = {}) {
     closeActiveStream();
 
-    const es = new EventSource(`/runs/${runId}/events`);
+    // EventSource cannot send Authorization headers — use ?token= query param
+    const token = localStorage.getItem('alms_auth_token');
+    const url = token
+        ? `/runs/${runId}/events?token=${encodeURIComponent(token)}`
+        : `/runs/${runId}/events`;
+    const es = new EventSource(url);
     activeEs = es;
     activeRunId.value = runId;
 

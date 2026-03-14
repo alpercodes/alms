@@ -1,4 +1,4 @@
-import { signal, computed } from 'https://esm.sh/@preact/signals@1.3.0';
+import { signal, computed } from '../deps.js';
 
 export const agents = signal([]);
 export const activeAgentId = signal(null);

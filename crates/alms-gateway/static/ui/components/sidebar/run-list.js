@@ -1,10 +1,6 @@
-import { h } from 'https://esm.sh/preact@10.24.3';
-import { computed } from 'https://esm.sh/@preact/signals@1.3.0';
-import htm from 'https://esm.sh/htm@3.1.1';
+import { html, computed } from '../../deps.js';
 import { runs } from '../../state/runs.js';
 import { fmtDate } from '../../utils/format.js';
-
-const html = htm.bind(h);
 
 const STATUS_ICONS = {
     completed: '\u2713',  // ✓

@@ -1,16 +1,12 @@
-import { h } from 'https://esm.sh/preact@10.24.3';
-import htm from 'https://esm.sh/htm@3.1.1';
+import { html } from '../../deps.js';
 import { sessions, activeSessionId } from '../../state/sessions.js';
 import { activeAgentId } from '../../state/agents.js';
 import { chatMessages } from '../../state/chat.js';
-import { activeRunId } from '../../state/runs.js';
+import { activeRunId, runs } from '../../state/runs.js';
 import { bgRuns } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
-import { runs } from '../../state/runs.js';
 import { listSessions, createSession, getSessionMessages } from '../../api/sessions.js';
 import { listRuns } from '../../api/runs.js';
-
-const html = htm.bind(h);
 
 function hasActiveRun(sessionId) {
     if (sessionId === activeSessionId.value && activeRunId.value) return true;

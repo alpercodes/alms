@@ -1,13 +1,9 @@
-import { h, render } from 'https://esm.sh/preact@10.24.3';
-import { signal } from 'https://esm.sh/@preact/signals@1.3.0';
-import htm from 'https://esm.sh/htm@3.1.1';
+import { h, html, render, signal } from './deps.js';
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
 import { chatMessages } from './state/chat.js';
 import { activePanel } from './state/panel.js';
-
-const html = htm.bind(h);
 
 // ── App status ──
 const status = signal('connecting...');

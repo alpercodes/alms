@@ -1,4 +1,4 @@
-import { signal } from 'https://esm.sh/@preact/signals@1.3.0';
+import { signal } from '../deps.js';
 
 export const sessions = signal([]);
 export const activeSessionId = signal(null);
