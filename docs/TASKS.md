@@ -43,7 +43,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-13:** Codex codebase review (`docs/codex-review-1303.md`): 6 findings — workspace identity split (#98), failed runs lose history (#99), default-agent not live (#100), config partially wired (#101), SSE subscription leak (#102), event log durability comments (#103), query-string auth scope (#104). Tasks added as P16.
 - **2026-03-14:** Cancel button for in-progress runs (#91): `CancellationToken` per run, 4 cancellation checkpoints (loop top, LLM streaming, tool execution, approval wait), `POST /runs/{run_id}/cancel` endpoint, `run_cancelled` SSE event, UI stop button. PR #65.
 - **2026-03-14:** Fixes #98 ✅, #99 ✅, #100 ✅ all merged. Channel tests (#62) already complete (29 tests exist). #91 ✅ merged.
-- **2026-03-14:** Fix #111: context token limit + assembly fixes. No ordering bugs found — root causes were `max_input_tokens` too low (32k→128k), token estimation too optimistic (chars/4→chars/3), and silent history load failure (warn→error). PR #71.
+- **2026-03-14:** Fix #111: context token limit + assembly fixes. No ordering bugs found — root causes were `max_input_tokens` too low (32k→128k), token estimation too optimistic (chars/4→chars/3), and silent history load failure (warn→error). PR #72.
+- **2026-03-14:** Fix #108: agent shell_exec cwd defaults to workspace directory. Added `default_cwd` field to `ShellExecTool`, re-registered on workspace attach. Sandbox security model preserved.
 
 ---
 
@@ -794,9 +795,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Likely cause: switching agents creates/selects a new session but the chat input event listeners or `activeRunId`/session state are not properly re-initialized.
 - **Owners:** Atlas
 
-108) URGENT: Agents start with cwd set to project root instead of workspace
-- `shell_exec` cwd defaults to the alms binary's working directory (project root), not the agent's workspace directory.
-- Agents should start in their own workspace dir (`{workspace_dir}/{name}/`) so file operations are scoped to their workspace by default.
+108) URGENT: Agents start with cwd set to project root instead of workspace ✅
+- Added `default_cwd` field to `ShellExecTool` (separate from `sandbox_root` security boundary). When `AgentRuntime.with_workspace()` attaches a workspace, shell_exec is re-registered with the workspace dir as default cwd. Priority: explicit cwd param > default_cwd (workspace) > sandbox_root > inherit from process.
 - **Owners:** Atlas
 
 109) URGENT: Cannot schedule messages/jobs from the UI

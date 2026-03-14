@@ -1,6 +1,7 @@
 use crate::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
+use tracing::warn;
 
 /// Built-in tool trait marker
 pub trait BuiltinTool: Tool {}
@@ -450,6 +451,10 @@ pub struct ShellExecTool {
     sandbox_root: Option<PathBuf>,
     /// When true, no cwd restriction is applied (power-user mode).
     unrestricted: bool,
+    /// Default working directory when no explicit `cwd` param is provided.
+    /// Used to set the agent's workspace as the "home directory".
+    /// Takes precedence over `sandbox_root` as default cwd.
+    default_cwd: Option<PathBuf>,
 }
 
 impl Default for ShellExecTool {
@@ -457,6 +462,7 @@ impl Default for ShellExecTool {
         Self {
             sandbox_root: None,
             unrestricted: true,
+            default_cwd: None,
         }
     }
 }
@@ -472,6 +478,7 @@ impl ShellExecTool {
         Self {
             sandbox_root: Some(root),
             unrestricted: false,
+            default_cwd: None,
         }
     }
 
@@ -480,7 +487,23 @@ impl ShellExecTool {
         Self {
             sandbox_root,
             unrestricted,
+            default_cwd: None,
         }
+    }
+
+    /// Set the default working directory for commands without an explicit `cwd` param.
+    pub fn with_default_cwd(mut self, cwd: PathBuf) -> Self {
+        if let Some(ref root) = self.sandbox_root
+            && !cwd.starts_with(root)
+        {
+            warn!(
+                default_cwd = %cwd.display(),
+                sandbox_root = %root.display(),
+                "default_cwd is outside sandbox_root — commands without explicit cwd will run outside the sandbox boundary"
+            );
+        }
+        self.default_cwd = Some(cwd);
+        self
     }
 }
 
@@ -512,7 +535,7 @@ impl Tool for ShellExecTool {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory for the process. Defaults to current directory."
+                    "description": "Working directory for the process. Defaults to the agent workspace when available, otherwise the project root."
                 },
                 "env": {
                     "type": "object",
@@ -575,10 +598,13 @@ impl Tool for ShellExecTool {
                 check_sandbox_path(cwd, root)?;
             }
             cmd.current_dir(cwd);
+        } else if let Some(ref default) = self.default_cwd {
+            // Agent workspace "home directory" — use as default cwd
+            cmd.current_dir(default);
         } else if !self.unrestricted
             && let Some(ref root) = self.sandbox_root
         {
-            // In sandboxed mode, default cwd to the sandbox root
+            // Fallback: sandbox root as cwd
             cmd.current_dir(root);
         }
 
@@ -1160,6 +1186,77 @@ mod tests {
             .unwrap();
         assert_eq!(result["exit_code"], 0);
         assert!(result["stdout"].as_str().unwrap().contains("found"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_default_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_dir = dir.path().join("workspace");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(ws_dir.join("marker.txt"), "home").unwrap();
+
+        let tool = ShellExecTool::new().with_default_cwd(ws_dir);
+        let result = tool
+            .execute(serde_json::json!({"argv": ["cat", "marker.txt"]}))
+            .await
+            .unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert!(result["stdout"].as_str().unwrap().contains("home"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_explicit_cwd_overrides_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_dir = dir.path().join("workspace");
+        let other_dir = dir.path().join("other");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(other_dir.join("marker.txt"), "explicit").unwrap();
+
+        let other_dir = std::fs::canonicalize(&other_dir).unwrap();
+        let tool = ShellExecTool::new().with_default_cwd(ws_dir);
+        let result = tool
+            .execute(serde_json::json!({
+                "argv": ["cat", "marker.txt"],
+                "cwd": other_dir.to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert!(result["stdout"].as_str().unwrap().contains("explicit"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_default_cwd_with_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ws_dir = root.join("workspace");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        std::fs::write(ws_dir.join("marker.txt"), "sandboxed-home").unwrap();
+
+        let tool = ShellExecTool::sandboxed(root.clone()).with_default_cwd(ws_dir);
+
+        // Default cwd should be workspace dir
+        let result = tool
+            .execute(serde_json::json!({"argv": ["cat", "marker.txt"]}))
+            .await
+            .unwrap();
+        assert_eq!(result["exit_code"], 0);
+        assert!(
+            result["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("sandboxed-home")
+        );
+
+        // Explicit cwd outside sandbox should be rejected
+        let result = tool
+            .execute(serde_json::json!({"argv": ["ls"], "cwd": "/etc"}))
+            .await;
+        assert!(result.is_err());
     }
 
     // ── FsReadTool ────────────────────────────────────────────────────────────
