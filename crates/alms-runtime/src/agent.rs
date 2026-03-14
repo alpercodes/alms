@@ -84,6 +84,11 @@ pub struct AgentRuntime {
     run_id: Option<alms_core::RunId>,
     /// Per-run cancellation token for cooperative cancellation.
     cancel_token: Option<CancellationToken>,
+    /// Resolved sandbox root (canonicalized). Retained so `with_workspace()` can
+    /// re-register shell_exec with the workspace dir as default cwd.
+    resolved_sandbox_root: Option<std::path::PathBuf>,
+    /// Whether shell commands bypass sandbox cwd restriction.
+    shell_unrestricted: bool,
 }
 
 impl AgentRuntime {
@@ -114,21 +119,37 @@ impl AgentRuntime {
             agent_id,
             config,
             llm,
-            tools: ToolRegistry::with_builtins_sandboxed(sandbox_root, shell_unrestricted),
+            tools: ToolRegistry::with_builtins_sandboxed(sandbox_root.clone(), shell_unrestricted),
             workspace: None,
             event_sender: None,
             run_id: None,
             cancel_token: None,
+            resolved_sandbox_root: sandbox_root,
+            shell_unrestricted,
         }
     }
 
     /// Attach an agent workspace for persistent identity files.
     ///
     /// Also registers the `workspace_write` tool so the agent can update
-    /// its `goals.md` and `memories.md` during runs.
+    /// its `goals.md` and `memories.md` during runs, and re-registers
+    /// `shell_exec` with the workspace directory as default cwd.
     pub fn with_workspace(mut self, workspace: AgentWorkspace) -> Self {
         let tool = WorkspaceWriteTool::new(workspace.clone());
         self.tools.register(std::sync::Arc::new(tool));
+
+        // Set shell_exec default cwd to the agent's workspace directory.
+        // Security model preserved: sandbox_root still governs which paths are
+        // valid for user-specified cwd; default_cwd only affects the fallback
+        // when no cwd parameter is provided.
+        let ws_dir = workspace.dir();
+        let shell_tool = alms_sandbox::ShellExecTool::with_policy(
+            self.resolved_sandbox_root.clone(),
+            self.shell_unrestricted,
+        )
+        .with_default_cwd(ws_dir);
+        self.tools.register(std::sync::Arc::new(shell_tool));
+
         self.workspace = Some(workspace);
         self
     }
@@ -927,6 +948,8 @@ mod tests {
             event_sender: Some(tx),
             run_id: None,
             cancel_token: None,
+            resolved_sandbox_root: None,
+            shell_unrestricted: true,
         };
 
         let request =
@@ -962,6 +985,8 @@ mod tests {
             event_sender: None,
             run_id: None,
             cancel_token: None,
+            resolved_sandbox_root: None,
+            shell_unrestricted: true,
         };
 
         let session_config = SessionConfig::default();
