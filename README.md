@@ -80,5 +80,3 @@ cargo run --bin alms -- gateway
 
 MIT
 
----
-Built by Mustafa for Alper
