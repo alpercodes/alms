@@ -77,7 +77,7 @@ export function openForegroundStream(runId, { onDone } = {}) {
         const msgs = [...chatMessages.value];
         const idx = msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
         if (idx >= 0) {
-            msgs[idx] = { ...msgs[idx], status: data.error ? 'fail' : 'done', result: data.result || data.error };
+            msgs[idx] = { ...msgs[idx], status: data.ok ? 'done' : 'fail', result: data.result };
         }
         chatMessages.value = msgs;
     });
