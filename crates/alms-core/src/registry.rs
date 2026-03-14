@@ -120,6 +120,20 @@ pub fn migrate_workspace_dirs(
         if uuid_dir.is_dir() && !name_dir.exists() {
             std::fs::rename(&uuid_dir, &name_dir)?;
             migrated += 1;
+            tracing::debug!(
+                agent_name = %name,
+                from = %uuid_dir.display(),
+                to = %name_dir.display(),
+                "Migrated workspace directory from UUID to name-based path"
+            );
+        } else if uuid_dir.is_dir() && name_dir.exists() {
+            tracing::warn!(
+                agent_name = %name,
+                uuid_dir = %uuid_dir.display(),
+                name_dir = %name_dir.display(),
+                "Both UUID and name workspace directories exist — skipping migration; \
+                 orphaned UUID directory may need manual cleanup"
+            );
         }
     }
     Ok(migrated)
