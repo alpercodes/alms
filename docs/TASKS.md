@@ -45,6 +45,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **2026-03-14:** Fixes #98 ✅, #99 ✅, #100 ✅ all merged. Channel tests (#62) already complete (29 tests exist). #91 ✅ merged.
 - **2026-03-14:** Fix #111: context token limit + assembly fixes. No ordering bugs found — root causes were `max_input_tokens` too low (32k→128k), token estimation too optimistic (chars/4→chars/3), and silent history load failure (warn→error). PR #72.
 - **2026-03-14:** Fix #108: agent shell_exec cwd defaults to workspace directory. Added `default_cwd` field to `ShellExecTool`, re-registered on workspace attach. Sandbox security model preserved.
+- **2026-03-14:** Fix #107: new agent session unresponsive until page reload. `createAgentFromPanel()` now calls `switchAgent()` after creating agent, enabling input and loading session.
 
 ---
 
@@ -789,10 +790,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 
 ## P-URGENT — User-reported bugs
 
-107) URGENT: New agent session unresponsive until page reload
-- After creating a new agent and switching to its session via the top-left navbar dropdown, the send button and Enter key do not work. Messages cannot be sent.
-- Only a full page reload fixes the input.
-- Likely cause: switching agents creates/selects a new session but the chat input event listeners or `activeRunId`/session state are not properly re-initialized.
+107) URGENT: New agent session unresponsive until page reload ✅
+- `createAgentFromPanel()` called `refreshAgents()` which updated the agent list but never switched to the new agent — input stayed disabled, no session created. Fix: parse the `POST /agents` response to get the new agent ID, then call `switchAgent()` which handles session loading + `enableInput()`.
 - **Owners:** Atlas
 
 108) URGENT: Agents start with cwd set to project root instead of workspace ✅
