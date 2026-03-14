@@ -1,6 +1,7 @@
 use crate::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
+use tracing::warn;
 
 /// Built-in tool trait marker
 pub trait BuiltinTool: Tool {}
@@ -492,6 +493,15 @@ impl ShellExecTool {
 
     /// Set the default working directory for commands without an explicit `cwd` param.
     pub fn with_default_cwd(mut self, cwd: PathBuf) -> Self {
+        if let Some(ref root) = self.sandbox_root
+            && !cwd.starts_with(root)
+        {
+            warn!(
+                default_cwd = %cwd.display(),
+                sandbox_root = %root.display(),
+                "default_cwd is outside sandbox_root — commands without explicit cwd will run outside the sandbox boundary"
+            );
+        }
         self.default_cwd = Some(cwd);
         self
     }
@@ -525,7 +535,7 @@ impl Tool for ShellExecTool {
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory for the process. Defaults to current directory."
+                    "description": "Working directory for the process. Defaults to the agent workspace when available, otherwise the project root."
                 },
                 "env": {
                     "type": "object",
