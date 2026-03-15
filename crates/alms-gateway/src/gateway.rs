@@ -74,7 +74,13 @@ impl GatewayConfig {
                 shell_policy: config.tools.shell_policy.clone(),
                 ..AgentConfig::default()
             },
-            session_config: SessionConfig::default(),
+            session_config: SessionConfig {
+                idle_timeout_secs: config.session.idle_timeout_secs,
+                auto_archive: config.session.auto_archive,
+                archive_ttl_secs: config.session.archive_ttl_secs,
+                max_messages: config.session.max_messages,
+                max_context_tokens: config.session.max_context_tokens,
+            },
             db_path: None,
             workspace_dir: None,
             agent_id: None,
