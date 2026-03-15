@@ -12,6 +12,42 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// Select an API key for the requested LLM provider.
+///
+/// Preference order:
+/// - `openai`: `OPENAI_API_KEY`, then `OPENROUTER_API_KEY`, then
+///   `ANTHROPIC_API_KEY`
+/// - `anthropic`: `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`, then
+///   `OPENROUTER_API_KEY`
+/// - other providers: `OPENAI_API_KEY`, then `OPENROUTER_API_KEY`, then
+///   `ANTHROPIC_API_KEY`
+///
+/// This preserves single-key setups by falling back to any available key when
+/// the preferred provider-specific key is absent.
+pub fn select_llm_api_key(
+    provider: &str,
+    openrouter_key: Option<String>,
+    openai_key: Option<String>,
+    anthropic_key: Option<String>,
+) -> Option<String> {
+    match provider {
+        "anthropic" => anthropic_key.or(openai_key).or(openrouter_key),
+        "openai" => openai_key.or(openrouter_key).or(anthropic_key),
+        _ => openai_key.or(openrouter_key).or(anthropic_key),
+    }
+}
+
+/// Resolve the LLM API key from environment variables using provider-aware
+/// selection rules.
+pub fn select_llm_api_key_from_env(provider: &str) -> Option<String> {
+    select_llm_api_key(
+        provider,
+        std::env::var("OPENROUTER_API_KEY").ok(),
+        std::env::var("OPENAI_API_KEY").ok(),
+        std::env::var("ANTHROPIC_API_KEY").ok(),
+    )
+}
+
 /// Top-level ALMS configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -97,18 +133,10 @@ impl AlmsConfig {
     /// Secrets are ONLY loaded here, never from config files.
     fn apply_env_overrides(&mut self) {
         // LLM settings
-        if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
-            self.llm.api_key = Some(key);
-        }
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            self.llm.api_key = Some(key);
-        }
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            self.llm.api_key = Some(key);
-        }
         if let Ok(provider) = std::env::var("ALMS_LLM_PROVIDER") {
             self.llm.provider = provider.to_lowercase();
         }
+        self.llm.api_key = select_llm_api_key_from_env(&self.llm.provider);
         if let Ok(url) = std::env::var("LLM_BASE_URL") {
             self.llm.base_url = url;
         }
@@ -414,6 +442,65 @@ fn dirs_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const LLM_ENV_VARS: [&str; 4] = [
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ALMS_LLM_PROVIDER",
+    ];
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    fn set_env_var(name: &str, value: &str) {
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+
+    fn remove_env_var(name: &str) {
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    impl EnvGuard {
+        fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let saved = LLM_ENV_VARS
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect::<Vec<_>>();
+
+            for name in LLM_ENV_VARS {
+                remove_env_var(name);
+            }
+            for (name, value) in overrides {
+                match value {
+                    Some(v) => set_env_var(name, v),
+                    None => remove_env_var(name),
+                }
+            }
+
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(v) => set_env_var(name, v),
+                    None => remove_env_var(name),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_default_config() {
@@ -487,6 +574,100 @@ model = "claude-sonnet"
     fn test_validation_good() {
         let config = AlmsConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_select_llm_api_key_openai_prefers_openai_then_openrouter() {
+        let selected = select_llm_api_key(
+            "openai",
+            Some("openrouter-key".into()),
+            Some("openai-key".into()),
+            Some("anthropic-key".into()),
+        );
+        assert_eq!(selected.as_deref(), Some("openai-key"));
+
+        let fallback = select_llm_api_key(
+            "openai",
+            Some("openrouter-key".into()),
+            None,
+            Some("anthropic-key".into()),
+        );
+        assert_eq!(fallback.as_deref(), Some("openrouter-key"));
+    }
+
+    #[test]
+    fn test_select_llm_api_key_anthropic_prefers_anthropic() {
+        let selected = select_llm_api_key(
+            "anthropic",
+            Some("openrouter-key".into()),
+            Some("openai-key".into()),
+            Some("anthropic-key".into()),
+        );
+        assert_eq!(selected.as_deref(), Some("anthropic-key"));
+    }
+
+    #[test]
+    fn test_select_llm_api_key_returns_none_when_no_keys_available() {
+        let selected = select_llm_api_key("openai", None, None, None);
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn test_select_llm_api_key_unknown_provider_uses_openai_fallback_chain() {
+        let selected = select_llm_api_key(
+            "custom-provider",
+            Some("openrouter-key".into()),
+            Some("openai-key".into()),
+            Some("anthropic-key".into()),
+        );
+        assert_eq!(selected.as_deref(), Some("openai-key"));
+    }
+
+    #[test]
+    fn test_select_llm_api_key_anthropic_falls_back_to_openai_then_openrouter() {
+        let fallback_to_openai = select_llm_api_key(
+            "anthropic",
+            Some("openrouter-key".into()),
+            Some("openai-key".into()),
+            None,
+        );
+        assert_eq!(fallback_to_openai.as_deref(), Some("openai-key"));
+
+        let fallback_to_openrouter =
+            select_llm_api_key("anthropic", Some("openrouter-key".into()), None, None);
+        assert_eq!(fallback_to_openrouter.as_deref(), Some("openrouter-key"));
+    }
+
+    #[test]
+    fn test_apply_env_overrides_selects_openai_key_for_openai_provider() {
+        let _guard = EnvGuard::set(&[
+            ("ALMS_LLM_PROVIDER", Some("openai")),
+            ("OPENROUTER_API_KEY", Some("openrouter-key")),
+            ("OPENAI_API_KEY", Some("openai-key")),
+            ("ANTHROPIC_API_KEY", Some("anthropic-key")),
+        ]);
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+
+        assert_eq!(config.llm.provider, "openai");
+        assert_eq!(config.llm.api_key.as_deref(), Some("openai-key"));
+    }
+
+    #[test]
+    fn test_apply_env_overrides_selects_anthropic_key_for_anthropic_provider() {
+        let _guard = EnvGuard::set(&[
+            ("ALMS_LLM_PROVIDER", Some("anthropic")),
+            ("OPENROUTER_API_KEY", Some("openrouter-key")),
+            ("OPENAI_API_KEY", Some("openai-key")),
+            ("ANTHROPIC_API_KEY", Some("anthropic-key")),
+        ]);
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+
+        assert_eq!(config.llm.provider, "anthropic");
+        assert_eq!(config.llm.api_key.as_deref(), Some("anthropic-key"));
     }
 
     #[test]

@@ -300,17 +300,11 @@ impl LlmConfig {
     pub fn from_env() -> Self {
         let mut config = Self::default();
 
-        if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") {
-            config.api_key = api_key;
-        }
-        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
-            config.api_key = api_key;
-        }
-        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
-            config.api_key = api_key;
-        }
         if let Ok(provider) = std::env::var("ALMS_LLM_PROVIDER") {
             config.provider = provider.to_lowercase();
+        }
+        if let Some(api_key) = alms_core::config::select_llm_api_key_from_env(&config.provider) {
+            config.api_key = api_key;
         }
 
         if let Ok(base_url) = std::env::var("LLM_BASE_URL") {
@@ -327,5 +321,97 @@ impl LlmConfig {
         }
 
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const LLM_ENV_VARS: [&str; 4] = [
+        "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "ALMS_LLM_PROVIDER",
+    ];
+
+    struct EnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    fn set_env_var(name: &str, value: &str) {
+        unsafe {
+            std::env::set_var(name, value);
+        }
+    }
+
+    fn remove_env_var(name: &str) {
+        unsafe {
+            std::env::remove_var(name);
+        }
+    }
+
+    impl EnvGuard {
+        fn set(overrides: &[(&'static str, Option<&str>)]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap();
+            let saved = LLM_ENV_VARS
+                .iter()
+                .map(|name| (*name, std::env::var(name).ok()))
+                .collect::<Vec<_>>();
+
+            for name in LLM_ENV_VARS {
+                remove_env_var(name);
+            }
+            for (name, value) in overrides {
+                match value {
+                    Some(v) => set_env_var(name, v),
+                    None => remove_env_var(name),
+                }
+            }
+
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, value) in &self.saved {
+                match value {
+                    Some(v) => set_env_var(name, v),
+                    None => remove_env_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_from_env_prefers_openai_key_for_openai_provider() {
+        let _guard = EnvGuard::set(&[
+            ("ALMS_LLM_PROVIDER", Some("openai")),
+            ("OPENROUTER_API_KEY", Some("openrouter-key")),
+            ("OPENAI_API_KEY", Some("openai-key")),
+            ("ANTHROPIC_API_KEY", Some("anthropic-key")),
+        ]);
+
+        let config = LlmConfig::from_env();
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.api_key, "openai-key");
+    }
+
+    #[test]
+    fn test_from_env_prefers_anthropic_key_for_anthropic_provider() {
+        let _guard = EnvGuard::set(&[
+            ("ALMS_LLM_PROVIDER", Some("anthropic")),
+            ("OPENROUTER_API_KEY", Some("openrouter-key")),
+            ("OPENAI_API_KEY", Some("openai-key")),
+            ("ANTHROPIC_API_KEY", Some("anthropic-key")),
+        ]);
+
+        let config = LlmConfig::from_env();
+        assert_eq!(config.provider, "anthropic");
+        assert_eq!(config.api_key, "anthropic-key");
     }
 }
