@@ -684,12 +684,21 @@ pub async fn stream_run_events(
 
     let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
 
-    // Register the live channel BEFORE snapshotting the event log.
-    // This closes the race where events produced between snapshot and
-    // registration would be lost. The overlap (events in both replay
-    // and live channel) is deduplicated by stream_with_replay.
-    let (tx, rx) = event_channel();
-    state.run_manager.register_sender(run_id, tx);
+    // Check run exists — return 404 for nonexistent runs instead of
+    // leaking an orphaned sender entry.
+    let run = state.run_manager.get_run(run_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": { "code": "NOT_FOUND", "message": "Run not found" }
+            })),
+        )
+    })?;
+
+    let is_terminal = matches!(
+        run.status,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+    );
 
     let logged_events = state.run_manager.events_from(run_id, from_id).await;
     let replay_events: Vec<SseEventData> = logged_events
@@ -710,7 +719,23 @@ pub async fn stream_run_events(
         );
     }
 
-    Ok(RunEventStream::stream_with_replay(rx, replay_events))
+    if is_terminal {
+        // Run is done — replay historical events then close. No sender
+        // registration since no new events will arrive.
+        info!(
+            "Run {} is {:?}, returning replay-only stream",
+            run_id.0, run.status
+        );
+        Ok(RunEventStream::stream_replay_only(replay_events).into_response())
+    } else {
+        // Run is active — register sender for live events + replay.
+        // Register BEFORE snapshotting the event log to close the race
+        // where events produced between snapshot and registration would
+        // be lost. Overlap is deduplicated by stream_with_replay.
+        let (tx, rx) = event_channel();
+        state.run_manager.register_sender(run_id, tx);
+        Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
+    }
 }
 
 #[cfg(test)]
