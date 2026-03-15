@@ -13,14 +13,19 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         Posture::Guarded => "guarded",
     };
 
-    // Builtin tools: respect the enabled filter from config.
+    // Builtin tools: report only tools that are actually registered (intersection
+    // of the enabled list with known builtins). Typos in enabled are excluded.
     let enabled = &state.agent_config.enabled_tools;
-    let all_builtins: Vec<&str> =
-        vec!["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec"];
+    let all_builtins: &[&str] =
+        &["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec"];
     let mut tools: Vec<String> = if enabled.is_empty() {
-        all_builtins.into_iter().map(String::from).collect()
+        all_builtins.iter().map(|s| String::from(*s)).collect()
     } else {
-        enabled.clone()
+        enabled
+            .iter()
+            .filter(|e| all_builtins.contains(&e.as_str()))
+            .cloned()
+            .collect()
     };
     // Runtime-added tools (agent infrastructure, not subject to enabled filter)
     tools.extend(["invoke_agent", "get_task_result", "read_subagent_session"].iter().map(|s| s.to_string()));

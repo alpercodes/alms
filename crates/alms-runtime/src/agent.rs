@@ -147,17 +147,20 @@ impl AgentRuntime {
         let tool = WorkspaceWriteTool::new(workspace.clone());
         self.tools.register(std::sync::Arc::new(tool));
 
-        // Set shell_exec default cwd to the agent's workspace directory.
-        // Security model preserved: sandbox_root still governs which paths are
-        // valid for user-specified cwd; default_cwd only affects the fallback
-        // when no cwd parameter is provided.
-        let ws_dir = workspace.dir();
-        let shell_tool = alms_sandbox::ShellExecTool::with_policy(
-            self.resolved_sandbox_root.clone(),
-            self.shell_unrestricted,
-        )
-        .with_default_cwd(ws_dir);
-        self.tools.register(std::sync::Arc::new(shell_tool));
+        // Re-register shell_exec with workspace dir as default cwd — but only
+        // if shell_exec was enabled in the first place. Otherwise we'd bypass
+        // the operator's tools.enabled restriction.
+        if self.config.enabled_tools.is_empty()
+            || self.config.enabled_tools.iter().any(|t| t == "shell_exec")
+        {
+            let ws_dir = workspace.dir();
+            let shell_tool = alms_sandbox::ShellExecTool::with_policy(
+                self.resolved_sandbox_root.clone(),
+                self.shell_unrestricted,
+            )
+            .with_default_cwd(ws_dir);
+            self.tools.register(std::sync::Arc::new(shell_tool));
+        }
 
         self.workspace = Some(workspace);
         self
