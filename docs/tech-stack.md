@@ -341,4 +341,34 @@ A clean split that tends to work:
 
 ---
 
+## 15) Resource footprint: ALMS vs Node.js alternatives
+
+### The claim
+
+A Rust single-binary daemon should be dramatically lighter than a Node.js equivalent (OpenClaw, etc.):
+- **Idle memory**: ~5–15 MB (Rust/tokio/axum) vs ~50–80 MB (Node.js/V8 baseline)
+- **Under load**: No GC pauses, no V8 heap bloat — memory grows predictably with actual data, not runtime overhead
+- **Startup time**: Sub-second cold start vs multi-second Node.js module loading
+- **Disk footprint**: Single static binary (~10–20 MB stripped) vs node_modules tree
+
+For the target use case — a personal agent daemon running 24/7 on a cheap VPS — this is the difference between a $5/mo box and a $20/mo one. That's a real product differentiator, not just a benchmark win.
+
+### We have to prove it
+
+These numbers are estimates. Before we can put them on a landing page or in a README, we need actual measurements. The methodology:
+
+1. **Idle baseline**: Start ALMS daemon, let it settle, measure RSS. Do the same with OpenClaw.
+2. **Under load**: Run N concurrent agent sessions with tool calls, measure peak RSS, p50/p99 response latency.
+3. **Startup**: Time from process start to first successful `/health` response.
+4. **Disk**: Compare release binary size vs OpenClaw's `node_modules` + runtime.
+
+Benchmarks should be run on the same machine (the VPS at minimum — 4 GB RAM, realistic target hardware) and documented with reproducible scripts.
+
+### Target
+
+ALMS should be able to run comfortably on hardware where OpenClaw struggles or is impractical. If we can't demonstrate a meaningful resource advantage, the "Rust for efficiency" argument is just marketing. The goal is to prove it with numbers.
+
+---
+
 *Authored by Mesut (2026-02-10). Updated based on repo findings + proposal (same date).*
+*§15 added by Tesla (2026-03-15).*
