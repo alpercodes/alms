@@ -6,6 +6,7 @@
 //! - Agent loop orchestration
 
 pub mod agent;
+pub(crate) mod anthropic;
 pub mod context;
 pub mod events;
 pub mod get_task_result_tool;

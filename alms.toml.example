@@ -6,6 +6,8 @@
 bind = "127.0.0.1:8080"
 
 [llm]
+# LLM provider: "openai" (OpenRouter-compatible, default) or "anthropic"
+provider = "openai"
 # provider base URL
 base_url = "https://openrouter.ai/api/v1"
 # model identifier
@@ -21,7 +23,9 @@ mock = false
 
 # Set API key via environment variable:
 #   export OPENROUTER_API_KEY=sk-...
-#   export OPENAI_API_KEY=sk-...        (alternative)
+#   export OPENAI_API_KEY=sk-...        (alternative for OpenAI-compatible)
+#   export ANTHROPIC_API_KEY=sk-ant-... (for Anthropic provider)
+#   export ALMS_LLM_PROVIDER=anthropic  (switch provider)
 #   export ALMS_LLM_MOCK=1             (mock mode, no key needed)
 
 [session]
