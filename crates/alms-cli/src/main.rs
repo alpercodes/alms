@@ -27,9 +27,9 @@ struct Cli {
 enum Commands {
     /// Start the gateway server
     Gateway {
-        /// Bind address
-        #[arg(short, long, default_value = "127.0.0.1:8080")]
-        bind: String,
+        /// Bind address (defaults to config value or 127.0.0.1:8080)
+        #[arg(short, long)]
+        bind: Option<String>,
         /// OpenRouter/OpenAI API key (overrides OPENROUTER_API_KEY env var)
         #[arg(long, env = "OPENROUTER_API_KEY")]
         api_key: Option<String>,
@@ -149,6 +149,16 @@ async fn main() -> anyhow::Result<()> {
                     std::env::set_var("OPENROUTER_API_KEY", key);
                 }
             }
+            // Resolve bind address: --bind flag > config (alms.toml / ALMS_BIND) > default
+            let bind = bind.unwrap_or_else(|| {
+                match alms_core::AlmsConfig::load() {
+                    Ok(c) => c.server.bind,
+                    Err(e) => {
+                        warn!("Failed to load config for bind address, using default: {}", e);
+                        "127.0.0.1:8080".to_string()
+                    }
+                }
+            });
             alms_gateway::serve(&bind).await?;
         }
         Commands::Health { url, json } => {
