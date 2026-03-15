@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS agents (
     created_at    TEXT NOT NULL,
     last_active   TEXT NOT NULL
 );
+
+CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
 ";
 
 // ---------------------------------------------------------------------------
@@ -888,32 +890,24 @@ impl SqliteStore {
     ///
     /// Returns `AgentNotFound` if the given ID does not exist in the table.
     pub fn set_default_agent(&self, id: AgentId) -> AlmsResult<()> {
-        let conn = self.conn.lock();
-        conn.execute_batch("BEGIN")
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
             .map_err(|e| AlmsError::Runtime(format!("SQLite begin: {e}")))?;
-        let result = (|| -> AlmsResult<()> {
-            conn.execute("UPDATE agents SET is_default = 0 WHERE is_default = 1", [])
-                .map_err(|e| AlmsError::Runtime(format!("SQLite clear_default: {e}")))?;
-            let affected = conn
-                .execute(
-                    "UPDATE agents SET is_default = 1 WHERE id = ?1",
-                    params![id.0.to_string()],
-                )
-                .map_err(|e| AlmsError::Runtime(format!("SQLite set_default: {e}")))?;
-            if affected == 0 {
-                return Err(AlmsError::AgentNotFound(id.0.to_string()));
-            }
-            Ok(())
-        })();
-        match &result {
-            Ok(()) => conn
-                .execute_batch("COMMIT")
-                .map_err(|e| AlmsError::Runtime(format!("SQLite commit: {e}")))?,
-            Err(_) => {
-                let _ = conn.execute_batch("ROLLBACK");
-            }
+        tx.execute("UPDATE agents SET is_default = 0 WHERE is_default = 1", [])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite clear_default: {e}")))?;
+        let affected = tx
+            .execute(
+                "UPDATE agents SET is_default = 1 WHERE id = ?1",
+                params![id.0.to_string()],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite set_default: {e}")))?;
+        if affected == 0 {
+            return Err(AlmsError::AgentNotFound(id.0.to_string()));
         }
-        result
+        tx.commit()
+            .map_err(|e| AlmsError::Runtime(format!("SQLite commit: {e}")))?;
+        Ok(())
     }
 
     /// Update an agent's `last_active` timestamp.
