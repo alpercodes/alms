@@ -918,13 +918,17 @@ impl SqliteStore {
 
     /// Update an agent's `last_active` timestamp.
     pub fn touch_agent(&self, id: AgentId) -> AlmsResult<()> {
-        self.conn
+        let rows = self
+            .conn
             .lock()
             .execute(
                 "UPDATE agents SET last_active = ?1 WHERE id = ?2",
                 params![chrono::Utc::now().to_rfc3339(), id.0.to_string()],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite touch_agent: {e}")))?;
+        if rows == 0 {
+            tracing::debug!(agent_id = %id, "touch_agent: no agent found with this ID");
+        }
         Ok(())
     }
 }
@@ -1460,6 +1464,14 @@ mod tests {
         let after = store.load_agent_by_id(agent.id).unwrap().unwrap();
 
         assert!(after.last_active > before.last_active);
+    }
+
+    #[test]
+    fn test_agent_touch_nonexistent_succeeds() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let fake_id = AgentId(uuid::Uuid::new_v4());
+        // Should succeed (not error) even for a nonexistent agent.
+        store.touch_agent(fake_id).unwrap();
     }
 
     #[test]
