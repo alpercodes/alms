@@ -436,7 +436,7 @@ async fn get_session(
     Json(session)
 }
 
-/// GET /sessions/{session_id}/messages — return user/assistant chat history
+/// GET /sessions/{session_id}/messages — return chat history including tool calls
 async fn get_session_messages(
     State(state): State<AppState>,
     Path(session_id): Path<SessionId>,
@@ -451,21 +451,46 @@ async fn get_session_messages(
             );
             let visible: Vec<serde_json::Value> = messages
                 .into_iter()
-                .filter_map(|m| {
-                    let role = match m.role {
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                        _ => return None, // skip system / tool messages
-                    };
-                    let text = match m.content {
-                        Content::Text(t) => t,
-                        _ => return None, // skip non-text content
-                    };
-                    Some(serde_json::json!({
-                        "role": role,
-                        "content": text,
+                .filter_map(|m| match (&m.role, &m.content) {
+                    (Role::User, Content::Text(t)) => Some(serde_json::json!({
+                        "role": "user",
+                        "type": "text",
+                        "content": t,
                         "timestamp": m.timestamp,
-                    }))
+                    })),
+                    (Role::Assistant, Content::Text(t)) => Some(serde_json::json!({
+                        "role": "assistant",
+                        "type": "text",
+                        "content": t,
+                        "timestamp": m.timestamp,
+                    })),
+                    (Role::Assistant, Content::ToolCall { name, params }) => {
+                        Some(serde_json::json!({
+                            "role": "assistant",
+                            "type": "tool_call",
+                            "tool": name,
+                            "params": params,
+                            "timestamp": m.timestamp,
+                            "metadata": m.metadata,
+                        }))
+                    }
+                    (Role::Tool, Content::ToolResult { tool_id, result }) => {
+                        let ok = m
+                            .metadata
+                            .as_ref()
+                            .and_then(|md| md.get("ok"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        Some(serde_json::json!({
+                            "role": "tool",
+                            "type": "tool_result",
+                            "tool_id": tool_id,
+                            "result": result,
+                            "ok": ok,
+                            "timestamp": m.timestamp,
+                        }))
+                    }
+                    _ => None, // skip system messages
                 })
                 .collect();
             Json(serde_json::json!({ "messages": visible })).into_response()

@@ -3,7 +3,7 @@
 //! Manages what the LLM actually sees — assembles system prompt,
 //! history (possibly compressed), and current input within a token budget.
 
-use crate::llm_types::LlmMessage;
+use crate::llm_types::{FunctionCall, LlmMessage, ToolCall};
 use alms_core::config::ContextConfig;
 use alms_session::{Content, Message, Role};
 use tracing::{debug, warn};
@@ -87,7 +87,7 @@ impl ContextBuilder {
         let mut used = 0;
         for msg in history {
             let llm_msg = self.session_msg_to_llm(msg);
-            let tokens = estimate_tokens(llm_msg.content_str());
+            let tokens = estimate_llm_message_tokens(&llm_msg);
             if used + tokens > budget {
                 warn!(
                     "Full context strategy exceeded budget at message {}/{}, truncating",
@@ -114,7 +114,7 @@ impl ContextBuilder {
                 break;
             }
             let llm_msg = self.session_msg_to_llm(msg);
-            let tokens = estimate_tokens(llm_msg.content_str());
+            let tokens = estimate_llm_message_tokens(&llm_msg);
             if used + tokens > budget {
                 break;
             }
@@ -161,7 +161,7 @@ impl ContextBuilder {
                 break;
             }
             let llm_msg = self.session_msg_to_llm(msg);
-            let tokens = estimate_tokens(llm_msg.content_str()) + 4;
+            let tokens = estimate_llm_message_tokens(&llm_msg) + 4;
             if msg_used + tokens > remaining {
                 break;
             }
@@ -173,20 +173,62 @@ impl ContextBuilder {
         messages.extend(selected);
     }
 
-    /// Convert a session Message to an LlmMessage
+    /// Convert a session Message to an LlmMessage.
+    /// Reconstructs structured tool call/result messages from persisted format
+    /// so the LLM has full visibility of previous tool executions across runs.
     fn session_msg_to_llm(&self, msg: &Message) -> LlmMessage {
-        match msg.role {
-            Role::System => LlmMessage::system(content_to_string(&msg.content)),
-            Role::User => LlmMessage::user(content_to_string(&msg.content)),
-            Role::Assistant => LlmMessage::assistant(content_to_string(&msg.content)),
-            Role::Tool => LlmMessage::tool_result(msg.id.clone(), content_to_string(&msg.content)),
+        match (&msg.role, &msg.content) {
+            // Reconstruct structured assistant message with tool_calls
+            (Role::Assistant, Content::ToolCall { name, params }) => {
+                let tool_call_id = msg
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("tool_call_id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                LlmMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: tool_call_id,
+                        function: FunctionCall {
+                            name: name.clone(),
+                            arguments: params.to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                }
+            }
+            // Reconstruct tool result with correct tool_call_id
+            (Role::Tool, Content::ToolResult { tool_id, result }) => {
+                let result_str = result.to_string();
+                // Truncate long tool outputs in context
+                let content = if result_str.len() > 2000 {
+                    format!(
+                        "{}... [truncated, {} bytes total]",
+                        &result_str[..2000],
+                        result_str.len()
+                    )
+                } else {
+                    result_str
+                };
+                LlmMessage::tool_result(tool_id.clone(), content)
+            }
+            (Role::System, _) => LlmMessage::system(content_to_string(&msg.content)),
+            (Role::User, _) => LlmMessage::user(content_to_string(&msg.content)),
+            (Role::Assistant, _) => LlmMessage::assistant(content_to_string(&msg.content)),
+            (Role::Tool, _) => LlmMessage::tool_result(
+                msg.id.clone(),
+                content_to_string(&msg.content),
+            ),
         }
     }
 
     fn estimate_total_tokens(&self, messages: &[LlmMessage]) -> usize {
         messages
             .iter()
-            .map(|m| estimate_tokens(m.content_str()) + 4) // 4 tokens overhead per message
+            .map(|m| estimate_llm_message_tokens(m) + 4) // 4 tokens overhead per message
             .sum()
     }
 }
@@ -201,7 +243,37 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(3)
 }
 
-/// Convert session Content to a string for LLM context
+/// Estimate tokens for a full LlmMessage, including tool_calls if present.
+/// Plain text messages use `content_str()`. Tool call messages (content: None,
+/// tool_calls: Some) estimate from the serialized tool call JSON instead.
+fn estimate_llm_message_tokens(msg: &LlmMessage) -> usize {
+    let content_tokens = estimate_tokens(msg.content_str());
+    let tool_call_tokens = msg
+        .tool_calls
+        .as_ref()
+        .map(|calls| {
+            calls
+                .iter()
+                .map(|tc| {
+                    // Account for id, function name, and arguments JSON
+                    estimate_tokens(&tc.id)
+                        + estimate_tokens(&tc.function.name)
+                        + estimate_tokens(&tc.function.arguments)
+                        + 10 // overhead for JSON structure: {"id":...,"function":{...}}
+                })
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    content_tokens + tool_call_tokens
+}
+
+/// Convert session Content to a plain-text string.
+///
+/// Used by `read_subagent_session_tool` for formatting subagent messages and as a
+/// fallback in `session_msg_to_llm` for unexpected role/content combinations (e.g.
+/// `Content::Image`). The `ToolCall`/`ToolResult` branches here are NOT used by
+/// `session_msg_to_llm` — those are handled by dedicated match arms that produce
+/// structured LLM messages instead.
 pub(crate) fn content_to_string(content: &Content) -> String {
     match content {
         Content::Text(text) => text.clone(),
@@ -248,6 +320,33 @@ mod tests {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("hello"), 2); // ceil(5/3) = 2
         assert_eq!(estimate_tokens("hello world"), 4); // ceil(11/3) = 4
+    }
+
+    #[test]
+    fn test_estimate_llm_message_tokens_text_only() {
+        let msg = LlmMessage::user("hello world");
+        assert_eq!(estimate_llm_message_tokens(&msg), estimate_tokens("hello world"));
+    }
+
+    #[test]
+    fn test_estimate_llm_message_tokens_tool_call() {
+        let msg = LlmMessage {
+            role: "assistant".to_string(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_abc123".to_string(),
+                function: FunctionCall {
+                    name: "shell_exec".to_string(),
+                    arguments: r#"{"argv":["ls","-la"]}"#.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+        };
+        let tokens = estimate_llm_message_tokens(&msg);
+        // Should be > 0 even though content is None
+        assert!(tokens > 0, "tool call messages must have non-zero token estimate");
+        // Sanity: id + name + arguments + overhead should be reasonable
+        assert!(tokens > 10, "expected at least ~10 tokens for a tool call, got {tokens}");
     }
 
     #[test]
@@ -414,5 +513,62 @@ mod tests {
         let result = content_to_string(&content);
         assert!(result.contains("[truncated"));
         assert!(result.len() < 3000);
+    }
+
+    #[test]
+    fn test_tool_call_reconstructed_in_context() {
+        let config = ContextConfig {
+            strategy: "full".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "run ls"),
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                content: Content::ToolCall {
+                    name: "shell_exec".to_string(),
+                    params: serde_json::json!({"argv": ["ls"]}),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"tool_call_id": "call_123"})),
+            },
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Tool,
+                content: Content::ToolResult {
+                    tool_id: "call_123".to_string(),
+                    result: serde_json::json!("file1.txt\nfile2.txt"),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"ok": true})),
+            },
+            make_msg(Role::Assistant, "Here are the files."),
+        ];
+
+        let messages = builder.build("System", &history, "now what?", None);
+
+        // system + 4 history + current = 6
+        assert_eq!(messages.len(), 6);
+
+        // Tool call message: assistant with tool_calls array
+        let tc_msg = &messages[2];
+        assert_eq!(tc_msg.role, "assistant");
+        assert!(tc_msg.content.is_none());
+        let calls = tc_msg.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_123");
+        assert_eq!(calls[0].function.name, "shell_exec");
+
+        // Tool result message: role=tool with tool_call_id
+        let tr_msg = &messages[3];
+        assert_eq!(tr_msg.role, "tool");
+        assert_eq!(tr_msg.tool_call_id.as_deref(), Some("call_123"));
+        assert!(tr_msg.content_str().contains("file1.txt"));
     }
 }

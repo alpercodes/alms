@@ -11,7 +11,8 @@ use crate::workspace_tool::WorkspaceWriteTool;
 use alms_core::config::ContextConfig;
 use alms_core::{AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
 use alms_session::{
-    ContextSummary, Message as SessionMessage, Role as SessionRole, SessionManager,
+    Content as SessionContent, ContextSummary, Message as SessionMessage, Role as SessionRole,
+    SessionManager,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, debug, error, info, instrument, warn};
@@ -562,6 +563,45 @@ impl AgentRuntime {
                     tool_call_id: None,
                 });
 
+                // Persist assistant text content (if any) before tool calls
+                if let Some(ref text) = content
+                    && !text.is_empty()
+                    && let Err(e) = session_manager.append_message(
+                        session_id,
+                        SessionMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            role: SessionRole::Assistant,
+                            content: SessionContent::Text(text.clone()),
+                            timestamp: alms_core::Timestamp::now(),
+                            metadata: None,
+                        },
+                    )
+                {
+                    warn!("Failed to persist assistant text to session: {}", e);
+                }
+
+                // Persist tool calls to session history
+                for tc in &tool_calls {
+                    if let Err(e) = session_manager.append_message(
+                        session_id,
+                        SessionMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            role: SessionRole::Assistant,
+                            content: SessionContent::ToolCall {
+                                name: tc.function.name.clone(),
+                                params: serde_json::from_str(&tc.function.arguments)
+                                    .unwrap_or_else(|_| {
+                                        serde_json::Value::String(tc.function.arguments.clone())
+                                    }),
+                            },
+                            timestamp: alms_core::Timestamp::now(),
+                            metadata: Some(serde_json::json!({ "tool_call_id": tc.id })),
+                        },
+                    ) {
+                        warn!("Failed to persist tool call to session: {}", e);
+                    }
+                }
+
                 // Checkpoint C: tool execution with cancellation support.
                 // Run all tool calls concurrently so background invoke_agent calls
                 // don't block each other, and independent tools finish in parallel.
@@ -584,11 +624,29 @@ impl AgentRuntime {
                 };
 
                 for (tool_call, result) in tool_calls.iter().zip(results) {
-                    let content = match result {
-                        Ok(value) => value.to_string(),
-                        Err(e) => format!("Error: {}", e),
+                    let (content, ok) = match result {
+                        Ok(value) => (value.to_string(), true),
+                        Err(e) => (format!("Error: {}", e), false),
                     };
-                    messages.push(LlmMessage::tool_result(&tool_call.id, content));
+                    messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
+
+                    // Persist tool result to session history
+                    if let Err(e) = session_manager.append_message(
+                        session_id,
+                        SessionMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            role: SessionRole::Tool,
+                            content: SessionContent::ToolResult {
+                                tool_id: tool_call.id.clone(),
+                                result: serde_json::from_str(&content)
+                                    .unwrap_or(serde_json::Value::String(content.clone())),
+                            },
+                            timestamp: alms_core::Timestamp::now(),
+                            metadata: Some(serde_json::json!({ "ok": ok })),
+                        },
+                    ) {
+                        warn!("Failed to persist tool result to session: {}", e);
+                    }
                 }
 
                 continue;

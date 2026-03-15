@@ -157,7 +157,32 @@ Notes:
 }
 ```
 
-### 4.3 List sessions (optional MVP)
+### 4.3 Get session messages
+`GET /sessions/{session_id}/messages`
+
+Returns the full chat history for a session, including tool calls and results.
+
+**Response 200**
+```json
+{
+  "messages": [
+    { "role": "user",      "type": "text",        "content": "run ls", "timestamp": "..." },
+    { "role": "assistant", "type": "text",        "content": "Sure, let me run that.", "timestamp": "..." },
+    { "role": "assistant", "type": "tool_call",   "tool": "shell_exec", "params": {"argv":["ls"]}, "timestamp": "...", "metadata": {"tool_call_id": "call_123"} },
+    { "role": "tool",      "type": "tool_result", "tool_id": "call_123", "result": "file1.txt\nfile2.txt", "ok": true, "timestamp": "..." },
+    { "role": "assistant", "type": "text",        "content": "Here are the files.", "timestamp": "..." }
+  ]
+}
+```
+
+**Message types:**
+- `text` — plain text message (user or assistant)
+- `tool_call` — assistant requested a tool execution (includes `tool`, `params`, `metadata.tool_call_id`)
+- `tool_result` — tool execution result (includes `tool_id`, `result`, `ok`)
+
+System messages are excluded from the response.
+
+### 4.4 List sessions (optional MVP)
 `GET /sessions?agent_key=main&limit=50`
 
 ---

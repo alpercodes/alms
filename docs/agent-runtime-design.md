@@ -150,6 +150,9 @@ ALMS currently hardcodes `take(50)` messages in `agent.rs:158`. No compression, 
 - `truncate`: simple tail of last N messages (no summarization, just drops old ones)
 - `sliding-summary`: the smart default described above
 
+**Tool call persistence and context reconstruction:**
+Tool calls and their results are persisted to the session database as structured `Content::ToolCall` / `Content::ToolResult` messages. During context building, these are reconstructed into proper OpenAI-format LLM messages (assistant messages with `tool_calls` array, tool-role messages with `tool_call_id`). This means the LLM has full visibility of previous tool executions across runs — it knows what tools were called, with what parameters, and what results were returned.
+
 ---
 
 ## 3) Agent Workspace Files

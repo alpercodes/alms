@@ -7,6 +7,7 @@ import { bgRuns } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
 import { listSessions, createSession, getSessionMessages } from '../../api/sessions.js';
 import { listRuns } from '../../api/runs.js';
+import { mapHistoryMessages } from '../../utils/history.js';
 
 function hasActiveRun(sessionId) {
     if (sessionId === activeSessionId.value && activeRunId.value) return true;
@@ -32,12 +33,7 @@ async function selectSession(sessionId) {
     // Load chat history
     try {
         const data = await getSessionMessages(sessionId);
-        const msgs = data.messages || [];
-        chatMessages.value = msgs.map(m => ({
-            type: m.role === 'user' ? 'user' : 'agent',
-            role: m.role,
-            text: m.content || '',
-        }));
+        chatMessages.value = mapHistoryMessages(data.messages || []);
     } catch {
         chatMessages.value = [];
     }

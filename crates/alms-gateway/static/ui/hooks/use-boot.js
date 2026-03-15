@@ -1,5 +1,6 @@
 import { fetchSettings } from '../api/settings.js';
 import { listSessions, createSession, getSessionMessages } from '../api/sessions.js';
+import { mapHistoryMessages } from '../utils/history.js';
 import { listRuns } from '../api/runs.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
@@ -75,12 +76,7 @@ async function loadAgentSessions(agentId) {
 async function loadHistory(sessionId) {
     try {
         const data = await getSessionMessages(sessionId);
-        const msgs = data.messages || [];
-        chatMessages.value = msgs.map(m => ({
-            type: m.role === 'user' ? 'user' : 'agent',
-            role: m.role,
-            text: m.content || '',
-        }));
+        chatMessages.value = mapHistoryMessages(data.messages || []);
     } catch (err) {
         console.error('[loadHistory] failed:', err);
         chatMessages.value = [];
