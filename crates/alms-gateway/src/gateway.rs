@@ -5,7 +5,7 @@
 use crate::session_queue::SessionQueue;
 use alms_channel::telegram::TelegramChannel;
 use alms_channel::{Channel, ChannelConfig};
-use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult, SessionId};
+use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult, SessionId, validate_agent_name};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
 use alms_session::{SessionConfig, SessionManager, SqliteStore};
 use std::path::Path;
@@ -432,10 +432,19 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         _ => {}
     }
 
+    let migration_name = "main";
+    if let Err(e) = validate_agent_name(migration_name) {
+        warn!(
+            "Migration agent name '{}' fails validation: {}",
+            migration_name, e
+        );
+        return;
+    }
+
     let now = chrono::Utc::now();
     let record = AgentRecord {
         id: agent_id,
-        name: "main".to_string(),
+        name: migration_name.to_string(),
         description: "Auto-migrated default agent".to_string(),
         model: None,
         system_prompt: None,
@@ -552,6 +561,14 @@ mod tests {
         let loaded = store.load_agent_by_id(agent_id).unwrap();
         assert!(loaded.is_some());
         assert_eq!(loaded.unwrap().id, agent_id);
+    }
+
+    #[test]
+    fn test_migrate_name_passes_validation() {
+        // The hardcoded migration name "main" must pass validate_agent_name.
+        // If "main" is ever added to the reserved-names list, this test will
+        // catch the breakage before it reaches production.
+        assert!(validate_agent_name("main").is_ok());
     }
 
     #[test]
