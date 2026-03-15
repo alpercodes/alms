@@ -98,7 +98,10 @@ impl EventLogManager {
     }
 
     pub async fn events_from(&self, run_id: RunId, from_id: u64) -> Vec<LoggedEvent> {
-        let log = self.get_or_create(run_id).await;
-        log.events_from(from_id).await
+        let logs = self.logs.read().await;
+        match logs.get(&run_id) {
+            Some(log) => log.events_from(from_id).await,
+            None => Vec::new(),
+        }
     }
 }

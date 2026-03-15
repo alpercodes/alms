@@ -191,6 +191,32 @@ impl RunEventStream {
         Self::stream_with_replay(receiver, Vec::new())
     }
 
+    /// Stream only replayed (historical) events, then close.
+    /// Used for terminal runs (Completed/Failed/Cancelled) where no new events will arrive.
+    pub fn stream_replay_only(
+        replay: Vec<SseEventData>,
+    ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+        let stream = tokio_stream::iter(replay.into_iter().map(|data| {
+            let event = Event::default()
+                .event(&data.event_type)
+                .id(data
+                    .event_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string()))
+                .json_data(&data.data)
+                .unwrap_or_else(|e| {
+                    error!(
+                        "Failed to serialize SSE replay event '{}': {}",
+                        data.event_type, e
+                    );
+                    Event::default().data("{}")
+                });
+            Ok::<_, Infallible>(event)
+        }));
+
+        Sse::new(stream)
+    }
+
     pub fn stream_with_replay(
         receiver: mpsc::UnboundedReceiver<SseEventData>,
         replay: Vec<SseEventData>,
