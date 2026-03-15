@@ -343,10 +343,18 @@ async fn execute_run(
             agent_config
         };
 
-    let mut runtime = alms_runtime::AgentRuntime::new(agent_id, agent_config, llm)
-        .with_event_sender(runtime_tx)
-        .with_run_id(run_id)
-        .with_cancel_token(cancel_token);
+    let mut runtime = match alms_runtime::AgentRuntime::new(agent_id, agent_config, llm) {
+        Ok(rt) => rt,
+        Err(e) => {
+            error!("Run {} failed to create runtime: {}", run_id.0, e);
+            state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            state.run_manager.untrack_in_flight();
+            return;
+        }
+    }
+    .with_event_sender(runtime_tx)
+    .with_run_id(run_id)
+    .with_cancel_token(cancel_token);
 
     // Attach workspace if configured — registers the workspace_write tool for this run
     if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {

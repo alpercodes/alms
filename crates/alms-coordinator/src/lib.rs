@@ -593,7 +593,7 @@ async fn run_agent_loop(
         llm.clone()
     };
 
-    let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm).with_event_sender(sub_tx);
+    let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?.with_event_sender(sub_tx);
 
     // Attach workspace for named subagents: {workspace_dir}/{name}/
     if attach_workspace && let (Some(ws_dir), Some(name)) = (workspace_dir, &request.subagent_name)
