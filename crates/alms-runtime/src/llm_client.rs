@@ -30,7 +30,7 @@ pub struct LlmClient {
 
 impl LlmClient {
     /// Create new LLM client with config
-    pub fn new(config: LlmConfig) -> AlmsResult<Self> {
+    pub fn new(mut config: LlmConfig) -> AlmsResult<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()

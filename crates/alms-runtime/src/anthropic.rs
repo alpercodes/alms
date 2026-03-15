@@ -430,7 +430,7 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                             created: 0,
                             model: String::new(),
                             choices: vec![StreamChoice {
-                                index: 0,
+                                index,
                                 delta: Delta {
                                     role: None,
                                     content: None,
