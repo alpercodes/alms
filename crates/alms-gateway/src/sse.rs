@@ -115,17 +115,6 @@ impl SseEventData {
         )
     }
 
-    pub fn tool_error(run_id: RunId, tool_invocation_id: ToolInvocationId, error: &str) -> Self {
-        Self::new(
-            "tool_error",
-            ToolErrorData {
-                run_id: run_id.0.to_string(),
-                tool_invocation_id: tool_invocation_id.0.to_string(),
-                error: error.to_string(),
-            },
-        )
-    }
-
     pub fn approval_required(
         run_id: RunId,
         approval_id: &str,
@@ -303,13 +292,6 @@ struct ToolEndData {
     tool_invocation_id: String,
     ok: bool,
     result: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-struct ToolErrorData {
-    run_id: String,
-    tool_invocation_id: String,
-    error: String,
 }
 
 #[derive(Debug, Serialize)]
