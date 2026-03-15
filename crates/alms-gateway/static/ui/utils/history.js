@@ -24,7 +24,7 @@ export function mapHistoryMessages(msgs) {
                 params: m.params,
                 status: hasResult ? (next.ok ? 'done' : 'fail') : 'done',
                 result: hasResult ? next.result : null,
-                id: m.metadata?.tool_call_id || m.tool,
+                id: (m.metadata && m.metadata.tool_call_id) || m.tool,
             });
             if (hasResult) i++; // skip the paired tool_result
         }

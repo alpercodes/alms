@@ -563,9 +563,26 @@ impl AgentRuntime {
                     tool_call_id: None,
                 });
 
+                // Persist assistant text content (if any) before tool calls
+                if let Some(ref text) = content
+                    && !text.is_empty()
+                    && let Err(e) = session_manager.append_message(
+                        session_id,
+                        SessionMessage {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            role: SessionRole::Assistant,
+                            content: SessionContent::Text(text.clone()),
+                            timestamp: alms_core::Timestamp::now(),
+                            metadata: None,
+                        },
+                    )
+                {
+                    warn!("Failed to persist assistant text to session: {}", e);
+                }
+
                 // Persist tool calls to session history
                 for tc in &tool_calls {
-                    let _ = session_manager.append_message(
+                    if let Err(e) = session_manager.append_message(
                         session_id,
                         SessionMessage {
                             id: uuid::Uuid::new_v4().to_string(),
@@ -573,12 +590,16 @@ impl AgentRuntime {
                             content: SessionContent::ToolCall {
                                 name: tc.function.name.clone(),
                                 params: serde_json::from_str(&tc.function.arguments)
-                                    .unwrap_or_default(),
+                                    .unwrap_or_else(|_| {
+                                        serde_json::Value::String(tc.function.arguments.clone())
+                                    }),
                             },
                             timestamp: alms_core::Timestamp::now(),
                             metadata: Some(serde_json::json!({ "tool_call_id": tc.id })),
                         },
-                    );
+                    ) {
+                        warn!("Failed to persist tool call to session: {}", e);
+                    }
                 }
 
                 // Checkpoint C: tool execution with cancellation support.
@@ -610,7 +631,7 @@ impl AgentRuntime {
                     messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
 
                     // Persist tool result to session history
-                    let _ = session_manager.append_message(
+                    if let Err(e) = session_manager.append_message(
                         session_id,
                         SessionMessage {
                             id: uuid::Uuid::new_v4().to_string(),
@@ -623,7 +644,9 @@ impl AgentRuntime {
                             timestamp: alms_core::Timestamp::now(),
                             metadata: Some(serde_json::json!({ "ok": ok })),
                         },
-                    );
+                    ) {
+                        warn!("Failed to persist tool result to session: {}", e);
+                    }
                 }
 
                 continue;

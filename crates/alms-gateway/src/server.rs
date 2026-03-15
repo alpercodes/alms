@@ -480,7 +480,7 @@ async fn get_session_messages(
                             .as_ref()
                             .and_then(|md| md.get("ok"))
                             .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
+                            .unwrap_or(false);
                         Some(serde_json::json!({
                             "role": "tool",
                             "type": "tool_result",
