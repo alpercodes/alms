@@ -42,9 +42,7 @@ impl LlmClient {
         };
 
         // Auto-set base_url for Anthropic if the user didn't override it
-        if provider == Provider::Anthropic
-            && config.base_url == "https://openrouter.ai/api/v1"
-        {
+        if provider == Provider::Anthropic && config.base_url == "https://openrouter.ai/api/v1" {
             config.base_url = "https://api.anthropic.com/v1".to_string();
         }
 

@@ -157,8 +157,8 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
                         blocks.push(ContentBlock::Text { text: text.clone() });
                     }
                     for tc in tool_calls {
-                        let input: Value =
-                            serde_json::from_str(&tc.function.arguments).unwrap_or_else(|e| {
+                        let input: Value = serde_json::from_str(&tc.function.arguments)
+                            .unwrap_or_else(|e| {
                                 tracing::warn!(
                                     "Malformed tool arguments for {}: {}",
                                     tc.function.name,
