@@ -300,8 +300,6 @@ pub struct SessionConfig {
     /// Not to be confused with [`ContextConfig::max_input_tokens`], which controls
     /// how many tokens are sent to the LLM in a single request.
     pub max_context_tokens: usize,
-    /// Directory for snapshot persistence
-    pub snapshot_dir: String,
 }
 
 impl Default for SessionConfig {
@@ -312,7 +310,6 @@ impl Default for SessionConfig {
             archive_ttl_secs: 30 * 24 * 60 * 60,
             max_messages: 10000,
             max_context_tokens: 256_000,
-            snapshot_dir: "./data/snapshots".into(),
         }
     }
 }

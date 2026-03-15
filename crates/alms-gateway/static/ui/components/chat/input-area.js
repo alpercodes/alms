@@ -1,4 +1,4 @@
-import { html, signal, useRef } from '../../deps.js';
+import { html, useRef } from '../../deps.js';
 import { activeSessionId } from '../../state/sessions.js';
 import { activeAgentId, agents } from '../../state/agents.js';
 import { activeRunId, runs } from '../../state/runs.js';
@@ -9,11 +9,7 @@ import { createRun, cancelRun as apiCancelRun, listRuns } from '../../api/runs.j
 import { openForegroundStream, closeActiveStream } from '../../hooks/use-event-source.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
 
-export const inputStatus = signal('');
-
 async function startRun(text) {
-    inputStatus.value = 'running';
-
     chatMessages.value = [...chatMessages.value,
         { type: 'user', role: 'user', text },
         { type: 'thinking' },
@@ -35,7 +31,6 @@ async function startRun(text) {
 
         openForegroundStream(runId, {
             onDone: () => {
-                inputStatus.value = '';
                 if (activeSessionId.value) {
                     listRuns(activeSessionId.value).then(d => {
                         runs.value = d.runs || [];
@@ -53,7 +48,6 @@ async function startRun(text) {
         chatMessages.value = chatMessages.value
             .filter(m => m.type !== 'thinking')
             .concat([{ type: 'error', text: `Failed to start run: ${err.message || err.status || 'unknown error'}` }]);
-        inputStatus.value = '';
         console.error('[startRun] failed:', err);
     }
 }
