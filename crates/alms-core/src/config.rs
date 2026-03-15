@@ -103,6 +103,12 @@ impl AlmsConfig {
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
             self.llm.api_key = Some(key);
         }
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            self.llm.api_key = Some(key);
+        }
+        if let Ok(provider) = std::env::var("ALMS_LLM_PROVIDER") {
+            self.llm.provider = provider.to_lowercase();
+        }
         if let Ok(url) = std::env::var("LLM_BASE_URL") {
             self.llm.base_url = url;
         }
@@ -150,8 +156,16 @@ impl AlmsConfig {
         // LLM validation
         if !self.llm.mock && self.llm.api_key.is_none() {
             warn!(
-                "No LLM API key configured. Set OPENROUTER_API_KEY or OPENAI_API_KEY, or enable mock mode with ALMS_LLM_MOCK=1"
+                "No LLM API key configured. Set OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY, or enable mock mode with ALMS_LLM_MOCK=1"
             );
+        }
+
+        let valid_providers = ["openai", "anthropic"];
+        if !valid_providers.contains(&self.llm.provider.as_str()) {
+            return Err(AlmsError::InvalidConfig(format!(
+                "llm.provider must be one of {:?}, got '{}'",
+                valid_providers, self.llm.provider
+            )));
         }
 
         if self.llm.timeout_secs == 0 {
@@ -224,6 +238,8 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
+    /// Provider: "openai" (default, OpenRouter-compatible) or "anthropic"
+    pub provider: String,
     pub base_url: String,
     pub model: String,
     #[serde(skip)]
@@ -237,6 +253,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: "openai".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             model: "moonshotai/kimi-k2.5".into(),
             api_key: None,

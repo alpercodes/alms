@@ -262,6 +262,7 @@ pub struct StreamOptions {
 /// This type is kept for backward compatibility with existing runtime/gateway code.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {
+    pub provider: String,
     pub api_key: String,
     pub base_url: String,
     pub default_model: String,
@@ -272,6 +273,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: "openai".to_string(),
             api_key: String::new(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             default_model: "moonshotai/kimi-k2.5".to_string(),
@@ -284,6 +286,7 @@ impl Default for LlmConfig {
 impl From<alms_core::config::LlmConfig> for LlmConfig {
     fn from(c: alms_core::config::LlmConfig) -> Self {
         Self {
+            provider: c.provider,
             api_key: c.api_key.unwrap_or_default(),
             base_url: c.base_url,
             default_model: c.model,
@@ -299,6 +302,15 @@ impl LlmConfig {
 
         if let Ok(api_key) = std::env::var("OPENROUTER_API_KEY") {
             config.api_key = api_key;
+        }
+        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+            config.api_key = api_key;
+        }
+        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+            config.api_key = api_key;
+        }
+        if let Ok(provider) = std::env::var("ALMS_LLM_PROVIDER") {
+            config.provider = provider.to_lowercase();
         }
 
         if let Ok(base_url) = std::env::var("LLM_BASE_URL") {

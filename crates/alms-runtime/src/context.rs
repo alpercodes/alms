@@ -69,6 +69,10 @@ impl ContextBuilder {
             }
         }
 
+        // 3.5. Group consecutive assistant tool-call messages into single messages
+        // with multiple tool_calls entries (required by OpenAI/Anthropic APIs).
+        Self::group_tool_calls(&mut messages);
+
         // 4. Current input
         messages.push(LlmMessage::user(current_input));
 
@@ -218,11 +222,47 @@ impl ContextBuilder {
             (Role::System, _) => LlmMessage::system(content_to_string(&msg.content)),
             (Role::User, _) => LlmMessage::user(content_to_string(&msg.content)),
             (Role::Assistant, _) => LlmMessage::assistant(content_to_string(&msg.content)),
-            (Role::Tool, _) => LlmMessage::tool_result(
-                msg.id.clone(),
-                content_to_string(&msg.content),
-            ),
+            (Role::Tool, _) => {
+                LlmMessage::tool_result(msg.id.clone(), content_to_string(&msg.content))
+            }
         }
+    }
+
+    /// Merge consecutive assistant messages that carry tool_calls (and no text
+    /// content) into a single message with all tool_calls combined.
+    ///
+    /// Persisted tool calls are stored as individual messages, but LLM APIs
+    /// expect a single assistant message with an array of all parallel tool
+    /// calls. This post-processing step restores that grouping.
+    fn group_tool_calls(messages: &mut Vec<LlmMessage>) {
+        let mut grouped: Vec<LlmMessage> = Vec::with_capacity(messages.len());
+
+        for msg in messages.drain(..) {
+            let is_tool_call_msg =
+                msg.role == "assistant" && msg.tool_calls.is_some() && msg.content.is_none();
+
+            if is_tool_call_msg {
+                // Try to merge with the previous message if it's also an
+                // assistant tool-call-only message.
+                if let Some(prev) = grouped.last_mut() {
+                    let prev_is_tool_call = prev.role == "assistant"
+                        && prev.tool_calls.is_some()
+                        && prev.content.is_none();
+
+                    if prev_is_tool_call {
+                        // Merge: append this message's tool_calls to the previous
+                        if let Some(new_calls) = msg.tool_calls {
+                            prev.tool_calls.as_mut().unwrap().extend(new_calls);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            grouped.push(msg);
+        }
+
+        *messages = grouped;
     }
 
     fn estimate_total_tokens(&self, messages: &[LlmMessage]) -> usize {
@@ -325,7 +365,10 @@ mod tests {
     #[test]
     fn test_estimate_llm_message_tokens_text_only() {
         let msg = LlmMessage::user("hello world");
-        assert_eq!(estimate_llm_message_tokens(&msg), estimate_tokens("hello world"));
+        assert_eq!(
+            estimate_llm_message_tokens(&msg),
+            estimate_tokens("hello world")
+        );
     }
 
     #[test]
@@ -344,9 +387,15 @@ mod tests {
         };
         let tokens = estimate_llm_message_tokens(&msg);
         // Should be > 0 even though content is None
-        assert!(tokens > 0, "tool call messages must have non-zero token estimate");
+        assert!(
+            tokens > 0,
+            "tool call messages must have non-zero token estimate"
+        );
         // Sanity: id + name + arguments + overhead should be reasonable
-        assert!(tokens > 10, "expected at least ~10 tokens for a tool call, got {tokens}");
+        assert!(
+            tokens > 10,
+            "expected at least ~10 tokens for a tool call, got {tokens}"
+        );
     }
 
     #[test]
@@ -570,5 +619,162 @@ mod tests {
         assert_eq!(tr_msg.role, "tool");
         assert_eq!(tr_msg.tool_call_id.as_deref(), Some("call_123"));
         assert!(tr_msg.content_str().contains("file1.txt"));
+    }
+
+    #[test]
+    fn test_parallel_tool_calls_grouped() {
+        let config = ContextConfig {
+            strategy: "full".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+        };
+        let builder = ContextBuilder::new(config);
+
+        // Simulate 3 parallel tool calls persisted as separate messages,
+        // followed by 3 tool results — the typical pattern for join_all.
+        let history = vec![
+            make_msg(Role::User, "list files and check disk"),
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                content: Content::ToolCall {
+                    name: "shell_exec".to_string(),
+                    params: serde_json::json!({"argv": ["ls"]}),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"tool_call_id": "call_A"})),
+            },
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                content: Content::ToolCall {
+                    name: "shell_exec".to_string(),
+                    params: serde_json::json!({"argv": ["df", "-h"]}),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"tool_call_id": "call_B"})),
+            },
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                content: Content::ToolCall {
+                    name: "echo".to_string(),
+                    params: serde_json::json!({"text": "done"}),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"tool_call_id": "call_C"})),
+            },
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Tool,
+                content: Content::ToolResult {
+                    tool_id: "call_A".to_string(),
+                    result: serde_json::json!("file1.txt"),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"ok": true})),
+            },
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Tool,
+                content: Content::ToolResult {
+                    tool_id: "call_B".to_string(),
+                    result: serde_json::json!("/dev/sda1 50G"),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"ok": true})),
+            },
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Tool,
+                content: Content::ToolResult {
+                    tool_id: "call_C".to_string(),
+                    result: serde_json::json!("done"),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"ok": true})),
+            },
+            make_msg(Role::Assistant, "Here's what I found."),
+        ];
+
+        let messages = builder.build("System", &history, "next?", None);
+
+        // system + 1 user + 1 grouped assistant + 3 tool results + 1 assistant text + current = 8
+        // (3 tool calls collapsed into 1)
+        assert_eq!(messages.len(), 8);
+
+        // The grouped assistant message should have 3 tool_calls
+        let tc_msg = &messages[2];
+        assert_eq!(tc_msg.role, "assistant");
+        assert!(tc_msg.content.is_none());
+        let calls = tc_msg.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].id, "call_A");
+        assert_eq!(calls[1].id, "call_B");
+        assert_eq!(calls[2].id, "call_C");
+        assert_eq!(calls[0].function.name, "shell_exec");
+        assert_eq!(calls[2].function.name, "echo");
+
+        // Tool results should follow individually
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_A"));
+        assert_eq!(messages[4].role, "tool");
+        assert_eq!(messages[4].tool_call_id.as_deref(), Some("call_B"));
+        assert_eq!(messages[5].role, "tool");
+        assert_eq!(messages[5].tool_call_id.as_deref(), Some("call_C"));
+
+        // Final assistant text
+        assert_eq!(messages[6].role, "assistant");
+        assert_eq!(messages[6].content_str(), "Here's what I found.");
+    }
+
+    #[test]
+    fn test_group_tool_calls_does_not_merge_across_text() {
+        // If there's an assistant text message between two tool call groups,
+        // they should NOT be merged.
+        let mut messages = vec![
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function: FunctionCall {
+                        name: "echo".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            LlmMessage::assistant("some text in between"),
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_2".to_string(),
+                    function: FunctionCall {
+                        name: "echo".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+        ];
+
+        ContextBuilder::group_tool_calls(&mut messages);
+
+        // Should remain 3 separate messages — not merged
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[0].tool_calls.as_ref().unwrap().len(),
+            1,
+            "first tool call should not absorb second"
+        );
+        assert_eq!(
+            messages[2].tool_calls.as_ref().unwrap().len(),
+            1,
+            "second tool call should stay separate"
+        );
     }
 }

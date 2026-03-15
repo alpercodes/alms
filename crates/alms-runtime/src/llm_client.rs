@@ -4,7 +4,7 @@ use reqwest::{Client, RequestBuilder};
 use tracing::{debug, error, info, warn};
 
 /// Result of parsing a single SSE event block.
-enum SseParseResult {
+pub(crate) enum SseParseResult {
     /// A valid data chunk was parsed.
     Chunk(StreamChunk),
     /// The `[DONE]` sentinel was received — stream is complete.
@@ -13,31 +13,58 @@ enum SseParseResult {
     Skip,
 }
 
+/// LLM provider type, determined from config at construction time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Provider {
+    OpenAi,
+    Anthropic,
+}
+
 /// LLM client for making API calls
 #[derive(Debug, Clone)]
 pub struct LlmClient {
     client: Client,
     config: LlmConfig,
+    provider: Provider,
 }
 
 impl LlmClient {
     /// Create new LLM client with config
-    pub fn new(config: LlmConfig) -> AlmsResult<Self> {
+    pub fn new(mut config: LlmConfig) -> AlmsResult<Self> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
             .map_err(|e| AlmsError::Runtime(format!("Failed to create HTTP client: {}", e)))?;
 
-        info!("LLM client initialized with base URL: {}", config.base_url);
+        let provider = match config.provider.as_str() {
+            "anthropic" => Provider::Anthropic,
+            _ => Provider::OpenAi,
+        };
+
+        // Auto-set base_url for Anthropic if the user didn't override it
+        if provider == Provider::Anthropic
+            && config.base_url == "https://openrouter.ai/api/v1"
+        {
+            config.base_url = "https://api.anthropic.com/v1".to_string();
+        }
+
+        info!(
+            "LLM client initialized: provider={}, base_url={}",
+            config.provider, config.base_url
+        );
         if config.api_key.is_empty() {
             error!(
-                "LLM api_key is empty — calls will fail with 401. Set OPENROUTER_API_KEY or OPENAI_API_KEY."
+                "LLM api_key is empty — calls will fail with 401. Set OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY."
             );
         } else {
             info!("LLM api_key loaded ({} chars)", config.api_key.len());
         }
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            provider,
+        })
     }
 
     /// Create from environment variables
@@ -45,18 +72,32 @@ impl LlmClient {
         Self::new(LlmConfig::from_env())
     }
 
-    /// Create a completion request builder
+    /// Create a completion request builder, adapting format per provider.
     fn build_request(&self, request: &CompletionRequest) -> AlmsResult<RequestBuilder> {
-        let url = format!("{}/chat/completions", self.config.base_url);
-
-        debug!("Sending completion request to {}", url);
-
-        Ok(self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("Content-Type", "application/json")
-            .json(request))
+        match self.provider {
+            Provider::OpenAi => {
+                let url = format!("{}/chat/completions", self.config.base_url);
+                debug!("Sending OpenAI completion request to {}", url);
+                Ok(self
+                    .client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", self.config.api_key))
+                    .header("Content-Type", "application/json")
+                    .json(request))
+            }
+            Provider::Anthropic => {
+                let url = format!("{}/messages", self.config.base_url);
+                debug!("Sending Anthropic completion request to {}", url);
+                let anthropic_req = crate::anthropic::to_anthropic_request(request);
+                Ok(self
+                    .client
+                    .post(&url)
+                    .header("x-api-key", &self.config.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .header("Content-Type", "application/json")
+                    .json(&anthropic_req))
+            }
+        }
     }
 
     /// Send a non-streaming completion request
@@ -86,10 +127,19 @@ impl LlmClient {
             )));
         }
 
-        let completion: CompletionResponse = response
-            .json()
-            .await
-            .map_err(|e| AlmsError::Runtime(format!("Failed to parse response: {}", e)))?;
+        let completion: CompletionResponse = match self.provider {
+            Provider::OpenAi => response
+                .json()
+                .await
+                .map_err(|e| AlmsError::Runtime(format!("Failed to parse response: {}", e)))?,
+            Provider::Anthropic => {
+                let anthropic_resp: crate::anthropic::AnthropicResponse =
+                    response.json().await.map_err(|e| {
+                        AlmsError::Runtime(format!("Failed to parse Anthropic response: {}", e))
+                    })?;
+                crate::anthropic::from_anthropic_response(anthropic_resp)
+            }
+        };
 
         if let Some(usage) = &completion.usage {
             debug!(
@@ -119,9 +169,12 @@ impl LlmClient {
 
         let mut request = request;
         request.stream = Some(true);
-        request.stream_options = Some(StreamOptions {
-            include_usage: true,
-        });
+        // Anthropic doesn't support stream_options
+        if self.provider == Provider::OpenAi {
+            request.stream_options = Some(StreamOptions {
+                include_usage: true,
+            });
+        }
 
         let req = self.build_request(&request)?;
 
@@ -153,6 +206,7 @@ impl LlmClient {
         // the LLM server stops sending data without closing the connection.
         let byte_stream = response.bytes_stream();
         let chunk_timeout = std::time::Duration::from_secs(60);
+        let provider = self.provider;
         let stream = futures::stream::unfold(
             (byte_stream, String::new()),
             move |(mut bytes, mut buf)| async move {
@@ -162,7 +216,7 @@ impl LlmClient {
                     if let Some(pos) = buf.find("\n\n") {
                         let event_text = buf[..pos].to_string();
                         buf = buf[pos + 2..].to_string();
-                        match Self::parse_sse_event(&event_text) {
+                        match Self::dispatch_sse_event(provider, &event_text) {
                             SseParseResult::Chunk(chunk) => {
                                 return Some((Ok(chunk), (bytes, buf)));
                             }
@@ -193,7 +247,7 @@ impl LlmClient {
                             if !buf.trim().is_empty() {
                                 let remaining = std::mem::take(&mut buf);
                                 if let SseParseResult::Chunk(chunk) =
-                                    Self::parse_sse_event(remaining.trim())
+                                    Self::dispatch_sse_event(provider, remaining.trim())
                                 {
                                     return Some((Ok(chunk), (bytes, buf)));
                                 }
@@ -215,7 +269,46 @@ impl LlmClient {
         Ok(stream.boxed())
     }
 
-    /// Parse a single SSE event block (one or more `data:` lines) into a StreamChunk.
+    /// Route an SSE event block to the appropriate provider-specific parser.
+    fn dispatch_sse_event(provider: Provider, event: &str) -> SseParseResult {
+        match provider {
+            Provider::OpenAi => Self::parse_sse_event(event),
+            Provider::Anthropic => Self::parse_anthropic_sse_block(event),
+        }
+    }
+
+    /// Parse an Anthropic SSE event block which has `event:` and `data:` fields.
+    fn parse_anthropic_sse_block(event: &str) -> SseParseResult {
+        let mut event_type: Option<&str> = None;
+        let mut data: Option<&str> = None;
+
+        for line in event.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            if let Some(et) = line
+                .strip_prefix("event: ")
+                .or_else(|| line.strip_prefix("event:"))
+            {
+                event_type = Some(et.trim());
+            }
+            if let Some(d) = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+            {
+                data = Some(d.trim());
+            }
+        }
+
+        match (event_type, data) {
+            (Some(et), Some(d)) => crate::anthropic::parse_anthropic_sse(et, d),
+            (Some("message_stop"), _) => SseParseResult::Done,
+            _ => SseParseResult::Skip,
+        }
+    }
+
+    /// Parse a single OpenAI SSE event block (one or more `data:` lines) into a StreamChunk.
     fn parse_sse_event(event: &str) -> SseParseResult {
         for line in event.lines() {
             let line = line.trim();
