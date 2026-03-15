@@ -32,7 +32,7 @@ max_tokens_per_run = 0
 [session]
 idle_timeout = "24h"                # human-readable durations
 max_messages = 10000
-max_context_tokens = 128000
+max_context_tokens = 256000
 snapshot_dir = "./data/snapshots"
 
 [context]

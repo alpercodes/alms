@@ -37,7 +37,7 @@ max_messages = 10000
 # This should be >= context.max_input_tokens (the LLM per-request budget)
 # because the session must store at least as much as the LLM can consume.
 # Typically set 2x the LLM context window to keep some older history around.
-max_context_tokens = 256000
+max_context_tokens = 256_000
 snapshot_dir = "./data/snapshots"
 
 [context]
