@@ -159,42 +159,32 @@ impl SqliteStore {
     ///
     /// Wrapped in a transaction so a crash mid-delete cannot leave orphaned rows.
     pub fn delete_session(&self, session_id: SessionId) -> AlmsResult<()> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let id_str = session_id.0.to_string();
-        conn.execute_batch("BEGIN")
+        let tx = conn
+            .transaction()
             .map_err(|e| AlmsError::Runtime(format!("SQLite begin delete_session: {e}")))?;
-        let result = (|| -> AlmsResult<()> {
-            // Delete dependent rows first (foreign key order)
-            conn.execute(
-                "DELETE FROM context_summaries WHERE session_id = ?1",
-                params![&id_str],
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete summaries: {e}")))?;
-            conn.execute(
-                "DELETE FROM audit_events WHERE session_id = ?1",
-                params![&id_str],
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit: {e}")))?;
-            conn.execute(
-                "DELETE FROM messages WHERE session_id = ?1",
-                params![&id_str],
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite delete messages: {e}")))?;
-            conn.execute("DELETE FROM sessions WHERE id = ?1", params![&id_str])
-                .map_err(|e| AlmsError::Runtime(format!("SQLite delete session: {e}")))?;
-            Ok(())
-        })();
-        match &result {
-            Ok(()) => {
-                conn.execute_batch("COMMIT").map_err(|e| {
-                    AlmsError::Runtime(format!("SQLite commit delete_session: {e}"))
-                })?;
-            }
-            Err(_) => {
-                let _ = conn.execute_batch("ROLLBACK");
-            }
-        }
-        result
+        // Delete dependent rows first (foreign key order)
+        tx.execute(
+            "DELETE FROM context_summaries WHERE session_id = ?1",
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete summaries: {e}")))?;
+        tx.execute(
+            "DELETE FROM audit_events WHERE session_id = ?1",
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit: {e}")))?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete messages: {e}")))?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete session: {e}")))?;
+        tx.commit()
+            .map_err(|e| AlmsError::Runtime(format!("SQLite commit delete_session: {e}")))?;
+        Ok(())
     }
 
     /// Flush the WAL to the main database file.
@@ -818,69 +808,58 @@ impl SqliteStore {
     /// Wrapped in a transaction so a crash mid-delete cannot leave orphaned
     /// rows. Returns `true` if the agent existed and was deleted.
     pub fn delete_agent(&self, id: AgentId) -> AlmsResult<bool> {
-        let conn = self.conn.lock();
+        let mut conn = self.conn.lock();
         let id_str = id.0.to_string();
 
-        conn.execute_batch("BEGIN")
+        let tx = conn
+            .transaction()
             .map_err(|e| AlmsError::Runtime(format!("SQLite begin delete_agent: {e}")))?;
 
-        let result = (|| -> AlmsResult<bool> {
-            // 1. Collect session IDs belonging to this agent
-            let mut stmt = conn
+        // 1. Collect session IDs belonging to this agent
+        let session_ids: Vec<String> = {
+            let mut stmt = tx
                 .prepare("SELECT id FROM sessions WHERE agent_id = ?1")
                 .map_err(|e| AlmsError::Runtime(format!("SQLite prepare session query: {e}")))?;
-            let session_ids: Vec<String> = stmt
-                .query_map(params![&id_str], |row| row.get(0))
+            stmt.query_map(params![&id_str], |row| row.get(0))
                 .map_err(|e| AlmsError::Runtime(format!("SQLite query agent sessions: {e}")))?
                 .filter_map(|r| r.ok())
-                .collect();
+                .collect()
+        };
 
-            // 2. Delete dependent rows for each session (FK order)
-            for sid in &session_ids {
-                conn.execute(
-                    "DELETE FROM context_summaries WHERE session_id = ?1",
-                    params![sid],
-                )
+        // 2. Delete dependent rows for each session (FK order)
+        for sid in &session_ids {
+            tx.execute(
+                "DELETE FROM context_summaries WHERE session_id = ?1",
+                params![sid],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete summaries for session: {e}")))?;
+            tx.execute(
+                "DELETE FROM audit_events WHERE session_id = ?1",
+                params![sid],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit for session: {e}")))?;
+            tx.execute("DELETE FROM messages WHERE session_id = ?1", params![sid])
                 .map_err(|e| {
-                    AlmsError::Runtime(format!("SQLite delete summaries for session: {e}"))
+                    AlmsError::Runtime(format!("SQLite delete messages for session: {e}"))
                 })?;
-                conn.execute(
-                    "DELETE FROM audit_events WHERE session_id = ?1",
-                    params![sid],
-                )
-                .map_err(|e| AlmsError::Runtime(format!("SQLite delete audit for session: {e}")))?;
-                conn.execute("DELETE FROM messages WHERE session_id = ?1", params![sid])
-                    .map_err(|e| {
-                        AlmsError::Runtime(format!("SQLite delete messages for session: {e}"))
-                    })?;
-            }
-
-            // 3. Delete the sessions themselves
-            conn.execute("DELETE FROM sessions WHERE agent_id = ?1", params![&id_str])
-                .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent sessions: {e}")))?;
-
-            // 4. Delete jobs belonging to this agent
-            conn.execute("DELETE FROM jobs WHERE agent_id = ?1", params![&id_str])
-                .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent jobs: {e}")))?;
-
-            // 5. Delete the agent row
-            let affected = conn
-                .execute("DELETE FROM agents WHERE id = ?1", params![&id_str])
-                .map_err(|e| AlmsError::Runtime(format!("SQLite delete_agent: {e}")))?;
-
-            Ok(affected > 0)
-        })();
-
-        match &result {
-            Ok(_) => {
-                conn.execute_batch("COMMIT")
-                    .map_err(|e| AlmsError::Runtime(format!("SQLite commit delete_agent: {e}")))?;
-            }
-            Err(_) => {
-                let _ = conn.execute_batch("ROLLBACK");
-            }
         }
-        result
+
+        // 3. Delete the sessions themselves
+        tx.execute("DELETE FROM sessions WHERE agent_id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent sessions: {e}")))?;
+
+        // 4. Delete jobs belonging to this agent
+        tx.execute("DELETE FROM jobs WHERE agent_id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent jobs: {e}")))?;
+
+        // 5. Delete the agent row
+        let affected = tx
+            .execute("DELETE FROM agents WHERE id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete_agent: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| AlmsError::Runtime(format!("SQLite commit delete_agent: {e}")))?;
+        Ok(affected > 0)
     }
 
     /// Set an agent as the default, clearing any previous default.
