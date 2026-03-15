@@ -13,20 +13,19 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         Posture::Guarded => "guarded",
     };
 
-    // List tools by name directly — avoids constructing a full ToolRegistry per request.
-    let mut tools: Vec<&str> = vec![
-        "echo",
-        "fs_list",
-        "fs_read",
-        "fs_write",
-        "get_task_result",
-        "http_get",
-        "invoke_agent",
-        "math",
-        "shell_exec",
-    ];
+    // Builtin tools: respect the enabled filter from config.
+    let enabled = &state.agent_config.enabled_tools;
+    let all_builtins: Vec<&str> =
+        vec!["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec"];
+    let mut tools: Vec<String> = if enabled.is_empty() {
+        all_builtins.into_iter().map(String::from).collect()
+    } else {
+        enabled.clone()
+    };
+    // Runtime-added tools (agent infrastructure, not subject to enabled filter)
+    tools.extend(["invoke_agent", "get_task_result", "read_subagent_session"].iter().map(|s| s.to_string()));
     if state.workspace_dir.is_some() {
-        tools.push("workspace_write");
+        tools.push("workspace_write".to_string());
     }
 
     let agent_id = state.default_agent_id.read().unwrap().0.to_string();

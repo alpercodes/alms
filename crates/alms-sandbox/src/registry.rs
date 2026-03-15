@@ -145,55 +145,42 @@ impl ToolRegistry {
 
     /// Create a registry with all built-in tools registered (unrestricted).
     pub fn with_builtin_tools() -> Self {
-        Self::with_builtin_tools_sandboxed(None, false)
+        Self::with_builtin_tools_sandboxed(None, false, &[])
     }
 
-    /// Create a registry with all built-in tools registered and optional sandbox.
+    /// Create a registry with built-in tools registered and optional sandbox.
     ///
     /// `sandbox_root` — when `Some`, fs tools and shell cwd are restricted to
     /// this directory (canonicalized). When `None`, no path restriction.
     /// `shell_unrestricted` — when `true`, shell_exec ignores sandbox_root for cwd.
+    /// `enabled` — when non-empty, only builtins whose name appears in the
+    /// list are registered. Empty slice = all builtins enabled.
     pub fn with_builtin_tools_sandboxed(
         sandbox_root: Option<std::path::PathBuf>,
         shell_unrestricted: bool,
+        enabled: &[String],
     ) -> Self {
         let registry = Self::new();
-        registry.register_builtin_tools_sandboxed(sandbox_root, shell_unrestricted);
+        registry.register_builtin_tools_sandboxed(sandbox_root, shell_unrestricted, enabled);
         registry
     }
 
-    /// Register all built-in tools with optional sandbox configuration.
+    /// Register built-in tools with optional sandbox configuration.
+    ///
+    /// When `enabled` is non-empty, only tools whose name appears in the list
+    /// are registered. When empty, all builtins are registered.
     pub fn register_builtin_tools_sandboxed(
         &self,
         sandbox_root: Option<std::path::PathBuf>,
         shell_unrestricted: bool,
+        enabled: &[String],
     ) {
         use crate::builtin::{
             EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool, ShellExecTool,
         };
 
-        // Register echo tool
-        if let Err(e) = self.register(Arc::new(EchoTool::new())) {
-            error!("Failed to register echo tool: {}", e);
-        }
-
-        // Register math tool
-        if let Err(e) = self.register(Arc::new(MathTool::new())) {
-            error!("Failed to register math tool: {}", e);
-        }
-
-        // Register http_get tool
-        if let Err(e) = self.register(Arc::new(HttpGetTool::new())) {
-            error!("Failed to register http_get tool: {}", e);
-        }
-
-        // Register shell_exec tool
+        // Build all tools, then filter by the enabled list.
         let shell_tool = ShellExecTool::with_policy(sandbox_root.clone(), shell_unrestricted);
-        if let Err(e) = self.register(Arc::new(shell_tool)) {
-            error!("Failed to register shell_exec tool: {}", e);
-        }
-
-        // Register filesystem tools
         let (fs_read, fs_write, fs_list) = match sandbox_root {
             Some(ref root) => (
                 FsReadTool::sandboxed(root.clone()),
@@ -202,17 +189,28 @@ impl ToolRegistry {
             ),
             None => (FsReadTool::new(), FsWriteTool::new(), FsListTool::new()),
         };
-        if let Err(e) = self.register(Arc::new(fs_read)) {
-            error!("Failed to register fs_read tool: {}", e);
-        }
-        if let Err(e) = self.register(Arc::new(fs_write)) {
-            error!("Failed to register fs_write tool: {}", e);
-        }
-        if let Err(e) = self.register(Arc::new(fs_list)) {
-            error!("Failed to register fs_list tool: {}", e);
+
+        let all_tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(EchoTool::new()),
+            Arc::new(MathTool::new()),
+            Arc::new(HttpGetTool::new()),
+            Arc::new(shell_tool),
+            Arc::new(fs_read),
+            Arc::new(fs_write),
+            Arc::new(fs_list),
+        ];
+
+        for tool in all_tools {
+            if enabled.is_empty() || enabled.iter().any(|e| e == tool.name()) {
+                if let Err(e) = self.register(tool) {
+                    error!("Failed to register {} tool: {}", "builtin", e);
+                }
+            } else {
+                debug!("Skipping disabled builtin tool: {}", tool.name());
+            }
         }
 
-        info!("Registered all built-in tools");
+        info!("Registered built-in tools (filter: {:?})", enabled);
     }
 
     /// Execute a tool by name
@@ -302,5 +300,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_enabled_filter_restricts_builtins() {
+        let enabled = vec!["echo".to_string(), "math".to_string()];
+        let registry = ToolRegistry::with_builtin_tools_sandboxed(None, false, &enabled);
+        assert!(registry.contains("echo"));
+        assert!(registry.contains("math"));
+        assert!(!registry.contains("http_get"));
+        assert!(!registry.contains("shell_exec"));
+        assert!(!registry.contains("fs_read"));
+        assert!(!registry.contains("fs_write"));
+        assert!(!registry.contains("fs_list"));
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn test_empty_enabled_registers_all_builtins() {
+        let registry = ToolRegistry::with_builtin_tools_sandboxed(None, false, &[]);
+        assert!(registry.contains("echo"));
+        assert!(registry.contains("math"));
+        assert!(registry.contains("http_get"));
+        assert!(registry.contains("shell_exec"));
+        assert!(registry.contains("fs_read"));
+        assert!(registry.contains("fs_write"));
+        assert!(registry.contains("fs_list"));
+        assert_eq!(registry.len(), 7);
     }
 }

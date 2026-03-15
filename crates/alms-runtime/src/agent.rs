@@ -45,6 +45,8 @@ pub struct AgentConfig {
     pub sandbox_root: String,
     /// Shell execution policy: "sandboxed" or "unrestricted".
     pub shell_policy: String,
+    /// Enabled builtin tools. Empty = all enabled (backward compatible).
+    pub enabled_tools: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -60,6 +62,7 @@ impl Default for AgentConfig {
             posture: Posture::FullControl,
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
+            enabled_tools: Vec::new(),
         }
     }
 }
@@ -115,12 +118,17 @@ impl AgentRuntime {
             Some(canonical)
         };
         let shell_unrestricted = config.shell_policy == "unrestricted";
+        let tools = ToolRegistry::with_builtins_sandboxed(
+            sandbox_root.clone(),
+            shell_unrestricted,
+            &config.enabled_tools,
+        );
 
         Self {
             agent_id,
             config,
             llm,
-            tools: ToolRegistry::with_builtins_sandboxed(sandbox_root.clone(), shell_unrestricted),
+            tools,
             workspace: None,
             event_sender: None,
             run_id: None,
