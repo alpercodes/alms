@@ -200,6 +200,7 @@ impl ToolRegistry {
             Arc::new(fs_list),
         ];
 
+        let builtin_names: Vec<String> = all_tools.iter().map(|t| t.name().to_string()).collect();
         for tool in all_tools {
             if enabled.is_empty() || enabled.iter().any(|e| e == tool.name()) {
                 if let Err(e) = self.register(tool) {
@@ -207,6 +208,16 @@ impl ToolRegistry {
                 }
             } else {
                 debug!("Skipping disabled builtin tool: {}", tool.name());
+            }
+        }
+
+        // Warn about enabled entries that don't match any builtin tool name.
+        for name in enabled {
+            if !builtin_names.iter().any(|b| b == name) {
+                warn!(
+                    "tools.enabled contains unknown builtin '{}' — typo?",
+                    name
+                );
             }
         }
 
