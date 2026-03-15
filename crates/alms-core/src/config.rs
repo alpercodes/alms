@@ -403,7 +403,7 @@ pub struct ToolsConfig {
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
-            enabled: vec!["echo".into(), "math".into(), "http_get".into()],
+            enabled: Vec::new(),
             timeout_secs: 30,
             max_output_bytes: 65536,
             sandbox_root: ".".into(),

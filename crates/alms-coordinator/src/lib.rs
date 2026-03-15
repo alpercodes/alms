@@ -512,6 +512,7 @@ fn agent_config_for_subagent(
         posture,
         sandbox_root: base.sandbox_root.clone(),
         shell_policy: base.shell_policy.clone(),
+        enabled_tools: base.enabled_tools.clone(),
         ..AgentConfig::default()
     };
     (config, model)

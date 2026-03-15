@@ -31,14 +31,19 @@ impl ToolRegistry {
     }
 
     /// Create registry with sandbox-aware built-in tools.
+    ///
+    /// `enabled` — when non-empty, only builtins whose name appears in the
+    /// list are registered. Empty slice = all builtins enabled.
     pub fn with_builtins_sandboxed(
         sandbox_root: Option<std::path::PathBuf>,
         shell_unrestricted: bool,
+        enabled: &[String],
     ) -> Self {
         Self {
             registry: SandboxRegistry::with_builtin_tools_sandboxed(
                 sandbox_root,
                 shell_unrestricted,
+                enabled,
             ),
         }
     }

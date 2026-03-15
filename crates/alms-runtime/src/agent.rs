@@ -45,6 +45,8 @@ pub struct AgentConfig {
     pub sandbox_root: String,
     /// Shell execution policy: "sandboxed" or "unrestricted".
     pub shell_policy: String,
+    /// Enabled builtin tools. Empty = all enabled (backward compatible).
+    pub enabled_tools: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -60,6 +62,7 @@ impl Default for AgentConfig {
             posture: Posture::FullControl,
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
+            enabled_tools: Vec::new(),
         }
     }
 }
@@ -115,12 +118,17 @@ impl AgentRuntime {
             Some(canonical)
         };
         let shell_unrestricted = config.shell_policy == "unrestricted";
+        let tools = ToolRegistry::with_builtins_sandboxed(
+            sandbox_root.clone(),
+            shell_unrestricted,
+            &config.enabled_tools,
+        );
 
         Self {
             agent_id,
             config,
             llm,
-            tools: ToolRegistry::with_builtins_sandboxed(sandbox_root.clone(), shell_unrestricted),
+            tools,
             workspace: None,
             event_sender: None,
             run_id: None,
@@ -139,17 +147,20 @@ impl AgentRuntime {
         let tool = WorkspaceWriteTool::new(workspace.clone());
         self.tools.register(std::sync::Arc::new(tool));
 
-        // Set shell_exec default cwd to the agent's workspace directory.
-        // Security model preserved: sandbox_root still governs which paths are
-        // valid for user-specified cwd; default_cwd only affects the fallback
-        // when no cwd parameter is provided.
-        let ws_dir = workspace.dir();
-        let shell_tool = alms_sandbox::ShellExecTool::with_policy(
-            self.resolved_sandbox_root.clone(),
-            self.shell_unrestricted,
-        )
-        .with_default_cwd(ws_dir);
-        self.tools.register(std::sync::Arc::new(shell_tool));
+        // Re-register shell_exec with workspace dir as default cwd — but only
+        // if shell_exec was enabled in the first place. Otherwise we'd bypass
+        // the operator's tools.enabled restriction.
+        if self.config.enabled_tools.is_empty()
+            || self.config.enabled_tools.iter().any(|t| t == "shell_exec")
+        {
+            let ws_dir = workspace.dir();
+            let shell_tool = alms_sandbox::ShellExecTool::with_policy(
+                self.resolved_sandbox_root.clone(),
+                self.shell_unrestricted,
+            )
+            .with_default_cwd(ws_dir);
+            self.tools.register(std::sync::Arc::new(shell_tool));
+        }
 
         self.workspace = Some(workspace);
         self
