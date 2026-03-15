@@ -15,11 +15,15 @@ use tracing::{info, warn};
 /// Select an API key for the requested LLM provider.
 ///
 /// Preference order:
-/// - `openai`: `OPENAI_API_KEY`, then `OPENROUTER_API_KEY`
-/// - `anthropic`: `ANTHROPIC_API_KEY`
+/// - `openai`: `OPENAI_API_KEY`, then `OPENROUTER_API_KEY`, then
+///   `ANTHROPIC_API_KEY`
+/// - `anthropic`: `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`, then
+///   `OPENROUTER_API_KEY`
+/// - other providers: `OPENAI_API_KEY`, then `OPENROUTER_API_KEY`, then
+///   `ANTHROPIC_API_KEY`
 ///
-/// If the preferred provider-specific key is absent, fall back to any available
-/// key so existing single-key setups continue to work.
+/// This preserves single-key setups by falling back to any available key when
+/// the preferred provider-specific key is absent.
 pub fn select_llm_api_key(
     provider: &str,
     openrouter_key: Option<String>,
@@ -585,8 +589,12 @@ model = "claude-sonnet"
         );
         assert_eq!(selected.as_deref(), Some("openai-key"));
 
-        let fallback =
-            select_llm_api_key("openai", Some("openrouter-key".into()), None, Some("anthropic-key".into()));
+        let fallback = select_llm_api_key(
+            "openai",
+            Some("openrouter-key".into()),
+            None,
+            Some("anthropic-key".into()),
+        );
         assert_eq!(fallback.as_deref(), Some("openrouter-key"));
     }
 
@@ -599,6 +607,38 @@ model = "claude-sonnet"
             Some("anthropic-key".into()),
         );
         assert_eq!(selected.as_deref(), Some("anthropic-key"));
+    }
+
+    #[test]
+    fn test_select_llm_api_key_returns_none_when_no_keys_available() {
+        let selected = select_llm_api_key("openai", None, None, None);
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn test_select_llm_api_key_unknown_provider_uses_openai_fallback_chain() {
+        let selected = select_llm_api_key(
+            "custom-provider",
+            Some("openrouter-key".into()),
+            Some("openai-key".into()),
+            Some("anthropic-key".into()),
+        );
+        assert_eq!(selected.as_deref(), Some("openai-key"));
+    }
+
+    #[test]
+    fn test_select_llm_api_key_anthropic_falls_back_to_openai_then_openrouter() {
+        let fallback_to_openai = select_llm_api_key(
+            "anthropic",
+            Some("openrouter-key".into()),
+            Some("openai-key".into()),
+            None,
+        );
+        assert_eq!(fallback_to_openai.as_deref(), Some("openai-key"));
+
+        let fallback_to_openrouter =
+            select_llm_api_key("anthropic", Some("openrouter-key".into()), None, None);
+        assert_eq!(fallback_to_openrouter.as_deref(), Some("openrouter-key"));
     }
 
     #[test]
