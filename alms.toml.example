@@ -33,7 +33,11 @@ idle_timeout_secs = 86400            # 24 hours
 auto_archive = true
 archive_ttl_secs = 2592000          # 30 days
 max_messages = 10000
-max_context_tokens = 128000
+# SESSION STORAGE limit: max tokens of conversation history to retain on disk.
+# This should be >= context.max_input_tokens (the LLM per-request budget)
+# because the session must store at least as much as the LLM can consume.
+# Typically set 2x the LLM context window to keep some older history around.
+max_context_tokens = 256000
 snapshot_dir = "./data/snapshots"
 
 [context]
@@ -42,7 +46,9 @@ snapshot_dir = "./data/snapshots"
 #   "sliding-summary" - rolling summary + recent window (best quality)
 #   "full"            - send everything (for small conversations)
 strategy = "truncate"
-# max tokens to send to the LLM per request
+# PER-REQUEST LLM budget: max tokens to send to the LLM in a single request.
+# Should match your model's context window size. This is different from
+# session.max_context_tokens, which is the total session storage limit.
 max_input_tokens = 128000
 # number of recent messages to always keep in full
 recent_window = 20

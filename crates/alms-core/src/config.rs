@@ -195,6 +195,17 @@ impl AlmsConfig {
             ));
         }
 
+        // Cross-section validation: session storage must hold at least one
+        // full context window, otherwise the ContextBuilder could request more
+        // tokens than the session retains.
+        if self.session.max_context_tokens < self.context.max_input_tokens {
+            return Err(AlmsError::InvalidConfig(format!(
+                "session.max_context_tokens ({}) must be >= context.max_input_tokens ({}) — \
+                 the session storage limit must be at least as large as the LLM context window budget",
+                self.session.max_context_tokens, self.context.max_input_tokens
+            )));
+        }
+
         // Tools validation
         if self.tools.timeout_secs == 0 {
             return Err(AlmsError::InvalidConfig(
@@ -265,7 +276,11 @@ impl Default for LlmConfig {
     }
 }
 
-/// Session management configuration
+/// Session management configuration.
+///
+/// Controls how sessions are stored and retained. This is distinct from
+/// [`ContextConfig`], which controls how much of a session's history is sent
+/// to the LLM in a single request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionConfig {
@@ -275,6 +290,15 @@ pub struct SessionConfig {
     /// Delete archived sessions after this many seconds
     pub archive_ttl_secs: u64,
     pub max_messages: usize,
+    /// Maximum total tokens to retain in a session's history.
+    ///
+    /// This is a **storage** limit — it caps how much conversation history the
+    /// session keeps on disk/in the database. It should be >= `context.max_input_tokens`
+    /// because the session must store at least as much history as the LLM context
+    /// window can consume per request.
+    ///
+    /// Not to be confused with [`ContextConfig::max_input_tokens`], which controls
+    /// how many tokens are sent to the LLM in a single request.
     pub max_context_tokens: usize,
     /// Directory for snapshot persistence
     pub snapshot_dir: String,
@@ -287,19 +311,29 @@ impl Default for SessionConfig {
             auto_archive: true,
             archive_ttl_secs: 30 * 24 * 60 * 60,
             max_messages: 10000,
-            max_context_tokens: 128000,
+            max_context_tokens: 256_000,
             snapshot_dir: "./data/snapshots".into(),
         }
     }
 }
 
-/// Context window management configuration
+/// Context window management configuration.
+///
+/// Controls how the session's message history is assembled into a prompt for
+/// each LLM request. This is distinct from [`SessionConfig`], which controls
+/// how much history the session retains in storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextConfig {
     /// Strategy: "sliding-summary", "full", "truncate"
     pub strategy: String,
-    /// Max tokens to send to the LLM
+    /// Maximum tokens to send to the LLM in a single request.
+    ///
+    /// This is the **per-request** token budget for the context window assembled
+    /// by the ContextBuilder. It should match your LLM's context window size.
+    ///
+    /// Not to be confused with [`SessionConfig::max_context_tokens`], which is
+    /// the total token storage limit for the session's history on disk.
     pub max_input_tokens: usize,
     /// Number of recent messages to always keep in full
     pub recent_window: usize,
@@ -456,5 +490,39 @@ model = "claude-sonnet"
     fn test_validation_good() {
         let config = AlmsConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validation_context_tokens_less_than_input_tokens() {
+        let mut config = AlmsConfig::default();
+        // Session storage smaller than LLM context window — should fail
+        config.session.max_context_tokens = 64_000;
+        config.context.max_input_tokens = 128_000;
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_context_tokens"),
+            "error should mention max_context_tokens: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validation_context_tokens_equal_to_input_tokens() {
+        let mut config = AlmsConfig::default();
+        // Equal is fine — the session stores exactly one context window
+        config.session.max_context_tokens = 128_000;
+        config.context.max_input_tokens = 128_000;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_default_max_context_tokens_larger_than_max_input_tokens() {
+        let config = AlmsConfig::default();
+        assert!(
+            config.session.max_context_tokens >= config.context.max_input_tokens,
+            "default max_context_tokens ({}) should be >= max_input_tokens ({})",
+            config.session.max_context_tokens,
+            config.context.max_input_tokens,
+        );
     }
 }

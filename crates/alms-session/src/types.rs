@@ -109,7 +109,8 @@ pub struct SessionConfig {
     pub archive_ttl_secs: u64,
     /// Maximum messages per session (default: 10000)
     pub max_messages: usize,
-    /// Maximum context tokens (default: 128000)
+    /// Maximum total tokens to retain in the session's history (storage limit).
+    /// Must be >= the LLM per-request budget (`ContextConfig::max_input_tokens`).
     pub max_context_tokens: usize,
 }
 
@@ -120,7 +121,7 @@ impl Default for SessionConfig {
             auto_archive: true,
             archive_ttl_secs: 30 * 24 * 60 * 60, // 30 days
             max_messages: 10000,
-            max_context_tokens: 128000,
+            max_context_tokens: 256_000,
         }
     }
 }
