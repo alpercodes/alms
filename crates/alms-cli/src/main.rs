@@ -151,9 +151,13 @@ async fn main() -> anyhow::Result<()> {
             }
             // Resolve bind address: --bind flag > config (alms.toml / ALMS_BIND) > default
             let bind = bind.unwrap_or_else(|| {
-                alms_core::AlmsConfig::load()
-                    .map(|c| c.server.bind)
-                    .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+                match alms_core::AlmsConfig::load() {
+                    Ok(c) => c.server.bind,
+                    Err(e) => {
+                        warn!("Failed to load config for bind address, using default: {}", e);
+                        "127.0.0.1:8080".to_string()
+                    }
+                }
             });
             alms_gateway::serve(&bind).await?;
         }
