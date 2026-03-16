@@ -347,7 +347,18 @@ async fn execute_run(
         Ok(rt) => rt,
         Err(e) => {
             error!("Run {} failed to create runtime: {}", run_id.0, e);
+            state
+                .run_manager
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_error(run_id, &e.to_string()),
+                )
+                .await;
             state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            state.run_manager.remove_senders(run_id);
+            state.run_manager.remove_cancel_token(run_id);
+            state.approval_store.clear_for_run(run_id);
             state.run_manager.untrack_in_flight();
             return;
         }

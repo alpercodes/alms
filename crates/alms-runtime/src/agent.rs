@@ -1162,4 +1162,19 @@ mod tests {
             "Error should mention sandbox_root: {err}"
         );
     }
+
+    #[test]
+    fn test_empty_sandbox_root_means_unrestricted() {
+        let config = crate::llm_types::LlmConfig {
+            mock: true,
+            ..crate::llm_types::LlmConfig::default()
+        };
+        let llm = LlmClient::new(config).unwrap();
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let result = AgentRuntime::new(AgentId::new(), agent_config, llm);
+        assert!(result.is_ok(), "Empty sandbox_root should mean unrestricted");
+    }
 }
