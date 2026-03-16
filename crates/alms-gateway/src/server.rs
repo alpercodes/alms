@@ -934,14 +934,10 @@ mod tests {
         let done_id = RunId::new();
 
         // Insert two runs: one running, one completed.
-        let active_run = Run::new(SessionId::new(), AgentId::new(), "active".to_string());
+        let mut active_run = Run::new(SessionId::new(), AgentId::new(), "active".to_string());
         let mut done_run = Run::new(SessionId::new(), AgentId::new(), "done".to_string());
         // Override IDs for deterministic test.
-        let active_run = {
-            let mut r = active_run;
-            r.run_id = active_id;
-            r
-        };
+        active_run.run_id = active_id;
         done_run.run_id = done_id;
 
         rm.insert_run(active_run);
