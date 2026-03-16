@@ -104,6 +104,33 @@ impl RunManager {
         self.event_senders.remove(&run_id);
     }
 
+    /// Remove sender entries for runs that have already reached a terminal
+    /// state. This is a defense-in-depth measure against the TOCTOU race in
+    /// SSE subscription (see #149): if a sender is registered between the
+    /// status check and `remove_senders` in `execute_run`, the entry becomes
+    /// orphaned. Calling this periodically (or on demand) cleans up any
+    /// leaked entries.
+    pub fn purge_terminal_senders(&self) {
+        self.event_senders.retain(|run_id, _| {
+            let is_terminal = self
+                .runs
+                .get(run_id)
+                .map(|r| {
+                    matches!(
+                        r.status,
+                        alms_core::RunStatus::Completed
+                            | alms_core::RunStatus::Failed
+                            | alms_core::RunStatus::Cancelled
+                    )
+                })
+                .unwrap_or(true); // run not found ⇒ definitely stale
+            if is_terminal {
+                tracing::debug!(run_id = %run_id.0, "Purged orphaned sender entry for terminal run");
+            }
+            !is_terminal
+        });
+    }
+
     pub fn insert_run(&self, run: Run) {
         self.runs.insert(run.run_id, run);
     }
@@ -898,5 +925,56 @@ mod tests {
         let r = rm.get_run(run_id).unwrap();
         assert_eq!(r.status, alms_core::RunStatus::Cancelled);
         assert!(r.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_purge_terminal_senders_removes_completed() {
+        let rm = RunManager::new();
+        let active_id = RunId::new();
+        let done_id = RunId::new();
+
+        // Insert two runs: one running, one completed.
+        let mut active_run = Run::new(SessionId::new(), AgentId::new(), "active".to_string());
+        let mut done_run = Run::new(SessionId::new(), AgentId::new(), "done".to_string());
+        // Override IDs for deterministic test.
+        active_run.run_id = active_id;
+        done_run.run_id = done_id;
+
+        rm.insert_run(active_run);
+        rm.insert_run(done_run);
+        rm.mark_run_as_running(active_id);
+        rm.mark_run_as_running(done_id);
+        rm.mark_run_as_completed(done_id, "output".into(), Default::default());
+
+        // Register senders for both.
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        rm.register_sender(active_id, tx1);
+        rm.register_sender(done_id, tx2);
+
+        assert!(rm.event_senders.contains_key(&active_id));
+        assert!(rm.event_senders.contains_key(&done_id));
+
+        rm.purge_terminal_senders();
+
+        // Active run's sender should be kept, completed run's sender removed.
+        assert!(rm.event_senders.contains_key(&active_id));
+        assert!(!rm.event_senders.contains_key(&done_id));
+    }
+
+    #[tokio::test]
+    async fn test_purge_terminal_senders_removes_missing_runs() {
+        let rm = RunManager::new();
+        let orphan_id = RunId::new();
+
+        // Register a sender for a run that doesn't exist in the runs map.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        rm.register_sender(orphan_id, tx);
+        assert!(rm.event_senders.contains_key(&orphan_id));
+
+        rm.purge_terminal_senders();
+
+        // Sender for nonexistent run should be purged.
+        assert!(!rm.event_senders.contains_key(&orphan_id));
     }
 }

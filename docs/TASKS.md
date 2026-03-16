@@ -766,7 +766,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - **Evidence:** `config.rs:18-24`, `gateway.rs:67-82`, `main.rs:29-32`, `main.rs:129-152`
 - **Owners:** Atlas
 
-102) MEDIUM: SSE subscription leak — subscribe to nonexistent/finished runs without error
+102) MEDIUM: SSE subscription leak — subscribe to nonexistent/finished runs without error ✅
 - `runs.rs:598-605` always registers a live sender before checking run state. Subscribing to a nonexistent or already-finished run gets an open SSE stream instead of a 404.
 - Post-completion subscriptions leave stale `event_senders` entries that are never pruned (no future events to trigger cleanup).
 - Fix: check run existence and status *before* registering a sender. Return 404 for nonexistent runs, return the historical event log for finished runs (then close), only register a live sender for active runs. Add periodic or disconnect-aware cleanup for orphaned entries.

@@ -467,6 +467,9 @@ async fn execute_run(
     }
 
     state.run_manager.remove_senders(run_id);
+    // Defense-in-depth: sweep any other orphaned sender entries for runs
+    // that reached terminal state (covers the TOCTOU window in #149).
+    state.run_manager.purge_terminal_senders();
     state.run_manager.remove_cancel_token(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
@@ -746,6 +749,33 @@ pub async fn stream_run_events(
         // stream_with_replay.
         let (tx, rx) = event_channel();
         state.run_manager.register_sender(run_id, tx);
+
+        // TOCTOU guard: the run may have completed between the time the
+        // client initiated the SSE request and `register_sender`. In that
+        // case `execute_run` already called `remove_senders` before we
+        // registered, so our sender entry is orphaned. Re-check and clean
+        // up if needed (fixes #149).
+        let became_terminal = state
+            .run_manager
+            .get_run(run_id)
+            .map(|r| {
+                matches!(
+                    r.status,
+                    RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+                )
+            })
+            .unwrap_or(true);
+
+        if became_terminal {
+            state.run_manager.remove_senders(run_id);
+            warn!(
+                "Run {} became terminal during SSE subscription — cleaned up orphaned sender",
+                run_id.0
+            );
+            // Fall through to replay-only: the sender's rx will see
+            // channel closed immediately, so stream_with_replay will
+            // emit the replay events and then close.
+        }
 
         let logged_events = state.run_manager.events_from(run_id, from_id).await;
         let replay_events: Vec<SseEventData> = logged_events
