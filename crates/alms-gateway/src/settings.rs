@@ -16,8 +16,15 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     // Builtin tools: report only tools that are actually registered (intersection
     // of the enabled list with known builtins). Typos in enabled are excluded.
     let enabled = &state.agent_config.enabled_tools;
-    let all_builtins: &[&str] =
-        &["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec"];
+    let all_builtins: &[&str] = &[
+        "echo",
+        "fs_list",
+        "fs_read",
+        "fs_write",
+        "http_get",
+        "math",
+        "shell_exec",
+    ];
     let mut tools: Vec<String> = if enabled.is_empty() {
         all_builtins.iter().map(|s| String::from(*s)).collect()
     } else {
@@ -28,7 +35,11 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
             .collect()
     };
     // Runtime-added tools (agent infrastructure, not subject to enabled filter)
-    tools.extend(["invoke_agent", "get_task_result", "read_subagent_session"].iter().map(|s| s.to_string()));
+    tools.extend(
+        ["invoke_agent", "get_task_result", "read_subagent_session"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
     if state.workspace_dir.is_some() {
         tools.push("workspace_write".to_string());
     }

@@ -1175,6 +1175,9 @@ mod tests {
             ..AgentConfig::default()
         };
         let result = AgentRuntime::new(AgentId::new(), agent_config, llm);
-        assert!(result.is_ok(), "Empty sandbox_root should mean unrestricted");
+        assert!(
+            result.is_ok(),
+            "Empty sandbox_root should mean unrestricted"
+        );
     }
 }
