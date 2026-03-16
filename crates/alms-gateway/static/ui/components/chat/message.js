@@ -2,7 +2,7 @@ import { html } from '../../deps.js';
 
 export function Message({ type, role, text, sealed }) {
     const cls = type === 'user' ? 'user' : 'agent';
-    const label = type === 'user' ? 'You' : 'Agent';
+    const label = type === 'user' ? '>' : '$';
     const streaming = type === 'agent' && sealed === false;
     return html`
         <div class="msg ${cls}">
