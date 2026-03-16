@@ -60,18 +60,20 @@ Impact:
 Missing coverage:
 - There is no test for a stalled SSE stream, mid-tool-call timeout, or missing `[DONE]` / `message_stop`.
 
-### 3. Medium - invalid `tools.sandbox_root` fails open to the current working directory
+### 3. Medium - invalid `tools.sandbox_root` fails open to the current working directory — **FIXED (PR #158)**
 
 Evidence:
 - `crates/alms-runtime/src/agent.rs:99-115` canonicalizes `config.sandbox_root`.
-- If canonicalization fails, `crates/alms-runtime/src/agent.rs:103-112` falls back to `current_dir()` and continues with that as the active sandbox root.
+- ~~If canonicalization fails, `crates/alms-runtime/src/agent.rs:103-112` falls back to `current_dir()` and continues with that as the active sandbox root.~~
 
 Impact:
 - A typo or bad deployment path can silently widen the accessible filesystem from the intended restricted directory to the process cwd.
 - This is especially risky because the warning is easy to miss in production logs.
 
 Safer behavior:
-- Fail closed on invalid sandbox roots, or require an explicit opt-in fallback.
+- ~~Fail closed on invalid sandbox roots, or require an explicit opt-in fallback.~~
+
+**Resolution:** `AgentRuntime::new()` now returns `Result` and rejects unresolvable `sandbox_root` with `AlmsError::InvalidConfig`. Set `sandbox_root = ""` to explicitly opt out of sandboxing.
 
 ### 4. Medium - provider API key selection ignores the chosen provider and simply lets the last env var win
 
@@ -135,7 +137,7 @@ Impact:
 
 1. Enforce `[tools].enabled` at runtime and reflect the real tool set in `/settings`.
 2. Change stream-stall handling from silent EOF to an explicit runtime error.
-3. Make invalid `sandbox_root` fail closed.
+3. ~~Make invalid `sandbox_root` fail closed.~~ **Done (PR #158)**
 4. Resolve API-key loading by provider, not by env-var order.
 5. Either wire the remaining config knobs into production code or remove them from the public config surface.
 6. Repair `docs/index.md`, update `docs/api.md` session routes, and refresh `README.md` to match SQLite/SSE/current crate layout.
@@ -143,7 +145,7 @@ Impact:
 ## Coverage gaps worth adding tests for
 
 - Config-driven tool allowlisting.
-- Invalid `sandbox_root` behavior.
+- ~~Invalid `sandbox_root` behavior.~~ **Covered (PR #158)**
 - Multi-provider API-key env precedence.
 - Stalled streaming responses.
 - Session archival and retention behavior.
