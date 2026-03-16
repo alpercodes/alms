@@ -448,6 +448,9 @@ async fn execute_run(
     }
 
     state.run_manager.remove_senders(run_id);
+    // Defense-in-depth: sweep any other orphaned sender entries for runs
+    // that reached terminal state (covers the TOCTOU window in #149).
+    state.run_manager.purge_terminal_senders();
     state.run_manager.remove_cancel_token(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
@@ -728,8 +731,8 @@ pub async fn stream_run_events(
         let (tx, rx) = event_channel();
         state.run_manager.register_sender(run_id, tx);
 
-        // TOCTOU guard: the run may have transitioned to terminal between
-        // the `is_terminal` check above and `register_sender`. In that
+        // TOCTOU guard: the run may have completed between the time the
+        // client initiated the SSE request and `register_sender`. In that
         // case `execute_run` already called `remove_senders` before we
         // registered, so our sender entry is orphaned. Re-check and clean
         // up if needed (fixes #149).
