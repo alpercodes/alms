@@ -96,24 +96,24 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
-    /// Create new agent runtime
-    pub fn new(agent_id: AgentId, config: AgentConfig, llm: LlmClient) -> Self {
+    /// Create new agent runtime.
+    ///
+    /// Returns an error if `sandbox_root` is non-empty but cannot be resolved
+    /// (fail-closed: refuses to widen the sandbox silently).
+    pub fn new(agent_id: AgentId, config: AgentConfig, llm: LlmClient) -> AlmsResult<Self> {
         // Resolve sandbox root: empty string = unrestricted, otherwise canonicalize.
         let sandbox_root = if config.sandbox_root.is_empty() {
             None
         } else {
             let path = std::path::PathBuf::from(&config.sandbox_root);
-            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|e| {
-                let fallback = std::env::current_dir().unwrap_or_else(|_| path.clone());
-                let fallback = std::fs::canonicalize(&fallback).unwrap_or(fallback);
-                warn!(
-                    configured = %path.display(),
-                    fallback = %fallback.display(),
-                    error = %e,
-                    "tools.sandbox_root cannot be resolved, falling back to current directory"
-                );
-                fallback
-            });
+            let canonical = std::fs::canonicalize(&path).map_err(|e| {
+                AlmsError::InvalidConfig(format!(
+                    "tools.sandbox_root '{}' cannot be resolved: {}. \
+                     Set sandbox_root = \"\" to explicitly opt out of sandboxing.",
+                    path.display(),
+                    e,
+                ))
+            })?;
             info!(sandbox_root = %canonical.display(), "Filesystem sandbox active");
             Some(canonical)
         };
@@ -124,7 +124,7 @@ impl AgentRuntime {
             &config.enabled_tools,
         );
 
-        Self {
+        Ok(Self {
             agent_id,
             config,
             llm,
@@ -135,7 +135,7 @@ impl AgentRuntime {
             cancel_token: None,
             resolved_sandbox_root: sandbox_root,
             shell_unrestricted,
-        }
+        })
     }
 
     /// Attach an agent workspace for persistent identity files.
@@ -205,7 +205,7 @@ impl AgentRuntime {
     /// Create with default config
     pub fn with_defaults(agent_id: AgentId) -> AlmsResult<Self> {
         let llm = LlmClient::from_env()?;
-        Ok(Self::new(agent_id, AgentConfig::default(), llm))
+        Self::new(agent_id, AgentConfig::default(), llm)
     }
 
     /// Run the agent on a single input
@@ -1125,7 +1125,7 @@ mod tests {
         let session_manager = SessionManager::new(session_config);
         let llm = LlmClient::new(config).unwrap();
         let agent_id = AgentId::new();
-        let runtime = AgentRuntime::new(agent_id, AgentConfig::default(), llm);
+        let runtime = AgentRuntime::new(agent_id, AgentConfig::default(), llm).unwrap();
 
         // Run with mock LLM (succeeds)
         let result = runtime
@@ -1141,5 +1141,40 @@ mod tests {
                 && matches!(&m.content, alms_session::Content::Text(t) if t == "hello agent")),
             "User message should be persisted in session history"
         );
+    }
+
+    #[test]
+    fn test_invalid_sandbox_root_fails_closed() {
+        let config = crate::llm_types::LlmConfig {
+            mock: true,
+            ..crate::llm_types::LlmConfig::default()
+        };
+        let llm = LlmClient::new(config).unwrap();
+        let agent_config = AgentConfig {
+            sandbox_root: "/nonexistent/path/that/does/not/exist".into(),
+            ..AgentConfig::default()
+        };
+        let result = AgentRuntime::new(AgentId::new(), agent_config, llm);
+        assert!(result.is_err(), "Should fail when sandbox_root is invalid");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("sandbox_root"),
+            "Error should mention sandbox_root: {err}"
+        );
+    }
+
+    #[test]
+    fn test_empty_sandbox_root_means_unrestricted() {
+        let config = crate::llm_types::LlmConfig {
+            mock: true,
+            ..crate::llm_types::LlmConfig::default()
+        };
+        let llm = LlmClient::new(config).unwrap();
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let result = AgentRuntime::new(AgentId::new(), agent_config, llm);
+        assert!(result.is_ok(), "Empty sandbox_root should mean unrestricted");
     }
 }

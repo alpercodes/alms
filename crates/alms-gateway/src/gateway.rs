@@ -283,11 +283,17 @@ impl Gateway {
                         // Read the live default agent ID per message so
                         // set-default changes take effect immediately.
                         let agent_id = self.agent_id();
-                        let runtime = Arc::new(AgentRuntime::new(
+                        let runtime = match AgentRuntime::new(
                             agent_id,
                             self.config.agent_config.clone(),
                             self.llm.clone(),
-                        ));
+                        ) {
+                            Ok(rt) => Arc::new(rt),
+                            Err(e) => {
+                                error!("Failed to create agent runtime: {}", e);
+                                continue;
+                            }
+                        };
                         let context_id = format!("telegram_{}", msg.chat_id.0);
                         let session = self.session_manager.get_or_create(agent_id, &context_id);
                         let sm = Arc::clone(&self.session_manager);

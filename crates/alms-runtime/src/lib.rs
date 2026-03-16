@@ -54,12 +54,12 @@ impl RuntimeManager {
     }
 
     /// Create a new agent runtime
-    pub fn create_runtime(&self, agent_id: AgentId, config: AgentConfig) -> AgentRuntime {
+    pub fn create_runtime(&self, agent_id: AgentId, config: AgentConfig) -> AlmsResult<AgentRuntime> {
         AgentRuntime::new(agent_id, config, self.llm.clone())
     }
 
     /// Create runtime with default config
-    pub fn create_runtime_default(&self, agent_id: AgentId) -> AgentRuntime {
+    pub fn create_runtime_default(&self, agent_id: AgentId) -> AlmsResult<AgentRuntime> {
         AgentRuntime::new(agent_id, AgentConfig::default(), self.llm.clone())
     }
 }
