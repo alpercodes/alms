@@ -567,7 +567,20 @@ impl axum::serve::Listener for NoDelayListener {
     }
 }
 
-/// Start the gateway HTTP server
+/// Start the gateway HTTP server from a pre-loaded config.
+///
+/// This is the preferred entry-point: the caller loads `AlmsConfig` once
+/// and passes it here, avoiding a second parse inside the gateway.
+pub async fn serve_with_config(bind_addr: &str, config: &alms_core::AlmsConfig) -> AlmsResult<()> {
+    let gateway_config = crate::gateway::GatewayConfig::from_alms_config_with_env(config);
+    let gateway = Gateway::new(gateway_config)?;
+    serve_with_gateway(bind_addr, gateway).await
+}
+
+/// Start the gateway HTTP server (loads config from env internally).
+///
+/// Prefer `serve_with_config` when the caller already has an `AlmsConfig`
+/// to avoid parsing config twice.
 pub async fn serve(bind_addr: &str) -> AlmsResult<()> {
     let gateway = Gateway::from_env()?;
     serve_with_gateway(bind_addr, gateway).await

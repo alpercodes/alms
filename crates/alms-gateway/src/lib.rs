@@ -38,7 +38,7 @@ pub mod workspace;
 // Re-export main types
 pub use gateway::{Gateway, GatewayConfig};
 pub use runs::{create_run, get_run_status};
-pub use server::{AppState, RunManager, serve, serve_with_gateway};
+pub use server::{AppState, RunManager, serve, serve_with_config, serve_with_gateway};
 pub use sse::{RunEventStream, SseEventData, event_channel};
 
 use alms_core::AlmsResult;

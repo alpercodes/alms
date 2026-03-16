@@ -214,10 +214,7 @@ impl ToolRegistry {
         // Warn about enabled entries that don't match any builtin tool name.
         for name in enabled {
             if !builtin_names.iter().any(|b| b == name) {
-                warn!(
-                    "tools.enabled contains unknown builtin '{}' — typo?",
-                    name
-                );
+                warn!("tools.enabled contains unknown builtin '{}' — typo?", name);
             }
         }
 

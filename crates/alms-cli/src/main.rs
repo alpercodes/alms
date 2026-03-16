@@ -149,18 +149,14 @@ async fn main() -> anyhow::Result<()> {
                     std::env::set_var("OPENROUTER_API_KEY", key);
                 }
             }
-            // Resolve bind address: --bind flag > config (alms.toml / ALMS_BIND) > default
-            let bind = bind.unwrap_or_else(|| match alms_core::AlmsConfig::load() {
-                Ok(c) => c.server.bind,
-                Err(e) => {
-                    warn!(
-                        "Failed to load config for bind address, using default: {}",
-                        e
-                    );
-                    "127.0.0.1:8080".to_string()
-                }
+            // Load config once — used for bind address and passed to the gateway.
+            let config = alms_core::AlmsConfig::load().unwrap_or_else(|e| {
+                warn!("Failed to load config, using defaults: {}", e);
+                alms_core::AlmsConfig::default()
             });
-            alms_gateway::serve(&bind).await?;
+            // Resolve bind address: --bind flag > config (alms.toml / ALMS_BIND) > default
+            let bind = bind.unwrap_or(config.server.bind.clone());
+            alms_gateway::serve_with_config(&bind, &config).await?;
         }
         Commands::Health { url, json } => {
             let health_url = format!("{}/health", url.trim_end_matches('/'));

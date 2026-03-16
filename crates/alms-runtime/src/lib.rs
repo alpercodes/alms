@@ -54,7 +54,11 @@ impl RuntimeManager {
     }
 
     /// Create a new agent runtime
-    pub fn create_runtime(&self, agent_id: AgentId, config: AgentConfig) -> AlmsResult<AgentRuntime> {
+    pub fn create_runtime(
+        &self,
+        agent_id: AgentId,
+        config: AgentConfig,
+    ) -> AlmsResult<AgentRuntime> {
         AgentRuntime::new(agent_id, config, self.llm.clone())
     }
 

@@ -89,14 +89,15 @@ impl GatewayConfig {
         }
     }
 
-    /// Load from environment using the unified config system.
+    /// Build GatewayConfig from a pre-loaded AlmsConfig, applying
+    /// environment-variable overrides for db_path, workspace_dir, and
+    /// agent_id.
     ///
     /// Defaults to `./data/alms.db` for SQLite persistence and
     /// `./data/workspace` for agent workspace files. Override with
     /// `ALMS_DB_PATH` and `ALMS_WORKSPACE_DIR` env vars.
-    pub fn from_env() -> AlmsResult<Self> {
-        let config = AlmsConfig::load()?;
-        let mut gateway_config = Self::from_alms_config(&config);
+    pub fn from_alms_config_with_env(config: &AlmsConfig) -> Self {
+        let mut gateway_config = Self::from_alms_config(config);
 
         gateway_config.db_path =
             Some(std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| "./data/alms.db".to_string()));
@@ -113,7 +114,17 @@ impl GatewayConfig {
 
         gateway_config.agent_id = Some(resolve_default_agent_id(Path::new("./data")));
 
-        Ok(gateway_config)
+        gateway_config
+    }
+
+    /// Load from environment using the unified config system.
+    ///
+    /// This calls `AlmsConfig::load()` internally. If you already have a
+    /// loaded config, prefer `from_alms_config_with_env()` to avoid
+    /// parsing config twice.
+    pub fn from_env() -> AlmsResult<Self> {
+        let config = AlmsConfig::load()?;
+        Ok(Self::from_alms_config_with_env(&config))
     }
 }
 
