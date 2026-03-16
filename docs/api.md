@@ -312,8 +312,8 @@ data: {"run_id":"...","session_id":"...","ts":"..."}
 { "run_id": "<uuid>", "ts": "..." }
 ```
 
-#### Reconnect (post-MVP)
-Support `Last-Event-ID` to resume streaming without losing events.
+#### Reconnect
+Supported via `Last-Event-ID` header. The server replays missed events and deduplicates overlap with the live stream.
 
 ### 5.4 Cancel a run
 `POST /runs/{run_id}/cancel`
@@ -477,23 +477,86 @@ Note: clears the previous default agent atomically (SQLite transaction).
 
 ---
 
-## 10) Auth (optional MVP)
+## 10) Settings
 
-If ALMS is local-only, auth may be omitted.
+### 10.1 Get server settings
+`GET /settings`
 
-If exposed beyond localhost, add:
-- `Authorization: Bearer <token>`
-- single shared token in env/config
+Returns current server defaults for UI pre-population.
+
+**Response 200**
+```json
+{
+  "model": "openai/gpt-4o",
+  "base_url": "https://openrouter.ai/api/v1",
+  "max_tokens": 4096,
+  "posture": "full_control",
+  "context_strategy": "truncate",
+  "enabled_tools": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write"],
+  "agent_id": "<uuid>",
+  "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null}],
+  "workspace_dir": "./data/workspace"
+}
+```
 
 ---
 
-## 11) Open questions (to resolve early)
+## 11) Workspace (agent identity files)
 
-1) Do we commit to `POST /runs` + `GET /runs/{id}/events` for MVP, or keep a shorter `/agent/run/stream` and alias it?
-2) What is the canonical `agent_key` set (e.g. `main`, `planner`, …)?
-3) What is the minimal approval surface we’re willing to ship in MVP?
-4) Do we need run persistence for reconnect in MVP (store events), or is best-effort streaming acceptable?
+### 11.1 Get agent workspace
+`GET /agents/{id_or_name}/workspace`
+
+Returns all workspace files (personality.md, goals.md, memories.md, user.md) for the agent.
+
+**Response 200**
+```json
+{
+  "files": {
+    "personality.md": "...",
+    "goals.md": "...",
+    "memories.md": "...",
+    "user.md": "..."
+  }
+}
+```
+
+### 11.2 Update a workspace file
+`PUT /agents/{id_or_name}/workspace/{file}`
+
+Updates a single workspace file. `{file}` is one of: `personality.md`, `goals.md`, `memories.md`, `user.md`.
+
+**Request** — plain text body or JSON:
+```json
+{
+  "content": "Updated file content here"
+}
+```
+
+**Response 200** — `{ "ok": true }`
 
 ---
 
-*Authored by Mesut (2026-02-11). Updated after rethinking API fit for ALMS goals.*
+## 12) Tasks (subagent status)
+
+### 12.1 List tasks
+`GET /tasks`
+
+Returns active and recent subagent tasks managed by the coordinator.
+
+### 12.2 Get task
+`GET /tasks/{task_id}`
+
+Returns status and result of a specific subagent task.
+
+---
+
+## 13) Auth
+
+Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
+
+- `Authorization: Bearer <token>` header required on all endpoints except `GET /health`
+- Single shared token configured via env var (never in config files)
+
+---
+
+*Authored by Mesut (2026-02-11). Updated 2026-03-16 with settings, workspace, tasks endpoints and reconnect support.*

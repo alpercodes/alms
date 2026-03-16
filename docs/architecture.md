@@ -108,9 +108,19 @@ Isolated tool execution used by every agent regardless of hierarchy level.
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 
+### LLM Client (`alms-runtime`)
+
+Multi-provider LLM support with streaming. Provider selected via `llm.provider` config or `ALMS_LLM_PROVIDER` env var.
+
+**Providers:**
+- **OpenAI / OpenRouter** — OpenAI-compatible chat completions API (default)
+- **Anthropic** — Messages API with full streaming, tool use, and response format mapping
+
+API keys loaded from env vars only (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`). Provider-aware key selection: each provider prefers its own key, falls back to others.
+
 ### Session Manager (`alms-session`)
 
-Owns conversation history and workspace state.
+Owns conversation history and workspace state. Backed by **SQLite** (`./data/alms.db`) for durable persistence of sessions, audit events, scheduled jobs, and the agent registry.
 
 **Hierarchy:**
 ```
@@ -127,8 +137,11 @@ session:{parent_id}
 
 HTTP/SSE control plane. Handles top-level user interactions and exposes coordinator state.
 
-**Run endpoints:** `POST /runs`, `GET /runs/{id}`, `GET /runs/{id}/events`
-**Coordinator endpoints (planned):** `GET /tasks`, `GET /tasks/{id}`
+**Run endpoints:** `POST /runs`, `GET /runs/{id}`, `GET /runs/{id}/events`, `POST /runs/{id}/cancel`
+**Agent endpoints:** `GET/POST /agents`, `GET/PUT/DELETE /agents/{id_or_name}`, `POST /agents/{id_or_name}/default`
+**Workspace endpoints:** `GET /agents/{id_or_name}/workspace`, `PUT /agents/{id_or_name}/workspace/{file}`
+**Task endpoints:** `GET /tasks`, `GET /tasks/{id}`
+**Other:** `GET /settings`, `GET /audit`, `POST /jobs`, `GET /jobs/{id}`, `GET /sessions`, `GET /health`
 
 **SSE event propagation:** Subagent `tool_start`/`tool_end`/`progress` events are forwarded into the parent run's SSE stream so the UI can show subagent activity inline.
 
@@ -223,6 +236,6 @@ alms-cli → alms-gateway → alms-runtime  → alms-core
 
 ---
 
-*Architecture Date: 2026-03-12*
+*Architecture Date: 2026-03-16*
 *Topology: Pure hierarchy — any agent can spawn subagents, no peer-to-peer*
 *Future: Option 2 (peer mesh) under consideration for long-running agent collaboration*
