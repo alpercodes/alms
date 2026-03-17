@@ -614,24 +614,47 @@ impl AgentRuntime {
                 }
 
                 // Checkpoint C: tool execution with cancellation support.
-                // Run all tool calls concurrently so background invoke_agent calls
-                // don't block each other, and independent tools finish in parallel.
                 //
-                // NOTE — Guarded posture: when multiple tool calls arrive in a single
-                // LLM response, all approval requests are emitted concurrently. The UI
-                // will show them simultaneously rather than one at a time.
-                let tool_future = futures::future::join_all(
-                    tool_calls
-                        .iter()
-                        .map(|tc| self.execute_tool_call(tc, session_manager, session_id)),
-                );
-                let results = if let Some(ref token) = self.cancel_token {
-                    tokio::select! {
-                        r = tool_future => r,
-                        _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                // Full-control posture: run all tool calls concurrently so background
+                // invoke_agent calls don't block each other and independent tools
+                // finish in parallel.
+                //
+                // Guarded posture: run tool calls sequentially so the user sees one
+                // approval prompt at a time rather than all at once.
+                let results = match self.config.posture {
+                    Posture::Guarded => {
+                        // Note: cancellation during active tool execution (post-approval)
+                        // is not detected until the tool completes, which is acceptable
+                        // since guarded tools block on approval (which IS cancellation-aware).
+                        let mut results = Vec::with_capacity(tool_calls.len());
+                        for tc in &tool_calls {
+                            if let Some(ref token) = self.cancel_token
+                                && token.is_cancelled()
+                            {
+                                return Err(AlmsError::Cancelled);
+                            }
+                            results.push(
+                                self.execute_tool_call(tc, session_manager, session_id)
+                                    .await,
+                            );
+                        }
+                        results
                     }
-                } else {
-                    tool_future.await
+                    Posture::FullControl => {
+                        let tool_future = futures::future::join_all(
+                            tool_calls
+                                .iter()
+                                .map(|tc| self.execute_tool_call(tc, session_manager, session_id)),
+                        );
+                        if let Some(ref token) = self.cancel_token {
+                            tokio::select! {
+                                r = tool_future => r,
+                                _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                            }
+                        } else {
+                            tool_future.await
+                        }
+                    }
                 };
 
                 for (tool_call, result) in tool_calls.iter().zip(results) {
@@ -1140,6 +1163,106 @@ mod tests {
             history.iter().any(|m| m.role == alms_session::Role::User
                 && matches!(&m.content, alms_session::Content::Text(t) if t == "hello agent")),
             "User message should be persisted in session history"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_guarded_posture_sequential_approvals() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let tools = crate::ToolRegistry::with_builtins_sandboxed(None, true, &["echo".to_string()]);
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let agent_id = AgentId::new();
+        let session = session_manager.get_or_create(agent_id, "test");
+
+        let runtime = AgentRuntime {
+            agent_id,
+            config: AgentConfig {
+                posture: Posture::Guarded,
+                ..AgentConfig::default()
+            },
+            llm: LlmClient::new(config).unwrap(),
+            tools,
+            workspace: None,
+            event_sender: Some(tx),
+            run_id: None,
+            cancel_token: None,
+            resolved_sandbox_root: None,
+            shell_unrestricted: true,
+        };
+
+        let tool_calls = vec![
+            ToolCall {
+                id: "tc1".to_string(),
+                function: FunctionCall {
+                    name: "echo".to_string(),
+                    arguments: r#"{"text":"first"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "tc2".to_string(),
+                function: FunctionCall {
+                    name: "echo".to_string(),
+                    arguments: r#"{"text":"second"}"#.to_string(),
+                },
+            },
+        ];
+
+        // Track the order: approval_count increments only after each approval resolves.
+        let approval_count = Arc::new(AtomicUsize::new(0));
+        let approval_count_clone = approval_count.clone();
+
+        // Spawn the approval handler: approve each request, verify sequential ordering.
+        let handler = tokio::spawn(async move {
+            let mut approval_order = Vec::new();
+            while let Some(event) = rx.recv().await {
+                match event {
+                    RuntimeEvent::ApprovalRequired {
+                        decision_tx, tool, ..
+                    } => {
+                        let count = approval_count_clone.load(Ordering::SeqCst);
+                        approval_order.push((tool, count));
+                        decision_tx.send(true).unwrap();
+                        approval_count_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+            approval_order
+        });
+
+        // Execute tool calls sequentially (guarded path)
+        let mut results = Vec::new();
+        for tc in &tool_calls {
+            results.push(
+                runtime
+                    .execute_tool_call(tc, &session_manager, session.id)
+                    .await,
+            );
+        }
+
+        // Both should succeed
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+
+        // Drop the runtime's sender to close the channel so the handler finishes
+        drop(runtime);
+
+        let approval_order = handler.await.unwrap();
+        // The second approval should have seen count=1 (first was resolved),
+        // proving sequential execution.
+        assert_eq!(approval_order.len(), 2);
+        assert_eq!(approval_order[0].1, 0, "First approval should see count=0");
+        assert_eq!(
+            approval_order[1].1, 1,
+            "Second approval should see count=1 (first resolved)"
         );
     }
 

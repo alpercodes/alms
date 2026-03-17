@@ -327,7 +327,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - `invoke_agent(task, system_prompt?, background?)` spawns a subagent via the Coordinator.
 - Foreground (default): blocks and returns `{ response }`. Background: returns `{ task_id }` immediately.
 - `get_task_result(task_id)` polls the background task; returns running/completed/failed/cancelled.
-- Parallel tool execution: agent_loop uses `join_all` so multiple tool calls run concurrently.
+- Parallel tool execution: agent_loop uses `join_all` for concurrent tool calls in full-control posture; guarded posture runs them sequentially (one approval at a time).
 - **Owners:** Atlas
 
 110) Replace `fs_write` with search-and-replace edit tool
