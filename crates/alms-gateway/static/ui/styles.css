@@ -24,8 +24,8 @@
   --accent-text: #86efac;
 
   /* ── Semantic ── */
-  --success: #4ade80;
-  --success-muted: rgba(74, 222, 128, 0.1);
+  --success: #34d399;
+  --success-muted: rgba(52, 211, 153, 0.1);
   --warning: #facc15;
   --warning-muted: rgba(250, 204, 21, 0.1);
   --error: #f87171;
@@ -53,7 +53,6 @@
   --overlay-backdrop: rgba(0,0,0,0.6);
 
   /* ── Typography ── */
-  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', ui-monospace, 'Consolas', monospace;
 
   --text-2xs: 0.625rem;
