@@ -669,6 +669,50 @@ impl SqliteStore {
 
     // ── Agents ────────────────────────────────────────────────────────────────
 
+    /// Atomically insert an agent record only if the agents table is empty,
+    /// and mark it as the default agent.
+    ///
+    /// Returns `true` if the insert happened, `false` if agents already existed.
+    /// The INSERT and set-default happen in a single transaction to avoid both
+    /// the TOCTOU race and a partial-failure state where the agent is created
+    /// but not yet marked as default.
+    pub fn create_agent_if_none_exist(&self, agent: &AgentRecord) -> AlmsResult<bool> {
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .map_err(|e| AlmsError::Runtime(format!("SQLite begin: {e}")))?;
+
+        let exists: bool = tx
+            .query_row("SELECT 1 FROM agents LIMIT 1", [], |_row| Ok(true))
+            .unwrap_or(false);
+
+        if exists {
+            return Ok(false);
+        }
+
+        tx.execute(
+            "INSERT INTO agents \
+             (id, name, description, model, system_prompt, posture, is_default, created_at, last_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                agent.id.0.to_string(),
+                &agent.name,
+                &agent.description,
+                agent.model.as_deref(),
+                agent.system_prompt.as_deref(),
+                agent.posture.as_deref(),
+                1i32,
+                agent.created_at.to_rfc3339(),
+                agent.last_active.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite create_agent_if_none_exist: {e}")))?;
+
+        tx.commit()
+            .map_err(|e| AlmsError::Runtime(format!("SQLite commit: {e}")))?;
+        Ok(true)
+    }
+
     /// Insert a new agent record. Fails if the name or id already exists.
     pub fn create_agent(&self, agent: &AgentRecord) -> AlmsResult<()> {
         self.conn
@@ -1562,5 +1606,57 @@ mod tests {
         store.save_message(session.id, &new_message("one")).unwrap();
         store.save_message(session.id, &new_message("two")).unwrap();
         assert_eq!(store.message_count(session.id).unwrap(), 2);
+    }
+
+    // ── create_agent_if_none_exist tests ─────────────────────────────────
+
+    #[test]
+    fn test_create_agent_if_none_exist_inserts_when_empty() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent = new_agent("main");
+        let inserted = store.create_agent_if_none_exist(&agent).unwrap();
+
+        assert!(inserted);
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "main");
+        assert!(
+            agents[0].is_default,
+            "inserted agent should be marked as default"
+        );
+    }
+
+    #[test]
+    fn test_create_agent_if_none_exist_skips_when_agents_present() {
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        // Pre-populate an agent
+        let existing = new_agent("atlas");
+        store.create_agent(&existing).unwrap();
+
+        // Attempt to insert another agent via the atomic method
+        let new = new_agent("main");
+        let inserted = store.create_agent_if_none_exist(&new).unwrap();
+
+        assert!(!inserted);
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "atlas");
+    }
+
+    #[test]
+    fn test_create_agent_if_none_exist_idempotent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent = new_agent("main");
+
+        let first = store.create_agent_if_none_exist(&agent).unwrap();
+        assert!(first);
+
+        // Second call sees the agent inserted by the first call and returns false
+        let second = store.create_agent_if_none_exist(&agent).unwrap();
+        assert!(!second);
+
+        let agents = store.list_agents().unwrap();
+        assert_eq!(agents.len(), 1);
     }
 }

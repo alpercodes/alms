@@ -442,20 +442,12 @@ async fn process_telegram_message(
 /// `./data/agent_id` (a plain-text UUID) before multi-agent support was added.
 /// If the agents table already has entries, this is a no-op.
 ///
+/// Uses `create_agent_if_none_exist` to atomically check-and-insert within a
+/// single SQLite transaction, avoiding the TOCTOU race between checking
+/// `list_agents().is_empty()` and `create_agent()`.
+///
 /// All errors are non-fatal (`warn!` only) — migration must never block startup.
 fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
-    // If agents table already has entries, skip (already migrated or manually created)
-    match store.list_agents() {
-        Ok(agents) if !agents.is_empty() => {
-            return;
-        }
-        Err(e) => {
-            warn!("Failed to check agents table during migration: {}", e);
-            return;
-        }
-        _ => {}
-    }
-
     let migration_name = "main";
     if let Err(e) = validate_agent_name(migration_name) {
         warn!(
@@ -478,15 +470,15 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         last_active: now,
     };
 
-    if let Err(e) = store.create_agent(&record) {
-        warn!("Failed to migrate sidecar agent to registry: {}", e);
-        return;
+    // Atomic check-and-insert: only inserts if the agents table is empty.
+    // Returns Ok(false) if agents already exist (no-op), avoiding the TOCTOU
+    // race that existed when list_agents() and create_agent() were separate calls.
+    // The agent is marked as default within the same transaction.
+    match store.create_agent_if_none_exist(&record) {
+        Ok(true) => info!("Migrated sidecar agent to registry: {}", agent_id.0),
+        Ok(false) => {} // agents already exist, nothing to migrate
+        Err(e) => warn!("Failed to migrate sidecar agent to registry: {}", e),
     }
-
-    if let Err(e) = store.set_default_agent(agent_id) {
-        warn!("Failed to set migrated agent as default: {}", e);
-    }
-    info!("Migrated sidecar agent to registry: {}", agent_id.0);
 }
 
 #[cfg(test)]
