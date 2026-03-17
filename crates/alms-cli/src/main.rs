@@ -200,9 +200,16 @@ async fn main() -> anyhow::Result<()> {
         Commands::Dashboard { url } => {
             let url = url.trim_end_matches('/').to_string();
             println!("Opening {url} ...");
-            if let Err(e) = open::that(&url) {
-                eprintln!("Open manually: {url}");
-                anyhow::bail!("Failed to open browser: {e}");
+            match open::that(&url) {
+                Ok(()) => {
+                    // open::that() can silently succeed on headless systems
+                    // (no browser available). Always print the URL as a fallback.
+                    println!("If the browser did not open, visit: {url}");
+                }
+                Err(e) => {
+                    eprintln!("Open manually: {url}");
+                    anyhow::bail!("Failed to open browser: {e}");
+                }
             }
         }
         Commands::Completions { shell } => {

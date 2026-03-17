@@ -164,14 +164,14 @@ impl Coordinator {
     ) -> AlmsResult<TaskId> {
         // Reject concurrent invocations of the same named subagent to prevent
         // session corruption from parallel writes to the same session history.
-        if let Some(ref name) = request.subagent_name {
-            if !self.active_named.insert(name.clone()) {
-                return Err(alms_core::AlmsError::Runtime(format!(
-                    "Named subagent '{}' is already running — concurrent invocations \
-                     of the same named subagent are not supported",
-                    name
-                )));
-            }
+        if let Some(ref name) = request.subagent_name
+            && !self.active_named.insert(name.clone())
+        {
+            return Err(alms_core::AlmsError::Runtime(format!(
+                "Named subagent '{}' is already running — concurrent invocations \
+                 of the same named subagent are not supported",
+                name
+            )));
         }
 
         let task_id = TaskId::new();
