@@ -414,7 +414,7 @@ async fn serve_ui() -> impl IntoResponse {
             ("Cache-Control", "no-store"),
             ("Content-Type", "text/html; charset=utf-8"),
         ],
-        include_str!("../static/index.html"),
+        include_str!("../static/ui/index.html"),
     )
 }
 
