@@ -49,7 +49,13 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let agents_list = state
         .session_manager
         .store()
-        .and_then(|s| s.list_agents().ok())
+        .and_then(|s| match s.list_agents() {
+            Ok(agents) => Some(agents),
+            Err(e) => {
+                tracing::warn!("Failed to list agents for /settings: {e}");
+                None
+            }
+        })
         .unwrap_or_default()
         .into_iter()
         .map(|a| {
