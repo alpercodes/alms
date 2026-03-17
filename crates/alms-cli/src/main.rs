@@ -183,10 +183,8 @@ async fn main() -> anyhow::Result<()> {
                             "{}",
                             serde_json::json!({ "ok": false, "error": format!("HTTP {status}") })
                         );
-                    } else {
-                        eprintln!("Health check failed: HTTP {}", status);
                     }
-                    std::process::exit(1);
+                    anyhow::bail!("Health check failed: HTTP {}", status);
                 }
                 Err(e) => {
                     if json {
@@ -194,10 +192,8 @@ async fn main() -> anyhow::Result<()> {
                             "{}",
                             serde_json::json!({ "ok": false, "error": format!("Cannot reach gateway: {e}") })
                         );
-                    } else {
-                        eprintln!("Cannot reach gateway at {}: {}", health_url, e);
                     }
-                    std::process::exit(1);
+                    anyhow::bail!("Cannot reach gateway at {}: {}", health_url, e);
                 }
             }
         }
@@ -205,9 +201,8 @@ async fn main() -> anyhow::Result<()> {
             let url = url.trim_end_matches('/').to_string();
             println!("Opening {url} ...");
             if let Err(e) = open::that(&url) {
-                eprintln!("Failed to open browser: {e}");
                 eprintln!("Open manually: {url}");
-                std::process::exit(1);
+                anyhow::bail!("Failed to open browser: {e}");
             }
         }
         Commands::Completions { shell } => {
