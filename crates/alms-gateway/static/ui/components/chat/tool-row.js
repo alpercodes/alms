@@ -5,9 +5,11 @@ export function ToolRow({ tool, params, status, result, id }) {
 
     const toggle = () => { expanded.value = !expanded.value; };
 
-    const paramStr = params ? Object.entries(params).map(([k, v]) =>
-        typeof v === 'string' ? v : JSON.stringify(v)
-    ).join(' ') : '';
+    const entries = params ? Object.entries(params) : [];
+    const paramStr = entries.map(([k, v]) => {
+        const val = typeof v === 'string' ? v : JSON.stringify(v);
+        return entries.length > 1 ? `${k}=${val}` : val;
+    }).join(' ');
 
     if (status === 'running') {
         return html`

@@ -23,7 +23,8 @@ export function TokenBadge({ usage }) {
 export function ErrorMessage({ text }) {
     return html`
         <div class="msg agent">
-            <div class="msg-body" style="border-color: var(--error); color: var(--error);">
+            <div class="msg-label" style="color: var(--error);">!</div>
+            <div class="msg-body" style="border-left-color: var(--error); color: var(--error);">
                 ${text}
             </div>
         </div>
