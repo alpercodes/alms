@@ -541,7 +541,8 @@ struct SubagentRecordConfig {
 
 /// Build an `AgentConfig` for a subagent. Named subagents get their config
 /// from the agent registry; ephemeral subagents use a default prompt.
-/// Both inherit sandbox settings from the parent's base config.
+/// Both inherit sandbox, tool, and runtime settings (max_iterations,
+/// max_tokens, context_config) from the parent's base config.
 fn agent_config_for_subagent(
     record: Option<SubagentRecordConfig>,
     base: &AgentConfig,
@@ -563,7 +564,9 @@ fn agent_config_for_subagent(
         sandbox_root: base.sandbox_root.clone(),
         shell_policy: base.shell_policy.clone(),
         enabled_tools: base.enabled_tools.clone(),
-        ..AgentConfig::default()
+        max_iterations: base.max_iterations,
+        max_tokens: base.max_tokens,
+        context_config: base.context_config.clone(),
     };
     (config, model)
 }
@@ -871,6 +874,59 @@ mod tests {
 
         let second = coord.take_result_rx(task_id);
         assert!(second.is_none(), "second take should return None");
+    }
+
+    // -- (j-pre) subagent config inherits parent runtime settings ---------------
+
+    #[test]
+    fn test_subagent_inherits_parent_config() {
+        let parent = AgentConfig {
+            system_prompt: "parent prompt".into(),
+            max_iterations: 42,
+            max_tokens: 9999,
+            context_config: alms_core::config::ContextConfig {
+                strategy: "sliding-summary".into(),
+                max_input_tokens: 50_000,
+                recent_window: 5,
+                summary_interval: 10,
+                summary_model: Some("cheap-model".into()),
+            },
+            posture: alms_runtime::Posture::Guarded,
+            sandbox_root: "/sandbox".into(),
+            shell_policy: "unrestricted".into(),
+            enabled_tools: vec!["echo".into(), "math".into()],
+        };
+
+        // Ephemeral subagent (no registry record)
+        let (config, model) = agent_config_for_subagent(None, &parent);
+        assert!(model.is_none());
+        // Should inherit runtime settings from parent
+        assert_eq!(config.max_iterations, 42);
+        assert_eq!(config.max_tokens, 9999);
+        assert_eq!(config.context_config.strategy, "sliding-summary");
+        assert_eq!(config.context_config.max_input_tokens, 50_000);
+        assert_eq!(config.context_config.recent_window, 5);
+        // Should inherit sandbox settings
+        assert_eq!(config.sandbox_root, "/sandbox");
+        assert_eq!(config.shell_policy, "unrestricted");
+        assert_eq!(config.enabled_tools, vec!["echo", "math"]);
+        // system_prompt should be the default subagent prompt, not the parent's
+        assert_eq!(config.system_prompt, DEFAULT_SUBAGENT_PROMPT);
+
+        // Named subagent with registry overrides
+        let record = SubagentRecordConfig {
+            system_prompt: Some("custom prompt".into()),
+            model: Some("gpt-5".into()),
+            posture: Some("guarded".into()),
+        };
+        let (config2, model2) = agent_config_for_subagent(Some(record), &parent);
+        assert_eq!(model2.as_deref(), Some("gpt-5"));
+        assert_eq!(config2.system_prompt, "custom prompt");
+        assert_eq!(config2.posture, alms_runtime::Posture::Guarded);
+        // Should still inherit runtime settings from parent
+        assert_eq!(config2.max_iterations, 42);
+        assert_eq!(config2.max_tokens, 9999);
+        assert_eq!(config2.context_config.max_input_tokens, 50_000);
     }
 
     // -- (j) get_completed_result on unknown task → None ------------------------
