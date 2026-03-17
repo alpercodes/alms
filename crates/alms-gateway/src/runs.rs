@@ -297,7 +297,15 @@ async fn execute_run(
             });
 
     // Agent name for workspace path resolution (name-based, not UUID-based).
+    // When None (deleted agent, missing record), both bootstrap and workspace
+    // attachment are skipped — warn so operators know why.
     let agent_name = agent_record.as_ref().map(|r| r.name.clone());
+    if state.workspace_dir.is_some() && agent_name.is_none() {
+        warn!(
+            "Agent {} has no registry record — workspace and bootstrap skipped",
+            agent_id.0
+        );
+    }
 
     // Use AppState snapshots — no gateway lock needed.
     let merged = apply_overrides(
