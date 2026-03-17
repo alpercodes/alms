@@ -685,9 +685,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: per-name lock (or route through `SessionQueue`) so concurrent invocations of the same named subagent are serialized.
 - **Owners:** Atlas
 
-88) Fix SSE stream timeout returning partial content as complete (GitHub #30)
-- When an SSE chunk read times out, the stream terminates silently. The partial response is surfaced to the user as if the LLM finished normally.
-- Fix: emit a `run_error` event on timeout so the UI/caller knows the response was truncated, and consider auto-retry.
+88) ~~Fix SSE stream timeout returning partial content as complete (GitHub #30)~~ **DONE (PR #175)**
+- Stream timeout now yields `Err` instead of `None`, discarding partial content. Agent loop falls back to buffered mode automatically.
 - **Owners:** Atlas
 
 ---

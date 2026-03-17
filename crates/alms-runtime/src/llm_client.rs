@@ -257,7 +257,13 @@ impl LlmClient {
                                 "LLM stream stalled (no data for {}s), terminating",
                                 chunk_timeout.as_secs()
                             );
-                            return None; // timeout — treat as stream end
+                            return Some((
+                                Err(AlmsError::Runtime(format!(
+                                    "LLM stream stalled (no data for {}s) — partial response discarded",
+                                    chunk_timeout.as_secs()
+                                ))),
+                                (bytes, buf),
+                            ));
                         }
                     }
                 }

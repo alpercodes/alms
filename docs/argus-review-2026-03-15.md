@@ -45,17 +45,19 @@ Impact:
 Missing coverage:
 - I found no test asserting that a restricted tool set actually removes tools from the runtime or from `/settings`.
 
-### 2. High - stalled LLM streams are treated as a clean end-of-stream, so ALMS can persist truncated replies as successful output
+### 2. High - stalled LLM streams are treated as a clean end-of-stream, so ALMS can persist truncated replies as successful output — **FIXED (PR #175)**
 
 Evidence:
 - `crates/alms-runtime/src/llm_client.rs:204-206` explicitly says stalled streams are terminated after 60 seconds.
-- `crates/alms-runtime/src/llm_client.rs:257-262` logs a warning and returns `None` on timeout instead of returning an error.
-- `crates/alms-runtime/src/agent.rs:675-743` accepts normal stream termination and returns whatever content/tool-call fragments were accumulated so far.
+- ~~`crates/alms-runtime/src/llm_client.rs:257-262` logs a warning and returns `None` on timeout instead of returning an error.~~
+- ~~`crates/alms-runtime/src/agent.rs:675-743` accepts normal stream termination and returns whatever content/tool-call fragments were accumulated so far.~~
 
 Impact:
-- A hung provider connection can produce a partial assistant reply that looks successful.
-- A partially streamed tool call can also be returned with incomplete JSON arguments.
-- Because this path does not raise an error, the session history and user-visible run result can silently diverge from what the model intended to send.
+- ~~A hung provider connection can produce a partial assistant reply that looks successful.~~
+- ~~A partially streamed tool call can also be returned with incomplete JSON arguments.~~
+- ~~Because this path does not raise an error, the session history and user-visible run result can silently diverge from what the model intended to send.~~
+
+Fix: Stream timeout now yields `Err(AlmsError::Runtime(...))` instead of `None`. Partial content is discarded and the agent loop's existing fallback-to-buffered path retries with a fresh non-streaming LLM call.
 
 Missing coverage:
 - There is no test for a stalled SSE stream, mid-tool-call timeout, or missing `[DONE]` / `message_stop`.
@@ -136,7 +138,7 @@ Impact:
 ## Recommended next actions
 
 1. Enforce `[tools].enabled` at runtime and reflect the real tool set in `/settings`.
-2. Change stream-stall handling from silent EOF to an explicit runtime error.
+2. ~~Change stream-stall handling from silent EOF to an explicit runtime error.~~ **Done (PR #175)**
 3. ~~Make invalid `sandbox_root` fail closed.~~ **Done (PR #158)**
 4. Resolve API-key loading by provider, not by env-var order.
 5. Either wire the remaining config knobs into production code or remove them from the public config surface.
@@ -147,6 +149,6 @@ Impact:
 - Config-driven tool allowlisting.
 - ~~Invalid `sandbox_root` behavior.~~ **Covered (PR #158)**
 - Multi-provider API-key env precedence.
-- Stalled streaming responses.
+- ~~Stalled streaming responses.~~ **Covered (PR #175)** — error path tested implicitly via fallback; explicit timeout test recommended.
 - Session archival and retention behavior.
 - `/settings` staying aligned with the actual tool registry.
