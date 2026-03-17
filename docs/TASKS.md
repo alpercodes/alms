@@ -639,8 +639,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - `get_task_result` tool remains as explicit fallback.
 - **Owners:** Atlas
 
-77) Guard concurrent invocations of same named subagent
-- Reject or queue if the same named subagent is already running.
+77) ~~Guard concurrent invocations of same named subagent~~ **DONE (PR #179)**
+- `DashSet` tracks active names; `spawn_subagent` rejects if already running. RAII drop guard ensures cleanup on panic.
 - **Owners:** Atlas
 
 ### Phase 3 — Advanced orchestration
@@ -680,9 +680,8 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Fix: use Landlock (Linux) or a restricted OS user to enforce true filesystem isolation for spawned processes.
 - **Owners:** Atlas, Mustafa
 
-87) Fix race condition with concurrent named subagent invocations (GitHub #37)
-- Two parallel `invoke_agent(name="X")` calls can both try to create/load the same subagent session simultaneously, causing duplicate sessions or lost messages.
-- Fix: per-name lock (or route through `SessionQueue`) so concurrent invocations of the same named subagent are serialized.
+87) ~~Fix race condition with concurrent named subagent invocations (GitHub #37)~~ **DONE (PR #179)**
+- Concurrent same-name invocations rejected via `DashSet` guard with RAII cleanup.
 - **Owners:** Atlas
 
 88) ~~Fix SSE stream timeout returning partial content as complete (GitHub #30)~~ **DONE (PR #175)**

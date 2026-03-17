@@ -94,6 +94,9 @@ pub struct Coordinator {
     main_agent: AgentId,
     /// Active subagents: TaskId -> SubagentHandle
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
+    /// Named subagents currently executing — prevents concurrent invocations
+    /// of the same named subagent which would corrupt shared session history.
+    active_named: Arc<dashmap::DashSet<String>>,
     /// Shared session manager — used to give each subagent its own context
     session_manager: Arc<SessionManager>,
     /// LLM client — cloned for each subagent runtime
@@ -109,6 +112,7 @@ impl Coordinator {
         Self {
             main_agent,
             subagents: Arc::new(DashMap::new()),
+            active_named: Arc::new(dashmap::DashSet::new()),
             session_manager,
             llm,
             base_agent_config: AgentConfig::default(),
@@ -126,6 +130,7 @@ impl Coordinator {
         Self {
             main_agent,
             subagents: Arc::new(DashMap::new()),
+            active_named: Arc::new(dashmap::DashSet::new()),
             session_manager,
             llm,
             base_agent_config,
@@ -157,6 +162,18 @@ impl Coordinator {
         request: SubagentRequest,
         parent_event_tx: Option<RuntimeEventSender>,
     ) -> AlmsResult<TaskId> {
+        // Reject concurrent invocations of the same named subagent to prevent
+        // session corruption from parallel writes to the same session history.
+        if let Some(ref name) = request.subagent_name {
+            if !self.active_named.insert(name.clone()) {
+                return Err(alms_core::AlmsError::Runtime(format!(
+                    "Named subagent '{}' is already running — concurrent invocations \
+                     of the same named subagent are not supported",
+                    name
+                )));
+            }
+        }
+
         let task_id = TaskId::new();
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel::<TaskResult>();
@@ -182,6 +199,7 @@ impl Coordinator {
         );
 
         let subagents = self.subagents.clone();
+        let active_named = self.active_named.clone();
         let session_manager = self.session_manager.clone();
         let llm = self.llm.clone();
         let base_agent_config = self.base_agent_config.clone();
@@ -198,6 +216,7 @@ impl Coordinator {
                     task_id,
                     request,
                     subagents,
+                    active_named,
                     cancel_rx,
                     result_tx,
                     session_manager,
@@ -373,6 +392,25 @@ impl SubagentDispatcher for Coordinator {
 }
 
 // ---------------------------------------------------------------------------
+// RAII guard for named subagent lock
+// ---------------------------------------------------------------------------
+
+/// Removes a named subagent from the active set on drop, guaranteeing cleanup
+/// even if the subagent task panics.
+struct NamedSubagentGuard {
+    name: Option<String>,
+    active_named: Arc<dashmap::DashSet<String>>,
+}
+
+impl Drop for NamedSubagentGuard {
+    fn drop(&mut self) {
+        if let Some(ref name) = self.name {
+            self.active_named.remove(name);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal subagent runner
 // ---------------------------------------------------------------------------
 
@@ -381,6 +419,7 @@ async fn run_subagent(
     task_id: TaskId,
     request: SubagentRequest,
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
+    active_named: Arc<dashmap::DashSet<String>>,
     mut cancel_rx: oneshot::Receiver<()>,
     result_tx: oneshot::Sender<TaskResult>,
     session_manager: Arc<SessionManager>,
@@ -389,6 +428,12 @@ async fn run_subagent(
     base_agent_config: AgentConfig,
     workspace_dir: Option<std::path::PathBuf>,
 ) {
+    // RAII guard: removes the name from active_named on drop (including panics).
+    let _named_guard = NamedSubagentGuard {
+        name: request.subagent_name.clone(),
+        active_named,
+    };
+
     let start = std::time::Instant::now();
 
     if let Some(mut handle) = subagents.get_mut(&task_id) {
@@ -467,6 +512,11 @@ async fn run_subagent(
         handle.status = new_status;
         handle.completed_result = Some(task_result.clone());
     }
+
+    // Release the named subagent lock before sending the result, so that
+    // callers who receive the result can immediately re-invoke the same name.
+    // The guard also handles panic cleanup via Drop.
+    drop(_named_guard);
 
     // Deliver result to dispatch() caller (foreground mode — may already be dropped)
     let _ = result_tx.send(task_result);
@@ -881,6 +931,56 @@ mod tests {
             4,
             "Named subagent should have 4 messages (2 turns), got {}",
             messages.len()
+        );
+    }
+
+    // -- (l) concurrent named subagent invocations are rejected -----------------
+
+    #[tokio::test]
+    async fn test_concurrent_named_subagent_rejected() {
+        let coord = test_coordinator();
+        let session_id = test_session_id();
+
+        // Spawn a named subagent with a long timeout so it stays active
+        let request = SubagentRequest {
+            task: "Long task".to_string(),
+            timeout: Duration::from_secs(300),
+            parent_session: session_id,
+            parent_run_id: None,
+            subagent_name: Some("researcher".to_string()),
+        };
+        let _task_id = coord.spawn_subagent(request, None).await.unwrap();
+
+        // Second invocation with the same name should be rejected
+        let request2 = SubagentRequest {
+            task: "Another task".to_string(),
+            timeout: Duration::from_secs(300),
+            parent_session: session_id,
+            parent_run_id: None,
+            subagent_name: Some("researcher".to_string()),
+        };
+        let result = coord.spawn_subagent(request2, None).await;
+        assert!(
+            result.is_err(),
+            "Second concurrent spawn should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("already running"),
+            "Error should mention 'already running': {err}"
+        );
+
+        // Different name should still work
+        let request3 = SubagentRequest {
+            task: "Different agent".to_string(),
+            timeout: Duration::from_secs(300),
+            parent_session: session_id,
+            parent_run_id: None,
+            subagent_name: Some("coder".to_string()),
+        };
+        assert!(
+            coord.spawn_subagent(request3, None).await.is_ok(),
+            "Different named subagent should succeed"
         );
     }
 
