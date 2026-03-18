@@ -218,6 +218,7 @@ impl TelegramChannel {
     /// Run the polling loop
     async fn run_polling(&self, tx: mpsc::Sender<IncomingMessage>) -> AlmsResult<()> {
         info!("Starting Telegram polling loop");
+        let mut consecutive_errors: u64 = 0;
 
         while self.running.load(Ordering::Relaxed) {
             let offset = self.last_update_id.load(Ordering::Relaxed);
@@ -225,6 +226,7 @@ impl TelegramChannel {
 
             match self.get_updates(offset_param).await {
                 Ok(updates) => {
+                    consecutive_errors = 0;
                     for update in updates {
                         if update.update_id > self.last_update_id.load(Ordering::Relaxed) {
                             self.last_update_id
@@ -240,9 +242,27 @@ impl TelegramChannel {
                     }
                 }
                 Err(e) => {
-                    error!("Error getting updates: {}", e);
-                    // Back off on error to avoid hammering a down API
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    consecutive_errors += 1;
+                    let base = std::cmp::min(5 * (1u64 << consecutive_errors.min(6)), 300);
+                    // Add jitter: ±25% using subsecond nanos as cheap entropy
+                    let jitter_range = (base / 4).max(1);
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos() as u64;
+                    let backoff = base - jitter_range + (nanos % (2 * jitter_range + 1));
+                    if consecutive_errors <= 3 {
+                        error!("Error getting updates (attempt {}): {}", consecutive_errors, e);
+                    } else {
+                        warn!("Error getting updates (attempt {}, backoff {}s): {}", consecutive_errors, backoff, e);
+                    }
+                    // Sleep in 1s increments so shutdown isn't blocked by long backoffs.
+                    for _ in 0..backoff {
+                        if !self.running.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
             }
         }
