@@ -105,6 +105,9 @@ pub struct Coordinator {
     base_agent_config: AgentConfig,
     /// Workspace base directory — named subagents get workspaces under this dir
     workspace_dir: Option<std::path::PathBuf>,
+    /// Tracks the last-used system_prompt per named subagent context key,
+    /// so we can warn when a re-invocation uses a different prompt.
+    subagent_prompts: Arc<DashMap<String, String>>,
 }
 
 impl Coordinator {
@@ -117,6 +120,7 @@ impl Coordinator {
             llm,
             base_agent_config: AgentConfig::default(),
             workspace_dir: None,
+            subagent_prompts: Arc::new(DashMap::new()),
         }
     }
 
@@ -135,6 +139,7 @@ impl Coordinator {
             llm,
             base_agent_config,
             workspace_dir: None,
+            subagent_prompts: Arc::new(DashMap::new()),
         }
     }
 
@@ -204,6 +209,7 @@ impl Coordinator {
         let llm = self.llm.clone();
         let base_agent_config = self.base_agent_config.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let subagent_prompts = self.subagent_prompts.clone();
 
         let span = tracing::info_span!(
             "subagent::execute",
@@ -224,6 +230,7 @@ impl Coordinator {
                     parent_event_tx,
                     base_agent_config,
                     workspace_dir,
+                    subagent_prompts,
                 )
                 .await;
             }
@@ -427,6 +434,7 @@ async fn run_subagent(
     parent_event_tx: Option<RuntimeEventSender>,
     base_agent_config: AgentConfig,
     workspace_dir: Option<std::path::PathBuf>,
+    subagent_prompts: Arc<DashMap<String, String>>,
 ) {
     // RAII guard: removes the name from active_named on drop (including panics).
     let _named_guard = NamedSubagentGuard {
@@ -465,7 +473,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None)
         }
-        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref()) => {
+        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), &subagent_prompts) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -524,6 +532,11 @@ async fn run_subagent(
     // Keep the handle long enough for background callers to poll the result.
     tokio::time::sleep(Duration::from_secs(SUBAGENT_TTL_SECS)).await;
     subagents.remove(&task_id);
+    // Clean up cached prompt to prevent unbounded memory growth.
+    if let Some(ref name) = request.subagent_name {
+        let ctx_key = format!("subagent_{}_{}", request.parent_session.0, name);
+        subagent_prompts.remove(&ctx_key);
+    }
     debug!("Cleaned up subagent {:?}", task_id);
 }
 
@@ -583,6 +596,7 @@ fn agent_config_for_subagent(
 ///
 /// **Ephemeral subagents** (`subagent_name` is None): fresh agent ID,
 /// fresh session, default config, no workspace.
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     task_id: TaskId,
     request: &SubagentRequest,
@@ -591,6 +605,7 @@ async fn run_agent_loop(
     parent_event_tx: Option<RuntimeEventSender>,
     base_agent_config: &AgentConfig,
     workspace_dir: Option<&std::path::Path>,
+    subagent_prompts: &DashMap<String, String>,
 ) -> AlmsResult<RunOutput> {
     // Derive identity and config based on whether the subagent is named
     let (agent_id, context_id, config, model_override, attach_workspace) =
@@ -622,6 +637,26 @@ async fn run_agent_loop(
                 });
 
             let (config, model) = agent_config_for_subagent(record_config, base_agent_config);
+
+            // Detect system_prompt drift: warn when the prompt changes between
+            // invocations of the same named subagent within the same parent session.
+            //
+            // Safety: concurrent invocations of the same named subagent are
+            // rejected by the active_named guard in spawn_subagent(), so this
+            // get-then-insert is not racy for a given stable_ctx.
+            if let Some(prev_prompt) = subagent_prompts.get(&stable_ctx)
+                && *prev_prompt != config.system_prompt
+            {
+                warn!(
+                    subagent_name = %name,
+                    context_id = %stable_ctx,
+                    "Named subagent '{name}' system_prompt has changed since the last \
+                     invocation. The existing session history was built under the \
+                     previous prompt — this may cause inconsistent behavior."
+                );
+            }
+            subagent_prompts.insert(stable_ctx.clone(), config.system_prompt.clone());
+
             (stable_id, stable_ctx, config, model, true)
         } else {
             // Ephemeral: fresh each invocation
