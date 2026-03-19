@@ -6,6 +6,7 @@
 //!   GET    /jobs/{job_id}  — get a single job
 //!   DELETE /jobs/{job_id}  — cancel a job
 
+use crate::api_error;
 use crate::cron_utils;
 use crate::server::AppState;
 use alms_core::job::{CreateJobRequest, JobId, JobSchedule};
@@ -27,43 +28,30 @@ pub async fn create_job(
     if let JobSchedule::Recurring { ref cron } = req.schedule {
         let fields: Vec<&str> = cron.split_whitespace().collect();
         if fields.len() != 5 {
-            return (
+            return api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "INVALID_CRON",
-                        "message": format!(
-                            "cron expression must have exactly 5 fields, got {}",
-                            fields.len()
-                        )
-                    }
-                })),
+                "INVALID_CRON",
+                format!(
+                    "cron expression must have exactly 5 fields, got {}",
+                    fields.len()
+                ),
             )
-                .into_response();
+            .into_response();
         }
         if cron_utils::next_after(cron, Utc::now()).is_none() {
-            return (
+            return api_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "INVALID_CRON",
-                        "message": "cron expression is invalid or has no future occurrences"
-                    }
-                })),
+                "INVALID_CRON",
+                "cron expression is invalid or has no future occurrences",
             )
-                .into_response();
+            .into_response();
         }
     }
 
     let job = match state.job_store.create(req) {
         Ok(job) => job,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": { "code": "INTERNAL_ERROR", "message": e.to_string() }
-                })),
-            )
+            return api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", e)
                 .into_response();
         }
     };
@@ -102,13 +90,7 @@ pub async fn get_job(
 ) -> impl IntoResponse {
     match state.job_store.get(job_id) {
         Some(job) => Json(serde_json::json!(job)).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": "job not found" }
-            })),
-        )
-            .into_response(),
+        None => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response(),
     }
 }
 
@@ -123,26 +105,19 @@ pub async fn cancel_job(
             state.scheduler.cancel(job_id).await;
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(Some(false)) => (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": { "code": "ALREADY_CANCELLED", "message": "job is already cancelled" }
-            })),
-        )
-            .into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": "job not found" }
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "INTERNAL_ERROR", "message": e.to_string() }
-            })),
-        )
-            .into_response(),
+        Ok(Some(false)) => {
+            api_error(
+                StatusCode::CONFLICT,
+                "ALREADY_CANCELLED",
+                "job is already cancelled",
+            )
+            .into_response()
+        }
+        Ok(None) => {
+            api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response()
+        }
+        Err(e) => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", e).into_response()
+        }
     }
 }

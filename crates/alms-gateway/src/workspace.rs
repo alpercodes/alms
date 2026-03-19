@@ -4,6 +4,7 @@
 //! PUT  /agents/{id_or_name}/workspace/{file}   — overwrite a workspace file (user-facing)
 
 use crate::agents::resolve_agent;
+use crate::api_error;
 use crate::server::AppState;
 use alms_runtime::{AgentWorkspace, WorkspaceFile};
 use axum::{
@@ -24,25 +25,23 @@ pub async fn get_workspace(
     Path(id_or_name): Path<String>,
 ) -> impl IntoResponse {
     let Some(ref workspace_dir) = state.workspace_dir else {
-        return (
+        return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_CONFIGURED", "message": "Workspace directory not configured (set ALMS_WORKSPACE_DIR)" }
-            })),
+            "NOT_CONFIGURED",
+            "Workspace directory not configured (set ALMS_WORKSPACE_DIR)",
         )
-            .into_response();
+        .into_response();
     };
 
     let store = match state.session_manager.store() {
         Some(s) => s,
         None => {
-            return (
+            return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": { "code": "NO_STORE", "message": "Store not available" }
-                })),
+                "NO_STORE",
+                "Store not available",
             )
-                .into_response();
+            .into_response();
         }
     };
 
@@ -82,13 +81,12 @@ pub async fn update_workspace_file(
     Json(body): Json<UpdateWorkspaceFileRequest>,
 ) -> impl IntoResponse {
     let Some(ref workspace_dir) = state.workspace_dir else {
-        return (
+        return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_CONFIGURED", "message": "Workspace directory not configured (set ALMS_WORKSPACE_DIR)" }
-            })),
+            "NOT_CONFIGURED",
+            "Workspace directory not configured (set ALMS_WORKSPACE_DIR)",
         )
-            .into_response();
+        .into_response();
     };
 
     let workspace_file = match file.as_str() {
@@ -97,29 +95,27 @@ pub async fn update_workspace_file(
         "memories" => WorkspaceFile::Memories,
         "user" => WorkspaceFile::User,
         _ => {
-            return (
+            return api_error(
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": {
-                        "code": "UNKNOWN_FILE",
-                        "message": format!("Unknown file '{}': must be 'personality', 'goals', 'memories', or 'user'", file)
-                    }
-                })),
+                "UNKNOWN_FILE",
+                format!(
+                    "Unknown file '{}': must be 'personality', 'goals', 'memories', or 'user'",
+                    file
+                ),
             )
-                .into_response();
+            .into_response();
         }
     };
 
     let store = match state.session_manager.store() {
         Some(s) => s,
         None => {
-            return (
+            return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": { "code": "NO_STORE", "message": "Store not available" }
-                })),
+                "NO_STORE",
+                "Store not available",
             )
-                .into_response();
+            .into_response();
         }
     };
 
@@ -132,13 +128,7 @@ pub async fn update_workspace_file(
 
     // Write directly using the filesystem path — user API allows all files including personality.
     if let Err(e) = workspace.ensure_dir() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "IO_ERROR", "message": e.to_string() }
-            })),
-        )
-            .into_response();
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR", e).into_response();
     }
 
     let path = workspace.dir().join(workspace_file.filename());
@@ -148,13 +138,7 @@ pub async fn update_workspace_file(
             "file": workspace_file.filename(),
         }))
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "IO_ERROR", "message": e.to_string() }
-            })),
-        )
-            .into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "IO_ERROR", e).into_response(),
     }
 }
 

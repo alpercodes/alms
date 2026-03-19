@@ -11,6 +11,7 @@
 //! POST   /agents/{id_or_name}/default — set as default
 //! ```
 
+use crate::api_error;
 use crate::server::AppState;
 use alms_core::{
     AgentId, AgentRecord, CreateAgentRequest, UpdateAgentRequest, validate_agent_name,
@@ -26,20 +27,6 @@ use chrono::Utc;
 
 /// Valid posture values.
 const VALID_POSTURES: &[&str] = &["full_control", "guarded"];
-
-/// Build a structured API error response.
-fn api_error(
-    status: StatusCode,
-    code: &str,
-    message: impl std::fmt::Display,
-) -> (StatusCode, Json<serde_json::Value>) {
-    (
-        status,
-        Json(serde_json::json!({
-            "error": { "code": code, "message": message.to_string() }
-        })),
-    )
-}
 
 /// Validate a posture string. Empty string is allowed (means "clear override").
 fn validate_posture(posture: &str) -> Result<(), String> {

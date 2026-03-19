@@ -5,6 +5,7 @@
 //!   GET  /approvals          — list pending approvals
 //!   POST /approvals/{id}     — approve or deny
 
+use crate::api_error;
 use crate::server::AppState;
 use alms_core::RunId;
 use axum::{
@@ -145,11 +146,10 @@ pub async fn resolve_approval(
         "approve" => true,
         "deny" => false,
         _ => {
-            return Err((
+            return Err(api_error(
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": { "code": "BAD_REQUEST", "message": "decision must be 'approve' or 'deny'" }
-                })),
+                "BAD_REQUEST",
+                "decision must be 'approve' or 'deny'",
             ));
         }
     };
@@ -178,11 +178,10 @@ pub async fn resolve_approval(
         }
         Ok(Json(serde_json::json!({ "ok": true })))
     } else {
-        Err((
+        Err(api_error(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": "Approval not found or already resolved" }
-            })),
+            "NOT_FOUND",
+            "Approval not found or already resolved",
         ))
     }
 }

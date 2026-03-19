@@ -50,12 +50,8 @@ pub async fn get_task(
             "status": format!("{:?}", status),
         }))
         .into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": "Task not found" }
-            })),
-        )
-            .into_response(),
+        None => {
+            crate::api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Task not found").into_response()
+        }
     }
 }
