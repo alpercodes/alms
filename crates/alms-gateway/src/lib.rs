@@ -35,6 +35,23 @@ pub mod sse;
 pub mod tasks;
 pub mod workspace;
 
+/// Build a structured API error response.
+///
+/// Used across all HTTP handlers to produce consistent
+/// `{ "error": { "code": "...", "message": "..." } }` bodies.
+pub(crate) fn api_error(
+    status: axum::http::StatusCode,
+    code: &str,
+    message: impl std::fmt::Display,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "error": { "code": code, "message": message.to_string() }
+        })),
+    )
+}
+
 // Re-export main types
 pub use gateway::{Gateway, GatewayConfig};
 pub use runs::{create_run, get_run_status};

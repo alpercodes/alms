@@ -49,13 +49,12 @@ pub async fn require_auth(
     }
 
     warn!("Rejected unauthenticated request to {}", req.uri().path());
-    (
+    crate::api_error(
         StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({
-            "error": { "code": "UNAUTHORIZED", "message": "Missing or invalid Bearer token" }
-        })),
+        "UNAUTHORIZED",
+        "Missing or invalid Bearer token",
     )
-        .into_response()
+    .into_response()
 }
 
 #[cfg(test)]

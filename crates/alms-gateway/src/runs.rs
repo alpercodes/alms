@@ -2,6 +2,7 @@
 //!
 //! Implements POST /runs and GET /runs/{id}/events per docs/api.md
 
+use crate::api_error;
 use crate::approvals::{ApprovalStore, PendingApproval};
 use crate::cron_utils;
 use crate::server::AppState;
@@ -167,34 +168,28 @@ pub async fn cancel_run(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let run = state.run_manager.get_run(run_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": "Run not found" }
-            })),
-        )
-    })?;
+    let run = state
+        .run_manager
+        .get_run(run_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Run not found"))?;
 
     match run.status {
         RunStatus::Queued | RunStatus::Running => {}
         _ => {
-            return Err((
+            return Err(api_error(
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": { "code": "ALREADY_FINISHED", "message": "Run already finished" }
-                })),
+                "ALREADY_FINISHED",
+                "Run already finished",
             ));
         }
     }
 
     let found = state.run_manager.cancel_run(run_id);
     if !found {
-        return Err((
+        return Err(api_error(
             StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": { "code": "ALREADY_FINISHED", "message": "Run already finished" }
-            })),
+            "ALREADY_FINISHED",
+            "Run already finished",
         ));
     }
 
@@ -217,11 +212,10 @@ pub async fn create_run(
     let session = match state.session_manager.get(req.session_id) {
         Ok(session) => session,
         Err(_) => {
-            return Err((
+            return Err(api_error(
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": { "code": "NOT_FOUND", "message": "Session not found" }
-                })),
+                "NOT_FOUND",
+                "Session not found",
             ));
         }
     };
@@ -245,11 +239,10 @@ pub async fn create_run(
 
     // Reject new runs during shutdown.
     if state.shutdown_token.is_cancelled() {
-        return Err((
+        return Err(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": { "code": "SHUTTING_DOWN", "message": "Server is shutting down" }
-            })),
+            "SHUTTING_DOWN",
+            "Server is shutting down",
         ));
     }
 
@@ -745,11 +738,10 @@ pub async fn get_run_status(
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
     match state.run_manager.get_run(run_id) {
         Some(run) => Ok(Json(RunStatusResponse::from(run))),
-        None => Err((
+        None => Err(api_error(
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": "Run not found" }
-            })),
+            "NOT_FOUND",
+            "Run not found",
         )),
     }
 }
@@ -772,14 +764,10 @@ pub async fn stream_run_events(
 
     // Check run exists — return 404 for nonexistent runs instead of
     // leaking an orphaned sender entry.
-    let run = state.run_manager.get_run(run_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": "Run not found" }
-            })),
-        )
-    })?;
+    let run = state
+        .run_manager
+        .get_run(run_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Run not found"))?;
 
     let is_terminal = matches!(
         run.status,

@@ -11,6 +11,7 @@
 //! POST   /agents/{id_or_name}/default — set as default
 //! ```
 
+use crate::api_error;
 use crate::server::AppState;
 use alms_core::{
     AgentId, AgentRecord, CreateAgentRequest, UpdateAgentRequest, validate_agent_name,
@@ -45,11 +46,10 @@ fn get_store(
     state: &AppState,
 ) -> Result<&std::sync::Arc<SqliteStore>, (StatusCode, Json<serde_json::Value>)> {
     state.session_manager.store().ok_or_else(|| {
-        (
+        api_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_AVAILABLE", "message": "Agent registry not available (no database configured)" }
-            })),
+            "NOT_AVAILABLE",
+            "Agent registry not available (no database configured)",
         )
     })
 }
@@ -59,54 +59,40 @@ pub(crate) fn resolve_agent(
     store: &SqliteStore,
     id_or_name: &str,
 ) -> Result<AgentRecord, (StatusCode, Json<serde_json::Value>)> {
-    let map_err = |e: alms_core::AlmsError| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "INTERNAL", "message": e.to_string() }
-            })),
+    let not_found = || {
+        api_error(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            format!("Agent not found: {id_or_name}"),
         )
     };
+    let internal =
+        |e: alms_core::AlmsError| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e);
 
     // Try UUID first
     if let Ok(uuid) = uuid::Uuid::parse_str(id_or_name) {
         let agent_id = AgentId(uuid);
         return match store.load_agent_by_id(agent_id) {
             Ok(Some(agent)) => Ok(agent),
-            Ok(None) => Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": { "code": "NOT_FOUND", "message": format!("Agent not found: {id_or_name}") }
-                })),
-            )),
-            Err(e) => Err(map_err(e)),
+            Ok(None) => Err(not_found()),
+            Err(e) => Err(internal(e)),
         };
     }
 
     // Fall back to name lookup
     match store.load_agent_by_name(id_or_name) {
         Ok(Some(agent)) => Ok(agent),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": format!("Agent not found: {id_or_name}") }
-            })),
-        )),
-        Err(e) => Err(map_err(e)),
+        Ok(None) => Err(not_found()),
+        Err(e) => Err(internal(e)),
     }
 }
 
 /// GET /agents — list all agents.
 pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
     let store = get_store(&state)?;
-    let agents = store.list_agents().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "INTERNAL", "message": e.to_string() }
-            })),
-        )
-    })?;
+    let agents = store
+        .list_agents()
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
     Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({ "agents": agents })))
 }
 
@@ -118,27 +104,15 @@ pub async fn create_agent(
     let store = get_store(&state)?;
 
     // Validate name
-    validate_agent_name(&req.name).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": { "code": "INVALID_NAME", "message": e.to_string() }
-            })),
-        )
-    })?;
+    validate_agent_name(&req.name)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, "INVALID_NAME", e))?;
 
     let wants_default = req.is_default.unwrap_or(false);
 
     // Validate posture if provided
     if let Some(ref p) = req.posture {
-        validate_posture(p).map_err(|msg| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": { "code": "INVALID_POSTURE", "message": msg }
-                })),
-            )
-        })?;
+        validate_posture(p)
+            .map_err(|msg| api_error(StatusCode::BAD_REQUEST, "INVALID_POSTURE", msg))?;
     }
 
     let now = Utc::now();
@@ -157,29 +131,18 @@ pub async fn create_agent(
     };
 
     store.create_agent(&agent).map_err(|e| match &e {
-        alms_core::AlmsError::DuplicateName(name) => (
+        alms_core::AlmsError::DuplicateName(name) => api_error(
             StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": { "code": "DUPLICATE_NAME", "message": format!("Agent name '{name}' already exists") }
-            })),
+            "DUPLICATE_NAME",
+            format!("Agent name '{name}' already exists"),
         ),
-        _ => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "INTERNAL", "message": e.to_string() }
-            })),
-        ),
+        _ => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e),
     })?;
 
     if wants_default {
-        store.set_default_agent(agent.id).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": { "code": "INTERNAL", "message": e.to_string() }
-                })),
-            )
-        })?;
+        store
+            .set_default_agent(agent.id)
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
         *state.default_agent_id.write().unwrap() = agent.id;
         agent.is_default = true;
     }
@@ -229,14 +192,8 @@ pub async fn update_agent(
         agent.system_prompt = if sp.is_empty() { None } else { Some(sp) };
     }
     if let Some(posture) = req.posture {
-        validate_posture(&posture).map_err(|msg| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": { "code": "INVALID_POSTURE", "message": msg }
-                })),
-            )
-        })?;
+        validate_posture(&posture)
+            .map_err(|msg| api_error(StatusCode::BAD_REQUEST, "INVALID_POSTURE", msg))?;
         agent.posture = if posture.is_empty() {
             None
         } else {
@@ -246,14 +203,9 @@ pub async fn update_agent(
 
     agent.last_active = Utc::now();
 
-    store.update_agent(&agent).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "INTERNAL", "message": e.to_string() }
-            })),
-        )
-    })?;
+    store
+        .update_agent(&agent)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
 
     Ok(Json(agent))
 }
@@ -268,25 +220,16 @@ pub async fn delete_agent(
 
     // Guard: cannot delete the default agent
     if agent.is_default {
-        return Err((
+        return Err(api_error(
             StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": {
-                    "code": "CANNOT_DELETE_DEFAULT",
-                    "message": "Cannot delete the default agent. Set another agent as default first."
-                }
-            })),
+            "CANNOT_DELETE_DEFAULT",
+            "Cannot delete the default agent. Set another agent as default first.",
         ));
     }
 
-    store.delete_agent(agent.id).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "INTERNAL", "message": e.to_string() }
-            })),
-        )
-    })?;
+    store
+        .delete_agent(agent.id)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
 
     Ok(Json(
         serde_json::json!({ "ok": true, "deleted": agent.id.to_string() }),
@@ -301,14 +244,9 @@ pub async fn set_default(
     let store = get_store(&state)?;
     let agent = resolve_agent(store, &id_or_name)?;
 
-    store.set_default_agent(agent.id).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": { "code": "INTERNAL", "message": e.to_string() }
-            })),
-        )
-    })?;
+    store
+        .set_default_agent(agent.id)
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
 
     // Update the live default agent ID so the running gateway uses it immediately.
     *state.default_agent_id.write().unwrap() = agent.id;

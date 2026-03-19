@@ -22,6 +22,7 @@ use alms_core::{AgentId, AlmsResult, JobStatus, Run, RunId, SessionId};
 use alms_runtime::Scheduler;
 use alms_session::{Content, Role};
 use alms_session::{JobStore, SessionManager};
+use crate::api_error;
 use axum::{
     Extension, Json, Router,
     extract::{Path, Query, State, WebSocketUpgrade},
@@ -522,13 +523,9 @@ async fn get_session_messages(
                 .collect();
             Json(serde_json::json!({ "messages": visible })).into_response()
         }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": "Session not found" }
-            })),
-        )
-            .into_response(),
+        Err(_) => {
+            api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response()
+        }
     }
 }
 
@@ -543,13 +540,9 @@ async fn get_audit(
             events.truncate(limit);
             Json(serde_json::json!({ "events": events })).into_response()
         }
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": { "code": "NOT_FOUND", "message": "Session not found" }
-            })),
-        )
-            .into_response(),
+        Err(_) => {
+            api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response()
+        }
     }
 }
 
