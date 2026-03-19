@@ -33,18 +33,22 @@ pub enum Posture {
 /// Developer-controlled prompt files embedded at compile time from
 /// `crates/alms-runtime/prompts/`. Not user-editable — workspace files
 /// (personality, goals, memories, user) are prepended to both stages.
+///
+/// The initial prompt comes from `AgentConfig.system_prompt` (defaults to
+/// `prompts/initial.md`, overridable per-agent). `tool_loop` is appended
+/// to the initial prompt after tool results — it never replaces the
+/// agent's identity.
 #[derive(Debug, Clone)]
 pub struct SystemPrompts {
-    /// Used for the first LLM call (before any tool execution).
-    pub initial: String,
-    /// Used for subsequent LLM calls (after tool results come back).
+    /// Appended to the system prompt for LLM calls after tool results.
+    /// The agent's initial prompt (identity, instructions) is preserved;
+    /// this adds continuation guidance on top.
     pub tool_loop: String,
 }
 
 impl Default for SystemPrompts {
     fn default() -> Self {
         Self {
-            initial: include_str!("../prompts/initial.md").trim().to_string(),
             tool_loop: include_str!("../prompts/tool_loop.md").trim().to_string(),
         }
     }
@@ -77,10 +81,9 @@ pub struct AgentConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        let prompts = SystemPrompts::default();
         Self {
-            system_prompt: prompts.initial.clone(),
-            prompts,
+            system_prompt: include_str!("../prompts/initial.md").trim().to_string(),
+            prompts: SystemPrompts::default(),
             max_iterations: 10,
             max_tokens: 4096,
             context_config: ContextConfig::default(),
@@ -714,11 +717,16 @@ impl AgentRuntime {
                     }
                 }
 
-                // Swap to tool_loop system prompt for subsequent iterations.
-                // messages[0] is always the system message.
+                // Append tool_loop instructions to the system prompt for
+                // subsequent iterations. The agent's identity (initial prompt +
+                // workspace prefix) is preserved; tool_loop adds continuation
+                // guidance on top.
                 if !messages.is_empty() && messages[0].role == "system" {
-                    let tool_loop_prompt =
-                        self.assemble_system_prompt(&self.config.prompts.tool_loop);
+                    let combined = format!(
+                        "{}\n\n{}",
+                        self.config.system_prompt, self.config.prompts.tool_loop
+                    );
+                    let tool_loop_prompt = self.assemble_system_prompt(&combined);
                     messages[0] = LlmMessage::system(tool_loop_prompt);
                 }
 
