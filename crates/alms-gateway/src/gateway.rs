@@ -310,9 +310,26 @@ impl Gateway {
                             &self.config.agent_config,
                             &self.llm,
                         );
+                        // Bootstrap detection: first-time agents get the
+                        // bootstrap interview prompt instead of their default.
+                        let mut agent_config = resolved.agent_config;
+                        if let (Some(ws_dir), Some(name)) =
+                            (&self.config.workspace_dir, &resolved.agent_name)
+                        {
+                            let workspace =
+                                alms_runtime::AgentWorkspace::new(ws_dir, name);
+                            if workspace.needs_bootstrap() {
+                                info!(
+                                    "Telegram: agent '{}' needs bootstrap — using interview prompt",
+                                    name
+                                );
+                                agent_config.system_prompt =
+                                    alms_runtime::AgentWorkspace::bootstrap_prompt().to_string();
+                            }
+                        }
                         let mut runtime = match AgentRuntime::new(
                             agent_id,
-                            resolved.agent_config,
+                            agent_config,
                             resolved.llm,
                         ) {
                             Ok(rt) => rt,
