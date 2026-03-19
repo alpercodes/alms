@@ -3,6 +3,7 @@
 //! GET /tasks         — list all active subagent tasks
 //! GET /tasks/{id}    — get status of a specific task
 
+use crate::api_error;
 use crate::server::AppState;
 use alms_coordinator::TaskId;
 use axum::{
@@ -35,10 +36,7 @@ pub async fn get_task(
     let uuid = match task_id_str.parse::<uuid::Uuid>() {
         Ok(u) => u,
         Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "invalid task_id"})),
-            )
+            return api_error(StatusCode::BAD_REQUEST, "BAD_REQUEST", "invalid task_id")
                 .into_response();
         }
     };
@@ -50,8 +48,6 @@ pub async fn get_task(
             "status": format!("{:?}", status),
         }))
         .into_response(),
-        None => {
-            crate::api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Task not found").into_response()
-        }
+        None => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Task not found").into_response(),
     }
 }
