@@ -53,7 +53,13 @@ export function openForegroundStream(runId, { onDone } = {}) {
     activeRunId.value = runId;
 
     es.addEventListener('token_delta', (e) => {
-        const { delta } = JSON.parse(e.data);
+        const data = JSON.parse(e.data);
+        // Intentionally suppress all subagent token_delta events.
+        // Mixing text from multiple concurrent LLM streams into the
+        // parent's chat bubble would produce garbled, interleaved output.
+        // Subagent work is represented by tool rows instead.
+        if (data.source_agent) return;
+        const delta = data.delta;
         deltaBuffer += delta;
         scheduleFlush();
     });
@@ -66,6 +72,7 @@ export function openForegroundStream(runId, { onDone } = {}) {
             tool: data.tool,
             params: data.params,
             status: 'running',
+            sourceAgent: data.source_agent || null,
             id: data.tool_invocation_id || data.call_id || data.tool,
         }];
         // Seal the previous agent message so new deltas start a new bubble

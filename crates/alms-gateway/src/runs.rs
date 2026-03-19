@@ -610,12 +610,12 @@ async fn forward_runtime_events(
 ) {
     while let Some(event) = rx.recv().await {
         match event {
-            RuntimeEvent::TokenDelta { delta } => {
+            RuntimeEvent::TokenDelta { delta, source_agent } => {
                 run_manager
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::token_delta(run_id, &delta),
+                        SseEventData::token_delta(run_id, &delta, source_agent),
                     )
                     .await;
             }
@@ -623,6 +623,7 @@ async fn forward_runtime_events(
                 invocation_id,
                 tool,
                 params,
+                source_agent,
             } => {
                 run_manager
                     .send_event(
@@ -633,6 +634,7 @@ async fn forward_runtime_events(
                             ToolInvocationId(invocation_id),
                             &tool,
                             params,
+                            source_agent,
                         ),
                     )
                     .await;
@@ -641,12 +643,13 @@ async fn forward_runtime_events(
                 invocation_id,
                 ok,
                 result,
+                source_agent,
             } => {
                 run_manager
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::tool_end(run_id, ToolInvocationId(invocation_id), ok, result),
+                        SseEventData::tool_end(run_id, ToolInvocationId(invocation_id), ok, result, source_agent),
                     )
                     .await;
             }

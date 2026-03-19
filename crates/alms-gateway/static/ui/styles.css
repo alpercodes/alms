@@ -1116,3 +1116,42 @@ header h1 {
     max-width: var(--drawer-width);
   }
 }
+
+/* ── Subagent UI indicators ── */
+.tool-row.subagent-header {
+  border-left-color: #a78bfa;
+  font-weight: 500;
+}
+.tool-row.subagent-header.done {
+  border-left-color: var(--success);
+}
+.subagent-badge {
+  color: #a78bfa;
+  font-weight: 600;
+  font-size: var(--text-xs);
+}
+.tool-row.subagent-nested {
+  margin-left: var(--space-5);
+  border-left-color: var(--border-default);
+  font-size: var(--text-2xs);
+  opacity: 0.75;
+}
+.subagent-tag {
+  color: #a78bfa;
+  font-size: var(--text-2xs);
+  margin-right: var(--space-1);
+}
+.subagent-spinner {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid #a78bfa;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin-right: var(--space-1);
+  vertical-align: middle;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

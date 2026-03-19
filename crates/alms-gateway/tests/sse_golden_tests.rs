@@ -17,7 +17,7 @@ async fn test_event_sequence_basic_run() {
         alms_core::SessionId::new(),
     ))
     .unwrap();
-    tx.send(SseEventData::token_delta(run_id, "Hello world"))
+    tx.send(SseEventData::token_delta(run_id, "Hello world", None))
         .unwrap();
     tx.send(SseEventData::run_finished(
         run_id,

@@ -691,11 +691,26 @@ async fn run_agent_loop(
         runtime = runtime.with_workspace(workspace);
     }
 
-    // Forward subagent tool events into the parent run's event stream
+    // Forward subagent tool events into the parent run's event stream,
+    // tagging each event with the subagent's identity so the UI can
+    // distinguish subagent activity from parent activity.
     if let Some(parent_tx) = parent_event_tx {
+        let label = request
+            .subagent_name
+            .clone()
+            .unwrap_or_else(|| format!("subagent-{}", &task_id.0.to_string()[..8]));
         tokio::spawn(async move {
+            use alms_runtime::RuntimeEvent;
             let mut rx = sub_rx;
-            while let Some(event) = rx.recv().await {
+            while let Some(mut event) = rx.recv().await {
+                match &mut event {
+                    RuntimeEvent::ToolStart { source_agent, .. }
+                    | RuntimeEvent::ToolEnd { source_agent, .. }
+                    | RuntimeEvent::TokenDelta { source_agent, .. } => {
+                        *source_agent = Some(label.clone());
+                    }
+                    _ => {}
+                }
                 let _ = parent_tx.send(event);
             }
         });

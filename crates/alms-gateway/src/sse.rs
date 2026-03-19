@@ -71,12 +71,13 @@ impl SseEventData {
         )
     }
 
-    pub fn token_delta(run_id: RunId, delta: &str) -> Self {
+    pub fn token_delta(run_id: RunId, delta: &str, source_agent: Option<String>) -> Self {
         Self::new(
             "token_delta",
             TokenDeltaData {
                 run_id: run_id.0.to_string(),
                 delta: delta.to_string(),
+                source_agent,
             },
         )
     }
@@ -86,6 +87,7 @@ impl SseEventData {
         tool_invocation_id: ToolInvocationId,
         tool: &str,
         params: serde_json::Value,
+        source_agent: Option<String>,
     ) -> Self {
         Self::new(
             "tool_start",
@@ -94,6 +96,7 @@ impl SseEventData {
                 tool_invocation_id: tool_invocation_id.0.to_string(),
                 tool: tool.to_string(),
                 params,
+                source_agent,
             },
         )
     }
@@ -103,6 +106,7 @@ impl SseEventData {
         tool_invocation_id: ToolInvocationId,
         ok: bool,
         result: serde_json::Value,
+        source_agent: Option<String>,
     ) -> Self {
         Self::new(
             "tool_end",
@@ -111,6 +115,7 @@ impl SseEventData {
                 tool_invocation_id: tool_invocation_id.0.to_string(),
                 ok,
                 result,
+                source_agent,
             },
         )
     }
@@ -302,6 +307,8 @@ struct RunStartedData {
 struct TokenDeltaData {
     run_id: String,
     delta: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -310,6 +317,8 @@ struct ToolStartData {
     tool_invocation_id: String,
     tool: String,
     params: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -318,6 +327,8 @@ struct ToolEndData {
     tool_invocation_id: String,
     ok: bool,
     result: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -386,7 +397,7 @@ mod tests {
         let tool_id = ToolInvocationId::new();
 
         let event =
-            SseEventData::tool_end(run_id, tool_id, true, serde_json::json!({"output": "test"}));
+            SseEventData::tool_end(run_id, tool_id, true, serde_json::json!({"output": "test"}), None);
 
         assert_eq!(event.event_type, "tool_end");
     }

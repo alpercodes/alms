@@ -14,15 +14,23 @@ pub enum RuntimeEvent {
         invocation_id: Uuid,
         tool: String,
         params: Value,
+        /// When set, this event originated from a subagent (not the parent).
+        source_agent: Option<String>,
     },
     /// A tool execution completed (ok=true) or failed (ok=false).
     ToolEnd {
         invocation_id: Uuid,
         ok: bool,
         result: Value,
+        /// When set, this event originated from a subagent (not the parent).
+        source_agent: Option<String>,
     },
     /// A chunk of text from the LLM response, for real-time streaming to the UI.
-    TokenDelta { delta: String },
+    TokenDelta {
+        delta: String,
+        /// When set, this delta originated from a subagent's LLM stream.
+        source_agent: Option<String>,
+    },
     /// Approval is required before executing a tool (guarded posture).
     ///
     /// The gateway stores the `decision_tx` and emits an `approval_required`
@@ -55,6 +63,7 @@ mod tests {
             invocation_id: id,
             tool: "echo".to_string(),
             params: serde_json::json!({"text": "hi"}),
+            source_agent: None,
         })
         .unwrap();
 
@@ -62,6 +71,7 @@ mod tests {
             invocation_id: id,
             ok: true,
             result: serde_json::json!({"output": "hi"}),
+            source_agent: None,
         })
         .unwrap();
 

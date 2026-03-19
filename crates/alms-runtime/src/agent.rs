@@ -724,7 +724,7 @@ impl AgentRuntime {
             {
                 content.push_str(&text);
                 if let Some(ref sender) = self.event_sender {
-                    let _ = sender.send(RuntimeEvent::TokenDelta { delta: text });
+                    let _ = sender.send(RuntimeEvent::TokenDelta { delta: text, source_agent: None });
                 }
             }
 
@@ -856,6 +856,7 @@ impl AgentRuntime {
                 invocation_id,
                 tool: name.to_string(),
                 params: args.clone(),
+                source_agent: None,
             });
         }
 
@@ -895,6 +896,7 @@ impl AgentRuntime {
                     invocation_id,
                     ok: false,
                     result: serde_json::json!({"error": "denied by user"}),
+                    source_agent: None,
                 });
                 return Err(alms_core::AlmsError::ToolExecution(format!(
                     "Tool '{}' denied by user",
@@ -935,6 +937,7 @@ impl AgentRuntime {
                         invocation_id,
                         ok: true,
                         result: value.clone(),
+                        source_agent: None,
                     });
                 }
             }
@@ -966,6 +969,7 @@ impl AgentRuntime {
                         invocation_id,
                         ok: false,
                         result: serde_json::json!({"error": e.to_string()}),
+                        source_agent: None,
                     });
                 }
             }
@@ -1059,7 +1063,7 @@ mod tests {
         // Verify TokenDelta events were emitted (one per word chunk)
         let mut deltas = Vec::new();
         while let Ok(event) = rx.try_recv() {
-            if let RuntimeEvent::TokenDelta { delta } = event {
+            if let RuntimeEvent::TokenDelta { delta, .. } = event {
                 deltas.push(delta);
             }
         }
