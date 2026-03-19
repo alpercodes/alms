@@ -28,11 +28,37 @@ pub enum Posture {
     Guarded,
 }
 
+/// Staged system prompts for different phases of the agent loop.
+///
+/// Developer-controlled prompt files embedded at compile time from
+/// `crates/alms-runtime/prompts/`. Not user-editable — workspace files
+/// (personality, goals, memories, user) are prepended to both stages.
+#[derive(Debug, Clone)]
+pub struct SystemPrompts {
+    /// Used for the first LLM call (before any tool execution).
+    pub initial: String,
+    /// Used for subsequent LLM calls (after tool results come back).
+    pub tool_loop: String,
+}
+
+impl Default for SystemPrompts {
+    fn default() -> Self {
+        Self {
+            initial: include_str!("../prompts/initial.md").trim().to_string(),
+            tool_loop: include_str!("../prompts/tool_loop.md").trim().to_string(),
+        }
+    }
+}
+
 /// Agent runtime configuration
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// System prompt
+    /// System prompt (used as initial prompt; kept for backward compatibility
+    /// with per-agent overrides). When set via per-agent config, overrides
+    /// `prompts.initial` but leaves `prompts.tool_loop` unchanged.
     pub system_prompt: String,
+    /// Staged system prompts for the agent loop.
+    pub prompts: SystemPrompts,
     /// Maximum iterations for tool loops
     pub max_iterations: u32,
     /// Maximum tokens per response
@@ -51,11 +77,10 @@ pub struct AgentConfig {
 
 impl Default for AgentConfig {
     fn default() -> Self {
+        let prompts = SystemPrompts::default();
         Self {
-            system_prompt: "You are a helpful assistant. Use tools when appropriate. \
-                You can run `alms --help` via shell_exec to discover CLI commands \
-                for managing agents, sessions, and runs."
-                .to_string(),
+            system_prompt: prompts.initial.clone(),
+            prompts,
             max_iterations: 10,
             max_tokens: 4096,
             context_config: ContextConfig::default(),
@@ -314,6 +339,21 @@ impl AgentRuntime {
         }
     }
 
+    /// Assemble the full system prompt for a given stage, prepending workspace
+    /// files if attached.
+    fn assemble_system_prompt(&self, base_prompt: &str) -> String {
+        if let Some(ref ws) = self.workspace {
+            let prefix = ws.build_system_prompt_prefix();
+            if prefix.is_empty() {
+                base_prompt.to_string()
+            } else {
+                format!("{}\n\n{}", prefix, base_prompt)
+            }
+        } else {
+            base_prompt.to_string()
+        }
+    }
+
     /// Build context window for LLM using ContextBuilder.
     ///
     /// For the `sliding-summary` strategy this is async because it may call the
@@ -324,16 +364,7 @@ impl AgentRuntime {
         session_id: &alms_core::SessionId,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
-        let system_prompt = if let Some(ref ws) = self.workspace {
-            let prefix = ws.build_system_prompt_prefix();
-            if prefix.is_empty() {
-                self.config.system_prompt.clone()
-            } else {
-                format!("{}\n\n{}", prefix, self.config.system_prompt)
-            }
-        } else {
-            self.config.system_prompt.clone()
-        };
+        let system_prompt = self.assemble_system_prompt(&self.config.system_prompt);
 
         let history = match session_manager.get_history(*session_id) {
             Ok(h) => h,
@@ -681,6 +712,14 @@ impl AgentRuntime {
                     ) {
                         warn!("Failed to persist tool result to session: {}", e);
                     }
+                }
+
+                // Swap to tool_loop system prompt for subsequent iterations.
+                // messages[0] is always the system message.
+                if !messages.is_empty() && messages[0].role == "system" {
+                    let tool_loop_prompt =
+                        self.assemble_system_prompt(&self.config.prompts.tool_loop);
+                    messages[0] = LlmMessage::system(tool_loop_prompt);
                 }
 
                 continue;
