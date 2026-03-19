@@ -43,6 +43,9 @@ pub struct TelegramChannel {
     /// repurposed as error backoff duration.
     #[allow(dead_code)]
     poll_interval_secs: u64,
+    /// Optional file path for persisting last_update_id across restarts.
+    /// When set, the offset is read on startup and written after each batch.
+    offset_file: Option<std::path::PathBuf>,
 }
 
 impl TelegramChannel {
@@ -59,6 +62,60 @@ impl TelegramChannel {
             cancel_token: CancellationToken::new(),
             poll_handle: Arc::new(Mutex::new(None)),
             poll_interval_secs: 5,
+            offset_file: None,
+        }
+    }
+
+    /// Set the file path for persisting the Telegram update offset.
+    pub fn with_offset_file(mut self, path: std::path::PathBuf) -> Self {
+        self.offset_file = Some(path);
+        self
+    }
+
+    /// Load persisted offset from file. Returns 0 if file doesn't exist, is invalid,
+    /// or contains a negative value.
+    fn load_offset(&self) -> i64 {
+        let Some(ref path) = self.offset_file else {
+            return 0;
+        };
+        match std::fs::read_to_string(path) {
+            Ok(s) => s.trim().parse::<i64>().unwrap_or(0).max(0),
+            Err(_) => 0,
+        }
+    }
+
+    /// Persist current offset to file.
+    ///
+    /// On Unix, uses atomic temp+rename. On Windows, writes directly since
+    /// `fs::rename` fails when the target exists.
+    fn save_offset(&self, offset: i64) {
+        let Some(ref path) = self.offset_file else {
+            return;
+        };
+        if cfg!(windows) {
+            // Windows: fs::rename fails if target exists. Write directly —
+            // small file, corruption risk is negligible for an offset value.
+            if let Err(e) = std::fs::write(path, offset.to_string()) {
+                warn!(
+                    "Failed to write Telegram offset to {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        } else {
+            // Unix: atomic temp+rename
+            let tmp = path.with_extension("tmp");
+            if let Err(e) = std::fs::write(&tmp, offset.to_string()) {
+                warn!(
+                    "Failed to write Telegram offset to {}: {}",
+                    tmp.display(),
+                    e
+                );
+                return;
+            }
+            if let Err(e) = std::fs::rename(&tmp, path) {
+                warn!("Failed to rename Telegram offset file: {}", e);
+            }
         }
     }
 
@@ -269,6 +326,11 @@ impl TelegramChannel {
                             return Ok(());
                         }
                     }
+                    // Persist offset after processing each batch
+                    let current = self.last_update_id.load(Ordering::Relaxed);
+                    if current > 0 {
+                        self.save_offset(current);
+                    }
                 }
                 Err(e) => {
                     consecutive_errors += 1;
@@ -385,6 +447,13 @@ impl Channel for TelegramChannel {
         self.use_webhook = config.use_webhook;
         self.webhook_url = config.webhook_url;
         self.poll_interval_secs = config.poll_interval_secs;
+
+        // Restore persisted offset from previous run (avoids duplicate replies)
+        let saved_offset = self.load_offset();
+        if saved_offset > 0 {
+            self.last_update_id.store(saved_offset, Ordering::Relaxed);
+            info!("Restored Telegram update offset: {}", saved_offset);
+        }
 
         // Validate the token by getting bot info
         let me = self.get_me().await?;
@@ -703,6 +772,82 @@ mod tests {
     fn poll_handle_none_initially() {
         let channel = TelegramChannel::new();
         assert!(channel.poll_handle.lock().is_none());
+    }
+
+    // -- offset persistence tests --
+
+    /// Create a unique temp directory for tests using PID + nanosecond timestamp
+    /// to avoid collisions in parallel CI runs.
+    fn test_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "alms_test_{}_{}_{nanos}",
+            label,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn offset_persist_and_restore() {
+        let dir = test_temp_dir("persist");
+        let offset_file = dir.join("telegram_offset");
+
+        // Save offset
+        let ch = TelegramChannel::new().with_offset_file(offset_file.clone());
+        ch.save_offset(42);
+
+        // Restore into a new channel
+        let ch2 = TelegramChannel::new().with_offset_file(offset_file.clone());
+        assert_eq!(ch2.load_offset(), 42);
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offset_load_missing_file_returns_zero() {
+        let ch = TelegramChannel::new()
+            .with_offset_file(std::path::PathBuf::from("/nonexistent/path/offset"));
+        assert_eq!(ch.load_offset(), 0);
+    }
+
+    #[test]
+    fn offset_load_no_file_configured_returns_zero() {
+        let ch = TelegramChannel::new();
+        assert_eq!(ch.load_offset(), 0);
+    }
+
+    #[test]
+    fn offset_load_corrupted_file_returns_zero() {
+        let dir = test_temp_dir("corrupt");
+        let offset_file = dir.join("telegram_offset");
+
+        // Write garbage content
+        std::fs::write(&offset_file, "not_a_number\n").unwrap();
+
+        let ch = TelegramChannel::new().with_offset_file(offset_file);
+        assert_eq!(ch.load_offset(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn offset_load_negative_value_clamped_to_zero() {
+        let dir = test_temp_dir("negative");
+        let offset_file = dir.join("telegram_offset");
+
+        // Write a negative offset (corrupted/malicious)
+        std::fs::write(&offset_file, "-5\n").unwrap();
+
+        let ch = TelegramChannel::new().with_offset_file(offset_file);
+        assert_eq!(ch.load_offset(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- split_message tests (existing) --

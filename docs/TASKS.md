@@ -531,10 +531,11 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - Added 29 tests across 3 files: `telegram/mod.rs` (convert_update, api_url, polling offset), `telegram/types.rs` (builder + serde), `alms-core/channel.rs` (Command::parse, IncomingMessage). Total: 37 tests in alms-channel.
 - **Owners:** Atlas
 
-63) Persist Telegram update offset to SQLite
+63) Persist Telegram update offset to sidecar file ✅
 - If the process crashes after processing an update but before the next `getUpdates` with incremented offset, Telegram redelivers the update → duplicate reply.
-- Fix: persist `last_update_id` to SQLite (or a sidecar file) after processing each batch.
-- **Owners:** Atlas
+- Fix: persist `last_update_id` to sidecar file (`./data/telegram_offset`) after processing each batch; restore on startup.
+- Done in PR #186 (atomic write on Unix, direct write on Windows, negative-value clamping, 6 persistence tests).
+- **Owners:** Atlas, Larry
 
 106) Telegram message loop ignores per-agent config overrides
 - The Telegram message handler in `gateway.rs` creates `AgentRuntime` with the server-default `agent_config` and `llm` client. It does not look up per-agent overrides (model, system_prompt, posture) from the agent registry.

@@ -225,6 +225,14 @@ impl Gateway {
             info!("Initializing Telegram channel");
             let mut telegram = TelegramChannel::new();
 
+            // Persist update offset alongside the DB file (e.g. ./data/telegram_offset)
+            if let Some(ref db_path) = self.config.db_path {
+                let data_dir = std::path::Path::new(db_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
+                telegram = telegram.with_offset_file(data_dir.join("telegram_offset"));
+            }
+
             let channel_config = ChannelConfig {
                 token: token.clone(),
                 use_webhook: false,
