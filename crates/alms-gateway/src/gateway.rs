@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 /// Gateway configuration
@@ -490,6 +490,7 @@ async fn process_telegram_message(
 /// `list_agents().is_empty()` and `create_agent()`.
 ///
 /// All errors are non-fatal (`warn!` only) — migration must never block startup.
+#[instrument(skip(store))]
 fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
     let migration_name = "main";
     if let Err(e) = validate_agent_name(migration_name) {
