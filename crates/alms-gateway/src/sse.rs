@@ -396,8 +396,13 @@ mod tests {
         let run_id = RunId::new();
         let tool_id = ToolInvocationId::new();
 
-        let event =
-            SseEventData::tool_end(run_id, tool_id, true, serde_json::json!({"output": "test"}), None);
+        let event = SseEventData::tool_end(
+            run_id,
+            tool_id,
+            true,
+            serde_json::json!({"output": "test"}),
+            None,
+        );
 
         assert_eq!(event.event_type, "tool_end");
     }

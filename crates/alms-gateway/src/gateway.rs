@@ -301,18 +301,36 @@ impl Gateway {
                     if let Some(ref telegram) = self.channels.telegram {
                         // Read the live default agent ID per message so
                         // set-default changes take effect immediately.
+                        // Apply per-agent config overrides (model, system_prompt,
+                        // posture) from the agent registry, same as the HTTP run path.
                         let agent_id = self.agent_id();
-                        let runtime = match AgentRuntime::new(
+                        let resolved = crate::runs::resolve_agent_config(
                             agent_id,
-                            self.config.agent_config.clone(),
-                            self.llm.clone(),
+                            &self.session_manager,
+                            &self.config.agent_config,
+                            &self.llm,
+                        );
+                        let mut runtime = match AgentRuntime::new(
+                            agent_id,
+                            resolved.agent_config,
+                            resolved.llm,
                         ) {
-                            Ok(rt) => Arc::new(rt),
+                            Ok(rt) => rt,
                             Err(e) => {
                                 error!("Failed to create agent runtime: {}", e);
                                 continue;
                             }
                         };
+                        // Attach workspace so agent personality/goals/memories
+                        // are prepended to the system prompt (same as HTTP path).
+                        if let (Some(ws_dir), Some(name)) =
+                            (&self.config.workspace_dir, &resolved.agent_name)
+                        {
+                            let workspace =
+                                alms_runtime::AgentWorkspace::new(ws_dir, name);
+                            runtime = runtime.with_workspace(workspace);
+                        }
+                        let runtime = Arc::new(runtime);
                         let context_id = format!("telegram_{}", msg.chat_id.0);
                         let session = self.session_manager.get_or_create(agent_id, &context_id);
                         let sm = Arc::clone(&self.session_manager);

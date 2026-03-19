@@ -74,7 +74,7 @@ export function AgentsTab() {
                        value=${newName.value}
                        onInput=${e => { newName.value = e.target.value; }}
                        onKeyDown=${e => { if (e.key === 'Enter') onCreate(); }}
-                       style="flex:1; background:var(--input-bg); color:var(--text); border:1px solid var(--border); padding:var(--space-2); font-family:var(--font-mono); font-size:var(--text-sm);" />
+                       style="flex:1; background:var(--surface-2); color:var(--text-primary); border:1px solid var(--border-default); padding:var(--space-2); font-family:var(--font-mono); font-size:var(--text-sm);" />
                 <button class="agent-card-btn" onClick=${onCreate}
                         disabled=${loading.value}>
                     ${loading.value ? '...' : '+ Create'}

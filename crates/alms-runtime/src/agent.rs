@@ -724,7 +724,10 @@ impl AgentRuntime {
             {
                 content.push_str(&text);
                 if let Some(ref sender) = self.event_sender {
-                    let _ = sender.send(RuntimeEvent::TokenDelta { delta: text, source_agent: None });
+                    let _ = sender.send(RuntimeEvent::TokenDelta {
+                        delta: text,
+                        source_agent: None,
+                    });
                 }
             }
 

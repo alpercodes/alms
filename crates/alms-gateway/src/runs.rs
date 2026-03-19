@@ -31,6 +31,60 @@ struct RunOverrides {
     posture: Option<String>,
 }
 
+/// Result of resolving per-agent config from the agent registry.
+pub struct ResolvedAgentConfig {
+    pub agent_config: alms_runtime::AgentConfig,
+    pub llm: alms_runtime::LlmClient,
+    /// Agent name from registry (None if record not found).
+    pub agent_name: Option<String>,
+}
+
+/// Resolve per-agent config overrides from the agent registry.
+///
+/// Looks up the agent record by ID, applies system_prompt/model/posture
+/// overrides on top of the base config. Returns the merged config, LLM
+/// client with model override, and agent name for workspace resolution.
+/// No per-run overrides are applied — callers layer those on top.
+pub fn resolve_agent_config(
+    agent_id: alms_core::AgentId,
+    session_manager: &alms_session::SessionManager,
+    base_config: &alms_runtime::AgentConfig,
+    llm: &alms_runtime::LlmClient,
+) -> ResolvedAgentConfig {
+    let agent_record = session_manager
+        .store()
+        .and_then(|store| match store.load_agent_by_id(agent_id) {
+            Ok(record) => record,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load agent record for {}, using server defaults: {}",
+                    agent_id, e
+                );
+                None
+            }
+        });
+
+    let agent_name = agent_record.as_ref().map(|r| r.name.clone());
+
+    let merged = apply_overrides(
+        base_config.clone(),
+        agent_record.as_ref(),
+        &RunOverrides::default(),
+    );
+
+    let llm = if let Some(model) = merged.model_override {
+        llm.clone().with_model(model)
+    } else {
+        llm.clone()
+    };
+
+    ResolvedAgentConfig {
+        agent_config: merged.agent_config,
+        llm,
+        agent_name,
+    }
+}
+
 /// Result of merging server defaults + per-agent + per-run overrides.
 struct MergedConfig {
     agent_config: alms_runtime::AgentConfig,
@@ -279,27 +333,15 @@ async fn execute_run(
 
     state.run_manager.mark_run_as_running(run_id);
 
-    // Look up per-agent config overrides from the agent registry.
-    // Errors are absorbed — agent lookup failure should not block the run.
-    let agent_record =
-        state
-            .session_manager
-            .store()
-            .and_then(|store| match store.load_agent_by_id(agent_id) {
-                Ok(record) => record,
-                Err(e) => {
-                    warn!(
-                        "Failed to load agent record for {}, using server defaults: {}",
-                        agent_id, e
-                    );
-                    None
-                }
-            });
-
-    // Agent name for workspace path resolution (name-based, not UUID-based).
-    // When None (deleted agent, missing record), both bootstrap and workspace
-    // attachment are skipped — warn so operators know why.
-    let agent_name = agent_record.as_ref().map(|r| r.name.clone());
+    // Resolve per-agent config (model, system_prompt, posture) from the
+    // agent registry, then layer per-run overrides on top.
+    let resolved = resolve_agent_config(
+        agent_id,
+        &state.session_manager,
+        &state.agent_config,
+        &state.llm,
+    );
+    let agent_name = resolved.agent_name;
     if state.workspace_dir.is_some() && agent_name.is_none() {
         warn!(
             "Agent {} has no registry record — workspace and bootstrap skipped",
@@ -307,23 +349,23 @@ async fn execute_run(
         );
     }
 
-    // Use AppState snapshots — no gateway lock needed.
-    let merged = apply_overrides(
-        state.agent_config.clone(),
-        agent_record.as_ref(),
-        &overrides,
-    );
-    let agent_config = merged.agent_config;
-
-    let llm = {
-        let llm = state.llm.clone();
-        if let Some(model) = merged.model_override {
-            info!("Run {} using model override: {}", run_id.0, model);
-            llm.with_model(model)
-        } else {
-            llm
+    // Apply per-run overrides (highest precedence) on top of the resolved config.
+    let mut agent_config = resolved.agent_config;
+    let mut llm = resolved.llm;
+    if let Some(m) = overrides.max_tokens.filter(|&m| m > 0) {
+        agent_config.max_tokens = m;
+    }
+    if let Some(ref p) = overrides.posture {
+        match p.as_str() {
+            "guarded" => agent_config.posture = alms_runtime::Posture::Guarded,
+            "full_control" => agent_config.posture = alms_runtime::Posture::FullControl,
+            _ => {}
         }
-    };
+    }
+    if let Some(ref model) = overrides.model {
+        info!("Run {} using model override: {}", run_id.0, model);
+        llm = llm.with_model(model.clone());
+    }
 
     // Create a runtime event channel so we can forward tool events to SSE.
     // Clone before moving into `with_event_sender` so invoke_agent can forward
