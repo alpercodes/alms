@@ -51,18 +51,20 @@ pub fn resolve_agent_config(
     base_config: &alms_runtime::AgentConfig,
     llm: &alms_runtime::LlmClient,
 ) -> ResolvedAgentConfig {
-    let agent_record = session_manager
-        .store()
-        .and_then(|store| match store.load_agent_by_id(agent_id) {
-            Ok(record) => record,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to load agent record for {}, using server defaults: {}",
-                    agent_id, e
-                );
-                None
-            }
-        });
+    let agent_record =
+        session_manager
+            .store()
+            .and_then(|store| match store.load_agent_by_id(agent_id) {
+                Ok(record) => record,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load agent record for {}, using server defaults: {}",
+                        agent_id,
+                        e
+                    );
+                    None
+                }
+            });
 
     let agent_name = agent_record.as_ref().map(|r| r.name.clone());
 
@@ -652,7 +654,10 @@ async fn forward_runtime_events(
 ) {
     while let Some(event) = rx.recv().await {
         match event {
-            RuntimeEvent::TokenDelta { delta, source_agent } => {
+            RuntimeEvent::TokenDelta {
+                delta,
+                source_agent,
+            } => {
                 run_manager
                     .send_event(
                         run_id,
@@ -691,7 +696,13 @@ async fn forward_runtime_events(
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::tool_end(run_id, ToolInvocationId(invocation_id), ok, result, source_agent),
+                        SseEventData::tool_end(
+                            run_id,
+                            ToolInvocationId(invocation_id),
+                            ok,
+                            result,
+                            source_agent,
+                        ),
                     )
                     .await;
             }
