@@ -1,7 +1,7 @@
 //! Bearer token authentication middleware.
 
 use axum::{
-    Extension, Json,
+    Extension,
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},

@@ -105,19 +105,13 @@ pub async fn cancel_job(
             state.scheduler.cancel(job_id).await;
             StatusCode::NO_CONTENT.into_response()
         }
-        Ok(Some(false)) => {
-            api_error(
-                StatusCode::CONFLICT,
-                "ALREADY_CANCELLED",
-                "job is already cancelled",
-            )
-            .into_response()
-        }
-        Ok(None) => {
-            api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response()
-        }
-        Err(e) => {
-            api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", e).into_response()
-        }
+        Ok(Some(false)) => api_error(
+            StatusCode::CONFLICT,
+            "ALREADY_CANCELLED",
+            "job is already cancelled",
+        )
+        .into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "job not found").into_response(),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", e).into_response(),
     }
 }

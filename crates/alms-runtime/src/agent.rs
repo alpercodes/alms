@@ -1277,16 +1277,14 @@ mod tests {
         let handler = tokio::spawn(async move {
             let mut approval_order = Vec::new();
             while let Some(event) = rx.recv().await {
-                match event {
-                    RuntimeEvent::ApprovalRequired {
-                        decision_tx, tool, ..
-                    } => {
-                        let count = approval_count_clone.load(Ordering::SeqCst);
-                        approval_order.push((tool, count));
-                        decision_tx.send(true).unwrap();
-                        approval_count_clone.fetch_add(1, Ordering::SeqCst);
-                    }
-                    _ => {}
+                if let RuntimeEvent::ApprovalRequired {
+                    decision_tx, tool, ..
+                } = event
+                {
+                    let count = approval_count_clone.load(Ordering::SeqCst);
+                    approval_order.push((tool, count));
+                    decision_tx.send(true).unwrap();
+                    approval_count_clone.fetch_add(1, Ordering::SeqCst);
                 }
             }
             approval_order
