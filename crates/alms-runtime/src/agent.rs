@@ -28,11 +28,41 @@ pub enum Posture {
     Guarded,
 }
 
+/// Staged system prompts for different phases of the agent loop.
+///
+/// Developer-controlled prompt files embedded at compile time from
+/// `crates/alms-runtime/prompts/`. Not user-editable — workspace files
+/// (personality, goals, memories, user) are prepended to both stages.
+///
+/// The initial prompt comes from `AgentConfig.system_prompt` (defaults to
+/// `prompts/initial.md`, overridable per-agent). `tool_loop` is appended
+/// to the initial prompt after tool results — it never replaces the
+/// agent's identity.
+#[derive(Debug, Clone)]
+pub struct SystemPrompts {
+    /// Appended to the system prompt for LLM calls after tool results.
+    /// The agent's initial prompt (identity, instructions) is preserved;
+    /// this adds continuation guidance on top.
+    pub tool_loop: String,
+}
+
+impl Default for SystemPrompts {
+    fn default() -> Self {
+        Self {
+            tool_loop: include_str!("../prompts/tool_loop.md").trim().to_string(),
+        }
+    }
+}
+
 /// Agent runtime configuration
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// System prompt
+    /// System prompt used for the initial LLM call. Defaults to
+    /// `prompts/initial.md`. Per-agent overrides replace this value
+    /// but leave `prompts.tool_loop` unchanged.
     pub system_prompt: String,
+    /// Staged system prompts for the agent loop.
+    pub prompts: SystemPrompts,
     /// Maximum iterations for tool loops
     pub max_iterations: u32,
     /// Maximum tokens per response
@@ -52,10 +82,8 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            system_prompt: "You are a helpful assistant. Use tools when appropriate. \
-                You can run `alms --help` via shell_exec to discover CLI commands \
-                for managing agents, sessions, and runs."
-                .to_string(),
+            system_prompt: include_str!("../prompts/initial.md").trim().to_string(),
+            prompts: SystemPrompts::default(),
             max_iterations: 10,
             max_tokens: 4096,
             context_config: ContextConfig::default(),
@@ -314,6 +342,21 @@ impl AgentRuntime {
         }
     }
 
+    /// Assemble the full system prompt for a given stage, prepending workspace
+    /// files if attached.
+    fn assemble_system_prompt(&self, base_prompt: &str) -> String {
+        if let Some(ref ws) = self.workspace {
+            let prefix = ws.build_system_prompt_prefix();
+            if prefix.is_empty() {
+                base_prompt.to_string()
+            } else {
+                format!("{}\n\n{}", prefix, base_prompt)
+            }
+        } else {
+            base_prompt.to_string()
+        }
+    }
+
     /// Build context window for LLM using ContextBuilder.
     ///
     /// For the `sliding-summary` strategy this is async because it may call the
@@ -324,16 +367,7 @@ impl AgentRuntime {
         session_id: &alms_core::SessionId,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
-        let system_prompt = if let Some(ref ws) = self.workspace {
-            let prefix = ws.build_system_prompt_prefix();
-            if prefix.is_empty() {
-                self.config.system_prompt.clone()
-            } else {
-                format!("{}\n\n{}", prefix, self.config.system_prompt)
-            }
-        } else {
-            self.config.system_prompt.clone()
-        };
+        let system_prompt = self.assemble_system_prompt(&self.config.system_prompt);
 
         let history = match session_manager.get_history(*session_id) {
             Ok(h) => h,
@@ -681,6 +715,19 @@ impl AgentRuntime {
                     ) {
                         warn!("Failed to persist tool result to session: {}", e);
                     }
+                }
+
+                // Append tool_loop instructions to the system prompt for
+                // subsequent iterations. The agent's identity (initial prompt +
+                // workspace prefix) is preserved; tool_loop adds continuation
+                // guidance on top.
+                if !messages.is_empty() && messages[0].role == "system" {
+                    let combined = format!(
+                        "{}\n\n{}",
+                        self.config.system_prompt, self.config.prompts.tool_loop
+                    );
+                    let tool_loop_prompt = self.assemble_system_prompt(&combined);
+                    messages[0] = LlmMessage::system(tool_loop_prompt);
                 }
 
                 continue;

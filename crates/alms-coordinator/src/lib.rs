@@ -580,6 +580,7 @@ fn agent_config_for_subagent(
         max_iterations: base.max_iterations,
         max_tokens: base.max_tokens,
         context_config: base.context_config.clone(),
+        prompts: base.prompts.clone(),
     };
     (config, model)
 }
@@ -945,6 +946,7 @@ mod tests {
             sandbox_root: "/sandbox".into(),
             shell_policy: "unrestricted".into(),
             enabled_tools: vec!["echo".into(), "math".into()],
+            ..AgentConfig::default()
         };
 
         // Ephemeral subagent (no registry record)

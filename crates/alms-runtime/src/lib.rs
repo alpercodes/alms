@@ -20,7 +20,7 @@ pub mod tools;
 pub mod workspace;
 pub mod workspace_tool;
 
-pub use agent::{AgentConfig, AgentRuntime, Posture, RunOutput};
+pub use agent::{AgentConfig, AgentRuntime, Posture, RunOutput, SystemPrompts};
 pub use context::ContextBuilder;
 pub use events::{RuntimeEvent, RuntimeEventSender};
 pub use get_task_result_tool::GetTaskResultTool;
