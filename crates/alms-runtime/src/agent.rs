@@ -57,9 +57,9 @@ impl Default for SystemPrompts {
 /// Agent runtime configuration
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
-    /// System prompt (used as initial prompt; kept for backward compatibility
-    /// with per-agent overrides). When set via per-agent config, overrides
-    /// `prompts.initial` but leaves `prompts.tool_loop` unchanged.
+    /// System prompt used for the initial LLM call. Defaults to
+    /// `prompts/initial.md`. Per-agent overrides replace this value
+    /// but leave `prompts.tool_loop` unchanged.
     pub system_prompt: String,
     /// Staged system prompts for the agent loop.
     pub prompts: SystemPrompts,
