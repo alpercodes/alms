@@ -8,7 +8,7 @@ import { ApprovalCard } from './components/chat/approval-card.js';
 import { MessageQueue } from './components/chat/message-queue.js';
 import { InputArea } from './components/chat/input-area.js';
 import { chatMessages } from './state/chat.js';
-import { activePanel } from './state/panel.js';
+import { PanelContainer } from './components/panel/index.js';
 import { scrollToBottom } from './utils/format.js';
 
 // ── App status ──
@@ -67,19 +67,6 @@ function ChatView() {
     `;
 }
 
-// ── Panel placeholder (Phase 4 will replace with Drawer) ──
-function Panel() {
-    if (!activePanel.value) return null;
-    return html`
-        <div id="panel" class="open">
-            <div class="panel-body" style="display:flex">
-                <div style="color: var(--text-disabled); font-style: italic; font-size: var(--text-sm);">
-                    ${activePanel.value.charAt(0).toUpperCase() + activePanel.value.slice(1)} panel — coming in Phase 4
-                </div>
-            </div>
-        </div>
-    `;
-}
 
 function App() {
     return html`
@@ -87,7 +74,7 @@ function App() {
         <div id="main">
             <${Sidebar} />
             <${ChatView} />
-            <${Panel} />
+            <${PanelContainer} />
         </div>
     `;
 }

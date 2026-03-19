@@ -1094,3 +1094,25 @@ header h1 {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* ── Panel close button ── */
+.panel-close {
+  flex: 0 0 auto !important;
+  width: 32px;
+  color: var(--text-muted);
+  font-weight: bold;
+}
+.panel-close:hover { color: var(--error); }
+
+/* ── Responsive panel overlay ── */
+@media (max-width: 900px) {
+  #panel.open {
+    position: absolute;
+    right: 0;
+    top: var(--header-height);
+    bottom: 0;
+    z-index: 100;
+    width: 100%;
+    max-width: var(--drawer-width);
+  }
+}
