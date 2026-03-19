@@ -4,11 +4,14 @@ mod types;
 use alms_core::channel::{ChatId, MessageId, UserId};
 use alms_core::{AlmsResult, Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use types::*;
 
@@ -29,6 +32,12 @@ pub struct TelegramChannel {
     running: Arc<AtomicBool>,
     use_webhook: bool,
     webhook_url: Option<String>,
+    /// Token used to cancel the polling loop immediately (including in-flight
+    /// long-poll HTTP requests) without waiting for the 30-second timeout.
+    cancel_token: CancellationToken,
+    /// Handle to the spawned polling task. Guarded by a mutex so `stop()` can
+    /// abort the task and `receive_updates()` can detect double-calls.
+    poll_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Currently unused after removing the interval ticker (long-poll timeout
     /// is the wait mechanism). Retained for config API compatibility; may be
     /// repurposed as error backoff duration.
@@ -47,6 +56,8 @@ impl TelegramChannel {
             running: Arc::new(AtomicBool::new(false)),
             use_webhook: false,
             webhook_url: None,
+            cancel_token: CancellationToken::new(),
+            poll_handle: Arc::new(Mutex::new(None)),
             poll_interval_secs: 5,
         }
     }
@@ -215,16 +226,34 @@ impl TelegramChannel {
         Ok(MessageId(sent.message_id))
     }
 
-    /// Run the polling loop
+    /// Run the polling loop.
+    ///
+    /// Uses `tokio::select!` with the cancellation token so in-flight
+    /// long-poll HTTP requests are dropped immediately on shutdown instead
+    /// of blocking for up to 30 seconds.
     async fn run_polling(&self, tx: mpsc::Sender<IncomingMessage>) -> AlmsResult<()> {
         info!("Starting Telegram polling loop");
         let mut consecutive_errors: u64 = 0;
 
-        while self.running.load(Ordering::Relaxed) {
+        loop {
+            if self.cancel_token.is_cancelled() || !self.running.load(Ordering::Relaxed) {
+                break;
+            }
+
             let offset = self.last_update_id.load(Ordering::Relaxed);
             let offset_param = if offset > 0 { Some(offset + 1) } else { None };
 
-            match self.get_updates(offset_param).await {
+            // Race the long-poll against the cancellation token so we can
+            // exit without waiting for the full HTTP timeout.
+            let updates_result = tokio::select! {
+                result = self.get_updates(offset_param) => result,
+                _ = self.cancel_token.cancelled() => {
+                    info!("Polling cancelled during get_updates");
+                    break;
+                }
+            };
+
+            match updates_result {
                 Ok(updates) => {
                     consecutive_errors = 0;
                     for update in updates {
@@ -252,16 +281,23 @@ impl TelegramChannel {
                         .subsec_nanos() as u64;
                     let backoff = base - jitter_range + (nanos % (2 * jitter_range + 1));
                     if consecutive_errors <= 3 {
-                        error!("Error getting updates (attempt {}): {}", consecutive_errors, e);
+                        error!(
+                            "Error getting updates (attempt {}): {}",
+                            consecutive_errors, e
+                        );
                     } else {
-                        warn!("Error getting updates (attempt {}, backoff {}s): {}", consecutive_errors, backoff, e);
+                        warn!(
+                            "Error getting updates (attempt {}, backoff {}s): {}",
+                            consecutive_errors, backoff, e
+                        );
                     }
-                    // Sleep in 1s increments so shutdown isn't blocked by long backoffs.
-                    for _ in 0..backoff {
-                        if !self.running.load(Ordering::Relaxed) {
+                    // Back off with cancellation support via token.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                        _ = self.cancel_token.cancelled() => {
+                            info!("Polling cancelled during error backoff");
                             break;
                         }
-                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
             }
@@ -378,11 +414,24 @@ impl Channel for TelegramChannel {
         let (tx, rx) = mpsc::channel(100);
 
         let channel = self.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             if let Err(e) = channel.run_polling(tx).await {
                 error!("Polling error: {}", e);
             }
         });
+
+        // Guard against multiple concurrent polling tasks + store handle
+        // under a single lock acquisition to avoid TOCTOU.
+        {
+            let mut guard = self.poll_handle.lock();
+            if guard.is_some() {
+                handle.abort();
+                return Err(alms_core::AlmsError::Channel(
+                    "receive_updates() called while a polling task is already running".to_string(),
+                ));
+            }
+            *guard = Some(handle);
+        }
 
         Ok(rx)
     }
@@ -408,6 +457,22 @@ impl Channel for TelegramChannel {
     async fn stop(&self) -> AlmsResult<()> {
         info!("Stopping Telegram channel");
         self.running.store(false, Ordering::Relaxed);
+        // Cancel the token so the polling loop (including in-flight HTTP
+        // requests) exits immediately rather than waiting up to 30 seconds.
+        //
+        // Note: CancellationToken is one-shot — after stop(), a subsequent
+        // receive_updates() call would exit immediately. If restart support
+        // is needed in the future, create a fresh token in receive_updates().
+        self.cancel_token.cancel();
+
+        // Take the handle out of the mutex (drop the guard before awaiting
+        // because parking_lot MutexGuard is !Send).
+        let handle = self.poll_handle.lock().take();
+        if let Some(handle) = handle {
+            // Token cancellation causes run_polling to exit cleanly via
+            // tokio::select!, so we just await — no abort() needed.
+            let _ = handle.await;
+        }
 
         if self.use_webhook {
             self.delete_webhook().await?;
@@ -615,6 +680,29 @@ mod tests {
         let offset = channel.last_update_id.load(Ordering::Relaxed);
         let offset_param = if offset > 0 { Some(offset + 1) } else { None };
         assert_eq!(offset_param, Some(103));
+    }
+
+    // -- cancellation / double-call guard tests --
+
+    #[test]
+    fn cancel_token_cancelled_after_stop() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let channel = TelegramChannel::new();
+            assert!(!channel.cancel_token.is_cancelled());
+            // stop() cancels the token even without a running poll task
+            channel.stop().await.unwrap();
+            assert!(channel.cancel_token.is_cancelled());
+        });
+    }
+
+    #[test]
+    fn poll_handle_none_initially() {
+        let channel = TelegramChannel::new();
+        assert!(channel.poll_handle.lock().is_none());
     }
 
     // -- split_message tests (existing) --

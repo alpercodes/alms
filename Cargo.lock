@@ -44,12 +44,14 @@ version = "0.1.0"
 dependencies = [
  "alms-core",
  "async-trait",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
+ "tokio-util",
  "tracing",
 ]
 
