@@ -133,6 +133,7 @@ impl GatewayConfig {
 /// The sidecar file is `<data_dir>/agent_id` — a plain-text UUID.
 /// If the file is missing or contains garbage, a new ID is generated and
 /// persisted (self-healing). Write failures are non-fatal warnings.
+#[instrument]
 fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
     // 1. Env var override takes highest precedence
     if let Ok(val) = std::env::var("ALMS_AGENT_ID") {
