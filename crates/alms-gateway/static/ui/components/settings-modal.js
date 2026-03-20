@@ -83,7 +83,7 @@ export function SettingsModal({ open, onClose }) {
                     <label class="settings-label">Server info</label>
                     <div class="settings-info">
                         <div>Model: <span class="settings-info-value">${defaults.model || 'unknown'}</span></div>
-                        <div>Provider: <span class="settings-info-value">${defaults.base_url || 'unknown'}</span></div>
+                        <div>Base URL: <span class="settings-info-value">${defaults.base_url || 'unknown'}</span></div>
                         <div>Context strategy: <span class="settings-info-value">${defaults.context_strategy || 'truncate'}</span></div>
                         <div>Tools: <span class="settings-info-value">${(defaults.enabled_tools || []).length} enabled</span></div>
                         <div>Workspace: <span class="settings-info-value">${defaults.workspace_dir || 'not configured'}</span></div>
