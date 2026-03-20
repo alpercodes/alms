@@ -490,7 +490,7 @@ Returns current server defaults for UI pre-population.
   "model": "openai/gpt-4o",
   "base_url": "https://openrouter.ai/api/v1",
   "max_tokens": 4096,
-  "posture": "full_control",
+  "posture": "guarded",
   "context_strategy": "truncate",
   "enabled_tools": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write"],
   "agent_id": "<uuid>",
