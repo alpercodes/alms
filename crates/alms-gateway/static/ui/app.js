@@ -1,4 +1,4 @@
-import { h, html, render, signal, useEffect, useRef } from './deps.js';
+import { h, html, render, signal, useEffect, useRef, useSignal } from './deps.js';
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
@@ -9,6 +9,7 @@ import { MessageQueue } from './components/chat/message-queue.js';
 import { InputArea } from './components/chat/input-area.js';
 import { chatMessages } from './state/chat.js';
 import { PanelContainer } from './components/panel/index.js';
+import { SettingsModal } from './components/settings-modal.js';
 import { scrollToBottom } from './utils/format.js';
 
 // ── App status ──
@@ -132,13 +133,15 @@ function ChatView() {
 
 
 function App() {
+    const settingsOpen = useSignal(false);
     return html`
-        <${Header} status=${status} onOpenSettings=${() => {}} />
+        <${Header} status=${status} onOpenSettings=${() => { settingsOpen.value = true; }} />
         <div id="main">
             <${Sidebar} />
             <${ChatView} />
             <${PanelContainer} />
         </div>
+        <${SettingsModal} open=${settingsOpen.value} onClose=${() => { settingsOpen.value = false; }} />
     `;
 }
 
