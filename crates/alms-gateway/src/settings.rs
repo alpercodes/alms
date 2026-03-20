@@ -59,11 +59,17 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or_default()
         .into_iter()
         .map(|a| {
+            let bootstrap = state
+                .workspace_dir
+                .as_ref()
+                .map(|ws| alms_runtime::AgentWorkspace::new(ws, &a.name).needs_bootstrap())
+                .unwrap_or(false);
             serde_json::json!({
                 "name": a.name,
                 "id": a.id.0.to_string(),
                 "is_default": a.is_default,
                 "model": a.model,
+                "needs_bootstrap": bootstrap,
             })
         })
         .collect::<Vec<_>>();

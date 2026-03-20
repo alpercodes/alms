@@ -10,6 +10,8 @@ import { InputArea } from './components/chat/input-area.js';
 import { chatMessages } from './state/chat.js';
 import { PanelContainer } from './components/panel/index.js';
 import { SettingsModal } from './components/settings-modal.js';
+import { OnboardingView } from './components/onboarding.js';
+import { agents } from './state/agents.js';
 import { scrollToBottom } from './utils/format.js';
 
 // ── App status ──
@@ -134,13 +136,18 @@ function ChatView() {
 
 function App() {
     const settingsOpen = useSignal(false);
+    const hasAgents = agents.value.length > 0;
     return html`
         <${Header} status=${status} onOpenSettings=${() => { settingsOpen.value = true; }} />
-        <div id="main">
-            <${Sidebar} />
-            <${ChatView} />
-            <${PanelContainer} />
-        </div>
+        ${hasAgents
+            ? html`
+                <div id="main">
+                    <${Sidebar} />
+                    <${ChatView} />
+                    <${PanelContainer} />
+                </div>`
+            : html`<${OnboardingView} />`
+        }
         <${SettingsModal} open=${settingsOpen.value} onClose=${() => { settingsOpen.value = false; }} />
     `;
 }
