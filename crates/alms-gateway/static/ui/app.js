@@ -15,28 +15,54 @@ import { scrollToBottom } from './utils/format.js';
 export const status = signal('connecting...');
 
 /**
- * Group invoke_agent tool rows with their subsequent subagent-nested tool rows.
- * Returns an array of render items where subagent groups are collapsed into
- * { type: 'subagent-group', header, children } objects.
+ * Group invoke_agent tool rows with their subagent-nested tool rows.
+ * Matches by sourceAgent identity (name from invoke_agent params) rather
+ * than array adjacency, so interleaved events from concurrent tools are
+ * correctly grouped.
  */
 function groupMessages(msgs) {
-    const result = [];
-    let i = 0;
-    while (i < msgs.length) {
+    // First pass: find all invoke_agent headers and their subagent names
+    const invokeIndices = new Map(); // index -> subagent name
+    for (let i = 0; i < msgs.length; i++) {
         const m = msgs[i];
         if (m.type === 'tool' && m.tool === 'invoke_agent') {
-            // Collect subsequent subagent-nested tools belonging to this invoke
-            const children = [];
-            let j = i + 1;
-            while (j < msgs.length && msgs[j].type === 'tool' && msgs[j].sourceAgent) {
-                children.push(msgs[j]);
-                j++;
+            const name = m.params?.name || m.params?.subagent_name || null;
+            if (name) invokeIndices.set(i, name);
+        }
+    }
+
+    // Second pass: assign each sourceAgent tool to its invoke_agent header
+    const childrenOf = new Map(); // invoke index -> [tool messages]
+    const consumed = new Set();   // indices consumed as children
+
+    for (let i = 0; i < msgs.length; i++) {
+        const m = msgs[i];
+        if (m.type === 'tool' && m.sourceAgent && !invokeIndices.has(i)) {
+            // Find the matching invoke_agent header by name
+            for (const [idx, name] of invokeIndices) {
+                if (m.sourceAgent === name) {
+                    if (!childrenOf.has(idx)) childrenOf.set(idx, []);
+                    childrenOf.get(idx).push(m);
+                    consumed.add(i);
+                    break;
+                }
             }
-            result.push({ type: 'subagent-group', header: m, children });
-            i = j;
+        }
+    }
+
+    // Third pass: build result
+    const result = [];
+    for (let i = 0; i < msgs.length; i++) {
+        if (consumed.has(i)) continue;
+        const m = msgs[i];
+        if (invokeIndices.has(i)) {
+            result.push({
+                type: 'subagent-group',
+                header: m,
+                children: childrenOf.get(i) || [],
+            });
         } else {
             result.push(m);
-            i++;
         }
     }
     return result;
@@ -63,25 +89,27 @@ function ChatView() {
                 `}
                 ${grouped.map((m, i) => {
                     if (m.type === 'subagent-group') {
-                        return html`<${SubagentGroup} key=${'sg-'+i} header=${m.header} children=${m.children} />`;
+                        const sgKey = 'sg-' + (m.header.id || i);
+                        return html`<${SubagentGroup} key=${sgKey} header=${m.header} children=${m.children} />`;
                     }
+                    const key = m.id || i;
                     if (m.type === 'user' || m.type === 'agent') {
-                        return html`<${Message} key=${i} type=${m.type} text=${m.text} sealed=${m.sealed} />`;
+                        return html`<${Message} key=${key} type=${m.type} text=${m.text} sealed=${m.sealed} />`;
                     }
                     if (m.type === 'tool') {
-                        return html`<${ToolRow} key=${i} ...${m} />`;
+                        return html`<${ToolRow} key=${key} ...${m} />`;
                     }
                     if (m.type === 'approval') {
-                        return html`<${ApprovalCard} key=${i} ...${m} />`;
+                        return html`<${ApprovalCard} key=${key} ...${m} />`;
                     }
                     if (m.type === 'error') {
-                        return html`<${ErrorMessage} key=${i} text=${m.text} />`;
+                        return html`<${ErrorMessage} key=${key} text=${m.text} />`;
                     }
                     if (m.type === 'system') {
-                        return html`<${SystemMessage} key=${i} text=${m.text} />`;
+                        return html`<${SystemMessage} key=${key} text=${m.text} />`;
                     }
                     if (m.type === 'tokens') {
-                        return html`<${TokenBadge} key=${i} usage=${m.usage} />`;
+                        return html`<${TokenBadge} key=${key} usage=${m.usage} />`;
                     }
                     if (m.type === 'thinking') {
                         return html`
