@@ -45,8 +45,8 @@ async function newSession() {
         const ctx = 'web-chat-' + Date.now();
         const resp = await createSession(activeAgentId.value, ctx);
         // Reload sessions
-        const data = await listSessions();
-        sessions.value = (data.sessions || []).filter(s => s.agent_id === activeAgentId.value);
+        const data = await listSessions(activeAgentId.value);
+        sessions.value = data.sessions || [];
         activeSessionId.value = resp.session_id;
         chatMessages.value = [];
         runs.value = [];
