@@ -17,18 +17,28 @@ pub trait BuiltinTool: Tool {}
 fn check_sandbox_path(path: &str, sandbox_root: &Path) -> SandboxResult<PathBuf> {
     let p = Path::new(path);
 
+    // Canonicalize the sandbox root so the comparison works even when the
+    // root was stored as a relative path or without UNC prefix (Windows).
+    let canonical_root = canonicalize_best_effort(sandbox_root).map_err(|e| {
+        SandboxError::SandboxViolation(format!(
+            "Cannot resolve sandbox root '{}': {}",
+            sandbox_root.display(),
+            e
+        ))
+    })?;
+
     // Resolve: relative paths join to sandbox_root, absolute stay as-is
     let resolved = if p.is_absolute() {
         p.to_path_buf()
     } else {
-        sandbox_root.join(p)
+        canonical_root.join(p)
     };
 
     // Canonicalize to follow symlinks. Walk up for non-existent paths.
     let canonical = canonicalize_best_effort(&resolved)
         .map_err(|e| SandboxError::SandboxViolation(format!("Cannot resolve '{}': {}", path, e)))?;
 
-    if !canonical.starts_with(sandbox_root) {
+    if !canonical.starts_with(&canonical_root) {
         return Err(SandboxError::SandboxViolation(format!(
             "Path '{}' is outside sandbox root",
             path

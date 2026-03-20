@@ -175,18 +175,39 @@ impl AgentRuntime {
         let tool = WorkspaceWriteTool::new(workspace.clone());
         self.tools.register(std::sync::Arc::new(tool));
 
-        // Re-register shell_exec with workspace dir as default cwd — but only
-        // if shell_exec was enabled in the first place. Otherwise we'd bypass
-        // the operator's tools.enabled restriction.
-        if self.config.enabled_tools.is_empty()
-            || self.config.enabled_tools.iter().any(|t| t == "shell_exec")
-        {
-            let ws_dir = workspace.dir();
+        let ws_root = workspace.dir().to_path_buf();
+        let enabled = &self.config.enabled_tools;
+        let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
+
+        // Re-register fs_read/fs_write/fs_list sandboxed to the workspace
+        // directory so file operations default to the agent's workspace
+        // instead of the project root.
+        if tool_enabled("fs_read") {
+            self.tools
+                .register(std::sync::Arc::new(alms_sandbox::FsReadTool::sandboxed(
+                    ws_root.clone(),
+                )));
+        }
+        if tool_enabled("fs_write") {
+            self.tools
+                .register(std::sync::Arc::new(alms_sandbox::FsWriteTool::sandboxed(
+                    ws_root.clone(),
+                )));
+        }
+        if tool_enabled("fs_list") {
+            self.tools
+                .register(std::sync::Arc::new(alms_sandbox::FsListTool::sandboxed(
+                    ws_root,
+                )));
+        }
+
+        // Re-register shell_exec with workspace dir as default cwd.
+        if tool_enabled("shell_exec") {
             let shell_tool = alms_sandbox::ShellExecTool::with_policy(
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
-            .with_default_cwd(ws_dir);
+            .with_default_cwd(workspace.dir());
             self.tools.register(std::sync::Arc::new(shell_tool));
         }
 
