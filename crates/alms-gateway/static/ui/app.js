@@ -38,14 +38,16 @@ function groupMessages(msgs) {
     for (let i = 0; i < msgs.length; i++) {
         const m = msgs[i];
         if (m.type === 'tool' && m.sourceAgent && !invokeIndices.has(i)) {
-            // Find the matching invoke_agent header by name
+            // Find the LAST matching invoke_agent header by name
+            // (handles duplicate names from re-invocations)
+            let matchIdx = -1;
             for (const [idx, name] of invokeIndices) {
-                if (m.sourceAgent === name) {
-                    if (!childrenOf.has(idx)) childrenOf.set(idx, []);
-                    childrenOf.get(idx).push(m);
-                    consumed.add(i);
-                    break;
-                }
+                if (m.sourceAgent === name) matchIdx = idx;
+            }
+            if (matchIdx >= 0) {
+                if (!childrenOf.has(matchIdx)) childrenOf.set(matchIdx, []);
+                childrenOf.get(matchIdx).push(m);
+                consumed.add(i);
             }
         }
     }

@@ -136,7 +136,7 @@ function AgentCard({ agent, isActive }) {
             `}
             <div class="agent-card-actions">
                 <button class="agent-card-btn" onClick=${() => switchAgent(agent.id)}>Select</button>
-                <button class="agent-card-btn" onClick=${() => { editing.value = true; }}>Edit</button>
+                <button class="agent-card-btn" onClick=${() => { model.value = agent.model || ''; systemPrompt.value = agent.system_prompt || ''; posture.value = agent.posture || ''; editing.value = true; }}>Edit</button>
                 ${!agent.is_default && html`
                     <button class="agent-card-btn" onClick=${onSetDefault}>Set Default</button>
                 `}
