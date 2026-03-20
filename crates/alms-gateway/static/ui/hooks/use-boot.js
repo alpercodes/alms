@@ -43,9 +43,8 @@ export async function boot() {
  */
 async function loadAgentSessions(agentId) {
     try {
-        const data = await listSessions();
-        // Server returns all sessions — filter to this agent client-side
-        const agentSessions = (data.sessions || []).filter(s => s.agent_id === agentId);
+        const data = await listSessions(agentId);
+        const agentSessions = data.sessions || [];
         sessions.value = agentSessions;
 
         if (agentSessions.length > 0) {
@@ -59,8 +58,8 @@ async function loadAgentSessions(agentId) {
             // Create a first session
             const ctx = 'web-chat-' + Date.now();
             const resp = await createSession(agentId, ctx);
-            const reloaded = await listSessions();
-            sessions.value = (reloaded.sessions || []).filter(s => s.agent_id === agentId);
+            const reloaded = await listSessions(agentId);
+            sessions.value = reloaded.sessions || [];
             activeSessionId.value = resp.session_id;
             chatMessages.value = [];
             runs.value = [];
