@@ -537,7 +537,7 @@ header h1 {
   border-radius: var(--radius-sm);
 }
 .approval-card.resolved { border-color: var(--border-subtle); }
-.approval-card.resolved h3 { color: var(--text-muted); }
+
 
 .approval-btns { display: flex; gap: var(--space-2); }
 .btn {

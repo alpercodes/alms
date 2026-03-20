@@ -21,10 +21,10 @@ use uuid::Uuid;
 /// Execution posture: controls whether tools require approval before running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Posture {
-    /// Execute tools directly without approval (default).
-    #[default]
+    /// Execute tools directly without approval.
     FullControl,
-    /// Require explicit user approval before each tool execution.
+    /// Require explicit user approval before each tool execution (default).
+    #[default]
     Guarded,
 }
 
@@ -87,7 +87,7 @@ impl Default for AgentConfig {
             max_iterations: 10,
             max_tokens: 4096,
             context_config: ContextConfig::default(),
-            posture: Posture::FullControl,
+            posture: Posture::default(),
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
             enabled_tools: Vec::new(),
@@ -1098,7 +1098,7 @@ mod tests {
         let config = AgentConfig::default();
         assert_eq!(config.max_iterations, 10);
         assert!(!config.system_prompt.is_empty());
-        assert_eq!(config.posture, Posture::FullControl);
+        assert_eq!(config.posture, Posture::Guarded);
     }
 
     #[tokio::test]
