@@ -20,9 +20,9 @@ function toolSummary(tool, params) {
         case 'http_get':
             return params.url || '';
         case 'math':
-            return params.expression || '';
+            return params.operation ? params.operation + '(' + [params.a, params.b, params.n].filter(v => v !== undefined).join(', ') + ')' : '';
         case 'echo':
-            return params.text || '';
+            return params.message || params.text || '';
         default: {
             const entries = Object.entries(params);
             return entries.map(([k, v]) => {
