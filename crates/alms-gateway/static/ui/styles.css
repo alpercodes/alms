@@ -481,6 +481,17 @@ header h1 {
   cursor: pointer;
   transition: color var(--duration-normal);
 }
+
+
+.tool-name {
+  color: var(--accent-text);
+  font-weight: 600;
+  margin: 0 var(--space-1);
+}
+.tool-summary {
+  color: var(--text-secondary);
+  margin-left: var(--space-1);
+}
 .tool-row:hover { color: var(--text-primary); }
 .tool-row.done { border-left-color: var(--success); color: var(--success); }
 .tool-row.fail { border-left-color: var(--error); color: var(--error); }
