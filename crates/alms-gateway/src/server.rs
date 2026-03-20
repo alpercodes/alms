@@ -428,15 +428,26 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
-/// GET /sessions — list all sessions across all agents
+/// GET /sessions?agent_id=<uuid> — list sessions, optionally filtered by agent.
 ///
 /// Excludes internal sessions created by the coordinator (subagent_*) and
 /// scheduler (job_*) — these are implementation details not shown in the UI.
-async fn list_sessions(State(state): State<AppState>) -> impl IntoResponse {
+async fn list_sessions(
+    State(state): State<AppState>,
+    Query(params): Query<ListSessionsQuery>,
+) -> impl IntoResponse {
     let mut sessions = state.session_manager.list_all();
     sessions
         .retain(|s| !s.context_id.starts_with("subagent_") && !s.context_id.starts_with("job_"));
+    if let Some(agent_id) = params.agent_id {
+        sessions.retain(|s| s.agent_id == agent_id);
+    }
     Json(serde_json::json!({ "sessions": sessions }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSessionsQuery {
+    agent_id: Option<AgentId>,
 }
 
 /// Create a new session
