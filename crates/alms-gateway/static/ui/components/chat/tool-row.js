@@ -5,6 +5,7 @@ function toolSummary(tool, params) {
     if (!params) return '';
     switch (tool) {
         case 'shell_exec':
+            if (params.argv) return params.argv.join(' ');
             return params.command || '';
         case 'fs_read':
             return params.path || '';
