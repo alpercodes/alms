@@ -175,7 +175,7 @@ impl AgentRuntime {
         let tool = WorkspaceWriteTool::new(workspace.clone());
         self.tools.register(std::sync::Arc::new(tool));
 
-        let ws_root = Some(workspace.dir().to_path_buf());
+        let ws_root = workspace.dir().to_path_buf();
         let enabled = &self.config.enabled_tools;
         let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
 
@@ -185,19 +185,19 @@ impl AgentRuntime {
         if tool_enabled("fs_read") {
             self.tools
                 .register(std::sync::Arc::new(alms_sandbox::FsReadTool::sandboxed(
-                    ws_root.clone().unwrap(),
+                    ws_root.clone(),
                 )));
         }
         if tool_enabled("fs_write") {
             self.tools
                 .register(std::sync::Arc::new(alms_sandbox::FsWriteTool::sandboxed(
-                    ws_root.clone().unwrap(),
+                    ws_root.clone(),
                 )));
         }
         if tool_enabled("fs_list") {
             self.tools
                 .register(std::sync::Arc::new(alms_sandbox::FsListTool::sandboxed(
-                    ws_root.clone().unwrap(),
+                    ws_root,
                 )));
         }
 
