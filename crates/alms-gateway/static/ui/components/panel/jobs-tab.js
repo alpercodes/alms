@@ -5,6 +5,27 @@ import { activePanelTab } from '../../state/panel.js';
 import { listJobs, createJob, cancelJob } from '../../api/jobs.js';
 import { fmtDate } from '../../utils/format.js';
 
+const PRESETS = [
+    { label: '1m',   cron: '* * * * *',       desc: 'Every minute' },
+    { label: '5m',   cron: '*/5 * * * *',     desc: 'Every 5 minutes' },
+    { label: '15m',  cron: '*/15 * * * *',    desc: 'Every 15 minutes' },
+    { label: '30m',  cron: '*/30 * * * *',    desc: 'Every 30 minutes' },
+    { label: '1h',   cron: '0 * * * *',       desc: 'Every hour' },
+    { label: '6h',   cron: '0 */6 * * *',     desc: 'Every 6 hours' },
+    { label: '12h',  cron: '0 */12 * * *',    desc: 'Every 12 hours' },
+    { label: '1d',   cron: '0 0 * * *',       desc: 'Daily at midnight' },
+];
+
+/** Human-readable description of a cron expression. */
+function describeCron(expr) {
+    if (!expr) return '';
+    const preset = PRESETS.find(p => p.cron === expr.trim());
+    if (preset) return preset.desc;
+    const parts = expr.trim().split(/\s+/);
+    if (parts.length !== 5) return 'Invalid cron (need 5 fields)';
+    return expr;
+}
+
 async function refreshJobs() {
     try {
         const data = await listJobs();
@@ -20,12 +41,16 @@ export function JobsTab() {
     const agentId = useSignal(activeAgentId.value || '');
     const error = useSignal('');
     const loading = useSignal(false);
+    const customMode = useSignal(false);
 
     useEffect(() => {
         if (activePanelTab.value === 'jobs') refreshJobs();
     }, [activePanelTab.value]);
 
     useEffect(() => { agentId.value = activeAgentId.value || ''; }, [activeAgentId.value]);
+
+    const cronDesc = describeCron(cron.value);
+    const isPreset = PRESETS.some(p => p.cron === cron.value.trim());
 
     const onCreate = async () => {
         if (!agentId.value || !cron.value.trim() || !prompt.value.trim()) return;
@@ -39,6 +64,7 @@ export function JobsTab() {
             });
             cron.value = '';
             prompt.value = '';
+            customMode.value = false;
             await refreshJobs();
         } catch (err) {
             error.value = err.error?.message || err.message || 'Failed to create job';
@@ -65,17 +91,44 @@ export function JobsTab() {
                         <option value=${a.id}>${a.name}</option>
                     `)}
                 </select>
-                <input class="jobs-input" type="text" placeholder="Cron: */5 * * * *"
-                       value=${cron.value}
-                       onInput=${e => { cron.value = e.target.value; }} />
-                <textarea class="jobs-textarea" rows="2" placeholder="Prompt..."
+
+                <div class="cron-presets">
+                    ${PRESETS.map(p => html`
+                        <button class="cron-btn ${cron.value === p.cron ? 'active' : ''}"
+                                title=${p.desc}
+                                onClick=${() => { cron.value = p.cron; customMode.value = false; }}>
+                            ${p.label}
+                        </button>
+                    `)}
+                    <button class="cron-btn ${customMode.value ? 'active' : ''}"
+                            title="Custom cron expression"
+                            onClick=${() => { customMode.value = true; cron.value = ''; }}>
+                        custom
+                    </button>
+                </div>
+
+                ${customMode.value && html`
+                    <input class="jobs-input" type="text" placeholder="min hour dom mon dow"
+                           value=${cron.value}
+                           onInput=${e => { cron.value = e.target.value; }} />
+                `}
+
+                ${cron.value && html`
+                    <div class="cron-preview">${cronDesc}</div>
+                `}
+
+                <textarea class="jobs-textarea" rows="2" placeholder="Prompt for the agent..."
                           value=${prompt.value}
                           onInput=${e => { prompt.value = e.target.value; }}></textarea>
+
                 ${!agentId.value && html`
-                    <div style="color:var(--text-muted); font-size:var(--text-xs); font-style:italic;">No agents available. Create an agent first.</div>
+                    <div style="color:var(--text-muted); font-size:var(--text-xs); font-style:italic;">
+                        No agents available. Create an agent first.
+                    </div>
                 `}
+
                 <button class="jobs-submit" onClick=${onCreate}
-                        disabled=${loading.value || !agentId.value}>
+                        disabled=${loading.value || !agentId.value || !cron.value.trim()}>
                     ${loading.value ? '...' : 'Schedule'}
                 </button>
             </div>
@@ -90,7 +143,7 @@ export function JobsTab() {
                     <div class="job-item">
                         <div class="job-prompt">${j.prompt || j.task || '(no prompt)'}</div>
                         <div class="job-meta">
-                            <span>${j.schedule?.cron || JSON.stringify(j.schedule)}</span>
+                            <span>${describeCron(j.schedule?.cron) || JSON.stringify(j.schedule)}</span>
                             ${j.next_run_at && html`<span> | next: ${fmtDate(j.next_run_at)}</span>`}
                         </div>
                         <span class="job-status-${j.status || 'active'}">${j.status || 'active'}</span>
