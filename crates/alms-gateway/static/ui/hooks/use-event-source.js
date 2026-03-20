@@ -66,6 +66,7 @@ export function openForegroundStream(runId, { onDone } = {}) {
 
     es.addEventListener('tool_start', (e) => {
         flushDeltaBuffer(); // flush pending text before tool row
+        sealLastAgent();    // seal agent cursor BEFORE appending tool row
         const data = JSON.parse(e.data);
         chatMessages.value = [...chatMessages.value, {
             type: 'tool',
@@ -75,8 +76,6 @@ export function openForegroundStream(runId, { onDone } = {}) {
             sourceAgent: data.source_agent || null,
             id: data.tool_invocation_id || data.call_id || data.tool,
         }];
-        // Seal the previous agent message so new deltas start a new bubble
-        sealLastAgent();
     });
 
     es.addEventListener('tool_end', (e) => {
