@@ -41,7 +41,7 @@
 
   /* ── Prompt colors ── */
   --user-prompt: #4ade80;
-  --agent-prompt: #a1a1aa;
+  --agent-prompt: #e4e4e7;
 
   /* ── Shadows ── */
   --shadow-sm: 0 1px 2px rgba(0,0,0,0.3);
@@ -169,7 +169,7 @@ header h1 {
   gap: var(--space-1);
   font-size: var(--text-sm);
   font-weight: 500;
-  color: var(--text-secondary);
+  color: var(--text-primary);
   cursor: pointer;
   padding: var(--space-1) var(--space-2);
   border-radius: var(--radius-md);
@@ -185,7 +185,7 @@ header h1 {
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   font-weight: 500;
-  color: var(--text-secondary);
+  color: var(--text-primary);
   background: transparent;
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
@@ -327,7 +327,7 @@ header h1 {
   text-overflow: ellipsis;
   transition: all var(--duration-fast);
 }
-.session-item:hover { background: var(--surface-3); color: var(--text-secondary); }
+.session-item:hover { background: var(--surface-3); color: var(--text-primary); }
 .session-item.active {
   color: var(--accent-text);
   border-left-color: var(--accent);
@@ -450,7 +450,7 @@ header h1 {
 }
 .msg.agent .msg-body {
   border-left-color: var(--agent-prompt);
-  color: var(--text-secondary);
+  color: var(--text-primary);
 }
 
 .msg-tokens {
@@ -478,7 +478,7 @@ header h1 {
   cursor: pointer;
   transition: color var(--duration-normal);
 }
-.tool-row:hover { color: var(--text-secondary); }
+.tool-row:hover { color: var(--text-primary); }
 .tool-row.done { border-left-color: var(--success); color: var(--success); }
 .tool-row.fail { border-left-color: var(--error); color: var(--error); }
 .tool-row-detail {
@@ -697,7 +697,7 @@ header h1 {
   transition: all var(--duration-normal);
 }
 .panel-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-.panel-tab:hover:not(.active) { color: var(--text-secondary); }
+.panel-tab:hover:not(.active) { color: var(--text-primary); }
 
 .panel-body {
   flex: 1;
@@ -897,7 +897,7 @@ header h1 {
   font-family: var(--font-mono);
   font-weight: 500;
   background: var(--surface-3);
-  color: var(--text-secondary);
+  color: var(--text-primary);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
   cursor: pointer;
@@ -1012,7 +1012,7 @@ header h1 {
   box-shadow: var(--shadow-lg);
 }
 .onboard-card h2 { font-size: var(--text-2xl); color: var(--text-primary); font-weight: 700; }
-.onboard-card p { font-size: var(--text-sm); color: var(--text-secondary); line-height: 1.6; }
+.onboard-card p { font-size: var(--text-sm); color: var(--text-primary); line-height: 1.6; }
 .onboard-card label {
   font-size: var(--text-2xs);
   font-weight: 600;
