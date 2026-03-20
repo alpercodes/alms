@@ -690,28 +690,6 @@ header h1 {
 }
 #panel.open { display: flex; }
 
-.panel-tabs {
-  display: flex;
-  border-bottom: 1px solid var(--border-subtle);
-  flex-shrink: 0;
-  padding: 0 var(--space-2);
-}
-.panel-tab {
-  flex: 1;
-  padding: var(--space-3) var(--space-2);
-  font-size: var(--text-xs);
-  font-family: var(--font-mono);
-  font-weight: 500;
-  background: none;
-  color: var(--text-muted);
-  border: none;
-  border-bottom: 2px solid transparent;
-  cursor: pointer;
-  text-align: center;
-  transition: all var(--duration-normal);
-}
-.panel-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-.panel-tab:hover:not(.active) { color: var(--text-primary); }
 
 .panel-body {
   flex: 1;
@@ -1140,13 +1118,6 @@ header h1 {
 }
 
 /* ── Panel close button ── */
-.panel-close {
-  flex: 0 0 auto !important;
-  width: 32px;
-  color: var(--text-muted);
-  font-weight: bold;
-}
-.panel-close:hover { color: var(--error); }
 
 /* ── Responsive panel overlay ── */
 @media (max-width: 900px) {
