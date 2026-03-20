@@ -50,7 +50,6 @@ export function JobsTab() {
     useEffect(() => { agentId.value = activeAgentId.value || ''; }, [activeAgentId.value]);
 
     const cronDesc = describeCron(cron.value);
-    const isPreset = PRESETS.some(p => p.cron === cron.value.trim());
 
     const onCreate = async () => {
         if (!agentId.value || !cron.value.trim() || !prompt.value.trim()) return;
@@ -128,7 +127,7 @@ export function JobsTab() {
                 `}
 
                 <button class="jobs-submit" onClick=${onCreate}
-                        disabled=${loading.value || !agentId.value || !cron.value.trim()}>
+                        disabled=${loading.value || !agentId.value || !cron.value.trim() || !prompt.value.trim()}>
                     ${loading.value ? '...' : 'Schedule'}
                 </button>
             </div>
