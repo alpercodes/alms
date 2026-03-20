@@ -14,8 +14,8 @@ export function OnboardingView() {
         if (!val) return;
 
         // Validate: lowercase, digits, hyphens, 1-64 chars
-        if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(val)) {
-            error.value = 'Invalid name: lowercase letters, digits, hyphens only (1-64 chars)';
+        if (!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(val)) {
+            error.value = 'Invalid name: lowercase letters, digits, hyphens only (1-64 chars, no trailing hyphen)';
             return;
         }
 
