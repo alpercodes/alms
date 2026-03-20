@@ -1167,6 +1167,25 @@ header h1 {
   margin-right: var(--space-1);
   vertical-align: middle;
 }
+
+.subagent-group {
+  margin: var(--space-1) 0;
+}
+.subagent-count {
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  margin-left: var(--space-2);
+}
+.subagent-count::before { content: '('; }
+.subagent-count::after { content: ' tools)'; }
+.subagent-result {
+  margin-left: var(--space-5);
+  font-size: var(--text-2xs);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-all;
+  padding: var(--space-1) var(--space-3);
+}
 @keyframes spin {
   to { transform: rotate(360deg); }
 }

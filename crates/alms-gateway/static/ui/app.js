@@ -3,7 +3,7 @@ import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
 import { Message, ErrorMessage, SystemMessage, TokenBadge } from './components/chat/message.js';
-import { ToolRow } from './components/chat/tool-row.js';
+import { ToolRow, SubagentGroup } from './components/chat/tool-row.js';
 import { ApprovalCard } from './components/chat/approval-card.js';
 import { MessageQueue } from './components/chat/message-queue.js';
 import { InputArea } from './components/chat/input-area.js';
@@ -14,6 +14,34 @@ import { scrollToBottom } from './utils/format.js';
 // ── App status ──
 export const status = signal('connecting...');
 
+/**
+ * Group invoke_agent tool rows with their subsequent subagent-nested tool rows.
+ * Returns an array of render items where subagent groups are collapsed into
+ * { type: 'subagent-group', header, children } objects.
+ */
+function groupMessages(msgs) {
+    const result = [];
+    let i = 0;
+    while (i < msgs.length) {
+        const m = msgs[i];
+        if (m.type === 'tool' && m.tool === 'invoke_agent') {
+            // Collect subsequent subagent-nested tools belonging to this invoke
+            const children = [];
+            let j = i + 1;
+            while (j < msgs.length && msgs[j].type === 'tool' && msgs[j].sourceAgent) {
+                children.push(msgs[j]);
+                j++;
+            }
+            result.push({ type: 'subagent-group', header: m, children });
+            i = j;
+        } else {
+            result.push(m);
+            i++;
+        }
+    }
+    return result;
+}
+
 // ── Chat view ──
 function ChatView() {
     const messagesRef = useRef(null);
@@ -23,15 +51,20 @@ function ChatView() {
         scrollToBottom(messagesRef.current);
     }, [chatMessages.value]);
 
+    const grouped = groupMessages(chatMessages.value);
+
     return html`
         <div id="chat">
             <div id="messages" ref=${messagesRef}>
-                ${chatMessages.value.length === 0 && html`
+                ${grouped.length === 0 && html`
                     <div style="color: var(--text-disabled); font-style: italic; padding: var(--space-8); text-align: center; font-size: var(--text-sm);">
                         No messages yet. Send a message to start.
                     </div>
                 `}
-                ${chatMessages.value.map((m, i) => {
+                ${grouped.map((m, i) => {
+                    if (m.type === 'subagent-group') {
+                        return html`<${SubagentGroup} key=${'sg-'+i} header=${m.header} children=${m.children} />`;
+                    }
                     if (m.type === 'user' || m.type === 'agent') {
                         return html`<${Message} key=${i} type=${m.type} text=${m.text} sealed=${m.sealed} />`;
                     }
