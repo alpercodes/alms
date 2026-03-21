@@ -125,6 +125,7 @@ impl SseEventData {
         approval_id: &str,
         capability: &str,
         request: serde_json::Value,
+        source_agent: Option<String>,
     ) -> Self {
         Self::new(
             "approval_required",
@@ -133,6 +134,7 @@ impl SseEventData {
                 approval_id: approval_id.to_string(),
                 capability: capability.to_string(),
                 request,
+                source_agent,
             },
         )
     }
@@ -337,6 +339,8 @@ struct ApprovalRequiredData {
     approval_id: String,
     capability: String,
     request: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

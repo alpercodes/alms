@@ -826,6 +826,7 @@ async fn forward_runtime_events(
                 tool,
                 params,
                 decision_tx,
+                source_agent,
             } => {
                 let request = serde_json::json!({"tool": &tool, "params": &params});
                 approval_store.insert(PendingApproval {
@@ -845,6 +846,7 @@ async fn forward_runtime_events(
                             &approval_id.to_string(),
                             &tool,
                             request,
+                            source_agent,
                         ),
                     )
                     .await;

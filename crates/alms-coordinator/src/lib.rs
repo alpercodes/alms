@@ -865,10 +865,10 @@ async fn run_agent_loop(
                 match &mut event {
                     RuntimeEvent::ToolStart { source_agent, .. }
                     | RuntimeEvent::ToolEnd { source_agent, .. }
-                    | RuntimeEvent::TokenDelta { source_agent, .. } => {
+                    | RuntimeEvent::TokenDelta { source_agent, .. }
+                    | RuntimeEvent::ApprovalRequired { source_agent, .. } => {
                         *source_agent = Some(label.clone());
                     }
-                    _ => {}
                 }
                 let _ = parent_tx.send(event);
             }
