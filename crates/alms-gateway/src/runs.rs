@@ -451,6 +451,9 @@ async fn execute_run(
         // Separate channel for background subagent events → session stream.
         // This is independent of the parent's runtime_tx, so it doesn't
         // block the parent run from finishing.
+        // Note: bg_run_id uses the parent's run_id. These events may arrive
+        // after the parent run has finished. The frontend uses source_agent
+        // (not run_id) for SubagentBar routing, so this is acceptable.
         let (bg_event_tx, bg_event_rx) = mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
         let bg_state = state.clone();
         let bg_session_id = session_id;
@@ -483,6 +486,15 @@ async fn execute_run(
                         result.clone(),
                         source_agent.clone(),
                     ),
+                    alms_runtime::RuntimeEvent::ApprovalRequired { tool, .. } => {
+                        warn!(
+                            "Background subagent requested approval for '{}' — \
+                             approvals are not supported for background subagents. \
+                             The subagent will hang until timeout.",
+                            tool
+                        );
+                        continue;
+                    }
                     _ => continue,
                 };
                 bg_state
