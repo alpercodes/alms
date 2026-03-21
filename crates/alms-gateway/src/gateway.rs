@@ -203,7 +203,15 @@ impl Gateway {
             }
             None => Arc::new(SessionManager::new(config.session_config.clone())),
         };
-        let llm = LlmClient::new(config.llm_config.clone())?;
+        // Resolve API key from secrets file if available, overriding env vars
+        let mut llm_config = config.llm_config.clone();
+        let secrets_path = alms_core::secrets::secrets_path_from_db(config.db_path.as_deref());
+        if let Ok(secrets) = alms_core::secrets::SecretsStore::load(&secrets_path) {
+            if let Some(key) = secrets.resolve_key(&llm_config.provider) {
+                llm_config.api_key = key;
+            }
+        }
+        let llm = LlmClient::new(llm_config)?;
 
         Ok(Self {
             config,
@@ -310,6 +318,7 @@ impl Gateway {
                             &self.session_manager,
                             &self.config.agent_config,
                             &self.llm,
+                            None, // Telegram path: no secrets access (uses startup-resolved key)
                         );
                         // Bootstrap detection: first-time agents get the
                         // bootstrap interview prompt instead of their default.

@@ -71,7 +71,7 @@ alms-cli → alms-gateway → alms-runtime    → alms-core
 
 Unified config in `alms-core/src/config.rs` (`AlmsConfig`):
 - **Layered precedence**: compiled defaults → `alms.toml` config file → env var overrides
-- **Secrets** (API keys, tokens) are ONLY loaded from env vars, never from config files (`#[serde(skip)]`)
+- **Secrets** (API keys, tokens): loaded from `data/secrets.json` (via `alms auth set` or UI) with fallback to env vars. Never stored in `alms.toml` (`#[serde(skip)]`)
 - See `alms.toml.example` for all options with documentation
 - Key env vars: `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `ALMS_LLM_PROVIDER` (`openai`|`anthropic`), `TELEGRAM_BOT_TOKEN`, `ALMS_LLM_MOCK=1`, `DEFAULT_MODEL`, `LLM_BASE_URL`, `ALMS_AGENT_ID`, `ALMS_AUTH_TOKEN`, `ALMS_SANDBOX_ROOT`, `ALMS_SHELL_POLICY`, `ALMS_WORKSPACE_DIR` (default: `./data/workspace`)
 - `GatewayConfig::from_env()` uses `AlmsConfig::load()` internally — single source of truth

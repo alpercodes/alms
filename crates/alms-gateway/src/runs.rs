@@ -51,6 +51,7 @@ pub fn resolve_agent_config(
     session_manager: &alms_session::SessionManager,
     base_config: &alms_runtime::AgentConfig,
     llm: &alms_runtime::LlmClient,
+    secrets: Option<&alms_core::secrets::SecretsStore>,
 ) -> ResolvedAgentConfig {
     let agent_record =
         session_manager
@@ -80,7 +81,11 @@ pub fn resolve_agent_config(
     let mut llm = llm.clone();
     if let Some(ref record) = agent_record {
         if let Some(ref provider) = record.provider {
-            llm = llm.with_provider(provider);
+            llm = if let Some(s) = secrets {
+                llm.with_provider_and_secrets(provider, s)
+            } else {
+                llm.with_provider(provider)
+            };
         }
     }
     if let Some(model) = merged.model_override {
@@ -341,6 +346,7 @@ async fn execute_run(
         &state.session_manager,
         &state.agent_config,
         &state.llm,
+        Some(&state.secrets.read().unwrap()),
     );
     let agent_name = resolved.agent_name;
     if state.workspace_dir.is_some() && agent_name.is_none() {

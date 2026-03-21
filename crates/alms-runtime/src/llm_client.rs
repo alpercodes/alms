@@ -444,19 +444,14 @@ impl LlmClient {
         self
     }
 
-    /// Override the LLM provider, reconfiguring base_url and api_key.
-    ///
-    /// Switches the client to use a different provider's API endpoint and
-    /// authentication. The api_key is resolved from environment variables
-    /// using the provider-aware selection rules.
-    pub fn with_provider(mut self, provider: &str) -> Self {
-        let new_provider = match provider {
+    /// Internal: switch provider, base_url, and resolve API key.
+    fn apply_provider(&mut self, provider: &str, resolve_key: impl FnOnce(&str) -> Option<String>) {
+        self.provider = match provider {
             "anthropic" => Provider::Anthropic,
-            "openrouter" => Provider::OpenAi, // OpenRouter uses OpenAI-compatible API
+            "openrouter" => Provider::OpenAi,
             _ => Provider::OpenAi,
         };
 
-        // Set provider-appropriate base URL (only if still on the default)
         match provider {
             "anthropic" => {
                 self.config.base_url = "https://api.anthropic.com/v1".to_string();
@@ -470,8 +465,7 @@ impl LlmClient {
             _ => {}
         }
 
-        // Resolve the api_key for the new provider from env vars
-        if let Some(key) = alms_core::config::select_llm_api_key_from_env(provider) {
+        if let Some(key) = resolve_key(provider) {
             self.config.api_key = key;
         } else {
             warn!(
@@ -481,7 +475,22 @@ impl LlmClient {
         }
 
         self.config.provider = provider.to_string();
-        self.provider = new_provider;
+    }
+
+    /// Override the LLM provider, resolving API key from env vars.
+    pub fn with_provider(mut self, provider: &str) -> Self {
+        self.apply_provider(provider, alms_core::config::select_llm_api_key_from_env);
+        self
+    }
+
+    /// Override the LLM provider, resolving API key from secrets store
+    /// (falls back to env vars if not in secrets).
+    pub fn with_provider_and_secrets(
+        mut self,
+        provider: &str,
+        secrets: &alms_core::secrets::SecretsStore,
+    ) -> Self {
+        self.apply_provider(provider, |p| secrets.resolve_key(p));
         self
     }
 

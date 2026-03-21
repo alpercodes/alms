@@ -944,6 +944,52 @@ header h1 {
 .settings-input:focus, .settings-select:focus { border-color: var(--accent); }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
 
+
+.api-key-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  font-size: var(--text-xs);
+  flex-wrap: wrap;
+}
+.api-key-provider {
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 90px;
+  font-family: var(--font-mono);
+}
+.api-key-value {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  flex: 1;
+}
+.api-key-value.set { color: var(--success); }
+.api-key-value.unset { color: var(--text-disabled); font-style: italic; }
+.api-key-source {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  background: var(--surface-3);
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-sm);
+}
+.api-key-actions { display: flex; gap: var(--space-1); }
+.api-key-btn {
+  font-size: var(--text-2xs);
+  font-family: var(--font-mono);
+  padding: 2px var(--space-2);
+  background: var(--surface-3);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+.api-key-btn:hover { background: var(--surface-4); color: var(--text-primary); }
+.api-key-btn.save { background: var(--accent); color: var(--text-inverse); border-color: var(--accent); }
+.api-key-btn.save:hover { background: var(--accent-hover); }
+.api-key-btn.remove { color: var(--error); }
+.api-key-btn.remove:hover { background: var(--error-muted); }
+.api-key-row .settings-input { flex: 1; min-width: 200px; }
 .settings-divider {
   border-top: 1px solid var(--border-subtle);
   margin: var(--space-1) 0;

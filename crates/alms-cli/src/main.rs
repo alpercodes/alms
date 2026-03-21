@@ -1,10 +1,12 @@
 mod cmd_agent;
+mod cmd_auth;
 mod cmd_job;
 mod cmd_run;
 mod cmd_session;
 mod helpers;
 
 use cmd_agent::AgentCommands;
+use cmd_auth::AuthCommands;
 use cmd_job::JobCommands;
 use cmd_run::RunCommands;
 use cmd_session::SessionCommands;
@@ -68,6 +70,14 @@ enum Commands {
     Session {
         #[command(subcommand)]
         cmd: SessionCommands,
+        /// Output as JSON instead of human-readable text
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// Manage API keys for LLM providers
+    Auth {
+        #[command(subcommand)]
+        cmd: AuthCommands,
         /// Output as JSON instead of human-readable text
         #[arg(long, global = true)]
         json: bool,
@@ -227,6 +237,22 @@ async fn main() -> anyhow::Result<()> {
                 }
                 SessionCommands::Delete { session_id } => {
                     cmd_session::session_delete(&store, &session_id, json)?;
+                }
+            }
+        }
+        Commands::Auth { cmd, json } => {
+            let data_dir: std::path::PathBuf = std::env::var("ALMS_DATA_DIR")
+                .unwrap_or_else(|_| "./data".to_string())
+                .into();
+            match cmd {
+                AuthCommands::Set { provider, key } => {
+                    cmd_auth::auth_set(&data_dir, &provider, key, json)?;
+                }
+                AuthCommands::List => {
+                    cmd_auth::auth_list(&data_dir, json)?;
+                }
+                AuthCommands::Remove { provider } => {
+                    cmd_auth::auth_remove(&data_dir, &provider, json)?;
                 }
             }
         }

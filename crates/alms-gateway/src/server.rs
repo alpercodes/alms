@@ -6,6 +6,7 @@ use crate::agents;
 use crate::api_error;
 use crate::approvals::{ApprovalStore, list_approvals, resolve_approval};
 use crate::auth::{AuthToken, require_auth};
+use crate::auth_keys;
 use crate::cron_utils;
 use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
@@ -268,6 +269,8 @@ pub struct AppState {
     pub llm: alms_runtime::LlmClient,
     /// Auth token — read once at startup.
     pub auth_token_value: Option<String>,
+    /// Shared secrets store for API key management.
+    pub secrets: Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>,
 }
 
 impl AppState {
@@ -285,7 +288,8 @@ impl AppState {
         let llm_config = gateway.llm_config().clone();
         let agent_config = gateway.agent_config().clone();
         let auth_token_value = gateway.auth_token().map(String::from);
-        let job_store = match gateway.db_path() {
+        let db_path_str = gateway.db_path().map(String::from);
+        let job_store = match db_path_str.as_deref() {
             Some(path) => {
                 tracing::info!("Opening SQLite job store at {}", path);
                 Arc::new(JobStore::with_sqlite(path)?)
@@ -345,6 +349,15 @@ impl AppState {
             default_agent_id,
             llm,
             auth_token_value,
+            secrets: {
+                let secrets_path = alms_core::secrets::secrets_path_from_db(db_path_str.as_deref());
+                Arc::new(std::sync::RwLock::new(
+                    alms_core::secrets::SecretsStore::load(secrets_path).unwrap_or_else(|e| {
+                        tracing::warn!("Failed to load secrets: {e}");
+                        alms_core::secrets::SecretsStore::empty()
+                    }),
+                ))
+            },
         })
     }
 }
@@ -408,6 +421,15 @@ fn protected_router() -> Router<AppState> {
         // Coordinator tasks (active subagents)
         .route("/tasks", get(list_tasks))
         .route("/tasks/{task_id}", get(get_task))
+        // API key management
+        .route(
+            "/auth/keys",
+            get(auth_keys::list_keys).put(auth_keys::set_key),
+        )
+        .route(
+            "/auth/keys/{provider}",
+            axum::routing::delete(auth_keys::remove_key),
+        )
         .route("/ws", get(websocket_handler))
 }
 

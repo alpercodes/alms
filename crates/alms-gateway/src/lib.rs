@@ -23,6 +23,7 @@
 pub mod agents;
 pub mod approvals;
 pub mod auth;
+pub mod auth_keys;
 pub mod cron_utils;
 pub mod event_log;
 pub mod gateway;

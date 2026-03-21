@@ -1,5 +1,110 @@
 import { html, useSignal, useEffect } from '../deps.js';
 import { serverDefaults, localSettings, saveSettings } from '../state/settings.js';
+import { listKeys, setKey, removeKey } from '../api/auth.js';
+
+const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
+
+function ApiKeysSection() {
+    const keys = useSignal([]);
+    const editing = useSignal(null);
+    const newKey = useSignal('');
+    const saving = useSignal(false);
+    const error = useSignal('');
+
+    const refresh = async () => {
+        try {
+            const data = await listKeys();
+            keys.value = data.keys || [];
+        } catch (err) {
+            console.error('[auth] list keys failed:', err);
+        }
+    };
+
+    useEffect(() => { refresh(); }, []);
+
+    const onSave = async (provider) => {
+        if (!newKey.value.trim()) return;
+        saving.value = true;
+        error.value = '';
+        try {
+            await setKey(provider, newKey.value.trim());
+            newKey.value = '';
+            editing.value = null;
+            await refresh();
+        } catch (err) {
+            error.value = err.error?.message || err.message || 'Failed to save key';
+        } finally {
+            saving.value = false;
+        }
+    };
+
+    const onRemove = async (provider) => {
+        try {
+            await removeKey(provider);
+            await refresh();
+        } catch (err) {
+            error.value = err.error?.message || err.message || 'Failed to remove key';
+        }
+    };
+
+    return html`
+        <div class="settings-row">
+            <label class="settings-label">API Keys</label>
+            ${PROVIDERS.map(p => {
+                const info = keys.value.find(k => k.provider === p);
+                const configured = info?.configured;
+                const source = info?.source || 'none';
+                const masked = info?.key || '';
+
+                if (editing.value === p) {
+                    return html`
+                        <div class="api-key-row" key=${p}>
+                            <span class="api-key-provider">${p}</span>
+                            <input class="settings-input" type="password"
+                                   placeholder="Paste API key..."
+                                   value=${newKey.value}
+                                   onInput=${e => { newKey.value = e.target.value; }}
+                                   onKeyDown=${e => { if (e.key === 'Enter') onSave(p); }} />
+                            <div class="api-key-actions">
+                                <button class="api-key-btn save" onClick=${() => onSave(p)}
+                                        disabled=${saving.value}>
+                                    ${saving.value ? '...' : 'Save'}
+                                </button>
+                                <button class="api-key-btn" onClick=${() => { editing.value = null; newKey.value = ''; }}>
+                                    Cancel
+                                </button>
+                            </div>
+                        </div>
+                    `;
+                }
+
+                return html`
+                    <div class="api-key-row" key=${p}>
+                        <span class="api-key-provider">${p}</span>
+                        <span class="api-key-value ${configured ? 'set' : 'unset'}">
+                            ${configured ? masked : 'not configured'}
+                        </span>
+                        ${configured && source === 'secrets' && html`
+                            <span class="api-key-source">stored</span>
+                        `}
+                        ${configured && source === 'env' && html`
+                            <span class="api-key-source">env var</span>
+                        `}
+                        <div class="api-key-actions">
+                            <button class="api-key-btn" onClick=${() => { editing.value = p; newKey.value = ''; }}>
+                                ${configured ? 'Change' : 'Set'}
+                            </button>
+                            ${configured && source === 'secrets' && html`
+                                <button class="api-key-btn remove" onClick=${() => onRemove(p)}>Remove</button>
+                            `}
+                        </div>
+                    </div>
+                `;
+            })}
+            ${error.value && html`<div style="color:var(--error); font-size:var(--text-xs);">${error.value}</div>`}
+        </div>
+    `;
+}
 
 export function SettingsModal({ open, onClose }) {
     const model = useSignal('');
@@ -7,7 +112,6 @@ export function SettingsModal({ open, onClose }) {
     const posture = useSignal('');
     const saved = useSignal(false);
 
-    // Reset form values when modal opens
     useEffect(() => {
         if (open) {
             model.value = localSettings.value.model || '';
@@ -52,6 +156,10 @@ export function SettingsModal({ open, onClose }) {
             <div class="settings-modal">
                 <h2>Settings</h2>
 
+                <${ApiKeysSection} />
+
+                <div class="settings-divider"></div>
+
                 <div class="settings-row">
                     <label class="settings-label">Model override</label>
                     <input class="settings-input" type="text"
@@ -93,7 +201,6 @@ export function SettingsModal({ open, onClose }) {
                         <div>Base URL: <span class="settings-info-value">${defaults.base_url || 'unknown'}</span></div>
                         <div>Context: <span class="settings-info-value">${defaults.context_strategy || 'truncate'}</span></div>
                         <div>Tools: <span class="settings-info-value">${(defaults.enabled_tools || []).length} enabled</span></div>
-                        <div>Workspace: <span class="settings-info-value">${defaults.workspace_dir || 'not configured'}</span></div>
                     </div>
                 </div>
 
