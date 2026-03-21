@@ -79,14 +79,14 @@ pub fn resolve_agent_config(
     // Apply per-agent provider override first (changes base_url + api_key),
     // then model override on top.
     let mut llm = llm.clone();
-    if let Some(ref record) = agent_record {
-        if let Some(ref provider) = record.provider {
-            llm = if let Some(s) = secrets {
-                llm.with_provider_and_secrets(provider, s)
-            } else {
-                llm.with_provider(provider)
-            };
-        }
+    if let Some(ref record) = agent_record
+        && let Some(ref provider) = record.provider
+    {
+        llm = if let Some(s) = secrets {
+            llm.with_provider_and_secrets(provider, s)
+        } else {
+            llm.with_provider(provider)
+        };
     }
     if let Some(model) = merged.model_override {
         llm = llm.with_model(model);
@@ -422,7 +422,7 @@ async fn execute_run(
     }
     .with_event_sender(runtime_tx)
     .with_run_id(run_id)
-    .with_cancel_token(cancel_token);
+    .with_cancel_token(cancel_token.clone());
 
     // Attach workspace if configured — registers the workspace_write tool for this run
     if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
@@ -432,6 +432,8 @@ async fn execute_run(
 
     // Register invoke_agent + get_task_result tools.
     // Subagent events are forwarded into this run's SSE stream.
+    // The cancel_token is passed to InvokeAgentTool so that cancelling the
+    // parent run propagates to all subagents spawned during this run.
     {
         let dispatcher: std::sync::Arc<dyn alms_runtime::SubagentDispatcher> =
             state.coordinator.clone();
@@ -441,7 +443,8 @@ async fn execute_run(
             session_id,
             Some(run_id),
             Some(invoke_agent_tx),
-        );
+        )
+        .with_cancel_token(cancel_token);
         let read_session_tool =
             alms_runtime::ReadSubagentSessionTool::new(state.session_manager.clone(), session_id);
         runtime = runtime

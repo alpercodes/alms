@@ -8,6 +8,7 @@
 use crate::events::RuntimeEventSender;
 use alms_core::{AlmsError, AlmsResult, RunId, SessionId};
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Outcome of polling a background subagent task.
@@ -42,6 +43,7 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<RuntimeEventSender>,
         subagent_name: Option<String>,
+        parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<String>;
 
     /// Fire a subagent in the background and return its task ID immediately.
@@ -56,6 +58,7 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
         _parent_run_id: Option<RunId>,
         _parent_event_tx: Option<RuntimeEventSender>,
         _subagent_name: Option<String>,
+        _parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<Uuid> {
         Err(AlmsError::Runtime(
             "dispatch_background not supported by this dispatcher".to_string(),

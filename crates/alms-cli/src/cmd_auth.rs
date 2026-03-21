@@ -103,7 +103,7 @@ pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
             .collect();
         println!("{}", serde_json::to_string_pretty(&entries)?);
     } else {
-        println!("{:<15} {:<12} {}", "PROVIDER", "SOURCE", "KEY");
+        println!("{:<15} {:<12} KEY", "PROVIDER", "SOURCE");
         println!("{}", "-".repeat(50));
         for p in VALID_PROVIDERS {
             let env_key = alms_core::config::select_llm_api_key_from_env(p);

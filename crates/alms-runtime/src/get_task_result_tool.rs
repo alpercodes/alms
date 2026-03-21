@@ -85,6 +85,7 @@ mod tests {
     use crate::events::RuntimeEventSender;
     use alms_core::{AlmsResult, RunId, SessionId};
     use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
 
     #[derive(Debug)]
     struct MockDispatcher(PollResult);
@@ -98,6 +99,7 @@ mod tests {
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
             _subagent_name: Option<String>,
+            _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<String> {
             Ok("ok".to_string())
         }
