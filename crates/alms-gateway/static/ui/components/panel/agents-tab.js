@@ -68,8 +68,9 @@ function AgentEditModal({ agent, onClose }) {
                             value=${provider.value}
                             onChange=${e => { provider.value = e.target.value; }}>
                         <option value="">Server default</option>
-                        <option value="openai">OpenAI / OpenRouter</option>
+                        <option value="openai">OpenAI</option>
                         <option value="anthropic">Anthropic</option>
+                        <option value="openrouter">OpenRouter</option>
                     </select>
                 </div>
 
