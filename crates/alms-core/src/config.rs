@@ -33,6 +33,7 @@ pub fn select_llm_api_key(
     match provider {
         "anthropic" => anthropic_key.or(openai_key).or(openrouter_key),
         "openai" => openai_key.or(openrouter_key).or(anthropic_key),
+        "openrouter" => openrouter_key.or(openai_key).or(anthropic_key),
         _ => openai_key.or(openrouter_key).or(anthropic_key),
     }
 }
