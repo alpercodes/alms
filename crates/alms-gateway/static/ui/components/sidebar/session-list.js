@@ -8,6 +8,7 @@ import { auditEvents } from '../../state/audit.js';
 import { listSessions, createSession, getSessionMessages } from '../../api/sessions.js';
 import { listRuns } from '../../api/runs.js';
 import { mapHistoryMessages } from '../../utils/history.js';
+import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
 
 function hasActiveRun(sessionId) {
     if (sessionId === activeSessionId.value && activeRunId.value) return true;
@@ -18,6 +19,7 @@ function hasActiveRun(sessionId) {
 async function selectSession(sessionId) {
     if (sessionId === activeSessionId.value) return;
 
+    closeSessionStream();
     activeSessionId.value = sessionId;
     chatMessages.value = [];
     auditEvents.value = null;
@@ -37,6 +39,8 @@ async function selectSession(sessionId) {
     } catch {
         chatMessages.value = [];
     }
+
+    openSessionStream(sessionId);
 }
 
 async function newSession() {
@@ -50,6 +54,7 @@ async function newSession() {
         activeSessionId.value = resp.session_id;
         chatMessages.value = [];
         runs.value = [];
+        openSessionStream(resp.session_id);
     } catch (err) {
         console.error('[newSession] failed:', err);
     }

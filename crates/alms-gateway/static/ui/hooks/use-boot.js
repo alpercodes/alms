@@ -10,6 +10,7 @@ import { chatMessages } from '../state/chat.js';
 import { messageQueue, bgRuns } from '../state/queue.js';
 import { wsFiles } from '../state/workspace.js';
 import { auditEvents } from '../state/audit.js';
+import { openSessionStream, closeSessionStream } from './use-session-stream.js';
 
 const AGENT_KEY = 'alms_active_agent';
 
@@ -54,6 +55,8 @@ async function loadAgentSessions(agentId) {
                 loadHistory(latest.id),
                 loadRunHistory(latest.id),
             ]);
+            // Open persistent session stream
+            openSessionStream(latest.id);
         } else {
             // Create a first session
             const ctx = 'web-chat-' + Date.now();
@@ -63,6 +66,8 @@ async function loadAgentSessions(agentId) {
             activeSessionId.value = resp.session_id;
             chatMessages.value = [];
             runs.value = [];
+            // Open persistent session stream
+            openSessionStream(resp.session_id);
         }
     } catch (err) {
         console.error('[loadAgentSessions] failed:', err);
@@ -100,6 +105,8 @@ async function loadRunHistory(sessionId) {
 export async function switchAgent(agentId) {
     const agent = agents.value.find(a => a.id === agentId);
     if (!agent) return;
+
+    closeSessionStream(); // close previous session stream
 
     activeAgentId.value = agentId;
     localStorage.setItem(AGENT_KEY, agentId);

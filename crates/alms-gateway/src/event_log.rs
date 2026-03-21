@@ -105,3 +105,60 @@ impl EventLogManager {
         }
     }
 }
+
+/// Session-level event log — stores events across all runs in a session.
+///
+/// Uses its own monotonic event ID counter (separate from per-run IDs)
+/// so that `Last-Event-ID` reconnect works correctly at the session level.
+#[derive(Debug, Default, Clone)]
+pub struct SessionEventLogManager {
+    logs: Arc<RwLock<HashMap<SessionId, EventLog>>>,
+}
+
+impl SessionEventLogManager {
+    pub fn new() -> Self {
+        Self {
+            logs: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn get_or_create(&self, session_id: SessionId) -> EventLog {
+        let mut logs = self.logs.write().await;
+        logs.get(&session_id).cloned().unwrap_or_else(|| {
+            let log = EventLog::new();
+            logs.insert(session_id, log.clone());
+            log
+        })
+    }
+
+    pub async fn log_event(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        event_type: &str,
+        data: serde_json::Value,
+    ) -> u64 {
+        let log = self.get_or_create(session_id).await;
+        let event_id = log.next_event_id().await;
+
+        let event = LoggedEvent {
+            event_id,
+            run_id,
+            session_id,
+            event_type: event_type.to_string(),
+            data,
+            ts: Utc::now(),
+        };
+
+        log.append(event).await;
+        event_id
+    }
+
+    pub async fn events_from(&self, session_id: SessionId, from_id: u64) -> Vec<LoggedEvent> {
+        let logs = self.logs.read().await;
+        match logs.get(&session_id) {
+            Some(log) => log.events_from(from_id).await,
+            None => Vec::new(),
+        }
+    }
+}

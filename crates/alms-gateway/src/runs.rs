@@ -259,6 +259,16 @@ pub async fn create_run(
 
     state.run_manager.insert_run(run.clone());
 
+    // Notify session-level SSE subscribers that a new run was created.
+    state
+        .run_manager
+        .send_session_event(
+            session_id,
+            run_id,
+            SseEventData::run_created(run_id, session_id, false),
+        )
+        .await;
+
     // Create per-run cancellation token BEFORE enqueue so cancelling a
     // queued-but-not-yet-started run works.
     let cancel_token = CancellationToken::new();
@@ -686,6 +696,16 @@ pub(crate) async fn completion_notification_loop(
         let run_id = run.run_id;
         state.run_manager.insert_run(run);
 
+        // Notify session-level SSE subscribers about the notification run.
+        state
+            .run_manager
+            .send_session_event(
+                session_id,
+                run_id,
+                SseEventData::run_created(run_id, session_id, true),
+            )
+            .await;
+
         info!(
             run_id = %run_id.0,
             session_id = %session_id.0,
@@ -972,6 +992,58 @@ pub async fn stream_run_events(
         }
         Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
     }
+}
+
+/// GET /sessions/{session_id}/events — persistent session-level SSE stream.
+///
+/// Unlike the per-run endpoint, this stream stays open across runs.
+/// All events from any run on this session are forwarded, including
+/// notification runs from subagent completions.
+#[instrument(level = "info", skip(state, headers), fields(session_id = %session_id.0))]
+pub async fn stream_session_events(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Verify session exists
+    state
+        .session_manager
+        .get(session_id)
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found"))?;
+
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
+
+    let (tx, rx) = event_channel();
+    state.run_manager.register_session_sender(session_id, tx);
+
+    // Replay missed events on reconnect
+    let logged_events = state
+        .run_manager
+        .session_events_from(session_id, from_id)
+        .await;
+    let replay_events: Vec<SseEventData> = logged_events
+        .into_iter()
+        .map(|e| SseEventData {
+            event_type: e.event_type,
+            data: e.data,
+            ts: e.ts,
+            event_id: Some(e.event_id),
+        })
+        .collect();
+
+    if !replay_events.is_empty() {
+        info!(
+            "Replaying {} session events for {}",
+            replay_events.len(),
+            session_id.0
+        );
+    }
+
+    Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
 }
 
 #[cfg(test)]

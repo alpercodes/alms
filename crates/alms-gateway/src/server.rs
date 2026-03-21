@@ -49,6 +49,10 @@ pub struct RunManager {
     pub runs: Arc<DashMap<RunId, Run>>,
     /// Persistent event log for reconnect-after-restart support
     pub event_log: EventLogManager,
+    /// Session-level event senders for persistent SSE streams.
+    pub session_senders: Arc<DashMap<SessionId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
+    /// Session-level event log for reconnect support.
+    pub session_event_log: crate::event_log::SessionEventLogManager,
     /// Counter of in-flight (spawned but not yet finished) run tasks.
     in_flight: Arc<AtomicUsize>,
     /// Notified when an in-flight run completes (counter reaches zero).
@@ -63,6 +67,8 @@ impl RunManager {
             event_senders: Arc::new(DashMap::new()),
             runs: Arc::new(DashMap::new()),
             event_log: EventLogManager::new(),
+            session_senders: Arc::new(DashMap::new()),
+            session_event_log: crate::event_log::SessionEventLogManager::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: Arc::new(DashMap::new()),
@@ -210,12 +216,13 @@ impl RunManager {
 
     /// Send event to all active subscribers AND persist to event log.
     /// Dead subscribers (closed channels) are pruned automatically.
+    /// Fans out to both per-run and per-session subscribers.
     pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
+        // Per-run event log + fan-out
         let event_id = self
             .event_log
             .log_event(run_id, session_id, &event.event_type, event.data.clone())
             .await;
-
         event.event_id = Some(event_id);
 
         if let Some(mut senders) = self.event_senders.get_mut(&run_id) {
@@ -226,11 +233,68 @@ impl RunManager {
                 tracing::debug!(run_id = %run_id.0, pruned, "Pruned dead SSE subscriber(s)");
             }
         }
+
+        // Per-session event log + fan-out
+        let session_event_id = self
+            .session_event_log
+            .log_event(session_id, run_id, &event.event_type, event.data.clone())
+            .await;
+        let mut session_event = event;
+        session_event.event_id = Some(session_event_id);
+
+        if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
+            senders.retain(|sender| sender.send(session_event.clone()).is_ok());
+        }
     }
 
-    /// Get events from a specific ID for reconnect
+    /// Send a session-only event (not associated with a specific run).
+    pub async fn send_session_event(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        event: SseEventData,
+    ) {
+        let session_event_id = self
+            .session_event_log
+            .log_event(session_id, run_id, &event.event_type, event.data.clone())
+            .await;
+        let mut tagged = event;
+        tagged.event_id = Some(session_event_id);
+
+        if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
+            senders.retain(|sender| sender.send(tagged.clone()).is_ok());
+        }
+    }
+
+    pub fn register_session_sender(
+        &self,
+        session_id: SessionId,
+        sender: mpsc::UnboundedSender<SseEventData>,
+    ) {
+        self.session_senders
+            .entry(session_id)
+            .or_default()
+            .push(sender);
+    }
+
+    pub fn remove_session_senders(&self, session_id: SessionId) {
+        self.session_senders.remove(&session_id);
+    }
+
+    /// Get per-run events from a specific ID for reconnect
     pub async fn events_from(&self, run_id: RunId, from_id: u64) -> Vec<LoggedEvent> {
         self.event_log.events_from(run_id, from_id).await
+    }
+
+    /// Get per-session events from a specific ID for reconnect
+    pub async fn session_events_from(
+        &self,
+        session_id: SessionId,
+        from_id: u64,
+    ) -> Vec<LoggedEvent> {
+        self.session_event_log
+            .events_from(session_id, from_id)
+            .await
     }
 }
 
@@ -384,6 +448,10 @@ fn protected_router() -> Router<AppState> {
         // Sessions
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{session_id}/messages", get(get_session_messages))
+        .route(
+            "/sessions/{session_id}/events",
+            get(crate::runs::stream_session_events),
+        )
         .route("/sessions/{agent_id}/{context_id}", get(get_session))
         // Runs (canonical API per spec)
         .route("/runs", get(list_runs).post(create_run))
