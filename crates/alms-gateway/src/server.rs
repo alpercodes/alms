@@ -242,10 +242,10 @@ impl RunManager {
         let is_delta = event.event_type == "token_delta";
 
         let session_event = if is_delta {
-            // Fast path: no logging, just fan out with a synthetic event_id
-            let mut e = event;
-            e.event_id = Some(0); // placeholder — not used for replay
-            e
+            // Fast path: no logging, just fan out. Leave event_id as None
+            // so the dedup filter in stream_with_replay passes it through
+            // (dedup only drops Some(id) where id <= max_replay_id).
+            event
         } else {
             let session_event_id = self
                 .session_event_log
