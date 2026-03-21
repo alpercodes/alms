@@ -121,9 +121,10 @@ export function startSubagentPoll(onAllDone) {
             const data = await listTasks();
             const allTasks = data.tasks || [];
 
-            // Cross-reference: check which of OUR running subagents are
-            // still active in the coordinator, not the global count.
-            const runningNames = getRunningNames();
+            // Check if any coordinator tasks are still active.
+            // Note: this is a global check, not per-subagent, since the
+            // tasks API doesn't expose subagent names. Bounded by
+            // MAX_POLL_COUNT so it won't poll forever.
             const stillActive = allTasks.some(t =>
                 (t.status === 'Running' || t.status === 'Pending')
             );
