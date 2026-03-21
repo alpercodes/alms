@@ -12,10 +12,19 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// In-memory secrets store backed by a JSON file.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SecretsStore {
     path: PathBuf,
     keys: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for SecretsStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretsStore")
+            .field("path", &self.path)
+            .field("providers", &self.keys.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -76,11 +85,15 @@ impl SecretsStore {
     }
 
     /// Mask a key for display: show first 4 and last 4 chars.
+    /// Safe for non-ASCII keys (uses char boundaries).
     pub fn masked_key(key: &str) -> String {
-        if key.len() <= 12 {
-            return "*".repeat(key.len());
+        let chars: Vec<char> = key.chars().collect();
+        if chars.len() <= 12 {
+            return "*".repeat(chars.len());
         }
-        format!("{}...{}", &key[..4], &key[key.len() - 4..])
+        let prefix: String = chars[..4].iter().collect();
+        let suffix: String = chars[chars.len() - 4..].iter().collect();
+        format!("{prefix}...{suffix}")
     }
 
     /// Get a masked version of a key for a provider.
