@@ -283,8 +283,9 @@ mod tests {
             }),
         );
 
-        // Give handler time to start processing normal1 (blocked on gate)
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Yield to let the handler task start processing normal1 (blocked on gate)
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
 
         let tx2 = tx.clone();
         queue.enqueue_low(
