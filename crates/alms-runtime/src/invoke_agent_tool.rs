@@ -23,6 +23,10 @@ pub struct InvokeAgentTool {
     /// Parent run's cancellation token — threaded into subagent dispatch so
     /// cancelling the parent also cancels active subagents.
     parent_cancel_token: Option<CancellationToken>,
+    /// Separate event sender for background subagents. Goes to session
+    /// subscribers directly (not through the parent's runtime channel)
+    /// so it doesn't block the parent run from finishing.
+    background_event_tx: Option<RuntimeEventSender>,
 }
 
 impl InvokeAgentTool {
@@ -38,7 +42,15 @@ impl InvokeAgentTool {
             parent_run_id,
             parent_event_tx,
             parent_cancel_token: None,
+            background_event_tx: None,
         }
+    }
+
+    /// Attach a separate event sender for background subagent dispatch.
+    /// Events from background subagents flow to session subscribers directly.
+    pub fn with_background_event_tx(mut self, tx: RuntimeEventSender) -> Self {
+        self.background_event_tx = Some(tx);
+        self
     }
 
     /// Attach the parent run's cancellation token so that cancelling the parent
@@ -115,21 +127,17 @@ impl Tool for InvokeAgentTool {
             .unwrap_or(false);
 
         if background {
-            // Background subagents do NOT receive the parent's event sender.
-            // Passing it would keep the parent's runtime_rx channel alive
-            // (via the forwarding task's clone), preventing the parent run
-            // from finishing until the subagent completes — defeating the
-            // purpose of background dispatch. See #231.
-            //
-            // Background subagents use the completion notification channel
-            // instead of real-time event forwarding.
+            // Background subagents use a SEPARATE event sender that goes to
+            // session subscribers directly (not through the parent's runtime
+            // channel). This provides live activity for the SubagentBar
+            // without blocking the parent run from finishing. See #231.
             let task_id = self
                 .dispatcher
                 .dispatch_background(
                     task,
                     self.parent_session_id,
                     self.parent_run_id,
-                    None, // no parent event forwarding for background
+                    self.background_event_tx.clone(),
                     subagent_name,
                     self.parent_cancel_token.clone(),
                 )

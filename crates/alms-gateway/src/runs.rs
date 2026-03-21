@@ -448,13 +448,58 @@ async fn execute_run(
         let dispatcher: std::sync::Arc<dyn alms_runtime::SubagentDispatcher> =
             state.coordinator.clone();
         let get_task_tool = alms_runtime::GetTaskResultTool::new(dispatcher.clone());
+        // Separate channel for background subagent events → session stream.
+        // This is independent of the parent's runtime_tx, so it doesn't
+        // block the parent run from finishing.
+        let (bg_event_tx, bg_event_rx) = mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
+        let bg_state = state.clone();
+        let bg_session_id = session_id;
+        let bg_run_id = run_id;
+        tokio::spawn(async move {
+            let mut rx = bg_event_rx;
+            while let Some(event) = rx.recv().await {
+                let sse = match &event {
+                    alms_runtime::RuntimeEvent::ToolStart {
+                        invocation_id,
+                        tool,
+                        params,
+                        source_agent,
+                    } => SseEventData::tool_start(
+                        bg_run_id,
+                        crate::sse::ToolInvocationId(*invocation_id),
+                        tool,
+                        params.clone(),
+                        source_agent.clone(),
+                    ),
+                    alms_runtime::RuntimeEvent::ToolEnd {
+                        invocation_id,
+                        ok,
+                        result,
+                        source_agent,
+                    } => SseEventData::tool_end(
+                        bg_run_id,
+                        crate::sse::ToolInvocationId(*invocation_id),
+                        *ok,
+                        result.clone(),
+                        source_agent.clone(),
+                    ),
+                    _ => continue,
+                };
+                bg_state
+                    .run_manager
+                    .send_session_event(bg_session_id, bg_run_id, sse)
+                    .await;
+            }
+        });
+
         let invoke_tool = alms_runtime::InvokeAgentTool::new(
             dispatcher,
             session_id,
             Some(run_id),
             Some(invoke_agent_tx),
         )
-        .with_cancel_token(cancel_token);
+        .with_cancel_token(cancel_token)
+        .with_background_event_tx(bg_event_tx);
         let read_session_tool =
             alms_runtime::ReadSubagentSessionTool::new(state.session_manager.clone(), session_id);
         runtime = runtime
