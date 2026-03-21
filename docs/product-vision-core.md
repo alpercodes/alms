@@ -57,4 +57,37 @@ Both modes share the same core: persistent agents with identity, workspace, tool
 
 ---
 
+## Implementation Layers
+
+The vision breaks down into three layers of increasing difficulty. Each is independently useful.
+
+### Layer 1 — Agents working independently on a shared project
+
+Agents have persistent identity, tools, workspace, and can act on a shared repository. They execute tasks on their own — write code, run tests, open PRs — but don't talk to each other directly.
+
+**Status**: Mostly built. Agent runtime, workspace files, tool execution, scheduling, persistence all exist.
+
+### Layer 2 — Peer-to-peer communication between agents
+
+Agents can send messages to each other asynchronously. Not just "invoke and wait for result" (the current hierarchy model), but actual ongoing conversations. This requires:
+
+- **Message bus**: Agent A sends a message to Agent B's session; B gets notified and processes it
+- **Agent-to-agent sessions**: Like user-to-agent sessions, but both sides are agents
+- **Group sessions**: Multiple agents in one conversation
+- **Always-on listeners**: Agents that are running and waiting for incoming messages, not just invoked per-task
+
+This is the biggest architectural gap. The current design is pure hierarchy (parent spawns child, child returns result, no peer messaging). This layer changes that.
+
+### Layer 3 — Emergent team dynamics
+
+Agents know *when* and *how* to collaborate without being told every step. Scheduled standups happen automatically. A developer agent knows to request a review after opening a PR. A PM agent notices a blocker and reassigns work.
+
+This is less about infrastructure and more about agent behavior — prompt engineering, role definitions, and teaching agents the team's workflow. The infrastructure from Layer 2 makes it possible; Layer 3 makes it feel natural.
+
+### Approach
+
+Build in order: Layer 1 (done) → Layer 2 (peer DMs first, then group chats) → Layer 3 (scheduled rituals, behavioral patterns).
+
+---
+
 *This is the product. Everything else — the Rust binary, the WASM sandbox, the SSE streaming, the multi-agent hierarchy — is infrastructure in service of this idea.*
