@@ -133,10 +133,16 @@ export function openForegroundStream(runId, { onDone, _retryCount = 0 } = {}) {
             : msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
         if (idx >= 0) {
             msgs[idx] = { ...msgs[idx], status, result: data.result };
-            // If invoke_agent finished, update subagent tracking
+            // If invoke_agent finished, update subagent tracking.
+            // But NOT for background dispatch — tool_end fires immediately
+            // with a task_id result while the subagent is still running.
             if (msgs[idx].tool === 'invoke_agent') {
                 const name = msgs[idx].params?.name || msgs[idx].params?.subagent_name;
-                if (name) trackSubagentEnd(name, status);
+                const resultObj = typeof data.result === 'string' ? (() => { try { return JSON.parse(data.result); } catch { return null; } })() : data.result;
+                const isBackground = resultObj && resultObj.task_id;
+                if (name && !isBackground) {
+                    trackSubagentEnd(name, status);
+                }
             }
         }
         chatMessages.value = msgs;
