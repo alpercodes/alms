@@ -93,26 +93,27 @@ impl GatewayConfig {
     /// environment-variable overrides for db_path, workspace_dir, and
     /// agent_id.
     ///
-    /// Defaults to `./data/alms.db` for SQLite persistence and
-    /// `./data/workspace` for agent workspace files. Override with
-    /// `ALMS_DB_PATH` and `ALMS_WORKSPACE_DIR` env vars.
+    /// The data directory is resolved from `config.server.data_dir` (which
+    /// itself respects the `ALMS_DATA_DIR` env var). Individual paths can
+    /// still be overridden with `ALMS_DB_PATH` and `ALMS_WORKSPACE_DIR`.
     pub fn from_alms_config_with_env(config: &AlmsConfig) -> Self {
         let mut gateway_config = Self::from_alms_config(config);
 
-        gateway_config.db_path =
-            Some(std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| "./data/alms.db".to_string()));
+        let data_dir = &config.server.data_dir;
+
+        gateway_config.db_path = Some(config.server.db_path());
         gateway_config.workspace_dir = Some(
             std::env::var("ALMS_WORKSPACE_DIR")
                 .map(Into::into)
-                .unwrap_or_else(|_| std::path::PathBuf::from("./data/workspace")),
+                .unwrap_or_else(|_| std::path::PathBuf::from(format!("{data_dir}/workspace"))),
         );
 
-        // Ensure ./data/ exists before SQLite tries to open files there.
-        if let Err(e) = std::fs::create_dir_all("./data") {
-            tracing::warn!("Could not create ./data directory: {}", e);
+        // Ensure data dir exists before SQLite tries to open files there.
+        if let Err(e) = std::fs::create_dir_all(data_dir) {
+            tracing::warn!("Could not create data directory {}: {}", data_dir, e);
         }
 
-        gateway_config.agent_id = Some(resolve_default_agent_id(Path::new("./data")));
+        gateway_config.agent_id = Some(resolve_default_agent_id(Path::new(data_dir)));
 
         gateway_config
     }
