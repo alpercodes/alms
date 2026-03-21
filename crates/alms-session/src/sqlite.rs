@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS agents (
     model         TEXT,
     system_prompt TEXT,
     posture       TEXT,
+    provider      TEXT,
     is_default    INTEGER NOT NULL DEFAULT 0,
     created_at    TEXT NOT NULL,
     last_active   TEXT NOT NULL
@@ -116,6 +117,8 @@ impl SqliteStore {
             Connection::open(path).map_err(|e| AlmsError::Runtime(format!("SQLite open: {e}")))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| AlmsError::Runtime(format!("SQLite schema init: {e}")))?;
+        // Auto-migrate: add provider column if missing (existing DBs).
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN provider TEXT;");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -692,8 +695,8 @@ impl SqliteStore {
 
         tx.execute(
             "INSERT INTO agents \
-             (id, name, description, model, system_prompt, posture, is_default, created_at, last_active) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 agent.id.0.to_string(),
                 &agent.name,
@@ -701,6 +704,7 @@ impl SqliteStore {
                 agent.model.as_deref(),
                 agent.system_prompt.as_deref(),
                 agent.posture.as_deref(),
+                agent.provider.as_deref(),
                 1i32,
                 agent.created_at.to_rfc3339(),
                 agent.last_active.to_rfc3339(),
@@ -719,8 +723,8 @@ impl SqliteStore {
             .lock()
             .execute(
                 "INSERT INTO agents \
-                 (id, name, description, model, system_prompt, posture, is_default, created_at, last_active) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     agent.id.0.to_string(),
                     &agent.name,
@@ -728,6 +732,7 @@ impl SqliteStore {
                     agent.model.as_deref(),
                     agent.system_prompt.as_deref(),
                     agent.posture.as_deref(),
+                    agent.provider.as_deref(),
                     agent.is_default as i32,
                     agent.created_at.to_rfc3339(),
                     agent.last_active.to_rfc3339(),
@@ -754,12 +759,13 @@ impl SqliteStore {
             .lock()
             .execute(
                 "UPDATE agents SET description = ?1, model = ?2, system_prompt = ?3, \
-                 posture = ?4, last_active = ?5 WHERE id = ?6",
+                 posture = ?4, provider = ?5, last_active = ?6 WHERE id = ?7",
                 params![
                     &agent.description,
                     agent.model.as_deref(),
                     agent.system_prompt.as_deref(),
                     agent.posture.as_deref(),
+                    agent.provider.as_deref(),
                     agent.last_active.to_rfc3339(),
                     agent.id.0.to_string(),
                 ],
@@ -775,7 +781,7 @@ impl SqliteStore {
     pub fn load_agent_by_id(&self, id: AgentId) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, name, description, model, system_prompt, posture, is_default, created_at, last_active \
+            "SELECT id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active \
              FROM agents WHERE id = ?1",
             params![id.0.to_string()],
             parse_agent_row,
@@ -791,7 +797,7 @@ impl SqliteStore {
     pub fn load_agent_by_name(&self, name: &str) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, name, description, model, system_prompt, posture, is_default, created_at, last_active \
+            "SELECT id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active \
              FROM agents WHERE name = ?1",
             params![name],
             parse_agent_row,
@@ -809,7 +815,7 @@ impl SqliteStore {
     pub fn get_default_agent(&self) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, name, description, model, system_prompt, posture, is_default, created_at, last_active \
+            "SELECT id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active \
              FROM agents WHERE is_default = 1 LIMIT 1",
             [],
             parse_agent_row,
@@ -826,7 +832,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, description, model, system_prompt, posture, is_default, created_at, last_active \
+                "SELECT id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active \
                  FROM agents ORDER BY created_at",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
@@ -1084,9 +1090,10 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let model: Option<String> = row.get(3)?;
     let system_prompt: Option<String> = row.get(4)?;
     let posture: Option<String> = row.get(5)?;
-    let is_default: i32 = row.get(6)?;
-    let created_at_str: String = row.get(7)?;
-    let last_active_str: String = row.get(8)?;
+    let provider: Option<String> = row.get(6)?;
+    let is_default: i32 = row.get(7)?;
+    let created_at_str: String = row.get(8)?;
+    let last_active_str: String = row.get(9)?;
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -1105,6 +1112,7 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         model,
         system_prompt,
         posture,
+        provider,
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),
@@ -1267,6 +1275,7 @@ mod tests {
             model: None,
             system_prompt: None,
             posture: None,
+            provider: None,
             is_default: false,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),

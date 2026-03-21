@@ -26,7 +26,7 @@ export const IconSend = () => html`<svg width="20" height="20" viewBox="0 0 20 2
 
 export const IconStop = () => html`<svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor"><rect x="5" y="5" width="10" height="10" rx="1.5"/></svg>`;
 
-export const IconGear = () => html`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="10" r="3"/><path d="M10 1.5v2M10 16.5v2M3.5 10h-2M18.5 10h-2M4.4 4.4l-1.4-1.4M17 17l-1.4-1.4M4.4 15.6l-1.4 1.4M17 3l-1.4 1.4"/></svg>`;
+export const IconGear = () => html`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8.3 3.1l.4-1.5a.6.6 0 01.6-.5h1.4a.6.6 0 01.6.5l.4 1.5a5.5 5.5 0 011.5.9l1.5-.5a.6.6 0 01.7.3l.7 1.2a.6.6 0 01-.1.7l-1.1 1a5.5 5.5 0 010 1.7l1.1 1a.6.6 0 01.1.7l-.7 1.2a.6.6 0 01-.7.3l-1.5-.5a5.5 5.5 0 01-1.5.9l-.4 1.5a.6.6 0 01-.6.5H9.3a.6.6 0 01-.6-.5l-.4-1.5a5.5 5.5 0 01-1.5-.9l-1.5.5a.6.6 0 01-.7-.3l-.7-1.2a.6.6 0 01.1-.7l1.1-1a5.5 5.5 0 010-1.7l-1.1-1a.6.6 0 01-.1-.7l.7-1.2a.6.6 0 01.7-.3l1.5.5a5.5 5.5 0 011.5-.9z"/><circle cx="10" cy="10" r="2.5"/></svg>`;
 
 export const IconPlus = () => html`<svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M10 4v12M4 10h12"/></svg>`;
 

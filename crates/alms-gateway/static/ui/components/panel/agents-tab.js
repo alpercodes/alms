@@ -19,6 +19,7 @@ function AgentEditModal({ agent, onClose }) {
     const model = useSignal(agent.model || '');
     const systemPrompt = useSignal(agent.system_prompt || '');
     const posture = useSignal(agent.posture || '');
+    const provider = useSignal(agent.provider || '');
     const saving = useSignal(false);
     const error = useSignal('');
 
@@ -32,6 +33,7 @@ function AgentEditModal({ agent, onClose }) {
                 model: model.value || null,
                 system_prompt: systemPrompt.value || null,
                 posture: posture.value || null,
+                provider: provider.value || null,
             });
             await refreshAgents();
             onClose();
@@ -58,6 +60,17 @@ function AgentEditModal({ agent, onClose }) {
                            value=${model.value}
                            onInput=${e => { model.value = e.target.value; }} />
                     <span class="settings-hint">Leave empty to use server default.</span>
+                </div>
+
+                <div class="settings-row">
+                    <label class="settings-label">Provider</label>
+                    <select class="settings-select"
+                            value=${provider.value}
+                            onChange=${e => { provider.value = e.target.value; }}>
+                        <option value="">Server default</option>
+                        <option value="openai">OpenAI / OpenRouter</option>
+                        <option value="anthropic">Anthropic</option>
+                    </select>
                 </div>
 
                 <div class="settings-row">
@@ -131,6 +144,9 @@ function AgentCard({ agent, isActive, onEdit }) {
             <div class="agent-card-meta">
                 model: ${agent.model || serverModel}${!agent.model ? ' (default)' : ''}
             </div>
+            ${agent.provider && html`
+                <div class="agent-card-meta">provider: ${agent.provider}</div>
+            `}
             ${agent.posture && html`
                 <div class="agent-card-meta">posture: ${agent.posture}</div>
             `}

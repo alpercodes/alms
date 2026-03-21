@@ -879,6 +879,7 @@ mod tests {
             model: model.map(String::from),
             system_prompt: system_prompt.map(String::from),
             posture: posture.map(String::from),
+            provider: None,
             is_default: false,
             created_at: now,
             last_active: now,
