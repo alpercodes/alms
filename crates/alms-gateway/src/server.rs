@@ -268,6 +268,10 @@ impl RunManager {
 
         if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
             senders.retain(|sender| sender.send(tagged.clone()).is_ok());
+            if senders.is_empty() {
+                drop(senders);
+                self.session_senders.remove(&session_id);
+            }
         }
     }
 

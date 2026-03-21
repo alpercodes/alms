@@ -10,11 +10,7 @@ import { chatMessages } from '../state/chat.js';
 import { activeRunId } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearCompletedSubagents } from '../state/subagents.js';
 import { messageQueue } from '../state/queue.js';
-import { runs } from '../state/runs.js';
 import { activeSessionId } from '../state/sessions.js';
-import { listRuns } from '../api/runs.js';
-import { getSessionMessages } from '../api/sessions.js';
-import { mapHistoryMessages } from '../utils/history.js';
 
 let activeSessionEs = null;
 let sessionRetryCount = 0;
