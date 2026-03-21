@@ -152,6 +152,9 @@ impl AlmsConfig {
         if let Ok(bind) = std::env::var("ALMS_BIND") {
             self.server.bind = bind;
         }
+        if let Ok(data_dir) = std::env::var("ALMS_DATA_DIR") {
+            self.server.data_dir = data_dir;
+        }
         if let Ok(token) = std::env::var("ALMS_AUTH_TOKEN") {
             self.server.auth_token = Some(token);
         }
@@ -259,6 +262,9 @@ impl AlmsConfig {
 #[serde(default)]
 pub struct ServerConfig {
     pub bind: String,
+    /// Base directory for ALMS data files (SQLite DB, workspace, secrets).
+    /// Override with `ALMS_DATA_DIR` env var. Default: `./data`.
+    pub data_dir: String,
     /// Bearer token for API authentication — loaded from env only
     #[serde(skip)]
     pub auth_token: Option<String>,
@@ -268,8 +274,18 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8080".into(),
+            data_dir: "./data".into(),
             auth_token: None,
         }
+    }
+}
+
+impl ServerConfig {
+    /// Return the resolved path to the SQLite database file.
+    ///
+    /// Precedence: `ALMS_DB_PATH` env var > `{data_dir}/alms.db`.
+    pub fn db_path(&self) -> String {
+        std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| format!("{}/alms.db", self.data_dir))
     }
 }
 

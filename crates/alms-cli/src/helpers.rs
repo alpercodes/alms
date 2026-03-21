@@ -1,9 +1,15 @@
-use alms_core::{AgentId, AgentRecord};
+use alms_core::{AgentId, AgentRecord, AlmsConfig};
 use alms_session::SqliteStore;
 
 /// Open the SQLite store at the configured DB path.
+///
+/// Resolves the database path via `AlmsConfig` (which reads `alms.toml` and
+/// env vars), ensuring the CLI uses the same database as the gateway.
+/// Precedence: `ALMS_DB_PATH` env var > `{data_dir}/alms.db` (where
+/// `data_dir` comes from config / `ALMS_DATA_DIR` env var, default `./data`).
 pub(crate) fn open_db() -> anyhow::Result<SqliteStore> {
-    let db_path = std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| "./data/alms.db".to_string());
+    let config = AlmsConfig::load().unwrap_or_default();
+    let db_path = config.server.db_path();
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
         std::fs::create_dir_all(parent)?;
     }

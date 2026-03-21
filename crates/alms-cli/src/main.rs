@@ -241,9 +241,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Auth { cmd, json } => {
-            let data_dir: std::path::PathBuf = std::env::var("ALMS_DATA_DIR")
-                .unwrap_or_else(|_| "./data".to_string())
-                .into();
+            let config = alms_core::AlmsConfig::load().unwrap_or_default();
+            let data_dir: std::path::PathBuf = config.server.data_dir.into();
             match cmd {
                 AuthCommands::Set { provider, key } => {
                     cmd_auth::auth_set(&data_dir, &provider, key, json)?;
@@ -269,8 +268,9 @@ async fn main() -> anyhow::Result<()> {
                     provider,
                     default,
                 } => {
+                    let config = alms_core::AlmsConfig::load().unwrap_or_default();
                     let workspace_dir: std::path::PathBuf = std::env::var("ALMS_WORKSPACE_DIR")
-                        .unwrap_or_else(|_| "./data/workspace".to_string())
+                        .unwrap_or_else(|_| format!("{}/workspace", config.server.data_dir))
                         .into();
                     cmd_agent::agent_create(
                         &store,
