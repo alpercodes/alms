@@ -155,13 +155,14 @@ impl SessionEventLogManager {
             ts: Utc::now(),
         };
 
-        log.append(event).await;
-
-        // Trim oldest events to bound memory usage
-        let mut events = log.events.write().await;
-        if events.len() > SESSION_EVENT_LOG_MAX {
-            let drain = events.len() - SESSION_EVENT_LOG_MAX;
-            events.drain(..drain);
+        // Append + trim in a single lock acquisition
+        {
+            let mut events = log.events.write().await;
+            events.push(event);
+            if events.len() > SESSION_EVENT_LOG_MAX {
+                let drain = events.len() - SESSION_EVENT_LOG_MAX;
+                events.drain(..drain);
+            }
         }
 
         event_id

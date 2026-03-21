@@ -234,17 +234,30 @@ impl RunManager {
             }
         }
 
-        // Per-session event log + fan-out
-        let session_event_id = self
-            .session_event_log
-            .log_event(session_id, run_id, &event.event_type, event.data.clone())
-            .await;
-        let mut session_event = event;
-        session_event.event_id = Some(session_event_id);
+        // Per-session fan-out: forward to session subscribers.
+        // Skip session event LOG for token_delta — these are high-frequency
+        // (50-100 per response) and the extra lock acquisitions + clones
+        // cause noticeable latency. Session reconnect doesn't need individual
+        // deltas — the chat history is loaded via getSessionMessages instead.
+        let is_delta = event.event_type == "token_delta";
+
+        let session_event = if is_delta {
+            // Fast path: no logging, just fan out with a synthetic event_id
+            let mut e = event;
+            e.event_id = Some(0); // placeholder — not used for replay
+            e
+        } else {
+            let session_event_id = self
+                .session_event_log
+                .log_event(session_id, run_id, &event.event_type, event.data.clone())
+                .await;
+            let mut e = event;
+            e.event_id = Some(session_event_id);
+            e
+        };
 
         if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
             senders.retain(|sender| sender.send(session_event.clone()).is_ok());
-            // Clean up empty entries to prevent DashMap leak
             if senders.is_empty() {
                 drop(senders);
                 self.session_senders.remove(&session_id);
