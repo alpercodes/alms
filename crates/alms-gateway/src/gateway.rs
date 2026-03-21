@@ -133,6 +133,10 @@ impl GatewayConfig {
 /// The sidecar file is `<data_dir>/agent_id` — a plain-text UUID.
 /// If the file is missing or contains garbage, a new ID is generated and
 /// persisted (self-healing). Write failures are non-fatal warnings.
+/// Whether the agent ID was loaded from an existing sidecar file (true)
+/// or freshly generated (false). Used to skip auto-migration on first run.
+static SIDECAR_EXISTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[instrument]
 fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
     // 1. Env var override takes highest precedence
@@ -150,6 +154,7 @@ fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
     if let Ok(contents) = std::fs::read_to_string(&id_file) {
         if let Ok(uuid) = Uuid::parse_str(contents.trim()) {
             info!("Loaded persisted agent ID: {}", uuid);
+            SIDECAR_EXISTED.store(true, std::sync::atomic::Ordering::Relaxed);
             return AgentId(uuid);
         }
         warn!(
@@ -194,8 +199,11 @@ impl Gateway {
             Some(path) => {
                 info!("Opening SQLite session store at {}", path);
                 let store = SqliteStore::open(path)?;
-                // Auto-migrate sidecar agent into the agents registry
-                migrate_sidecar_agent(&store, *agent_id.read().unwrap());
+                // Auto-migrate sidecar agent into the agents registry — only
+                // if a sidecar file existed (actual migration, not first run).
+                if SIDECAR_EXISTED.load(std::sync::atomic::Ordering::Relaxed) {
+                    migrate_sidecar_agent(&store, *agent_id.read().unwrap());
+                }
                 Arc::new(SessionManager::with_store(
                     config.session_config.clone(),
                     store,
