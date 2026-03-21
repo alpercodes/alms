@@ -714,7 +714,15 @@ impl AgentRuntime {
 
                 for (tool_call, result) in tool_calls.iter().zip(results) {
                     let (content, ok) = match result {
-                        Ok(value) => (value.to_string(), true),
+                        Ok(value) => {
+                            // shell_exec returns Ok even for non-zero exit codes;
+                            // check exit_code so persisted metadata matches SSE events.
+                            let ok = value
+                                .get("exit_code")
+                                .and_then(|v| v.as_i64())
+                                .is_none_or(|code| code == 0);
+                            (value.to_string(), ok)
+                        }
                         Err(e) => (format!("Error: {}", e), false),
                     };
                     messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
@@ -1005,10 +1013,17 @@ impl AgentRuntime {
                         timestamp: alms_core::Timestamp::now(),
                     },
                 );
+                // shell_exec returns Ok even for non-zero exit codes;
+                // surface the exit code so the UI shows failure (red X).
+                let ok = value
+                    .get("exit_code")
+                    .and_then(|v| v.as_i64())
+                    .is_none_or(|code| code == 0);
+
                 if let Some(ref sender) = self.event_sender {
                     let _ = sender.send(RuntimeEvent::ToolEnd {
                         invocation_id,
-                        ok: true,
+                        ok,
                         result: value.clone(),
                         source_agent: None,
                     });
