@@ -54,7 +54,6 @@ export function SubagentBar() {
     const entries = Object.entries(activeSubagents.value);
     if (entries.length === 0) return null;
 
-    const runningCount = entries.filter(([, info]) => info.status === 'running').length;
 
     return html`
         <div class="sa-bar">

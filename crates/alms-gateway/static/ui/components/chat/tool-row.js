@@ -44,15 +44,13 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent }) {
         expanded.value = !expanded.value;
     };
 
-    const isSubagent = !!sourceAgent;
     const summary = toolSummary(tool, params);
     const truncSummary = summary.slice(0, PREVIEW_LEN) + (summary.length > PREVIEW_LEN ? '\u2026' : '');
-    const rowClass = isSubagent ? 'tool-row subagent-nested' : 'tool-row';
+    const rowClass = 'tool-row';
 
     if (status === 'running') {
         return html`
             <div class="${rowClass}" onClick=${toggle}>
-                ${isSubagent ? html`<span class="subagent-tag">[${sourceAgent}]</span>` : ''}
                 <span style="color: var(--warning);">$</span>
                 <span class="tool-name">${tool}</span>
                 <span class="tool-summary">${truncSummary}</span>
@@ -67,7 +65,6 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent }) {
 
     return html`
         <div class="${rowClass} ${status}" onClick=${toggle}>
-            ${isSubagent ? html`<span class="subagent-tag">[${sourceAgent}]</span>` : ''}
             <span>${icon}</span>
             <span class="tool-name">${tool}</span>
             <span class="tool-summary">${truncSummary}</span>
