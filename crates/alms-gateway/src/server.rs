@@ -358,7 +358,7 @@ impl AppState {
                 Arc::new(std::sync::RwLock::new(
                     alms_core::secrets::SecretsStore::load(secrets_path).unwrap_or_else(|e| {
                         tracing::warn!("Failed to load secrets: {e}");
-                        alms_core::secrets::SecretsStore::load("/dev/null").unwrap()
+                        alms_core::secrets::SecretsStore::empty()
                     }),
                 ))
             },

@@ -25,6 +25,14 @@ struct SecretsFile {
 }
 
 impl SecretsStore {
+    /// Create an empty in-memory secrets store with no file backing.
+    pub fn empty() -> Self {
+        Self {
+            path: PathBuf::new(),
+            keys: HashMap::new(),
+        }
+    }
+
     /// Load secrets from a file path, creating it if it doesn't exist.
     pub fn load(path: impl Into<PathBuf>) -> AlmsResult<Self> {
         let path = path.into();

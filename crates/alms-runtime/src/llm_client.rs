@@ -452,11 +452,10 @@ impl LlmClient {
     pub fn with_provider(mut self, provider: &str) -> Self {
         let new_provider = match provider {
             "anthropic" => Provider::Anthropic,
-            "openrouter" => Provider::OpenAi, // OpenRouter uses OpenAI-compatible API
+            "openrouter" => Provider::OpenAi,
             _ => Provider::OpenAi,
         };
 
-        // Set provider-appropriate base URL (only if still on the default)
         match provider {
             "anthropic" => {
                 self.config.base_url = "https://api.anthropic.com/v1".to_string();
@@ -470,8 +469,49 @@ impl LlmClient {
             _ => {}
         }
 
-        // Resolve the api_key for the new provider from env vars
         if let Some(key) = alms_core::config::select_llm_api_key_from_env(provider) {
+            self.config.api_key = key;
+        } else {
+            warn!(
+                "No API key found for provider '{}' — requests will fail",
+                provider
+            );
+        }
+
+        self.config.provider = provider.to_string();
+        self.provider = new_provider;
+        self
+    }
+
+    /// Override LLM provider with secrets-aware key resolution.
+    ///
+    /// Like `with_provider()` but resolves the API key from the secrets
+    /// store first, falling back to env vars.
+    pub fn with_provider_and_secrets(
+        mut self,
+        provider: &str,
+        secrets: &alms_core::secrets::SecretsStore,
+    ) -> Self {
+        let new_provider = match provider {
+            "anthropic" => Provider::Anthropic,
+            "openrouter" => Provider::OpenAi,
+            _ => Provider::OpenAi,
+        };
+
+        match provider {
+            "anthropic" => {
+                self.config.base_url = "https://api.anthropic.com/v1".to_string();
+            }
+            "openrouter" => {
+                self.config.base_url = "https://openrouter.ai/api/v1".to_string();
+            }
+            "openai" => {
+                self.config.base_url = "https://api.openai.com/v1".to_string();
+            }
+            _ => {}
+        }
+
+        if let Some(key) = secrets.resolve_key(provider) {
             self.config.api_key = key;
         } else {
             warn!(

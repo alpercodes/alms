@@ -112,15 +112,11 @@ pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
         println!("{:<15} {:<12} {}", "PROVIDER", "SOURCE", "KEY");
         println!("{}", "-".repeat(50));
         for p in VALID_PROVIDERS {
+            let env_key = alms_core::config::select_llm_api_key_from_env(p);
             let (source, masked) = if providers.contains(&p.to_string()) {
                 ("secrets", store.get_masked(p).unwrap_or_default())
-            } else if alms_core::config::select_llm_api_key_from_env(p).is_some() {
-                (
-                    "env var",
-                    alms_core::config::select_llm_api_key_from_env(p)
-                        .map(|k| SecretsStore::masked_key(&k))
-                        .unwrap_or_default(),
-                )
+            } else if let Some(k) = env_key {
+                ("env var", SecretsStore::masked_key(&k))
             } else {
                 ("not set", String::new())
             };
@@ -131,6 +127,13 @@ pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
 }
 
 pub(crate) fn auth_remove(data_dir: &Path, provider: &str, json: bool) -> anyhow::Result<()> {
+    if !VALID_PROVIDERS.contains(&provider) {
+        anyhow::bail!(
+            "Unknown provider '{}'. Must be one of: {}",
+            provider,
+            VALID_PROVIDERS.join(", ")
+        );
+    }
     let mut store = SecretsStore::load(secrets_path(data_dir))?;
     let existed = store.remove_key(provider)?;
 
