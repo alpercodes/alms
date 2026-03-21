@@ -700,7 +700,9 @@ pub(crate) async fn completion_notification_loop(
             .register_cancel_token(run_id, cancel_token.clone());
 
         let state_clone = state.clone();
-        state.session_queue.enqueue(
+        // Low priority: notification runs yield to user messages.
+        // If the user has queued messages, those execute first.
+        state.session_queue.enqueue_low(
             session_id,
             Box::pin(async move {
                 execute_run(
