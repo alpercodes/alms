@@ -1,5 +1,6 @@
 import { chatMessages } from '../state/chat.js';
 import { activeRunId } from '../state/runs.js';
+import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearCompletedSubagents } from '../state/subagents.js';
 
 // Active foreground EventSource reference
 let activeEs = null;
@@ -65,28 +66,70 @@ export function openForegroundStream(runId, { onDone } = {}) {
     });
 
     es.addEventListener('tool_start', (e) => {
-        flushDeltaBuffer(); // flush pending text before tool row
-        sealLastAgent();    // seal agent cursor BEFORE appending tool row
+        flushDeltaBuffer();
         const data = JSON.parse(e.data);
-        chatMessages.value = [...chatMessages.value, {
-            type: 'tool',
-            tool: data.tool,
-            params: data.params,
-            status: 'running',
-            sourceAgent: data.source_agent || null,
-            id: data.tool_invocation_id || data.call_id || data.tool,
-        }];
+        const toolId = data.tool_invocation_id || data.call_id || data.tool;
+
+        if (data.tool === 'invoke_agent') {
+            // Show simple "subagent invoked" in chat
+            sealLastAgent();
+            const name = data.params?.name || data.params?.subagent_name || 'subagent';
+            const task = data.params?.task || '';
+            chatMessages.value = [...chatMessages.value, {
+                type: 'tool',
+                tool: 'invoke_agent',
+                params: data.params,
+                status: 'running',
+                id: toolId,
+            }];
+            trackSubagentStart(name, task);
+        } else if (data.source_agent) {
+            // Subagent tool: track in status bar, don't clutter chat
+            trackSubagentTool(data.source_agent, {
+                id: toolId,
+                tool: data.tool,
+                params: data.params,
+                status: 'running',
+            });
+        } else {
+            // Regular tool: show in chat
+            sealLastAgent();
+            chatMessages.value = [...chatMessages.value, {
+                type: 'tool',
+                tool: data.tool,
+                params: data.params,
+                status: 'running',
+                id: toolId,
+            }];
+        }
     });
 
     es.addEventListener('tool_end', (e) => {
         const data = JSON.parse(e.data);
-        const msgs = [...chatMessages.value];
         const matchId = data.tool_invocation_id;
+        const status = data.ok ? 'done' : 'fail';
+
+        if (data.source_agent) {
+            // Update subagent tool status in the status bar
+            trackSubagentTool(data.source_agent, {
+                id: matchId,
+                status,
+                result: data.result,
+            });
+        }
+
+        // Check if this is an invoke_agent completing
+        const msgs = [...chatMessages.value];
         const idx = matchId
             ? msgs.findLastIndex(m => m.type === 'tool' && m.id === matchId)
             : msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
         if (idx >= 0) {
-            msgs[idx] = { ...msgs[idx], status: data.ok ? 'done' : 'fail', result: data.result };
+            msgs[idx] = { ...msgs[idx], status, result: data.result };
+            // If invoke_agent finished, update subagent tracking
+            if (msgs[idx].tool === 'invoke_agent') {
+                const name = msgs[idx].params?.name || msgs[idx].params?.subagent_name;
+                if (name) trackSubagentEnd(name, status);
+            }
         }
         chatMessages.value = msgs;
     });
@@ -145,6 +188,7 @@ export function openForegroundStream(runId, { onDone } = {}) {
         }
         closeActiveStream();
         activeRunId.value = null;
+        clearCompletedSubagents();
         if (onDone) onDone(status, data);
     };
 

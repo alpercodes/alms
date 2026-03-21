@@ -36,60 +36,6 @@ function toolSummary(tool, params) {
 const PREVIEW_LEN = 120;
 const DETAIL_LEN = 500;
 
-/**
- * SubagentGroup — wraps an invoke_agent row + its nested subagent tool rows.
- * Click the header to expand/collapse all nested tools.
- * Click individual nested tools to expand their detail.
- */
-export function SubagentGroup({ header, children }) {
-    const expanded = useSignal(false);
-    const toggle = () => { expanded.value = !expanded.value; };
-
-    const { params, status, result } = header;
-    const name = params?.name || params?.subagent_name || 'subagent';
-    const task = params?.task || '';
-    const taskPreview = task.slice(0, PREVIEW_LEN) + (task.length > PREVIEW_LEN ? '\u2026' : '');
-    const hasChildren = children && children.length > 0;
-
-    if (status === 'running') {
-        return html`
-            <div class="subagent-group">
-                <div class="tool-row subagent-header" onClick=${toggle}>
-                    <span class="subagent-spinner"></span>
-                    <span class="subagent-badge">${name}</span>
-                    ${taskPreview}
-                    ${hasChildren ? html`<span class="subagent-count">${children.length}</span>` : ''}
-                </div>
-                ${expanded.value && children && children.map((c, i) =>
-                    html`<${ToolRow} key=${c.id || i} ...${c} />`
-                )}
-            </div>
-        `;
-    }
-
-    const icon = status === 'done' ? '\u2713' : '\u2717';
-    const resultText = result ? (typeof result === 'string' ? result : JSON.stringify(result)).slice(0, DETAIL_LEN) : '';
-
-    return html`
-        <div class="subagent-group">
-            <div class="tool-row subagent-header ${status}" onClick=${toggle}>
-                <span>${icon}</span>
-                <span class="subagent-badge">${name}</span>
-                ${!expanded.value && resultText
-                    ? html` \u2192 ${resultText.slice(0, PREVIEW_LEN)}${resultText.length > PREVIEW_LEN ? '\u2026' : ''}`
-                    : ''
-                }
-                ${hasChildren ? html`<span class="subagent-count">${children.length}</span>` : ''}
-            </div>
-            ${expanded.value && html`
-                ${resultText && html`<pre class="tool-row-detail subagent-result">${resultText}</pre>`}
-                ${children && children.map((c, i) =>
-                    html`<${ToolRow} key=${c.id || i} ...${c} />`
-                )}
-            `}
-        </div>
-    `;
-}
 
 export function ToolRow({ tool, params, status, result, id, sourceAgent }) {
     const expanded = useSignal(false);
