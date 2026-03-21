@@ -636,6 +636,99 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Subagent completion notifications
+// ---------------------------------------------------------------------------
+
+/// Receives background subagent completion events and creates follow-up
+/// runs on the parent agent's session so the parent is automatically notified.
+///
+/// This mirrors `scheduler_fire_loop`: each notification is enqueued via
+/// `SessionQueue` to respect per-session FIFO ordering.
+pub(crate) async fn completion_notification_loop(
+    mut rx: mpsc::UnboundedReceiver<alms_coordinator::SubagentCompletion>,
+    state: AppState,
+) {
+    while let Some(completion) = rx.recv().await {
+        let session_id = completion.parent_session_id;
+        let agent_id = completion.parent_agent_id;
+
+        // Verify the parent session still exists.
+        let context_id = match state.session_manager.get(session_id) {
+            Ok(session) => session.context_id,
+            Err(_) => {
+                warn!(
+                    session_id = %session_id.0,
+                    task_id = %completion.task_id.0,
+                    "Parent session not found for subagent completion notification — skipping"
+                );
+                continue;
+            }
+        };
+
+        let notification = format_completion_notification(&completion);
+        let run = Run::new(session_id, agent_id, notification.clone());
+        let run_id = run.run_id;
+        state.run_manager.insert_run(run);
+
+        info!(
+            run_id = %run_id.0,
+            session_id = %session_id.0,
+            task_id = %completion.task_id.0,
+            subagent = ?completion.subagent_name,
+            "Subagent completion → auto-creating notification run"
+        );
+
+        let cancel_token = CancellationToken::new();
+        state
+            .run_manager
+            .register_cancel_token(run_id, cancel_token.clone());
+
+        let state_clone = state.clone();
+        state.session_queue.enqueue(
+            session_id,
+            Box::pin(async move {
+                execute_run(
+                    state_clone,
+                    run_id,
+                    session_id,
+                    agent_id,
+                    notification,
+                    RunOverrides::default(),
+                    context_id,
+                    cancel_token,
+                )
+                .await;
+            }),
+        );
+    }
+}
+
+/// Format a human-readable notification message for the parent agent.
+fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> String {
+    let name = c.subagent_name.as_deref().unwrap_or("(unnamed subagent)");
+    let status = match c.status {
+        alms_coordinator::TaskStatus::Completed => "completed",
+        alms_coordinator::TaskStatus::Failed => "failed",
+        alms_coordinator::TaskStatus::Cancelled => "cancelled",
+        _ => "finished",
+    };
+
+    format!(
+        "[Subagent notification] Background subagent \"{name}\" (task {task_id}) has {status}.\n\
+         \n\
+         Summary: {summary}\n\
+         \n\
+         Use read_subagent_session(\"{name}\") for the full conversation history.",
+        task_id = c.task_id.0,
+        summary = c.summary,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Runtime event forwarding
+// ---------------------------------------------------------------------------
+
 /// Reads RuntimeEvents from the runtime and forwards them as SSE events.
 /// Also stores ApprovalRequired events in the approval store so clients can resolve them.
 async fn forward_runtime_events(
