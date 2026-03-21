@@ -20,11 +20,11 @@ pub fn secrets_path(data_dir: &Path) -> PathBuf {
 }
 
 /// Resolve secrets path from an optional database file path.
-/// Falls back to `./data/secrets.json` if no db_path is provided.
+/// Falls back to the default data directory if no db_path is provided.
 pub fn secrets_path_from_db(db_path: Option<&str>) -> PathBuf {
     db_path
         .and_then(|p| Path::new(p).parent().map(|d| d.join("secrets.json")))
-        .unwrap_or_else(|| PathBuf::from("./data/secrets.json"))
+        .unwrap_or_else(|| secrets_path(Path::new("./data")))
 }
 
 /// In-memory secrets store backed by a JSON file.

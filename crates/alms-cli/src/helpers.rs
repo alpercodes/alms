@@ -8,12 +8,18 @@ use alms_session::SqliteStore;
 /// Precedence: `ALMS_DB_PATH` env var > `{data_dir}/alms.db` (where
 /// `data_dir` comes from config / `ALMS_DATA_DIR` env var, default `./data`).
 pub(crate) fn open_db() -> anyhow::Result<SqliteStore> {
+    let (store, _) = open_db_with_config()?;
+    Ok(store)
+}
+
+/// Open DB and return the loaded config (avoids re-parsing alms.toml).
+pub(crate) fn open_db_with_config() -> anyhow::Result<(SqliteStore, AlmsConfig)> {
     let config = AlmsConfig::load().unwrap_or_default();
     let db_path = config.server.db_path();
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    Ok(SqliteStore::open(&db_path)?)
+    Ok((SqliteStore::open(&db_path)?, config))
 }
 
 /// Resolve an agent by UUID or name slug.
