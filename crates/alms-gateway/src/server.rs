@@ -244,8 +244,6 @@ impl RunManager {
         // (50-100 per response) and the extra lock acquisitions + clones
         // cause noticeable latency. Session reconnect doesn't need individual
         // deltas — the chat history is loaded via getSessionMessages instead.
-        let is_delta = event.event_type == "token_delta";
-
         let session_event = if is_delta {
             // Fast path: no logging, just fan out. Leave event_id as None
             // so the dedup filter in stream_with_replay passes it through
@@ -302,10 +300,6 @@ impl RunManager {
             .entry(session_id)
             .or_default()
             .push(sender);
-    }
-
-    pub fn remove_session_senders(&self, session_id: SessionId) {
-        self.session_senders.remove(&session_id);
     }
 
     /// Get per-run events from a specific ID for reconnect

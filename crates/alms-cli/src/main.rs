@@ -347,8 +347,7 @@ async fn main() -> anyhow::Result<()> {
                 prompt,
                 schedule,
             } => {
-                let store = open_db()?;
-                cmd_job::job_create(&url, &store, &agent, &prompt, &schedule, json).await?;
+                cmd_job::job_create(&url, &agent, &prompt, &schedule, json).await?;
             }
             JobCommands::Cancel { job_id } => {
                 cmd_job::job_cancel(&url, &job_id, json).await?;

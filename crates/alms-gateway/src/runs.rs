@@ -779,6 +779,27 @@ pub(crate) async fn completion_notification_loop(
             )
             .await;
 
+        // Persist the subagent completion marker to session history so it
+        // survives page refreshes and appears in the chat on reload.
+        {
+            let name = completion.subagent_name.as_deref().unwrap_or("subagent");
+            let label = match status_str {
+                "fail" => "failed",
+                "cancelled" => "cancelled",
+                _ => "completed",
+            };
+            let marker = alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: alms_session::Role::Assistant,
+                content: alms_session::Content::Text(format!("[Subagent '{}' {}]", name, label)),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: None,
+            };
+            if let Err(e) = state.session_manager.append_message(session_id, marker) {
+                warn!("Failed to persist subagent completion marker: {e}");
+            }
+        }
+
         let notification = format_completion_notification(&completion);
         let run = Run::new(session_id, agent_id, notification.clone());
         let run_id = run.run_id;

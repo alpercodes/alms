@@ -222,17 +222,6 @@ impl SseEventData {
             },
         )
     }
-
-    /// Session-level: initial connection ack.
-    pub fn session_connected(session_id: alms_core::SessionId) -> Self {
-        Self::new(
-            "session_connected",
-            SessionConnectedData {
-                session_id: session_id.0.to_string(),
-                ts: Utc::now(),
-            },
-        )
-    }
 }
 
 /// SSE event stream wrapper
@@ -440,12 +429,6 @@ struct SubagentCompletedData {
     subagent_name: Option<String>,
     status: String,
     summary: String,
-    ts: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize)]
-struct SessionConnectedData {
-    session_id: String,
     ts: DateTime<Utc>,
 }
 
