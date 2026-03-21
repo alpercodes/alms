@@ -1005,10 +1005,17 @@ impl AgentRuntime {
                         timestamp: alms_core::Timestamp::now(),
                     },
                 );
+                // shell_exec returns Ok even for non-zero exit codes;
+                // surface the exit code so the UI shows failure (red X).
+                let ok = value
+                    .get("exit_code")
+                    .and_then(|v| v.as_i64())
+                    .is_none_or(|code| code == 0);
+
                 if let Some(ref sender) = self.event_sender {
                     let _ = sender.send(RuntimeEvent::ToolEnd {
                         invocation_id,
-                        ok: true,
+                        ok,
                         result: value.clone(),
                         source_agent: None,
                     });
