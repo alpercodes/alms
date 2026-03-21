@@ -699,6 +699,28 @@ pub(crate) async fn completion_notification_loop(
             }
         };
 
+        // Notify session subscribers that a subagent completed.
+        // This updates the SubagentBar and shows a system message BEFORE
+        // the notification run starts.
+        let status_str = match completion.status {
+            alms_coordinator::TaskStatus::Completed => "done",
+            alms_coordinator::TaskStatus::Failed => "fail",
+            _ => "done",
+        };
+        state
+            .run_manager
+            .send_session_event(
+                session_id,
+                alms_core::RunId::new(), // no run yet
+                SseEventData::subagent_completed(
+                    session_id,
+                    completion.subagent_name.clone(),
+                    status_str,
+                    &completion.summary,
+                ),
+            )
+            .await;
+
         let notification = format_completion_notification(&completion);
         let run = Run::new(session_id, agent_id, notification.clone());
         let run_id = run.run_id;

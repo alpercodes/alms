@@ -158,6 +158,23 @@ export function openSessionStream(sessionId) {
         sealLastAgent();
     });
 
+    // ── subagent_completed ──
+    es.addEventListener('subagent_completed', (e) => {
+        const data = JSON.parse(e.data);
+        const name = data.subagent_name || 'subagent';
+        const status = data.status === 'fail' ? 'fail' : 'done';
+
+        // Update SubagentBar to show "done" (stays visible until notification run finishes)
+        trackSubagentEnd(name, status);
+
+        // Show system message in chat
+        const label = status === 'done' ? 'completed' : 'failed';
+        chatMessages.value = [...chatMessages.value, {
+            type: 'system',
+            text: `Subagent '${name}' ${label}.`,
+        }];
+    });
+
     // ── approval_resolved ──
     es.addEventListener('approval_resolved', (e) => {
         const data = JSON.parse(e.data);
