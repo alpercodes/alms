@@ -46,7 +46,9 @@ function scheduleFlush() {
  * @param {{ onDone: Function }} options
  * @returns {{ close: Function }}
  */
-export function openForegroundStream(runId, { onDone } = {}) {
+const MAX_SSE_RETRIES = 5;
+
+export function openForegroundStream(runId, { onDone, _retryCount = 0 } = {}) {
     closeActiveStream();
 
     // EventSource cannot send Authorization headers — use ?token= query param
@@ -220,23 +222,44 @@ export function openForegroundStream(runId, { onDone } = {}) {
                     closeActiveStream();
                     activeRunId.value = null;
                     clearCompletedSubagents();
-                    if (onDone) onDone(st === 'completed' ? 'finished' : st, data);
+                    if (onDone) onDone(st === 'completed' ? 'finished' : st === 'failed' ? 'error' : st, data);
                 } else {
                     // Run is still active — try to reopen the SSE stream.
-                    // A small delay avoids a tight reconnect loop.
+                    if (_retryCount >= MAX_SSE_RETRIES) {
+                        console.error('[SSE] Max retries reached, giving up');
+                        closeActiveStream();
+                        activeRunId.value = null;
+                        clearCompletedSubagents();
+                        chatMessages.value = [...chatMessages.value, {
+                            type: 'error', text: 'Lost connection to server. Refresh to retry.',
+                        }];
+                        return;
+                    }
+                    const delay = Math.min(2000 * Math.pow(2, _retryCount), 15000);
                     setTimeout(() => {
                         if (activeRunId.value === stuckRunId) {
-                            openForegroundStream(stuckRunId, { onDone });
+                            openForegroundStream(stuckRunId, { onDone, _retryCount: _retryCount + 1 });
                         }
-                    }, 2000);
+                    }, delay);
                 }
             }).catch(() => {
-                // Server unreachable — retry after a longer delay.
+                // Server unreachable — retry with backoff.
+                if (_retryCount >= MAX_SSE_RETRIES) {
+                    console.error('[SSE] Max retries reached (server unreachable)');
+                    closeActiveStream();
+                    activeRunId.value = null;
+                    clearCompletedSubagents();
+                    chatMessages.value = [...chatMessages.value, {
+                        type: 'error', text: 'Server unreachable. Refresh to retry.',
+                    }];
+                    return;
+                }
+                const delay = Math.min(5000 * Math.pow(2, _retryCount), 30000);
                 setTimeout(() => {
                     if (activeRunId.value === stuckRunId) {
-                        openForegroundStream(stuckRunId, { onDone });
+                        openForegroundStream(stuckRunId, { onDone, _retryCount: _retryCount + 1 });
                     }
-                }, 5000);
+                }, delay);
             });
         }
     };
