@@ -706,7 +706,6 @@ pub(crate) async fn completion_notification_loop(
 
 /// Format a human-readable notification message for the parent agent.
 fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> String {
-    let name = c.subagent_name.as_deref().unwrap_or("(unnamed subagent)");
     let status = match c.status {
         alms_coordinator::TaskStatus::Completed => "completed",
         alms_coordinator::TaskStatus::Failed => "failed",
@@ -714,13 +713,26 @@ fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> S
         _ => "finished",
     };
 
+    let (label, follow_up) = match &c.subagent_name {
+        Some(name) => (
+            format!("\"{name}\""),
+            format!("Use read_subagent_session(\"{name}\") for the full conversation history."),
+        ),
+        None => (
+            format!("(task {})", c.task_id.0),
+            format!(
+                "Use get_task_result(\"{}\") to retrieve the full result.",
+                c.task_id.0
+            ),
+        ),
+    };
+
     format!(
-        "[Subagent notification] Background subagent \"{name}\" (task {task_id}) has {status}.\n\
+        "[Subagent notification] Background subagent {label} has {status}.\n\
          \n\
          Summary: {summary}\n\
          \n\
-         Use read_subagent_session(\"{name}\") for the full conversation history.",
-        task_id = c.task_id.0,
+         {follow_up}",
         summary = c.summary,
     )
 }

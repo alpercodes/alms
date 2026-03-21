@@ -209,6 +209,7 @@ impl Coordinator {
         &self,
         request: SubagentRequest,
         parent_event_tx: Option<RuntimeEventSender>,
+        is_background: bool,
     ) -> AlmsResult<TaskId> {
         // Reject concurrent invocations of the same named subagent to prevent
         // session corruption from parallel writes to the same session history.
@@ -229,11 +230,16 @@ impl Coordinator {
         let parent_session_id = request.parent_session;
 
         // Resolve the parent agent ID from the session.
-        let parent_agent_id = self
-            .session_manager
-            .get(parent_session_id)
-            .map(|s| s.agent_id)
-            .unwrap_or(self.main_agent);
+        let parent_agent_id = match self.session_manager.get(parent_session_id) {
+            Ok(session) => session.agent_id,
+            Err(_) => {
+                warn!(
+                    parent_session = %parent_session_id.0,
+                    "Parent session not found when spawning subagent — falling back to main agent ID"
+                );
+                self.main_agent
+            }
+        };
 
         let handle = SubagentHandle {
             task_id,
@@ -243,7 +249,7 @@ impl Coordinator {
             parent_run_id,
             parent_session_id,
             parent_agent_id,
-            is_background: false,
+            is_background,
             result_rx: Some(result_rx),
             completed_result: None,
         };
@@ -354,7 +360,7 @@ impl SubagentDispatcher for Coordinator {
             subagent_name,
         };
 
-        let task_id = self.spawn_subagent(request, parent_event_tx).await?;
+        let task_id = self.spawn_subagent(request, parent_event_tx, false).await?;
 
         // Take the result receiver — must happen immediately after spawn_subagent
         // since the handle is already in the DashMap.
@@ -407,12 +413,7 @@ impl SubagentDispatcher for Coordinator {
             parent_run_id,
             subagent_name,
         };
-        let task_id = self.spawn_subagent(request, parent_event_tx).await?;
-
-        // Mark as background so run_subagent fires a completion notification.
-        if let Some(mut handle) = self.subagents.get_mut(&task_id) {
-            handle.is_background = true;
-        }
+        let task_id = self.spawn_subagent(request, parent_event_tx, true).await?;
 
         // Drop the oneshot receiver — background callers poll via completed_result,
         // not the channel. This frees the allocation; run_subagent's result_tx.send()
@@ -602,7 +603,7 @@ async fn run_subagent(
             subagent_name: request.subagent_name.clone(),
             status: new_status,
             summary,
-            execution_time_ms: start.elapsed().as_millis() as u64,
+            execution_time_ms: task_result.execution_time_ms,
             parent_session_id,
             parent_agent_id,
         };
@@ -935,7 +936,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
 
         let cancel_result = coord.cancel_subagent(task_id);
         assert!(cancel_result.is_ok(), "cancel should succeed");
@@ -965,7 +966,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
         let result_rx = coord.take_result_rx(task_id).unwrap();
 
         let task_result = result_rx.await.expect("should receive result");
@@ -999,7 +1000,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
 
         let active = coord.list_active();
         assert!(
@@ -1031,7 +1032,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
 
         let first = coord.take_result_rx(task_id);
         assert!(first.is_some(), "first take should return the receiver");
@@ -1170,7 +1171,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
         };
-        let _task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let _task_id = coord.spawn_subagent(request, None, false).await.unwrap();
 
         // Second invocation with the same name should be rejected
         let request2 = SubagentRequest {
@@ -1180,7 +1181,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
         };
-        let result = coord.spawn_subagent(request2, None).await;
+        let result = coord.spawn_subagent(request2, None, false).await;
         assert!(
             result.is_err(),
             "Second concurrent spawn should be rejected"
@@ -1200,7 +1201,7 @@ mod tests {
             subagent_name: Some("coder".to_string()),
         };
         assert!(
-            coord.spawn_subagent(request3, None).await.is_ok(),
+            coord.spawn_subagent(request3, None, false).await.is_ok(),
             "Different named subagent should succeed"
         );
     }
