@@ -410,6 +410,17 @@ impl AppState {
         if let Some(ref ws_dir) = workspace_dir {
             coord = coord.with_workspace_dir(ws_dir.clone());
         }
+
+        // Construct secrets store early so both coordinator and AppState can use it.
+        let secrets_path = alms_core::secrets::secrets_path_from_db(db_path_str.as_deref());
+        let secrets = Arc::new(std::sync::RwLock::new(
+            alms_core::secrets::SecretsStore::load(secrets_path).unwrap_or_else(|e| {
+                tracing::warn!("Failed to load secrets: {e}");
+                alms_core::secrets::SecretsStore::empty()
+            }),
+        ));
+
+        coord = coord.with_secrets(secrets.clone());
         let coordinator = Arc::new(coord);
 
         // Migrate any legacy UUID-based workspace directories to name-based paths.
@@ -453,15 +464,7 @@ impl AppState {
             default_agent_id,
             llm,
             auth_token_value,
-            secrets: {
-                let secrets_path = alms_core::secrets::secrets_path_from_db(db_path_str.as_deref());
-                Arc::new(std::sync::RwLock::new(
-                    alms_core::secrets::SecretsStore::load(secrets_path).unwrap_or_else(|e| {
-                        tracing::warn!("Failed to load secrets: {e}");
-                        alms_core::secrets::SecretsStore::empty()
-                    }),
-                ))
-            },
+            secrets, // constructed earlier alongside coordinator
         })
     }
 }

@@ -139,6 +139,8 @@ pub struct Coordinator {
     /// Channel for notifying the gateway when a background subagent completes.
     /// The gateway listens on the receiving end and creates follow-up runs.
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
+    /// Secrets store for API key resolution (per-agent provider overrides).
+    secrets: Option<Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>>,
 }
 
 impl Coordinator {
@@ -153,6 +155,7 @@ impl Coordinator {
             workspace_dir: None,
             subagent_prompts: Arc::new(DashMap::new()),
             completion_tx: None,
+            secrets: None,
         }
     }
 
@@ -173,6 +176,7 @@ impl Coordinator {
             workspace_dir: None,
             subagent_prompts: Arc::new(DashMap::new()),
             completion_tx: None,
+            secrets: None,
         }
     }
 
@@ -180,6 +184,15 @@ impl Coordinator {
     /// under `{workspace_dir}/{agent_name}/`.
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Set the secrets store for API key resolution in subagent provider overrides.
+    pub fn with_secrets(
+        mut self,
+        secrets: Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>,
+    ) -> Self {
+        self.secrets = Some(secrets);
         self
     }
 
@@ -273,6 +286,7 @@ impl Coordinator {
         let workspace_dir = self.workspace_dir.clone();
         let subagent_prompts = self.subagent_prompts.clone();
         let completion_tx = self.completion_tx.clone();
+        let secrets = self.secrets.clone();
 
         let span = tracing::info_span!(
             "subagent::execute",
@@ -296,6 +310,7 @@ impl Coordinator {
                     subagent_prompts,
                     completion_tx,
                     parent_cancel_token,
+                    secrets,
                 )
                 .await;
             }
@@ -508,6 +523,7 @@ async fn run_subagent(
     subagent_prompts: Arc<DashMap<String, String>>,
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
     parent_cancel_token: Option<CancellationToken>,
+    secrets: Option<Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>>,
 ) {
     // RAII guard: removes the name from active_named on drop (including panics).
     let _named_guard = NamedSubagentGuard {
@@ -565,7 +581,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None)
         }
-        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), &subagent_prompts, child_cancel_token.clone()) => {
+        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref()) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -757,6 +773,7 @@ async fn run_agent_loop(
     workspace_dir: Option<&std::path::Path>,
     subagent_prompts: &DashMap<String, String>,
     cancel_token: CancellationToken,
+    secrets: Option<&Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>>,
 ) -> AlmsResult<RunOutput> {
     // Derive identity and config based on whether the subagent is named
     let (agent_id, context_id, config, model_override, provider_override, attach_workspace) =
@@ -827,11 +844,15 @@ async fn run_agent_loop(
     // Create a per-subagent event channel
     let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
 
-    // Apply provider override first, then model override
+    // Apply provider override first (with secrets for key resolution), then model
     let mut subagent_llm = llm.clone();
     if let Some(ref provider) = provider_override {
         info!("Named subagent using provider override: {provider}");
-        subagent_llm = subagent_llm.with_provider(provider);
+        subagent_llm = if let Some(s) = secrets {
+            subagent_llm.with_provider_and_secrets(provider, &s.read().unwrap())
+        } else {
+            subagent_llm.with_provider(provider)
+        };
     }
     if let Some(model) = model_override {
         info!("Named subagent using model override: {model}");
