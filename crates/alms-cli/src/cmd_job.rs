@@ -3,7 +3,7 @@ use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
 use alms_session::SqliteStore;
 use clap::Subcommand;
 
-use crate::helpers::{api_delete, api_post, fmt_time, resolve_agent, short_id};
+use crate::helpers::{api_delete, api_get, api_post, fmt_time, resolve_agent, short_id};
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum JobCommands {
@@ -130,17 +130,30 @@ pub(crate) fn job_show(store: &SqliteStore, job_id_str: &str, json: bool) -> any
 
 pub(crate) async fn job_create(
     url: &str,
-    store: &SqliteStore,
     agent_name_or_id: &str,
     prompt: &str,
     schedule_str: &str,
     json: bool,
 ) -> anyhow::Result<()> {
-    let agent = resolve_agent(store, agent_name_or_id)?;
+    // Resolve agent via the gateway HTTP API instead of direct SQLite,
+    // avoiding state disagreement between CLI and gateway. Fixes #26.
+    let agent_val = api_get(url, &format!("agents/{agent_name_or_id}")).await?;
+    let agent_id_str = agent_val
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Agent not found: {agent_name_or_id}"))?;
+    let agent_id: alms_core::AgentId = agent_id_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("Invalid agent ID returned by gateway: {agent_id_str}"))?;
+    let agent_name = agent_val
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(agent_name_or_id);
+
     let schedule = parse_schedule(schedule_str)?;
 
     let req = CreateJobRequest {
-        agent_id: agent.id,
+        agent_id,
         prompt: prompt.to_string(),
         schedule,
     };
@@ -150,7 +163,7 @@ pub(crate) async fn job_create(
         println!("{}", serde_json::to_string_pretty(&val)?);
     } else {
         let created: Job = serde_json::from_value(val)?;
-        println!("Created job {} for agent '{}'", created.id, agent.name);
+        println!("Created job {} for agent '{}'", created.id, agent_name);
     }
     Ok(())
 }
