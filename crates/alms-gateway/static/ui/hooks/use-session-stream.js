@@ -162,13 +162,15 @@ export function openSessionStream(sessionId) {
     es.addEventListener('subagent_completed', (e) => {
         const data = JSON.parse(e.data);
         const name = data.subagent_name || 'subagent';
-        const status = data.status === 'fail' ? 'fail' : 'done';
+        const status = data.status || 'done';
 
-        // Update SubagentBar to show "done" (stays visible until notification run finishes)
+        // Update SubagentBar (stays visible until notification run finishes)
         trackSubagentEnd(name, status);
 
         // Show system message in chat
-        const label = status === 'done' ? 'completed' : 'failed';
+        const label = status === 'done' ? 'completed'
+            : status === 'fail' ? 'failed'
+            : status === 'cancelled' ? 'cancelled' : 'completed';
         chatMessages.value = [...chatMessages.value, {
             type: 'system',
             text: `Subagent '${name}' ${label}.`,
