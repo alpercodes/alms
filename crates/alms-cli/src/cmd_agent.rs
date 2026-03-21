@@ -24,6 +24,9 @@ pub(crate) enum AgentCommands {
         /// System prompt override
         #[arg(long)]
         system_prompt: Option<String>,
+        /// LLM provider override ("openai", "anthropic", "openrouter")
+        #[arg(long)]
+        provider: Option<String>,
         /// Set as the default agent
         #[arg(long)]
         default: bool,
@@ -59,6 +62,9 @@ pub(crate) enum AgentCommands {
         /// System prompt override (empty string to clear)
         #[arg(long)]
         system_prompt: Option<String>,
+        /// LLM provider override (empty string to clear)
+        #[arg(long)]
+        provider: Option<String>,
         /// Description
         #[arg(long)]
         description: Option<String>,
@@ -103,6 +109,7 @@ pub(crate) fn agent_create(
     model: Option<String>,
     posture: Option<String>,
     system_prompt: Option<String>,
+    provider: Option<String>,
     default: bool,
     json: bool,
     workspace_dir: Option<&std::path::Path>,
@@ -117,7 +124,7 @@ pub(crate) fn agent_create(
         model,
         system_prompt,
         posture,
-        provider: None,
+        provider,
         is_default: default,
         created_at: now,
         last_active: now,
@@ -187,6 +194,10 @@ pub(crate) fn agent_show(store: &SqliteStore, name_or_id: &str, json: bool) -> a
         agent.posture.as_deref().unwrap_or("(server default)")
     );
     println!(
+        "Provider:      {}",
+        agent.provider.as_deref().unwrap_or("(server default)")
+    );
+    println!(
         "System Prompt: {}",
         if agent.system_prompt.is_some() {
             "(custom)"
@@ -252,6 +263,7 @@ pub(crate) fn agent_config(
     model: Option<String>,
     posture: Option<String>,
     system_prompt: Option<String>,
+    provider: Option<String>,
     description: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
@@ -268,6 +280,9 @@ pub(crate) fn agent_config(
     }
     if let Some(sp) = system_prompt {
         agent.system_prompt = if sp.is_empty() { None } else { Some(sp) };
+    }
+    if let Some(prov) = provider {
+        agent.provider = if prov.is_empty() { None } else { Some(prov) };
     }
 
     agent.last_active = chrono::Utc::now();
@@ -296,6 +311,7 @@ mod tests {
             &store,
             "test-agent".into(),
             Some("desc".into()),
+            None,
             None,
             None,
             None,
@@ -330,6 +346,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
             None,
@@ -338,6 +355,7 @@ mod tests {
         let err = agent_create(
             &store,
             "dup".into(),
+            None,
             None,
             None,
             None,
@@ -360,6 +378,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             false,
             false,
             None,
@@ -377,6 +396,7 @@ mod tests {
         agent_create(
             &store,
             "reviewer".into(),
+            None,
             None,
             None,
             None,
@@ -449,6 +469,7 @@ mod tests {
             Some("new-model".into()),
             Some("guarded".into()),
             None,
+            None,
             Some("updated desc".into()),
             false,
         )
@@ -483,6 +504,7 @@ mod tests {
             &store,
             "clearable",
             Some(String::new()),
+            None,
             None,
             None,
             None,
