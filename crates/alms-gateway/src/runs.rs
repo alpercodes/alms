@@ -434,6 +434,24 @@ async fn execute_run(
     .with_run_id(run_id)
     .with_cancel_token(cancel_token.clone());
 
+    // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into shell_exec processes
+    // so that CLI commands invoked by agents find the correct database and
+    // workspace regardless of the sandboxed cwd.
+    {
+        let mut shell_env = std::collections::HashMap::new();
+        shell_env.insert(
+            "ALMS_DATA_DIR".to_string(),
+            state.data_dir.to_string_lossy().into_owned(),
+        );
+        if let Some(ref ws_dir) = state.workspace_dir {
+            shell_env.insert(
+                "ALMS_WORKSPACE_DIR".to_string(),
+                ws_dir.to_string_lossy().into_owned(),
+            );
+        }
+        runtime = runtime.with_shell_default_env(shell_env);
+    }
+
     // Attach workspace if configured — registers the workspace_write tool for this run
     if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
         let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);

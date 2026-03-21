@@ -28,6 +28,10 @@ pub struct GatewayConfig {
     pub session_config: SessionConfig,
     /// Path to SQLite database file (None = in-memory only, not persisted)
     pub db_path: Option<String>,
+    /// Absolute path to the data directory (SQLite DB, secrets, etc.).
+    /// Propagated as `ALMS_DATA_DIR` to shell_exec so agent CLI commands
+    /// find the right database regardless of sandbox cwd.
+    pub data_dir: Option<std::path::PathBuf>,
     /// Base directory for agent workspace files (None = workspace API disabled)
     pub workspace_dir: Option<std::path::PathBuf>,
     /// Explicit agent ID (None = resolve from sidecar file or generate new)
@@ -45,6 +49,7 @@ impl Default for GatewayConfig {
             agent_config: AgentConfig::default(),
             session_config: SessionConfig::default(),
             db_path: None,
+            data_dir: None,
             workspace_dir: None,
             agent_id: None,
             auth_token: None,
@@ -83,6 +88,7 @@ impl GatewayConfig {
                 max_context_tokens: config.session.max_context_tokens,
             },
             db_path: None,
+            data_dir: None,
             workspace_dir: None,
             agent_id: None,
             auth_token: config.server.auth_token.clone(),
@@ -112,6 +118,18 @@ impl GatewayConfig {
         if let Err(e) = std::fs::create_dir_all(data_dir) {
             tracing::warn!("Could not create data directory {}: {}", data_dir, e);
         }
+
+        // Resolve data_dir to an absolute path so shell_exec children inherit
+        // the correct ALMS_DATA_DIR regardless of their cwd.
+        let data_dir_path = std::path::PathBuf::from(data_dir);
+        gateway_config.data_dir =
+            Some(std::fs::canonicalize(&data_dir_path).unwrap_or_else(|_| {
+                // canonicalize can fail if the dir doesn't exist yet (edge case).
+                // Fall back to making it absolute via current_dir + join.
+                std::env::current_dir()
+                    .map(|cwd| cwd.join(&data_dir_path))
+                    .unwrap_or(data_dir_path)
+            }));
 
         gateway_config.agent_id = Some(resolve_default_agent_id(Path::new(data_dir)));
 
@@ -357,6 +375,26 @@ impl Gateway {
                                 continue;
                             }
                         };
+                        // Inject ALMS_DATA_DIR so CLI commands invoked via
+                        // shell_exec find the correct database.
+                        {
+                            let mut shell_env = std::collections::HashMap::new();
+                            if let Some(ref dd) = self.config.data_dir {
+                                shell_env.insert(
+                                    "ALMS_DATA_DIR".to_string(),
+                                    dd.to_string_lossy().into_owned(),
+                                );
+                            }
+                            if let Some(ref ws) = self.config.workspace_dir {
+                                shell_env.insert(
+                                    "ALMS_WORKSPACE_DIR".to_string(),
+                                    ws.to_string_lossy().into_owned(),
+                                );
+                            }
+                            if !shell_env.is_empty() {
+                                runtime = runtime.with_shell_default_env(shell_env);
+                            }
+                        }
                         // Attach workspace so agent personality/goals/memories
                         // are prepended to the system prompt (same as HTTP path).
                         if let (Some(ws_dir), Some(name)) =
@@ -431,6 +469,11 @@ impl Gateway {
     /// Get agent config reference
     pub fn agent_config(&self) -> &AgentConfig {
         &self.config.agent_config
+    }
+
+    /// Get the absolute path to the data directory.
+    pub fn data_dir(&self) -> Option<&std::path::Path> {
+        self.config.data_dir.as_deref()
     }
 
     /// Get workspace base directory (None = workspace API disabled)

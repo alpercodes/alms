@@ -353,6 +353,9 @@ pub struct AppState {
     pub approval_store: ApprovalStore,
     /// Base directory for agent workspace files (None = workspace API disabled)
     pub workspace_dir: Option<std::path::PathBuf>,
+    /// Absolute path to the gateway's data directory. Propagated to shell_exec
+    /// as `ALMS_DATA_DIR` so CLI commands invoked by agents find the right DB.
+    pub data_dir: std::path::PathBuf,
     /// Job store for scheduled jobs
     pub job_store: Arc<JobStore>,
     /// Scheduler for firing jobs at the right time
@@ -385,6 +388,10 @@ impl AppState {
         completion_tx: tokio::sync::mpsc::UnboundedSender<alms_coordinator::SubagentCompletion>,
     ) -> AlmsResult<Self> {
         let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
+        let data_dir = gateway
+            .data_dir()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("./data"));
         let session_manager = gateway.session_manager().clone();
         let llm = gateway.llm().clone();
         let agent_id = gateway.agent_id();
@@ -410,6 +417,7 @@ impl AppState {
         if let Some(ref ws_dir) = workspace_dir {
             coord = coord.with_workspace_dir(ws_dir.clone());
         }
+        coord = coord.with_data_dir(data_dir.clone());
 
         // Construct secrets store early so both coordinator and AppState can use it.
         let secrets_path = alms_core::secrets::secrets_path_from_db(db_path_str.as_deref());
@@ -454,6 +462,7 @@ impl AppState {
             run_manager: RunManager::new(),
             approval_store: ApprovalStore::new(),
             workspace_dir,
+            data_dir,
             job_store,
             scheduler,
             coordinator,

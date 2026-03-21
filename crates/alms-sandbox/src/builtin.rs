@@ -1,5 +1,6 @@
 use crate::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use tracing::warn;
 
@@ -465,6 +466,10 @@ pub struct ShellExecTool {
     /// Used to set the agent's workspace as the "home directory".
     /// Takes precedence over `sandbox_root` as default cwd.
     default_cwd: Option<PathBuf>,
+    /// Default environment variables injected into spawned processes.
+    /// Applied after `env_clear()` — the tool call's `env` parameter
+    /// overrides these on conflict.
+    default_env: HashMap<String, String>,
 }
 
 impl Default for ShellExecTool {
@@ -473,6 +478,7 @@ impl Default for ShellExecTool {
             sandbox_root: None,
             unrestricted: true,
             default_cwd: None,
+            default_env: HashMap::new(),
         }
     }
 }
@@ -489,6 +495,7 @@ impl ShellExecTool {
             sandbox_root: Some(root),
             unrestricted: false,
             default_cwd: None,
+            default_env: HashMap::new(),
         }
     }
 
@@ -498,6 +505,7 @@ impl ShellExecTool {
             sandbox_root,
             unrestricted,
             default_cwd: None,
+            default_env: HashMap::new(),
         }
     }
 
@@ -513,6 +521,15 @@ impl ShellExecTool {
             );
         }
         self.default_cwd = Some(cwd);
+        self
+    }
+
+    /// Set default environment variables for spawned processes.
+    ///
+    /// These are injected after `env_clear()` so they don't leak the daemon's
+    /// secrets. The tool call's `env` parameter overrides defaults on conflict.
+    pub fn with_default_env(mut self, env: HashMap<String, String>) -> Self {
+        self.default_env = env;
         self
     }
 }
@@ -619,8 +636,12 @@ impl Tool for ShellExecTool {
         }
 
         // Clear the daemon's environment (which holds API keys, tokens, etc.)
-        // before applying user-specified env vars.
+        // then inject gateway-provided defaults (ALMS_DATA_DIR, etc.),
+        // then apply tool-call env params which override defaults on conflict.
         cmd.env_clear();
+        for (k, v) in &self.default_env {
+            cmd.env(k, v);
+        }
         if let Some(env_obj) = params.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env_obj {
                 if let Some(val) = v.as_str() {
@@ -1267,6 +1288,57 @@ mod tests {
             .execute(serde_json::json!({"argv": ["ls"], "cwd": "/etc"}))
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_default_env() {
+        let mut env = HashMap::new();
+        env.insert(
+            "ALMS_DATA_DIR".to_string(),
+            "/tmp/alms-test-data".to_string(),
+        );
+        env.insert("ALMS_WORKSPACE_DIR".to_string(), "/tmp/alms-ws".to_string());
+
+        let tool = ShellExecTool::new().with_default_env(env);
+        let result = tool
+            .execute(serde_json::json!({"argv": ["env"]}))
+            .await
+            .unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("ALMS_DATA_DIR=/tmp/alms-test-data"),
+            "default_env should inject ALMS_DATA_DIR into spawned process"
+        );
+        assert!(
+            stdout.contains("ALMS_WORKSPACE_DIR=/tmp/alms-ws"),
+            "default_env should inject ALMS_WORKSPACE_DIR into spawned process"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_tool_call_env_overrides_default() {
+        let mut env = HashMap::new();
+        env.insert("ALMS_DATA_DIR".to_string(), "/default/path".to_string());
+
+        let tool = ShellExecTool::new().with_default_env(env);
+        let result = tool
+            .execute(serde_json::json!({
+                "argv": ["env"],
+                "env": {"ALMS_DATA_DIR": "/override/path"}
+            }))
+            .await
+            .unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("ALMS_DATA_DIR=/override/path"),
+            "tool call env should override default_env: {stdout}"
+        );
+        assert!(
+            !stdout.contains("ALMS_DATA_DIR=/default/path"),
+            "default value should be overridden"
+        );
     }
 
     // ── FsReadTool ────────────────────────────────────────────────────────────
