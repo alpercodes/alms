@@ -579,22 +579,23 @@ async fn run_subagent(
 
     // Store result in the handle for background-mode polling, then update status.
     // Also capture background flag and parent info for the completion notification.
-    let (is_background, parent_session_id, parent_agent_id) =
-        if let Some(mut handle) = subagents.get_mut(&task_id) {
-            handle.status = new_status;
-            handle.completed_result = Some(task_result.clone());
-            (
-                handle.is_background,
-                handle.parent_session_id,
-                handle.parent_agent_id,
-            )
+    let background_info = if let Some(mut handle) = subagents.get_mut(&task_id) {
+        handle.status = new_status;
+        handle.completed_result = Some(task_result.clone());
+        if handle.is_background {
+            Some((handle.parent_session_id, handle.parent_agent_id))
         } else {
-            (false, request.parent_session, AgentId::new())
-        };
+            None
+        }
+    } else {
+        None
+    };
 
     // Fire completion notification for background subagents so the gateway
     // can auto-create a follow-up run on the parent session.
-    if is_background && let Some(ref tx) = completion_tx {
+    if let Some((parent_session_id, parent_agent_id)) = background_info
+        && let Some(ref tx) = completion_tx
+    {
         let summary = truncate_for_notification(&task_result.result);
         let completion = SubagentCompletion {
             task_id,
@@ -1223,5 +1224,49 @@ mod tests {
         // Each ephemeral invocation creates its own session, so we can't
         // look up a single session with all 4 messages. This test verifies
         // that the calls succeed independently (no shared state).
+    }
+
+    // -- truncate_for_notification -----------------------------------------------
+
+    #[test]
+    fn test_truncate_short_response() {
+        let result = serde_json::json!({"response": "Hello world"});
+        assert_eq!(truncate_for_notification(&result), "Hello world");
+    }
+
+    #[test]
+    fn test_truncate_long_response() {
+        let long = "a".repeat(1000);
+        let result = serde_json::json!({"response": long});
+        let truncated = truncate_for_notification(&result);
+        assert!(truncated.len() < 1000);
+        assert!(truncated.ends_with("…[truncated]"));
+        // 800 chars of 'a' + the suffix
+        assert!(truncated.starts_with(&"a".repeat(800)));
+    }
+
+    #[test]
+    fn test_truncate_error_field() {
+        let result = serde_json::json!({"error": "something broke"});
+        assert_eq!(truncate_for_notification(&result), "something broke");
+    }
+
+    #[test]
+    fn test_truncate_no_content() {
+        let result = serde_json::json!({"cancelled": true});
+        assert_eq!(truncate_for_notification(&result), "[no content]");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_boundary() {
+        // 799 ASCII chars + a 2-byte char at position 799-800 = would split mid-char at 800
+        let mut s = "a".repeat(799);
+        s.push('é'); // 2-byte UTF-8
+        s.push_str("zzz");
+        let result = serde_json::json!({"response": s});
+        let truncated = truncate_for_notification(&result);
+        assert!(truncated.ends_with("…[truncated]"));
+        // Must not panic or produce invalid UTF-8
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 }
