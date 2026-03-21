@@ -5,6 +5,7 @@ pub mod error;
 pub mod job;
 pub mod registry;
 pub mod run;
+pub mod secrets;
 
 pub use channel::{Channel, ChannelConfig, ChannelMessage, IncomingMessage, OutgoingMessage};
 
