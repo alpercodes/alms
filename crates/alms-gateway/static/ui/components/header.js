@@ -2,15 +2,16 @@ import { h, html, computed } from '../deps.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { activePanel, activePanelTab } from '../state/panel.js';
 import { localSettings, serverDefaults } from '../state/settings.js';
+import { theme, toggleTheme } from '../state/theme.js';
 import { switchAgent } from '../hooks/use-boot.js';
-import { IconGear } from '../utils/icons.js';
+import { IconGear, IconSun, IconMoon } from '../utils/icons.js';
 
 const TABS = ['agents', 'workspace', 'jobs', 'audit'];
 
 const effectivePosture = computed(() => {
     const local = localSettings.value.posture;
     const server = serverDefaults.value.posture;
-    return local || server || 'full_control';
+    return local || server || 'guarded';
 });
 
 function togglePanel(tab) {
@@ -68,6 +69,11 @@ export function Header({ onOpenSettings, status }) {
                     </button>
                 `)}
             </div>
+
+            <button class="header-icon-btn" title="Toggle theme" aria-label="Toggle theme"
+                    onClick=${toggleTheme}>
+                ${theme.value === 'dark' ? html`<${IconSun} />` : html`<${IconMoon} />`}
+            </button>
 
             <button class="header-icon-btn" title="Settings" aria-label="Settings"
                     onClick=${onOpenSettings}>

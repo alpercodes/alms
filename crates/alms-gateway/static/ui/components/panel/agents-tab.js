@@ -14,8 +14,8 @@ async function refreshAgents() {
     }
 }
 
-function AgentCard({ agent, isActive }) {
-    const editing = useSignal(false);
+/** Small popup modal for editing agent settings. */
+function AgentEditModal({ agent, onClose }) {
     const model = useSignal(agent.model || '');
     const systemPrompt = useSignal(agent.system_prompt || '');
     const posture = useSignal(agent.posture || '');
@@ -34,7 +34,7 @@ function AgentCard({ agent, isActive }) {
                 posture: posture.value || null,
             });
             await refreshAgents();
-            editing.value = false;
+            onClose();
         } catch (err) {
             error.value = err.error?.message || err.message || 'Save failed';
         } finally {
@@ -42,13 +42,60 @@ function AgentCard({ agent, isActive }) {
         }
     };
 
-    const onCancel = () => {
-        model.value = agent.model || '';
-        systemPrompt.value = agent.system_prompt || '';
-        posture.value = agent.posture || '';
-        error.value = '';
-        editing.value = false;
+    const onOverlayClick = (e) => {
+        if (e.target === e.currentTarget) onClose();
     };
+
+    return html`
+        <div class="settings-overlay open" onClick=${onOverlayClick}>
+            <div class="settings-modal" style="width:400px;">
+                <h2>${agent.name}</h2>
+
+                <div class="settings-row">
+                    <label class="settings-label">Model</label>
+                    <input class="settings-input" type="text"
+                           placeholder=${serverModel + ' (server default)'}
+                           value=${model.value}
+                           onInput=${e => { model.value = e.target.value; }} />
+                    <span class="settings-hint">Leave empty to use server default.</span>
+                </div>
+
+                <div class="settings-row">
+                    <label class="settings-label">System prompt</label>
+                    <textarea class="settings-input" rows="4"
+                              style="resize:vertical; min-height:60px; font-size:var(--text-xs);"
+                              placeholder="Uses server default if empty"
+                              value=${systemPrompt.value}
+                              onInput=${e => { systemPrompt.value = e.target.value; }}></textarea>
+                </div>
+
+                <div class="settings-row">
+                    <label class="settings-label">Posture</label>
+                    <select class="settings-select"
+                            value=${posture.value}
+                            onChange=${e => { posture.value = e.target.value; }}>
+                        <option value="">Server default (${serverDefaults.value.posture || 'guarded'})</option>
+                        <option value="full_control">full_control</option>
+                        <option value="guarded">guarded</option>
+                    </select>
+                </div>
+
+                ${error.value && html`<div style="color:var(--error); font-size:var(--text-xs);">${error.value}</div>`}
+
+                <div class="settings-footer">
+                    <button class="settings-cancel" onClick=${onClose}>Cancel</button>
+                    <button class="settings-save" onClick=${onSave} disabled=${saving.value}>
+                        ${saving.value ? '...' : 'Save'}
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function AgentCard({ agent, isActive, onEdit }) {
+    const error = useSignal('');
+    const serverModel = serverDefaults.value.model || 'default';
 
     const onDelete = async () => {
         if (!confirm('Delete agent "' + agent.name + '"?')) return;
@@ -75,48 +122,6 @@ function AgentCard({ agent, isActive }) {
         }
     };
 
-    if (editing.value) {
-        return html`
-            <div class="agent-card ${isActive ? 'active' : ''}">
-                <div class="agent-card-header">
-                    <span class="agent-card-name">${agent.name}</span>
-                    ${agent.is_default && html`<span class="agent-badge">default</span>`}
-                </div>
-
-                <label class="agent-field-label">Model</label>
-                <input class="agent-field-input" type="text"
-                       placeholder=${serverModel + ' (server default)'}
-                       value=${model.value}
-                       onInput=${e => { model.value = e.target.value; }} />
-
-                <label class="agent-field-label">System prompt</label>
-                <textarea class="agent-field-input agent-field-textarea" rows="3"
-                          placeholder="Uses server default if empty"
-                          value=${systemPrompt.value}
-                          onInput=${e => { systemPrompt.value = e.target.value; }}></textarea>
-
-                <label class="agent-field-label">Posture</label>
-                <select class="agent-field-input"
-                        value=${posture.value}
-                        onChange=${e => { posture.value = e.target.value; }}>
-                    <option value="">Server default (${serverDefaults.value.posture || 'full_control'})</option>
-                    <option value="full_control">full_control</option>
-                    <option value="guarded">guarded</option>
-                </select>
-
-                ${error.value && html`<div class="agent-error">${error.value}</div>`}
-
-                <div class="agent-card-actions">
-                    <button class="agent-card-btn agent-btn-save" onClick=${onSave}
-                            disabled=${saving.value}>
-                        ${saving.value ? '...' : 'Save'}
-                    </button>
-                    <button class="agent-card-btn" onClick=${onCancel}>Cancel</button>
-                </div>
-            </div>
-        `;
-    }
-
     return html`
         <div class="agent-card ${isActive ? 'active' : ''}">
             <div class="agent-card-header">
@@ -134,9 +139,10 @@ function AgentCard({ agent, isActive }) {
                     prompt: ${agent.system_prompt.slice(0, 80)}${agent.system_prompt.length > 80 ? '\u2026' : ''}
                 </div>
             `}
+            ${error.value && html`<div class="agent-error">${error.value}</div>`}
             <div class="agent-card-actions">
                 <button class="agent-card-btn" onClick=${() => switchAgent(agent.id)}>Select</button>
-                <button class="agent-card-btn" onClick=${() => { model.value = agent.model || ''; systemPrompt.value = agent.system_prompt || ''; posture.value = agent.posture || ''; editing.value = true; }}>Edit</button>
+                <button class="agent-card-btn" onClick=${() => onEdit(agent)}>Edit</button>
                 ${!agent.is_default && html`
                     <button class="agent-card-btn" onClick=${onSetDefault}>Set Default</button>
                 `}
@@ -150,6 +156,7 @@ export function AgentsTab() {
     const newName = useSignal('');
     const error = useSignal('');
     const loading = useSignal(false);
+    const editingAgent = useSignal(null);
 
     useEffect(() => {
         if (activePanelTab.value === 'agents') refreshAgents();
@@ -190,9 +197,17 @@ export function AgentsTab() {
             ${agents.value.length === 0
                 ? html`<div style="color:var(--text-disabled); font-style:italic; padding:var(--space-4); font-size:var(--text-sm);">No agents</div>`
                 : agents.value.map(a => html`
-                    <${AgentCard} key=${a.id} agent=${a} isActive=${a.id === activeAgentId.value} />
+                    <${AgentCard} key=${a.id} agent=${a}
+                                  isActive=${a.id === activeAgentId.value}
+                                  onEdit=${(agent) => { editingAgent.value = agent; }} />
                 `)
             }
+
+            ${editingAgent.value && html`
+                <${AgentEditModal}
+                    agent=${editingAgent.value}
+                    onClose=${() => { editingAgent.value = null; }} />
+            `}
         </div>
     `;
 }

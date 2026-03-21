@@ -23,6 +23,7 @@ async function startRun(text) {
             input: { type: 'text', text },
         };
         const settings = localSettings.value;
+        if (settings.model) runBody.model = settings.model;
         if (settings.max_tokens != null) runBody.max_tokens = settings.max_tokens;
         if (settings.posture) runBody.posture = settings.posture;
 
