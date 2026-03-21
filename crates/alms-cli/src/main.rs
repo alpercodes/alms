@@ -240,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
                     model,
                     posture,
                     system_prompt,
+                    provider,
                     default,
                 } => {
                     let workspace_dir: std::path::PathBuf = std::env::var("ALMS_WORKSPACE_DIR")
@@ -252,6 +253,7 @@ async fn main() -> anyhow::Result<()> {
                         model,
                         posture,
                         system_prompt,
+                        provider,
                         default,
                         json,
                         Some(&workspace_dir),
@@ -271,6 +273,7 @@ async fn main() -> anyhow::Result<()> {
                     model,
                     posture,
                     system_prompt,
+                    provider,
                     description,
                 } => {
                     cmd_agent::agent_config(
@@ -279,6 +282,7 @@ async fn main() -> anyhow::Result<()> {
                         model,
                         posture,
                         system_prompt,
+                        provider,
                         description,
                         json,
                     )?;

@@ -1,3 +1,47 @@
+
+/* ── Light mode ── */
+[data-theme='light'] {
+  --surface-0: #ffffff;
+  --surface-1: #f4f4f5;
+  --surface-2: #e4e4e7;
+  --surface-3: #d4d4d8;
+  --surface-4: #a1a1aa;
+
+  --text-primary: #09090b;
+  --text-secondary: #3f3f46;
+  --text-muted: #71717a;
+  --text-disabled: #a1a1aa;
+  --text-inverse: #fafafa;
+
+  --accent: #16a34a;
+  --accent-hover: #15803d;
+  --accent-muted: rgba(22, 163, 74, 0.1);
+  --accent-text: #16a34a;
+
+  --success: #16a34a;
+  --success-muted: rgba(22, 163, 74, 0.1);
+  --warning: #ca8a04;
+  --warning-muted: rgba(202, 138, 4, 0.1);
+  --error: #dc2626;
+  --error-muted: rgba(220, 38, 38, 0.1);
+  --info: #2563eb;
+  --info-muted: rgba(37, 99, 235, 0.1);
+
+  --border-subtle: #e4e4e7;
+  --border-default: #d4d4d8;
+  --border-strong: #a1a1aa;
+  --border-accent: #16a34a;
+
+  --user-prompt: #16a34a;
+  --agent-prompt: #18181b;
+
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.08);
+  --shadow-lg: 0 8px 24px rgba(0,0,0,0.12);
+  --shadow-overlay: 0 16px 48px rgba(0,0,0,0.15);
+
+  --overlay-backdrop: rgba(0,0,0,0.3);
+}
 /* ══════════════════════════════════════════════════════════════════════
    ALMS Design System
    ══════════════════════════════════════════════════════════════════════ */

@@ -550,6 +550,7 @@ struct SubagentRecordConfig {
     system_prompt: Option<String>,
     model: Option<String>,
     posture: Option<String>,
+    provider: Option<String>,
 }
 
 /// Build an `AgentConfig` for a subagent. Named subagents get their config
@@ -559,10 +560,10 @@ struct SubagentRecordConfig {
 fn agent_config_for_subagent(
     record: Option<SubagentRecordConfig>,
     base: &AgentConfig,
-) -> (AgentConfig, Option<String>) {
-    let (system_prompt, model, posture_str) = match record {
-        Some(r) => (r.system_prompt, r.model, r.posture),
-        None => (None, None, None),
+) -> (AgentConfig, Option<String>, Option<String>) {
+    let (system_prompt, model, posture_str, provider) = match record {
+        Some(r) => (r.system_prompt, r.model, r.posture, r.provider),
+        None => (None, None, None, None),
     };
 
     let posture = match posture_str.as_deref() {
@@ -582,7 +583,7 @@ fn agent_config_for_subagent(
         context_config: base.context_config.clone(),
         prompts: base.prompts.clone(),
     };
-    (config, model)
+    (config, model, provider)
 }
 
 /// Run the actual agent loop for a subagent.
@@ -609,7 +610,7 @@ async fn run_agent_loop(
     subagent_prompts: &DashMap<String, String>,
 ) -> AlmsResult<RunOutput> {
     // Derive identity and config based on whether the subagent is named
-    let (agent_id, context_id, config, model_override, attach_workspace) =
+    let (agent_id, context_id, config, model_override, provider_override, attach_workspace) =
         if let Some(ref name) = request.subagent_name {
             // Named: deterministic identity, look up agent registry for config
             let parent_as_agent = AgentId(request.parent_session.0);
@@ -627,6 +628,7 @@ async fn run_agent_loop(
                         system_prompt: record.system_prompt,
                         model: record.model,
                         posture: record.posture,
+                        provider: record.provider,
                     }
                 })
                 .or_else(|| {
@@ -637,7 +639,8 @@ async fn run_agent_loop(
                     None
                 });
 
-            let (config, model) = agent_config_for_subagent(record_config, base_agent_config);
+            let (config, model, provider) =
+                agent_config_for_subagent(record_config, base_agent_config);
 
             // Detect system_prompt drift: warn when the prompt changes between
             // invocations of the same named subagent within the same parent session.
@@ -658,14 +661,15 @@ async fn run_agent_loop(
             }
             subagent_prompts.insert(stable_ctx.clone(), config.system_prompt.clone());
 
-            (stable_id, stable_ctx, config, model, true)
+            (stable_id, stable_ctx, config, model, provider, true)
         } else {
             // Ephemeral: fresh each invocation
-            let (config, _) = agent_config_for_subagent(None, base_agent_config);
+            let (config, _, _) = agent_config_for_subagent(None, base_agent_config);
             (
                 AgentId::new(),
                 format!("subagent_{}", task_id.0),
                 config,
+                None,
                 None,
                 false,
             )
@@ -674,13 +678,16 @@ async fn run_agent_loop(
     // Create a per-subagent event channel
     let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
 
-    // Apply model override from agent registry
-    let subagent_llm = if let Some(model) = model_override {
+    // Apply provider override first, then model override
+    let mut subagent_llm = llm.clone();
+    if let Some(ref provider) = provider_override {
+        info!("Named subagent using provider override: {provider}");
+        subagent_llm = subagent_llm.with_provider(provider);
+    }
+    if let Some(model) = model_override {
         info!("Named subagent using model override: {model}");
-        llm.clone().with_model(model)
-    } else {
-        llm.clone()
-    };
+        subagent_llm = subagent_llm.with_model(model);
+    }
 
     let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?.with_event_sender(sub_tx);
 
@@ -950,7 +957,7 @@ mod tests {
         };
 
         // Ephemeral subagent (no registry record)
-        let (config, model) = agent_config_for_subagent(None, &parent);
+        let (config, model, _provider) = agent_config_for_subagent(None, &parent);
         assert!(model.is_none());
         // Should inherit runtime settings from parent
         assert_eq!(config.max_iterations, 42);
@@ -970,8 +977,9 @@ mod tests {
             system_prompt: Some("custom prompt".into()),
             model: Some("gpt-5".into()),
             posture: Some("guarded".into()),
+            provider: Some("anthropic".into()),
         };
-        let (config2, model2) = agent_config_for_subagent(Some(record), &parent);
+        let (config2, model2, provider2) = agent_config_for_subagent(Some(record), &parent);
         assert_eq!(model2.as_deref(), Some("gpt-5"));
         assert_eq!(config2.system_prompt, "custom prompt");
         assert_eq!(config2.posture, alms_runtime::Posture::Guarded);

@@ -21,6 +21,8 @@ pub struct AgentRecord {
     pub system_prompt: Option<String>,
     /// Per-agent posture override (None = use server default).
     pub posture: Option<String>,
+    /// Per-agent LLM provider override (None = use server default).
+    pub provider: Option<String>,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
@@ -35,6 +37,7 @@ pub struct CreateAgentRequest {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub posture: Option<String>,
+    pub provider: Option<String>,
     #[serde(default)]
     pub is_default: Option<bool>,
 }
@@ -49,6 +52,7 @@ pub struct UpdateAgentRequest {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub posture: Option<String>,
+    pub provider: Option<String>,
 }
 
 /// Validate an agent name slug.

@@ -75,11 +75,17 @@ pub fn resolve_agent_config(
         &RunOverrides::default(),
     );
 
-    let llm = if let Some(model) = merged.model_override {
-        llm.clone().with_model(model)
-    } else {
-        llm.clone()
-    };
+    // Apply per-agent provider override first (changes base_url + api_key),
+    // then model override on top.
+    let mut llm = llm.clone();
+    if let Some(ref record) = agent_record {
+        if let Some(ref provider) = record.provider {
+            llm = llm.with_provider(provider);
+        }
+    }
+    if let Some(model) = merged.model_override {
+        llm = llm.with_model(model);
+    }
 
     ResolvedAgentConfig {
         agent_config: merged.agent_config,
@@ -879,6 +885,7 @@ mod tests {
             model: model.map(String::from),
             system_prompt: system_prompt.map(String::from),
             posture: posture.map(String::from),
+            provider: None,
             is_default: false,
             created_at: now,
             last_active: now,

@@ -123,6 +123,7 @@ pub async fn create_agent(
         model: req.model,
         system_prompt: req.system_prompt,
         posture: req.posture,
+        provider: req.provider,
         // Always INSERT with is_default=false; set_default_agent atomically
         // clears old default + sets new one in a single transaction.
         is_default: false,
@@ -201,6 +202,14 @@ pub async fn update_agent(
         };
     }
 
+    if let Some(provider) = req.provider {
+        agent.provider = if provider.is_empty() {
+            None
+        } else {
+            Some(provider)
+        };
+    }
+
     agent.last_active = Utc::now();
 
     store
@@ -270,6 +279,7 @@ mod tests {
             model: None,
             system_prompt: None,
             posture: None,
+            provider: None,
             is_default: false,
             created_at: now,
             last_active: now,
