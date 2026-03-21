@@ -11,7 +11,8 @@ use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
-    cancel_run, create_run, get_run_status, list_runs, scheduler_fire_loop, stream_run_events,
+    cancel_run, completion_notification_loop, create_run, get_run_status, list_runs,
+    scheduler_fire_loop, stream_run_events,
 };
 use crate::session_queue::SessionQueue;
 use crate::settings::get_settings;
@@ -274,6 +275,7 @@ impl AppState {
         gateway: Gateway,
         scheduler: Arc<Scheduler>,
         shutdown_token: CancellationToken,
+        completion_tx: tokio::sync::mpsc::UnboundedSender<alms_coordinator::SubagentCompletion>,
     ) -> AlmsResult<Self> {
         let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
         let session_manager = gateway.session_manager().clone();
@@ -295,7 +297,8 @@ impl AppState {
             session_manager.clone(),
             llm.clone(),
             agent_config.clone(),
-        );
+        )
+        .with_completion_channel(completion_tx);
         if let Some(ref ws_dir) = workspace_dir {
             coord = coord.with_workspace_dir(ws_dir.clone());
         }
@@ -625,7 +628,10 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let (fire_tx, fire_rx) = tokio::sync::mpsc::unbounded_channel::<alms_core::JobId>();
     let scheduler = Arc::new(Scheduler::new().with_fire_channel(fire_tx));
 
-    let state = AppState::new(gateway, scheduler, shutdown_token.clone())?;
+    let (completion_tx, completion_rx) =
+        tokio::sync::mpsc::unbounded_channel::<alms_coordinator::SubagentCompletion>();
+
+    let state = AppState::new(gateway, scheduler, shutdown_token.clone(), completion_tx)?;
 
     {
         let mut gateway = state.gateway.lock().await;
@@ -643,6 +649,14 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     // Spawn the fire-receiver: turns fired JobIds into real agent runs.
     let fire_state = state.clone();
     let fire_handle = tokio::spawn(scheduler_fire_loop(fire_rx, fire_state));
+
+    // Spawn the completion-notification loop: turns background subagent
+    // completions into follow-up runs on the parent session.
+    let completion_state = state.clone();
+    let completion_handle = tokio::spawn(completion_notification_loop(
+        completion_rx,
+        completion_state,
+    ));
 
     // Use the auth token snapshot from AppState — no mutex lock needed.
     let auth_token = AuthToken(state.auth_token_value.clone());
@@ -707,6 +721,10 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     fire_handle.abort();
     fire_handle.await.ok();
     info!("Scheduler fire loop stopped");
+
+    completion_handle.abort();
+    completion_handle.await.ok();
+    info!("Completion notification loop stopped");
 
     // Phase 4: Gateway message loop already exiting (token cancelled).
     gateway_handle.await.ok();

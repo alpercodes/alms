@@ -13,7 +13,11 @@ use std::time::Duration;
 /// and also how long its result is kept in memory after completion so that
 /// background callers can poll via `get_task_result`.
 const SUBAGENT_TTL_SECS: u64 = 300;
-use tokio::sync::oneshot;
+
+/// Max characters in a completion notification summary.
+const NOTIFICATION_SUMMARY_MAX_CHARS: usize = 800;
+
+use tokio::sync::{mpsc, oneshot};
 use tracing::{Instrument, debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -66,6 +70,25 @@ pub struct TaskResult {
     pub tokens_used: Option<usize>,
 }
 
+/// Event sent when a background subagent finishes.
+///
+/// The gateway listens on the receiving end and creates follow-up runs
+/// to notify the parent agent. This is the foundation for peer messaging:
+/// the channel will evolve into a broader agent notification bus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentCompletion {
+    pub task_id: TaskId,
+    pub subagent_name: Option<String>,
+    pub status: TaskStatus,
+    /// Truncated summary of the result (for context efficiency).
+    pub summary: String,
+    pub execution_time_ms: u64,
+    /// Parent session to notify.
+    pub parent_session_id: SessionId,
+    /// Parent agent ID (for run creation).
+    pub parent_agent_id: AgentId,
+}
+
 /// Handle to a running subagent
 #[derive(Debug)]
 pub struct SubagentHandle {
@@ -74,6 +97,10 @@ pub struct SubagentHandle {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub cancel_tx: oneshot::Sender<()>,
     pub parent_run_id: Option<RunId>,
+    pub parent_session_id: SessionId,
+    pub parent_agent_id: AgentId,
+    /// Whether this was spawned via `dispatch_background` (triggers completion notification).
+    pub is_background: bool,
     /// Receiver for the final TaskResult — taken by `dispatch()` to await completion.
     pub result_rx: Option<oneshot::Receiver<TaskResult>>,
     /// Stored result for background tasks — set by `run_subagent` on completion
@@ -108,6 +135,9 @@ pub struct Coordinator {
     /// Tracks the last-used system_prompt per named subagent context key,
     /// so we can warn when a re-invocation uses a different prompt.
     subagent_prompts: Arc<DashMap<String, String>>,
+    /// Channel for notifying the gateway when a background subagent completes.
+    /// The gateway listens on the receiving end and creates follow-up runs.
+    completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
 }
 
 impl Coordinator {
@@ -121,6 +151,7 @@ impl Coordinator {
             base_agent_config: AgentConfig::default(),
             workspace_dir: None,
             subagent_prompts: Arc::new(DashMap::new()),
+            completion_tx: None,
         }
     }
 
@@ -140,6 +171,7 @@ impl Coordinator {
             base_agent_config,
             workspace_dir: None,
             subagent_prompts: Arc::new(DashMap::new()),
+            completion_tx: None,
         }
     }
 
@@ -147,6 +179,17 @@ impl Coordinator {
     /// under `{workspace_dir}/{agent_name}/`.
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Set a completion notification channel. When a background subagent
+    /// finishes, a [`SubagentCompletion`] is sent through this channel so
+    /// the gateway can create a follow-up run on the parent session.
+    pub fn with_completion_channel(
+        mut self,
+        tx: mpsc::UnboundedSender<SubagentCompletion>,
+    ) -> Self {
+        self.completion_tx = Some(tx);
         self
     }
 
@@ -166,6 +209,7 @@ impl Coordinator {
         &self,
         request: SubagentRequest,
         parent_event_tx: Option<RuntimeEventSender>,
+        is_background: bool,
     ) -> AlmsResult<TaskId> {
         // Reject concurrent invocations of the same named subagent to prevent
         // session corruption from parallel writes to the same session history.
@@ -183,6 +227,19 @@ impl Coordinator {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel::<TaskResult>();
         let parent_run_id = request.parent_run_id;
+        let parent_session_id = request.parent_session;
+
+        // Resolve the parent agent ID from the session.
+        let parent_agent_id = match self.session_manager.get(parent_session_id) {
+            Ok(session) => session.agent_id,
+            Err(_) => {
+                warn!(
+                    parent_session = %parent_session_id.0,
+                    "Parent session not found when spawning subagent — falling back to main agent ID"
+                );
+                self.main_agent
+            }
+        };
 
         let handle = SubagentHandle {
             task_id,
@@ -190,6 +247,9 @@ impl Coordinator {
             started_at: chrono::Utc::now(),
             cancel_tx,
             parent_run_id,
+            parent_session_id,
+            parent_agent_id,
+            is_background,
             result_rx: Some(result_rx),
             completed_result: None,
         };
@@ -210,6 +270,7 @@ impl Coordinator {
         let base_agent_config = self.base_agent_config.clone();
         let workspace_dir = self.workspace_dir.clone();
         let subagent_prompts = self.subagent_prompts.clone();
+        let completion_tx = self.completion_tx.clone();
 
         let span = tracing::info_span!(
             "subagent::execute",
@@ -231,6 +292,7 @@ impl Coordinator {
                     base_agent_config,
                     workspace_dir,
                     subagent_prompts,
+                    completion_tx,
                 )
                 .await;
             }
@@ -298,7 +360,7 @@ impl SubagentDispatcher for Coordinator {
             subagent_name,
         };
 
-        let task_id = self.spawn_subagent(request, parent_event_tx).await?;
+        let task_id = self.spawn_subagent(request, parent_event_tx, false).await?;
 
         // Take the result receiver — must happen immediately after spawn_subagent
         // since the handle is already in the DashMap.
@@ -351,7 +413,7 @@ impl SubagentDispatcher for Coordinator {
             parent_run_id,
             subagent_name,
         };
-        let task_id = self.spawn_subagent(request, parent_event_tx).await?;
+        let task_id = self.spawn_subagent(request, parent_event_tx, true).await?;
 
         // Drop the oneshot receiver — background callers poll via completed_result,
         // not the channel. This frees the allocation; run_subagent's result_tx.send()
@@ -435,6 +497,7 @@ async fn run_subagent(
     base_agent_config: AgentConfig,
     workspace_dir: Option<std::path::PathBuf>,
     subagent_prompts: Arc<DashMap<String, String>>,
+    completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
 ) {
     // RAII guard: removes the name from active_named on drop (including panics).
     let _named_guard = NamedSubagentGuard {
@@ -516,9 +579,41 @@ async fn run_subagent(
     };
 
     // Store result in the handle for background-mode polling, then update status.
-    if let Some(mut handle) = subagents.get_mut(&task_id) {
+    // Also capture background flag and parent info for the completion notification.
+    let background_info = if let Some(mut handle) = subagents.get_mut(&task_id) {
         handle.status = new_status;
         handle.completed_result = Some(task_result.clone());
+        if handle.is_background {
+            Some((handle.parent_session_id, handle.parent_agent_id))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Fire completion notification for background subagents so the gateway
+    // can auto-create a follow-up run on the parent session.
+    if let Some((parent_session_id, parent_agent_id)) = background_info
+        && let Some(ref tx) = completion_tx
+    {
+        let summary = truncate_for_notification(&task_result.result);
+        let completion = SubagentCompletion {
+            task_id,
+            subagent_name: request.subagent_name.clone(),
+            status: new_status,
+            summary,
+            execution_time_ms: task_result.execution_time_ms,
+            parent_session_id,
+            parent_agent_id,
+        };
+        if let Err(e) = tx.send(completion) {
+            warn!(
+                task_id = %task_id.0,
+                error = %e,
+                "Failed to send completion notification (receiver dropped)"
+            );
+        }
     }
 
     // Release the named subagent lock before sending the result, so that
@@ -538,6 +633,25 @@ async fn run_subagent(
         subagent_prompts.remove(&ctx_key);
     }
     debug!("Cleaned up subagent {:?}", task_id);
+}
+
+/// Truncate a subagent result value to a short summary for completion notifications.
+fn truncate_for_notification(result: &serde_json::Value) -> String {
+    let text = result["response"]
+        .as_str()
+        .or_else(|| result["error"].as_str())
+        .unwrap_or("[no content]");
+
+    if text.len() <= NOTIFICATION_SUMMARY_MAX_CHARS {
+        text.to_string()
+    } else {
+        // Truncate at a char boundary
+        let mut end = NOTIFICATION_SUMMARY_MAX_CHARS;
+        while !text.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        format!("{}…[truncated]", &text[..end])
+    }
 }
 
 /// Default system prompt for ephemeral (unnamed) subagents.
@@ -829,7 +943,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
 
         let cancel_result = coord.cancel_subagent(task_id);
         assert!(cancel_result.is_ok(), "cancel should succeed");
@@ -859,7 +973,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
         let result_rx = coord.take_result_rx(task_id).unwrap();
 
         let task_result = result_rx.await.expect("should receive result");
@@ -893,7 +1007,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
 
         let active = coord.list_active();
         assert!(
@@ -925,7 +1039,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
 
         let first = coord.take_result_rx(task_id);
         assert!(first.is_some(), "first take should return the receiver");
@@ -1065,7 +1179,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
         };
-        let _task_id = coord.spawn_subagent(request, None).await.unwrap();
+        let _task_id = coord.spawn_subagent(request, None, false).await.unwrap();
 
         // Second invocation with the same name should be rejected
         let request2 = SubagentRequest {
@@ -1075,7 +1189,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
         };
-        let result = coord.spawn_subagent(request2, None).await;
+        let result = coord.spawn_subagent(request2, None, false).await;
         assert!(
             result.is_err(),
             "Second concurrent spawn should be rejected"
@@ -1095,7 +1209,7 @@ mod tests {
             subagent_name: Some("coder".to_string()),
         };
         assert!(
-            coord.spawn_subagent(request3, None).await.is_ok(),
+            coord.spawn_subagent(request3, None, false).await.is_ok(),
             "Different named subagent should succeed"
         );
     }
@@ -1119,5 +1233,49 @@ mod tests {
         // Each ephemeral invocation creates its own session, so we can't
         // look up a single session with all 4 messages. This test verifies
         // that the calls succeed independently (no shared state).
+    }
+
+    // -- truncate_for_notification -----------------------------------------------
+
+    #[test]
+    fn test_truncate_short_response() {
+        let result = serde_json::json!({"response": "Hello world"});
+        assert_eq!(truncate_for_notification(&result), "Hello world");
+    }
+
+    #[test]
+    fn test_truncate_long_response() {
+        let long = "a".repeat(1000);
+        let result = serde_json::json!({"response": long});
+        let truncated = truncate_for_notification(&result);
+        assert!(truncated.len() < 1000);
+        assert!(truncated.ends_with("…[truncated]"));
+        // 800 chars of 'a' + the suffix
+        assert!(truncated.starts_with(&"a".repeat(800)));
+    }
+
+    #[test]
+    fn test_truncate_error_field() {
+        let result = serde_json::json!({"error": "something broke"});
+        assert_eq!(truncate_for_notification(&result), "something broke");
+    }
+
+    #[test]
+    fn test_truncate_no_content() {
+        let result = serde_json::json!({"cancelled": true});
+        assert_eq!(truncate_for_notification(&result), "[no content]");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_boundary() {
+        // 799 ASCII chars + a 2-byte char at position 799-800 = would split mid-char at 800
+        let mut s = "a".repeat(799);
+        s.push('é'); // 2-byte UTF-8
+        s.push_str("zzz");
+        let result = serde_json::json!({"response": s});
+        let truncated = truncate_for_notification(&result);
+        assert!(truncated.ends_with("…[truncated]"));
+        // Must not panic or produce invalid UTF-8
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 }
