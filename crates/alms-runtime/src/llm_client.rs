@@ -444,13 +444,9 @@ impl LlmClient {
         self
     }
 
-    /// Override the LLM provider, reconfiguring base_url and api_key.
-    ///
-    /// Switches the client to use a different provider's API endpoint and
-    /// authentication. The api_key is resolved from environment variables
-    /// using the provider-aware selection rules.
-    pub fn with_provider(mut self, provider: &str) -> Self {
-        let new_provider = match provider {
+    /// Internal: switch provider, base_url, and resolve API key.
+    fn apply_provider(&mut self, provider: &str, resolve_key: impl FnOnce(&str) -> Option<String>) {
+        self.provider = match provider {
             "anthropic" => Provider::Anthropic,
             "openrouter" => Provider::OpenAi,
             _ => Provider::OpenAi,
@@ -469,7 +465,7 @@ impl LlmClient {
             _ => {}
         }
 
-        if let Some(key) = alms_core::config::select_llm_api_key_from_env(provider) {
+        if let Some(key) = resolve_key(provider) {
             self.config.api_key = key;
         } else {
             warn!(
@@ -479,49 +475,22 @@ impl LlmClient {
         }
 
         self.config.provider = provider.to_string();
-        self.provider = new_provider;
+    }
+
+    /// Override the LLM provider, resolving API key from env vars.
+    pub fn with_provider(mut self, provider: &str) -> Self {
+        self.apply_provider(provider, alms_core::config::select_llm_api_key_from_env);
         self
     }
 
-    /// Override LLM provider with secrets-aware key resolution.
-    ///
-    /// Like `with_provider()` but resolves the API key from the secrets
-    /// store first, falling back to env vars.
+    /// Override the LLM provider, resolving API key from secrets store
+    /// (falls back to env vars if not in secrets).
     pub fn with_provider_and_secrets(
         mut self,
         provider: &str,
         secrets: &alms_core::secrets::SecretsStore,
     ) -> Self {
-        let new_provider = match provider {
-            "anthropic" => Provider::Anthropic,
-            "openrouter" => Provider::OpenAi,
-            _ => Provider::OpenAi,
-        };
-
-        match provider {
-            "anthropic" => {
-                self.config.base_url = "https://api.anthropic.com/v1".to_string();
-            }
-            "openrouter" => {
-                self.config.base_url = "https://openrouter.ai/api/v1".to_string();
-            }
-            "openai" => {
-                self.config.base_url = "https://api.openai.com/v1".to_string();
-            }
-            _ => {}
-        }
-
-        if let Some(key) = secrets.resolve_key(provider) {
-            self.config.api_key = key;
-        } else {
-            warn!(
-                "No API key found for provider '{}' — requests will fail",
-                provider
-            );
-        }
-
-        self.config.provider = provider.to_string();
-        self.provider = new_provider;
+        self.apply_provider(provider, |p| secrets.resolve_key(p));
         self
     }
 

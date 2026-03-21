@@ -6,7 +6,7 @@
 
 use crate::api_error;
 use crate::server::AppState;
-use alms_core::secrets::SecretsStore;
+use alms_core::secrets::{SecretsStore, VALID_PROVIDERS};
 use axum::{
     Json,
     extract::{Path, State},
@@ -14,8 +14,6 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Deserialize;
-
-const VALID_PROVIDERS: &[&str] = &["openai", "anthropic", "openrouter"];
 
 /// GET /auth/keys — list which providers have keys (masked values only).
 pub async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
@@ -94,6 +92,17 @@ pub async fn remove_key(
     State(state): State<AppState>,
     Path(provider): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if !VALID_PROVIDERS.contains(&provider.as_str()) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PROVIDER",
+            format!(
+                "Unknown provider '{}'. Must be one of: {}",
+                provider,
+                VALID_PROVIDERS.join(", ")
+            ),
+        ));
+    }
     let existed = state
         .secrets
         .write()

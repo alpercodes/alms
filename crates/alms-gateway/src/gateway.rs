@@ -205,15 +205,7 @@ impl Gateway {
         };
         // Resolve API key from secrets file if available, overriding env vars
         let mut llm_config = config.llm_config.clone();
-        let secrets_path = config
-            .db_path
-            .as_ref()
-            .and_then(|p| {
-                std::path::Path::new(p)
-                    .parent()
-                    .map(|d| d.join("secrets.json"))
-            })
-            .unwrap_or_else(|| std::path::PathBuf::from("./data/secrets.json"));
+        let secrets_path = alms_core::secrets::secrets_path_from_db(config.db_path.as_deref());
         if let Ok(secrets) = alms_core::secrets::SecretsStore::load(&secrets_path) {
             if let Some(key) = secrets.resolve_key(&llm_config.provider) {
                 llm_config.api_key = key;

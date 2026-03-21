@@ -347,14 +347,7 @@ impl AppState {
             llm,
             auth_token_value,
             secrets: {
-                let secrets_path = db_path_str
-                    .as_deref()
-                    .and_then(|p| {
-                        std::path::Path::new(p)
-                            .parent()
-                            .map(|d| d.join("secrets.json"))
-                    })
-                    .unwrap_or_else(|| std::path::PathBuf::from("./data/secrets.json"));
+                let secrets_path = alms_core::secrets::secrets_path_from_db(db_path_str.as_deref());
                 Arc::new(std::sync::RwLock::new(
                     alms_core::secrets::SecretsStore::load(secrets_path).unwrap_or_else(|e| {
                         tracing::warn!("Failed to load secrets: {e}");

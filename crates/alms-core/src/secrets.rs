@@ -11,6 +11,22 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Valid LLM provider names. Single source of truth for CLI, HTTP API, and UI.
+pub const VALID_PROVIDERS: &[&str] = &["openai", "anthropic", "openrouter"];
+
+/// Resolve the default secrets file path from a data directory.
+pub fn secrets_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("secrets.json")
+}
+
+/// Resolve secrets path from an optional database file path.
+/// Falls back to `./data/secrets.json` if no db_path is provided.
+pub fn secrets_path_from_db(db_path: Option<&str>) -> PathBuf {
+    db_path
+        .and_then(|p| Path::new(p).parent().map(|d| d.join("secrets.json")))
+        .unwrap_or_else(|| PathBuf::from("./data/secrets.json"))
+}
+
 /// In-memory secrets store backed by a JSON file.
 #[derive(Clone)]
 pub struct SecretsStore {

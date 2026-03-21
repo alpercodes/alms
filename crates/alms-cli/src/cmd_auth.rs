@@ -6,7 +6,7 @@
 //! alms auth remove <provider>    — remove a stored key
 //! ```
 
-use alms_core::secrets::SecretsStore;
+use alms_core::secrets::{self, SecretsStore, VALID_PROVIDERS};
 use clap::Subcommand;
 use std::path::Path;
 
@@ -26,12 +26,6 @@ pub(crate) enum AuthCommands {
         /// Provider name to remove
         provider: String,
     },
-}
-
-const VALID_PROVIDERS: &[&str] = &["openai", "anthropic", "openrouter"];
-
-fn secrets_path(data_dir: &Path) -> std::path::PathBuf {
-    data_dir.join("secrets.json")
 }
 
 pub(crate) fn auth_set(
@@ -63,7 +57,7 @@ pub(crate) fn auth_set(
         anyhow::bail!("API key cannot be empty");
     }
 
-    let mut store = SecretsStore::load(secrets_path(data_dir))?;
+    let mut store = SecretsStore::load(secrets::secrets_path(data_dir))?;
     store.set_key(provider, &key)?;
 
     if json {
@@ -86,7 +80,7 @@ pub(crate) fn auth_set(
 }
 
 pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
-    let store = SecretsStore::load(secrets_path(data_dir))?;
+    let store = SecretsStore::load(secrets::secrets_path(data_dir))?;
     let providers = store.list_providers();
 
     if json {
@@ -134,7 +128,7 @@ pub(crate) fn auth_remove(data_dir: &Path, provider: &str, json: bool) -> anyhow
             VALID_PROVIDERS.join(", ")
         );
     }
-    let mut store = SecretsStore::load(secrets_path(data_dir))?;
+    let mut store = SecretsStore::load(secrets::secrets_path(data_dir))?;
     let existed = store.remove_key(provider)?;
 
     if json {
