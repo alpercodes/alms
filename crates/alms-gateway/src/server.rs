@@ -244,6 +244,11 @@ impl RunManager {
 
         if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
             senders.retain(|sender| sender.send(session_event.clone()).is_ok());
+            // Clean up empty entries to prevent DashMap leak
+            if senders.is_empty() {
+                drop(senders);
+                self.session_senders.remove(&session_id);
+            }
         }
     }
 

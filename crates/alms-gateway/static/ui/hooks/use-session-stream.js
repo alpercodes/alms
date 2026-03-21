@@ -17,6 +17,8 @@ import { getSessionMessages } from '../api/sessions.js';
 import { mapHistoryMessages } from '../utils/history.js';
 
 let activeSessionEs = null;
+let sessionRetryCount = 0;
+const MAX_SESSION_RETRIES = 10;
 let deltaBuffer = '';
 let flushTimer = null;
 
@@ -70,6 +72,7 @@ export function openSessionStream(sessionId) {
         : `/sessions/${sessionId}/events`;
     const es = new EventSource(url);
     activeSessionEs = es;
+    sessionRetryCount = 0;
 
     // ── run_created: a new run started on this session ──
     es.addEventListener('run_created', (e) => {
@@ -202,7 +205,9 @@ export function openSessionStream(sessionId) {
             messageQueue.value = messageQueue.value.slice(1);
             import('../components/chat/input-area.js').then(mod => {
                 if (mod.startRun) mod.startRun(next.text);
-            }).catch(() => {});
+            }).catch(err => {
+                console.error('[session-stream] Failed to process queued message:', err);
+            });
         }
     };
 
@@ -211,14 +216,18 @@ export function openSessionStream(sessionId) {
     es.addEventListener('run_cancelled', handleRunEnd('cancelled'));
 
     es.onerror = () => {
-        // EventSource auto-reconnects on transient errors.
-        // If permanently closed, try to reopen after a delay.
         if (es.readyState === EventSource.CLOSED) {
+            sessionRetryCount++;
+            if (sessionRetryCount >= MAX_SESSION_RETRIES) {
+                console.error('[session-stream] Max retries reached');
+                return;
+            }
+            const delay = Math.min(2000 * Math.pow(2, sessionRetryCount - 1), 30000);
             setTimeout(() => {
                 if (activeSessionId.value === sessionId) {
                     openSessionStream(sessionId);
                 }
-            }, 3000);
+            }, delay);
         }
     };
 }

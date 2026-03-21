@@ -604,6 +604,14 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     let run = Run::for_job(session_id, job.agent_id, job.prompt.clone(), job_id);
     let run_id = run.run_id;
     state.run_manager.insert_run(run.clone());
+    state
+        .run_manager
+        .send_session_event(
+            session_id,
+            run_id,
+            SseEventData::run_created(run_id, session_id, false),
+        )
+        .await;
     info!("Job fired → run {}", run_id.0);
 
     // Execute the run (awaits completion; errors are handled inside execute_run).

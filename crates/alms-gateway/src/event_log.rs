@@ -106,10 +106,15 @@ impl EventLogManager {
     }
 }
 
+/// Maximum events retained per session. Older events are discarded.
+const SESSION_EVENT_LOG_MAX: usize = 5000;
+
 /// Session-level event log — stores events across all runs in a session.
 ///
 /// Uses its own monotonic event ID counter (separate from per-run IDs)
 /// so that `Last-Event-ID` reconnect works correctly at the session level.
+/// Automatically trims to `SESSION_EVENT_LOG_MAX` events to prevent
+/// unbounded memory growth across long-lived sessions.
 #[derive(Debug, Default, Clone)]
 pub struct SessionEventLogManager {
     logs: Arc<RwLock<HashMap<SessionId, EventLog>>>,
@@ -151,6 +156,14 @@ impl SessionEventLogManager {
         };
 
         log.append(event).await;
+
+        // Trim oldest events to bound memory usage
+        let mut events = log.events.write().await;
+        if events.len() > SESSION_EVENT_LOG_MAX {
+            let drain = events.len() - SESSION_EVENT_LOG_MAX;
+            events.drain(..drain);
+        }
+
         event_id
     }
 
