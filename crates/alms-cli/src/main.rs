@@ -256,7 +256,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Agent { cmd, json } => {
-            let store = open_db()?;
+            let (store, config) = helpers::open_db_with_config()?;
             match cmd {
                 AgentCommands::List => cmd_agent::agent_list(&store, json)?,
                 AgentCommands::Create {
@@ -268,7 +268,6 @@ async fn main() -> anyhow::Result<()> {
                     provider,
                     default,
                 } => {
-                    let config = alms_core::AlmsConfig::load().unwrap_or_default();
                     let workspace_dir: std::path::PathBuf = std::env::var("ALMS_WORKSPACE_DIR")
                         .unwrap_or_else(|_| format!("{}/workspace", config.server.data_dir))
                         .into();
