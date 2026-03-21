@@ -535,8 +535,8 @@ impl AgentRuntime {
     /// Main agent loop with tool execution
     #[instrument(
         level = "debug",
-        skip(self, messages),
-        fields(agent_id = %self.agent_id.0)
+        skip(self, session_manager, messages),
+        fields(agent_id = %self.agent_id.0, session_id = %session_id.0)
     )]
     async fn agent_loop(
         &self,
@@ -851,11 +851,12 @@ impl AgentRuntime {
     /// Execute a tool call, emitting tool_start/tool_end events and handling approvals.
     #[instrument(
         level = "info",
-        skip(self, tool_call),
+        skip(self, tool_call, session_manager),
         fields(
             agent_id = %self.agent_id.0,
             tool_name = %tool_call.function.name,
-            tool_call_id = %tool_call.id
+            tool_call_id = %tool_call.id,
+            session_id = %session_id.0
         )
     )]
     async fn execute_tool_call(
