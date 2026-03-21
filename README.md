@@ -1,12 +1,11 @@
 # ALMS - Agent Loop Management System
 
-A technically superior, more usable, and more secure alternative to OpenClaw.
+A platform where teams of AI agents collaborate on projects — like a virtual company.
 
 ## Quick Start
 
 ```bash
-# Clone and build
-cd /workspace/alms
+# Requires Rust nightly (auto-installed from rust-toolchain.toml)
 cargo build --release
 
 # Run the gateway
@@ -22,52 +21,43 @@ curl http://127.0.0.1:8080/health
 alms/
 ├── Cargo.toml                 # Workspace configuration
 ├── crates/
-│   ├── alms-core/            # Core types and errors
-│   ├── alms-session/         # Session management
-│   ├── alms-gateway/         # HTTP/WebSocket gateway
-│   ├── alms-runtime/         # Agent runtime
+│   ├── alms-core/            # Core types, config, errors
+│   ├── alms-session/         # Session management, SQLite persistence
+│   ├── alms-gateway/         # HTTP/SSE gateway, web UI
+│   ├── alms-runtime/         # Agent runtime, LLM client, context builder
+│   ├── alms-coordinator/     # Multi-agent orchestration
 │   ├── alms-sandbox/         # WASM tool sandbox
-│   ├── alms-channel/         # Channel adapters
+│   ├── alms-channel/         # Channel adapters (Telegram)
 │   └── alms-cli/             # Command-line interface
-├── docs/
-│   └── architecture.md       # System architecture
-└── research/
-    ├── session-issues.md     # OpenClaw analysis (subagent)
-    └── tech-stack.md         # Rust vs Go decision
+├── docs/                     # Design docs, reviews, task list
+└── research/                 # Competitive analysis, tech-stack decisions
 ```
 
 ## Architecture
 
 See [docs/architecture.md](docs/architecture.md) for detailed design.
 
-Key improvements over OpenClaw:
-
 | Feature | OpenClaw | ALMS |
 |---------|----------|------|
-| Language | Node.js | Rust (zero-cost abstractions) |
+| Language | Node.js | Rust (single binary) |
 | Session Keys | Complex scope rules | Simple explicit context_id |
-| Concurrency | Promise-based, locks | Actor model, lock-free |
-| Storage | JSON files | Append-only log + snapshots |
-| Tools | In-process | WASM sandbox |
-| Transport | WebSocket only | Multi-protocol |
+| Concurrency | Promise-based, locks | tokio async, lock-free maps |
+| Storage | JSON files | SQLite (WAL mode) |
+| Tools | In-process, no isolation | WASM sandbox + capability gating |
+| Transport | WebSocket only | SSE streaming + HTTP API |
 
 ## Development
 
 ### Prerequisites
 
-- Rust 1.75+ (install via [rustup](https://rustup.rs/))
-- Cargo
+- Rust nightly (auto-installed via `rust-toolchain.toml`)
 
-### Build
+### Build & Test
 
 ```bash
 cargo build --release
-```
-
-### Test
-
-```bash
-cargo test
+cargo test --all
+make ci          # fmt-check + clippy + test + build-release
 ```
 
 ### Run
@@ -79,4 +69,3 @@ cargo run --bin alms -- gateway
 ## License
 
 MIT
-
