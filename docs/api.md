@@ -119,45 +119,56 @@ But channels (Telegram) naturally bring `context_id` (chat id). So MVP should su
 - session resources use `session_id`
 - convenience endpoint maps `(agent_key, context_id) → session_id`
 
-### 4.1 Create or get a session by context
-`POST /sessions:resolve`
+### 4.1 List sessions
+`GET /sessions`
+
+Returns all active sessions.
+
+**Response 200**
+```json
+{
+  "sessions": [
+    {
+      "session_id": "<uuid>",
+      "agent_id": "<uuid>",
+      "context_id": "telegram:1853446411",
+      "created_at": "2026-02-11T07:00:00Z",
+      "last_activity": "2026-02-11T07:52:00Z",
+      "status": "active"
+    }
+  ]
+}
+```
+
+### 4.2 Create session
+`POST /sessions`
 
 **Request**
 ```json
 {
-  "agent_key": "main",
+  "agent_id": "<uuid>",
   "context_id": "telegram:1853446411"
 }
 ```
 
-**Response 200**
+**Response 201**
 ```json
 {
   "session_id": "<uuid>",
-  "created": true
+  "agent_id": "<uuid>",
+  "context_id": "telegram:1853446411"
 }
 ```
 
-Notes:
-- `agent_key` is a stable name (e.g. `main`) rather than requiring clients to invent UUID agent ids.
-- Internally, ALMS can still map to `AgentId`.
+### 4.3 Get session by agent + context
+`GET /sessions/{agent_id}/{context_id}`
 
-### 4.2 Get session
-`GET /sessions/{session_id}`
+Resolves a session by agent UUID and context ID string. This is how channels (Telegram) look up sessions.
 
-**Response 200**
-```json
-{
-  "session_id": "<uuid>",
-  "agent_key": "main",
-  "context_id": "telegram:1853446411",
-  "created_at": "2026-02-11T07:00:00Z",
-  "last_activity": "2026-02-11T07:52:00Z",
-  "status": "active"
-}
-```
+**Response 200** — Session object
+**Response 404** — no session found for this agent/context pair
 
-### 4.3 Get session messages
+### 4.4 Get session messages
 `GET /sessions/{session_id}/messages`
 
 Returns the full chat history for a session, including tool calls and results.
@@ -181,9 +192,6 @@ Returns the full chat history for a session, including tool calls and results.
 - `tool_result` — tool execution result (includes `tool_id`, `result`, `ok`)
 
 System messages are excluded from the response.
-
-### 4.4 List sessions (optional MVP)
-`GET /sessions?agent_key=main&limit=50`
 
 ---
 
