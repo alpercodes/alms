@@ -43,6 +43,8 @@ pub enum RuntimeEvent {
         params: Value,
         /// Send `true` to allow execution, `false` to deny.
         decision_tx: tokio::sync::oneshot::Sender<bool>,
+        /// When set, this approval originated from a subagent.
+        source_agent: Option<String>,
     },
 }
 
@@ -96,6 +98,7 @@ mod tests {
             tool: "shell".to_string(),
             params: serde_json::json!({}),
             decision_tx,
+            source_agent: None,
         })
         .unwrap();
 
@@ -117,6 +120,7 @@ mod tests {
             tool: "shell".to_string(),
             params: serde_json::json!({}),
             decision_tx,
+            source_agent: None,
         })
         .unwrap();
 

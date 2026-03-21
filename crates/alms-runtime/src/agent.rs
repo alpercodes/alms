@@ -946,6 +946,7 @@ impl AgentRuntime {
                 tool: name.to_string(),
                 params: args.clone(),
                 decision_tx,
+                source_agent: None,
             });
             // Checkpoint D: approval wait with cancellation support.
             let approved = if let Some(ref token) = self.cancel_token {
