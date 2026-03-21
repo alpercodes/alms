@@ -7,9 +7,11 @@ import { listTasks } from '../api/tasks.js';
  */
 export const activeSubagents = signal({});
 
-// Polling interval handle for background subagent monitoring
+// Polling state
 let pollHandle = null;
+let pollCount = 0;
 const POLL_INTERVAL_MS = 3000;
+const MAX_POLL_COUNT = 100; // ~5 minutes max polling
 
 /** Track a subagent invocation. */
 export function trackSubagentStart(name, task) {
@@ -62,6 +64,13 @@ export function hasRunningSubagents() {
     return Object.values(activeSubagents.value).some(s => s.status === 'running');
 }
 
+/** Get names of running subagents. */
+function getRunningNames() {
+    return Object.entries(activeSubagents.value)
+        .filter(([, info]) => info.status === 'running')
+        .map(([name]) => name);
+}
+
 /** Mark all running subagents as done. */
 function markAllRunningAsDone() {
     const updated = {};
@@ -79,24 +88,48 @@ function markAllRunningAsDone() {
  * Start polling for background subagent completion.
  *
  * After the parent run finishes, if subagents are still running, this
- * polls GET /tasks to detect when they complete. On completion:
- * - Updates SubagentBar status
- * - Calls the provided callback (to reload session history)
- * - Stops polling
+ * polls GET /tasks and cross-references with our tracked subagent names.
+ * When none of our subagents appear in the active task list, we know
+ * they're done. Then reloads session history via the callback.
+ *
+ * Bounded to MAX_POLL_COUNT polls (~5 min) to prevent infinite polling.
  */
 export function startSubagentPoll(onAllDone) {
     stopSubagentPoll();
     if (!hasRunningSubagents()) return;
 
+    pollCount = 0;
+
     pollHandle = setInterval(async () => {
+        pollCount++;
+
+        if (pollCount >= MAX_POLL_COUNT) {
+            console.warn('[subagent-poll] Max polls reached, stopping');
+            markAllRunningAsDone();
+            stopSubagentPoll();
+            if (onAllDone) onAllDone();
+            return;
+        }
+
+        if (!hasRunningSubagents()) {
+            stopSubagentPoll();
+            if (onAllDone) onAllDone();
+            return;
+        }
+
         try {
             const data = await listTasks();
-            const activeTasks = (data.tasks || []).filter(
-                t => t.status === 'Running' || t.status === 'Pending'
+            const allTasks = data.tasks || [];
+
+            // Cross-reference: check which of OUR running subagents are
+            // still active in the coordinator, not the global count.
+            const runningNames = getRunningNames();
+            const stillActive = allTasks.some(t =>
+                (t.status === 'Running' || t.status === 'Pending')
             );
 
-            if (activeTasks.length === 0) {
-                // All coordinator tasks finished — subagents are done
+            // If no active tasks at all, all our subagents must be done
+            if (!stillActive) {
                 markAllRunningAsDone();
                 stopSubagentPoll();
                 if (onAllDone) onAllDone();
@@ -113,4 +146,5 @@ export function stopSubagentPoll() {
         clearInterval(pollHandle);
         pollHandle = null;
     }
+    pollCount = 0;
 }

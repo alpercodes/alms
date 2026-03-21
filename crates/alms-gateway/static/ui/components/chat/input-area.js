@@ -12,6 +12,8 @@ import { openForegroundStream, closeActiveStream } from '../../hooks/use-event-s
 import { hasRunningSubagents, startSubagentPoll, stopSubagentPoll } from '../../state/subagents.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
 
+let reloadDebounce = null;
+
 async function startRun(text) {
     chatMessages.value = [...chatMessages.value,
         { type: 'user', role: 'user', text },
@@ -38,12 +40,16 @@ async function startRun(text) {
             onDone: () => {
                 const reloadHistory = () => {
                     if (!activeSessionId.value) return;
-                    getSessionMessages(activeSessionId.value).then(d => {
-                        chatMessages.value = mapHistoryMessages(d.messages || []);
-                    }).catch(() => {});
-                    listRuns(activeSessionId.value).then(d => {
-                        runs.value = d.runs || [];
-                    }).catch(() => {});
+                    // Debounce: avoid concurrent reload from onDone + poll
+                    clearTimeout(reloadDebounce);
+                    reloadDebounce = setTimeout(() => {
+                        getSessionMessages(activeSessionId.value).then(d => {
+                            chatMessages.value = mapHistoryMessages(d.messages || []);
+                        }).catch(() => {});
+                        listRuns(activeSessionId.value).then(d => {
+                            runs.value = d.runs || [];
+                        }).catch(() => {});
+                    }, 300);
                 };
 
                 reloadHistory();
