@@ -882,19 +882,7 @@ async fn run_agent_loop(
     // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into subagent shell_exec
     // processes so CLI commands find the right database.
     {
-        let mut shell_env = std::collections::HashMap::new();
-        if let Some(dd) = data_dir {
-            shell_env.insert(
-                "ALMS_DATA_DIR".to_string(),
-                dd.to_string_lossy().into_owned(),
-            );
-        }
-        if let Some(ws) = workspace_dir {
-            shell_env.insert(
-                "ALMS_WORKSPACE_DIR".to_string(),
-                ws.to_string_lossy().into_owned(),
-            );
-        }
+        let shell_env = alms_core::build_shell_default_env(data_dir, workspace_dir);
         if !shell_env.is_empty() {
             runtime = runtime.with_shell_default_env(shell_env);
         }

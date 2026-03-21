@@ -391,7 +391,11 @@ impl AppState {
         let data_dir = gateway
             .data_dir()
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|cwd| cwd.join("data"))
+                    .unwrap_or_else(|_| std::path::PathBuf::from("./data"))
+            });
         let session_manager = gateway.session_manager().clone();
         let llm = gateway.llm().clone();
         let agent_id = gateway.agent_id();

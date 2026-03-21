@@ -438,18 +438,13 @@ async fn execute_run(
     // so that CLI commands invoked by agents find the correct database and
     // workspace regardless of the sandboxed cwd.
     {
-        let mut shell_env = std::collections::HashMap::new();
-        shell_env.insert(
-            "ALMS_DATA_DIR".to_string(),
-            state.data_dir.to_string_lossy().into_owned(),
+        let shell_env = alms_core::build_shell_default_env(
+            Some(&state.data_dir),
+            state.workspace_dir.as_deref(),
         );
-        if let Some(ref ws_dir) = state.workspace_dir {
-            shell_env.insert(
-                "ALMS_WORKSPACE_DIR".to_string(),
-                ws_dir.to_string_lossy().into_owned(),
-            );
+        if !shell_env.is_empty() {
+            runtime = runtime.with_shell_default_env(shell_env);
         }
-        runtime = runtime.with_shell_default_env(shell_env);
     }
 
     // Attach workspace if configured — registers the workspace_write tool for this run

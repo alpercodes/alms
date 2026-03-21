@@ -378,19 +378,10 @@ impl Gateway {
                         // Inject ALMS_DATA_DIR so CLI commands invoked via
                         // shell_exec find the correct database.
                         {
-                            let mut shell_env = std::collections::HashMap::new();
-                            if let Some(ref dd) = self.config.data_dir {
-                                shell_env.insert(
-                                    "ALMS_DATA_DIR".to_string(),
-                                    dd.to_string_lossy().into_owned(),
-                                );
-                            }
-                            if let Some(ref ws) = self.config.workspace_dir {
-                                shell_env.insert(
-                                    "ALMS_WORKSPACE_DIR".to_string(),
-                                    ws.to_string_lossy().into_owned(),
-                                );
-                            }
+                            let shell_env = alms_core::build_shell_default_env(
+                                self.config.data_dir.as_deref(),
+                                self.config.workspace_dir.as_deref(),
+                            );
                             if !shell_env.is_empty() {
                                 runtime = runtime.with_shell_default_env(shell_env);
                             }
