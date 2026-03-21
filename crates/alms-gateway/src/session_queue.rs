@@ -3,6 +3,8 @@
 //!
 //! Supports two priority levels: normal (user runs) and low (notification runs).
 //! Low-priority items only execute when no normal-priority items are pending.
+//! Under sustained normal-priority load, low-priority items are intentionally
+//! starved — user messages always take precedence over notifications.
 
 use dashmap::DashMap;
 use std::collections::VecDeque;
@@ -154,12 +156,15 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
                         work.await;
                     }
                     Ok(Some(PriorityItem::Low(work))) => {
-                        // Check if normal items arrived while we were waiting.
-                        // If so, defer this low item and process normals first.
+                        // Defer: loop back to check for normal items first.
                         low_queue.push_back(work);
                     }
                     Ok(None) => {
+                        // Channel closed — drain any remaining low-priority items.
                         debug!(key = ?key, "Session queue handler exiting: channel closed");
+                        for work in low_queue.drain(..) {
+                            work.await;
+                        }
                         senders.remove(&key);
                         break;
                     }
