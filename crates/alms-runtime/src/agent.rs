@@ -265,11 +265,28 @@ impl AgentRuntime {
     /// `env_clear()`, so the spawned CLI commands can discover the gateway's
     /// data directory (`ALMS_DATA_DIR`) and workspace directory
     /// (`ALMS_WORKSPACE_DIR`) even when cwd is sandboxed elsewhere.
+    ///
+    /// Re-registers the `shell_exec` tool immediately so that unnamed agents
+    /// (which skip `with_workspace()`) still receive the environment variables.
     pub fn with_shell_default_env(
         mut self,
         env: std::collections::HashMap<String, String>,
     ) -> Self {
         self.shell_default_env = env;
+
+        // Re-register shell_exec with the new default env so unnamed agents
+        // (which never call with_workspace()) still get ALMS_DATA_DIR injected.
+        let enabled = &self.config.enabled_tools;
+        let shell_enabled = enabled.is_empty() || enabled.iter().any(|t| t == "shell_exec");
+        if shell_enabled && self.tools.contains("shell_exec") {
+            let shell_tool = alms_sandbox::ShellExecTool::with_policy(
+                self.resolved_sandbox_root.clone(),
+                self.shell_unrestricted,
+            )
+            .with_default_env(self.shell_default_env.clone());
+            self.tools.register(std::sync::Arc::new(shell_tool));
+        }
+
         self
     }
 
