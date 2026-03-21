@@ -6,6 +6,8 @@ import { chatMessages } from '../../state/chat.js';
 import { messageQueue } from '../../state/queue.js';
 import { localSettings } from '../../state/settings.js';
 import { createRun, cancelRun as apiCancelRun, listRuns } from '../../api/runs.js';
+import { getSessionMessages } from '../../api/sessions.js';
+import { mapHistoryMessages } from '../../utils/history.js';
 import { openForegroundStream, closeActiveStream } from '../../hooks/use-event-source.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
 
@@ -33,6 +35,12 @@ async function startRun(text) {
         openForegroundStream(runId, {
             onDone: () => {
                 if (activeSessionId.value) {
+                    // Reload full session history so any messages produced by
+                    // background subagent notification runs (which the UI was
+                    // not subscribed to) are picked up and displayed.
+                    getSessionMessages(activeSessionId.value).then(d => {
+                        chatMessages.value = mapHistoryMessages(d.messages || []);
+                    }).catch(() => {});
                     listRuns(activeSessionId.value).then(d => {
                         runs.value = d.runs || [];
                     }).catch(() => {});

@@ -1,9 +1,14 @@
 import { chatMessages } from '../state/chat.js';
 import { activeRunId } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearCompletedSubagents } from '../state/subagents.js';
+import { getRun } from '../api/runs.js';
 
 // Active foreground EventSource reference
 let activeEs = null;
+
+// Run ID for the active stream (local copy so error handler can reference it
+// even if activeRunId signal has already been touched)
+let activeStreamRunId = null;
 
 // ── Streaming delta buffer ──
 // Accumulate token deltas and flush to signal at display refresh rate
@@ -41,7 +46,9 @@ function scheduleFlush() {
  * @param {{ onDone: Function }} options
  * @returns {{ close: Function }}
  */
-export function openForegroundStream(runId, { onDone } = {}) {
+const MAX_SSE_RETRIES = 5;
+
+export function openForegroundStream(runId, { onDone, _retryCount = 0 } = {}) {
     closeActiveStream();
 
     // EventSource cannot send Authorization headers — use ?token= query param
@@ -51,6 +58,7 @@ export function openForegroundStream(runId, { onDone } = {}) {
         : `/runs/${runId}/events`;
     const es = new EventSource(url);
     activeEs = es;
+    activeStreamRunId = runId;
     activeRunId.value = runId;
 
     es.addEventListener('token_delta', (e) => {
@@ -197,8 +205,63 @@ export function openForegroundStream(runId, { onDone } = {}) {
     es.addEventListener('run_cancelled', finishHandler('cancelled'));
 
     es.onerror = () => {
-        // EventSource auto-reconnects, but if the stream is truly dead
-        // (server restart, etc.), the error fires repeatedly.
+        // EventSource auto-reconnects (readyState === CONNECTING === 0),
+        // but if the connection is permanently lost (readyState === CLOSED === 2),
+        // no further reconnection attempts occur.  In that case we must
+        // poll the run status and recover — otherwise activeRunId is never
+        // cleared and the UI gets stuck showing the thinking indicator.
+        if (es.readyState === EventSource.CLOSED) {
+            const stuckRunId = activeStreamRunId;
+            if (!stuckRunId) return;
+            getRun(stuckRunId).then(data => {
+                const st = data && data.status;
+                if (st === 'completed' || st === 'failed' || st === 'cancelled') {
+                    // Run already finished server-side — clean up the UI.
+                    flushDeltaBuffer();
+                    sealLastAgent();
+                    closeActiveStream();
+                    activeRunId.value = null;
+                    clearCompletedSubagents();
+                    if (onDone) onDone(st === 'completed' ? 'finished' : st === 'failed' ? 'error' : st, data);
+                } else {
+                    // Run is still active — try to reopen the SSE stream.
+                    if (_retryCount >= MAX_SSE_RETRIES) {
+                        console.error('[SSE] Max retries reached, giving up');
+                        closeActiveStream();
+                        activeRunId.value = null;
+                        clearCompletedSubagents();
+                        chatMessages.value = [...chatMessages.value, {
+                            type: 'error', text: 'Lost connection to server. Refresh to retry.',
+                        }];
+                        return;
+                    }
+                    const delay = Math.min(2000 * Math.pow(2, _retryCount), 15000);
+                    setTimeout(() => {
+                        if (activeRunId.value === stuckRunId) {
+                            openForegroundStream(stuckRunId, { onDone, _retryCount: _retryCount + 1 });
+                        }
+                    }, delay);
+                }
+            }).catch(() => {
+                // Server unreachable — retry with backoff.
+                if (_retryCount >= MAX_SSE_RETRIES) {
+                    console.error('[SSE] Max retries reached (server unreachable)');
+                    closeActiveStream();
+                    activeRunId.value = null;
+                    clearCompletedSubagents();
+                    chatMessages.value = [...chatMessages.value, {
+                        type: 'error', text: 'Server unreachable. Refresh to retry.',
+                    }];
+                    return;
+                }
+                const delay = Math.min(5000 * Math.pow(2, _retryCount), 30000);
+                setTimeout(() => {
+                    if (activeRunId.value === stuckRunId) {
+                        openForegroundStream(stuckRunId, { onDone, _retryCount: _retryCount + 1 });
+                    }
+                }, delay);
+            });
+        }
     };
 
     return { close: () => closeActiveStream() };
@@ -228,4 +291,5 @@ export function closeActiveStream() {
         activeEs.close();
         activeEs = null;
     }
+    activeStreamRunId = null;
 }
