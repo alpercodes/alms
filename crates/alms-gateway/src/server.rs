@@ -302,6 +302,25 @@ impl RunManager {
             .push(sender);
     }
 
+    /// Close all active SSE sender channels (both per-run and per-session).
+    ///
+    /// Dropping the senders causes the corresponding `UnboundedReceiverStream`
+    /// in each SSE response to terminate, which allows Axum's graceful
+    /// shutdown to complete instead of waiting indefinitely for long-lived
+    /// SSE connections.
+    pub fn close_all_senders(&self) {
+        let run_count = self.event_senders.len();
+        let session_count = self.session_senders.len();
+        self.event_senders.clear();
+        self.session_senders.clear();
+        if run_count + session_count > 0 {
+            info!(
+                "Closed {} per-run and {} per-session SSE sender(s) for shutdown",
+                run_count, session_count
+            );
+        }
+    }
+
     /// Get per-run events from a specific ID for reconnect
     pub async fn events_from(&self, run_id: RunId, from_id: u64) -> Vec<LoggedEvent> {
         self.event_log.events_from(run_id, from_id).await
@@ -814,7 +833,7 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     // small token_delta events sit in the TCP send buffer and never reach
     // the browser until the connection closes (observed on Windows).
     axum::serve(NoDelayListener(listener), app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_token))
+        .with_graceful_shutdown(shutdown_signal(shutdown_token, state.run_manager.clone()))
         .await?;
 
     // Phase 1: Signal received. Axum stopped accepting new connections.
@@ -864,7 +883,12 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
 }
 
 /// Returns a future that completes when a shutdown signal is received.
-async fn shutdown_signal(token: CancellationToken) {
+///
+/// After the signal fires, this function:
+/// 1. Cancels the shutdown token (stops scheduler, gateway message loop, etc.)
+/// 2. Closes all SSE sender channels so persistent SSE connections terminate
+///    and Axum's graceful shutdown can actually complete.
+async fn shutdown_signal(token: CancellationToken, run_manager: RunManager) {
     let ctrl_c = tokio::signal::ctrl_c();
 
     #[cfg(unix)]
@@ -884,6 +908,11 @@ async fn shutdown_signal(token: CancellationToken) {
     }
 
     token.cancel();
+
+    // Close all SSE sender channels so persistent SSE connections (especially
+    // session-level streams) terminate. Without this, Axum's graceful shutdown
+    // waits indefinitely for long-lived SSE connections to close.
+    run_manager.close_all_senders();
 }
 
 /// Re-register all non-cancelled persisted jobs with the scheduler on startup.
