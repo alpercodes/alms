@@ -9,7 +9,10 @@ import { createRun, cancelRun as apiCancelRun, listRuns } from '../../api/runs.j
 import { getSessionMessages } from '../../api/sessions.js';
 import { mapHistoryMessages } from '../../utils/history.js';
 import { openForegroundStream, closeActiveStream } from '../../hooks/use-event-source.js';
+import { hasRunningSubagents, startSubagentPoll, stopSubagentPoll } from '../../state/subagents.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
+
+let reloadDebounce = null;
 
 async function startRun(text) {
     chatMessages.value = [...chatMessages.value,
@@ -18,6 +21,7 @@ async function startRun(text) {
     ];
 
     closeActiveStream();
+    stopSubagentPoll(); // Stop any background polling from a previous run
 
     try {
         const runBody = {
@@ -34,17 +38,31 @@ async function startRun(text) {
 
         openForegroundStream(runId, {
             onDone: () => {
-                if (activeSessionId.value) {
-                    // Reload full session history so any messages produced by
-                    // background subagent notification runs (which the UI was
-                    // not subscribed to) are picked up and displayed.
-                    getSessionMessages(activeSessionId.value).then(d => {
-                        chatMessages.value = mapHistoryMessages(d.messages || []);
-                    }).catch(() => {});
-                    listRuns(activeSessionId.value).then(d => {
-                        runs.value = d.runs || [];
-                    }).catch(() => {});
+                const reloadHistory = () => {
+                    if (!activeSessionId.value) return;
+                    // Debounce: avoid concurrent reload from onDone + poll
+                    clearTimeout(reloadDebounce);
+                    reloadDebounce = setTimeout(() => {
+                        getSessionMessages(activeSessionId.value).then(d => {
+                            chatMessages.value = mapHistoryMessages(d.messages || []);
+                        }).catch(() => {});
+                        listRuns(activeSessionId.value).then(d => {
+                            runs.value = d.runs || [];
+                        }).catch(() => {});
+                    }, 300);
+                };
+
+                reloadHistory();
+
+                // If background subagents are still running, poll until
+                // they finish, then reload history to pick up notification
+                // messages produced by completion_notification_loop.
+                if (hasRunningSubagents()) {
+                    startSubagentPoll(() => {
+                        reloadHistory();
+                    });
                 }
+
                 if (messageQueue.value.length > 0) {
                     const next = messageQueue.value[0];
                     messageQueue.value = messageQueue.value.slice(1);
