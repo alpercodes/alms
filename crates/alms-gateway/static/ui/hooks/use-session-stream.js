@@ -1,0 +1,264 @@
+/**
+ * Session-level SSE stream — persistent connection across runs.
+ *
+ * Opens EventSource to /sessions/{sessionId}/events and handles all
+ * event types. Stays open across runs — notification runs, background
+ * subagent completions, and job runs all arrive on the same stream.
+ */
+
+import { chatMessages } from '../state/chat.js';
+import { activeRunId } from '../state/runs.js';
+import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearCompletedSubagents } from '../state/subagents.js';
+import { messageQueue } from '../state/queue.js';
+import { activeSessionId } from '../state/sessions.js';
+
+let activeSessionEs = null;
+let sessionRetryCount = 0;
+const MAX_SESSION_RETRIES = 10;
+let deltaBuffer = '';
+let flushTimer = null;
+
+function flushDeltaBuffer() {
+    flushTimer = null;
+    if (!deltaBuffer) return;
+    const pending = deltaBuffer;
+    deltaBuffer = '';
+    const msgs = chatMessages.value.filter(m => m.type !== 'thinking');
+    const copy = [...msgs];
+    const last = copy[copy.length - 1];
+    if (last && last.type === 'agent' && !last.sealed) {
+        copy[copy.length - 1] = { ...last, text: last.text + pending };
+    } else {
+        copy.push({ type: 'agent', role: 'assistant', text: pending, sealed: false });
+    }
+    chatMessages.value = copy;
+}
+
+function scheduleFlush() {
+    if (flushTimer === null) {
+        flushTimer = requestAnimationFrame(flushDeltaBuffer);
+    }
+}
+
+function sealLastAgent() {
+    const msgs = chatMessages.value;
+    const hasThinking = msgs.some(m => m.type === 'thinking');
+    const filtered = hasThinking ? msgs.filter(m => m.type !== 'thinking') : msgs;
+    const last = filtered[filtered.length - 1];
+    if (last && last.type === 'agent' && !last.sealed) {
+        const updated = [...filtered];
+        updated[updated.length - 1] = { ...last, sealed: true };
+        chatMessages.value = updated;
+    } else if (hasThinking) {
+        chatMessages.value = filtered;
+    }
+}
+
+/**
+ * Open a persistent session-level SSE stream.
+ * Stays open across runs — all events for this session arrive here.
+ */
+export function openSessionStream(sessionId) {
+    closeSessionStream();
+    if (!sessionId) return;
+
+    const token = localStorage.getItem('alms_auth_token');
+    const url = token
+        ? `/sessions/${sessionId}/events?token=${encodeURIComponent(token)}`
+        : `/sessions/${sessionId}/events`;
+    const es = new EventSource(url);
+    activeSessionEs = es;
+    sessionRetryCount = 0;
+
+    // ── run_created: a new run started on this session ──
+    es.addEventListener('run_created', (e) => {
+        const data = JSON.parse(e.data);
+        activeRunId.value = data.run_id;
+
+        if (data.is_notification) {
+            // Notification run from subagent completion — show system indicator
+            chatMessages.value = [...chatMessages.value, { type: 'thinking' }];
+        } else {
+            // User-initiated run — thinking indicator already added by startRun
+        }
+    });
+
+    // ── token_delta ──
+    es.addEventListener('token_delta', (e) => {
+        const data = JSON.parse(e.data);
+        if (data.source_agent) return; // suppress subagent interleaving
+        deltaBuffer += data.delta;
+        scheduleFlush();
+    });
+
+    // ── tool_start ──
+    es.addEventListener('tool_start', (e) => {
+        flushDeltaBuffer();
+        const data = JSON.parse(e.data);
+        const toolId = data.tool_invocation_id || data.call_id || data.tool;
+
+        if (data.tool === 'invoke_agent') {
+            sealLastAgent();
+            const name = data.params?.name || data.params?.subagent_name || 'subagent';
+            const task = data.params?.task || '';
+            chatMessages.value = [...chatMessages.value, {
+                type: 'tool', tool: 'invoke_agent', params: data.params,
+                status: 'running', id: toolId,
+            }];
+            trackSubagentStart(name, task);
+        } else if (data.source_agent) {
+            trackSubagentTool(data.source_agent, {
+                id: toolId, tool: data.tool, params: data.params, status: 'running',
+            });
+        } else {
+            sealLastAgent();
+            chatMessages.value = [...chatMessages.value, {
+                type: 'tool', tool: data.tool, params: data.params,
+                status: 'running', id: toolId,
+            }];
+        }
+    });
+
+    // ── tool_end ──
+    es.addEventListener('tool_end', (e) => {
+        const data = JSON.parse(e.data);
+        const matchId = data.tool_invocation_id;
+        const status = data.ok ? 'done' : 'fail';
+
+        if (data.source_agent) {
+            trackSubagentTool(data.source_agent, { id: matchId, status, result: data.result });
+        }
+
+        const msgs = [...chatMessages.value];
+        const idx = matchId
+            ? msgs.findLastIndex(m => m.type === 'tool' && m.id === matchId)
+            : msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
+        if (idx >= 0) {
+            msgs[idx] = { ...msgs[idx], status, result: data.result };
+            if (msgs[idx].tool === 'invoke_agent') {
+                const name = msgs[idx].params?.name || msgs[idx].params?.subagent_name;
+                const resultObj = typeof data.result === 'object' ? data.result : null;
+                const isBackground = resultObj && resultObj.task_id;
+                if (name && !isBackground) {
+                    trackSubagentEnd(name, status);
+                }
+            }
+        }
+        chatMessages.value = msgs;
+    });
+
+    // ── approval_required ──
+    es.addEventListener('approval_required', (e) => {
+        flushDeltaBuffer();
+        const data = JSON.parse(e.data);
+        chatMessages.value = [...chatMessages.value, {
+            type: 'approval', approvalId: data.approval_id,
+            tool: data.capability, params: data.request, resolved: false,
+        }];
+        sealLastAgent();
+    });
+
+    // ── subagent_completed ──
+    es.addEventListener('subagent_completed', (e) => {
+        const data = JSON.parse(e.data);
+        const name = data.subagent_name || 'subagent';
+        const status = data.status || 'done';
+
+        // Update SubagentBar (stays visible until notification run finishes)
+        trackSubagentEnd(name, status);
+
+        // Show system message in chat
+        const label = status === 'done' ? 'completed'
+            : status === 'fail' ? 'failed'
+            : status === 'cancelled' ? 'cancelled' : 'completed';
+        chatMessages.value = [...chatMessages.value, {
+            type: 'system',
+            text: `Subagent '${name}' ${label}.`,
+        }];
+    });
+
+    // ── approval_resolved ──
+    es.addEventListener('approval_resolved', (e) => {
+        const data = JSON.parse(e.data);
+        const msgs = [...chatMessages.value];
+        const idx = msgs.findLastIndex(m => m.type === 'approval' && m.approvalId === data.approval_id);
+        if (idx >= 0) {
+            msgs[idx] = { ...msgs[idx], resolved: true, decision: data.decision };
+        }
+        chatMessages.value = msgs;
+    });
+
+    // ── run_finished / run_error / run_cancelled ──
+    const handleRunEnd = (status) => (e) => {
+        flushDeltaBuffer();
+        sealLastAgent();
+        const data = e.data ? JSON.parse(e.data) : {};
+
+        if (status === 'error') {
+            const errMsg = typeof data.error === 'string'
+                ? data.error : (data.error?.message || 'Run failed');
+            chatMessages.value = [...chatMessages.value, { type: 'error', text: errMsg }];
+        }
+        if (status === 'cancelled') {
+            chatMessages.value = [...chatMessages.value, { type: 'system', text: '(run cancelled)' }];
+        }
+
+        const usage = (data.prompt_tokens || data.completion_tokens)
+            ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
+            : data.usage;
+        if (usage) {
+            chatMessages.value = [...chatMessages.value, { type: 'tokens', usage }];
+        }
+
+        activeRunId.value = null;
+        clearCompletedSubagents();
+
+        // Process queued user messages via dynamic import
+        // (avoids circular dependency with input-area.js)
+        if (messageQueue.value.length > 0) {
+            const next = messageQueue.value[0];
+            messageQueue.value = messageQueue.value.slice(1);
+            import('../components/chat/input-area.js').then(mod => {
+                if (mod.startRun) mod.startRun(next.text);
+            }).catch(err => {
+                console.error('[session-stream] Failed to process queued message:', err);
+            });
+        }
+    };
+
+    es.addEventListener('run_finished', handleRunEnd('finished'));
+    es.addEventListener('run_error', handleRunEnd('error'));
+    es.addEventListener('run_cancelled', handleRunEnd('cancelled'));
+
+    es.onerror = () => {
+        if (es.readyState === EventSource.CLOSED) {
+            sessionRetryCount++;
+            if (sessionRetryCount >= MAX_SESSION_RETRIES) {
+                console.error('[session-stream] Max retries reached');
+                return;
+            }
+            const delay = Math.min(2000 * Math.pow(2, sessionRetryCount - 1), 30000);
+            setTimeout(() => {
+                if (activeSessionId.value === sessionId) {
+                    openSessionStream(sessionId);
+                }
+            }, delay);
+        }
+    };
+}
+
+export function closeSessionStream() {
+    if (flushTimer !== null) {
+        cancelAnimationFrame(flushTimer);
+        flushTimer = null;
+    }
+    flushDeltaBuffer();
+    if (activeSessionEs) {
+        activeSessionEs.close();
+        activeSessionEs = null;
+    }
+}
+
+export function isSessionStreamOpen() {
+    return activeSessionEs !== null;
+}

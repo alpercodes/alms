@@ -5,23 +5,14 @@ import { activeRunId, runs } from '../../state/runs.js';
 import { chatMessages } from '../../state/chat.js';
 import { messageQueue } from '../../state/queue.js';
 import { localSettings } from '../../state/settings.js';
-import { createRun, cancelRun as apiCancelRun, listRuns } from '../../api/runs.js';
-import { getSessionMessages } from '../../api/sessions.js';
-import { mapHistoryMessages } from '../../utils/history.js';
-import { openForegroundStream, closeActiveStream } from '../../hooks/use-event-source.js';
-import { hasRunningSubagents, startSubagentPoll, stopSubagentPoll } from '../../state/subagents.js';
+import { createRun, cancelRun as apiCancelRun } from '../../api/runs.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
 
-let reloadDebounce = null;
-
-async function startRun(text) {
+export async function startRun(text) {
     chatMessages.value = [...chatMessages.value,
         { type: 'user', role: 'user', text },
         { type: 'thinking' },
     ];
-
-    closeActiveStream();
-    stopSubagentPoll(); // Stop any background polling from a previous run
 
     try {
         const runBody = {
@@ -33,45 +24,11 @@ async function startRun(text) {
         if (settings.max_tokens != null) runBody.max_tokens = settings.max_tokens;
         if (settings.posture) runBody.posture = settings.posture;
 
-        const data = await createRun(runBody);
-        const runId = data.run_id;
-
-        openForegroundStream(runId, {
-            onDone: () => {
-                const reloadHistory = () => {
-                    if (!activeSessionId.value) return;
-                    // Debounce: avoid concurrent reload from onDone + poll
-                    clearTimeout(reloadDebounce);
-                    reloadDebounce = setTimeout(() => {
-                        getSessionMessages(activeSessionId.value).then(d => {
-                            chatMessages.value = mapHistoryMessages(d.messages || []);
-                        }).catch(() => {});
-                        listRuns(activeSessionId.value).then(d => {
-                            runs.value = d.runs || [];
-                        }).catch(() => {});
-                    }, 300);
-                };
-
-                reloadHistory();
-
-                // If background subagents are still running, poll until
-                // they finish, then reload history to pick up notification
-                // messages produced by completion_notification_loop.
-                if (hasRunningSubagents()) {
-                    startSubagentPoll(() => {
-                        reloadHistory();
-                    });
-                }
-
-                if (messageQueue.value.length > 0) {
-                    const next = messageQueue.value[0];
-                    messageQueue.value = messageQueue.value.slice(1);
-                    startRun(next.text);
-                }
-            },
-        });
+        await createRun(runBody);
+        // No need to open a per-run SSE stream — the session stream
+        // (opened by use-boot.js) receives all events automatically.
+        // run_created → token_delta → run_finished all arrive there.
     } catch (err) {
-        // Remove thinking indicator and show error
         chatMessages.value = chatMessages.value
             .filter(m => m.type !== 'thinking')
             .concat([{ type: 'error', text: `Failed to start run: ${err.message || err.status || 'unknown error'}` }]);

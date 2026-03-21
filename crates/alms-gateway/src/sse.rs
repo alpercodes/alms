@@ -186,6 +186,53 @@ impl SseEventData {
             },
         )
     }
+
+    /// Session-level: a new run was created on this session.
+    pub fn run_created(
+        run_id: RunId,
+        session_id: alms_core::SessionId,
+        is_notification: bool,
+    ) -> Self {
+        Self::new(
+            "run_created",
+            RunCreatedData {
+                run_id: run_id.0.to_string(),
+                session_id: session_id.0.to_string(),
+                is_notification,
+                ts: Utc::now(),
+            },
+        )
+    }
+
+    /// Session-level: a background subagent completed.
+    pub fn subagent_completed(
+        session_id: alms_core::SessionId,
+        subagent_name: Option<String>,
+        status: &str,
+        summary: &str,
+    ) -> Self {
+        Self::new(
+            "subagent_completed",
+            SubagentCompletedData {
+                session_id: session_id.0.to_string(),
+                subagent_name,
+                status: status.to_string(),
+                summary: summary.chars().take(200).collect(),
+                ts: Utc::now(),
+            },
+        )
+    }
+
+    /// Session-level: initial connection ack.
+    pub fn session_connected(session_id: alms_core::SessionId) -> Self {
+        Self::new(
+            "session_connected",
+            SessionConnectedData {
+                session_id: session_id.0.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
 }
 
 /// SSE event stream wrapper
@@ -375,6 +422,30 @@ struct ErrorData {
 #[derive(Debug, Serialize)]
 struct RunCancelledData {
     run_id: String,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunCreatedData {
+    run_id: String,
+    session_id: String,
+    is_notification: bool,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubagentCompletedData {
+    session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subagent_name: Option<String>,
+    status: String,
+    summary: String,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionConnectedData {
+    session_id: String,
     ts: DateTime<Utc>,
 }
 

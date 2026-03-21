@@ -259,6 +259,16 @@ pub async fn create_run(
 
     state.run_manager.insert_run(run.clone());
 
+    // Notify session-level SSE subscribers that a new run was created.
+    state
+        .run_manager
+        .send_session_event(
+            session_id,
+            run_id,
+            SseEventData::run_created(run_id, session_id, false),
+        )
+        .await;
+
     // Create per-run cancellation token BEFORE enqueue so cancelling a
     // queued-but-not-yet-started run works.
     let cancel_token = CancellationToken::new();
@@ -438,13 +448,70 @@ async fn execute_run(
         let dispatcher: std::sync::Arc<dyn alms_runtime::SubagentDispatcher> =
             state.coordinator.clone();
         let get_task_tool = alms_runtime::GetTaskResultTool::new(dispatcher.clone());
+        // Separate channel for background subagent events → session stream.
+        // This is independent of the parent's runtime_tx, so it doesn't
+        // block the parent run from finishing.
+        // Note: bg_run_id uses the parent's run_id. These events may arrive
+        // after the parent run has finished. The frontend uses source_agent
+        // (not run_id) for SubagentBar routing, so this is acceptable.
+        let (bg_event_tx, bg_event_rx) = mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
+        let bg_state = state.clone();
+        let bg_session_id = session_id;
+        let bg_run_id = run_id;
+        tokio::spawn(async move {
+            let mut rx = bg_event_rx;
+            while let Some(event) = rx.recv().await {
+                let sse = match &event {
+                    alms_runtime::RuntimeEvent::ToolStart {
+                        invocation_id,
+                        tool,
+                        params,
+                        source_agent,
+                    } => SseEventData::tool_start(
+                        bg_run_id,
+                        crate::sse::ToolInvocationId(*invocation_id),
+                        tool,
+                        params.clone(),
+                        source_agent.clone(),
+                    ),
+                    alms_runtime::RuntimeEvent::ToolEnd {
+                        invocation_id,
+                        ok,
+                        result,
+                        source_agent,
+                    } => SseEventData::tool_end(
+                        bg_run_id,
+                        crate::sse::ToolInvocationId(*invocation_id),
+                        *ok,
+                        result.clone(),
+                        source_agent.clone(),
+                    ),
+                    alms_runtime::RuntimeEvent::ApprovalRequired { tool, .. } => {
+                        warn!(
+                            "Background subagent requested approval for '{}' — \
+                             approvals are not supported for background subagents. \
+                             The subagent will hang until timeout.",
+                            tool
+                        );
+                        continue;
+                    }
+                    _ => continue,
+                };
+                bg_state
+                    .run_manager
+                    .send_session_event(bg_session_id, bg_run_id, sse)
+                    .await;
+            }
+        });
+
         let invoke_tool = alms_runtime::InvokeAgentTool::new(
             dispatcher,
             session_id,
             Some(run_id),
             Some(invoke_agent_tx),
         )
-        .with_cancel_token(cancel_token);
+        .with_cancel_token(cancel_token)
+        .with_background_event_tx(bg_event_tx);
         let read_session_tool =
             alms_runtime::ReadSubagentSessionTool::new(state.session_manager.clone(), session_id);
         runtime = runtime
@@ -594,6 +661,14 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     let run = Run::for_job(session_id, job.agent_id, job.prompt.clone(), job_id);
     let run_id = run.run_id;
     state.run_manager.insert_run(run.clone());
+    state
+        .run_manager
+        .send_session_event(
+            session_id,
+            run_id,
+            SseEventData::run_created(run_id, session_id, false),
+        )
+        .await;
     info!("Job fired → run {}", run_id.0);
 
     // Execute the run (awaits completion; errors are handled inside execute_run).
@@ -681,10 +756,43 @@ pub(crate) async fn completion_notification_loop(
             }
         };
 
+        // Notify session subscribers that a subagent completed.
+        // This updates the SubagentBar and shows a system message BEFORE
+        // the notification run starts.
+        let status_str = match completion.status {
+            alms_coordinator::TaskStatus::Completed => "done",
+            alms_coordinator::TaskStatus::Failed => "fail",
+            alms_coordinator::TaskStatus::Cancelled => "cancelled",
+            _ => "done",
+        };
+        state
+            .run_manager
+            .send_session_event(
+                session_id,
+                alms_core::RunId::new(), // no run yet
+                SseEventData::subagent_completed(
+                    session_id,
+                    completion.subagent_name.clone(),
+                    status_str,
+                    &completion.summary,
+                ),
+            )
+            .await;
+
         let notification = format_completion_notification(&completion);
         let run = Run::new(session_id, agent_id, notification.clone());
         let run_id = run.run_id;
         state.run_manager.insert_run(run);
+
+        // Notify session-level SSE subscribers about the notification run.
+        state
+            .run_manager
+            .send_session_event(
+                session_id,
+                run_id,
+                SseEventData::run_created(run_id, session_id, true),
+            )
+            .await;
 
         info!(
             run_id = %run_id.0,
@@ -972,6 +1080,58 @@ pub async fn stream_run_events(
         }
         Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
     }
+}
+
+/// GET /sessions/{session_id}/events — persistent session-level SSE stream.
+///
+/// Unlike the per-run endpoint, this stream stays open across runs.
+/// All events from any run on this session are forwarded, including
+/// notification runs from subagent completions.
+#[instrument(level = "info", skip(state, headers), fields(session_id = %session_id.0))]
+pub async fn stream_session_events(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Verify session exists
+    state
+        .session_manager
+        .get(session_id)
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found"))?;
+
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
+
+    let (tx, rx) = event_channel();
+    state.run_manager.register_session_sender(session_id, tx);
+
+    // Replay missed events on reconnect
+    let logged_events = state
+        .run_manager
+        .session_events_from(session_id, from_id)
+        .await;
+    let replay_events: Vec<SseEventData> = logged_events
+        .into_iter()
+        .map(|e| SseEventData {
+            event_type: e.event_type,
+            data: e.data,
+            ts: e.ts,
+            event_id: Some(e.event_id),
+        })
+        .collect();
+
+    if !replay_events.is_empty() {
+        info!(
+            "Replaying {} session events for {}",
+            replay_events.len(),
+            session_id.0
+        );
+    }
+
+    Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
 }
 
 #[cfg(test)]
