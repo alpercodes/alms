@@ -11,6 +11,7 @@ alms-session = { path = "../alms-session" }
 alms-runtime = { path = "../alms-runtime" }
 
 tokio.workspace = true
+tokio-util.workspace = true
 crossbeam.workspace = true
 dashmap.workspace = true
 serde.workspace = true

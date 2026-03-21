@@ -18,6 +18,7 @@ const SUBAGENT_TTL_SECS: u64 = 300;
 const NOTIFICATION_SUMMARY_MAX_CHARS: usize = 800;
 
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, info, instrument, warn};
 use uuid::Uuid;
 
@@ -210,6 +211,7 @@ impl Coordinator {
         request: SubagentRequest,
         parent_event_tx: Option<RuntimeEventSender>,
         is_background: bool,
+        parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<TaskId> {
         // Reject concurrent invocations of the same named subagent to prevent
         // session corruption from parallel writes to the same session history.
@@ -293,6 +295,7 @@ impl Coordinator {
                     workspace_dir,
                     subagent_prompts,
                     completion_tx,
+                    parent_cancel_token,
                 )
                 .await;
             }
@@ -351,6 +354,7 @@ impl SubagentDispatcher for Coordinator {
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<RuntimeEventSender>,
         subagent_name: Option<String>,
+        parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<String> {
         let request = SubagentRequest {
             task,
@@ -360,7 +364,9 @@ impl SubagentDispatcher for Coordinator {
             subagent_name,
         };
 
-        let task_id = self.spawn_subagent(request, parent_event_tx, false).await?;
+        let task_id = self
+            .spawn_subagent(request, parent_event_tx, false, parent_cancel_token)
+            .await?;
 
         // Take the result receiver — must happen immediately after spawn_subagent
         // since the handle is already in the DashMap.
@@ -395,7 +401,7 @@ impl SubagentDispatcher for Coordinator {
 
     #[instrument(
         level = "info",
-        skip(self, task, parent_event_tx),
+        skip(self, task, parent_event_tx, parent_cancel_token),
         fields(parent_session = %parent_session_id.0)
     )]
     async fn dispatch_background(
@@ -405,6 +411,7 @@ impl SubagentDispatcher for Coordinator {
         parent_run_id: Option<RunId>,
         parent_event_tx: Option<RuntimeEventSender>,
         subagent_name: Option<String>,
+        parent_cancel_token: Option<CancellationToken>,
     ) -> alms_core::AlmsResult<Uuid> {
         let request = SubagentRequest {
             task,
@@ -413,7 +420,9 @@ impl SubagentDispatcher for Coordinator {
             parent_run_id,
             subagent_name,
         };
-        let task_id = self.spawn_subagent(request, parent_event_tx, true).await?;
+        let task_id = self
+            .spawn_subagent(request, parent_event_tx, true, parent_cancel_token)
+            .await?;
 
         // Drop the oneshot receiver — background callers poll via completed_result,
         // not the channel. This frees the allocation; run_subagent's result_tx.send()
@@ -489,7 +498,7 @@ async fn run_subagent(
     request: SubagentRequest,
     subagents: Arc<DashMap<TaskId, SubagentHandle>>,
     active_named: Arc<dashmap::DashSet<String>>,
-    mut cancel_rx: oneshot::Receiver<()>,
+    cancel_rx: oneshot::Receiver<()>,
     result_tx: oneshot::Sender<TaskResult>,
     session_manager: Arc<SessionManager>,
     llm: LlmClient,
@@ -498,6 +507,7 @@ async fn run_subagent(
     workspace_dir: Option<std::path::PathBuf>,
     subagent_prompts: Arc<DashMap<String, String>>,
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
+    parent_cancel_token: Option<CancellationToken>,
 ) {
     // RAII guard: removes the name from active_named on drop (including panics).
     let _named_guard = NamedSubagentGuard {
@@ -518,6 +528,25 @@ async fn run_subagent(
         "Subagent execution started"
     );
 
+    // Create a child cancellation token that fires when EITHER:
+    //   1. The parent run's CancellationToken is cancelled, OR
+    //   2. The explicit `cancel_subagent()` oneshot fires.
+    // This unifies both cancellation paths into a single token that
+    // gets attached to the subagent's AgentRuntime.
+    let child_cancel_token = parent_cancel_token
+        .as_ref()
+        .map(|p| p.child_token())
+        .unwrap_or_default();
+
+    // Bridge the oneshot cancel_rx to the child token: when cancel_subagent()
+    // sends on the oneshot, we cancel the child token.
+    let bridge_token = child_cancel_token.clone();
+    let bridge_handle = tokio::spawn(async move {
+        if cancel_rx.await.is_ok() {
+            bridge_token.cancel();
+        }
+    });
+
     let (new_status, result_value, tokens_used) = tokio::select! {
         _ = tokio::time::sleep(request.timeout) => {
             warn!(
@@ -528,7 +557,7 @@ async fn run_subagent(
             );
             (TaskStatus::Failed, serde_json::json!({"error": "Timeout"}), None)
         }
-        _ = &mut cancel_rx => {
+        _ = child_cancel_token.cancelled() => {
             info!(
                 target: "subagent::cancelled",
                 task_id = %task_id.0,
@@ -536,7 +565,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None)
         }
-        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), &subagent_prompts) => {
+        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), &subagent_prompts, child_cancel_token.clone()) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -569,6 +598,11 @@ async fn run_subagent(
             }
         }
     };
+
+    // Cancel child token to clean up the bridge task (if it's still waiting
+    // on the oneshot). This is a no-op if the token was already cancelled.
+    child_cancel_token.cancel();
+    bridge_handle.abort();
 
     let task_result = TaskResult {
         task_id,
@@ -722,6 +756,7 @@ async fn run_agent_loop(
     base_agent_config: &AgentConfig,
     workspace_dir: Option<&std::path::Path>,
     subagent_prompts: &DashMap<String, String>,
+    cancel_token: CancellationToken,
 ) -> AlmsResult<RunOutput> {
     // Derive identity and config based on whether the subagent is named
     let (agent_id, context_id, config, model_override, provider_override, attach_workspace) =
@@ -803,7 +838,9 @@ async fn run_agent_loop(
         subagent_llm = subagent_llm.with_model(model);
     }
 
-    let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?.with_event_sender(sub_tx);
+    let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?
+        .with_event_sender(sub_tx)
+        .with_cancel_token(cancel_token);
 
     // Attach workspace for named subagents: {workspace_dir}/{name}/
     if attach_workspace && let (Some(ws_dir), Some(name)) = (workspace_dir, &request.subagent_name)
@@ -872,7 +909,14 @@ mod tests {
     async fn test_dispatch_foreground_success() {
         let coord = test_coordinator();
         let result = coord
-            .dispatch("Say hello".to_string(), test_session_id(), None, None, None)
+            .dispatch(
+                "Say hello".to_string(),
+                test_session_id(),
+                None,
+                None,
+                None,
+                None,
+            )
             .await;
 
         let response = result.expect("dispatch should succeed");
@@ -893,6 +937,7 @@ mod tests {
             .dispatch_background(
                 "Background work".to_string(),
                 test_session_id(),
+                None,
                 None,
                 None,
                 None,
@@ -943,7 +988,10 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
+        let task_id = coord
+            .spawn_subagent(request, None, false, None)
+            .await
+            .unwrap();
 
         let cancel_result = coord.cancel_subagent(task_id);
         assert!(cancel_result.is_ok(), "cancel should succeed");
@@ -973,7 +1021,10 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
+        let task_id = coord
+            .spawn_subagent(request, None, false, None)
+            .await
+            .unwrap();
         let result_rx = coord.take_result_rx(task_id).unwrap();
 
         let task_result = result_rx.await.expect("should receive result");
@@ -1007,7 +1058,10 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
+        let task_id = coord
+            .spawn_subagent(request, None, false, None)
+            .await
+            .unwrap();
 
         let active = coord.list_active();
         assert!(
@@ -1039,7 +1093,10 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord.spawn_subagent(request, None, false).await.unwrap();
+        let task_id = coord
+            .spawn_subagent(request, None, false, None)
+            .await
+            .unwrap();
 
         let first = coord.take_result_rx(task_id);
         assert!(first.is_some(), "first take should return the receiver");
@@ -1093,7 +1150,7 @@ mod tests {
             posture: Some("guarded".into()),
             provider: Some("anthropic".into()),
         };
-        let (config2, model2, provider2) = agent_config_for_subagent(Some(record), &parent);
+        let (config2, model2, _provider2) = agent_config_for_subagent(Some(record), &parent);
         assert_eq!(model2.as_deref(), Some("gpt-5"));
         assert_eq!(config2.system_prompt, "custom prompt");
         assert_eq!(config2.posture, alms_runtime::Posture::Guarded);
@@ -1129,6 +1186,7 @@ mod tests {
                 None,
                 None,
                 Some("reviewer".to_string()),
+                None,
             )
             .await
             .expect("first dispatch should succeed");
@@ -1142,6 +1200,7 @@ mod tests {
                 None,
                 None,
                 Some("reviewer".to_string()),
+                None,
             )
             .await
             .expect("second dispatch should succeed");
@@ -1179,7 +1238,10 @@ mod tests {
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
         };
-        let _task_id = coord.spawn_subagent(request, None, false).await.unwrap();
+        let _task_id = coord
+            .spawn_subagent(request, None, false, None)
+            .await
+            .unwrap();
 
         // Second invocation with the same name should be rejected
         let request2 = SubagentRequest {
@@ -1189,7 +1251,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
         };
-        let result = coord.spawn_subagent(request2, None, false).await;
+        let result = coord.spawn_subagent(request2, None, false, None).await;
         assert!(
             result.is_err(),
             "Second concurrent spawn should be rejected"
@@ -1209,7 +1271,10 @@ mod tests {
             subagent_name: Some("coder".to_string()),
         };
         assert!(
-            coord.spawn_subagent(request3, None, false).await.is_ok(),
+            coord
+                .spawn_subagent(request3, None, false, None)
+                .await
+                .is_ok(),
             "Different named subagent should succeed"
         );
     }
@@ -1221,12 +1286,26 @@ mod tests {
 
         // Two invocations without name — each should get a fresh session
         let _r1 = coord
-            .dispatch("Task one".to_string(), parent_session, None, None, None)
+            .dispatch(
+                "Task one".to_string(),
+                parent_session,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("first dispatch should succeed");
 
         let _r2 = coord
-            .dispatch("Task two".to_string(), parent_session, None, None, None)
+            .dispatch(
+                "Task two".to_string(),
+                parent_session,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("second dispatch should succeed");
 

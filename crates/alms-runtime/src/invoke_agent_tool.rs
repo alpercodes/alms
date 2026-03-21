@@ -6,6 +6,7 @@ use alms_core::{RunId, SessionId};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Built-in tool that spawns a subagent and awaits its result.
 ///
@@ -19,6 +20,9 @@ pub struct InvokeAgentTool {
     /// Clone of the parent run's event sender so subagent tool events
     /// are forwarded into the parent's SSE stream.
     parent_event_tx: Option<RuntimeEventSender>,
+    /// Parent run's cancellation token — threaded into subagent dispatch so
+    /// cancelling the parent also cancels active subagents.
+    parent_cancel_token: Option<CancellationToken>,
 }
 
 impl InvokeAgentTool {
@@ -33,7 +37,15 @@ impl InvokeAgentTool {
             parent_session_id,
             parent_run_id,
             parent_event_tx,
+            parent_cancel_token: None,
         }
+    }
+
+    /// Attach the parent run's cancellation token so that cancelling the parent
+    /// propagates to all subagents spawned by this tool.
+    pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
+        self.parent_cancel_token = Some(token);
+        self
     }
 }
 
@@ -111,6 +123,7 @@ impl Tool for InvokeAgentTool {
                     self.parent_run_id,
                     self.parent_event_tx.clone(),
                     subagent_name,
+                    self.parent_cancel_token.clone(),
                 )
                 .await
                 .map_err(|e| SandboxError::Io(format!("Subagent error: {}", e)))?;
@@ -126,6 +139,7 @@ impl Tool for InvokeAgentTool {
                 self.parent_run_id,
                 self.parent_event_tx.clone(),
                 subagent_name,
+                self.parent_cancel_token.clone(),
             )
             .await
             .map_err(|e| SandboxError::Io(format!("Subagent error: {}", e)))?;
@@ -143,6 +157,7 @@ mod tests {
     use super::*;
     use alms_core::{AlmsResult, RunId, SessionId};
     use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     #[derive(Debug)]
@@ -157,6 +172,7 @@ mod tests {
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
             _subagent_name: Option<String>,
+            _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<String> {
             Ok(self.0.clone())
         }
@@ -201,6 +217,7 @@ mod tests {
                 _parent_run_id: Option<RunId>,
                 _parent_event_tx: Option<RuntimeEventSender>,
                 _subagent_name: Option<String>,
+                _parent_cancel_token: Option<CancellationToken>,
             ) -> AlmsResult<String> {
                 Err(alms_core::AlmsError::Runtime("subagent failed".to_string()))
             }
@@ -236,6 +253,7 @@ mod tests {
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
             _subagent_name: Option<String>,
+            _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<String> {
             Ok("foreground".to_string())
         }
@@ -247,6 +265,7 @@ mod tests {
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
             _subagent_name: Option<String>,
+            _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<Uuid> {
             Ok(self.0)
         }
@@ -316,6 +335,7 @@ mod tests {
             _parent_run_id: Option<RunId>,
             _parent_event_tx: Option<RuntimeEventSender>,
             subagent_name: Option<String>,
+            _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<String> {
             *self.0.lock().unwrap() = Some(subagent_name);
             Ok("ok".to_string())

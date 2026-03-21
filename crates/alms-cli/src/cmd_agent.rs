@@ -257,6 +257,7 @@ pub(crate) fn agent_set_default(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn agent_config(
     store: &SqliteStore,
     name_or_id: &str,
