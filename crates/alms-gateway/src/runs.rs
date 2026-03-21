@@ -705,6 +705,7 @@ pub(crate) async fn completion_notification_loop(
         let status_str = match completion.status {
             alms_coordinator::TaskStatus::Completed => "done",
             alms_coordinator::TaskStatus::Failed => "fail",
+            alms_coordinator::TaskStatus::Cancelled => "cancelled",
             _ => "done",
         };
         state

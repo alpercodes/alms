@@ -217,7 +217,7 @@ impl SseEventData {
                 session_id: session_id.0.to_string(),
                 subagent_name,
                 status: status.to_string(),
-                summary: summary[..summary.len().min(200)].to_string(),
+                summary: summary.chars().take(200).collect(),
                 ts: Utc::now(),
             },
         )
