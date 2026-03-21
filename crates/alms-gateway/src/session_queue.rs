@@ -1,7 +1,13 @@
 //! Per-session work queue — guarantees FIFO execution within a session key
 //! while allowing concurrent execution across different sessions.
+//!
+//! Supports two priority levels: normal (user runs) and low (notification runs).
+//! Low-priority items only execute when no normal-priority items are pending.
+//! Under sustained normal-priority load, low-priority items are intentionally
+//! starved — user messages always take precedence over notifications.
 
 use dashmap::DashMap;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::future::Future;
 use std::hash::Hash;
@@ -15,16 +21,23 @@ use tracing::debug;
 /// A boxed future representing a unit of work to execute.
 type WorkItem = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
+/// A tagged work item with priority.
+enum PriorityItem {
+    Normal(WorkItem),
+    Low(WorkItem),
+}
+
 /// Per-key sequential work queue.
 ///
 /// Each unique key gets a dedicated handler task that processes work items
-/// one at a time in FIFO order. Different keys process concurrently.
+/// one at a time. Normal-priority items are processed before low-priority
+/// ones. Different keys process concurrently.
 ///
 /// Idle handlers self-terminate after 5 minutes and clean up their DashMap entry.
 /// On shutdown (cancellation token), remaining items are drained before exit.
 #[derive(Debug)]
 pub struct SessionQueue<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> {
-    senders: Arc<DashMap<K, mpsc::UnboundedSender<WorkItem>>>,
+    senders: Arc<DashMap<K, mpsc::UnboundedSender<PriorityItem>>>,
     shutdown: CancellationToken,
 }
 
@@ -36,33 +49,35 @@ impl<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> SessionQueue<K> {
         }
     }
 
-    /// Enqueue a work item for the given key.
-    ///
-    /// If no handler exists for this key, one is spawned. The work item
-    /// will execute after any previously enqueued items for the same key.
+    /// Enqueue a normal-priority work item (user runs).
     pub fn enqueue(&self, key: K, work: WorkItem) {
-        // First attempt: look up existing sender.
+        self.enqueue_item(key, PriorityItem::Normal(work));
+    }
+
+    /// Enqueue a low-priority work item (notification runs).
+    /// Low-priority items execute only when no normal items are pending.
+    pub fn enqueue_low(&self, key: K, work: WorkItem) {
+        self.enqueue_item(key, PriorityItem::Low(work));
+    }
+
+    fn enqueue_item(&self, key: K, item: PriorityItem) {
         if let Some(sender) = self.senders.get(&key) {
-            match sender.send(work) {
+            match sender.send(item) {
                 Ok(()) => return,
-                Err(mpsc::error::SendError(returned_work)) => {
-                    // Handler exited (idle timeout race) — drop ref, remove stale
-                    // entry, and fall through to spawn a new handler.
+                Err(mpsc::error::SendError(returned_item)) => {
                     drop(sender);
                     self.senders.remove(&key);
-                    self.spawn_handler(key, returned_work);
+                    self.spawn_handler(key, returned_item);
                     return;
                 }
             }
         }
-
-        // No sender — create a new channel + handler.
-        self.spawn_handler(key, work);
+        self.spawn_handler(key, item);
     }
 
-    fn spawn_handler(&self, key: K, first_item: WorkItem) {
+    fn spawn_handler(&self, key: K, first_item: PriorityItem) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let _ = tx.send(first_item); // cannot fail — we hold the rx
+        let _ = tx.send(first_item);
 
         let senders = Arc::clone(&self.senders);
         let shutdown = self.shutdown.clone();
@@ -75,28 +90,61 @@ impl<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> SessionQueue<K> {
     }
 }
 
-/// Sequential handler loop for a single key.
+/// Sequential handler loop for a single key with priority support.
 ///
-/// Processes work items one at a time. Exits on:
-/// - All senders dropped (channel closed)
-/// - Idle timeout (5 minutes with no work)
-/// - Shutdown signal (drains remaining items first)
+/// Drains all normal-priority items before processing any low-priority ones.
+/// This ensures user messages are always processed before notification runs.
 async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
     key: K,
-    mut rx: mpsc::UnboundedReceiver<WorkItem>,
-    senders: Arc<DashMap<K, mpsc::UnboundedSender<WorkItem>>>,
+    mut rx: mpsc::UnboundedReceiver<PriorityItem>,
+    senders: Arc<DashMap<K, mpsc::UnboundedSender<PriorityItem>>>,
     shutdown: CancellationToken,
 ) {
     let idle_timeout = Duration::from_secs(300);
+    let mut low_queue: VecDeque<WorkItem> = VecDeque::new();
 
     loop {
+        // First: drain any pending normal items before touching low-priority.
+        // try_recv is non-blocking — picks up items that arrived while we
+        // were executing the previous work item.
+        let mut got_normal = false;
+        while let Ok(item) = rx.try_recv() {
+            match item {
+                PriorityItem::Normal(work) => {
+                    work.await;
+                    got_normal = true;
+                }
+                PriorityItem::Low(work) => {
+                    low_queue.push_back(work);
+                }
+            }
+        }
+
+        // If we processed normal items, loop back to check for more
+        // (they may have arrived while we were awaiting).
+        if got_normal {
+            continue;
+        }
+
+        // No normal items pending — process one low-priority item if available.
+        if let Some(low_work) = low_queue.pop_front() {
+            low_work.await;
+            continue;
+        }
+
+        // Nothing pending — wait for new items (with timeout and shutdown).
         tokio::select! {
-            biased; // prefer shutdown over new work
+            biased;
 
             _ = shutdown.cancelled() => {
                 debug!(key = ?key, "Session queue handler shutting down, draining remaining items");
                 rx.close();
-                while let Some(work) = rx.recv().await {
+                while let Some(item) = rx.recv().await {
+                    match item {
+                        PriorityItem::Normal(work) | PriorityItem::Low(work) => work.await,
+                    }
+                }
+                for work in low_queue.drain(..) {
                     work.await;
                 }
                 break;
@@ -104,21 +152,31 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
 
             result = timeout(idle_timeout, rx.recv()) => {
                 match result {
-                    Ok(Some(work)) => {
+                    Ok(Some(PriorityItem::Normal(work))) => {
                         work.await;
                     }
+                    Ok(Some(PriorityItem::Low(work))) => {
+                        // Defer: loop back to check for normal items first.
+                        low_queue.push_back(work);
+                    }
                     Ok(None) => {
-                        // All senders dropped — channel closed.
+                        // Channel closed — drain any remaining low-priority items.
                         debug!(key = ?key, "Session queue handler exiting: channel closed");
+                        for work in low_queue.drain(..) {
+                            work.await;
+                        }
                         senders.remove(&key);
                         break;
                     }
                     Err(_) => {
-                        // Idle timeout — self-cleanup.
                         debug!(key = ?key, "Session queue handler exiting: idle timeout");
                         senders.remove(&key);
-                        // Drain any items that arrived between timeout and remove.
-                        while let Ok(work) = rx.try_recv() {
+                        while let Ok(item) = rx.try_recv() {
+                            match item {
+                                PriorityItem::Normal(work) | PriorityItem::Low(work) => work.await,
+                            }
+                        }
+                        for work in low_queue.drain(..) {
                             work.await;
                         }
                         break;
@@ -140,7 +198,6 @@ mod tests {
         let shutdown = CancellationToken::new();
         let queue = SessionQueue::<u64>::new(shutdown);
 
-        // Track execution order: each work item records when it starts and ends.
         let counter = Arc::new(AtomicUsize::new(0));
         let (tx, mut rx) = mpsc::unbounded_channel::<(usize, usize)>();
 
@@ -165,8 +222,6 @@ mod tests {
         }
 
         assert_eq!(results.len(), 3);
-        // Each item should start after the previous one ended.
-        // Item 0: start=0, end=1. Item 1: start=2, end=3. Item 2: start=4, end=5.
         for i in 1..results.len() {
             assert!(
                 results[i].0 > results[i - 1].1,
@@ -184,7 +239,6 @@ mod tests {
         let shutdown = CancellationToken::new();
         let queue = SessionQueue::<u64>::new(shutdown);
 
-        // Use a barrier so both tasks must be running at the same time to proceed.
         let barrier = Arc::new(Barrier::new(2));
         let (tx, mut rx) = mpsc::unbounded_channel::<u64>();
 
@@ -194,7 +248,7 @@ mod tests {
             queue.enqueue(
                 key,
                 Box::pin(async move {
-                    b.wait().await; // both must reach here concurrently
+                    b.wait().await;
                     let _ = tx.send(key);
                 }),
             );
@@ -207,6 +261,62 @@ mod tests {
         }
         results.sort();
         assert_eq!(results, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn low_priority_deferred_behind_normal() {
+        let shutdown = CancellationToken::new();
+        let queue = SessionQueue::<u64>::new(shutdown);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<&'static str>();
+
+        // Enqueue: normal blocks on gate, then low, then normal.
+        // Expected order: normal1, normal2, low
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let tx1 = tx.clone();
+        queue.enqueue(
+            1,
+            Box::pin(async move {
+                let _ = gate_rx.await; // block until gate opens
+                let _ = tx1.send("normal1");
+            }),
+        );
+
+        // Yield to let the handler task start processing normal1 (blocked on gate)
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let tx2 = tx.clone();
+        queue.enqueue_low(
+            1,
+            Box::pin(async move {
+                let _ = tx2.send("low");
+            }),
+        );
+
+        let tx3 = tx.clone();
+        queue.enqueue(
+            1,
+            Box::pin(async move {
+                let _ = tx3.send("normal2");
+            }),
+        );
+
+        // Unblock normal1
+        let _ = gate_tx.send(());
+        drop(tx);
+
+        let mut results = Vec::new();
+        while let Some(r) = rx.recv().await {
+            results.push(r);
+        }
+
+        assert_eq!(
+            results,
+            vec!["normal1", "normal2", "low"],
+            "Low-priority item should execute after all normal items"
+        );
     }
 
     #[tokio::test]
@@ -224,15 +334,12 @@ mod tests {
             }),
         );
 
-        // Wait for the work item to complete.
         rx.recv().await;
 
-        // Advance past idle timeout.
         tokio::time::advance(Duration::from_secs(301)).await;
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 
-        // Handler should have cleaned up.
         assert!(
             !queue.senders.contains_key(&42),
             "DashMap entry should be removed after idle timeout"
@@ -255,12 +362,10 @@ mod tests {
         );
         rx1.recv().await;
 
-        // Evict via idle timeout.
         tokio::time::advance(Duration::from_secs(301)).await;
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
 
-        // Re-enqueue — should spawn new handler.
         let (tx2, mut rx2) = mpsc::unbounded_channel::<u8>();
         queue.enqueue(
             1,
@@ -279,13 +384,11 @@ mod tests {
         let queue = SessionQueue::<u64>::new(shutdown.clone());
         let executed = Arc::new(AtomicUsize::new(0));
 
-        // Enqueue items that block until shutdown.
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
         let e = Arc::clone(&executed);
         queue.enqueue(
             1,
             Box::pin(async move {
-                // Block until gate opens.
                 let _ = gate_rx.await;
                 e.fetch_add(1, Ordering::SeqCst);
             }),
@@ -299,11 +402,9 @@ mod tests {
             }),
         );
 
-        // Signal shutdown and unblock the first item.
         shutdown.cancel();
         let _ = gate_tx.send(());
 
-        // Give handler time to drain.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert_eq!(
