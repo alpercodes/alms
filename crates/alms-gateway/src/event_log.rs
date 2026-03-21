@@ -93,7 +93,8 @@ impl EventLogManager {
             ts: Utc::now(),
         };
 
-        log.append(event).await;
+        // Single lock acquisition for append
+        log.events.write().await.push(event);
         event_id
     }
 

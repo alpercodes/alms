@@ -218,12 +218,17 @@ impl RunManager {
     /// Dead subscribers (closed channels) are pruned automatically.
     /// Fans out to both per-run and per-session subscribers.
     pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
-        // Per-run event log + fan-out
-        let event_id = self
-            .event_log
-            .log_event(run_id, session_id, &event.event_type, event.data.clone())
-            .await;
-        event.event_id = Some(event_id);
+        let is_delta = event.event_type == "token_delta";
+
+        // Per-run event log — skip token_delta to reduce lock contention.
+        // Live per-run subscribers still receive deltas via fan-out below.
+        if !is_delta {
+            let event_id = self
+                .event_log
+                .log_event(run_id, session_id, &event.event_type, event.data.clone())
+                .await;
+            event.event_id = Some(event_id);
+        }
 
         if let Some(mut senders) = self.event_senders.get_mut(&run_id) {
             let before = senders.len();
