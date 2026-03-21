@@ -115,13 +115,21 @@ impl Tool for InvokeAgentTool {
             .unwrap_or(false);
 
         if background {
+            // Background subagents do NOT receive the parent's event sender.
+            // Passing it would keep the parent's runtime_rx channel alive
+            // (via the forwarding task's clone), preventing the parent run
+            // from finishing until the subagent completes — defeating the
+            // purpose of background dispatch. See #231.
+            //
+            // Background subagents use the completion notification channel
+            // instead of real-time event forwarding.
             let task_id = self
                 .dispatcher
                 .dispatch_background(
                     task,
                     self.parent_session_id,
                     self.parent_run_id,
-                    self.parent_event_tx.clone(),
+                    None, // no parent event forwarding for background
                     subagent_name,
                     self.parent_cancel_token.clone(),
                 )
