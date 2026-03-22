@@ -333,8 +333,8 @@ impl Gateway {
                     if let Some(ref telegram) = self.channels.telegram {
                         // Read the live default agent ID per message so
                         // set-default changes take effect immediately.
-                        // Apply per-agent config overrides (model, system_prompt,
-                        // posture) from the agent registry, same as the HTTP run path.
+                        // Apply per-agent config overrides (model, posture) from
+                        // the agent registry, same as the HTTP run path.
                         let agent_id = self.agent_id();
                         let resolved = crate::runs::resolve_agent_config(
                             agent_id,
@@ -558,7 +558,6 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         name: migration_name.to_string(),
         description: "Auto-migrated default agent".to_string(),
         model: None,
-        system_prompt: None,
         posture: None,
         provider: None,
         is_default: false,
@@ -694,7 +693,6 @@ mod tests {
             name: "atlas".to_string(),
             description: String::new(),
             model: None,
-            system_prompt: None,
             posture: None,
             provider: None,
             is_default: true,

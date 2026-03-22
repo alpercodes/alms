@@ -121,7 +121,6 @@ pub async fn create_agent(
         name: req.name,
         description: req.description.unwrap_or_default(),
         model: req.model,
-        system_prompt: req.system_prompt,
         posture: req.posture,
         provider: req.provider,
         // Always INSERT with is_default=false; set_default_agent atomically
@@ -188,9 +187,6 @@ pub async fn update_agent(
     }
     if let Some(model) = req.model {
         agent.model = if model.is_empty() { None } else { Some(model) };
-    }
-    if let Some(sp) = req.system_prompt {
-        agent.system_prompt = if sp.is_empty() { None } else { Some(sp) };
     }
     if let Some(posture) = req.posture {
         validate_posture(&posture)
@@ -277,7 +273,6 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             model: None,
-            system_prompt: None,
             posture: None,
             provider: None,
             is_default: false,

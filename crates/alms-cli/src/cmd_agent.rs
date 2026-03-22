@@ -21,9 +21,6 @@ pub(crate) enum AgentCommands {
         /// Posture override ("guarded" or "full_control")
         #[arg(long)]
         posture: Option<String>,
-        /// System prompt override
-        #[arg(long)]
-        system_prompt: Option<String>,
         /// LLM provider override ("openai", "anthropic", "openrouter")
         #[arg(long)]
         provider: Option<String>,
@@ -59,9 +56,6 @@ pub(crate) enum AgentCommands {
         /// Posture override (empty string to clear)
         #[arg(long)]
         posture: Option<String>,
-        /// System prompt override (empty string to clear)
-        #[arg(long)]
-        system_prompt: Option<String>,
         /// LLM provider override (empty string to clear)
         #[arg(long)]
         provider: Option<String>,
@@ -108,7 +102,6 @@ pub(crate) fn agent_create(
     description: Option<String>,
     model: Option<String>,
     posture: Option<String>,
-    system_prompt: Option<String>,
     provider: Option<String>,
     default: bool,
     json: bool,
@@ -122,7 +115,6 @@ pub(crate) fn agent_create(
         name,
         description: description.unwrap_or_default(),
         model,
-        system_prompt,
         posture,
         provider,
         is_default: default,
@@ -198,14 +190,6 @@ pub(crate) fn agent_show(store: &SqliteStore, name_or_id: &str, json: bool) -> a
         agent.provider.as_deref().unwrap_or("(server default)")
     );
     println!(
-        "System Prompt: {}",
-        if agent.system_prompt.is_some() {
-            "(custom)"
-        } else {
-            "(server default)"
-        }
-    );
-    println!(
         "Default:       {}",
         if agent.is_default { "yes" } else { "no" }
     );
@@ -257,13 +241,11 @@ pub(crate) fn agent_set_default(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn agent_config(
     store: &SqliteStore,
     name_or_id: &str,
     model: Option<String>,
     posture: Option<String>,
-    system_prompt: Option<String>,
     provider: Option<String>,
     description: Option<String>,
     json: bool,
@@ -278,9 +260,6 @@ pub(crate) fn agent_config(
     }
     if let Some(p) = posture {
         agent.posture = if p.is_empty() { None } else { Some(p) };
-    }
-    if let Some(sp) = system_prompt {
-        agent.system_prompt = if sp.is_empty() { None } else { Some(sp) };
     }
     if let Some(prov) = provider {
         agent.provider = if prov.is_empty() { None } else { Some(prov) };
@@ -315,7 +294,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
             false,
             None,
@@ -347,7 +325,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
             false,
             None,
@@ -356,7 +333,6 @@ mod tests {
         let err = agent_create(
             &store,
             "dup".into(),
-            None,
             None,
             None,
             None,
@@ -379,7 +355,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             false,
             false,
             None,
@@ -397,7 +372,6 @@ mod tests {
         agent_create(
             &store,
             "reviewer".into(),
-            None,
             None,
             None,
             None,
@@ -470,7 +444,6 @@ mod tests {
             Some("new-model".into()),
             Some("guarded".into()),
             None,
-            None,
             Some("updated desc".into()),
             false,
         )
@@ -491,7 +464,6 @@ mod tests {
             name: "clearable".to_string(),
             description: String::new(),
             model: Some("old-model".to_string()),
-            system_prompt: None,
             posture: Some("guarded".to_string()),
             provider: None,
             is_default: false,
@@ -505,7 +477,6 @@ mod tests {
             &store,
             "clearable",
             Some(String::new()),
-            None,
             None,
             None,
             None,

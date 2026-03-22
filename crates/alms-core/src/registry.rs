@@ -17,8 +17,6 @@ pub struct AgentRecord {
     pub description: String,
     /// Per-agent model override (None = use server default).
     pub model: Option<String>,
-    /// Per-agent system prompt override (None = use server default).
-    pub system_prompt: Option<String>,
     /// Per-agent posture override (None = use server default).
     pub posture: Option<String>,
     /// Per-agent LLM provider override (None = use server default).
@@ -35,7 +33,6 @@ pub struct CreateAgentRequest {
     #[serde(default)]
     pub description: Option<String>,
     pub model: Option<String>,
-    pub system_prompt: Option<String>,
     pub posture: Option<String>,
     pub provider: Option<String>,
     #[serde(default)]
@@ -50,7 +47,6 @@ pub struct CreateAgentRequest {
 pub struct UpdateAgentRequest {
     pub description: Option<String>,
     pub model: Option<String>,
-    pub system_prompt: Option<String>,
     pub posture: Option<String>,
     pub provider: Option<String>,
 }

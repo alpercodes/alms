@@ -17,7 +17,6 @@ async function refreshAgents() {
 /** Small popup modal for editing agent settings. */
 function AgentEditModal({ agent, onClose }) {
     const model = useSignal(agent.model || '');
-    const systemPrompt = useSignal(agent.system_prompt || '');
     const posture = useSignal(agent.posture || '');
     const provider = useSignal(agent.provider || '');
     const saving = useSignal(false);
@@ -31,7 +30,6 @@ function AgentEditModal({ agent, onClose }) {
         try {
             await updateAgent(agent.id, {
                 model: model.value || null,
-                system_prompt: systemPrompt.value || null,
                 posture: posture.value || null,
                 provider: provider.value || null,
             });
@@ -72,15 +70,6 @@ function AgentEditModal({ agent, onClose }) {
                         <option value="anthropic">Anthropic</option>
                         <option value="openrouter">OpenRouter</option>
                     </select>
-                </div>
-
-                <div class="settings-row">
-                    <label class="settings-label">System prompt</label>
-                    <textarea class="settings-input" rows="4"
-                              style="resize:vertical; min-height:60px; font-size:var(--text-xs);"
-                              placeholder="Uses server default if empty"
-                              value=${systemPrompt.value}
-                              onInput=${e => { systemPrompt.value = e.target.value; }}></textarea>
                 </div>
 
                 <div class="settings-row">
@@ -150,11 +139,6 @@ function AgentCard({ agent, isActive, onEdit }) {
             `}
             ${agent.posture && html`
                 <div class="agent-card-meta">posture: ${agent.posture}</div>
-            `}
-            ${agent.system_prompt && html`
-                <div class="agent-card-meta agent-card-prompt">
-                    prompt: ${agent.system_prompt.slice(0, 80)}${agent.system_prompt.length > 80 ? '\u2026' : ''}
-                </div>
             `}
             ${error.value && html`<div class="agent-error">${error.value}</div>`}
             <div class="agent-card-actions">

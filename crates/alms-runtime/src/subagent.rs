@@ -30,8 +30,8 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     /// Spawn a subagent, await its completion, and return the response text.
     ///
     /// Named subagents (`subagent_name` = Some) must be pre-registered in the
-    /// agent registry via `alms agent create`. Their config (system_prompt,
-    /// model, posture) and workspace files are loaded from the registry.
+    /// agent registry via `alms agent create`. Their config (model, posture)
+    /// and workspace files are loaded from the registry.
     ///
     /// `parent_event_tx` is the parent run's runtime event sender. When
     /// provided, the subagent's tool events are forwarded into the parent

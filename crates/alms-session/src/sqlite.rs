@@ -713,14 +713,13 @@ impl SqliteStore {
 
         tx.execute(
             "INSERT INTO agents \
-             (id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, name, description, model, posture, provider, is_default, created_at, last_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 agent.id.0.to_string(),
                 &agent.name,
                 &agent.description,
                 agent.model.as_deref(),
-                agent.system_prompt.as_deref(),
                 agent.posture.as_deref(),
                 agent.provider.as_deref(),
                 1i32,
@@ -741,14 +740,13 @@ impl SqliteStore {
             .lock()
             .execute(
                 "INSERT INTO agents \
-                 (id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, name, description, model, posture, provider, is_default, created_at, last_active) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     agent.id.0.to_string(),
                     &agent.name,
                     &agent.description,
                     agent.model.as_deref(),
-                    agent.system_prompt.as_deref(),
                     agent.posture.as_deref(),
                     agent.provider.as_deref(),
                     agent.is_default as i32,
@@ -776,12 +774,11 @@ impl SqliteStore {
             .conn
             .lock()
             .execute(
-                "UPDATE agents SET description = ?1, model = ?2, system_prompt = ?3, \
-                 posture = ?4, provider = ?5, last_active = ?6 WHERE id = ?7",
+                "UPDATE agents SET description = ?1, model = ?2, \
+                 posture = ?3, provider = ?4, last_active = ?5 WHERE id = ?6",
                 params![
                     &agent.description,
                     agent.model.as_deref(),
-                    agent.system_prompt.as_deref(),
                     agent.posture.as_deref(),
                     agent.provider.as_deref(),
                     agent.last_active.to_rfc3339(),
@@ -799,7 +796,7 @@ impl SqliteStore {
     pub fn load_agent_by_id(&self, id: AgentId) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active \
+            "SELECT id, name, description, model, posture, provider, is_default, created_at, last_active \
              FROM agents WHERE id = ?1",
             params![id.0.to_string()],
             parse_agent_row,
@@ -815,7 +812,7 @@ impl SqliteStore {
     pub fn load_agent_by_name(&self, name: &str) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active \
+            "SELECT id, name, description, model, posture, provider, is_default, created_at, last_active \
              FROM agents WHERE name = ?1",
             params![name],
             parse_agent_row,
@@ -833,7 +830,7 @@ impl SqliteStore {
     pub fn get_default_agent(&self) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active \
+            "SELECT id, name, description, model, posture, provider, is_default, created_at, last_active \
              FROM agents WHERE is_default = 1 LIMIT 1",
             [],
             parse_agent_row,
@@ -850,7 +847,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, description, model, system_prompt, posture, provider, is_default, created_at, last_active \
+                "SELECT id, name, description, model, posture, provider, is_default, created_at, last_active \
                  FROM agents ORDER BY created_at",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
@@ -1106,12 +1103,11 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let name: String = row.get(1)?;
     let description: String = row.get(2)?;
     let model: Option<String> = row.get(3)?;
-    let system_prompt: Option<String> = row.get(4)?;
-    let posture: Option<String> = row.get(5)?;
-    let provider: Option<String> = row.get(6)?;
-    let is_default: i32 = row.get(7)?;
-    let created_at_str: String = row.get(8)?;
-    let last_active_str: String = row.get(9)?;
+    let posture: Option<String> = row.get(4)?;
+    let provider: Option<String> = row.get(5)?;
+    let is_default: i32 = row.get(6)?;
+    let created_at_str: String = row.get(7)?;
+    let last_active_str: String = row.get(8)?;
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -1128,7 +1124,6 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         name,
         description,
         model,
-        system_prompt,
         posture,
         provider,
         is_default: is_default != 0,
@@ -1291,7 +1286,6 @@ mod tests {
             name: name.to_string(),
             description: String::new(),
             model: None,
-            system_prompt: None,
             posture: None,
             provider: None,
             is_default: false,
@@ -1534,7 +1528,6 @@ mod tests {
         );
         assert_eq!(loaded.posture.as_deref(), Some("guarded"));
         assert_eq!(loaded.description, "A custom agent");
-        assert!(loaded.system_prompt.is_none());
     }
 
     #[test]

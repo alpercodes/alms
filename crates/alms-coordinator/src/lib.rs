@@ -728,7 +728,6 @@ const DEFAULT_SUBAGENT_PROMPT: &str = "You are a general-purpose assistant. Comp
 
 /// Config extracted from an agent registry record for a named subagent.
 struct SubagentRecordConfig {
-    system_prompt: Option<String>,
     model: Option<String>,
     posture: Option<String>,
     provider: Option<String>,
@@ -742,9 +741,9 @@ fn agent_config_for_subagent(
     record: Option<SubagentRecordConfig>,
     base: &AgentConfig,
 ) -> (AgentConfig, Option<String>, Option<String>) {
-    let (system_prompt, model, posture_str, provider) = match record {
-        Some(r) => (r.system_prompt, r.model, r.posture, r.provider),
-        None => (None, None, None, None),
+    let (model, posture_str, provider) = match record {
+        Some(r) => (r.model, r.posture, r.provider),
+        None => (None, None, None),
     };
 
     let posture = match posture_str.as_deref() {
@@ -754,7 +753,7 @@ fn agent_config_for_subagent(
     };
 
     let config = AgentConfig {
-        system_prompt: system_prompt.unwrap_or_else(|| DEFAULT_SUBAGENT_PROMPT.to_string()),
+        system_prompt: DEFAULT_SUBAGENT_PROMPT.to_string(),
         posture,
         sandbox_root: base.sandbox_root.clone(),
         shell_policy: base.shell_policy.clone(),
@@ -773,7 +772,7 @@ fn agent_config_for_subagent(
 /// event channel (if provided), then calls `runtime.run()`.
 ///
 /// **Named subagents** (`subagent_name` is Some): looked up in the agent
-/// registry for config (system_prompt, model, posture). Workspace is
+/// registry for config (model, posture). Workspace is
 /// attached if `workspace_dir` is set. Session identity is deterministic
 /// (UUID v5 from parent session + name) — conversation history preserved.
 ///
@@ -801,7 +800,7 @@ async fn run_agent_loop(
             let stable_id = AgentId::deterministic(parent_as_agent, name);
             let stable_ctx = format!("subagent_{}_{}", request.parent_session.0, name);
 
-            // Look up agent record in registry for system_prompt/model/posture
+            // Look up agent record in registry for model/posture
             let record_config = session_manager
                 .store()
                 .and_then(|store| store.load_agent_by_name(name).ok())
@@ -809,7 +808,6 @@ async fn run_agent_loop(
                 .map(|record| {
                     debug!("Loaded agent record for named subagent '{name}'");
                     SubagentRecordConfig {
-                        system_prompt: record.system_prompt,
                         model: record.model,
                         posture: record.posture,
                         provider: record.provider,
@@ -1198,14 +1196,14 @@ mod tests {
 
         // Named subagent with registry overrides
         let record = SubagentRecordConfig {
-            system_prompt: Some("custom prompt".into()),
             model: Some("gpt-5".into()),
             posture: Some("guarded".into()),
             provider: Some("anthropic".into()),
         };
         let (config2, model2, _provider2) = agent_config_for_subagent(Some(record), &parent);
         assert_eq!(model2.as_deref(), Some("gpt-5"));
-        assert_eq!(config2.system_prompt, "custom prompt");
+        // system_prompt is always the default subagent prompt (not overridable per-agent)
+        assert_eq!(config2.system_prompt, DEFAULT_SUBAGENT_PROMPT);
         assert_eq!(config2.posture, alms_runtime::Posture::Guarded);
         // Should still inherit runtime settings from parent
         assert_eq!(config2.max_iterations, 42);

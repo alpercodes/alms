@@ -264,7 +264,6 @@ async fn main() -> anyhow::Result<()> {
                     description,
                     model,
                     posture,
-                    system_prompt,
                     provider,
                     default,
                 } => {
@@ -275,7 +274,6 @@ async fn main() -> anyhow::Result<()> {
                         description,
                         model,
                         posture,
-                        system_prompt,
                         provider,
                         default,
                         json,
@@ -295,7 +293,6 @@ async fn main() -> anyhow::Result<()> {
                     name_or_id,
                     model,
                     posture,
-                    system_prompt,
                     provider,
                     description,
                 } => {
@@ -304,7 +301,6 @@ async fn main() -> anyhow::Result<()> {
                         &name_or_id,
                         model,
                         posture,
-                        system_prompt,
                         provider,
                         description,
                         json,
