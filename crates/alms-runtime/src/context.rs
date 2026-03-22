@@ -117,8 +117,10 @@ impl ContextBuilder {
         // with multiple tool_calls entries (required by OpenAI/Anthropic APIs).
         Self::group_tool_calls(&mut messages);
 
-        // 4. Current input
-        messages.push(LlmMessage::user(current_input));
+        // 4. Current input (skip if empty — avoids sending a blank user message to the LLM)
+        if !current_input.is_empty() {
+            messages.push(LlmMessage::user(current_input));
+        }
 
         debug!(
             "Context built: {} messages, ~{} tokens (budget: {})",
@@ -493,6 +495,32 @@ mod tests {
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[2].role, "assistant");
         assert_eq!(messages[3].role, "user");
+    }
+
+    #[test]
+    fn test_build_skips_empty_input() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "Hello"),
+            make_msg(Role::Assistant, "Hi there!"),
+        ];
+
+        // Empty input should not produce a trailing user message
+        let messages = builder.build("You are helpful.", &history, "", None);
+
+        // system + 2 history = 3 (no empty user message appended)
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].role, "assistant");
     }
 
     #[test]
