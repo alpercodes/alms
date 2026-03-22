@@ -881,6 +881,11 @@ async fn run_agent_loop(
         .with_event_sender(sub_tx)
         .with_cancel_token(cancel_token);
 
+    // Set agent name for perspective mapping in DM sessions.
+    if let Some(ref name) = request.subagent_name {
+        runtime = runtime.with_agent_name(name.clone());
+    }
+
     // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into subagent shell_exec
     // processes so CLI commands find the right database.
     {

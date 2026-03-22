@@ -434,6 +434,11 @@ async fn execute_run(
     .with_run_id(run_id)
     .with_cancel_token(cancel_token.clone());
 
+    // Set agent name for perspective mapping in DM sessions.
+    if let Some(ref name) = agent_name {
+        runtime = runtime.with_agent_name(name.clone());
+    }
+
     // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into shell_exec processes
     // so that CLI commands invoked by agents find the correct database and
     // workspace regardless of the sandboxed cwd.

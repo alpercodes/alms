@@ -371,6 +371,10 @@ impl Gateway {
                                 continue;
                             }
                         };
+                        // Set agent name for perspective mapping in DM sessions.
+                        if let Some(ref name) = resolved.agent_name {
+                            runtime = runtime.with_agent_name(name.clone());
+                        }
                         // Inject ALMS_DATA_DIR so CLI commands invoked via
                         // shell_exec find the correct database.
                         {

@@ -124,6 +124,11 @@ pub struct AgentRuntime {
     /// Default env vars injected into shell_exec processes (e.g. ALMS_DATA_DIR).
     /// Retained so `with_workspace()` can pass them to the re-registered shell tool.
     shell_default_env: std::collections::HashMap<String, String>,
+    /// Agent name for perspective mapping in DM sessions.
+    /// When set and the context_id starts with "dm:", the context builder
+    /// maps messages from this agent to `Role::Assistant` so the LLM sees
+    /// them as its own previous responses.
+    agent_name: Option<String>,
 }
 
 impl AgentRuntime {
@@ -167,6 +172,7 @@ impl AgentRuntime {
             resolved_sandbox_root: sandbox_root,
             shell_unrestricted,
             shell_default_env: std::collections::HashMap::new(),
+            agent_name: None,
         })
     }
 
@@ -308,6 +314,17 @@ impl AgentRuntime {
         self
     }
 
+    /// Set the agent name for perspective mapping in DM sessions.
+    ///
+    /// When the context_id starts with `"dm:"`, the context builder uses this
+    /// name to map messages: messages where `from_agent == agent_name` become
+    /// `Role::Assistant` (the LLM's own previous responses), while messages from
+    /// other agents stay as `Role::User`.
+    pub fn with_agent_name(mut self, name: String) -> Self {
+        self.agent_name = Some(name);
+        self
+    }
+
     /// Create with default config
     pub fn with_defaults(agent_id: AgentId) -> AlmsResult<Self> {
         let llm = LlmClient::from_env()?;
@@ -349,7 +366,7 @@ impl AgentRuntime {
         // Build context first (reads history without current input to avoid double-counting),
         // then persist the user message so it survives agent loop failures.
         let history = self
-            .build_context(session_manager, &session.id, &input)
+            .build_context(session_manager, &session.id, context_id, &input)
             .await;
 
         let user_msg = SessionMessage {
@@ -439,10 +456,15 @@ impl AgentRuntime {
     ///
     /// For the `sliding-summary` strategy this is async because it may call the
     /// LLM to compress old messages into a rolling summary.
+    ///
+    /// For DM sessions (context_id starts with `"dm:"`), perspective mapping is
+    /// applied: messages from this agent become `Role::Assistant` so the LLM
+    /// sees them as its own previous responses.
     async fn build_context(
         &self,
         session_manager: &SessionManager,
         session_id: &alms_core::SessionId,
+        context_id: &str,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
         let system_prompt = self.assemble_system_prompt(&self.config.system_prompt);
@@ -478,7 +500,35 @@ impl AgentRuntime {
             };
 
         let builder = ContextBuilder::new(self.config.context_config.clone());
-        Ok(builder.build(&system_prompt, &history, input, summary_text.as_deref()))
+
+        // For DM sessions, apply perspective mapping so the LLM sees its own
+        // previous messages as Role::Assistant instead of Role::User.
+        let perspective = if context_id.starts_with("dm:") {
+            if let Some(ref name) = self.agent_name {
+                debug!(
+                    agent_name = %name,
+                    context_id = %context_id,
+                    "Applying perspective mapping for DM session"
+                );
+                Some(name.as_str())
+            } else {
+                warn!(
+                    context_id = %context_id,
+                    "DM session detected but agent_name not set — perspective mapping skipped"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(builder.build_with_perspective(
+            &system_prompt,
+            &history,
+            input,
+            summary_text.as_deref(),
+            perspective,
+        ))
     }
 
     /// Check whether history has grown past the summarization threshold and, if so,
@@ -1194,6 +1244,7 @@ mod tests {
             resolved_sandbox_root: None,
             shell_unrestricted: true,
             shell_default_env: std::collections::HashMap::new(),
+            agent_name: None,
         };
 
         let request =
@@ -1232,6 +1283,7 @@ mod tests {
             resolved_sandbox_root: None,
             shell_unrestricted: true,
             shell_default_env: std::collections::HashMap::new(),
+            agent_name: None,
         };
 
         let session_config = SessionConfig::default();
@@ -1239,12 +1291,137 @@ mod tests {
         let session = session_manager.get_or_create(runtime.agent_id, "test");
 
         let messages = runtime
-            .build_context(&session_manager, &session.id, "hello")
+            .build_context(&session_manager, &session.id, "test", "hello")
             .await
             .unwrap();
         // system prompt + current input = 2
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[tokio::test]
+    async fn test_build_context_dm_perspective_mapping() {
+        let runtime = AgentRuntime {
+            agent_id: AgentId::new(),
+            config: AgentConfig::default(),
+            llm: LlmClient::new(LlmConfig::default()).unwrap(),
+            tools: ToolRegistry::new(),
+            workspace: None,
+            event_sender: None,
+            run_id: None,
+            cancel_token: None,
+            resolved_sandbox_root: None,
+            shell_unrestricted: true,
+            shell_default_env: std::collections::HashMap::new(),
+            agent_name: Some("bob".to_string()),
+        };
+
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+
+        // Create a shared DM session and populate it with messages from both agents
+        let dm_context = "dm:alice:bob";
+        let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+        let session = session_manager.get_or_create_shared(session_id, dm_context);
+
+        // Alice's message (from_agent = "alice") — should stay User for Bob's perspective
+        session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: alms_session::Role::User,
+                    content: alms_session::Content::Text("Hello Bob!".to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: Some(serde_json::json!({
+                        "from_agent": "alice",
+                        "message_type": "dm",
+                    })),
+                },
+            )
+            .unwrap();
+
+        // Bob's message (from_agent = "bob") — should become Assistant for Bob's perspective
+        session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: alms_session::Role::User,
+                    content: alms_session::Content::Text("Hi Alice!".to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: Some(serde_json::json!({
+                        "from_agent": "bob",
+                        "message_type": "dm",
+                    })),
+                },
+            )
+            .unwrap();
+
+        let messages = runtime
+            .build_context(&session_manager, &session.id, dm_context, "What's up?")
+            .await
+            .unwrap();
+
+        // system + 2 history + current input = 4
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "system");
+        // Alice's message stays as "user" from Bob's perspective
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content_str(), "Hello Bob!");
+        // Bob's own message becomes "assistant" from Bob's perspective
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].content_str(), "Hi Alice!");
+        // Current input
+        assert_eq!(messages[3].role, "user");
+        assert_eq!(messages[3].content_str(), "What's up?");
+    }
+
+    #[tokio::test]
+    async fn test_build_context_non_dm_no_perspective() {
+        // When context_id does NOT start with "dm:", no perspective mapping should occur
+        let runtime = AgentRuntime {
+            agent_id: AgentId::new(),
+            config: AgentConfig::default(),
+            llm: LlmClient::new(LlmConfig::default()).unwrap(),
+            tools: ToolRegistry::new(),
+            workspace: None,
+            event_sender: None,
+            run_id: None,
+            cancel_token: None,
+            resolved_sandbox_root: None,
+            shell_unrestricted: true,
+            shell_default_env: std::collections::HashMap::new(),
+            agent_name: Some("bob".to_string()),
+        };
+
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let session = session_manager.get_or_create(runtime.agent_id, "regular-context");
+
+        // Add a message with from_agent metadata (shouldn't matter for non-DM)
+        session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: alms_session::Role::User,
+                    content: alms_session::Content::Text("Hello".to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: Some(serde_json::json!({"from_agent": "bob"})),
+                },
+            )
+            .unwrap();
+
+        let messages = runtime
+            .build_context(&session_manager, &session.id, "regular-context", "hi")
+            .await
+            .unwrap();
+
+        // system + 1 history + current = 3
+        assert_eq!(messages.len(), 3);
+        // No perspective mapping: message stays as "user" even though from_agent == "bob"
         assert_eq!(messages[1].role, "user");
     }
 
@@ -1348,6 +1525,7 @@ mod tests {
             resolved_sandbox_root: None,
             shell_unrestricted: true,
             shell_default_env: std::collections::HashMap::new(),
+            agent_name: None,
         };
 
         let tool_calls = vec![
