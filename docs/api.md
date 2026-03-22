@@ -262,6 +262,26 @@ data: {"run_id":"...","session_id":"...","ts":"..."}
 
 #### Event types (MVP)
 
+`run_created`
+Emitted immediately when a run is accepted and queued, before the agent loop starts. Includes an optional `source` field indicating what triggered the run.
+```json
+{
+  "run_id": "<uuid>",
+  "session_id": "<uuid>",
+  "is_notification": false,
+  "source": "user",
+  "ts": "..."
+}
+```
+
+`source` values:
+- `"user"` — user-initiated run (default)
+- `"peer:<agent_name>"` — direct message from another agent (e.g. `"peer:researcher"`)
+- `"job"` — scheduled job
+- `"subagent"` — subagent completion notification
+
+The `source` field is omitted when not set. `is_notification` is `true` when the run was triggered by a background event (e.g. a DM delivery or subagent completion) rather than an explicit user action.
+
 `run_started`
 ```json
 { "run_id": "<uuid>", "session_id": "<uuid>", "ts": "..." }
@@ -565,4 +585,4 @@ Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
 ---
 
-*Authored by Mesut (2026-02-11). Updated 2026-03-16 with settings, workspace, tasks endpoints and reconnect support.*
+*Authored by Mesut (2026-02-11). Updated 2026-03-22 with `run_created` SSE event and `source` field documentation.*
