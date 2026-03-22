@@ -105,30 +105,77 @@ fn dm_context_id(a: &str, b: &str) -> String {
 }
 ```
 
-Each side has its own session object for the DM, because sessions are keyed by `(agent_id, context_id)`:
+A DM conversation between two agents is a **single shared session** — just like a user↔agent chat. Both agents read from and write to the same session. When an agent receives a message, it sees the full conversation history (subject to the same context strategies: truncate, full, sliding-summary).
 
-- Agent B's session: `(agent_b_id, "dm:agent-a:agent-b")` -- B is the agent, A's messages appear as Role::User
-- Agent A's session: `(agent_a_id, "dm:agent-a:agent-b")` -- A is the agent, B's responses appear as Role::User
+### Session key
 
-**Dual-write model.** Each agent has its own view of the conversation, stored in its own session. When A sends a message to B:
+The shared DM session uses a deterministic `SessionId` derived from both participants (UUID v5 from the sorted name pair). It is **not** keyed by a single `AgentId` — both agents access the same session record.
 
-1. The message is appended to **B's DM session** as a User message (because from B's perspective, A is a "user" sending input)
-2. The message is also appended to **A's DM session** as an Assistant message with metadata `{forwarded: true}` (so A's context shows what it sent)
-3. When B responds, B's response is appended to B's DM session as Assistant (normal) and to A's DM session as User (with metadata `{from: "agent-b"}`)
+For group chats: similarly, one shared session per group, identified by a deterministic ID from the group name.
 
-This is dual-write, but it preserves the existing session model perfectly. Each agent's session tells a coherent story from that agent's perspective, using the existing Role::User / Role::Assistant model. The LLM sees a natural conversation.
+### Message storage
 
-**Why this works better than a shared session:**
+All messages in a shared session are stored with metadata identifying the sender:
 
-- No changes to SessionManager, ContextBuilder, or the agent loop
-- Each agent's context window is built independently from its own session
-- Token budgets, sliding-summary, and context strategies work unchanged
-- The session model remains `(AgentId, context_id)` -- no new composite keys
+```json
+{ "from_agent": "agent-a", "from_agent_id": "uuid-here" }
+```
 
-**Trade-off:** Messages are stored twice (once per side). This is acceptable because:
-- Messages are small (text + metadata)
-- Consistency is maintained by the MessageBus writing both sides atomically
-- Each agent can independently archive/compress its view without affecting the other
+Messages are stored as `Role::User` regardless of who sent them. The actual role mapping happens at context-building time (see below).
+
+### Perspective mapping in ContextBuilder
+
+The LLM API requires `"assistant"` for "my previous responses" and `"user"` for "input from others." Since a shared session has messages from multiple agents, the ContextBuilder performs **perspective mapping** when building context for a specific agent:
+
+- Messages where `from_agent == current_agent` → mapped to `"assistant"` (the LLM sees them as its own previous responses)
+- Messages where `from_agent != current_agent` → mapped to `"user"` (the LLM sees them as input)
+
+This means the same raw session data looks different depending on who is reading it:
+
+```
+Raw session (shared):
+  [User, from=agent-a] "Please review PR #42"
+  [User, from=agent-b] "I found 3 issues..."
+  [User, from=agent-a] "Fixed issues 1 and 2, pushed update"
+
+Agent B's context (perspective mapping):
+  [user]      "Please review PR #42"          ← from A, so "user"
+  [assistant] "I found 3 issues..."           ← from B (me), so "assistant"
+  [user]      "Fixed issues 1 and 2, pushed"  ← from A, so "user"
+
+Agent A's context (perspective mapping):
+  [assistant] "Please review PR #42"          ← from A (me), so "assistant"
+  [user]      "I found 3 issues..."           ← from B, so "user"
+  [assistant] "Fixed issues 1 and 2, pushed"  ← from A (me), so "assistant"
+```
+
+### DM flow
+
+When Agent A sends a message to Agent B:
+
+1. The MessageBus resolves the shared DM session (deterministic ID from sorted names)
+2. A's message is appended to the shared session with metadata `{from_agent: "agent-a"}`
+3. A `RunTrigger` is created targeting Agent B
+4. B's agent loop runs, ContextBuilder loads the shared session with B's perspective (B's messages → assistant, A's → user)
+5. B responds, response appended to the same shared session with `{from_agent: "agent-b"}`
+6. If B calls `send_message` back to A, a new `RunTrigger` targets A on the same shared session
+
+### Required changes to existing code
+
+1. **`SessionManager`** — add methods to create/load sessions by `SessionId` directly, not requiring `(AgentId, context_id)`. The shared session is not owned by a single agent.
+2. **`ContextBuilder`** — accept a `perspective_agent: &str` parameter. When building context, use `from_agent` metadata to map roles: self → `"assistant"`, others → `"user"`.
+3. **`MessageBus`** — write to one shared session instead of per-agent sessions.
+
+### Why this works
+
+- One session, one conversation history — no sync issues, no dual-write
+- Both agents see the full conversation, just from their own perspective
+- Sliding-summary and token budgets work unchanged (ContextBuilder handles one session)
+- Group chats use the exact same model (one shared session, perspective mapping per agent)
+
+**Note:** Perspective mapping in ContextBuilder requires testing and system prompt tuning. The LLM needs to correctly interpret role-swapped messages, especially in multi-turn conversations. This should be validated with real LLM calls before relying on it in production. Edge cases to watch: tool call messages in shared sessions, system messages, and how sliding-summary handles multi-agent conversation compression.
+
+**Future cleanup:** Consider renaming the internal `Role::Assistant` to `Role::Agent` throughout the codebase to better reflect ALMS semantics. This is a separate refactor — the LLM API mapping (`Role::Agent` → `"assistant"`) would happen in the ContextBuilder output layer.
 
 ### 3.3 The MessageBus
 
@@ -206,7 +253,7 @@ Group messages support @-mention routing (per `communication-architecture.md` Se
 - `@everyone` — all group members invoked
 - No tag — message is logged to all sessions but no agent is invoked
 
-The MessageBus parses mentions from the message text and only creates `RunTrigger` events for mentioned agents. Non-mentioned agents still receive the message in their group session (for context continuity) but their SessionQueue is not triggered.
+The MessageBus parses mentions from the message text and only creates `RunTrigger` events for mentioned agents. Non-mentioned agents still receive the message in their group session (for context continuity) but their AgentQueue is not triggered.
 
 Agents are informed about the mention system via their system prompt.
 
@@ -290,6 +337,8 @@ impl Tool for SendMessageTool {
 ```
 
 The tool returns immediately (fire-and-forget from the sender's perspective). The sender does NOT block waiting for a response. If the sender wants to see the response, it reads the DM session later using a new tool or gets notified.
+
+**Note:** The `send_message` tool currently only supports natural language (text) messages. Structured message support (Section 3.4, `MessagePayload::Structured`) will be added in a later phase — likely as an optional `structured` JSON parameter on the tool, or as a separate `send_structured_message` tool.
 
 ### 3.8 New Tool: `list_agents`
 
@@ -385,10 +434,10 @@ A daemon agent is not fundamentally different from a regular agent -- it is an a
                       | Loop       |
                       +-----+-----+
                             |
-                            | enqueue to SessionQueue
+                            | enqueue to AgentQueue
                             v
                       +-----+-----+
-                      | Session    |
+                      | Agent      |
                       | Queue      |
                       +-----+-----+
                             |
@@ -402,7 +451,7 @@ A daemon agent is not fundamentally different from a regular agent -- it is an a
 
 **There is no special "daemon loop" needed.** The existing machinery already handles:
 
-- Serial message processing per session (SessionQueue)
+- Serial message processing per agent (AgentQueue)
 - Context building from session history
 - Tool execution
 - SSE event streaming
@@ -428,7 +477,7 @@ When `daemon = 1`:
 - The gateway starts a listener for this agent on boot
 - The agent gets a persistent default session that survives restarts
 - Incoming messages (from peers, from the user, from scheduled tasks) all route to this session
-- The agent processes messages serially through its SessionQueue
+- The agent processes messages serially through its AgentQueue
 
 ### 4.4 Agent Lifecycle
 
@@ -486,22 +535,18 @@ CREATE TABLE IF NOT EXISTS group_members (
 
 ### 5.3 How Group Messages Work
 
+Group chats use the same **shared session** model as DMs (Section 3.2). One session per group, all members read from and write to it. The same perspective mapping applies — when Agent B reads the group session, B's own messages become `"assistant"` and everyone else's become `"user"`.
+
 When an agent sends a message to a group:
 
-1. The message is broadcast to all OTHER members of the group
-2. Each member receives the message in their own group session
-3. Each member's session uses `context_id = "group:{group_name}"`
-4. The sender's message appears as `Role::User` in each recipient's session, with metadata `{from: "sender-name"}`
-5. Each recipient may independently choose to respond (creating a run on their group session)
-6. Responses are broadcast back to all other members
+1. The message is appended to the **shared group session** with metadata `{from_agent: "sender-name"}`
+2. For @-mentioned agents (or `@everyone`): a `RunTrigger` is created targeting them
+3. Non-mentioned agents are not triggered but will see the message next time they read the session
+4. When a mentioned agent responds, the response is appended to the same shared session with `{from_agent: "responder-name"}`
 
-**Important**: Unlike a real group chat where everyone sees the same linear thread, each agent has its own session for the group. This means:
+The group session uses a deterministic `SessionId` derived from the group name. When any agent's turn comes, ContextBuilder loads the shared session with that agent's perspective — their messages as `"assistant"`, all others as `"user"` with `{from_agent}` metadata visible in the content.
 
-- Each agent builds its own context window from its perspective
-- Agents may respond at different times (async, not real-time round-robin)
-- The "group conversation" is a logical construct -- physically it is N sessions with cross-posted messages
-
-This is intentional: it matches how the existing session model works and avoids a shared-state coordination problem.
+Agents respond async — they process messages through their `AgentQueue` (Section 7) one at a time, so group participation is serialized with all their other work.
 
 ### 5.4 New Tools for Groups
 
@@ -592,9 +637,44 @@ Per `communication-architecture.md` Section 5: agents in a meeting receive the *
 
 ---
 
-## 7. Task Queue Priority
+## 7. No Parallel Agent Instances (Critical Constraint)
 
-Per `communication-architecture.md` Section 8, the agent task queue (currently `SessionQueue`) supports priority levels:
+Per `communication-architecture.md` Section 8.2: **no two instances of the same agent may run in parallel.** All invocations — whether from a user chat, a DM, a group message, a scheduled job, or a subagent call — go through a **single per-agent queue**. Tasks are processed strictly one at a time.
+
+This is a hard constraint, not a suggestion. Running an agent in parallel across sessions would cause:
+- State conflicts (agent making contradictory decisions in two conversations)
+- Memory corruption (two instances writing to the same workspace files)
+- Confusing behavior (agent appearing in two places at once)
+
+### Current state
+
+The existing `SessionQueue` is **per-session**, not per-agent. This means an agent could currently have runs processing simultaneously on different sessions (e.g., user session + subagent session). This is already wrong in theory but rarely triggered in practice.
+
+### Required change
+
+Replace or wrap `SessionQueue` with a **per-agent queue** (`AgentQueue`). All runs for a given agent — regardless of which session they target — are serialized through this single queue. The session-level queue becomes unnecessary or is absorbed into the agent-level queue.
+
+```
+                     All messages for Agent B
+                     (user chat, DMs, groups, jobs, subagent calls)
+                            |
+                            v
+                     +------+------+
+                     | AgentQueue  |  ← single queue per agent
+                     | (serial)    |
+                     +------+------+
+                            |
+                            v
+                     execute_run() on the appropriate session
+```
+
+This change should be part of **Phase 1** since it is foundational to correct agent behavior with peer messaging.
+
+---
+
+## 8. Task Queue Priority
+
+Per `communication-architecture.md` Section 8, the agent task queue (the new `AgentQueue` from Section 7) supports priority levels:
 
 - **Normal**: FIFO. Default for all invocations.
 - **Urgent**: Jumps to front of queue. For blocking bugs, security incidents, or time-sensitive invocations.
@@ -603,9 +683,9 @@ The existing `SessionQueue` already has a two-tier priority system (`enqueue()` 
 
 ---
 
-## 8. How This Integrates with Existing Systems
+## 9. How This Integrates with Existing Systems
 
-### 6.1 Coexistence with invoke_agent
+### 9.1 Coexistence with invoke_agent
 
 `invoke_agent` (the hierarchy model) and `send_message` (the peer model) coexist. They serve different purposes:
 
@@ -621,7 +701,7 @@ The existing `SessionQueue` already has a two-tier priority system (`enqueue()` 
 
 They should NOT be merged. A developer agent asking a reviewer agent for a review should use `send_message`. A PM agent assigning a task to a developer agent should use `invoke_agent`. The LLM will learn the distinction through system prompts and experience.
 
-### 6.2 SSE Streaming
+### 9.2 SSE Streaming
 
 Peer messages integrate with existing SSE infrastructure:
 
@@ -630,11 +710,11 @@ Peer messages integrate with existing SSE infrastructure:
 - The UI can subscribe to any session's event stream, including DM sessions
 - A new SSE event type `message_received` notifies the UI when an agent gets a peer message
 
-### 6.3 Context Building
+### 9.3 Context Building
 
-No changes needed. Each agent's DM session is a regular session. ContextBuilder reads from it using the standard strategies (truncate, full, sliding-summary). The only addition is metadata on messages indicating the sender (`from` field), which the system prompt instructs the agent to use.
+ContextBuilder requires one change: **perspective mapping** (Section 3.2). When building context for a shared DM or group session, the ContextBuilder accepts a `perspective_agent` parameter and maps `from_agent == self` to `"assistant"`, others to `"user"`. The standard strategies (truncate, full, sliding-summary) work unchanged on the mapped output.
 
-### 6.4 User Observation
+### 9.4 User Observation
 
 The user needs to observe agent-to-agent conversations. This is handled by:
 
@@ -646,9 +726,9 @@ No new endpoints are needed for observation -- the existing session/run/SSE infr
 
 ---
 
-## 9. Database Schema Changes
+## 10. Database Schema Changes
 
-### 9.1 New Tables
+### 10.1 New Tables
 
 ```sql
 -- Groups for multi-agent conversations
@@ -668,7 +748,7 @@ CREATE TABLE IF NOT EXISTS group_members (
 );
 ```
 
-### 9.2 Schema Migrations to Existing Tables
+### 10.2 Schema Migrations to Existing Tables
 
 ```sql
 -- Add daemon flag to agents table
@@ -679,7 +759,7 @@ ALTER TABLE agents ADD COLUMN daemon INTEGER NOT NULL DEFAULT 0;
 -- No schema change needed: metadata is already TEXT (JSON).
 ```
 
-### 9.3 Message Metadata Convention
+### 10.3 Message Metadata Convention
 
 Use the existing `metadata` JSON column on messages to track sender identity in DM/group contexts:
 
@@ -695,9 +775,9 @@ This avoids adding new columns to the messages table. The metadata column is alr
 
 ---
 
-## 10. API Changes
+## 11. API Changes
 
-### 10.1 New Endpoints
+### 11.1 New Endpoints
 
 ```
 POST   /messages              -- Send a message from one agent to another (or to a group)
@@ -709,14 +789,14 @@ POST   /groups/{name}/members -- Add a member to a group
 DELETE /groups/{name}/members/{agent} -- Remove a member
 ```
 
-### 10.2 Modified Endpoints
+### 11.2 Modified Endpoints
 
 ```
 GET /sessions -- Add filter params: ?type=dm|group|user to filter session types
 GET /agents   -- Add daemon flag to response, add status (idle/running/listening)
 ```
 
-### 10.3 New SSE Event Types
+### 11.3 New SSE Event Types
 
 ```json
 // Emitted on the recipient's session when a peer message arrives
@@ -732,7 +812,7 @@ GET /agents   -- Add daemon flag to response, add status (idle/running/listening
 
 ---
 
-## 11. Crate-Level Changes
+## 12. Crate-Level Changes
 
 ### alms-core
 
@@ -776,7 +856,7 @@ GET /agents   -- Add daemon flag to response, add status (idle/running/listening
 
 ---
 
-## 12. System Prompt Additions
+## 13. System Prompt Additions
 
 Agents need to know they can communicate with peers. The staged system prompt (`prompts/tool_loop.md`) should include:
 
@@ -807,9 +887,9 @@ This is injected by the runtime when it detects a `dm:*` context_id on the sessi
 
 ---
 
-## 13. Security Considerations
+## 14. Security Considerations
 
-### 13.1 Access Control
+### 14.1 Access Control
 
 **Phase 1 (open):** Any agent can message any other agent. This is simple and sufficient for small teams where all agents are trusted.
 
@@ -818,7 +898,11 @@ This is injected by the runtime when it detects a `dm:*` context_id on the sessi
 - `can_join_groups: true/false`
 - `can_create_groups: true/false`
 
-### 13.2 Message Rate Limiting
+### 14.2 Self-Messaging
+
+An agent sending a message to itself (`send_message(to="self-name")`) is currently allowed. This is a low-priority edge case — it could be used as a "leave a note for my next run" pattern. No explicit prevention for now; revisit if it causes issues.
+
+### 14.3 Message Rate Limiting
 
 Agents could flood each other with messages, creating infinite loops:
 - Agent A sends to Agent B
@@ -832,7 +916,7 @@ Agents could flood each other with messages, creating infinite loops:
 3. **Max message depth**: Track how many times a message has been "forwarded" (A->B->A->B...). After depth N (default: 5), delivery is refused with an error
 4. **Token budget per DM pair per hour**: Configurable limit on total tokens spent on a DM conversation
 
-### 13.3 User Override
+### 14.4 User Override
 
 The user (via the API or UI) can:
 - Pause a daemon agent (stop processing incoming messages)
@@ -842,7 +926,7 @@ The user (via the API or UI) can:
 
 ---
 
-## 14. Implementation Phases
+## 15. Implementation Phases
 
 Each phase delivers independent value and is a PR-sized chunk.
 
@@ -851,21 +935,22 @@ Each phase delivers independent value and is a PR-sized chunk.
 **Goal**: Agent A can send a message to Agent B. B receives it as a run input.
 
 **Changes:**
-- `alms-coordinator`: Add `MessageBus` with `send()` method. DM session derivation (`dm:a:b`). Dual-write to sender and recipient sessions.
+- `alms-coordinator`: Add `MessageBus` with `send()` method. DM session derivation (`dm:a:b`). Write message to the shared DM session.
 - `alms-coordinator`: Add `RunTrigger` type and `mpsc` channel.
 - `alms-gateway`: Generalize `completion_notification_loop` into `run_trigger_loop`. Wire `MessageBus` into `AppState`.
+- `alms-gateway`: Replace per-session `SessionQueue` with per-agent `AgentQueue` — all runs for a given agent serialize through one queue regardless of target session (Section 7).
 - `alms-runtime`: Add `SendMessageTool`. Register in runtime when MessageBus is available.
 - `alms-runtime`: Add `ListAgentsTool` (reads from `SqliteStore`).
 - `alms-runtime`: Add `ReadMessagesTool` (reads DM session history).
 - `alms-session`: No schema changes (DM sessions are regular sessions with a `dm:*` context_id).
 
 **Loop prevention (must ship with Phase 1):**
-- Message depth tracking: each message carries a `depth` counter incremented on each forward. MessageBus refuses delivery at `depth > MAX_DM_DEPTH` (default: 5).
+- Message depth tracking: the MessageBus internally tracks a `depth` counter per DM conversation chain, incremented each time a message bounces between the same pair (A→B = 1, B→A = 2, A→B = 3...). Delivery is refused at `depth > MAX_DM_DEPTH` (default: 5). This counter is managed entirely by the MessageBus — it is **not** exposed as a parameter on `send_message` and agents are unaware of it.
 - Per-DM-pair cooldown: after delivering a message, the MessageBus rejects another message between the same pair for T seconds (default: 5). This prevents tight A→B→A loops from burning tokens.
 - These are simple counters/timers in the MessageBus, not separate infrastructure.
 
 **Tests:**
-- Unit: MessageBus send/receive, DM context_id derivation, dual-write consistency, depth limit rejection, cooldown rejection
+- Unit: MessageBus send/receive, DM context_id derivation, message delivery, depth limit rejection, cooldown rejection
 - Integration: Agent A sends to Agent B, B's session gets a run with the message
 
 **Estimated size:** ~500 lines of new code, ~12 tests.
@@ -992,7 +1077,7 @@ Per `communication-architecture.md` Section 12, this is the core value propositi
 
 ---
 
-## 15. Migration Path from Current State
+## 16. Migration Path from Current State
 
 The transition from pure hierarchy to peer messaging is additive -- nothing is removed or changed in the existing system.
 
@@ -1003,22 +1088,22 @@ The transition from pure hierarchy to peer messaging is additive -- nothing is r
 | `get_task_result` tool | Unchanged. Still polls background subagent tasks. |
 | Subagent sessions (`subagent_*` context_id) | Unchanged. New DM sessions use `dm:*` context_id. |
 | Completion notification loop | Generalized into `run_trigger_loop` that handles all RunTrigger types. |
-| SessionManager / SQLite store | No breaking changes. New DM sessions are regular sessions. |
+| SessionManager / SQLite store | Minor change: add methods to load shared sessions by `SessionId` (not requiring `AgentId`). Shared DM/group sessions are not owned by a single agent. |
 | Agent registry | `daemon` column added with `DEFAULT 0` -- existing agents unaffected. |
 
 **Backward compatibility:** All existing agent behavior continues to work. Peer messaging is opt-in -- agents only get `send_message` and related tools when the MessageBus is configured. Agents that don't use peer messaging (e.g., CLI-invoked subagents) are unaffected.
 
 ---
 
-## 16. Open Questions and Future Directions
+## 17. Open Questions and Future Directions
 
-### 16.1 Response Notification
+### 17.1 Response Notification
 
-When Agent B responds to Agent A's message, Agent A is notified using the same pattern as background subagent completions: B's response is dual-written into A's DM session as a User message, and a `RunTrigger` is created on A's DM session. If A is a daemon or has an active listener, it processes B's response as a new run. If not, the response sits in A's DM session history and is visible on the next run.
+When Agent B responds to Agent A's message, Agent A is notified using the same pattern as background subagent completions: B's response is written to the **shared DM session** with `{from_agent: "agent-b"}`, and a `RunTrigger` is created targeting Agent A. If A is a daemon or has an active listener, it processes B's response as a new run (with perspective mapping showing B's message as `"user"`). If not, the response sits in the shared session and is visible on A's next run.
 
 This is the push model — no polling needed. The `RunTrigger` mechanism handles delivery for both the initial message and the response symmetrically.
 
-### 16.2 Message Delivery Guarantees
+### 17.2 Message Delivery Guarantees
 
 What happens if the gateway restarts while a message is in the `RunTrigger` channel?
 
@@ -1026,15 +1111,15 @@ What happens if the gateway restarts while a message is in the `RunTrigger` chan
 - **Future:** Persist RunTriggers to SQLite before processing. On restart, replay unprocessed triggers.
 - **Recommendation:** Accept in-memory delivery for Phase 1. The risk is low (single-process, restarts are rare) and the fix is straightforward when needed.
 
-### 16.3 Message Ordering in Groups
+### 17.3 Message Ordering in Groups
 
 Group messages are delivered independently to each member. Members process them at different speeds. This means:
 - Member A might see message 1, 2, 3 in order
 - Member B might see message 1, 3, 2 (if message 3 was delivered before it finished processing message 2's run)
 
-This is acceptable for async agent communication. If strict ordering is needed, the SessionQueue already ensures serial processing per session.
+This is acceptable for async agent communication. If strict ordering is needed, the AgentQueue ensures serial processing per agent, and messages within a single shared session are ordered by `seq`.
 
-### 16.4 Relationship to Layer 3
+### 17.4 Relationship to Layer 3
 
 Layer 3 (emergent team dynamics) builds on Layer 2 infrastructure:
 
@@ -1046,7 +1131,7 @@ Layer 2 provides the pipes. Layer 3 provides the behavior.
 
 ---
 
-## 17. Summary
+## 18. Summary
 
 Layer 2 adds peer-to-peer communication to ALMS, aligned with the product vision in `communication-architecture.md`. Eight implementation phases build incrementally:
 
@@ -1061,7 +1146,7 @@ Layer 2 adds peer-to-peer communication to ALMS, aligned with the product vision
 
 Key design principles:
 - **Hybrid messaging**: structured data for routine info, natural language for reasoning (cost control)
-- **Dual-write sessions**: each agent has its own view, no changes to SessionManager/ContextBuilder
+- **Shared sessions with perspective mapping**: one session per conversation, ContextBuilder maps roles based on who is reading (requires minor ContextBuilder + SessionManager changes)
 - **RunTrigger generalization**: the existing completion notification pattern becomes a universal message delivery mechanism
 - **Ignore signal**: agents can decline invocations to avoid wasted LLM calls
 - **Conservative extension**: reuses existing session/run/SSE infrastructure, keeps each phase independently deployable
