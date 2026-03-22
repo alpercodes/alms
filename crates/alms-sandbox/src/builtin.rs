@@ -49,6 +49,20 @@ fn check_sandbox_path(path: &str, sandbox_root: &Path) -> SandboxResult<PathBuf>
     Ok(canonical)
 }
 
+/// Async version of [`check_sandbox_path`] that offloads the blocking
+/// `std::fs::canonicalize()` / `path.exists()` calls to a blocking thread
+/// via `tokio::task::spawn_blocking`, preventing async worker stalls on
+/// slow filesystems or Windows antivirus scans.
+async fn check_sandbox_path_async(path: &str, sandbox_root: &Path) -> SandboxResult<PathBuf> {
+    let path_owned = path.to_owned();
+    let root_owned = sandbox_root.to_owned();
+    tokio::task::spawn_blocking(move || check_sandbox_path(&path_owned, &root_owned))
+        .await
+        .map_err(|e| {
+            SandboxError::SandboxViolation(format!("Sandbox path check task failed: {}", e))
+        })?
+}
+
 /// Canonicalize a path, walking up to the nearest existing ancestor if the
 /// full path does not yet exist (handles fs_write for new files/dirs).
 fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
@@ -622,7 +636,7 @@ impl Tool for ShellExecTool {
             if !self.unrestricted
                 && let Some(ref root) = self.sandbox_root
             {
-                check_sandbox_path(cwd, root)?;
+                check_sandbox_path_async(cwd, root).await?;
             }
             cmd.current_dir(cwd);
         } else if let Some(ref default) = self.default_cwd {
@@ -736,7 +750,7 @@ impl Tool for FsReadTool {
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
-            check_sandbox_path(path, root)?
+            check_sandbox_path_async(path, root).await?
         } else {
             PathBuf::from(path)
         };
@@ -815,7 +829,7 @@ impl Tool for FsWriteTool {
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
-            check_sandbox_path(path, root)?
+            check_sandbox_path_async(path, root).await?
         } else {
             PathBuf::from(path)
         };
@@ -919,7 +933,7 @@ impl Tool for FsListTool {
         let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
-            check_sandbox_path(path, root)?
+            check_sandbox_path_async(path, root).await?
         } else {
             PathBuf::from(path)
         };
