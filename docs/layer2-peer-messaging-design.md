@@ -451,7 +451,7 @@ A daemon agent is not fundamentally different from a regular agent -- it is an a
 
 **There is no special "daemon loop" needed.** The existing machinery already handles:
 
-- Serial message processing per session (SessionQueue)
+- Serial message processing per agent (AgentQueue)
 - Context building from session history
 - Tool execution
 - SSE event streaming
@@ -477,7 +477,7 @@ When `daemon = 1`:
 - The gateway starts a listener for this agent on boot
 - The agent gets a persistent default session that survives restarts
 - Incoming messages (from peers, from the user, from scheduled tasks) all route to this session
-- The agent processes messages serially through its SessionQueue
+- The agent processes messages serially through its AgentQueue
 
 ### 4.4 Agent Lifecycle
 
@@ -935,7 +935,7 @@ Each phase delivers independent value and is a PR-sized chunk.
 **Goal**: Agent A can send a message to Agent B. B receives it as a run input.
 
 **Changes:**
-- `alms-coordinator`: Add `MessageBus` with `send()` method. DM session derivation (`dm:a:b`). Write message to recipient's DM session.
+- `alms-coordinator`: Add `MessageBus` with `send()` method. DM session derivation (`dm:a:b`). Write message to the shared DM session.
 - `alms-coordinator`: Add `RunTrigger` type and `mpsc` channel.
 - `alms-gateway`: Generalize `completion_notification_loop` into `run_trigger_loop`. Wire `MessageBus` into `AppState`.
 - `alms-gateway`: Replace per-session `SessionQueue` with per-agent `AgentQueue` — all runs for a given agent serialize through one queue regardless of target session (Section 7).
@@ -1088,7 +1088,7 @@ The transition from pure hierarchy to peer messaging is additive -- nothing is r
 | `get_task_result` tool | Unchanged. Still polls background subagent tasks. |
 | Subagent sessions (`subagent_*` context_id) | Unchanged. New DM sessions use `dm:*` context_id. |
 | Completion notification loop | Generalized into `run_trigger_loop` that handles all RunTrigger types. |
-| SessionManager / SQLite store | No breaking changes. New DM sessions are regular sessions. |
+| SessionManager / SQLite store | Minor change: add methods to load shared sessions by `SessionId` (not requiring `AgentId`). Shared DM/group sessions are not owned by a single agent. |
 | Agent registry | `daemon` column added with `DEFAULT 0` -- existing agents unaffected. |
 
 **Backward compatibility:** All existing agent behavior continues to work. Peer messaging is opt-in -- agents only get `send_message` and related tools when the MessageBus is configured. Agents that don't use peer messaging (e.g., CLI-invoked subagents) are unaffected.
