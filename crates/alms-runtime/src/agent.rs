@@ -247,6 +247,24 @@ impl AgentRuntime {
         self
     }
 
+    /// Register the `send_message` tool for peer-to-peer agent messaging.
+    pub fn with_send_message(self, tool: crate::send_message_tool::SendMessageTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
+    /// Register the `list_agents` tool for agent discovery.
+    pub fn with_list_agents(self, tool: crate::list_agents_tool::ListAgentsTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
+    /// Register the `read_messages` tool for reading DM conversation history.
+    pub fn with_read_messages(self, tool: crate::read_messages_tool::ReadMessagesTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
     /// Set the run ID for audit event correlation.
     pub fn with_run_id(mut self, run_id: alms_core::RunId) -> Self {
         self.run_id = Some(run_id);

@@ -32,6 +32,32 @@ impl ContextBuilder {
         current_input: &str,
         existing_summary: Option<&str>,
     ) -> Vec<LlmMessage> {
+        self.build_with_perspective(
+            system_prompt,
+            history,
+            current_input,
+            existing_summary,
+            None,
+        )
+    }
+
+    /// Build the message list with optional perspective mapping.
+    ///
+    /// When `perspective_agent` is `Some("agent-name")`, messages in the session
+    /// are role-mapped based on `from_agent` metadata:
+    /// - `from_agent == perspective_agent` -> `"assistant"` (the LLM's own previous responses)
+    /// - `from_agent != perspective_agent` -> `"user"` (input from others)
+    ///
+    /// This is used for shared DM/group sessions where all messages are stored
+    /// as `Role::User` and the actual role depends on who is reading.
+    pub fn build_with_perspective(
+        &self,
+        system_prompt: &str,
+        history: &[Message],
+        current_input: &str,
+        existing_summary: Option<&str>,
+        perspective_agent: Option<&str>,
+    ) -> Vec<LlmMessage> {
         let mut messages = Vec::new();
 
         // 1. System prompt (always included)
@@ -45,16 +71,34 @@ impl ContextBuilder {
         let reserved = system_tokens + input_tokens + 500; // 500 token buffer for response
         let history_budget = self.config.max_input_tokens.saturating_sub(reserved);
 
+        // Store perspective for use in session_msg_to_llm calls during strategy execution.
+        // Since the strategies call session_msg_to_llm internally, we thread the
+        // perspective through by temporarily storing it. This is a bit awkward but
+        // avoids modifying every strategy method signature.
+        //
+        // For now, we pre-map the history if perspective is set, then pass the
+        // mapped messages through the standard strategies.
+        let mapped_history: Vec<Message>;
+        let history_ref = if let Some(agent) = perspective_agent {
+            mapped_history = history
+                .iter()
+                .map(|msg| self.apply_perspective(msg, agent))
+                .collect();
+            &mapped_history
+        } else {
+            history
+        };
+
         match self.config.strategy.as_str() {
             "full" => {
-                self.build_full(history, history_budget, &mut messages);
+                self.build_full(history_ref, history_budget, &mut messages);
             }
             "truncate" => {
-                self.build_truncate(history, history_budget, &mut messages);
+                self.build_truncate(history_ref, history_budget, &mut messages);
             }
             "sliding-summary" => {
                 self.build_sliding_summary(
-                    history,
+                    history_ref,
                     history_budget,
                     &mut messages,
                     existing_summary,
@@ -65,7 +109,7 @@ impl ContextBuilder {
                     "Unknown context strategy '{}', using truncate",
                     self.config.strategy
                 );
-                self.build_truncate(history, history_budget, &mut messages);
+                self.build_truncate(history_ref, history_budget, &mut messages);
             }
         }
 
@@ -84,6 +128,33 @@ impl ContextBuilder {
         );
 
         messages
+    }
+
+    /// Apply perspective mapping to a message.
+    ///
+    /// For shared sessions (DM/group), all messages are stored as `Role::User`.
+    /// When building context for a specific agent, messages from that agent
+    /// should be mapped to `Role::Assistant` so the LLM sees them as its own
+    /// previous responses.
+    fn apply_perspective(&self, msg: &Message, perspective_agent: &str) -> Message {
+        let from_agent = msg
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("from_agent"))
+            .and_then(|v| v.as_str());
+
+        match from_agent {
+            Some(sender) if sender == perspective_agent => {
+                // This agent's own message -> map to Assistant
+                let mut mapped = msg.clone();
+                mapped.role = Role::Assistant;
+                mapped
+            }
+            _ => {
+                // Someone else's message (or no metadata) -> keep as User
+                msg.clone()
+            }
+        }
     }
 
     /// Full strategy: include all history (oldest to newest), skip if over budget

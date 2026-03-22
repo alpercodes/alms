@@ -13,7 +13,7 @@ use crate::gateway::Gateway;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
     cancel_run, completion_notification_loop, create_run, get_run_status, list_runs,
-    scheduler_fire_loop, stream_run_events,
+    run_trigger_loop, scheduler_fire_loop, stream_run_events,
 };
 use crate::session_queue::SessionQueue;
 use crate::settings::get_settings;
@@ -364,8 +364,9 @@ pub struct AppState {
     pub coordinator: Arc<Coordinator>,
     /// Token cancelled during graceful shutdown.
     pub shutdown_token: CancellationToken,
-    /// Per-session work queue — serializes runs within a session.
-    pub session_queue: Arc<SessionQueue<SessionId>>,
+    /// Per-agent work queue -- serializes all runs for a given agent (Section 7
+    /// of the Layer 2 design: no parallel agent instances).
+    pub agent_queue: Arc<SessionQueue<AgentId>>,
     /// Snapshot of LLM config — read once at startup so handlers avoid locking the gateway.
     pub llm_config: alms_runtime::LlmConfig,
     /// Snapshot of agent config — read once at startup so handlers avoid locking the gateway.
@@ -378,6 +379,8 @@ pub struct AppState {
     pub auth_token_value: Option<String>,
     /// Shared secrets store for API key management.
     pub secrets: Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>,
+    /// Agent-to-agent message bus for peer messaging (Layer 2).
+    pub message_bus: Arc<alms_coordinator::message_bus::MessageBus>,
 }
 
 impl AppState {
@@ -386,6 +389,9 @@ impl AppState {
         scheduler: Arc<Scheduler>,
         shutdown_token: CancellationToken,
         completion_tx: tokio::sync::mpsc::UnboundedSender<alms_coordinator::SubagentCompletion>,
+        run_trigger_tx: tokio::sync::mpsc::UnboundedSender<
+            alms_coordinator::message_bus::RunTrigger,
+        >,
     ) -> AlmsResult<Self> {
         let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
         let data_dir = gateway
@@ -435,6 +441,12 @@ impl AppState {
         coord = coord.with_secrets(secrets.clone());
         let coordinator = Arc::new(coord);
 
+        // Create the peer-messaging MessageBus (Layer 2).
+        let message_bus = Arc::new(alms_coordinator::message_bus::MessageBus::new(
+            session_manager.clone(),
+            run_trigger_tx,
+        ));
+
         // Migrate any legacy UUID-based workspace directories to name-based paths.
         if let Some(ws_dir) = &workspace_dir
             && let Some(store) = session_manager.store()
@@ -471,13 +483,14 @@ impl AppState {
             scheduler,
             coordinator,
             shutdown_token: shutdown_token.clone(),
-            session_queue: Arc::new(SessionQueue::new(shutdown_token)),
+            agent_queue: Arc::new(SessionQueue::new(shutdown_token)),
             llm_config,
             agent_config,
             default_agent_id,
             llm,
             auth_token_value,
-            secrets, // constructed earlier alongside coordinator
+            secrets,
+            message_bus,
         })
     }
 }
@@ -777,7 +790,16 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let (completion_tx, completion_rx) =
         tokio::sync::mpsc::unbounded_channel::<alms_coordinator::SubagentCompletion>();
 
-    let state = AppState::new(gateway, scheduler, shutdown_token.clone(), completion_tx)?;
+    let (run_trigger_tx, run_trigger_rx) =
+        tokio::sync::mpsc::unbounded_channel::<alms_coordinator::message_bus::RunTrigger>();
+
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        run_trigger_tx,
+    )?;
 
     {
         let mut gateway = state.gateway.lock().await;
@@ -804,6 +826,11 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
         completion_state,
     ));
 
+    // Spawn the run-trigger loop: processes peer message triggers from the
+    // MessageBus and creates runs on the target agent's session.
+    let trigger_state = state.clone();
+    let trigger_handle = tokio::spawn(run_trigger_loop(run_trigger_rx, trigger_state));
+
     // Use the auth token snapshot from AppState — no mutex lock needed.
     let auth_token = AuthToken(state.auth_token_value.clone());
 
@@ -812,11 +839,11 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     // without requiring us to lock the gateway mutex from outside.
     let background_gateway = state.gateway.clone();
     let gateway_token = shutdown_token.clone();
-    let gateway_session_queue = state.session_queue.clone();
+    let gateway_agent_queue = state.agent_queue.clone();
     let gateway_handle = tokio::spawn(async move {
         let mut gateway = background_gateway.lock().await;
         if let Err(e) = gateway
-            .run_until_shutdown(gateway_token, gateway_session_queue)
+            .run_until_shutdown(gateway_token, gateway_agent_queue)
             .await
         {
             tracing::error!("Gateway message loop exited: {}", e);
@@ -871,6 +898,10 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     completion_handle.abort();
     completion_handle.await.ok();
     info!("Completion notification loop stopped");
+
+    trigger_handle.abort();
+    trigger_handle.await.ok();
+    info!("RunTrigger loop stopped");
 
     // Phase 4: Gateway message loop already exiting (token cancelled).
     gateway_handle.await.ok();

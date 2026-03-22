@@ -1,3 +1,5 @@
+pub mod message_bus;
+
 use alms_core::{AgentId, AlmsResult, RunId, SessionId};
 use alms_runtime::events::RuntimeEventSender;
 use alms_runtime::subagent::{PollResult, SubagentDispatcher};

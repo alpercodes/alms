@@ -5,7 +5,7 @@
 use crate::session_queue::SessionQueue;
 use alms_channel::telegram::TelegramChannel;
 use alms_channel::{Channel, ChannelConfig};
-use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult, SessionId, validate_agent_name};
+use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult, validate_agent_name};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
 use alms_session::{SessionConfig, SessionManager, SqliteStore};
 use std::path::Path;
@@ -307,12 +307,12 @@ impl Gateway {
 
     /// Run the message processing loop until the shutdown token is cancelled.
     ///
-    /// Messages to the same session are serialized via `session_queue` (FIFO).
-    /// Messages to different sessions process concurrently.
+    /// All runs for the same agent are serialized via `agent_queue` (FIFO).
+    /// Different agents process concurrently.
     pub async fn run_until_shutdown(
         &mut self,
         token: CancellationToken,
-        session_queue: Arc<SessionQueue<SessionId>>,
+        agent_queue: Arc<SessionQueue<AgentId>>,
     ) -> AlmsResult<()> {
         info!("Starting message processing loop (shutdown-aware)");
 
@@ -392,12 +392,10 @@ impl Gateway {
                             runtime = runtime.with_workspace(workspace);
                         }
                         let runtime = Arc::new(runtime);
-                        let context_id = format!("telegram_{}", msg.chat_id.0);
-                        let session = self.session_manager.get_or_create(agent_id, &context_id);
                         let sm = Arc::clone(&self.session_manager);
                         let tg = Arc::clone(telegram);
-                        session_queue.enqueue(
-                            session.id,
+                        agent_queue.enqueue(
+                            agent_id,
                             Box::pin(async move {
                                 process_telegram_message(runtime, sm, tg, msg).await;
                             }),
