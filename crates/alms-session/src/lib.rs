@@ -95,31 +95,37 @@ impl SessionManager {
         self.sessions.contains_key(key)
     }
 
-    /// Get or create a session
+    /// Get or create a session.
+    ///
+    /// Uses `DashMap::entry()` to make the check-and-insert atomic, preventing
+    /// a TOCTOU race where two threads could create duplicate sessions for the
+    /// same `(agent_id, context_id)` key.
     pub fn get_or_create(&self, agent_id: AgentId, context_id: impl Into<String>) -> Session {
         let context_id = context_id.into();
         let key = (agent_id, context_id.clone());
 
-        if let Some(entry) = self.sessions.get(&key) {
-            let session = entry.clone();
-            debug!("Found existing session: {:?}", session.id);
-            return session;
-        }
+        let session = self
+            .sessions
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let session = Session::new(agent_id, context_id);
+                self.session_by_id.insert(session.id, key);
+                self.history.insert(session.id, Vec::new());
+                self.audit.insert(session.id, Vec::new());
+                self.summaries.entry(session.id).or_default();
 
-        let session = Session::new(agent_id, context_id);
-        self.session_by_id.insert(session.id, key.clone());
-        self.sessions.insert(key, session.clone());
-        self.history.insert(session.id, Vec::new());
-        self.audit.insert(session.id, Vec::new());
-        self.summaries.entry(session.id).or_default();
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save_session(&session)
+                {
+                    warn!("Failed to persist session {}: {}", session.id.0, e);
+                }
 
-        if let Some(store) = &self.store
-            && let Err(e) = store.save_session(&session)
-        {
-            warn!("Failed to persist session {}: {}", session.id.0, e);
-        }
+                info!("Created new session: {:?}", session.id);
+                session
+            })
+            .clone();
 
-        info!("Created new session: {:?}", session.id);
+        debug!("get_or_create session: {:?}", session.id);
         session
     }
 
@@ -131,50 +137,51 @@ impl SessionManager {
     /// context_id)` in the internal map so it integrates with the existing
     /// session infrastructure.
     ///
-    /// `sentinel_agent_id` should be a stable ID associated with the conversation
-    /// (e.g., one of the participants, or a nil UUID). It is only used for the
-    /// internal DashMap key -- both participants access the session by `SessionId`.
+    /// Lock ordering: `sessions` (outer) -> `session_by_id` (inner), matching
+    /// `get_or_create` to prevent AB/BA deadlocks.
     pub fn get_or_create_shared(
         &self,
         session_id: SessionId,
         context_id: impl Into<String>,
     ) -> Session {
-        // Fast path: session already exists in the reverse index.
-        if let Some(key) = self.session_by_id.get(&session_id)
-            && let Some(session) = self.sessions.get(key.value())
-        {
-            debug!("Found existing shared session: {:?}", session_id);
-            return session.clone();
-        }
-
-        // Slow path: create the session with the provided deterministic SessionId.
         let context_id = context_id.into();
-        // Use a nil AgentId as sentinel for shared sessions.
         let sentinel = AgentId(uuid::Uuid::nil());
         let key = (sentinel, context_id.clone());
 
-        let session = Session {
-            id: session_id,
-            agent_id: sentinel,
-            context_id,
-            created_at: alms_core::Timestamp::now(),
-            last_activity: alms_core::Timestamp::now(),
-            status: types::SessionStatus::Active,
-        };
+        // Use `sessions.entry()` as the outer lock — same ordering as
+        // `get_or_create` — then insert into `session_by_id` inside the
+        // closure. This avoids the AB/BA deadlock that would occur if we
+        // locked `session_by_id` first.
+        let session = self
+            .sessions
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let session = Session {
+                    id: session_id,
+                    agent_id: sentinel,
+                    context_id,
+                    created_at: alms_core::Timestamp::now(),
+                    last_activity: alms_core::Timestamp::now(),
+                    status: types::SessionStatus::Active,
+                };
 
-        self.session_by_id.insert(session_id, key.clone());
-        self.sessions.insert(key, session.clone());
-        self.history.insert(session_id, Vec::new());
-        self.audit.insert(session_id, Vec::new());
-        self.summaries.entry(session_id).or_default();
+                self.session_by_id.insert(session_id, key);
+                self.history.insert(session_id, Vec::new());
+                self.audit.insert(session_id, Vec::new());
+                self.summaries.entry(session_id).or_default();
 
-        if let Some(store) = &self.store
-            && let Err(e) = store.save_session(&session)
-        {
-            warn!("Failed to persist shared session {}: {}", session_id.0, e);
-        }
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save_session(&session)
+                {
+                    warn!("Failed to persist shared session {}: {}", session_id.0, e);
+                }
 
-        info!("Created new shared session: {:?}", session_id);
+                info!("Created new shared session: {:?}", session_id);
+                session
+            })
+            .clone();
+
+        debug!("get_or_create_shared session: {:?}", session_id);
         session
     }
 
@@ -183,10 +190,18 @@ impl SessionManager {
         self.session_by_id.contains_key(&session_id)
     }
 
-    /// Get a session by ID
+    /// Get a session by ID.
+    ///
+    /// Clones the key out of `session_by_id` (releasing its read lock) before
+    /// looking up in `sessions`, so both maps are never locked simultaneously.
+    /// This maintains the same lock ordering as `get_or_create` / `get_or_create_shared`.
     pub fn get(&self, session_id: SessionId) -> AlmsResult<Session> {
-        if let Some(key) = self.session_by_id.get(&session_id)
-            && let Some(session) = self.sessions.get(key.value())
+        let key = self
+            .session_by_id
+            .get(&session_id)
+            .map(|r| r.value().clone());
+        if let Some(key) = key
+            && let Some(session) = self.sessions.get(&key)
         {
             return Ok(session.clone());
         }
@@ -210,8 +225,14 @@ impl SessionManager {
             history.push(message);
 
             // Update last_activity via the reverse index — O(1), no full scan.
-            if let Some(key) = self.session_by_id.get(&session_id)
-                && let Some(mut session) = self.sessions.get_mut(key.value())
+            // Clone the key out of `session_by_id` (releasing its read lock) before
+            // acquiring a write lock on `sessions`, avoiding cross-map lock nesting.
+            let session_key = self
+                .session_by_id
+                .get(&session_id)
+                .map(|r| r.value().clone());
+            if let Some(key) = session_key
+                && let Some(mut session) = self.sessions.get_mut(&key)
             {
                 session.touch();
                 // Write-through updated last_activity to SQLite
