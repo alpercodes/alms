@@ -16,6 +16,24 @@ use tracing::{error, info, warn};
 use types::*;
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org/bot";
+
+/// A newtype that wraps a secret string and redacts it in `Debug` output
+/// to prevent accidental exposure in logs or error messages.
+#[derive(Clone)]
+struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+impl Secret {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Telegram's hard limit for sendMessage text.
 // NOTE: Telegram counts UTF-16 code units, but we split on UTF-8 bytes.
 // This is conservative — we may over-split (send shorter chunks than needed)
@@ -25,9 +43,9 @@ const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 /// Telegram Bot API client
 #[derive(Debug, Clone)]
 pub struct TelegramChannel {
-    token: String,
+    token: Secret,
     client: Client,
-    base_url: String,
+    base_url: Secret,
     last_update_id: Arc<AtomicI64>,
     running: Arc<AtomicBool>,
     use_webhook: bool,
@@ -52,9 +70,9 @@ impl TelegramChannel {
     /// Create a new Telegram channel (not initialized)
     pub fn new() -> Self {
         Self {
-            token: String::new(),
+            token: Secret(String::new()),
             client: Client::new(),
-            base_url: String::new(),
+            base_url: Secret(String::new()),
             last_update_id: Arc::new(AtomicI64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             use_webhook: false,
@@ -121,7 +139,7 @@ impl TelegramChannel {
 
     /// Build the API URL for a method
     fn api_url(&self, method: &str) -> String {
-        format!("{}{}/{}", TELEGRAM_API_BASE, self.token, method)
+        format!("{}{}/{}", TELEGRAM_API_BASE, self.token.as_str(), method)
     }
 
     /// Make a GET request to the Telegram API
@@ -442,8 +460,8 @@ impl Channel for TelegramChannel {
             ));
         }
 
-        self.token = config.token;
-        self.base_url = format!("{}{}", TELEGRAM_API_BASE, self.token);
+        self.token = Secret(config.token);
+        self.base_url = Secret(format!("{}{}", TELEGRAM_API_BASE, self.token.as_str()));
         self.use_webhook = config.use_webhook;
         self.webhook_url = config.webhook_url;
         self.poll_interval_secs = config.poll_interval_secs;
@@ -696,11 +714,42 @@ mod tests {
     #[test]
     fn api_url_builds_correctly() {
         let mut channel = TelegramChannel::new();
-        channel.token = "tok123".to_string();
+        channel.token = Secret("tok123".to_string());
         assert_eq!(
             channel.api_url("sendMessage"),
             "https://api.telegram.org/bottok123/sendMessage"
         );
+    }
+
+    // -- Debug redaction tests --
+
+    #[test]
+    fn debug_output_redacts_token() {
+        let mut channel = TelegramChannel::new();
+        channel.token = Secret("SUPER_SECRET_TOKEN_12345".to_string());
+        channel.base_url = Secret(format!(
+            "https://api.telegram.org/bot{}",
+            "SUPER_SECRET_TOKEN_12345"
+        ));
+        let debug = format!("{:?}", channel);
+        assert!(
+            !debug.contains("SUPER_SECRET_TOKEN_12345"),
+            "Token was leaked in Debug output: {}",
+            debug
+        );
+        assert!(debug.contains("***"), "Debug should contain redacted '***'");
+    }
+
+    #[test]
+    fn secret_debug_redacts() {
+        let s = Secret("my-api-key".to_string());
+        assert_eq!(format!("{:?}", s), "***");
+    }
+
+    #[test]
+    fn secret_as_str_returns_value() {
+        let s = Secret("my-api-key".to_string());
+        assert_eq!(s.as_str(), "my-api-key");
     }
 
     // -- Polling offset tests --
