@@ -515,6 +515,12 @@ impl LlmClient {
     pub fn default_model(&self) -> &str {
         &self.config.default_model
     }
+
+    /// Get the current API key (test-only).
+    #[cfg(test)]
+    pub fn api_key(&self) -> &str {
+        &self.config.api_key
+    }
 }
 
 #[cfg(test)]
@@ -678,6 +684,8 @@ mod tests {
         assert_eq!(updated.provider(), "openrouter");
         // The default model should not change either
         assert_eq!(updated.default_model(), "moonshotai/kimi-k2.5");
+        // The key must have been updated to the new value
+        assert_eq!(updated.api_key(), "new-runtime-key");
     }
 
     #[test]
@@ -694,5 +702,7 @@ mod tests {
         let updated = client.with_secrets(&secrets);
         // Provider unchanged
         assert_eq!(updated.provider(), "openrouter");
+        // Key must remain the original value when secrets store has nothing
+        assert_eq!(updated.api_key(), "original-key");
     }
 }
