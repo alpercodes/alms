@@ -129,6 +129,7 @@ pub(crate) fn job_show(store: &SqliteStore, job_id_str: &str, json: bool) -> any
 }
 
 pub(crate) async fn job_create(
+    client: &reqwest::Client,
     url: &str,
     agent_name_or_id: &str,
     prompt: &str,
@@ -137,7 +138,7 @@ pub(crate) async fn job_create(
 ) -> anyhow::Result<()> {
     // Resolve agent via the gateway HTTP API instead of direct SQLite,
     // avoiding state disagreement between CLI and gateway. Fixes #26.
-    let agent_val = api_get(url, &format!("agents/{agent_name_or_id}")).await?;
+    let agent_val = api_get(client, url, &format!("agents/{agent_name_or_id}")).await?;
     let agent_id_str = agent_val
         .get("id")
         .and_then(|v| v.as_str())
@@ -157,7 +158,7 @@ pub(crate) async fn job_create(
         prompt: prompt.to_string(),
         schedule,
     };
-    let (_status, val) = api_post(url, "jobs", &req).await?;
+    let (_status, val) = api_post(client, url, "jobs", &req).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&val)?);
@@ -168,9 +169,14 @@ pub(crate) async fn job_create(
     Ok(())
 }
 
-pub(crate) async fn job_cancel(url: &str, job_id_str: &str, json: bool) -> anyhow::Result<()> {
+pub(crate) async fn job_cancel(
+    client: &reqwest::Client,
+    url: &str,
+    job_id_str: &str,
+    json: bool,
+) -> anyhow::Result<()> {
     uuid::Uuid::parse_str(job_id_str).map_err(|_| anyhow::anyhow!("Invalid job UUID"))?;
-    api_delete(url, &format!("jobs/{job_id_str}")).await?;
+    api_delete(client, url, &format!("jobs/{job_id_str}")).await?;
     if json {
         println!(
             "{}",

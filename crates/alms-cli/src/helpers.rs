@@ -85,8 +85,11 @@ pub(crate) fn parse_api_error(status: reqwest::StatusCode, body: &str) -> String
 }
 
 /// Send a GET request and return the response body as JSON Value.
-pub(crate) async fn api_get(base_url: &str, path: &str) -> anyhow::Result<serde_json::Value> {
-    let client = api_client()?;
+pub(crate) async fn api_get(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+) -> anyhow::Result<serde_json::Value> {
     let url = api_url(base_url, path);
     let resp = client.get(&url).send().await.map_err(|e| {
         if e.is_connect() {
@@ -107,11 +110,11 @@ pub(crate) async fn api_get(base_url: &str, path: &str) -> anyhow::Result<serde_
 
 /// Send a POST request with JSON body and return the response.
 pub(crate) async fn api_post(
+    client: &reqwest::Client,
     base_url: &str,
     path: &str,
     body: &impl serde::Serialize,
 ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
-    let client = api_client()?;
     let url = api_url(base_url, path);
     let resp = client.post(&url).json(body).send().await.map_err(|e| {
         if e.is_connect() {
@@ -131,8 +134,11 @@ pub(crate) async fn api_post(
 }
 
 /// Send a DELETE request and return the status code.
-pub(crate) async fn api_delete(base_url: &str, path: &str) -> anyhow::Result<reqwest::StatusCode> {
-    let client = api_client()?;
+pub(crate) async fn api_delete(
+    client: &reqwest::Client,
+    base_url: &str,
+    path: &str,
+) -> anyhow::Result<reqwest::StatusCode> {
     let url = api_url(base_url, path);
     let resp = client.delete(&url).send().await.map_err(|e| {
         if e.is_connect() {
