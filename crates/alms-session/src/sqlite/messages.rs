@@ -1,0 +1,192 @@
+//! Message persistence and loading.
+
+use super::*;
+
+impl SqliteStore {
+    // ── Messages ─────────────────────────────────────────────────────────────
+
+    /// Persist a message for a session.
+    ///
+    /// On insert, `seq` is computed as `MAX(seq) + 1` for the session via a
+    /// subquery so the allocation only happens when the row is actually new.
+    ///
+    /// On conflict (same message `id` already exists), only `content` and
+    /// `metadata` are updated -- `role`, `timestamp`, and `seq` are preserved
+    /// from the original insert.
+    pub fn save_message(&self, session_id: SessionId, msg: &Message) -> AlmsResult<()> {
+        let content_json = serde_json::to_string(&msg.content)?;
+        let metadata_json = msg
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let conn = self.conn.lock();
+        let sid = session_id.0.to_string();
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp, metadata, seq) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?2)) \
+             ON CONFLICT(id) DO UPDATE SET content=excluded.content, metadata=excluded.metadata",
+            params![
+                &msg.id,
+                &sid,
+                role_to_str(msg.role),
+                content_json,
+                msg.timestamp.0.to_rfc3339(),
+                metadata_json,
+            ],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite save_message: {e}")))?;
+        Ok(())
+    }
+
+    /// Load all messages for a session in logical order.
+    pub fn load_messages(&self, session_id: SessionId) -> AlmsResult<Vec<Message>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, role, content, timestamp, metadata \
+                 FROM messages WHERE session_id = ?1 ORDER BY seq",
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare messages: {e}")))?;
+
+        let rows = stmt
+            .query_map([session_id.0.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query messages: {e}")))?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable message row: {e}");
+                    None
+                }
+            })
+            .filter_map(|(id, role_str, content_json, ts_str, metadata_str)| {
+                let content: Content = match serde_json::from_str(&content_json) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("Skipping message {id}: bad content JSON: {e}");
+                        return None;
+                    }
+                };
+                let ts = match chrono::DateTime::parse_from_rfc3339(&ts_str) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!("Skipping message {id}: bad timestamp: {e}");
+                        return None;
+                    }
+                };
+                let metadata = metadata_str.and_then(|s| match serde_json::from_str(&s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::debug!("Message {id}: ignoring bad metadata JSON: {e}");
+                        None
+                    }
+                });
+                Some(Message {
+                    id,
+                    role: str_to_role(&role_str),
+                    content,
+                    timestamp: Timestamp(ts.with_timezone(&chrono::Utc)),
+                    metadata,
+                })
+            })
+            .collect();
+
+        Ok(rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+    use crate::types::{Content, Message, Role, Session};
+
+    fn new_session() -> Session {
+        Session::new(AgentId::new(), "test-ctx")
+    }
+
+    fn new_message(text: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: Content::Text(text.to_string()),
+            timestamp: Timestamp::now(),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_message_roundtrip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        let msg = new_message("Hello, world!");
+        store.save_message(session.id, &msg).unwrap();
+
+        let messages = store.load_messages(session.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(&messages[0].content, Content::Text(t) if t == "Hello, world!"));
+        assert!(matches!(messages[0].role, Role::User));
+    }
+
+    #[test]
+    fn test_multiple_messages_ordered() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        for i in 0..3 {
+            store
+                .save_message(session.id, &new_message(&format!("msg {i}")))
+                .unwrap();
+        }
+
+        let messages = store.load_messages(session.id).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(&messages[0].content, Content::Text(t) if t == "msg 0"));
+        assert!(matches!(&messages[2].content, Content::Text(t) if t == "msg 2"));
+    }
+
+    #[test]
+    fn test_reinsert_message_preserves_ordering() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        // Insert three messages; note the id of the first one.
+        let mut msg_a = new_message("first");
+        let msg_b = new_message("second");
+        let msg_c = new_message("third");
+        let id_a = msg_a.id.clone();
+
+        store.save_message(session.id, &msg_a).unwrap();
+        store.save_message(session.id, &msg_b).unwrap();
+        store.save_message(session.id, &msg_c).unwrap();
+
+        // Re-insert msg_a with updated content (same id).
+        msg_a.content = Content::Text("first-updated".to_string());
+        store.save_message(session.id, &msg_a).unwrap();
+
+        let messages = store.load_messages(session.id).unwrap();
+        assert_eq!(messages.len(), 3, "re-insert should not duplicate");
+
+        // msg_a must still be first (seq preserved on conflict).
+        assert_eq!(messages[0].id, id_a);
+        assert!(
+            matches!(&messages[0].content, Content::Text(t) if t == "first-updated"),
+            "content should be updated"
+        );
+        // Ordering must be: first-updated, second, third.
+        assert!(matches!(&messages[1].content, Content::Text(t) if t == "second"));
+        assert!(matches!(&messages[2].content, Content::Text(t) if t == "third"));
+    }
+}
