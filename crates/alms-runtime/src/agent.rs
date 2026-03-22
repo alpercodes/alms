@@ -121,6 +121,9 @@ pub struct AgentRuntime {
     resolved_sandbox_root: Option<std::path::PathBuf>,
     /// Whether shell commands bypass sandbox cwd restriction.
     shell_unrestricted: bool,
+    /// Default env vars injected into shell_exec processes (e.g. ALMS_DATA_DIR).
+    /// Retained so `with_workspace()` can pass them to the re-registered shell tool.
+    shell_default_env: std::collections::HashMap<String, String>,
 }
 
 impl AgentRuntime {
@@ -163,6 +166,7 @@ impl AgentRuntime {
             cancel_token: None,
             resolved_sandbox_root: sandbox_root,
             shell_unrestricted,
+            shell_default_env: std::collections::HashMap::new(),
         })
     }
 
@@ -201,13 +205,17 @@ impl AgentRuntime {
                 )));
         }
 
-        // Re-register shell_exec with workspace dir as default cwd.
+        // Re-register shell_exec with workspace dir as default cwd and
+        // gateway-provided default env vars (ALMS_DATA_DIR, etc.).
         if tool_enabled("shell_exec") {
-            let shell_tool = alms_sandbox::ShellExecTool::with_policy(
+            let mut shell_tool = alms_sandbox::ShellExecTool::with_policy(
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
             .with_default_cwd(workspace.dir());
+            if !self.shell_default_env.is_empty() {
+                shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
+            }
             self.tools.register(std::sync::Arc::new(shell_tool));
         }
 
@@ -248,6 +256,37 @@ impl AgentRuntime {
     /// Attach a cancellation token for cooperative run cancellation.
     pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
         self.cancel_token = Some(token);
+        self
+    }
+
+    /// Set default environment variables for `shell_exec` processes.
+    ///
+    /// These are injected into every process spawned by `shell_exec` after
+    /// `env_clear()`, so the spawned CLI commands can discover the gateway's
+    /// data directory (`ALMS_DATA_DIR`) and workspace directory
+    /// (`ALMS_WORKSPACE_DIR`) even when cwd is sandboxed elsewhere.
+    ///
+    /// Re-registers the `shell_exec` tool immediately so that unnamed agents
+    /// (which skip `with_workspace()`) still receive the environment variables.
+    pub fn with_shell_default_env(
+        mut self,
+        env: std::collections::HashMap<String, String>,
+    ) -> Self {
+        self.shell_default_env = env;
+
+        // Re-register shell_exec with the new default env so unnamed agents
+        // (which never call with_workspace()) still get ALMS_DATA_DIR injected.
+        let enabled = &self.config.enabled_tools;
+        let shell_enabled = enabled.is_empty() || enabled.iter().any(|t| t == "shell_exec");
+        if shell_enabled && self.tools.contains("shell_exec") {
+            let shell_tool = alms_sandbox::ShellExecTool::with_policy(
+                self.resolved_sandbox_root.clone(),
+                self.shell_unrestricted,
+            )
+            .with_default_env(self.shell_default_env.clone());
+            self.tools.register(std::sync::Arc::new(shell_tool));
+        }
+
         self
     }
 
@@ -1136,6 +1175,7 @@ mod tests {
             cancel_token: None,
             resolved_sandbox_root: None,
             shell_unrestricted: true,
+            shell_default_env: std::collections::HashMap::new(),
         };
 
         let request =
@@ -1173,6 +1213,7 @@ mod tests {
             cancel_token: None,
             resolved_sandbox_root: None,
             shell_unrestricted: true,
+            shell_default_env: std::collections::HashMap::new(),
         };
 
         let session_config = SessionConfig::default();
@@ -1288,6 +1329,7 @@ mod tests {
             cancel_token: None,
             resolved_sandbox_root: None,
             shell_unrestricted: true,
+            shell_default_env: std::collections::HashMap::new(),
         };
 
         let tool_calls = vec![

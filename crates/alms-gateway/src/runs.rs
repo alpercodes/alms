@@ -434,6 +434,19 @@ async fn execute_run(
     .with_run_id(run_id)
     .with_cancel_token(cancel_token.clone());
 
+    // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into shell_exec processes
+    // so that CLI commands invoked by agents find the correct database and
+    // workspace regardless of the sandboxed cwd.
+    {
+        let shell_env = alms_core::build_shell_default_env(
+            Some(&state.data_dir),
+            state.workspace_dir.as_deref(),
+        );
+        if !shell_env.is_empty() {
+            runtime = runtime.with_shell_default_env(shell_env);
+        }
+    }
+
     // Attach workspace if configured — registers the workspace_write tool for this run
     if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
         let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);

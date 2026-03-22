@@ -133,6 +133,9 @@ pub struct Coordinator {
     base_agent_config: AgentConfig,
     /// Workspace base directory — named subagents get workspaces under this dir
     workspace_dir: Option<std::path::PathBuf>,
+    /// Absolute path to the gateway's data directory. Propagated to subagent
+    /// shell_exec as `ALMS_DATA_DIR` so CLI commands find the right DB.
+    data_dir: Option<std::path::PathBuf>,
     /// Tracks the last-used system_prompt per named subagent context key,
     /// so we can warn when a re-invocation uses a different prompt.
     subagent_prompts: Arc<DashMap<String, String>>,
@@ -153,6 +156,7 @@ impl Coordinator {
             llm,
             base_agent_config: AgentConfig::default(),
             workspace_dir: None,
+            data_dir: None,
             subagent_prompts: Arc::new(DashMap::new()),
             completion_tx: None,
             secrets: None,
@@ -174,6 +178,7 @@ impl Coordinator {
             llm,
             base_agent_config,
             workspace_dir: None,
+            data_dir: None,
             subagent_prompts: Arc::new(DashMap::new()),
             completion_tx: None,
             secrets: None,
@@ -184,6 +189,13 @@ impl Coordinator {
     /// under `{workspace_dir}/{agent_name}/`.
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
+        self
+    }
+
+    /// Set the gateway's data directory so subagent shell_exec processes
+    /// inherit `ALMS_DATA_DIR` and can find the correct database.
+    pub fn with_data_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(dir);
         self
     }
 
@@ -284,6 +296,7 @@ impl Coordinator {
         let llm = self.llm.clone();
         let base_agent_config = self.base_agent_config.clone();
         let workspace_dir = self.workspace_dir.clone();
+        let data_dir = self.data_dir.clone();
         let subagent_prompts = self.subagent_prompts.clone();
         let completion_tx = self.completion_tx.clone();
         let secrets = self.secrets.clone();
@@ -307,6 +320,7 @@ impl Coordinator {
                     parent_event_tx,
                     base_agent_config,
                     workspace_dir,
+                    data_dir,
                     subagent_prompts,
                     completion_tx,
                     parent_cancel_token,
@@ -520,6 +534,7 @@ async fn run_subagent(
     parent_event_tx: Option<RuntimeEventSender>,
     base_agent_config: AgentConfig,
     workspace_dir: Option<std::path::PathBuf>,
+    data_dir: Option<std::path::PathBuf>,
     subagent_prompts: Arc<DashMap<String, String>>,
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
     parent_cancel_token: Option<CancellationToken>,
@@ -581,7 +596,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None)
         }
-        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref()) => {
+        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref()) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -771,6 +786,7 @@ async fn run_agent_loop(
     parent_event_tx: Option<RuntimeEventSender>,
     base_agent_config: &AgentConfig,
     workspace_dir: Option<&std::path::Path>,
+    data_dir: Option<&std::path::Path>,
     subagent_prompts: &DashMap<String, String>,
     cancel_token: CancellationToken,
     secrets: Option<&Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>>,
@@ -862,6 +878,15 @@ async fn run_agent_loop(
     let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?
         .with_event_sender(sub_tx)
         .with_cancel_token(cancel_token);
+
+    // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into subagent shell_exec
+    // processes so CLI commands find the right database.
+    {
+        let shell_env = alms_core::build_shell_default_env(data_dir, workspace_dir);
+        if !shell_env.is_empty() {
+            runtime = runtime.with_shell_default_env(shell_env);
+        }
+    }
 
     // Attach workspace for named subagents: {workspace_dir}/{name}/
     if attach_workspace && let (Some(ws_dir), Some(name)) = (workspace_dir, &request.subagent_name)

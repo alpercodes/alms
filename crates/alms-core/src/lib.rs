@@ -99,6 +99,34 @@ impl Default for Timestamp {
     }
 }
 
+/// Build the default environment variables for shell_exec subprocesses.
+///
+/// This injects `ALMS_DATA_DIR` and `ALMS_WORKSPACE_DIR` so that CLI commands
+/// invoked by agents (via `shell_exec`) find the correct database and workspace
+/// regardless of the sandbox cwd.
+///
+/// Used by the HTTP run path, the Telegram message path, and the coordinator's
+/// subagent spawn path to avoid duplicating the same env-building logic.
+pub fn build_shell_default_env(
+    data_dir: Option<&std::path::Path>,
+    workspace_dir: Option<&std::path::Path>,
+) -> std::collections::HashMap<String, String> {
+    let mut env = std::collections::HashMap::new();
+    if let Some(dd) = data_dir {
+        env.insert(
+            "ALMS_DATA_DIR".to_string(),
+            dd.to_string_lossy().into_owned(),
+        );
+    }
+    if let Some(ws) = workspace_dir {
+        env.insert(
+            "ALMS_WORKSPACE_DIR".to_string(),
+            ws.to_string_lossy().into_owned(),
+        );
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +154,29 @@ mod tests {
         let a = AgentId::deterministic(p1, "reviewer");
         let b = AgentId::deterministic(p2, "reviewer");
         assert_ne!(a, b, "different parents must produce different AgentIds");
+    }
+
+    #[test]
+    fn test_build_shell_default_env_both() {
+        let env = build_shell_default_env(
+            Some(std::path::Path::new("/data")),
+            Some(std::path::Path::new("/data/workspace")),
+        );
+        assert_eq!(env.get("ALMS_DATA_DIR").unwrap(), "/data");
+        assert_eq!(env.get("ALMS_WORKSPACE_DIR").unwrap(), "/data/workspace");
+    }
+
+    #[test]
+    fn test_build_shell_default_env_none() {
+        let env = build_shell_default_env(None, None);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn test_build_shell_default_env_data_only() {
+        let env = build_shell_default_env(Some(std::path::Path::new("/data")), None);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env.get("ALMS_DATA_DIR").unwrap(), "/data");
+        assert!(!env.contains_key("ALMS_WORKSPACE_DIR"));
     }
 }
