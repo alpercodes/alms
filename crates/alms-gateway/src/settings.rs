@@ -1,17 +1,13 @@
 //! Settings endpoint — exposes server-side LLM defaults for UI pre-population.
 
 use crate::server::AppState;
-use alms_runtime::Posture;
 use axum::{Json, extract::State, response::IntoResponse};
 
 /// GET /settings — returns current server defaults for UI pre-population.
 pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let llm = &state.llm_config;
     let agent = &state.agent_config;
-    let posture_str = match agent.posture {
-        Posture::FullControl => "full_control",
-        Posture::Guarded => "guarded",
-    };
+    let posture_str = agent.posture.to_string();
 
     // Builtin tools: report only tools that are actually registered (intersection
     // of the enabled list with known builtins). Typos in enabled are excluded.
