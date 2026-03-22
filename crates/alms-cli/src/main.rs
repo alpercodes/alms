@@ -10,7 +10,7 @@ use cmd_auth::AuthCommands;
 use cmd_job::JobCommands;
 use cmd_run::RunCommands;
 use cmd_session::SessionCommands;
-use helpers::open_db;
+use helpers::{api_client, open_db};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
@@ -169,8 +169,9 @@ async fn main() -> anyhow::Result<()> {
             alms_gateway::serve_with_config(&bind, &config).await?;
         }
         Commands::Health { url, json } => {
+            let client = api_client()?;
             let health_url = format!("{}/health", url.trim_end_matches('/'));
-            match reqwest::get(&health_url).await {
+            match client.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     let body: serde_json::Value = resp.json().await?;
                     if json {
@@ -308,24 +309,29 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Run { cmd, json, url } => match cmd {
-            RunCommands::Create {
-                session,
-                input,
-                model,
-                max_tokens,
-                posture,
-            } => {
-                cmd_run::run_create(&url, &session, &input, model, max_tokens, posture, json)
+        Commands::Run { cmd, json, url } => {
+            let client = api_client()?;
+            match cmd {
+                RunCommands::Create {
+                    session,
+                    input,
+                    model,
+                    max_tokens,
+                    posture,
+                } => {
+                    cmd_run::run_create(
+                        &client, &url, &session, &input, model, max_tokens, posture, json,
+                    )
                     .await?;
+                }
+                RunCommands::List { session, limit } => {
+                    cmd_run::run_list(&client, &url, &session, limit, json).await?;
+                }
+                RunCommands::Show { run_id } => {
+                    cmd_run::run_show(&client, &url, &run_id, json).await?;
+                }
             }
-            RunCommands::List { session, limit } => {
-                cmd_run::run_list(&url, &session, limit, json).await?;
-            }
-            RunCommands::Show { run_id } => {
-                cmd_run::run_show(&url, &run_id, json).await?;
-            }
-        },
+        }
         Commands::Job { cmd, json, url } => match cmd {
             JobCommands::List { agent } => {
                 let store = open_db()?;
@@ -340,10 +346,12 @@ async fn main() -> anyhow::Result<()> {
                 prompt,
                 schedule,
             } => {
-                cmd_job::job_create(&url, &agent, &prompt, &schedule, json).await?;
+                let client = api_client()?;
+                cmd_job::job_create(&client, &url, &agent, &prompt, &schedule, json).await?;
             }
             JobCommands::Cancel { job_id } => {
-                cmd_job::job_cancel(&url, &job_id, json).await?;
+                let client = api_client()?;
+                cmd_job::job_cancel(&client, &url, &job_id, json).await?;
             }
         },
     }

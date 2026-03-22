@@ -41,6 +41,7 @@ pub(crate) enum RunCommands {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_create(
+    client: &reqwest::Client,
     url: &str,
     session: &str,
     input: &str,
@@ -60,7 +61,7 @@ pub(crate) async fn run_create(
         max_tokens,
         posture,
     };
-    let (_status, val) = api_post(url, "runs", &req).await?;
+    let (_status, val) = api_post(client, url, "runs", &req).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&val)?);
     } else {
@@ -71,6 +72,7 @@ pub(crate) async fn run_create(
 }
 
 pub(crate) async fn run_list(
+    client: &reqwest::Client,
     url: &str,
     session: &str,
     limit: usize,
@@ -79,7 +81,7 @@ pub(crate) async fn run_list(
     let _uuid =
         uuid::Uuid::parse_str(session).map_err(|_| anyhow::anyhow!("Invalid session UUID"))?;
     let path = format!("runs?session_id={session}&limit={limit}");
-    let val = api_get(url, &path).await?;
+    let val = api_get(client, url, &path).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&val)?);
@@ -118,9 +120,14 @@ pub(crate) async fn run_list(
     Ok(())
 }
 
-pub(crate) async fn run_show(url: &str, run_id: &str, json: bool) -> anyhow::Result<()> {
+pub(crate) async fn run_show(
+    client: &reqwest::Client,
+    url: &str,
+    run_id: &str,
+    json: bool,
+) -> anyhow::Result<()> {
     let _uuid = uuid::Uuid::parse_str(run_id).map_err(|_| anyhow::anyhow!("Invalid run UUID"))?;
-    let val = api_get(url, &format!("runs/{run_id}")).await?;
+    let val = api_get(client, url, &format!("runs/{run_id}")).await?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&val)?);
