@@ -12,6 +12,32 @@ pub struct TokenUsage {
     pub completion_tokens: u32,
 }
 
+/// A record of a single tool call or tool result within a run.
+///
+/// Stored in the `run_tool_calls` table so that tool execution history is
+/// scoped to the run rather than polluting the (potentially shared) session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallRecord {
+    /// Sequence number within the run (monotonically increasing).
+    pub seq: u32,
+    /// "assistant" for tool calls, "tool" for tool results.
+    pub role: String,
+    /// Tool name (set for both calls and results).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Provider-assigned tool call ID (correlates call to result).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_id: Option<String>,
+    /// JSON-encoded tool parameters (for calls).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<String>,
+    /// JSON-encoded tool result (for results).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// When this record was created.
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Unique identifier for runs
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RunId(pub Uuid);
@@ -163,6 +189,9 @@ pub struct RunStatusResponse {
     pub ts: DateTime<Utc>,
     /// Set when this run was triggered by a scheduled job.
     pub job_id: Option<JobId>,
+    /// Number of tool call records stored for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_count: Option<u32>,
 }
 
 impl From<Run> for RunStatusResponse {
@@ -181,6 +210,7 @@ impl From<Run> for RunStatusResponse {
                 .ended_at
                 .unwrap_or_else(|| run.started_at.unwrap_or(run.created_at)),
             job_id: run.job_id,
+            tool_call_count: None,
         }
     }
 }

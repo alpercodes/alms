@@ -165,6 +165,37 @@ pub struct ListRunsQuery {
     pub limit: Option<usize>,
 }
 
+/// GET /runs/{run_id}/tool-calls — list tool call records for a run.
+pub async fn get_run_tool_calls(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Verify the run exists.
+    state
+        .run_manager
+        .get_run(run_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Run not found"))?;
+
+    let records = state
+        .session_manager
+        .store()
+        .map(|store| store.load_tool_calls(run_id))
+        .transpose()
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                format!("Failed to load tool calls: {e}"),
+            )
+        })?
+        .unwrap_or_default();
+
+    Ok(Json(serde_json::json!({
+        "run_id": run_id.0.to_string(),
+        "tool_calls": records,
+    })))
+}
+
 /// POST /runs/{run_id}/cancel — cancel a running or queued run.
 #[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
 pub async fn cancel_run(
@@ -588,6 +619,19 @@ async fn execute_run(
 
     match result {
         Ok(output) => {
+            // Persist tool call records to the run_tool_calls table.
+            if !output.tool_calls.is_empty()
+                && let Some(store) = state.session_manager.store()
+                && let Err(e) = store.save_tool_calls(run_id, &output.tool_calls)
+            {
+                warn!(
+                    "Failed to persist {} tool call records for run {}: {}",
+                    output.tool_calls.len(),
+                    run_id.0,
+                    e
+                );
+            }
+
             // token_delta events already emitted during streaming in the agent loop
             state
                 .run_manager
@@ -1113,7 +1157,14 @@ pub async fn get_run_status(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
     match state.run_manager.get_run(run_id) {
-        Some(run) => Ok(Json(RunStatusResponse::from(run))),
+        Some(run) => {
+            let mut resp = RunStatusResponse::from(run);
+            // Attach tool call count if SQLite is available.
+            if let Some(store) = state.session_manager.store() {
+                resp.tool_call_count = store.count_tool_calls(run_id).ok();
+            }
+            Ok(Json(resp))
+        }
         None => Err(api_error(
             StatusCode::NOT_FOUND,
             "NOT_FOUND",

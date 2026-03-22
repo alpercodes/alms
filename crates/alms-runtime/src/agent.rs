@@ -123,6 +123,8 @@ impl Default for AgentConfig {
 pub struct RunOutput {
     pub response: String,
     pub usage: TokenUsage,
+    /// Tool call records collected during this run (calls + results).
+    pub tool_calls: Vec<alms_core::ToolCallRecord>,
 }
 
 /// Agent runtime - executes agent loops
@@ -511,19 +513,15 @@ impl AgentRuntime {
         context_id: &str,
         history: AlmsResult<Vec<LlmMessage>>,
     ) -> AlmsResult<RunOutput> {
+        let is_dm = context_id.starts_with("dm:");
+
         let result = match history {
-            Ok(h) => self.agent_loop(session_manager, session_id, h).await,
+            Ok(h) => self.agent_loop(session_manager, session_id, h, is_dm).await,
             Err(e) => Err(e),
         };
 
-        // Detect DM sessions: the agent's response must be stored as
-        // Role::User with {from_agent, from_agent_id} metadata so that
-        // perspective mapping works for both participants. Non-DM sessions
-        // keep the existing Role::Assistant storage.
-        let is_dm = context_id.starts_with("dm:");
-
         match result {
-            Ok((response, usage)) => {
+            Ok((response, usage, tool_calls)) => {
                 // Skip persisting an assistant message when the response is
                 // empty. This happens when the agent used `ignore_message` to
                 // decline responding — there is nothing to record.
@@ -555,7 +553,11 @@ impl AgentRuntime {
                     self.agent_id.0, context_id, usage.prompt_tokens, usage.completion_tokens
                 );
 
-                Ok(RunOutput { response, usage })
+                Ok(RunOutput {
+                    response,
+                    usage,
+                    tool_calls,
+                })
             }
             Err(AlmsError::Cancelled) => {
                 // In DM sessions, attach from_agent metadata and use Role::User
@@ -841,9 +843,12 @@ impl AgentRuntime {
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
         mut messages: Vec<LlmMessage>,
-    ) -> AlmsResult<(String, TokenUsage)> {
+        is_dm: bool,
+    ) -> AlmsResult<(String, TokenUsage, Vec<alms_core::ToolCallRecord>)> {
         let mut iterations = 0;
         let mut total_usage = TokenUsage::default();
+        let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
+        let mut tool_seq: u32 = 0;
 
         loop {
             // Checkpoint A: check cancellation between iterations.
@@ -862,7 +867,11 @@ impl AgentRuntime {
                     max_iterations = %self.config.max_iterations,
                     "Max iterations reached"
                 );
-                return Ok(("[Max iterations reached]".to_string(), total_usage));
+                return Ok((
+                    "[Max iterations reached]".to_string(),
+                    total_usage,
+                    tool_call_records,
+                ));
             }
             iterations += 1;
 
@@ -927,43 +936,61 @@ impl AgentRuntime {
                     tool_call_id: None,
                 });
 
-                // Persist assistant text content (if any) before tool calls
-                if let Some(ref text) = content
-                    && !text.is_empty()
-                    && let Err(e) = session_manager.append_message(
-                        session_id,
-                        SessionMessage {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            role: SessionRole::Assistant,
-                            content: SessionContent::Text(text.clone()),
-                            timestamp: alms_core::Timestamp::now(),
-                            metadata: None,
-                        },
-                    )
-                {
-                    warn!("Failed to persist assistant text to session: {}", e);
+                // Persist assistant text content (if any) before tool calls.
+                // For DM sessions, skip session persistence — tool calls stay
+                // in-memory for the current run's multi-turn loop only.
+                if !is_dm {
+                    if let Some(ref text) = content
+                        && !text.is_empty()
+                        && let Err(e) = session_manager.append_message(
+                            session_id,
+                            SessionMessage {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                role: SessionRole::Assistant,
+                                content: SessionContent::Text(text.clone()),
+                                timestamp: alms_core::Timestamp::now(),
+                                metadata: None,
+                            },
+                        )
+                    {
+                        warn!("Failed to persist assistant text to session: {}", e);
+                    }
+
+                    // Persist tool calls to session history
+                    for tc in &tool_calls {
+                        if let Err(e) = session_manager.append_message(
+                            session_id,
+                            SessionMessage {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                role: SessionRole::Assistant,
+                                content: SessionContent::ToolCall {
+                                    name: tc.function.name.clone(),
+                                    params: serde_json::from_str(&tc.function.arguments)
+                                        .unwrap_or_else(|_| {
+                                            serde_json::Value::String(tc.function.arguments.clone())
+                                        }),
+                                },
+                                timestamp: alms_core::Timestamp::now(),
+                                metadata: Some(serde_json::json!({ "tool_call_id": tc.id })),
+                            },
+                        ) {
+                            warn!("Failed to persist tool call to session: {}", e);
+                        }
+                    }
                 }
 
-                // Persist tool calls to session history
+                // Collect tool call records for per-run storage (all sessions).
                 for tc in &tool_calls {
-                    if let Err(e) = session_manager.append_message(
-                        session_id,
-                        SessionMessage {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            role: SessionRole::Assistant,
-                            content: SessionContent::ToolCall {
-                                name: tc.function.name.clone(),
-                                params: serde_json::from_str(&tc.function.arguments)
-                                    .unwrap_or_else(|_| {
-                                        serde_json::Value::String(tc.function.arguments.clone())
-                                    }),
-                            },
-                            timestamp: alms_core::Timestamp::now(),
-                            metadata: Some(serde_json::json!({ "tool_call_id": tc.id })),
-                        },
-                    ) {
-                        warn!("Failed to persist tool call to session: {}", e);
-                    }
+                    tool_call_records.push(alms_core::ToolCallRecord {
+                        seq: tool_seq,
+                        role: "assistant".to_string(),
+                        tool_name: Some(tc.function.name.clone()),
+                        tool_id: Some(tc.id.clone()),
+                        params: Some(tc.function.arguments.clone()),
+                        result: None,
+                        timestamp: chrono::Utc::now(),
+                    });
+                    tool_seq += 1;
                 }
 
                 // Checkpoint C: tool execution with cancellation support.
@@ -1025,23 +1052,37 @@ impl AgentRuntime {
                     };
                     messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
 
-                    // Persist tool result to session history
-                    if let Err(e) = session_manager.append_message(
-                        session_id,
-                        SessionMessage {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            role: SessionRole::Tool,
-                            content: SessionContent::ToolResult {
-                                tool_id: tool_call.id.clone(),
-                                result: serde_json::from_str(&content)
-                                    .unwrap_or(serde_json::Value::String(content.clone())),
+                    // Persist tool result to session history (skip for DM sessions).
+                    if !is_dm
+                        && let Err(e) = session_manager.append_message(
+                            session_id,
+                            SessionMessage {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                role: SessionRole::Tool,
+                                content: SessionContent::ToolResult {
+                                    tool_id: tool_call.id.clone(),
+                                    result: serde_json::from_str(&content)
+                                        .unwrap_or(serde_json::Value::String(content.clone())),
+                                },
+                                timestamp: alms_core::Timestamp::now(),
+                                metadata: Some(serde_json::json!({ "ok": ok })),
                             },
-                            timestamp: alms_core::Timestamp::now(),
-                            metadata: Some(serde_json::json!({ "ok": ok })),
-                        },
-                    ) {
+                        )
+                    {
                         warn!("Failed to persist tool result to session: {}", e);
                     }
+
+                    // Collect tool result record for per-run storage (all sessions).
+                    tool_call_records.push(alms_core::ToolCallRecord {
+                        seq: tool_seq,
+                        role: "tool".to_string(),
+                        tool_name: Some(tool_call.function.name.clone()),
+                        tool_id: Some(tool_call.id.clone()),
+                        params: None,
+                        result: Some(content.clone()),
+                        timestamp: chrono::Utc::now(),
+                    });
+                    tool_seq += 1;
                 }
 
                 // Check if any tool result is an ignore_message marker.
@@ -1051,7 +1092,7 @@ impl AgentRuntime {
                     .any(|tc| tc.function.name == "ignore_message");
                 if ignored {
                     info!("Agent declined to respond via ignore_message — ending run early");
-                    return Ok((String::new(), total_usage));
+                    return Ok((String::new(), total_usage, tool_call_records));
                 }
 
                 // Append tool_loop instructions to the system prompt for
@@ -1070,7 +1111,7 @@ impl AgentRuntime {
                 continue;
             }
 
-            return Ok((content.unwrap_or_default(), total_usage));
+            return Ok((content.unwrap_or_default(), total_usage, tool_call_records));
         }
     }
 
