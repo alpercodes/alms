@@ -140,6 +140,17 @@ impl SessionManager {
         context_id: impl Into<String>,
     ) -> Session {
         // Fast path: session already exists in the reverse index.
+        //
+        // TODO(TOCTOU): There is a race between this lookup and the insert below —
+        // two concurrent callers could both miss the fast path and both create the
+        // session. In practice this is benign for three reasons:
+        //   1. DashMap::insert is idempotent — the second insert overwrites with an
+        //      identical Session (same deterministic SessionId, same sentinel AgentId).
+        //   2. The agent queue in the gateway serializes runs per-agent, so concurrent
+        //      calls for the same session are unlikely outside of DM delivery.
+        //   3. A duplicate save_session to SQLite is a harmless upsert.
+        // For strict correctness, DashMap's `entry()` API could make this atomic,
+        // but the added complexity is not warranted given the above guarantees.
         if let Some(key) = self.session_by_id.get(&session_id)
             && let Some(session) = self.sessions.get(key.value())
         {
