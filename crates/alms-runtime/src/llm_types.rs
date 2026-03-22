@@ -268,6 +268,8 @@ pub struct LlmConfig {
     pub default_model: String,
     pub timeout_secs: u64,
     pub mock: bool,
+    /// Per-chunk read timeout for SSE streaming (seconds).
+    pub stream_chunk_timeout_secs: u64,
 }
 
 impl Default for LlmConfig {
@@ -279,6 +281,7 @@ impl Default for LlmConfig {
             default_model: "moonshotai/kimi-k2.5".to_string(),
             timeout_secs: 120,
             mock: false,
+            stream_chunk_timeout_secs: 60,
         }
     }
 }
@@ -292,6 +295,7 @@ impl From<alms_core::config::LlmConfig> for LlmConfig {
             default_model: c.model,
             timeout_secs: c.timeout_secs,
             mock: c.mock,
+            stream_chunk_timeout_secs: c.stream_chunk_timeout_secs,
         }
     }
 }
@@ -318,6 +322,12 @@ impl LlmConfig {
         if let Ok(mock) = std::env::var("ALMS_LLM_MOCK") {
             let mock = mock.to_lowercase();
             config.mock = mock == "1" || mock == "true" || mock == "yes";
+        }
+
+        if let Ok(val) = std::env::var("ALMS_LLM_STREAM_CHUNK_TIMEOUT")
+            && let Ok(n) = val.parse()
+        {
+            config.stream_chunk_timeout_secs = n;
         }
 
         config

@@ -199,11 +199,11 @@ impl LlmClient {
         // with SSE event boundaries, so we accumulate lines and yield parsed
         // StreamChunks only when we see a blank-line separator.
         //
-        // Per-chunk read timeout: if no data arrives for 60 seconds, we treat the
-        // stream as stalled and terminate it. This prevents indefinite hangs when
-        // the LLM server stops sending data without closing the connection.
+        // Per-chunk read timeout: if no data arrives within the configured window
+        // we treat the stream as stalled and terminate it. This prevents indefinite
+        // hangs when the LLM server stops sending data without closing the connection.
         let byte_stream = response.bytes_stream();
-        let chunk_timeout = std::time::Duration::from_secs(60);
+        let chunk_timeout = std::time::Duration::from_secs(self.config.stream_chunk_timeout_secs);
         let provider = self.provider;
         let stream = futures::stream::unfold(
             (byte_stream, String::new()),

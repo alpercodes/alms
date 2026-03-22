@@ -147,6 +147,11 @@ impl AlmsConfig {
         if let Ok(val) = std::env::var("ALMS_LLM_MOCK") {
             self.llm.mock = matches!(val.to_lowercase().as_str(), "1" | "true" | "yes");
         }
+        if let Ok(val) = std::env::var("ALMS_LLM_STREAM_CHUNK_TIMEOUT")
+            && let Ok(n) = val.parse()
+        {
+            self.llm.stream_chunk_timeout_secs = n;
+        }
 
         // Server settings
         if let Ok(bind) = std::env::var("ALMS_BIND") {
@@ -203,6 +208,12 @@ impl AlmsConfig {
         if self.llm.timeout_secs == 0 {
             return Err(AlmsError::InvalidConfig(
                 "llm.timeout_secs must be > 0".into(),
+            ));
+        }
+
+        if self.llm.stream_chunk_timeout_secs == 0 {
+            return Err(AlmsError::InvalidConfig(
+                "llm.stream_chunk_timeout_secs must be > 0".into(),
             ));
         }
 
@@ -313,6 +324,10 @@ pub struct LlmConfig {
     pub max_retries: u32,
     pub max_tokens_per_run: u32,
     pub mock: bool,
+    /// Per-chunk read timeout for SSE streaming (seconds).
+    /// If no data arrives within this window the stream is treated as stalled.
+    /// Default: 60. Increase for slow reasoning models or high-latency connections.
+    pub stream_chunk_timeout_secs: u64,
 }
 
 impl Default for LlmConfig {
@@ -326,6 +341,7 @@ impl Default for LlmConfig {
             max_retries: 2,
             max_tokens_per_run: 0,
             mock: false,
+            stream_chunk_timeout_secs: 60,
         }
     }
 }
