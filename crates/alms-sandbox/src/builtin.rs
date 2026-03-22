@@ -105,6 +105,25 @@ fn safe_truncate(s: &str, max_bytes: usize) -> String {
     )
 }
 
+/// Returns a list of environment variable names that are critical for process
+/// spawning on the current platform.
+///
+/// These variables are safe to inherit (they don't contain secrets) and are
+/// re-injected after `env_clear()` so that child processes can run correctly.
+/// On Windows, the absence of `SystemRoot`, `PATH`, `PATHEXT`, and `COMSPEC`
+/// causes most executables to fail. On Unix, `PATH` is needed for command
+/// resolution.
+fn platform_critical_env_vars() -> &'static [&'static str] {
+    #[cfg(windows)]
+    {
+        &["SystemRoot", "PATH", "PATHEXT", "COMSPEC"]
+    }
+    #[cfg(not(windows))]
+    {
+        &["PATH"]
+    }
+}
+
 /// Echo tool - returns the input unchanged
 #[derive(Debug, Clone, Default)]
 pub struct EchoTool;
@@ -636,9 +655,21 @@ impl Tool for ShellExecTool {
         }
 
         // Clear the daemon's environment (which holds API keys, tokens, etc.)
+        // then re-inject platform-critical vars that don't contain secrets,
         // then inject gateway-provided defaults (ALMS_DATA_DIR, etc.),
         // then apply tool-call env params which override defaults on conflict.
         cmd.env_clear();
+
+        // Re-inject platform-critical env vars needed for process spawning.
+        // On Windows, clearing SystemRoot/PATH/PATHEXT/COMSPEC breaks most
+        // executables. On Unix, PATH is needed for command resolution.
+        // These are injected first so default_env / tool-call env can override.
+        for key in platform_critical_env_vars() {
+            if let Ok(val) = std::env::var(key) {
+                cmd.env(key, val);
+            }
+        }
+
         for (k, v) in &self.default_env {
             cmd.env(k, v);
         }
@@ -1175,19 +1206,48 @@ mod tests {
     #[cfg(unix)]
     async fn test_shell_exec_env_cleared() {
         // The daemon env has OPENROUTER_API_KEY etc. After env_clear(), "env" output
-        // should not contain any inherited vars — just whatever PATH-equivalent the
-        // OS injects by default.
+        // should not contain any inherited vars — only platform-critical vars
+        // (PATH) plus any default_env injections.
         let result = ShellExecTool::new()
             .execute(serde_json::json!({"argv": ["env"]}))
             .await
             .unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
         // With env_clear(), no OPENROUTER_API_KEY should leak.
         assert!(
-            !result["stdout"]
-                .as_str()
-                .unwrap()
-                .contains("OPENROUTER_API_KEY")
+            !stdout.contains("OPENROUTER_API_KEY"),
+            "API keys must not leak into spawned processes"
         );
+        // PATH should be re-injected for command resolution.
+        assert!(
+            stdout.contains("PATH="),
+            "PATH should be re-injected after env_clear(): {stdout}"
+        );
+    }
+
+    #[test]
+    fn test_platform_critical_env_vars_not_empty() {
+        let vars = platform_critical_env_vars();
+        assert!(
+            !vars.is_empty(),
+            "platform_critical_env_vars must not be empty"
+        );
+        assert!(
+            vars.contains(&"PATH"),
+            "PATH must be in platform-critical vars on all platforms"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_platform_critical_env_vars_windows() {
+        let vars = platform_critical_env_vars();
+        for expected in &["SystemRoot", "PATH", "PATHEXT", "COMSPEC"] {
+            assert!(
+                vars.contains(expected),
+                "{expected} must be in platform-critical vars on Windows"
+            );
+        }
     }
 
     #[tokio::test]
