@@ -338,18 +338,18 @@ mod tests {
         bus.cooldowns.clear();
         let err = bus
             .send(
-                if MAX_DM_DEPTH % 2 == 0 {
+                if MAX_DM_DEPTH.is_multiple_of(2) {
                     "alice"
                 } else {
                     "bob"
                 },
-                if MAX_DM_DEPTH % 2 == 0 { a } else { b },
-                if MAX_DM_DEPTH % 2 == 0 {
+                if MAX_DM_DEPTH.is_multiple_of(2) { a } else { b },
+                if MAX_DM_DEPTH.is_multiple_of(2) {
                     "bob"
                 } else {
                     "alice"
                 },
-                if MAX_DM_DEPTH % 2 == 0 { b } else { a },
+                if MAX_DM_DEPTH.is_multiple_of(2) { b } else { a },
                 "one more",
             )
             .await
@@ -433,18 +433,18 @@ mod tests {
         bus.cooldowns.clear();
         let err = bus
             .send(
-                if MAX_DM_DEPTH % 2 == 0 {
+                if MAX_DM_DEPTH.is_multiple_of(2) {
                     "alice"
                 } else {
                     "bob"
                 },
-                if MAX_DM_DEPTH % 2 == 0 { a } else { b },
-                if MAX_DM_DEPTH % 2 == 0 {
+                if MAX_DM_DEPTH.is_multiple_of(2) { a } else { b },
+                if MAX_DM_DEPTH.is_multiple_of(2) {
                     "bob"
                 } else {
                     "alice"
                 },
-                if MAX_DM_DEPTH % 2 == 0 { b } else { a },
+                if MAX_DM_DEPTH.is_multiple_of(2) { b } else { a },
                 "overflow",
             )
             .await
