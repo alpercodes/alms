@@ -712,7 +712,7 @@ Peer messages integrate with existing SSE infrastructure:
 
 ### 9.3 Context Building
 
-No changes needed. Each agent's DM session is a regular session. ContextBuilder reads from it using the standard strategies (truncate, full, sliding-summary). The only addition is metadata on messages indicating the sender (`from` field), which the system prompt instructs the agent to use.
+ContextBuilder requires one change: **perspective mapping** (Section 3.2). When building context for a shared DM or group session, the ContextBuilder accepts a `perspective_agent` parameter and maps `from_agent == self` to `"assistant"`, others to `"user"`. The standard strategies (truncate, full, sliding-summary) work unchanged on the mapped output.
 
 ### 9.4 User Observation
 
@@ -1099,7 +1099,7 @@ The transition from pure hierarchy to peer messaging is additive -- nothing is r
 
 ### 17.1 Response Notification
 
-When Agent B responds to Agent A's message, Agent A is notified using the same pattern as background subagent completions: B's response is written into A's DM session as a User message, and a `RunTrigger` is created on A's DM session. If A is a daemon or has an active listener, it processes B's response as a new run. If not, the response sits in A's DM session history and is visible on the next run.
+When Agent B responds to Agent A's message, Agent A is notified using the same pattern as background subagent completions: B's response is written to the **shared DM session** with `{from_agent: "agent-b"}`, and a `RunTrigger` is created targeting Agent A. If A is a daemon or has an active listener, it processes B's response as a new run (with perspective mapping showing B's message as `"user"`). If not, the response sits in the shared session and is visible on A's next run.
 
 This is the push model — no polling needed. The `RunTrigger` mechanism handles delivery for both the initial message and the response symmetrically.
 
