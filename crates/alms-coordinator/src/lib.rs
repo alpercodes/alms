@@ -746,11 +746,10 @@ fn agent_config_for_subagent(
         None => (None, None, None),
     };
 
-    let posture = match posture_str.as_deref() {
-        Some("guarded") => alms_runtime::Posture::Guarded,
-        Some("full_control") => alms_runtime::Posture::FullControl,
-        _ => alms_runtime::Posture::FullControl,
-    };
+    let posture = posture_str
+        .as_deref()
+        .and_then(|s| s.parse::<alms_runtime::Posture>().ok())
+        .unwrap_or(alms_runtime::Posture::FullControl);
 
     let config = AgentConfig {
         system_prompt: DEFAULT_SUBAGENT_PROMPT.to_string(),
