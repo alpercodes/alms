@@ -137,54 +137,48 @@ impl SessionManager {
     /// context_id)` in the internal map so it integrates with the existing
     /// session infrastructure.
     ///
-    /// Uses `DashMap::entry()` on the reverse index to make the check-and-insert
-    /// atomic, preventing a TOCTOU race where two threads could create duplicate
-    /// shared sessions for the same `SessionId`.
+    /// Lock ordering: `sessions` (outer) -> `session_by_id` (inner), matching
+    /// `get_or_create` to prevent AB/BA deadlocks.
     pub fn get_or_create_shared(
         &self,
         session_id: SessionId,
         context_id: impl Into<String>,
     ) -> Session {
         let context_id = context_id.into();
+        let sentinel = AgentId(uuid::Uuid::nil());
+        let key = (sentinel, context_id.clone());
 
-        // Atomic check-and-insert on the reverse index. The `entry()` call holds
-        // the shard lock, so only one thread can create a session for a given
-        // `SessionId`.
-        let key_ref = self.session_by_id.entry(session_id).or_insert_with(|| {
-            let sentinel = AgentId(uuid::Uuid::nil());
-            let key = (sentinel, context_id.clone());
-
-            let session = Session {
-                id: session_id,
-                agent_id: sentinel,
-                context_id,
-                created_at: alms_core::Timestamp::now(),
-                last_activity: alms_core::Timestamp::now(),
-                status: types::SessionStatus::Active,
-            };
-
-            self.sessions.insert(key.clone(), session.clone());
-            self.history.insert(session_id, Vec::new());
-            self.audit.insert(session_id, Vec::new());
-            self.summaries.entry(session_id).or_default();
-
-            if let Some(store) = &self.store
-                && let Err(e) = store.save_session(&session)
-            {
-                warn!("Failed to persist shared session {}: {}", session_id.0, e);
-            }
-
-            info!("Created new shared session: {:?}", session_id);
-            key
-        });
-
-        // Now look up the session in the forward map using the key from the
-        // reverse index. This always succeeds because we just inserted it above
-        // (or it was already there).
+        // Use `sessions.entry()` as the outer lock — same ordering as
+        // `get_or_create` — then insert into `session_by_id` inside the
+        // closure. This avoids the AB/BA deadlock that would occur if we
+        // locked `session_by_id` first.
         let session = self
             .sessions
-            .get(key_ref.value())
-            .expect("session must exist in forward map after reverse-index insert")
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let session = Session {
+                    id: session_id,
+                    agent_id: sentinel,
+                    context_id,
+                    created_at: alms_core::Timestamp::now(),
+                    last_activity: alms_core::Timestamp::now(),
+                    status: types::SessionStatus::Active,
+                };
+
+                self.session_by_id.insert(session_id, key);
+                self.history.insert(session_id, Vec::new());
+                self.audit.insert(session_id, Vec::new());
+                self.summaries.entry(session_id).or_default();
+
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save_session(&session)
+                {
+                    warn!("Failed to persist shared session {}: {}", session_id.0, e);
+                }
+
+                info!("Created new shared session: {:?}", session_id);
+                session
+            })
             .clone();
 
         debug!("get_or_create_shared session: {:?}", session_id);
