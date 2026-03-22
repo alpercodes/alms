@@ -283,6 +283,40 @@ impl RunManager {
         self.cancel_tokens.remove(&run_id);
     }
 
+    /// Cancel any in-progress runs spawned by a given job.
+    ///
+    /// Iterates in-memory runs, finds those with `job_id == Some(target)` that
+    /// are still `Queued` or `Running`, and triggers their cancellation tokens.
+    /// Returns the number of runs cancelled.
+    pub fn cancel_runs_for_job(&self, target: alms_core::JobId) -> usize {
+        let active_run_ids: Vec<RunId> = self
+            .runs
+            .iter()
+            .filter(|entry| {
+                let run = entry.value();
+                run.job_id == Some(target)
+                    && matches!(
+                        run.status,
+                        alms_core::RunStatus::Queued | alms_core::RunStatus::Running
+                    )
+            })
+            .map(|entry| entry.key().to_owned())
+            .collect();
+
+        let mut cancelled = 0;
+        for run_id in active_run_ids {
+            if self.cancel_run(run_id) {
+                tracing::info!(
+                    run_id = %run_id.0,
+                    job_id = %target,
+                    "Cancelled in-progress run for cancelled job"
+                );
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
     /// List runs for a session, newest first, up to `limit`.
     pub fn list_by_session(&self, session_id: SessionId, limit: usize) -> Vec<Run> {
         let mut runs: Vec<Run> = self
@@ -1286,5 +1320,80 @@ mod tests {
 
         // Sender for nonexistent run should be purged.
         assert!(!rm.event_senders.contains_key(&orphan_id));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_runs_for_job_cancels_active_run() {
+        let rm = RunManager::new();
+        let job_id = alms_core::JobId::new();
+
+        // Create a run associated with the job.
+        let mut run = Run::for_job(
+            SessionId::new(),
+            AgentId::new(),
+            "job prompt".to_string(),
+            job_id,
+        );
+        let run_id = run.run_id;
+        run.mark_running();
+        rm.insert_run(run);
+
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token.clone());
+
+        assert!(!token.is_cancelled());
+        let cancelled = rm.cancel_runs_for_job(job_id);
+        assert_eq!(cancelled, 1);
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_runs_for_job_skips_completed_run() {
+        let rm = RunManager::new();
+        let job_id = alms_core::JobId::new();
+
+        // Create a completed run for the same job — should not be cancelled.
+        let run = Run::for_job(
+            SessionId::new(),
+            AgentId::new(),
+            "done prompt".to_string(),
+            job_id,
+        );
+        let run_id = run.run_id;
+        rm.insert_run(run);
+        rm.mark_run_as_running(run_id);
+        rm.mark_run_as_completed(run_id, "output".into(), Default::default());
+
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token.clone());
+
+        let cancelled = rm.cancel_runs_for_job(job_id);
+        assert_eq!(cancelled, 0);
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_runs_for_job_ignores_other_jobs() {
+        let rm = RunManager::new();
+        let target_job = alms_core::JobId::new();
+        let other_job = alms_core::JobId::new();
+
+        // Create a running run for a *different* job.
+        let mut run = Run::for_job(
+            SessionId::new(),
+            AgentId::new(),
+            "other prompt".to_string(),
+            other_job,
+        );
+        let run_id = run.run_id;
+        run.mark_running();
+        rm.insert_run(run);
+
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token.clone());
+
+        let cancelled = rm.cancel_runs_for_job(target_job);
+        assert_eq!(cancelled, 0);
+        assert!(!token.is_cancelled());
     }
 }

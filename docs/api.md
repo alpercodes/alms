@@ -449,10 +449,29 @@ Cronjobs are “autonomy with persistence”. Even if implementation is minimal,
 }
 ```
 
-### 7.2 Run job now
+### 7.2 Cancel a job
+`DELETE /jobs/{job_id}`
+
+Cancels a scheduled job, removes it from the scheduler, and cancels any in-progress runs that were spawned by the job.
+
+**Response 204** — job cancelled successfully (no body).
+
+**Response 404** — job not found.
+
+**Response 409**
+```json
+{
+  "error": {
+    "code": "ALREADY_CANCELLED",
+    "message": "job is already cancelled"
+  }
+}
+```
+
+### 7.3 Run job now
 `POST /jobs/{job_id}:run`
 
-### 7.3 List job runs
+### 7.4 List job runs
 `GET /jobs/{job_id}/runs`
 
 ---

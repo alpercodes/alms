@@ -103,6 +103,12 @@ pub async fn cancel_job(
         Ok(Some(true)) => {
             // Also cancel in the scheduler so it doesn't fire again.
             state.scheduler.cancel(job_id).await;
+
+            // Cancel any in-progress run that was spawned by this job so
+            // we stop burning tokens on work the operator intended to halt.
+            // (cancel_runs_for_job logs each cancelled run individually)
+            state.run_manager.cancel_runs_for_job(job_id);
+
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(Some(false)) => api_error(
