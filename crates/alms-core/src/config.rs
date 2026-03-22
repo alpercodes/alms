@@ -287,6 +287,15 @@ impl ServerConfig {
     pub fn db_path(&self) -> String {
         std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| format!("{}/alms.db", self.data_dir))
     }
+
+    /// Return the resolved path to the agent workspace directory.
+    ///
+    /// Precedence: `ALMS_WORKSPACE_DIR` env var > `{data_dir}/workspace`.
+    pub fn workspace_dir(&self) -> PathBuf {
+        std::env::var("ALMS_WORKSPACE_DIR")
+            .map(Into::into)
+            .unwrap_or_else(|_| PathBuf::from(format!("{}/workspace", self.data_dir)))
+    }
 }
 
 /// LLM provider configuration.
@@ -719,5 +728,54 @@ model = "claude-sonnet"
             config.session.max_context_tokens,
             config.context.max_input_tokens,
         );
+    }
+
+    #[test]
+    fn test_workspace_dir_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("ALMS_WORKSPACE_DIR").ok();
+        remove_env_var("ALMS_WORKSPACE_DIR");
+
+        let config = ServerConfig::default();
+        assert_eq!(config.workspace_dir(), PathBuf::from("./data/workspace"));
+
+        // Restore
+        if let Some(v) = saved {
+            set_env_var("ALMS_WORKSPACE_DIR", &v);
+        }
+    }
+
+    #[test]
+    fn test_workspace_dir_env_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("ALMS_WORKSPACE_DIR").ok();
+        set_env_var("ALMS_WORKSPACE_DIR", "/custom/workspace");
+
+        let config = ServerConfig::default();
+        assert_eq!(config.workspace_dir(), PathBuf::from("/custom/workspace"));
+
+        // Restore
+        match saved {
+            Some(v) => set_env_var("ALMS_WORKSPACE_DIR", &v),
+            None => remove_env_var("ALMS_WORKSPACE_DIR"),
+        }
+    }
+
+    #[test]
+    fn test_workspace_dir_uses_data_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("ALMS_WORKSPACE_DIR").ok();
+        remove_env_var("ALMS_WORKSPACE_DIR");
+
+        let config = ServerConfig {
+            data_dir: "/my/data".into(),
+            ..Default::default()
+        };
+        assert_eq!(config.workspace_dir(), PathBuf::from("/my/data/workspace"));
+
+        // Restore
+        if let Some(v) = saved {
+            set_env_var("ALMS_WORKSPACE_DIR", &v);
+        }
     }
 }

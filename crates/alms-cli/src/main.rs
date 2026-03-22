@@ -268,9 +268,7 @@ async fn main() -> anyhow::Result<()> {
                     provider,
                     default,
                 } => {
-                    let workspace_dir: std::path::PathBuf = std::env::var("ALMS_WORKSPACE_DIR")
-                        .unwrap_or_else(|_| format!("{}/workspace", config.server.data_dir))
-                        .into();
+                    let workspace_dir = config.server.workspace_dir();
                     cmd_agent::agent_create(
                         &store,
                         name,
