@@ -42,9 +42,9 @@ pub struct ResolvedAgentConfig {
 
 /// Resolve per-agent config overrides from the agent registry.
 ///
-/// Looks up the agent record by ID, applies system_prompt/model/posture
-/// overrides on top of the base config. Returns the merged config, LLM
-/// client with model override, and agent name for workspace resolution.
+/// Looks up the agent record by ID, applies model/posture overrides on top
+/// of the base config. Returns the merged config, LLM client with model
+/// override, and agent name for workspace resolution.
 /// No per-run overrides are applied — callers layer those on top.
 pub fn resolve_agent_config(
     agent_id: alms_core::AgentId,
@@ -125,16 +125,13 @@ fn apply_overrides(
     };
 
     // ── Per-agent overrides (middle layer) ──
-    if let Some(record) = agent_record {
-        if let Some(ref sp) = record.system_prompt {
-            cfg.system_prompt = sp.clone();
-        }
-        if let Some(ref p) = record.posture {
-            match p.as_str() {
-                "guarded" => cfg.posture = alms_runtime::Posture::Guarded,
-                "full_control" => cfg.posture = alms_runtime::Posture::FullControl,
-                _ => {} // unknown posture — keep server default
-            }
+    if let Some(record) = agent_record
+        && let Some(ref p) = record.posture
+    {
+        match p.as_str() {
+            "guarded" => cfg.posture = alms_runtime::Posture::Guarded,
+            "full_control" => cfg.posture = alms_runtime::Posture::FullControl,
+            _ => {} // unknown posture — keep server default
         }
     }
 
@@ -354,8 +351,8 @@ async fn execute_run(
 
     state.run_manager.mark_run_as_running(run_id);
 
-    // Resolve per-agent config (model, system_prompt, posture) from the
-    // agent registry, then layer per-run overrides on top.
+    // Resolve per-agent config (model, posture) from the agent registry,
+    // then layer per-run overrides on top.
     let resolved = resolve_agent_config(
         agent_id,
         &state.session_manager,
@@ -1304,18 +1301,13 @@ mod tests {
         }
     }
 
-    fn test_agent(
-        model: Option<&str>,
-        system_prompt: Option<&str>,
-        posture: Option<&str>,
-    ) -> AgentRecord {
+    fn test_agent(model: Option<&str>, posture: Option<&str>) -> AgentRecord {
         let now = Utc::now();
         AgentRecord {
             id: AgentId::new(),
             name: "test-agent".into(),
             description: String::new(),
             model: model.map(String::from),
-            system_prompt: system_prompt.map(String::from),
             posture: posture.map(String::from),
             provider: None,
             is_default: false,
@@ -1336,18 +1328,19 @@ mod tests {
 
     #[test]
     fn test_per_agent_overrides() {
-        let agent = test_agent(Some("custom-model"), Some("agent prompt"), Some("guarded"));
+        let agent = test_agent(Some("custom-model"), Some("guarded"));
         let merged = apply_overrides(base_config(), Some(&agent), &RunOverrides::default());
-        assert_eq!(merged.agent_config.system_prompt, "agent prompt");
         assert!(matches!(merged.agent_config.posture, Posture::Guarded));
         assert_eq!(merged.model_override.as_deref(), Some("custom-model"));
         // max_tokens not overridden by agent
         assert_eq!(merged.agent_config.max_tokens, 4096);
+        // system_prompt is never overridden by agent — always server default
+        assert_eq!(merged.agent_config.system_prompt, "server default prompt");
     }
 
     #[test]
     fn test_per_run_overrides_beat_per_agent() {
-        let agent = test_agent(Some("agent-model"), Some("agent prompt"), Some("guarded"));
+        let agent = test_agent(Some("agent-model"), Some("guarded"));
         let overrides = RunOverrides {
             model: Some("run-model".into()),
             max_tokens: Some(8192),
@@ -1360,8 +1353,8 @@ mod tests {
         assert!(matches!(merged.agent_config.posture, Posture::FullControl));
         // Per-run max_tokens applied
         assert_eq!(merged.agent_config.max_tokens, 8192);
-        // system_prompt still comes from agent (no per-run system_prompt override)
-        assert_eq!(merged.agent_config.system_prompt, "agent prompt");
+        // system_prompt always stays as server default
+        assert_eq!(merged.agent_config.system_prompt, "server default prompt");
     }
 
     #[test]
@@ -1391,7 +1384,7 @@ mod tests {
 
     #[test]
     fn test_unknown_posture_ignored() {
-        let agent = test_agent(None, None, Some("yolo"));
+        let agent = test_agent(None, Some("yolo"));
         let merged = apply_overrides(base_config(), Some(&agent), &RunOverrides::default());
         // Unknown posture keeps server default
         assert!(matches!(merged.agent_config.posture, Posture::FullControl));

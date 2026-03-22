@@ -195,7 +195,7 @@ Token cost is a first-class constraint:
 - Cron/scheduler, SQLite persistence, web UI with agent selector
 - Coordinator with real AgentRuntime loops, foreground + background subagents
 - `invoke_agent` tool with `name` param for persistent subagent sessions (UUID v5 deterministic identity)
-- Named subagent workspaces with registry-based config (system_prompt, model, posture)
+- Named subagent workspaces with registry-based config (model, posture)
 - `alms agent create` initializes workspace directory with empty identity files
 - Default system prompt includes CLI awareness (`alms --help` via shell_exec)
 - Subagent SSE events forwarded into parent run stream
