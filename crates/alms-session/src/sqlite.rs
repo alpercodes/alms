@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS messages (
     seq        INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
+
 CREATE TABLE IF NOT EXISTS audit_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -124,6 +126,10 @@ impl SqliteStore {
         let _ = conn.execute_batch(
             "ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;\
              UPDATE messages SET seq = rowid WHERE seq = 0;",
+        );
+        // Auto-migrate: add (session_id, seq) index for message ordering queries.
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);",
         );
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -316,12 +322,14 @@ impl SqliteStore {
 
     // ── Messages ─────────────────────────────────────────────────────────────
 
-    /// Upsert a single message row.
+    /// Persist a message for a session.
     ///
-    /// Each message gets a monotonically increasing `seq` number within its
-    /// session, assigned once at first insert. On conflict (same message id)
-    /// only `content` and `metadata` are updated — `seq` is preserved so
-    /// ordering stays stable even after re-insertion.
+    /// On insert, `seq` is computed as `MAX(seq) + 1` for the session via a
+    /// subquery so the allocation only happens when the row is actually new.
+    ///
+    /// On conflict (same message `id` already exists), only `content` and
+    /// `metadata` are updated — `role`, `timestamp`, and `seq` are preserved
+    /// from the original insert.
     pub fn save_message(&self, session_id: SessionId, msg: &Message) -> AlmsResult<()> {
         let content_json = serde_json::to_string(&msg.content)?;
         let metadata_json = msg
@@ -331,16 +339,10 @@ impl SqliteStore {
             .transpose()?;
         let conn = self.conn.lock();
         let sid = session_id.0.to_string();
-        let next_seq: i64 = conn
-            .query_row(
-                "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?1",
-                params![&sid],
-                |row| row.get(0),
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite next_seq: {e}")))?;
         conn.execute(
             "INSERT INTO messages (id, session_id, role, content, timestamp, metadata, seq) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?2)) \
              ON CONFLICT(id) DO UPDATE SET content=excluded.content, metadata=excluded.metadata",
             params![
                 &msg.id,
@@ -349,7 +351,6 @@ impl SqliteStore {
                 content_json,
                 msg.timestamp.0.to_rfc3339(),
                 metadata_json,
-                next_seq,
             ],
         )
         .map_err(|e| AlmsError::Runtime(format!("SQLite save_message: {e}")))?;
