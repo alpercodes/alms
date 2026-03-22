@@ -200,6 +200,7 @@ export function SettingsModal({ open, onClose }) {
                         <div>Model: <span class="settings-info-value">${defaults.model || 'unknown'}</span></div>
                         <div>Base URL: <span class="settings-info-value">${defaults.base_url || 'unknown'}</span></div>
                         <div>Context: <span class="settings-info-value">${defaults.context_strategy || 'truncate'}</span></div>
+                        <div>Stream timeout: <span class="settings-info-value">${defaults.stream_chunk_timeout_secs || 60}s</span></div>
                         <div>Tools: <span class="settings-info-value">${(defaults.enabled_tools || []).length} enabled</span></div>
                     </div>
                 </div>

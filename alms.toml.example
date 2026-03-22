@@ -23,6 +23,10 @@ max_retries = 2
 max_tokens_per_run = 0
 # set to true for testing without an API key
 mock = false
+# per-chunk SSE read timeout (seconds). If no data arrives within this
+# window, the stream is treated as stalled and terminated. Increase for
+# slow reasoning models or high-latency connections.
+stream_chunk_timeout_secs = 60
 
 # Set API key via environment variable:
 #   export OPENROUTER_API_KEY=sk-...
