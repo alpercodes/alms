@@ -95,18 +95,30 @@ pub(crate) fn agent_list(store: &SqliteStore, json: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn agent_create(
-    store: &SqliteStore,
-    name: String,
-    description: Option<String>,
-    model: Option<String>,
-    posture: Option<String>,
-    provider: Option<String>,
-    default: bool,
-    json: bool,
-    workspace_dir: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+/// Options for creating a new agent via the CLI.
+pub(crate) struct AgentCreateOpts<'a> {
+    pub name: String,
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub posture: Option<String>,
+    pub provider: Option<String>,
+    pub default: bool,
+    pub json: bool,
+    pub workspace_dir: Option<&'a std::path::Path>,
+}
+
+pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> anyhow::Result<()> {
+    let AgentCreateOpts {
+        name,
+        description,
+        model,
+        posture,
+        provider,
+        default,
+        json,
+        workspace_dir,
+    } = opts;
+
     validate_agent_name(&name)?;
 
     let now = chrono::Utc::now();
@@ -241,15 +253,26 @@ pub(crate) fn agent_set_default(
     Ok(())
 }
 
-pub(crate) fn agent_config(
-    store: &SqliteStore,
-    name_or_id: &str,
-    model: Option<String>,
-    posture: Option<String>,
-    provider: Option<String>,
-    description: Option<String>,
-    json: bool,
-) -> anyhow::Result<()> {
+/// Options for updating an agent's configuration via the CLI.
+pub(crate) struct AgentConfigOpts<'a> {
+    pub name_or_id: &'a str,
+    pub model: Option<String>,
+    pub posture: Option<String>,
+    pub provider: Option<String>,
+    pub description: Option<String>,
+    pub json: bool,
+}
+
+pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> anyhow::Result<()> {
+    let AgentConfigOpts {
+        name_or_id,
+        model,
+        posture,
+        provider,
+        description,
+        json,
+    } = opts;
+
     let mut agent = resolve_agent(store, name_or_id)?;
 
     if let Some(d) = description {
@@ -289,14 +312,16 @@ mod tests {
         // Create
         agent_create(
             &store,
-            "test-agent".into(),
-            Some("desc".into()),
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
+            AgentCreateOpts {
+                name: "test-agent".into(),
+                description: Some("desc".into()),
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
         )
         .unwrap();
 
@@ -320,26 +345,30 @@ mod tests {
         let store = new_store();
         agent_create(
             &store,
-            "dup".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
+            AgentCreateOpts {
+                name: "dup".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
         )
         .unwrap();
         let err = agent_create(
             &store,
-            "dup".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
+            AgentCreateOpts {
+                name: "dup".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
         )
         .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -350,14 +379,16 @@ mod tests {
         let store = new_store();
         let err = agent_create(
             &store,
-            "Bad Name".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
+            AgentCreateOpts {
+                name: "Bad Name".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
         )
         .unwrap_err();
         assert!(err.to_string().contains("lowercase"));
@@ -371,14 +402,16 @@ mod tests {
 
         agent_create(
             &store,
-            "reviewer".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            Some(&ws_dir),
+            AgentCreateOpts {
+                name: "reviewer".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: Some(&ws_dir),
+            },
         )
         .unwrap();
 
@@ -440,12 +473,14 @@ mod tests {
 
         agent_config(
             &store,
-            "configurable",
-            Some("new-model".into()),
-            Some("guarded".into()),
-            None,
-            Some("updated desc".into()),
-            false,
+            AgentConfigOpts {
+                name_or_id: "configurable",
+                model: Some("new-model".into()),
+                posture: Some("guarded".into()),
+                provider: None,
+                description: Some("updated desc".into()),
+                json: false,
+            },
         )
         .unwrap();
 
@@ -475,12 +510,14 @@ mod tests {
         // Clear model by passing empty string
         agent_config(
             &store,
-            "clearable",
-            Some(String::new()),
-            None,
-            None,
-            None,
-            false,
+            AgentConfigOpts {
+                name_or_id: "clearable",
+                model: Some(String::new()),
+                posture: None,
+                provider: None,
+                description: None,
+                json: false,
+            },
         )
         .unwrap();
         let updated = resolve_agent(&store, "clearable").unwrap();
