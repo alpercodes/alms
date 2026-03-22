@@ -442,7 +442,10 @@ impl Default for ToolsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChannelsConfig {
-    /// Telegram bot token — loaded from env only
+    /// Telegram bot token — loaded from env only.
+    // TODO: wrap in a `Secret<String>` newtype that redacts Display/Debug output,
+    // similar to `alms_channel::telegram::Secret`. Currently raw `String` here,
+    // in `GatewayConfig`, and throughout the config layer — see PR #259 discussion.
     #[serde(skip)]
     pub telegram_token: Option<String>,
     pub telegram_poll_interval_secs: u64,
