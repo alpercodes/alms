@@ -253,7 +253,7 @@ Group messages support @-mention routing (per `communication-architecture.md` Se
 - `@everyone` — all group members invoked
 - No tag — message is logged to all sessions but no agent is invoked
 
-The MessageBus parses mentions from the message text and only creates `RunTrigger` events for mentioned agents. Non-mentioned agents still receive the message in their group session (for context continuity) but their SessionQueue is not triggered.
+The MessageBus parses mentions from the message text and only creates `RunTrigger` events for mentioned agents. Non-mentioned agents still receive the message in their group session (for context continuity) but their AgentQueue is not triggered.
 
 Agents are informed about the mention system via their system prompt.
 
