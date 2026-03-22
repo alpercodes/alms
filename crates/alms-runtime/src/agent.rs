@@ -438,6 +438,28 @@ impl AgentRuntime {
             .await
     }
 
+    /// Extract the peer agent name from a DM context_id.
+    ///
+    /// The context_id has the form `"dm:{name1}:{name2}"` where names are
+    /// sorted alphabetically.  The peer is whichever name is NOT this agent's
+    /// own `agent_name`.  Returns `None` if the context_id is malformed or
+    /// `agent_name` is not set.
+    fn dm_peer_name(&self, context_id: &str) -> Option<String> {
+        let name = self.agent_name.as_deref()?;
+        let parts: Vec<&str> = context_id.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        // parts[0] == "dm", parts[1] and parts[2] are the two agent names.
+        if parts[1] == name {
+            Some(parts[2].to_string())
+        } else if parts[2] == name {
+            Some(parts[1].to_string())
+        } else {
+            None
+        }
+    }
+
     /// Build `from_agent` metadata for DM sessions so that `read_messages`
     /// can attribute system markers (errors, cancellations) to the correct
     /// agent.  Returns `None` for non-DM sessions or when `agent_name` is
@@ -482,36 +504,27 @@ impl AgentRuntime {
                 // Skip persisting an assistant message when the response is
                 // empty. This happens when the agent used `ignore_message` to
                 // decline responding — there is nothing to record.
-                if !response.is_empty() {
-                    let (role, metadata) = if is_dm {
-                        if let Some(ref name) = self.agent_name {
-                            (
-                                SessionRole::User,
-                                Some(serde_json::json!({
-                                    "from_agent": name,
-                                    "from_agent_id": self.agent_id.0.to_string(),
-                                    "message_type": "dm",
-                                })),
-                            )
-                        } else {
-                            warn!(
-                                context_id = %context_id,
-                                "DM session but agent_name not set — storing reply as Role::Assistant"
-                            );
-                            (SessionRole::Assistant, None)
-                        }
-                    } else {
-                        (SessionRole::Assistant, None)
-                    };
-
+                //
+                // For DM sessions: do NOT persist the agent's final text
+                // response. The only messages in the shared DM session should
+                // be those written via `send_message` (through MessageBus) and
+                // error/cancellation markers. The agent's text response is
+                // internal processing noise — the agent was told to use
+                // `send_message` to reply.
+                if !response.is_empty() && !is_dm {
                     let reply_msg = SessionMessage {
                         id: uuid::Uuid::new_v4().to_string(),
-                        role,
+                        role: SessionRole::Assistant,
                         content: alms_session::Content::Text(response.clone()),
                         timestamp: alms_core::Timestamp::now(),
-                        metadata,
+                        metadata: None,
                     };
                     session_manager.append_message(session_id, reply_msg)?;
+                } else if !response.is_empty() && is_dm {
+                    debug!(
+                        context_id = %context_id,
+                        "DM session — skipping text response storage (agent should use send_message)"
+                    );
                 }
 
                 info!(
@@ -603,7 +616,26 @@ impl AgentRuntime {
         context_id: &str,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
-        let system_prompt = self.assemble_system_prompt(&self.config.system_prompt);
+        let mut system_prompt = self.assemble_system_prompt(&self.config.system_prompt);
+
+        // For DM sessions, append instructions telling the agent how to reply.
+        // The agent's text response will NOT be stored in the shared session,
+        // so it must use `send_message` to communicate with the peer.
+        if context_id.starts_with("dm:")
+            && let Some(peer) = self.dm_peer_name(context_id)
+        {
+            let dm_addendum = format!(
+                "\n\n---\nYou received a direct message from agent \"{peer}\". \
+                 To reply, use the send_message tool. Your text response will not be delivered to the other agent. \
+                 To decline responding, use the ignore_message tool."
+            );
+            system_prompt.push_str(&dm_addendum);
+            debug!(
+                peer = %peer,
+                context_id = %context_id,
+                "Injected DM recipient system prompt"
+            );
+        }
 
         let history = match session_manager.get_history(*session_id) {
             Ok(h) => h,
@@ -1779,10 +1811,10 @@ mod tests {
     }
 
     /// Integration test for `run_on_session`: verifies that the agent uses
-    /// the shared DM session directly (no session split) and does not
-    /// duplicate the input message (which was already persisted by MessageBus).
+    /// the shared DM session directly and does NOT persist its text response
+    /// (only `send_message`-written messages belong in the shared DM session).
     #[tokio::test]
-    async fn test_run_on_session_uses_shared_session_no_duplicate() {
+    async fn test_run_on_session_skips_text_response_for_dm() {
         let config = LlmConfig {
             mock: true,
             ..LlmConfig::default()
@@ -1834,55 +1866,64 @@ mod tests {
             .run_on_session(&session_manager, session_id, dm_context, "Hello Bob!")
             .await;
         assert!(result.is_ok(), "run_on_session should succeed");
+        let output = result.unwrap();
+        assert!(
+            !output.response.is_empty(),
+            "Mock LLM should produce a non-empty response"
+        );
 
-        // After run: the session should have 2 messages, both stored as
-        // Role::User with from_agent metadata. In a DM session, all messages
-        // (including the agent's reply) use Role::User — perspective mapping
-        // in ContextBuilder assigns Role::Assistant at read time.
+        // After run: the session should still have only 1 message.
+        // The agent's text response is NOT persisted to the DM session —
+        // only send_message-written messages belong there.
         let history_after = session_manager.get_history(session_id).unwrap();
         assert_eq!(
             history_after.len(),
-            2,
-            "Should have exactly 2 messages (alice's input + bob's reply). Found: {}",
+            1,
+            "DM text response should NOT be stored. Expected 1 (alice's input only). Found: {}",
             history_after.len()
         );
 
-        // All messages should be Role::User (shared DM session invariant).
-        let user_messages: Vec<_> = history_after
-            .iter()
-            .filter(|m| m.role == alms_session::Role::User)
-            .collect();
-        assert_eq!(
-            user_messages.len(),
-            2,
-            "All messages in a DM session should be Role::User. Found: {}",
-            user_messages.len()
-        );
-
-        // Alice's input message should still have its metadata intact.
-        let alice_meta = user_messages[0].metadata.as_ref().unwrap();
+        // The one message is alice's original input.
+        assert_eq!(history_after[0].role, alms_session::Role::User);
+        let alice_meta = history_after[0].metadata.as_ref().unwrap();
         assert_eq!(alice_meta["from_agent"], "alice");
+    }
 
-        // Bob's reply should have from_agent = "bob" with agent_id.
-        let bob_meta = user_messages[1]
-            .metadata
-            .as_ref()
-            .expect("Bob's reply must have from_agent metadata");
-        assert_eq!(bob_meta["from_agent"], "bob");
-        assert_eq!(bob_meta["from_agent_id"], bob_id.0.to_string());
-        assert_eq!(bob_meta["message_type"], "dm");
+    /// Verify that non-DM runs still persist the agent's text response normally.
+    #[tokio::test]
+    async fn test_non_dm_run_persists_text_response() {
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let llm = LlmClient::new(config).unwrap();
+        let agent_id = AgentId::new();
 
-        // There should be NO Role::Assistant messages in a DM session.
-        let assistant_messages: Vec<_> = history_after
-            .iter()
-            .filter(|m| m.role == alms_session::Role::Assistant)
-            .collect();
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(agent_id, agent_config, llm).unwrap();
+
+        // Run on a normal (non-DM) context.
+        let result = runtime
+            .run(&session_manager, "normal-context", "Hello agent")
+            .await;
+        assert!(result.is_ok(), "Normal run should succeed");
+
+        // The session should have 2 messages: user input + assistant response.
+        let session = session_manager.get_or_create(agent_id, "normal-context");
+        let history = session_manager.get_history(session.id).unwrap();
         assert_eq!(
-            assistant_messages.len(),
-            0,
-            "DM sessions should not have Role::Assistant messages (perspective mapping handles roles). Found: {}",
-            assistant_messages.len()
+            history.len(),
+            2,
+            "Non-DM run should persist both user input and assistant response. Found: {}",
+            history.len()
         );
+        assert_eq!(history[0].role, alms_session::Role::User);
+        assert_eq!(history[1].role, alms_session::Role::Assistant);
     }
 
     /// Verify that `dm_marker_metadata` returns `from_agent` metadata for DM
@@ -1953,5 +1994,150 @@ mod tests {
             .await;
 
         assert!(result.is_err(), "Should fail if session does not exist");
+    }
+
+    /// Verify `dm_peer_name` extracts the correct peer from a DM context_id.
+    #[test]
+    fn test_dm_peer_name() {
+        let config = crate::llm_types::LlmConfig {
+            mock: true,
+            ..crate::llm_types::LlmConfig::default()
+        };
+        let llm = LlmClient::new(config).unwrap();
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+
+        // Agent named "bob" in "dm:alice:bob" → peer is "alice".
+        let rt = AgentRuntime::new(AgentId::new(), agent_config.clone(), llm.clone())
+            .unwrap()
+            .with_agent_name("bob".to_string());
+        assert_eq!(rt.dm_peer_name("dm:alice:bob"), Some("alice".to_string()));
+
+        // Agent named "alice" in "dm:alice:bob" → peer is "bob".
+        let rt2 = AgentRuntime::new(AgentId::new(), agent_config.clone(), llm.clone())
+            .unwrap()
+            .with_agent_name("alice".to_string());
+        assert_eq!(rt2.dm_peer_name("dm:alice:bob"), Some("bob".to_string()));
+
+        // Non-DM context_id → None (not a valid DM context).
+        assert_eq!(rt.dm_peer_name("some-context"), None);
+
+        // Malformed context_id → None.
+        assert_eq!(rt.dm_peer_name("dm:only-one"), None);
+
+        // Agent name not in context_id → None.
+        let rt3 = AgentRuntime::new(AgentId::new(), agent_config.clone(), llm.clone())
+            .unwrap()
+            .with_agent_name("charlie".to_string());
+        assert_eq!(rt3.dm_peer_name("dm:alice:bob"), None);
+
+        // No agent_name set → None.
+        let rt4 = AgentRuntime::new(AgentId::new(), agent_config, llm).unwrap();
+        assert_eq!(rt4.dm_peer_name("dm:alice:bob"), None);
+    }
+
+    /// Verify that the DM system prompt addendum is injected into the context
+    /// when running on a DM session, telling the agent to use `send_message`.
+    #[tokio::test]
+    async fn test_dm_system_prompt_injection() {
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let llm = LlmClient::new(config).unwrap();
+        let bob_id = AgentId::new();
+
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(bob_id, agent_config, llm)
+            .unwrap()
+            .with_agent_name("bob".to_string());
+
+        // Create a shared DM session with one message from alice.
+        let dm_context = "dm:alice:bob";
+        let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+        let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+        let sender_msg = alms_session::Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: alms_session::Role::User,
+            content: alms_session::Content::Text("Hello Bob!".to_string()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "from_agent": "alice",
+                "from_agent_id": AgentId::new().0.to_string(),
+                "message_type": "dm",
+            })),
+        };
+        session_manager
+            .append_message(session_id, sender_msg)
+            .unwrap();
+
+        // Build context for the DM session.
+        let context = runtime
+            .build_context(&session_manager, &session_id, dm_context, "")
+            .await
+            .unwrap();
+
+        // The system message should contain DM-specific instructions.
+        let system_msg = &context[0];
+        assert_eq!(system_msg.role, "system");
+        let system_text = system_msg.content.as_deref().unwrap_or("");
+        assert!(
+            system_text.contains("direct message from agent \"alice\""),
+            "System prompt should mention the peer agent. Got: {}",
+            &system_text[system_text.len().saturating_sub(300)..]
+        );
+        assert!(
+            system_text.contains("send_message"),
+            "System prompt should instruct to use send_message"
+        );
+        assert!(
+            system_text.contains("ignore_message"),
+            "System prompt should mention ignore_message"
+        );
+    }
+
+    /// Verify that non-DM sessions do NOT get the DM system prompt addendum.
+    #[tokio::test]
+    async fn test_non_dm_no_system_prompt_injection() {
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let llm = LlmClient::new(config).unwrap();
+        let agent_id = AgentId::new();
+
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(agent_id, agent_config, llm)
+            .unwrap()
+            .with_agent_name("bob".to_string());
+
+        // Create a normal session.
+        let session = session_manager.get_or_create(agent_id, "normal-context");
+
+        // Build context for a non-DM session.
+        let context = runtime
+            .build_context(&session_manager, &session.id, "normal-context", "Hi")
+            .await
+            .unwrap();
+
+        let system_msg = &context[0];
+        let system_text = system_msg.content.as_deref().unwrap_or("");
+        assert!(
+            !system_text.contains("direct message from agent"),
+            "Non-DM session should NOT have DM prompt addendum"
+        );
     }
 }
