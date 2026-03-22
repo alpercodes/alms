@@ -75,12 +75,43 @@ impl SessionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Derive a deterministic SessionId for a DM conversation between two agents.
+    ///
+    /// Names are sorted alphabetically so both sides resolve to the same
+    /// SessionId regardless of who initiated the conversation (UUID v5).
+    pub fn deterministic_dm(a: &str, b: &str) -> Self {
+        let (first, second) = if a < b { (a, b) } else { (b, a) };
+        let input = format!("dm:{}:{}", first, second);
+        Self(Uuid::new_v5(&ALMS_NAMESPACE, input.as_bytes()))
+    }
 }
 
 impl Default for SessionId {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Derive the DM context_id for a pair of agents.
+///
+/// Names are sorted alphabetically so both sides resolve to the same
+/// context_id regardless of who initiated the conversation.
+///
+/// ```
+/// # use alms_core::dm_context_id;
+/// assert_eq!(dm_context_id("alice", "bob"), "dm:alice:bob");
+/// assert_eq!(dm_context_id("bob", "alice"), "dm:alice:bob");
+/// ```
+pub fn dm_context_id(a: &str, b: &str) -> String {
+    let (first, second) = if a < b { (a, b) } else { (b, a) };
+    format!("dm:{first}:{second}")
 }
 
 /// Timestamp wrapper for consistent handling
@@ -154,6 +185,41 @@ mod tests {
         let a = AgentId::deterministic(p1, "reviewer");
         let b = AgentId::deterministic(p2, "reviewer");
         assert_ne!(a, b, "different parents must produce different AgentIds");
+    }
+
+    #[test]
+    fn test_dm_context_id_sorted() {
+        assert_eq!(dm_context_id("alice", "bob"), "dm:alice:bob");
+        assert_eq!(dm_context_id("bob", "alice"), "dm:alice:bob");
+        assert_eq!(dm_context_id("zeta", "alpha"), "dm:alpha:zeta");
+    }
+
+    #[test]
+    fn test_dm_context_id_symmetric() {
+        let a = "developer";
+        let b = "reviewer";
+        assert_eq!(dm_context_id(a, b), dm_context_id(b, a));
+    }
+
+    #[test]
+    fn test_session_id_deterministic_dm_stable() {
+        let a = SessionId::deterministic_dm("alice", "bob");
+        let b = SessionId::deterministic_dm("alice", "bob");
+        assert_eq!(a, b, "same inputs must produce same SessionId");
+    }
+
+    #[test]
+    fn test_session_id_deterministic_dm_symmetric() {
+        let a = SessionId::deterministic_dm("alice", "bob");
+        let b = SessionId::deterministic_dm("bob", "alice");
+        assert_eq!(a, b, "reversed names must produce same SessionId");
+    }
+
+    #[test]
+    fn test_session_id_deterministic_dm_differs_by_pair() {
+        let ab = SessionId::deterministic_dm("alice", "bob");
+        let ac = SessionId::deterministic_dm("alice", "charlie");
+        assert_ne!(ab, ac, "different pairs must produce different SessionIds");
     }
 
     #[test]

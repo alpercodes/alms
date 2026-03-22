@@ -4,15 +4,15 @@
 
 **ALMS** = **Agent Loop Management System**
 
-A Rust-based agent platform where any agent can spawn subagents to delegate work, forming a pure tree hierarchy. Results flow up from children to parents — there is no peer-to-peer messaging between agents. Subagents can be ephemeral (one-shot) or persistent (named, with session history preserved across invocations).
+A Rust-based agent platform with two communication layers: (1) vertical delegation via `invoke_agent`, where any agent can spawn subagents to delegate work, forming a tree hierarchy with results flowing up from children to parents; and (2) peer-to-peer direct messaging via `send_message`, where any agent can send messages to any other agent by name through a shared MessageBus. Subagents can be ephemeral (one-shot) or persistent (named, with session history preserved across invocations).
 
 ---
 
 ## Core Design Principles
 
-1. **Pure Hierarchy** — Any agent can be an orchestrator; subagents return results to their parent
+1. **Hierarchy + Peer Messaging** — Any agent can be an orchestrator via `invoke_agent` (vertical delegation); agents can also communicate directly via `send_message` (peer-to-peer DM through a shared MessageBus)
 2. **Workers** — Subagents do work and return a result. They can be ephemeral (one-shot, fresh session) or persistent (named, with conversation history preserved across invocations via deterministic session IDs)
-3. **No Peer Messaging** — Agents do not talk to each other directly; all communication goes through the parent-child relationship
+3. **Two Communication Layers** — Layer 1: parent-child delegation via `invoke_agent` (blocking/background). Layer 2: peer-to-peer direct messaging via `send_message` (asynchronous, delivered into recipient's next context window via DM sessions with perspective mapping)
 4. **Explicit over Implicit** — Clear task boundaries, observable handoffs via SSE
 5. **Security First** — Capability-based permissions, strict sandboxing
 
@@ -48,9 +48,9 @@ Any agent running inside ALMS can call the `invoke_agent` tool to spawn a subage
 - Each subagent has its own tool registry, context window, and system prompt
 - Subagent runs a full `agent_loop` (multi-iteration tool use, up to `max_iterations`)
 
-### Option 2 — Peer Mesh (future direction, not yet designed)
+### Layer 2 — Peer-to-Peer Direct Messaging (Phase 1 implemented)
 
-Agents form a mesh where any agent can send messages to any other agent directly, enabling bidirectional collaboration without requiring a parent-child relationship. This supports scenarios like two long-running agents coordinating on a shared task. Not planned for current implementation — noted here for future consideration.
+Agents can send messages to any other agent by name via the `send_message` tool. Messages are delivered through a shared `MessageBus` in the Coordinator and stored in DM sessions (deterministic UUID v5 identity based on the sorted agent-name pair). The recipient's `ContextBuilder` uses perspective mapping (`build_with_perspective`) to correctly attribute messages as "self" vs "other" based on the `from_agent` metadata. This enables bidirectional collaboration without requiring a parent-child relationship.
 
 ---
 
@@ -104,7 +104,7 @@ LLM call → ... → emit result → stop
 
 Isolated tool execution used by every agent regardless of hierarchy level.
 
-**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list`, `workspace_write`, `invoke_agent`, `get_task_result`, `read_subagent_session`
+**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list`, `workspace_write`, `invoke_agent`, `get_task_result`, `read_subagent_session`, `send_message`
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 
@@ -170,7 +170,7 @@ User-facing interfaces (Telegram, web UI) connect only to top-level runs. Subage
 [User] ◄────────────┘
 ```
 
-The top-level agent decides *when* and *what* to delegate. Subagents do not communicate with each other — the parent sequences or parallelizes them as it sees fit.
+The top-level agent decides *when* and *what* to delegate. Subagents can also communicate with each other directly via `send_message` for peer coordination, in addition to the parent sequencing or parallelizing them.
 
 ---
 
@@ -191,7 +191,7 @@ Token cost is a first-class constraint:
 ### Completed ✅
 - Core types, session manager, agent runtime, WASM sandbox
 - HTTP gateway with SSE streaming, approval workflow, audit log
-- Built-in tools: echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, get_task_result, read_subagent_session
+- Built-in tools: echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, get_task_result, read_subagent_session, send_message
 - Cron/scheduler, SQLite persistence, web UI with agent selector
 - Coordinator with real AgentRuntime loops, foreground + background subagents
 - `invoke_agent` tool with `name` param for persistent subagent sessions (UUID v5 deterministic identity)
@@ -202,6 +202,7 @@ Token cost is a first-class constraint:
 - `GET /tasks`, `GET /tasks/{id}` HTTP endpoints
 - Agent registry with named persistent agents, per-agent config overrides
 - Token-by-token SSE streaming, sliding-summary context compression
+- Peer-to-peer direct messaging via `send_message` tool + MessageBus + DM sessions with perspective mapping (Layer 2 Phase 1)
 
 ### Pending 🎯
 - Autonomous subagent loops — see `docs/autonomous-subagents-design.md`
@@ -236,6 +237,5 @@ alms-cli → alms-gateway → alms-runtime  → alms-core
 
 ---
 
-*Architecture Date: 2026-03-16*
-*Topology: Pure hierarchy — any agent can spawn subagents, no peer-to-peer*
-*Future: Option 2 (peer mesh) under consideration for long-running agent collaboration*
+*Architecture Date: 2026-03-22*
+*Topology: Hierarchy (invoke_agent) + Peer DM (send_message via MessageBus)*

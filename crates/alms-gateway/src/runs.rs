@@ -277,8 +277,8 @@ pub async fn create_run(
         .register_cancel_token(run_id, cancel_token.clone());
 
     let state_clone = state.clone();
-    state.session_queue.enqueue(
-        session_id,
+    state.agent_queue.enqueue(
+        agent_id,
         Box::pin(async move {
             execute_run(
                 state_clone,
@@ -289,6 +289,7 @@ pub async fn create_run(
                 overrides,
                 context_id,
                 cancel_token,
+                false, // user-initiated run — not a peer message
             )
             .await;
         }),
@@ -316,6 +317,10 @@ async fn execute_run(
     overrides: RunOverrides,
     context_id: String,
     cancel_token: CancellationToken,
+    // When true, the input message has already been persisted to the session
+    // by the MessageBus. The agent loop uses `run_on_session` to look up the
+    // shared session by `SessionId` directly and skips re-persisting the input.
+    is_peer_message: bool,
 ) {
     // Track this run for graceful shutdown drain.
     state.run_manager.track_in_flight();
@@ -434,6 +439,11 @@ async fn execute_run(
     .with_run_id(run_id)
     .with_cancel_token(cancel_token.clone());
 
+    // Set agent name for perspective mapping in DM sessions.
+    if let Some(ref name) = agent_name {
+        runtime = runtime.with_agent_name(name.clone());
+    }
+
     // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into shell_exec processes
     // so that CLI commands invoked by agents find the correct database and
     // workspace regardless of the sandboxed cwd.
@@ -533,6 +543,27 @@ async fn execute_run(
             .with_read_subagent_session(read_session_tool);
     }
 
+    // Register peer messaging tools (Layer 2) when agent name is known.
+    if let Some(ref name) = agent_name {
+        let sender: std::sync::Arc<dyn alms_runtime::MessageSender> = state.message_bus.clone();
+        let send_tool = alms_runtime::SendMessageTool::new(
+            sender,
+            agent_id,
+            name.clone(),
+            state.session_manager.clone(),
+        );
+        let list_tool =
+            alms_runtime::ListAgentsTool::new(state.session_manager.clone(), name.clone());
+        let read_tool =
+            alms_runtime::ReadMessagesTool::new(state.session_manager.clone(), name.clone());
+        let ignore_tool = alms_runtime::IgnoreMessageTool::new();
+        runtime = runtime
+            .with_send_message(send_tool)
+            .with_list_agents(list_tool)
+            .with_read_messages(read_tool)
+            .with_ignore_message(ignore_tool);
+    }
+
     // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals).
     // We keep the handle so we can await it after the runtime finishes, ensuring
     // all tool events are flushed before we send run_finished.
@@ -545,9 +576,19 @@ async fn execute_run(
         forwarder_state.approval_store.clone(),
     ));
 
-    let result = runtime
-        .run(&state.session_manager, &context_id, input)
-        .await;
+    let result = if is_peer_message {
+        // Peer-triggered run: the input message is already in the shared
+        // session (written by MessageBus with from_agent metadata).
+        // Use run_on_session to look up the session by ID directly and
+        // skip re-persisting the input (fixes C1 session split + C2 double-write).
+        runtime
+            .run_on_session(&state.session_manager, session_id, &context_id, &input)
+            .await
+    } else {
+        runtime
+            .run(&state.session_manager, &context_id, input)
+            .await
+    };
 
     // Drop `runtime` explicitly to close `runtime_tx` and signal EOF to the
     // forwarder. Then await the forwarder so all buffered tool events are
@@ -635,13 +676,9 @@ pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, 
         if job.status == JobStatus::Cancelled {
             continue;
         }
-        let context_id = format!("job_{}", job_id.0);
-        let session = state
-            .session_manager
-            .get_or_create(job.agent_id, &context_id);
         let state_clone = state.clone();
-        state.session_queue.enqueue(
-            session.id,
+        state.agent_queue.enqueue(
+            job.agent_id,
             Box::pin(async move {
                 if let Err(e) = fire_job_run(state_clone, job_id).await {
                     error!("Job {} run dispatch failed: {}", job_id, e);
@@ -700,6 +737,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
         RunOverrides::default(),
         context_id,
         cancel_token,
+        false, // scheduled job — not a peer message
     )
     .await;
 
@@ -848,8 +886,8 @@ pub(crate) async fn completion_notification_loop(
         let state_clone = state.clone();
         // Low priority: notification runs yield to user messages.
         // If the user has queued messages, those execute first.
-        state.session_queue.enqueue_low(
-            session_id,
+        state.agent_queue.enqueue_low(
+            agent_id,
             Box::pin(async move {
                 execute_run(
                     state_clone,
@@ -860,6 +898,7 @@ pub(crate) async fn completion_notification_loop(
                     RunOverrides::default(),
                     context_id,
                     cancel_token,
+                    false, // subagent completion — not a peer message
                 )
                 .await;
             }),
@@ -898,6 +937,83 @@ fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> S
          {follow_up}",
         summary = c.summary,
     )
+}
+
+// ---------------------------------------------------------------------------
+// RunTrigger loop (peer messaging)
+// ---------------------------------------------------------------------------
+
+/// Processes `RunTrigger` events from the `MessageBus`.
+///
+/// Each trigger creates a run on the target agent's session, reusing the
+/// same `execute_run` path as user-initiated and notification runs.
+pub(crate) async fn run_trigger_loop(
+    mut rx: mpsc::UnboundedReceiver<alms_coordinator::message_bus::RunTrigger>,
+    state: AppState,
+) {
+    use alms_coordinator::message_bus::MessageSource;
+
+    while let Some(trigger) = rx.recv().await {
+        let session_id = trigger.session_id;
+        let agent_id = trigger.agent_id;
+        let context_id = trigger.context_id;
+
+        let source_label = match &trigger.source {
+            MessageSource::Agent { from_name, .. } => format!("peer:{from_name}"),
+            MessageSource::SubagentCompletion => "subagent-completion".to_string(),
+        };
+
+        info!(
+            session_id = %session_id.0,
+            agent_id = %agent_id.0,
+            source = %source_label,
+            "RunTrigger -> creating run"
+        );
+
+        // The message has already been persisted to the session by the
+        // MessageBus. We still pass `input` to execute_run so the
+        // agent loop knows what prompted this run (it reads from session
+        // history, but the run record needs the input).
+        let run = alms_core::Run::new(session_id, agent_id, trigger.input.clone());
+        let run_id = run.run_id;
+        state.run_manager.insert_run(run);
+
+        // Notify session-level SSE subscribers.
+        state
+            .run_manager
+            .send_session_event(
+                session_id,
+                run_id,
+                SseEventData::run_created(run_id, session_id, true),
+            )
+            .await;
+
+        let cancel_token = CancellationToken::new();
+        state
+            .run_manager
+            .register_cancel_token(run_id, cancel_token.clone());
+
+        let state_clone = state.clone();
+        let is_peer = matches!(trigger.source, MessageSource::Agent { .. });
+        // Peer messages use low priority so user-initiated runs take precedence.
+        state.agent_queue.enqueue_low(
+            agent_id,
+            Box::pin(async move {
+                execute_run(
+                    state_clone,
+                    run_id,
+                    session_id,
+                    agent_id,
+                    trigger.input,
+                    RunOverrides::default(),
+                    context_id,
+                    cancel_token,
+                    is_peer, // peer message — use shared session, skip input persist
+                )
+                .await;
+            }),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

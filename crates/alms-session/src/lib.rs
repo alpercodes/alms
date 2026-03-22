@@ -123,6 +123,66 @@ impl SessionManager {
         session
     }
 
+    /// Get or create a shared session by a known `SessionId`.
+    ///
+    /// Shared sessions (DM, group) are not owned by a single agent. They use
+    /// a deterministic `SessionId` derived from the participants. This method
+    /// creates the session if it does not exist, keyed by `(sentinel_agent_id,
+    /// context_id)` in the internal map so it integrates with the existing
+    /// session infrastructure.
+    ///
+    /// `sentinel_agent_id` should be a stable ID associated with the conversation
+    /// (e.g., one of the participants, or a nil UUID). It is only used for the
+    /// internal DashMap key -- both participants access the session by `SessionId`.
+    pub fn get_or_create_shared(
+        &self,
+        session_id: SessionId,
+        context_id: impl Into<String>,
+    ) -> Session {
+        // Fast path: session already exists in the reverse index.
+        if let Some(key) = self.session_by_id.get(&session_id)
+            && let Some(session) = self.sessions.get(key.value())
+        {
+            debug!("Found existing shared session: {:?}", session_id);
+            return session.clone();
+        }
+
+        // Slow path: create the session with the provided deterministic SessionId.
+        let context_id = context_id.into();
+        // Use a nil AgentId as sentinel for shared sessions.
+        let sentinel = AgentId(uuid::Uuid::nil());
+        let key = (sentinel, context_id.clone());
+
+        let session = Session {
+            id: session_id,
+            agent_id: sentinel,
+            context_id,
+            created_at: alms_core::Timestamp::now(),
+            last_activity: alms_core::Timestamp::now(),
+            status: types::SessionStatus::Active,
+        };
+
+        self.session_by_id.insert(session_id, key.clone());
+        self.sessions.insert(key, session.clone());
+        self.history.insert(session_id, Vec::new());
+        self.audit.insert(session_id, Vec::new());
+        self.summaries.entry(session_id).or_default();
+
+        if let Some(store) = &self.store
+            && let Err(e) = store.save_session(&session)
+        {
+            warn!("Failed to persist shared session {}: {}", session_id.0, e);
+        }
+
+        info!("Created new shared session: {:?}", session_id);
+        session
+    }
+
+    /// Check if a session with the given `SessionId` exists.
+    pub fn has_session_by_id(&self, session_id: SessionId) -> bool {
+        self.session_by_id.contains_key(&session_id)
+    }
+
     /// Get a session by ID
     pub fn get(&self, session_id: SessionId) -> AlmsResult<Session> {
         if let Some(key) = self.session_by_id.get(&session_id)

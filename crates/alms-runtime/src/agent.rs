@@ -124,6 +124,11 @@ pub struct AgentRuntime {
     /// Default env vars injected into shell_exec processes (e.g. ALMS_DATA_DIR).
     /// Retained so `with_workspace()` can pass them to the re-registered shell tool.
     shell_default_env: std::collections::HashMap<String, String>,
+    /// Agent name for perspective mapping in DM sessions.
+    /// When set and the context_id starts with "dm:", the context builder
+    /// maps messages from this agent to `Role::Assistant` so the LLM sees
+    /// them as its own previous responses.
+    agent_name: Option<String>,
 }
 
 impl AgentRuntime {
@@ -167,6 +172,7 @@ impl AgentRuntime {
             resolved_sandbox_root: sandbox_root,
             shell_unrestricted,
             shell_default_env: std::collections::HashMap::new(),
+            agent_name: None,
         })
     }
 
@@ -247,6 +253,30 @@ impl AgentRuntime {
         self
     }
 
+    /// Register the `send_message` tool for peer-to-peer agent messaging.
+    pub fn with_send_message(self, tool: crate::send_message_tool::SendMessageTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
+    /// Register the `list_agents` tool for agent discovery.
+    pub fn with_list_agents(self, tool: crate::list_agents_tool::ListAgentsTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
+    /// Register the `read_messages` tool for reading DM conversation history.
+    pub fn with_read_messages(self, tool: crate::read_messages_tool::ReadMessagesTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
+    /// Register the `ignore_message` tool so agents can decline to respond.
+    pub fn with_ignore_message(self, tool: crate::ignore_message_tool::IgnoreMessageTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
     /// Set the run ID for audit event correlation.
     pub fn with_run_id(mut self, run_id: alms_core::RunId) -> Self {
         self.run_id = Some(run_id);
@@ -287,6 +317,17 @@ impl AgentRuntime {
             self.tools.register(std::sync::Arc::new(shell_tool));
         }
 
+        self
+    }
+
+    /// Set the agent name for perspective mapping in DM sessions.
+    ///
+    /// When the context_id starts with `"dm:"`, the context builder uses this
+    /// name to map messages: messages where `from_agent == agent_name` become
+    /// `Role::Assistant` (the LLM's own previous responses), while messages from
+    /// other agents stay as `Role::User`.
+    pub fn with_agent_name(mut self, name: String) -> Self {
+        self.agent_name = Some(name);
         self
     }
 
@@ -331,7 +372,7 @@ impl AgentRuntime {
         // Build context first (reads history without current input to avoid double-counting),
         // then persist the user message so it survives agent loop failures.
         let history = self
-            .build_context(session_manager, &session.id, &input)
+            .build_context(session_manager, &session.id, context_id, &input)
             .await;
 
         let user_msg = SessionMessage {
@@ -343,21 +384,135 @@ impl AgentRuntime {
         };
         session_manager.append_message(session.id, user_msg)?;
 
+        self.finish_run(session_manager, session.id, context_id, history)
+            .await
+    }
+
+    /// Run the agent on a pre-existing shared session (e.g. a DM session).
+    ///
+    /// Unlike `run()`, this method:
+    /// - Looks up the session by `SessionId` directly instead of creating one
+    ///   via `get_or_create(agent_id, context_id)`. This ensures the agent uses
+    ///   the shared DM session created by `MessageBus`, not a new empty one.
+    /// - Skips persisting the input message because the `MessageBus` already
+    ///   wrote it to the session with `from_agent` metadata.
+    #[instrument(
+        level = "info",
+        skip(self, session_manager, input),
+        fields(
+            agent_id = %self.agent_id.0,
+            session_id = %session_id.0,
+            context_id = %context_id,
+            max_iterations = %self.config.max_iterations
+        )
+    )]
+    pub async fn run_on_session(
+        &self,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        context_id: &str,
+        input: &str,
+    ) -> AlmsResult<RunOutput> {
+        info!(
+            target: "agent::run_on_session_start",
+            agent_id = %self.agent_id.0,
+            session_id = %session_id.0,
+            context_id = %context_id,
+            input_len = input.len(),
+            "Agent run_on_session started (shared session, input already persisted)"
+        );
+
+        // Verify the session exists -- fail loudly if not.
+        session_manager.get(session_id)?;
+
+        // Build context: the input message is already in the session history
+        // (written by MessageBus), so we pass an empty string as the current
+        // input to avoid duplicating it in the context window.
+        let history = self
+            .build_context(session_manager, &session_id, context_id, "")
+            .await;
+
+        // Do NOT persist the input message -- it is already in the session.
+
+        self.finish_run(session_manager, session_id, context_id, history)
+            .await
+    }
+
+    /// Build `from_agent` metadata for DM sessions so that `read_messages`
+    /// can attribute system markers (errors, cancellations) to the correct
+    /// agent.  Returns `None` for non-DM sessions or when `agent_name` is
+    /// not set.
+    fn dm_marker_metadata(&self, is_dm: bool) -> Option<serde_json::Value> {
+        if is_dm {
+            self.agent_name.as_ref().map(|name| {
+                serde_json::json!({
+                    "from_agent": name,
+                    "from_agent_id": self.agent_id.0.to_string(),
+                    "message_type": "dm",
+                })
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Shared tail for `run()` and `run_on_session()`: executes the agent loop
+    /// and persists the result (assistant response, cancellation marker, or
+    /// error marker) to the session.
+    async fn finish_run(
+        &self,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        context_id: &str,
+        history: AlmsResult<Vec<LlmMessage>>,
+    ) -> AlmsResult<RunOutput> {
         let result = match history {
-            Ok(h) => self.agent_loop(session_manager, session.id, h).await,
+            Ok(h) => self.agent_loop(session_manager, session_id, h).await,
             Err(e) => Err(e),
         };
 
+        // Detect DM sessions: the agent's response must be stored as
+        // Role::User with {from_agent, from_agent_id} metadata so that
+        // perspective mapping works for both participants. Non-DM sessions
+        // keep the existing Role::Assistant storage.
+        let is_dm = context_id.starts_with("dm:");
+
         match result {
             Ok((response, usage)) => {
-                let assistant_msg = SessionMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    role: SessionRole::Assistant,
-                    content: alms_session::Content::Text(response.clone()),
-                    timestamp: alms_core::Timestamp::now(),
-                    metadata: None,
-                };
-                session_manager.append_message(session.id, assistant_msg)?;
+                // Skip persisting an assistant message when the response is
+                // empty. This happens when the agent used `ignore_message` to
+                // decline responding — there is nothing to record.
+                if !response.is_empty() {
+                    let (role, metadata) = if is_dm {
+                        if let Some(ref name) = self.agent_name {
+                            (
+                                SessionRole::User,
+                                Some(serde_json::json!({
+                                    "from_agent": name,
+                                    "from_agent_id": self.agent_id.0.to_string(),
+                                    "message_type": "dm",
+                                })),
+                            )
+                        } else {
+                            warn!(
+                                context_id = %context_id,
+                                "DM session but agent_name not set — storing reply as Role::Assistant"
+                            );
+                            (SessionRole::Assistant, None)
+                        }
+                    } else {
+                        (SessionRole::Assistant, None)
+                    };
+
+                    let reply_msg = SessionMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        role,
+                        content: alms_session::Content::Text(response.clone()),
+                        timestamp: alms_core::Timestamp::now(),
+                        metadata,
+                    };
+                    session_manager.append_message(session_id, reply_msg)?;
+                }
 
                 info!(
                     "Agent {} completed for context {} (prompt={} completion={} tokens)",
@@ -367,14 +522,22 @@ impl AgentRuntime {
                 Ok(RunOutput { response, usage })
             }
             Err(AlmsError::Cancelled) => {
+                // In DM sessions, attach from_agent metadata and use Role::User
+                // so read_messages perspective mapping works consistently — all
+                // messages in a shared DM session must be Role::User.
+                let role = if is_dm && self.agent_name.is_some() {
+                    SessionRole::User
+                } else {
+                    SessionRole::Assistant
+                };
                 let cancel_msg = SessionMessage {
                     id: uuid::Uuid::new_v4().to_string(),
-                    role: SessionRole::Assistant,
+                    role,
                     content: alms_session::Content::Text("[Run cancelled by user]".to_string()),
                     timestamp: alms_core::Timestamp::now(),
-                    metadata: None,
+                    metadata: self.dm_marker_metadata(is_dm),
                 };
-                if let Err(append_err) = session_manager.append_message(session.id, cancel_msg) {
+                if let Err(append_err) = session_manager.append_message(session_id, cancel_msg) {
                     warn!(
                         "Failed to persist cancellation marker to session: {}",
                         append_err
@@ -385,15 +548,23 @@ impl AgentRuntime {
             Err(e) => {
                 // Write a sanitized error marker so the session reflects the failed attempt
                 // without leaking sensitive details (API keys, URLs) into LLM context.
+                // In DM sessions, use Role::User with from_agent metadata so
+                // perspective mapping works — all messages in shared DM sessions
+                // must be Role::User.
                 let safe_reason = sanitize_error_for_session(&e);
+                let role = if is_dm && self.agent_name.is_some() {
+                    SessionRole::User
+                } else {
+                    SessionRole::Assistant
+                };
                 let error_msg = SessionMessage {
                     id: uuid::Uuid::new_v4().to_string(),
-                    role: SessionRole::Assistant,
+                    role,
                     content: alms_session::Content::Text(format!("[Run failed: {}]", safe_reason)),
                     timestamp: alms_core::Timestamp::now(),
-                    metadata: None,
+                    metadata: self.dm_marker_metadata(is_dm),
                 };
-                if let Err(append_err) = session_manager.append_message(session.id, error_msg) {
+                if let Err(append_err) = session_manager.append_message(session_id, error_msg) {
                     warn!("Failed to persist error marker to session: {}", append_err);
                 }
 
@@ -421,10 +592,15 @@ impl AgentRuntime {
     ///
     /// For the `sliding-summary` strategy this is async because it may call the
     /// LLM to compress old messages into a rolling summary.
+    ///
+    /// For DM sessions (context_id starts with `"dm:"`), perspective mapping is
+    /// applied: messages from this agent become `Role::Assistant` so the LLM
+    /// sees them as its own previous responses.
     async fn build_context(
         &self,
         session_manager: &SessionManager,
         session_id: &alms_core::SessionId,
+        context_id: &str,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
         let system_prompt = self.assemble_system_prompt(&self.config.system_prompt);
@@ -460,7 +636,35 @@ impl AgentRuntime {
             };
 
         let builder = ContextBuilder::new(self.config.context_config.clone());
-        Ok(builder.build(&system_prompt, &history, input, summary_text.as_deref()))
+
+        // For DM sessions, apply perspective mapping so the LLM sees its own
+        // previous messages as Role::Assistant instead of Role::User.
+        let perspective = if context_id.starts_with("dm:") {
+            if let Some(ref name) = self.agent_name {
+                debug!(
+                    agent_name = %name,
+                    context_id = %context_id,
+                    "Applying perspective mapping for DM session"
+                );
+                Some(name.as_str())
+            } else {
+                warn!(
+                    context_id = %context_id,
+                    "DM session detected but agent_name not set — perspective mapping skipped"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
+        Ok(builder.build_with_perspective(
+            &system_prompt,
+            &history,
+            input,
+            summary_text.as_deref(),
+            perspective,
+        ))
     }
 
     /// Check whether history has grown past the summarization threshold and, if so,
@@ -783,6 +987,16 @@ impl AgentRuntime {
                     ) {
                         warn!("Failed to persist tool result to session: {}", e);
                     }
+                }
+
+                // Check if any tool result is an ignore_message marker.
+                // When detected, end the run early without producing a response.
+                let ignored = tool_calls
+                    .iter()
+                    .any(|tc| tc.function.name == "ignore_message");
+                if ignored {
+                    info!("Agent declined to respond via ignore_message — ending run early");
+                    return Ok((String::new(), total_usage));
                 }
 
                 // Append tool_loop instructions to the system prompt for
@@ -1176,6 +1390,7 @@ mod tests {
             resolved_sandbox_root: None,
             shell_unrestricted: true,
             shell_default_env: std::collections::HashMap::new(),
+            agent_name: None,
         };
 
         let request =
@@ -1214,6 +1429,7 @@ mod tests {
             resolved_sandbox_root: None,
             shell_unrestricted: true,
             shell_default_env: std::collections::HashMap::new(),
+            agent_name: None,
         };
 
         let session_config = SessionConfig::default();
@@ -1221,12 +1437,137 @@ mod tests {
         let session = session_manager.get_or_create(runtime.agent_id, "test");
 
         let messages = runtime
-            .build_context(&session_manager, &session.id, "hello")
+            .build_context(&session_manager, &session.id, "test", "hello")
             .await
             .unwrap();
         // system prompt + current input = 2
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[tokio::test]
+    async fn test_build_context_dm_perspective_mapping() {
+        let runtime = AgentRuntime {
+            agent_id: AgentId::new(),
+            config: AgentConfig::default(),
+            llm: LlmClient::new(LlmConfig::default()).unwrap(),
+            tools: ToolRegistry::new(),
+            workspace: None,
+            event_sender: None,
+            run_id: None,
+            cancel_token: None,
+            resolved_sandbox_root: None,
+            shell_unrestricted: true,
+            shell_default_env: std::collections::HashMap::new(),
+            agent_name: Some("bob".to_string()),
+        };
+
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+
+        // Create a shared DM session and populate it with messages from both agents
+        let dm_context = "dm:alice:bob";
+        let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+        let session = session_manager.get_or_create_shared(session_id, dm_context);
+
+        // Alice's message (from_agent = "alice") — should stay User for Bob's perspective
+        session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: alms_session::Role::User,
+                    content: alms_session::Content::Text("Hello Bob!".to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: Some(serde_json::json!({
+                        "from_agent": "alice",
+                        "message_type": "dm",
+                    })),
+                },
+            )
+            .unwrap();
+
+        // Bob's message (from_agent = "bob") — should become Assistant for Bob's perspective
+        session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: alms_session::Role::User,
+                    content: alms_session::Content::Text("Hi Alice!".to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: Some(serde_json::json!({
+                        "from_agent": "bob",
+                        "message_type": "dm",
+                    })),
+                },
+            )
+            .unwrap();
+
+        let messages = runtime
+            .build_context(&session_manager, &session.id, dm_context, "What's up?")
+            .await
+            .unwrap();
+
+        // system + 2 history + current input = 4
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "system");
+        // Alice's message stays as "user" from Bob's perspective
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content_str(), "Hello Bob!");
+        // Bob's own message becomes "assistant" from Bob's perspective
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].content_str(), "Hi Alice!");
+        // Current input
+        assert_eq!(messages[3].role, "user");
+        assert_eq!(messages[3].content_str(), "What's up?");
+    }
+
+    #[tokio::test]
+    async fn test_build_context_non_dm_no_perspective() {
+        // When context_id does NOT start with "dm:", no perspective mapping should occur
+        let runtime = AgentRuntime {
+            agent_id: AgentId::new(),
+            config: AgentConfig::default(),
+            llm: LlmClient::new(LlmConfig::default()).unwrap(),
+            tools: ToolRegistry::new(),
+            workspace: None,
+            event_sender: None,
+            run_id: None,
+            cancel_token: None,
+            resolved_sandbox_root: None,
+            shell_unrestricted: true,
+            shell_default_env: std::collections::HashMap::new(),
+            agent_name: Some("bob".to_string()),
+        };
+
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let session = session_manager.get_or_create(runtime.agent_id, "regular-context");
+
+        // Add a message with from_agent metadata (shouldn't matter for non-DM)
+        session_manager
+            .append_message(
+                session.id,
+                alms_session::Message {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: alms_session::Role::User,
+                    content: alms_session::Content::Text("Hello".to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: Some(serde_json::json!({"from_agent": "bob"})),
+                },
+            )
+            .unwrap();
+
+        let messages = runtime
+            .build_context(&session_manager, &session.id, "regular-context", "hi")
+            .await
+            .unwrap();
+
+        // system + 1 history + current = 3
+        assert_eq!(messages.len(), 3);
+        // No perspective mapping: message stays as "user" even though from_agent == "bob"
         assert_eq!(messages[1].role, "user");
     }
 
@@ -1330,6 +1671,7 @@ mod tests {
             resolved_sandbox_root: None,
             shell_unrestricted: true,
             shell_default_env: std::collections::HashMap::new(),
+            agent_name: None,
         };
 
         let tool_calls = vec![
@@ -1434,5 +1776,182 @@ mod tests {
             result.is_ok(),
             "Empty sandbox_root should mean unrestricted"
         );
+    }
+
+    /// Integration test for `run_on_session`: verifies that the agent uses
+    /// the shared DM session directly (no session split) and does not
+    /// duplicate the input message (which was already persisted by MessageBus).
+    #[tokio::test]
+    async fn test_run_on_session_uses_shared_session_no_duplicate() {
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let llm = LlmClient::new(config).unwrap();
+        let bob_id = AgentId::new();
+
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(bob_id, agent_config, llm)
+            .unwrap()
+            .with_agent_name("bob".to_string());
+
+        // Simulate what MessageBus does: create a shared DM session and
+        // write the sender's message into it.
+        let dm_context = "dm:alice:bob";
+        let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+        let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+        let sender_msg = alms_session::Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: alms_session::Role::User,
+            content: alms_session::Content::Text("Hello Bob!".to_string()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "from_agent": "alice",
+                "from_agent_id": AgentId::new().0.to_string(),
+                "message_type": "dm",
+            })),
+        };
+        session_manager
+            .append_message(session_id, sender_msg)
+            .unwrap();
+
+        // Before run: session has exactly 1 message (from alice via MessageBus).
+        let history_before = session_manager.get_history(session_id).unwrap();
+        assert_eq!(
+            history_before.len(),
+            1,
+            "Pre-condition: 1 message from MessageBus"
+        );
+
+        // Run on the shared session (as the recipient agent would).
+        let result = runtime
+            .run_on_session(&session_manager, session_id, dm_context, "Hello Bob!")
+            .await;
+        assert!(result.is_ok(), "run_on_session should succeed");
+
+        // After run: the session should have 2 messages, both stored as
+        // Role::User with from_agent metadata. In a DM session, all messages
+        // (including the agent's reply) use Role::User — perspective mapping
+        // in ContextBuilder assigns Role::Assistant at read time.
+        let history_after = session_manager.get_history(session_id).unwrap();
+        assert_eq!(
+            history_after.len(),
+            2,
+            "Should have exactly 2 messages (alice's input + bob's reply). Found: {}",
+            history_after.len()
+        );
+
+        // All messages should be Role::User (shared DM session invariant).
+        let user_messages: Vec<_> = history_after
+            .iter()
+            .filter(|m| m.role == alms_session::Role::User)
+            .collect();
+        assert_eq!(
+            user_messages.len(),
+            2,
+            "All messages in a DM session should be Role::User. Found: {}",
+            user_messages.len()
+        );
+
+        // Alice's input message should still have its metadata intact.
+        let alice_meta = user_messages[0].metadata.as_ref().unwrap();
+        assert_eq!(alice_meta["from_agent"], "alice");
+
+        // Bob's reply should have from_agent = "bob" with agent_id.
+        let bob_meta = user_messages[1]
+            .metadata
+            .as_ref()
+            .expect("Bob's reply must have from_agent metadata");
+        assert_eq!(bob_meta["from_agent"], "bob");
+        assert_eq!(bob_meta["from_agent_id"], bob_id.0.to_string());
+        assert_eq!(bob_meta["message_type"], "dm");
+
+        // There should be NO Role::Assistant messages in a DM session.
+        let assistant_messages: Vec<_> = history_after
+            .iter()
+            .filter(|m| m.role == alms_session::Role::Assistant)
+            .collect();
+        assert_eq!(
+            assistant_messages.len(),
+            0,
+            "DM sessions should not have Role::Assistant messages (perspective mapping handles roles). Found: {}",
+            assistant_messages.len()
+        );
+    }
+
+    /// Verify that `dm_marker_metadata` returns `from_agent` metadata for DM
+    /// sessions and `None` for non-DM sessions.  This metadata is attached to
+    /// error/cancellation markers so `read_messages` can attribute them.
+    #[test]
+    fn test_dm_marker_metadata() {
+        let config = crate::llm_types::LlmConfig {
+            mock: true,
+            ..crate::llm_types::LlmConfig::default()
+        };
+        let llm = LlmClient::new(config).unwrap();
+        let agent_id = AgentId::new();
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+
+        // Without agent_name: always None regardless of is_dm.
+        let rt_no_name = AgentRuntime::new(agent_id, agent_config.clone(), llm.clone()).unwrap();
+        assert!(rt_no_name.dm_marker_metadata(true).is_none());
+        assert!(rt_no_name.dm_marker_metadata(false).is_none());
+
+        // With agent_name: returns metadata only when is_dm is true.
+        let rt_named = AgentRuntime::new(agent_id, agent_config, llm)
+            .unwrap()
+            .with_agent_name("bob".to_string());
+
+        let meta = rt_named.dm_marker_metadata(true);
+        assert!(
+            meta.is_some(),
+            "DM session with agent_name should produce metadata"
+        );
+        let meta = meta.unwrap();
+        assert_eq!(meta["from_agent"], "bob");
+        assert_eq!(meta["from_agent_id"], agent_id.0.to_string());
+        assert_eq!(meta["message_type"], "dm");
+
+        // Non-DM: no metadata even with agent_name set.
+        assert!(rt_named.dm_marker_metadata(false).is_none());
+    }
+
+    /// Verify that `run_on_session` fails with SessionNotFound if the session
+    /// does not exist (rather than silently creating a new empty session).
+    #[tokio::test]
+    async fn test_run_on_session_fails_if_session_missing() {
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let llm = LlmClient::new(config).unwrap();
+        let agent_id = AgentId::new();
+
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(agent_id, agent_config, llm)
+            .unwrap()
+            .with_agent_name("bob".to_string());
+
+        // Try to run on a non-existent session.
+        let fake_session_id = alms_core::SessionId::new();
+        let result = runtime
+            .run_on_session(&session_manager, fake_session_id, "dm:alice:bob", "hello")
+            .await;
+
+        assert!(result.is_err(), "Should fail if session does not exist");
     }
 }

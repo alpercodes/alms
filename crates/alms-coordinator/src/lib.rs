@@ -1,3 +1,5 @@
+pub mod message_bus;
+
 use alms_core::{AgentId, AlmsResult, RunId, SessionId};
 use alms_runtime::events::RuntimeEventSender;
 use alms_runtime::subagent::{PollResult, SubagentDispatcher};
@@ -878,6 +880,11 @@ async fn run_agent_loop(
     let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?
         .with_event_sender(sub_tx)
         .with_cancel_token(cancel_token);
+
+    // Set agent name for perspective mapping in DM sessions.
+    if let Some(ref name) = request.subagent_name {
+        runtime = runtime.with_agent_name(name.clone());
+    }
 
     // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into subagent shell_exec
     // processes so CLI commands find the right database.
