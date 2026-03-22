@@ -1117,7 +1117,7 @@ Group messages are delivered independently to each member. Members process them 
 - Member A might see message 1, 2, 3 in order
 - Member B might see message 1, 3, 2 (if message 3 was delivered before it finished processing message 2's run)
 
-This is acceptable for async agent communication. If strict ordering is needed, the SessionQueue already ensures serial processing per session.
+This is acceptable for async agent communication. If strict ordering is needed, the AgentQueue ensures serial processing per agent, and messages within a single shared session are ordered by `seq`.
 
 ### 17.4 Relationship to Layer 3
 
