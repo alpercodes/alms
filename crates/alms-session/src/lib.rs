@@ -210,11 +210,16 @@ impl SessionManager {
         ))
     }
 
-    /// Append a message to a session
+    /// Append a message to a session.
+    ///
+    /// Returns `Err(SessionNotFound)` early if no history entry exists for the
+    /// given `session_id` (stricter than the previous silent-success behavior,
+    /// but all callers create sessions via `get_or_create` first, so this is
+    /// always populated).
     ///
     /// Lock ordering: `history` is scoped and released before acquiring
-    /// `sessions`, matching the `sessions` -> `history` ordering used by
-    /// `get_or_create` / `get_or_create_shared` and preventing AB/BA deadlocks.
+    /// `sessions` / `session_by_id`, preventing AB/BA deadlocks with
+    /// `get_or_create` which holds `sessions` while inserting into `history`.
     pub fn append_message(&self, session_id: SessionId, message: Message) -> AlmsResult<()> {
         // Scope the history write lock so it is released before we touch `sessions`.
         {
