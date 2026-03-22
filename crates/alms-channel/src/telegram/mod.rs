@@ -45,7 +45,6 @@ const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 pub struct TelegramChannel {
     token: Secret,
     client: Client,
-    base_url: Secret,
     last_update_id: Arc<AtomicI64>,
     running: Arc<AtomicBool>,
     use_webhook: bool,
@@ -72,7 +71,6 @@ impl TelegramChannel {
         Self {
             token: Secret(String::new()),
             client: Client::new(),
-            base_url: Secret(String::new()),
             last_update_id: Arc::new(AtomicI64::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             use_webhook: false,
@@ -145,17 +143,13 @@ impl TelegramChannel {
     /// Make a GET request to the Telegram API
     async fn get<T: serde::de::DeserializeOwned>(&self, method: &str) -> AlmsResult<T> {
         let url = self.api_url(method);
-        let response = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| alms_core::AlmsError::Channel(format!("HTTP error: {}", e)))?;
+        let response = self.client.get(&url).send().await.map_err(|e| {
+            alms_core::AlmsError::Channel(format!("HTTP error: {}", e.without_url()))
+        })?;
 
-        let api_response: TelegramResponse<T> = response
-            .json()
-            .await
-            .map_err(|e| alms_core::AlmsError::Channel(format!("JSON parse error: {}", e)))?;
+        let api_response: TelegramResponse<T> = response.json().await.map_err(|e| {
+            alms_core::AlmsError::Channel(format!("JSON parse error: {}", e.without_url()))
+        })?;
 
         if api_response.ok {
             api_response
@@ -183,12 +177,13 @@ impl TelegramChannel {
             .json(body)
             .send()
             .await
-            .map_err(|e| alms_core::AlmsError::Channel(format!("HTTP error: {}", e)))?;
+            .map_err(|e| {
+                alms_core::AlmsError::Channel(format!("HTTP error: {}", e.without_url()))
+            })?;
 
-        let api_response: TelegramResponse<T> = response
-            .json()
-            .await
-            .map_err(|e| alms_core::AlmsError::Channel(format!("JSON parse error: {}", e)))?;
+        let api_response: TelegramResponse<T> = response.json().await.map_err(|e| {
+            alms_core::AlmsError::Channel(format!("JSON parse error: {}", e.without_url()))
+        })?;
 
         if api_response.ok {
             api_response
@@ -461,7 +456,6 @@ impl Channel for TelegramChannel {
         }
 
         self.token = Secret(config.token);
-        self.base_url = Secret(format!("{}{}", TELEGRAM_API_BASE, self.token.as_str()));
         self.use_webhook = config.use_webhook;
         self.webhook_url = config.webhook_url;
         self.poll_interval_secs = config.poll_interval_secs;
@@ -727,10 +721,6 @@ mod tests {
     fn debug_output_redacts_token() {
         let mut channel = TelegramChannel::new();
         channel.token = Secret("SUPER_SECRET_TOKEN_12345".to_string());
-        channel.base_url = Secret(format!(
-            "https://api.telegram.org/bot{}",
-            "SUPER_SECRET_TOKEN_12345"
-        ));
         let debug = format!("{:?}", channel);
         assert!(
             !debug.contains("SUPER_SECRET_TOKEN_12345"),
