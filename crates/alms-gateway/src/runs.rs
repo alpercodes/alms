@@ -77,7 +77,9 @@ pub fn resolve_agent_config(
     );
 
     // Apply per-agent provider override first (changes base_url + api_key),
-    // then model override on top.
+    // then ALWAYS re-resolve the API key from secrets for the effective
+    // provider. This ensures keys set at runtime (via UI or CLI) are picked
+    // up even for the default agent which has no per-agent provider field.
     let mut llm = llm.clone();
     if let Some(ref record) = agent_record
         && let Some(ref provider) = record.provider
@@ -87,6 +89,10 @@ pub fn resolve_agent_config(
         } else {
             llm.with_provider(provider)
         };
+    } else if let Some(s) = secrets {
+        // No per-agent provider override — re-resolve the key for the
+        // server-default provider from the live secrets store.
+        llm = llm.with_secrets(s);
     }
     if let Some(model) = merged.model_override {
         llm = llm.with_model(model);
