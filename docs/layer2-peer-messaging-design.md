@@ -489,22 +489,18 @@ CREATE TABLE IF NOT EXISTS group_members (
 
 ### 5.3 How Group Messages Work
 
+Group chats work like DM chats — each agent has a regular session for the group, and sees the full conversation history when it's their turn to respond.
+
 When an agent sends a message to a group:
 
-1. The message is broadcast to all OTHER members of the group
-2. Each member receives the message in their own group session
-3. Each member's session uses `context_id = "group:{group_name}"`
-4. The sender's message appears as `Role::User` in each recipient's session, with metadata `{from: "sender-name"}`
-5. Each recipient may independently choose to respond (creating a run on their group session)
-6. Responses are broadcast back to all other members
+1. The message is appended as `Role::User` to every OTHER member's group session (`context_id = "group:{group_name}"`) with metadata `{from: "sender-name"}`
+2. For @-mentioned agents (or `@everyone`): a `RunTrigger` is created on their group session
+3. Non-mentioned agents receive the message in their session (for context continuity) but no run is triggered
+4. When a mentioned agent responds, their response is broadcast to all other members' sessions as `Role::User` with `{from: "responder-name"}`
 
-**Important**: Unlike a real group chat where everyone sees the same linear thread, each agent has its own session for the group. This means:
+Each agent has its own session for the group (`(agent_id, "group:{group_name}")`). When it's an agent's turn to respond, it sees the full group conversation history — all messages from all participants — just like a user↔agent chat. The ContextBuilder handles it normally with truncation/sliding-summary as needed.
 
-- Each agent builds its own context window from its perspective
-- Agents may respond at different times (async, not real-time round-robin)
-- The "group conversation" is a logical construct -- physically it is N sessions with cross-posted messages
-
-This is intentional: it matches how the existing session model works and avoids a shared-state coordination problem.
+Agents respond async — they process messages through their `AgentQueue` (Section 7) one at a time, so group participation is serialized with all their other work.
 
 ### 5.4 New Tools for Groups
 
@@ -641,9 +637,9 @@ The existing `SessionQueue` already has a two-tier priority system (`enqueue()` 
 
 ---
 
-## 8. How This Integrates with Existing Systems
+## 9. How This Integrates with Existing Systems
 
-### 8.1 Coexistence with invoke_agent
+### 9.1 Coexistence with invoke_agent
 
 `invoke_agent` (the hierarchy model) and `send_message` (the peer model) coexist. They serve different purposes:
 
@@ -659,7 +655,7 @@ The existing `SessionQueue` already has a two-tier priority system (`enqueue()` 
 
 They should NOT be merged. A developer agent asking a reviewer agent for a review should use `send_message`. A PM agent assigning a task to a developer agent should use `invoke_agent`. The LLM will learn the distinction through system prompts and experience.
 
-### 8.2 SSE Streaming
+### 9.2 SSE Streaming
 
 Peer messages integrate with existing SSE infrastructure:
 
@@ -668,11 +664,11 @@ Peer messages integrate with existing SSE infrastructure:
 - The UI can subscribe to any session's event stream, including DM sessions
 - A new SSE event type `message_received` notifies the UI when an agent gets a peer message
 
-### 8.3 Context Building
+### 9.3 Context Building
 
 No changes needed. Each agent's DM session is a regular session. ContextBuilder reads from it using the standard strategies (truncate, full, sliding-summary). The only addition is metadata on messages indicating the sender (`from` field), which the system prompt instructs the agent to use.
 
-### 8.4 User Observation
+### 9.4 User Observation
 
 The user needs to observe agent-to-agent conversations. This is handled by:
 
@@ -684,9 +680,9 @@ No new endpoints are needed for observation -- the existing session/run/SSE infr
 
 ---
 
-## 9. Database Schema Changes
+## 10. Database Schema Changes
 
-### 9.1 New Tables
+### 10.1 New Tables
 
 ```sql
 -- Groups for multi-agent conversations
@@ -706,7 +702,7 @@ CREATE TABLE IF NOT EXISTS group_members (
 );
 ```
 
-### 9.2 Schema Migrations to Existing Tables
+### 10.2 Schema Migrations to Existing Tables
 
 ```sql
 -- Add daemon flag to agents table
@@ -717,7 +713,7 @@ ALTER TABLE agents ADD COLUMN daemon INTEGER NOT NULL DEFAULT 0;
 -- No schema change needed: metadata is already TEXT (JSON).
 ```
 
-### 9.3 Message Metadata Convention
+### 10.3 Message Metadata Convention
 
 Use the existing `metadata` JSON column on messages to track sender identity in DM/group contexts:
 
@@ -733,9 +729,9 @@ This avoids adding new columns to the messages table. The metadata column is alr
 
 ---
 
-## 10. API Changes
+## 11. API Changes
 
-### 10.1 New Endpoints
+### 11.1 New Endpoints
 
 ```
 POST   /messages              -- Send a message from one agent to another (or to a group)
@@ -747,14 +743,14 @@ POST   /groups/{name}/members -- Add a member to a group
 DELETE /groups/{name}/members/{agent} -- Remove a member
 ```
 
-### 10.2 Modified Endpoints
+### 11.2 Modified Endpoints
 
 ```
 GET /sessions -- Add filter params: ?type=dm|group|user to filter session types
 GET /agents   -- Add daemon flag to response, add status (idle/running/listening)
 ```
 
-### 10.3 New SSE Event Types
+### 11.3 New SSE Event Types
 
 ```json
 // Emitted on the recipient's session when a peer message arrives
@@ -770,7 +766,7 @@ GET /agents   -- Add daemon flag to response, add status (idle/running/listening
 
 ---
 
-## 11. Crate-Level Changes
+## 12. Crate-Level Changes
 
 ### alms-core
 
@@ -814,7 +810,7 @@ GET /agents   -- Add daemon flag to response, add status (idle/running/listening
 
 ---
 
-## 12. System Prompt Additions
+## 13. System Prompt Additions
 
 Agents need to know they can communicate with peers. The staged system prompt (`prompts/tool_loop.md`) should include:
 
@@ -845,9 +841,9 @@ This is injected by the runtime when it detects a `dm:*` context_id on the sessi
 
 ---
 
-## 13. Security Considerations
+## 14. Security Considerations
 
-### 13.1 Access Control
+### 14.1 Access Control
 
 **Phase 1 (open):** Any agent can message any other agent. This is simple and sufficient for small teams where all agents are trusted.
 
@@ -856,11 +852,11 @@ This is injected by the runtime when it detects a `dm:*` context_id on the sessi
 - `can_join_groups: true/false`
 - `can_create_groups: true/false`
 
-### 13.2 Self-Messaging
+### 14.2 Self-Messaging
 
 An agent sending a message to itself (`send_message(to="self-name")`) is currently allowed. This is a low-priority edge case — it could be used as a "leave a note for my next run" pattern. No explicit prevention for now; revisit if it causes issues.
 
-### 13.3 Message Rate Limiting
+### 14.3 Message Rate Limiting
 
 Agents could flood each other with messages, creating infinite loops:
 - Agent A sends to Agent B
@@ -874,7 +870,7 @@ Agents could flood each other with messages, creating infinite loops:
 3. **Max message depth**: Track how many times a message has been "forwarded" (A->B->A->B...). After depth N (default: 5), delivery is refused with an error
 4. **Token budget per DM pair per hour**: Configurable limit on total tokens spent on a DM conversation
 
-### 13.4 User Override
+### 14.4 User Override
 
 The user (via the API or UI) can:
 - Pause a daemon agent (stop processing incoming messages)
@@ -884,7 +880,7 @@ The user (via the API or UI) can:
 
 ---
 
-## 14. Implementation Phases
+## 15. Implementation Phases
 
 Each phase delivers independent value and is a PR-sized chunk.
 
@@ -1035,7 +1031,7 @@ Per `communication-architecture.md` Section 12, this is the core value propositi
 
 ---
 
-## 15. Migration Path from Current State
+## 16. Migration Path from Current State
 
 The transition from pure hierarchy to peer messaging is additive -- nothing is removed or changed in the existing system.
 
@@ -1053,15 +1049,15 @@ The transition from pure hierarchy to peer messaging is additive -- nothing is r
 
 ---
 
-## 16. Open Questions and Future Directions
+## 17. Open Questions and Future Directions
 
-### 16.1 Response Notification
+### 17.1 Response Notification
 
 When Agent B responds to Agent A's message, Agent A is notified using the same pattern as background subagent completions: B's response is dual-written into A's DM session as a User message, and a `RunTrigger` is created on A's DM session. If A is a daemon or has an active listener, it processes B's response as a new run. If not, the response sits in A's DM session history and is visible on the next run.
 
 This is the push model — no polling needed. The `RunTrigger` mechanism handles delivery for both the initial message and the response symmetrically.
 
-### 16.2 Message Delivery Guarantees
+### 17.2 Message Delivery Guarantees
 
 What happens if the gateway restarts while a message is in the `RunTrigger` channel?
 
@@ -1069,7 +1065,7 @@ What happens if the gateway restarts while a message is in the `RunTrigger` chan
 - **Future:** Persist RunTriggers to SQLite before processing. On restart, replay unprocessed triggers.
 - **Recommendation:** Accept in-memory delivery for Phase 1. The risk is low (single-process, restarts are rare) and the fix is straightforward when needed.
 
-### 16.3 Message Ordering in Groups
+### 17.3 Message Ordering in Groups
 
 Group messages are delivered independently to each member. Members process them at different speeds. This means:
 - Member A might see message 1, 2, 3 in order
@@ -1077,7 +1073,7 @@ Group messages are delivered independently to each member. Members process them 
 
 This is acceptable for async agent communication. If strict ordering is needed, the SessionQueue already ensures serial processing per session.
 
-### 16.4 Relationship to Layer 3
+### 17.4 Relationship to Layer 3
 
 Layer 3 (emergent team dynamics) builds on Layer 2 infrastructure:
 
@@ -1089,7 +1085,7 @@ Layer 2 provides the pipes. Layer 3 provides the behavior.
 
 ---
 
-## 17. Summary
+## 18. Summary
 
 Layer 2 adds peer-to-peer communication to ALMS, aligned with the product vision in `communication-architecture.md`. Eight implementation phases build incrementally:
 
