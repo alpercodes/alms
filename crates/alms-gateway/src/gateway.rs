@@ -108,11 +108,7 @@ impl GatewayConfig {
         let data_dir = &config.server.data_dir;
 
         gateway_config.db_path = Some(config.server.db_path());
-        gateway_config.workspace_dir = Some(
-            std::env::var("ALMS_WORKSPACE_DIR")
-                .map(Into::into)
-                .unwrap_or_else(|_| std::path::PathBuf::from(format!("{data_dir}/workspace"))),
-        );
+        gateway_config.workspace_dir = Some(config.server.workspace_dir());
 
         // Ensure data dir exists before SQLite tries to open files there.
         if let Err(e) = std::fs::create_dir_all(data_dir) {
