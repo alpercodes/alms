@@ -85,6 +85,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "max_tokens": agent.max_tokens,
         "posture": posture_str,
         "context_strategy": agent.context_config.strategy,
+        "stream_chunk_timeout_secs": llm.stream_chunk_timeout_secs,
         "enabled_tools": tools,
         "agent_id": agent_id,
         "agents": agents_list,
