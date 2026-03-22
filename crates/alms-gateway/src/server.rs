@@ -59,6 +59,8 @@ pub struct RunManager {
     drain_notify: Arc<tokio::sync::Notify>,
     /// Per-run cancellation tokens for cooperative cancellation.
     cancel_tokens: Arc<DashMap<RunId, CancellationToken>>,
+    /// Optional SQLite store for run persistence.
+    sqlite_store: Option<Arc<alms_session::SqliteStore>>,
 }
 
 impl RunManager {
@@ -72,6 +74,46 @@ impl RunManager {
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: Arc::new(DashMap::new()),
+            sqlite_store: None,
+        }
+    }
+
+    /// Set the SQLite store for run persistence.
+    pub fn with_store(mut self, store: Arc<alms_session::SqliteStore>) -> Self {
+        self.sqlite_store = Some(store);
+        self
+    }
+
+    /// Load persisted runs from SQLite into the in-memory DashMap.
+    ///
+    /// Only loads terminal runs (completed/failed/cancelled) -- queued/running
+    /// runs from a previous process are stale and should not be loaded.
+    pub fn hydrate_from_store(&self) {
+        let Some(store) = &self.sqlite_store else {
+            return;
+        };
+        match store.load_all_runs() {
+            Ok(runs) => {
+                let mut loaded = 0;
+                for run in runs {
+                    // Skip non-terminal runs — they are leftovers from a previous
+                    // process that crashed or was killed.
+                    if matches!(
+                        run.status,
+                        alms_core::RunStatus::Queued | alms_core::RunStatus::Running
+                    ) {
+                        continue;
+                    }
+                    self.runs.insert(run.run_id, run);
+                    loaded += 1;
+                }
+                if loaded > 0 {
+                    info!("Loaded {} persisted runs from SQLite", loaded);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load runs from SQLite: {}", e);
+            }
         }
     }
 
@@ -141,6 +183,11 @@ impl RunManager {
     }
 
     pub fn insert_run(&self, run: Run) {
+        if let Some(store) = &self.sqlite_store
+            && let Err(e) = store.save_run(&run)
+        {
+            tracing::warn!(run_id = %run.run_id.0, "Failed to persist new run to SQLite: {e}");
+        }
         self.runs.insert(run.run_id, run);
     }
 
@@ -149,12 +196,18 @@ impl RunManager {
     }
 
     pub fn update_run(&self, run: Run) {
+        if let Some(store) = &self.sqlite_store
+            && let Err(e) = store.save_run(&run)
+        {
+            tracing::warn!(run_id = %run.run_id.0, "Failed to persist run update to SQLite: {e}");
+        }
         self.runs.insert(run.run_id, run);
     }
 
     /// Atomically transition a run to Running state.
     pub fn mark_run_as_running(&self, run_id: RunId) {
         self.runs.entry(run_id).and_modify(|r| r.mark_running());
+        self.persist_run(run_id);
     }
 
     /// Atomically transition a run to Completed state.
@@ -167,6 +220,7 @@ impl RunManager {
         self.runs
             .entry(run_id)
             .and_modify(|r| r.mark_completed(output.clone(), usage));
+        self.persist_run(run_id);
     }
 
     /// Atomically transition a run to Failed state.
@@ -174,11 +228,23 @@ impl RunManager {
         self.runs
             .entry(run_id)
             .and_modify(|r| r.mark_failed(error.clone()));
+        self.persist_run(run_id);
     }
 
     /// Atomically transition a run to Cancelled state.
     pub fn mark_run_as_cancelled(&self, run_id: RunId) {
         self.runs.entry(run_id).and_modify(|r| r.mark_cancelled());
+        self.persist_run(run_id);
+    }
+
+    /// Persist the current state of a run to SQLite (if store is configured).
+    fn persist_run(&self, run_id: RunId) {
+        if let Some(store) = &self.sqlite_store
+            && let Some(run) = self.runs.get(&run_id)
+            && let Err(e) = store.save_run(run.value())
+        {
+            tracing::warn!(run_id = %run_id.0, "Failed to persist run to SQLite: {e}");
+        }
     }
 
     /// Store a per-run cancellation token.
@@ -472,10 +538,20 @@ impl AppState {
             }
         }
 
+        // Build RunManager with optional SQLite persistence, then hydrate
+        // completed runs from the database so GET /runs returns history.
+        let run_manager = if let Some(store) = session_manager.store() {
+            let rm = RunManager::new().with_store(Arc::clone(store));
+            rm.hydrate_from_store();
+            rm
+        } else {
+            RunManager::new()
+        };
+
         Ok(Self {
             session_manager,
             gateway: Arc::new(tokio::sync::Mutex::new(gateway)),
-            run_manager: RunManager::new(),
+            run_manager,
             approval_store: ApprovalStore::new(),
             workspace_dir,
             data_dir,

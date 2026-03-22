@@ -6,6 +6,7 @@
 use crate::types::{Content, ContextSummary, Message, Role, Session, SessionStatus};
 use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
 use alms_core::registry::AgentRecord;
+use alms_core::run::{Run, RunStatus, TokenUsage};
 use alms_core::{
     AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, RunId, SessionId, Timestamp,
 };
@@ -86,6 +87,24 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
+
+CREATE TABLE IF NOT EXISTS runs (
+    run_id            TEXT PRIMARY KEY,
+    session_id        TEXT NOT NULL,
+    agent_id          TEXT NOT NULL,
+    input             TEXT NOT NULL DEFAULT '',
+    response          TEXT,
+    error             TEXT,
+    status            TEXT NOT NULL DEFAULT 'queued',
+    started_at        TEXT,
+    ended_at          TEXT,
+    prompt_tokens     INTEGER,
+    completion_tokens INTEGER,
+    job_id            TEXT,
+    created_at        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id);
 ";
 
 // ---------------------------------------------------------------------------
@@ -969,6 +988,123 @@ impl SqliteStore {
         }
         Ok(())
     }
+
+    // ── Runs ─────────────────────────────────────────────────────────────────
+
+    /// Insert or update a run row (upsert).
+    pub fn save_run(&self, run: &Run) -> AlmsResult<()> {
+        let (prompt_tokens, completion_tokens) = run
+            .usage
+            .map(|u| {
+                (
+                    Some(u.prompt_tokens as i64),
+                    Some(u.completion_tokens as i64),
+                )
+            })
+            .unwrap_or((None, None));
+
+        self.conn
+            .lock()
+            .execute(
+                "INSERT OR REPLACE INTO runs \
+                 (run_id, session_id, agent_id, input, response, error, status, \
+                  started_at, ended_at, prompt_tokens, completion_tokens, job_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    run.run_id.0.to_string(),
+                    run.session_id.0.to_string(),
+                    run.agent_id.0.to_string(),
+                    &run.input,
+                    run.output.as_deref(),
+                    run.error.as_deref(),
+                    run_status_to_str(run.status),
+                    run.started_at.map(|dt| dt.to_rfc3339()),
+                    run.ended_at.map(|dt| dt.to_rfc3339()),
+                    prompt_tokens,
+                    completion_tokens,
+                    run.job_id.map(|j| j.0.to_string()),
+                    run.created_at.to_rfc3339(),
+                ],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite save_run: {e}")))?;
+        Ok(())
+    }
+
+    /// Load a single run by its ID.
+    pub fn load_run(&self, run_id: RunId) -> AlmsResult<Option<Run>> {
+        let conn = self.conn.lock();
+        let result = conn.query_row(
+            "SELECT run_id, session_id, agent_id, input, response, error, status, \
+                    started_at, ended_at, prompt_tokens, completion_tokens, job_id, created_at \
+             FROM runs WHERE run_id = ?1",
+            params![run_id.0.to_string()],
+            parse_run_row,
+        );
+        match result {
+            Ok(run) => Ok(Some(run)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AlmsError::Runtime(format!("SQLite load_run: {e}"))),
+        }
+    }
+
+    /// Load runs for a session, newest first, up to `limit`.
+    pub fn load_runs_by_session(
+        &self,
+        session_id: SessionId,
+        limit: usize,
+    ) -> AlmsResult<Vec<Run>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, session_id, agent_id, input, response, error, status, \
+                        started_at, ended_at, prompt_tokens, completion_tokens, job_id, created_at \
+                 FROM runs WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2",
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_runs_by_session: {e}")))?;
+
+        let rows = stmt
+            .query_map(
+                params![session_id.0.to_string(), limit as i64],
+                parse_run_row,
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query load_runs_by_session: {e}")))?
+            .filter_map(|r| match r {
+                Ok(run) => Some(run),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable run row: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Load all runs (for startup hydration), oldest first.
+    pub fn load_all_runs(&self) -> AlmsResult<Vec<Run>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, session_id, agent_id, input, response, error, status, \
+                        started_at, ended_at, prompt_tokens, completion_tokens, job_id, created_at \
+                 FROM runs ORDER BY created_at ASC",
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_all_runs: {e}")))?;
+
+        let rows = stmt
+            .query_map([], parse_run_row)
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query load_all_runs: {e}")))?
+            .filter_map(|r| match r {
+                Ok(run) => Some(run),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable run row: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        Ok(rows)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,6 +1158,26 @@ fn str_to_job_status(s: &str) -> JobStatus {
         "active" => JobStatus::Active,
         "cancelled" => JobStatus::Cancelled,
         _ => JobStatus::Pending,
+    }
+}
+
+fn run_status_to_str(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
+
+fn str_to_run_status(s: &str) -> RunStatus {
+    match s {
+        "running" => RunStatus::Running,
+        "completed" => RunStatus::Completed,
+        "failed" => RunStatus::Failed,
+        "cancelled" => RunStatus::Cancelled,
+        _ => RunStatus::Queued,
     }
 }
 
@@ -1129,6 +1285,74 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),
+    })
+}
+
+/// Parse a run row from a SELECT query.
+///
+/// Expected column order:
+///   0: run_id, 1: session_id, 2: agent_id, 3: input, 4: response,
+///   5: error, 6: status, 7: started_at, 8: ended_at,
+///   9: prompt_tokens, 10: completion_tokens, 11: job_id, 12: created_at
+fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
+    let run_id_str: String = row.get(0)?;
+    let session_id_str: String = row.get(1)?;
+    let agent_id_str: String = row.get(2)?;
+    let input: String = row.get(3)?;
+    let response: Option<String> = row.get(4)?;
+    let error: Option<String> = row.get(5)?;
+    let status_str: String = row.get(6)?;
+    let started_at_str: Option<String> = row.get(7)?;
+    let ended_at_str: Option<String> = row.get(8)?;
+    let prompt_tokens: Option<i64> = row.get(9)?;
+    let completion_tokens: Option<i64> = row.get(10)?;
+    let job_id_str: Option<String> = row.get(11)?;
+    let created_at_str: String = row.get(12)?;
+
+    let run_id_uuid = uuid::Uuid::parse_str(&run_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let session_id_uuid = uuid::Uuid::parse_str(&session_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let agent_id_uuid = uuid::Uuid::parse_str(&agent_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e))
+        })?
+        .with_timezone(&chrono::Utc);
+    let started_at = started_at_str
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let ended_at = ended_at_str
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let usage = match (prompt_tokens, completion_tokens) {
+        (Some(pt), Some(ct)) => Some(TokenUsage {
+            prompt_tokens: pt as u32,
+            completion_tokens: ct as u32,
+        }),
+        _ => None,
+    };
+    let job_id = job_id_str
+        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+        .map(alms_core::job::JobId);
+
+    Ok(Run {
+        run_id: RunId(run_id_uuid),
+        session_id: SessionId(session_id_uuid),
+        agent_id: AgentId(agent_id_uuid),
+        status: str_to_run_status(&status_str),
+        input,
+        output: response,
+        error,
+        usage,
+        created_at,
+        started_at,
+        ended_at,
+        job_id,
     })
 }
 
@@ -1712,5 +1936,176 @@ mod tests {
 
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
+    }
+
+    // ── Run persistence tests ─────────────────────────────────────────────
+
+    fn new_run(session_id: SessionId, agent_id: AgentId) -> Run {
+        Run::new(session_id, agent_id, "hello".to_string())
+    }
+
+    #[test]
+    fn test_run_save_and_load() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let run = new_run(session.id, session.agent_id);
+        let run_id = run.run_id;
+
+        store.save_run(&run).unwrap();
+
+        let loaded = store.load_run(run_id).unwrap().expect("run should exist");
+        assert_eq!(loaded.run_id, run_id);
+        assert_eq!(loaded.session_id, session.id);
+        assert_eq!(loaded.agent_id, session.agent_id);
+        assert_eq!(loaded.input, "hello");
+        assert!(matches!(loaded.status, RunStatus::Queued));
+        assert!(loaded.output.is_none());
+        assert!(loaded.error.is_none());
+        assert!(loaded.usage.is_none());
+        assert!(loaded.started_at.is_none());
+        assert!(loaded.ended_at.is_none());
+    }
+
+    #[test]
+    fn test_run_completed_roundtrip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let mut run = new_run(session.id, session.agent_id);
+        run.mark_running();
+        run.mark_completed(
+            "I am a response".to_string(),
+            TokenUsage {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+            },
+        );
+
+        store.save_run(&run).unwrap();
+
+        let loaded = store.load_run(run.run_id).unwrap().unwrap();
+        assert!(matches!(loaded.status, RunStatus::Completed));
+        assert_eq!(loaded.output.as_deref(), Some("I am a response"));
+        assert!(loaded.error.is_none());
+        let usage = loaded.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 50);
+        assert!(loaded.started_at.is_some());
+        assert!(loaded.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_run_failed_roundtrip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let mut run = new_run(session.id, session.agent_id);
+        run.mark_running();
+        run.mark_failed("LLM error".to_string());
+
+        store.save_run(&run).unwrap();
+
+        let loaded = store.load_run(run.run_id).unwrap().unwrap();
+        assert!(matches!(loaded.status, RunStatus::Failed));
+        assert_eq!(loaded.error.as_deref(), Some("LLM error"));
+        assert!(loaded.output.is_none());
+    }
+
+    #[test]
+    fn test_run_load_by_session() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session1 = new_session();
+        let session2 = Session::new(AgentId::new(), "other-ctx");
+
+        let r1 = new_run(session1.id, session1.agent_id);
+        let r2 = new_run(session1.id, session1.agent_id);
+        let r3 = new_run(session2.id, session2.agent_id);
+        store.save_run(&r1).unwrap();
+        store.save_run(&r2).unwrap();
+        store.save_run(&r3).unwrap();
+
+        let runs = store.load_runs_by_session(session1.id, 50).unwrap();
+        assert_eq!(runs.len(), 2);
+
+        let runs = store.load_runs_by_session(session2.id, 50).unwrap();
+        assert_eq!(runs.len(), 1);
+    }
+
+    #[test]
+    fn test_run_load_by_session_limit() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+
+        for _ in 0..5 {
+            store
+                .save_run(&new_run(session.id, session.agent_id))
+                .unwrap();
+        }
+
+        let runs = store.load_runs_by_session(session.id, 3).unwrap();
+        assert_eq!(runs.len(), 3);
+    }
+
+    #[test]
+    fn test_run_upsert_updates() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let mut run = new_run(session.id, session.agent_id);
+        store.save_run(&run).unwrap();
+
+        // Transition to completed
+        run.mark_running();
+        run.mark_completed(
+            "done".to_string(),
+            TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 20,
+            },
+        );
+        store.save_run(&run).unwrap();
+
+        let loaded = store.load_run(run.run_id).unwrap().unwrap();
+        assert!(matches!(loaded.status, RunStatus::Completed));
+        assert_eq!(loaded.output.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn test_run_load_nonexistent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let result = store.load_run(RunId::new()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_run_with_job_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let job_id = alms_core::job::JobId(uuid::Uuid::new_v4());
+        let run = Run::for_job(
+            session.id,
+            session.agent_id,
+            "job prompt".to_string(),
+            job_id,
+        );
+
+        store.save_run(&run).unwrap();
+
+        let loaded = store.load_run(run.run_id).unwrap().unwrap();
+        assert_eq!(loaded.job_id, Some(job_id));
+        assert_eq!(loaded.input, "job prompt");
+    }
+
+    #[test]
+    fn test_load_all_runs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+
+        store
+            .save_run(&new_run(session.id, session.agent_id))
+            .unwrap();
+        store
+            .save_run(&new_run(session.id, session.agent_id))
+            .unwrap();
+
+        let all = store.load_all_runs().unwrap();
+        assert_eq!(all.len(), 2);
     }
 }

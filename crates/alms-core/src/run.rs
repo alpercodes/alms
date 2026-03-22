@@ -151,6 +151,12 @@ pub struct RunStatusResponse {
     pub session_id: SessionId,
     pub agent_id: AgentId,
     pub status: RunStatus,
+    /// The agent's text response (populated when run completes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    /// Error message (populated when run fails).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub usage: Option<TokenUsage>,
@@ -166,6 +172,8 @@ impl From<Run> for RunStatusResponse {
             session_id: run.session_id,
             agent_id: run.agent_id,
             status: run.status,
+            response: run.output.clone(),
+            error: run.error.clone(),
             started_at: run.started_at,
             ended_at: run.ended_at,
             usage: run.usage,
