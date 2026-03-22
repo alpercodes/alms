@@ -528,6 +528,42 @@ mod tests {
         }
     }
 
+    /// RAII guard for a single env var. Restores the original value on drop,
+    /// making tests panic-safe.
+    struct SingleEnvGuard {
+        key: String,
+        original: Option<String>,
+    }
+
+    impl SingleEnvGuard {
+        fn set(key: &str, val: &str) -> Self {
+            let original = std::env::var(key).ok();
+            set_env_var(key, val);
+            Self {
+                key: key.to_string(),
+                original,
+            }
+        }
+
+        fn remove(key: &str) -> Self {
+            let original = std::env::var(key).ok();
+            remove_env_var(key);
+            Self {
+                key: key.to_string(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for SingleEnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => set_env_var(&self.key, v),
+                None => remove_env_var(&self.key),
+            }
+        }
+    }
+
     #[test]
     fn test_default_config() {
         let config = AlmsConfig::default();
@@ -733,49 +769,30 @@ model = "claude-sonnet"
     #[test]
     fn test_workspace_dir_default() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("ALMS_WORKSPACE_DIR").ok();
-        remove_env_var("ALMS_WORKSPACE_DIR");
+        let _guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
 
         let config = ServerConfig::default();
         assert_eq!(config.workspace_dir(), PathBuf::from("./data/workspace"));
-
-        // Restore
-        if let Some(v) = saved {
-            set_env_var("ALMS_WORKSPACE_DIR", &v);
-        }
     }
 
     #[test]
     fn test_workspace_dir_env_override() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("ALMS_WORKSPACE_DIR").ok();
-        set_env_var("ALMS_WORKSPACE_DIR", "/custom/workspace");
+        let _guard = SingleEnvGuard::set("ALMS_WORKSPACE_DIR", "/custom/workspace");
 
         let config = ServerConfig::default();
         assert_eq!(config.workspace_dir(), PathBuf::from("/custom/workspace"));
-
-        // Restore
-        match saved {
-            Some(v) => set_env_var("ALMS_WORKSPACE_DIR", &v),
-            None => remove_env_var("ALMS_WORKSPACE_DIR"),
-        }
     }
 
     #[test]
     fn test_workspace_dir_uses_data_dir() {
         let _lock = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("ALMS_WORKSPACE_DIR").ok();
-        remove_env_var("ALMS_WORKSPACE_DIR");
+        let _guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
 
         let config = ServerConfig {
             data_dir: "/my/data".into(),
             ..Default::default()
         };
         assert_eq!(config.workspace_dir(), PathBuf::from("/my/data/workspace"));
-
-        // Restore
-        if let Some(v) = saved {
-            set_env_var("ALMS_WORKSPACE_DIR", &v);
-        }
     }
 }
