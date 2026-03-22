@@ -494,9 +494,32 @@ impl LlmClient {
         self
     }
 
+    /// Re-resolve the API key from a `SecretsStore` for the current provider.
+    ///
+    /// Unlike `with_provider_and_secrets`, this does NOT change the provider or
+    /// base URL — it only refreshes the API key. Falls back to env vars if the
+    /// secrets store has no key for the active provider.
+    pub fn with_secrets(mut self, secrets: &alms_core::secrets::SecretsStore) -> Self {
+        if let Some(key) = secrets.resolve_key(&self.config.provider) {
+            self.config.api_key = key;
+        }
+        self
+    }
+
+    /// Get the configured provider string (e.g. `"openrouter"`, `"anthropic"`).
+    pub fn provider(&self) -> &str {
+        &self.config.provider
+    }
+
     /// Get default model name
     pub fn default_model(&self) -> &str {
         &self.config.default_model
+    }
+
+    /// Get the current API key (test-only).
+    #[cfg(test)]
+    pub fn api_key(&self) -> &str {
+        &self.config.api_key
     }
 }
 
@@ -627,5 +650,59 @@ mod tests {
         let last = chunks.last().unwrap();
         assert_eq!(last.choices[0].finish_reason.as_deref(), Some("stop"));
         assert!(last.usage.is_some());
+    }
+
+    #[test]
+    fn test_provider_getter() {
+        let config = LlmConfig {
+            provider: "anthropic".into(),
+            api_key: "test-key".into(),
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+        assert_eq!(client.provider(), "anthropic");
+    }
+
+    #[test]
+    fn test_with_secrets_updates_key() {
+        let config = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "old-key".into(),
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+
+        // Create a secrets store with a temp path so set_key can persist
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_path = dir.path().join("secrets.json");
+        let mut secrets = alms_core::secrets::SecretsStore::load(secrets_path)
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("openrouter", "new-runtime-key").unwrap();
+
+        let updated = client.with_secrets(&secrets);
+        // Provider should not change
+        assert_eq!(updated.provider(), "openrouter");
+        // The default model should not change either
+        assert_eq!(updated.default_model(), "moonshotai/kimi-k2.5");
+        // The key must have been updated to the new value
+        assert_eq!(updated.api_key(), "new-runtime-key");
+    }
+
+    #[test]
+    fn test_with_secrets_no_key_keeps_existing() {
+        let config = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "original-key".into(),
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+
+        // Empty secrets store has no key for openrouter
+        let secrets = alms_core::secrets::SecretsStore::empty();
+        let updated = client.with_secrets(&secrets);
+        // Provider unchanged
+        assert_eq!(updated.provider(), "openrouter");
+        // Key must remain the original value when secrets store has nothing
+        assert_eq!(updated.api_key(), "original-key");
     }
 }

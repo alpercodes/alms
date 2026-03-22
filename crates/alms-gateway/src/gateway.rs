@@ -203,6 +203,9 @@ pub struct Gateway {
     llm: LlmClient,
     /// Shared default agent ID — updated live when the default agent changes.
     agent_id: Arc<RwLock<AgentId>>,
+    /// Live secrets store — shared with AppState so runtime key changes are
+    /// visible to the Telegram handler (and any other non-HTTP paths).
+    secrets: Arc<RwLock<alms_core::secrets::SecretsStore>>,
 }
 
 impl Gateway {
@@ -226,15 +229,23 @@ impl Gateway {
             }
             None => Arc::new(SessionManager::new(config.session_config.clone())),
         };
+        // Load secrets store — used both for initial key resolution and shared
+        // with AppState so runtime key changes are visible everywhere.
+        let secrets_path = alms_core::secrets::secrets_path_from_db(config.db_path.as_deref());
+        let secrets_store =
+            alms_core::secrets::SecretsStore::load(&secrets_path).unwrap_or_else(|e| {
+                warn!("Failed to load secrets: {e}");
+                alms_core::secrets::SecretsStore::empty()
+            });
+
         // Resolve API key from secrets file if available, overriding env vars
         let mut llm_config = config.llm_config.clone();
-        let secrets_path = alms_core::secrets::secrets_path_from_db(config.db_path.as_deref());
-        if let Ok(secrets) = alms_core::secrets::SecretsStore::load(&secrets_path)
-            && let Some(key) = secrets.resolve_key(&llm_config.provider)
-        {
+        if let Some(key) = secrets_store.resolve_key(&llm_config.provider) {
             llm_config.api_key = key;
         }
         let llm = LlmClient::new(llm_config)?;
+
+        let secrets = Arc::new(RwLock::new(secrets_store));
 
         Ok(Self {
             config,
@@ -242,6 +253,7 @@ impl Gateway {
             channels: Channels { telegram: None },
             llm,
             agent_id,
+            secrets,
         })
     }
 
@@ -336,13 +348,15 @@ impl Gateway {
                         // Apply per-agent config overrides (model, posture) from
                         // the agent registry, same as the HTTP run path.
                         let agent_id = self.agent_id();
+                        let secrets_guard = self.secrets.read().unwrap();
                         let resolved = crate::runs::resolve_agent_config(
                             agent_id,
                             &self.session_manager,
                             &self.config.agent_config,
                             &self.llm,
-                            None, // Telegram path: no secrets access (uses startup-resolved key)
+                            Some(&secrets_guard),
                         );
+                        drop(secrets_guard);
                         // Bootstrap detection: first-time agents get the
                         // bootstrap interview prompt instead of their default.
                         let mut agent_config = resolved.agent_config;
@@ -483,6 +497,14 @@ impl Gateway {
     /// Get auth token (None = auth disabled)
     pub fn auth_token(&self) -> Option<&str> {
         self.config.auth_token.as_deref()
+    }
+
+    /// Get a clone of the shared secrets store handle.
+    ///
+    /// The returned `Arc` is the same instance used by the Gateway's Telegram
+    /// handler, so updates made through AppState's copy are visible here too.
+    pub fn secrets_handle(&self) -> Arc<RwLock<alms_core::secrets::SecretsStore>> {
+        Arc::clone(&self.secrets)
     }
 }
 

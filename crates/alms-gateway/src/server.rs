@@ -511,14 +511,9 @@ impl AppState {
         }
         coord = coord.with_data_dir(data_dir.clone());
 
-        // Construct secrets store early so both coordinator and AppState can use it.
-        let secrets_path = alms_core::secrets::secrets_path_from_db(db_path_str.as_deref());
-        let secrets = Arc::new(std::sync::RwLock::new(
-            alms_core::secrets::SecretsStore::load(secrets_path).unwrap_or_else(|e| {
-                tracing::warn!("Failed to load secrets: {e}");
-                alms_core::secrets::SecretsStore::empty()
-            }),
-        ));
+        // Share the Gateway's secrets store so runtime key changes are visible
+        // to both HTTP handlers and the Telegram message loop.
+        let secrets = gateway.secrets_handle();
 
         coord = coord.with_secrets(secrets.clone());
         let coordinator = Arc::new(coord);

@@ -868,6 +868,10 @@ async fn run_agent_loop(
         } else {
             subagent_llm.with_provider(provider)
         };
+    } else if let Some(s) = secrets {
+        // No per-agent provider override — re-resolve the key for the
+        // server-default provider from the live secrets store.
+        subagent_llm = subagent_llm.with_secrets(&s.read().unwrap());
     }
     if let Some(model) = model_override {
         info!("Named subagent using model override: {model}");
