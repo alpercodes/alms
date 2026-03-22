@@ -105,30 +105,31 @@ fn dm_context_id(a: &str, b: &str) -> String {
 }
 ```
 
-Each side has its own session object for the DM, because sessions are keyed by `(agent_id, context_id)`:
+A DM conversation between two agents works exactly like a user↔agent chat does today — **one shared session** with a persistent conversation history. When an agent receives a message, it sees the full chat history (subject to the same context strategies: truncate, full, sliding-summary).
 
-- Agent B's session: `(agent_b_id, "dm:agent-a:agent-b")` -- B is the agent, A's messages appear as Role::User
-- Agent A's session: `(agent_a_id, "dm:agent-a:agent-b")` -- A is the agent, B's responses appear as Role::User
+The DM session is owned by the **receiving agent** at any given moment. When Agent A sends a message to Agent B:
 
-**Dual-write model.** Each agent has its own view of the conversation, stored in its own session. When A sends a message to B:
+1. The MessageBus resolves the DM session: `(agent_b_id, "dm:agent-a:agent-b")`
+2. A's message is appended as `Role::User` (from B's perspective, A is the "user")
+3. A `RunTrigger` is created on B's DM session
+4. B's agent loop runs, sees the full DM conversation history, and responds
+5. B's response is appended as `Role::Assistant` (normal agent response)
 
-1. The message is appended to **B's DM session** as a User message (because from B's perspective, A is a "user" sending input)
-2. The message is also appended to **A's DM session** as an Assistant message with metadata `{forwarded: true}` (so A's context shows what it sent)
-3. When B responds, B's response is appended to B's DM session as Assistant (normal) and to A's DM session as User (with metadata `{from: "agent-b"}`)
+When B wants to reply back to A, the same flow reverses:
 
-This is dual-write, but it preserves the existing session model perfectly. Each agent's session tells a coherent story from that agent's perspective, using the existing Role::User / Role::Assistant model. The LLM sees a natural conversation.
+1. B calls `send_message(to="agent-a", message="...")`
+2. The MessageBus resolves the DM session: `(agent_a_id, "dm:agent-a:agent-b")`
+3. B's message is appended as `Role::User` in A's DM session
+4. A `RunTrigger` is created on A's DM session
+5. A processes it with full DM history
 
-**Why this works better than a shared session:**
+**Key point:** Each agent has its own DM session for the same conversation (`agent_a_id + context_id` vs `agent_b_id + context_id`). Messages are written to the **receiving** agent's session only. The sending agent's record of what it sent is in its own session's assistant responses (since it called `send_message` as a tool during its run).
 
-- No changes to SessionManager, ContextBuilder, or the agent loop
-- Each agent's context window is built independently from its own session
-- Token budgets, sliding-summary, and context strategies work unchanged
-- The session model remains `(AgentId, context_id)` -- no new composite keys
-
-**Trade-off:** Messages are stored twice (once per side). This is acceptable because:
-- Messages are small (text + metadata)
-- Consistency is maintained by the MessageBus writing both sides atomically
-- Each agent can independently archive/compress its view without affecting the other
+This means:
+- No dual-write complexity — messages are written once, to the recipient's session
+- Context building works unchanged (ContextBuilder reads the agent's session as normal)
+- Sliding-summary and token budgets work per-agent as they do today
+- The existing session model `(AgentId, context_id)` is unchanged
 
 ### 3.3 The MessageBus
 
@@ -290,6 +291,8 @@ impl Tool for SendMessageTool {
 ```
 
 The tool returns immediately (fire-and-forget from the sender's perspective). The sender does NOT block waiting for a response. If the sender wants to see the response, it reads the DM session later using a new tool or gets notified.
+
+**Note:** The `send_message` tool currently only supports natural language (text) messages. Structured message support (Section 3.4, `MessagePayload::Structured`) will be added in a later phase — likely as an optional `structured` JSON parameter on the tool, or as a separate `send_structured_message` tool.
 
 ### 3.8 New Tool: `list_agents`
 
@@ -592,9 +595,44 @@ Per `communication-architecture.md` Section 5: agents in a meeting receive the *
 
 ---
 
-## 7. Task Queue Priority
+## 7. No Parallel Agent Instances (Critical Constraint)
 
-Per `communication-architecture.md` Section 8, the agent task queue (currently `SessionQueue`) supports priority levels:
+Per `communication-architecture.md` Section 8.2: **no two instances of the same agent may run in parallel.** All invocations — whether from a user chat, a DM, a group message, a scheduled job, or a subagent call — go through a **single per-agent queue**. Tasks are processed strictly one at a time.
+
+This is a hard constraint, not a suggestion. Running an agent in parallel across sessions would cause:
+- State conflicts (agent making contradictory decisions in two conversations)
+- Memory corruption (two instances writing to the same workspace files)
+- Confusing behavior (agent appearing in two places at once)
+
+### Current state
+
+The existing `SessionQueue` is **per-session**, not per-agent. This means an agent could currently have runs processing simultaneously on different sessions (e.g., user session + subagent session). This is already wrong in theory but rarely triggered in practice.
+
+### Required change
+
+Replace or wrap `SessionQueue` with a **per-agent queue** (`AgentQueue`). All runs for a given agent — regardless of which session they target — are serialized through this single queue. The session-level queue becomes unnecessary or is absorbed into the agent-level queue.
+
+```
+                     All messages for Agent B
+                     (user chat, DMs, groups, jobs, subagent calls)
+                            |
+                            v
+                     +------+------+
+                     | AgentQueue  |  ← single queue per agent
+                     | (serial)    |
+                     +------+------+
+                            |
+                            v
+                     execute_run() on the appropriate session
+```
+
+This change should be part of **Phase 1** since it is foundational to correct agent behavior with peer messaging.
+
+---
+
+## 8. Task Queue Priority
+
+Per `communication-architecture.md` Section 8, the agent task queue (the new `AgentQueue` from Section 7) supports priority levels:
 
 - **Normal**: FIFO. Default for all invocations.
 - **Urgent**: Jumps to front of queue. For blocking bugs, security incidents, or time-sensitive invocations.
@@ -605,7 +643,7 @@ The existing `SessionQueue` already has a two-tier priority system (`enqueue()` 
 
 ## 8. How This Integrates with Existing Systems
 
-### 6.1 Coexistence with invoke_agent
+### 8.1 Coexistence with invoke_agent
 
 `invoke_agent` (the hierarchy model) and `send_message` (the peer model) coexist. They serve different purposes:
 
@@ -621,7 +659,7 @@ The existing `SessionQueue` already has a two-tier priority system (`enqueue()` 
 
 They should NOT be merged. A developer agent asking a reviewer agent for a review should use `send_message`. A PM agent assigning a task to a developer agent should use `invoke_agent`. The LLM will learn the distinction through system prompts and experience.
 
-### 6.2 SSE Streaming
+### 8.2 SSE Streaming
 
 Peer messages integrate with existing SSE infrastructure:
 
@@ -630,11 +668,11 @@ Peer messages integrate with existing SSE infrastructure:
 - The UI can subscribe to any session's event stream, including DM sessions
 - A new SSE event type `message_received` notifies the UI when an agent gets a peer message
 
-### 6.3 Context Building
+### 8.3 Context Building
 
 No changes needed. Each agent's DM session is a regular session. ContextBuilder reads from it using the standard strategies (truncate, full, sliding-summary). The only addition is metadata on messages indicating the sender (`from` field), which the system prompt instructs the agent to use.
 
-### 6.4 User Observation
+### 8.4 User Observation
 
 The user needs to observe agent-to-agent conversations. This is handled by:
 
@@ -818,7 +856,11 @@ This is injected by the runtime when it detects a `dm:*` context_id on the sessi
 - `can_join_groups: true/false`
 - `can_create_groups: true/false`
 
-### 13.2 Message Rate Limiting
+### 13.2 Self-Messaging
+
+An agent sending a message to itself (`send_message(to="self-name")`) is currently allowed. This is a low-priority edge case — it could be used as a "leave a note for my next run" pattern. No explicit prevention for now; revisit if it causes issues.
+
+### 13.3 Message Rate Limiting
 
 Agents could flood each other with messages, creating infinite loops:
 - Agent A sends to Agent B
@@ -832,7 +874,7 @@ Agents could flood each other with messages, creating infinite loops:
 3. **Max message depth**: Track how many times a message has been "forwarded" (A->B->A->B...). After depth N (default: 5), delivery is refused with an error
 4. **Token budget per DM pair per hour**: Configurable limit on total tokens spent on a DM conversation
 
-### 13.3 User Override
+### 13.4 User Override
 
 The user (via the API or UI) can:
 - Pause a daemon agent (stop processing incoming messages)
@@ -851,16 +893,17 @@ Each phase delivers independent value and is a PR-sized chunk.
 **Goal**: Agent A can send a message to Agent B. B receives it as a run input.
 
 **Changes:**
-- `alms-coordinator`: Add `MessageBus` with `send()` method. DM session derivation (`dm:a:b`). Dual-write to sender and recipient sessions.
+- `alms-coordinator`: Add `MessageBus` with `send()` method. DM session derivation (`dm:a:b`). Write message to recipient's DM session.
 - `alms-coordinator`: Add `RunTrigger` type and `mpsc` channel.
 - `alms-gateway`: Generalize `completion_notification_loop` into `run_trigger_loop`. Wire `MessageBus` into `AppState`.
+- `alms-gateway`: Replace per-session `SessionQueue` with per-agent `AgentQueue` — all runs for a given agent serialize through one queue regardless of target session (Section 7).
 - `alms-runtime`: Add `SendMessageTool`. Register in runtime when MessageBus is available.
 - `alms-runtime`: Add `ListAgentsTool` (reads from `SqliteStore`).
 - `alms-runtime`: Add `ReadMessagesTool` (reads DM session history).
 - `alms-session`: No schema changes (DM sessions are regular sessions with a `dm:*` context_id).
 
 **Loop prevention (must ship with Phase 1):**
-- Message depth tracking: each message carries a `depth` counter incremented on each forward. MessageBus refuses delivery at `depth > MAX_DM_DEPTH` (default: 5).
+- Message depth tracking: the MessageBus internally tracks a `depth` counter per DM conversation chain, incremented each time a message bounces between the same pair (A→B = 1, B→A = 2, A→B = 3...). Delivery is refused at `depth > MAX_DM_DEPTH` (default: 5). This counter is managed entirely by the MessageBus — it is **not** exposed as a parameter on `send_message` and agents are unaware of it.
 - Per-DM-pair cooldown: after delivering a message, the MessageBus rejects another message between the same pair for T seconds (default: 5). This prevents tight A→B→A loops from burning tokens.
 - These are simple counters/timers in the MessageBus, not separate infrastructure.
 
