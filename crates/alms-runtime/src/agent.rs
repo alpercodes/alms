@@ -453,20 +453,47 @@ impl AgentRuntime {
             Err(e) => Err(e),
         };
 
+        // Detect DM sessions: the agent's response must be stored as
+        // Role::User with {from_agent, from_agent_id} metadata so that
+        // perspective mapping works for both participants. Non-DM sessions
+        // keep the existing Role::Assistant storage.
+        let is_dm = context_id.starts_with("dm:");
+
         match result {
             Ok((response, usage)) => {
                 // Skip persisting an assistant message when the response is
                 // empty. This happens when the agent used `ignore_message` to
                 // decline responding — there is nothing to record.
                 if !response.is_empty() {
-                    let assistant_msg = SessionMessage {
+                    let (role, metadata) = if is_dm {
+                        if let Some(ref name) = self.agent_name {
+                            (
+                                SessionRole::User,
+                                Some(serde_json::json!({
+                                    "from_agent": name,
+                                    "from_agent_id": self.agent_id.0.to_string(),
+                                    "message_type": "dm",
+                                })),
+                            )
+                        } else {
+                            warn!(
+                                context_id = %context_id,
+                                "DM session but agent_name not set — storing reply as Role::Assistant"
+                            );
+                            (SessionRole::Assistant, None)
+                        }
+                    } else {
+                        (SessionRole::Assistant, None)
+                    };
+
+                    let reply_msg = SessionMessage {
                         id: uuid::Uuid::new_v4().to_string(),
-                        role: SessionRole::Assistant,
+                        role,
                         content: alms_session::Content::Text(response.clone()),
                         timestamp: alms_core::Timestamp::now(),
-                        metadata: None,
+                        metadata,
                     };
-                    session_manager.append_message(session_id, assistant_msg)?;
+                    session_manager.append_message(session_id, reply_msg)?;
                 }
 
                 info!(
@@ -1774,34 +1801,53 @@ mod tests {
             .await;
         assert!(result.is_ok(), "run_on_session should succeed");
 
-        // After run: session should have the original message + the assistant
-        // response. Critically, it should NOT have a duplicate user message.
+        // After run: the session should have 2 messages, both stored as
+        // Role::User with from_agent metadata. In a DM session, all messages
+        // (including the agent's reply) use Role::User — perspective mapping
+        // in ContextBuilder assigns Role::Assistant at read time.
         let history_after = session_manager.get_history(session_id).unwrap();
+        assert_eq!(
+            history_after.len(),
+            2,
+            "Should have exactly 2 messages (alice's input + bob's reply). Found: {}",
+            history_after.len()
+        );
 
+        // All messages should be Role::User (shared DM session invariant).
         let user_messages: Vec<_> = history_after
             .iter()
             .filter(|m| m.role == alms_session::Role::User)
             .collect();
         assert_eq!(
             user_messages.len(),
-            1,
-            "Should have exactly 1 user message (no duplicate). Found: {}",
+            2,
+            "All messages in a DM session should be Role::User. Found: {}",
             user_messages.len()
         );
 
-        // The user message should still have its metadata intact.
-        let meta = user_messages[0].metadata.as_ref().unwrap();
-        assert_eq!(meta["from_agent"], "alice");
+        // Alice's input message should still have its metadata intact.
+        let alice_meta = user_messages[0].metadata.as_ref().unwrap();
+        assert_eq!(alice_meta["from_agent"], "alice");
 
-        // There should be an assistant response (from mock LLM).
+        // Bob's reply should have from_agent = "bob" with agent_id.
+        let bob_meta = user_messages[1]
+            .metadata
+            .as_ref()
+            .expect("Bob's reply must have from_agent metadata");
+        assert_eq!(bob_meta["from_agent"], "bob");
+        assert_eq!(bob_meta["from_agent_id"], bob_id.0.to_string());
+        assert_eq!(bob_meta["message_type"], "dm");
+
+        // There should be NO Role::Assistant messages in a DM session.
         let assistant_messages: Vec<_> = history_after
             .iter()
             .filter(|m| m.role == alms_session::Role::Assistant)
             .collect();
         assert_eq!(
             assistant_messages.len(),
-            1,
-            "Should have exactly 1 assistant message"
+            0,
+            "DM sessions should not have Role::Assistant messages (perspective mapping handles roles). Found: {}",
+            assistant_messages.len()
         );
     }
 
