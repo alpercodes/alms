@@ -438,6 +438,23 @@ impl AgentRuntime {
             .await
     }
 
+    /// Build `from_agent` metadata for DM sessions so that `read_messages`
+    /// can attribute system markers (errors, cancellations) to the correct
+    /// agent.  Returns `None` for non-DM sessions or when `agent_name` is
+    /// not set.
+    fn dm_marker_metadata(&self, is_dm: bool) -> Option<serde_json::Value> {
+        if is_dm {
+            self.agent_name.as_ref().map(|name| {
+                serde_json::json!({
+                    "from_agent": name,
+                    "from_agent_id": self.agent_id.0.to_string(),
+                })
+            })
+        } else {
+            None
+        }
+    }
+
     /// Shared tail for `run()` and `run_on_session()`: executes the agent loop
     /// and persists the result (assistant response, cancellation marker, or
     /// error marker) to the session.
@@ -504,12 +521,14 @@ impl AgentRuntime {
                 Ok(RunOutput { response, usage })
             }
             Err(AlmsError::Cancelled) => {
+                // In DM sessions, attach from_agent metadata so read_messages
+                // can attribute the cancellation marker to this agent.
                 let cancel_msg = SessionMessage {
                     id: uuid::Uuid::new_v4().to_string(),
                     role: SessionRole::Assistant,
                     content: alms_session::Content::Text("[Run cancelled by user]".to_string()),
                     timestamp: alms_core::Timestamp::now(),
-                    metadata: None,
+                    metadata: self.dm_marker_metadata(is_dm),
                 };
                 if let Err(append_err) = session_manager.append_message(session_id, cancel_msg) {
                     warn!(
@@ -522,13 +541,15 @@ impl AgentRuntime {
             Err(e) => {
                 // Write a sanitized error marker so the session reflects the failed attempt
                 // without leaking sensitive details (API keys, URLs) into LLM context.
+                // In DM sessions, attach from_agent metadata so read_messages
+                // can attribute the error marker to this agent.
                 let safe_reason = sanitize_error_for_session(&e);
                 let error_msg = SessionMessage {
                     id: uuid::Uuid::new_v4().to_string(),
                     role: SessionRole::Assistant,
                     content: alms_session::Content::Text(format!("[Run failed: {}]", safe_reason)),
                     timestamp: alms_core::Timestamp::now(),
-                    metadata: None,
+                    metadata: self.dm_marker_metadata(is_dm),
                 };
                 if let Err(append_err) = session_manager.append_message(session_id, error_msg) {
                     warn!("Failed to persist error marker to session: {}", append_err);
@@ -1849,6 +1870,45 @@ mod tests {
             "DM sessions should not have Role::Assistant messages (perspective mapping handles roles). Found: {}",
             assistant_messages.len()
         );
+    }
+
+    /// Verify that `dm_marker_metadata` returns `from_agent` metadata for DM
+    /// sessions and `None` for non-DM sessions.  This metadata is attached to
+    /// error/cancellation markers so `read_messages` can attribute them.
+    #[test]
+    fn test_dm_marker_metadata() {
+        let config = crate::llm_types::LlmConfig {
+            mock: true,
+            ..crate::llm_types::LlmConfig::default()
+        };
+        let llm = LlmClient::new(config).unwrap();
+        let agent_id = AgentId::new();
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+
+        // Without agent_name: always None regardless of is_dm.
+        let rt_no_name = AgentRuntime::new(agent_id, agent_config.clone(), llm.clone()).unwrap();
+        assert!(rt_no_name.dm_marker_metadata(true).is_none());
+        assert!(rt_no_name.dm_marker_metadata(false).is_none());
+
+        // With agent_name: returns metadata only when is_dm is true.
+        let rt_named = AgentRuntime::new(agent_id, agent_config, llm)
+            .unwrap()
+            .with_agent_name("bob".to_string());
+
+        let meta = rt_named.dm_marker_metadata(true);
+        assert!(
+            meta.is_some(),
+            "DM session with agent_name should produce metadata"
+        );
+        let meta = meta.unwrap();
+        assert_eq!(meta["from_agent"], "bob");
+        assert_eq!(meta["from_agent_id"], agent_id.0.to_string());
+
+        // Non-DM: no metadata even with agent_name set.
+        assert!(rt_named.dm_marker_metadata(false).is_none());
     }
 
     /// Verify that `run_on_session` fails with SessionNotFound if the session
