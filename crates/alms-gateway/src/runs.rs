@@ -127,24 +127,19 @@ fn apply_overrides(
     // ── Per-agent overrides (middle layer) ──
     if let Some(record) = agent_record
         && let Some(ref p) = record.posture
+        && let Ok(posture) = p.parse::<alms_runtime::Posture>()
     {
-        match p.as_str() {
-            "guarded" => cfg.posture = alms_runtime::Posture::Guarded,
-            "full_control" => cfg.posture = alms_runtime::Posture::FullControl,
-            _ => {} // unknown posture — keep server default
-        }
+        cfg.posture = posture;
     }
 
     // ── Per-run overrides (highest precedence) ──
     if let Some(m) = overrides.max_tokens.filter(|&m| m > 0) {
         cfg.max_tokens = m;
     }
-    if let Some(ref p) = overrides.posture {
-        match p.as_str() {
-            "guarded" => cfg.posture = alms_runtime::Posture::Guarded,
-            "full_control" => cfg.posture = alms_runtime::Posture::FullControl,
-            _ => {} // unknown posture — keep current
-        }
+    if let Some(ref p) = overrides.posture
+        && let Ok(posture) = p.parse::<alms_runtime::Posture>()
+    {
+        cfg.posture = posture;
     }
 
     MergedConfig {
@@ -374,12 +369,10 @@ async fn execute_run(
     if let Some(m) = overrides.max_tokens.filter(|&m| m > 0) {
         agent_config.max_tokens = m;
     }
-    if let Some(ref p) = overrides.posture {
-        match p.as_str() {
-            "guarded" => agent_config.posture = alms_runtime::Posture::Guarded,
-            "full_control" => agent_config.posture = alms_runtime::Posture::FullControl,
-            _ => {}
-        }
+    if let Some(ref p) = overrides.posture
+        && let Ok(posture) = p.parse::<alms_runtime::Posture>()
+    {
+        agent_config.posture = posture;
     }
     if let Some(ref model) = overrides.model {
         info!("Run {} using model override: {}", run_id.0, model);

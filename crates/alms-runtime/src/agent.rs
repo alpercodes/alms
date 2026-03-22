@@ -28,6 +28,29 @@ pub enum Posture {
     Guarded,
 }
 
+impl std::fmt::Display for Posture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Posture::FullControl => write!(f, "full_control"),
+            Posture::Guarded => write!(f, "guarded"),
+        }
+    }
+}
+
+impl std::str::FromStr for Posture {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "full_control" => Ok(Posture::FullControl),
+            "guarded" => Ok(Posture::Guarded),
+            other => Err(format!(
+                "Invalid posture '{other}'. Must be one of: full_control, guarded"
+            )),
+        }
+    }
+}
+
 /// Staged system prompts for different phases of the agent loop.
 ///
 /// Developer-controlled prompt files embedded at compile time from
@@ -2139,5 +2162,31 @@ mod tests {
             !system_text.contains("direct message from agent"),
             "Non-DM session should NOT have DM prompt addendum"
         );
+    }
+
+    #[test]
+    fn test_posture_from_str() {
+        assert_eq!("guarded".parse::<Posture>().unwrap(), Posture::Guarded);
+        assert_eq!(
+            "full_control".parse::<Posture>().unwrap(),
+            Posture::FullControl
+        );
+        assert!("unknown".parse::<Posture>().is_err());
+        assert!("".parse::<Posture>().is_err());
+    }
+
+    #[test]
+    fn test_posture_display() {
+        assert_eq!(Posture::Guarded.to_string(), "guarded");
+        assert_eq!(Posture::FullControl.to_string(), "full_control");
+    }
+
+    #[test]
+    fn test_posture_roundtrip() {
+        for posture in [Posture::Guarded, Posture::FullControl] {
+            let s = posture.to_string();
+            let parsed: Posture = s.parse().unwrap();
+            assert_eq!(parsed, posture);
+        }
     }
 }

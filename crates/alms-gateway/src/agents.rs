@@ -16,6 +16,7 @@ use crate::server::AppState;
 use alms_core::{
     AgentId, AgentRecord, CreateAgentRequest, UpdateAgentRequest, validate_agent_name,
 };
+use alms_runtime::Posture;
 use alms_session::SqliteStore;
 use axum::{
     Json,
@@ -25,19 +26,12 @@ use axum::{
 };
 use chrono::Utc;
 
-/// Valid posture values.
-const VALID_POSTURES: &[&str] = &["full_control", "guarded"];
-
 /// Validate a posture string. Empty string is allowed (means "clear override").
 fn validate_posture(posture: &str) -> Result<(), String> {
-    if posture.is_empty() || VALID_POSTURES.contains(&posture) {
+    if posture.is_empty() {
         Ok(())
     } else {
-        Err(format!(
-            "Invalid posture '{}'. Must be one of: {}",
-            posture,
-            VALID_POSTURES.join(", ")
-        ))
+        posture.parse::<Posture>().map(|_| ())
     }
 }
 
