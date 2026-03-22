@@ -129,12 +129,18 @@ impl MessageSender for MessageBus {
 
         let dm_context = dm_context_id(sender_name, recipient_name);
 
-        // Per-DM-pair cooldown check
+        // Per-DM-pair cooldown check. When the cooldown has expired, also
+        // reset the depth counter so agents can have separate conversation
+        // bursts over time (depth tracks bouncing within a single burst,
+        // not all-time exchanges).
         if let Some(last_send) = self.cooldowns.get(&dm_context) {
             let elapsed = last_send.elapsed().as_secs();
             if elapsed < DM_COOLDOWN_SECS {
                 return Err(SendError::CooldownActive);
             }
+            // Cooldown expired — reset depth for this pair so a new
+            // conversation burst can start fresh.
+            self.depths.remove(&dm_context);
         }
 
         // Internal depth tracking: increments each time a different sender
@@ -405,5 +411,140 @@ mod tests {
         let meta = history[0].metadata.as_ref().unwrap();
         assert_eq!(meta["from_agent"], "alice");
         assert_eq!(meta["from_agent_id"], a.0.to_string());
+    }
+
+    #[tokio::test]
+    async fn test_depth_resets_after_cooldown_expires() {
+        let (bus, _rx) = setup();
+        let a = AgentId::new();
+        let b = AgentId::new();
+
+        // Exhaust depth: send MAX_DM_DEPTH alternating messages
+        for i in 0..MAX_DM_DEPTH {
+            bus.cooldowns.clear();
+            if i % 2 == 0 {
+                bus.send("alice", a, "bob", b, "ping").await.unwrap();
+            } else {
+                bus.send("bob", b, "alice", a, "pong").await.unwrap();
+            }
+        }
+
+        // Next message should be rejected (depth exceeded)
+        bus.cooldowns.clear();
+        let err = bus
+            .send(
+                if MAX_DM_DEPTH % 2 == 0 {
+                    "alice"
+                } else {
+                    "bob"
+                },
+                if MAX_DM_DEPTH % 2 == 0 { a } else { b },
+                if MAX_DM_DEPTH % 2 == 0 {
+                    "bob"
+                } else {
+                    "alice"
+                },
+                if MAX_DM_DEPTH % 2 == 0 { b } else { a },
+                "overflow",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendError::DepthExceeded));
+
+        // Simulate cooldown expiry: insert a cooldown timestamp in the past.
+        let dm_ctx = dm_context_id("alice", "bob");
+        bus.cooldowns.insert(
+            dm_ctx.clone(),
+            Instant::now() - std::time::Duration::from_secs(DM_COOLDOWN_SECS + 1),
+        );
+
+        // After cooldown expires, depth should be reset — sending should succeed.
+        let receipt = bus.send("alice", a, "bob", b, "fresh start").await.unwrap();
+        assert_eq!(
+            receipt.session_id,
+            SessionId::deterministic_dm("alice", "bob")
+        );
+    }
+
+    /// Integration test: full DM round-trip through MessageBus verifying
+    /// shared session, correct metadata, and no duplicate messages.
+    ///
+    /// This test exercises the flow that was broken by C1 (session split)
+    /// and C2 (double-write). It verifies that:
+    /// 1. MessageBus writes the sender's message to the shared DM session.
+    /// 2. The RunTrigger contains the correct session_id and context_id.
+    /// 3. Looking up the session by the deterministic SessionId finds the
+    ///    message that was written.
+    /// 4. No duplicate messages exist in the session.
+    #[tokio::test]
+    async fn test_full_dm_roundtrip_no_duplicate() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Step 1: Alice sends a message to Bob via the MessageBus.
+        let receipt = bus
+            .send("alice", alice_id, "bob", bob_id, "Hello Bob, how are you?")
+            .await
+            .unwrap();
+
+        let expected_session_id = SessionId::deterministic_dm("alice", "bob");
+        assert_eq!(receipt.session_id, expected_session_id);
+
+        // Step 2: Verify the RunTrigger was emitted with correct fields.
+        let trigger = rx.try_recv().unwrap();
+        assert_eq!(trigger.agent_id, bob_id);
+        assert_eq!(trigger.session_id, expected_session_id);
+        assert_eq!(trigger.input, "Hello Bob, how are you?");
+        assert_eq!(trigger.context_id, dm_context_id("alice", "bob"));
+
+        // Step 3: Verify the shared session has exactly ONE message
+        // (written by MessageBus) — no duplicate.
+        let history = bus
+            .session_manager
+            .get_history(expected_session_id)
+            .unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "Session should have exactly 1 message (from MessageBus), not {}",
+            history.len()
+        );
+
+        // Step 4: Verify metadata is correct (from_agent present).
+        let msg = &history[0];
+        assert_eq!(msg.role, alms_session::Role::User);
+        let meta = msg.metadata.as_ref().expect("metadata should be present");
+        assert_eq!(meta["from_agent"], "alice");
+        assert_eq!(meta["from_agent_id"], alice_id.0.to_string());
+        assert_eq!(meta["message_type"], "dm");
+
+        // Step 5: The shared session should be findable by SessionId directly
+        // (this is what run_on_session uses — if this fails, C1 is not fixed).
+        let session = bus.session_manager.get(expected_session_id).unwrap();
+        assert_eq!(session.id, expected_session_id);
+
+        // Step 6: A second message from Bob should use the SAME session.
+        bus.cooldowns.clear();
+        let receipt2 = bus
+            .send("bob", bob_id, "alice", alice_id, "I'm fine, thanks!")
+            .await
+            .unwrap();
+        assert_eq!(receipt2.session_id, expected_session_id);
+
+        let history2 = bus
+            .session_manager
+            .get_history(expected_session_id)
+            .unwrap();
+        assert_eq!(
+            history2.len(),
+            2,
+            "Session should have exactly 2 messages after Bob's reply"
+        );
+        assert_eq!(
+            history2[0].metadata.as_ref().unwrap()["from_agent"],
+            "alice"
+        );
+        assert_eq!(history2[1].metadata.as_ref().unwrap()["from_agent"], "bob");
     }
 }

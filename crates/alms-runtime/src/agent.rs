@@ -384,8 +384,72 @@ impl AgentRuntime {
         };
         session_manager.append_message(session.id, user_msg)?;
 
+        self.finish_run(session_manager, session.id, context_id, history)
+            .await
+    }
+
+    /// Run the agent on a pre-existing shared session (e.g. a DM session).
+    ///
+    /// Unlike `run()`, this method:
+    /// - Looks up the session by `SessionId` directly instead of creating one
+    ///   via `get_or_create(agent_id, context_id)`. This ensures the agent uses
+    ///   the shared DM session created by `MessageBus`, not a new empty one.
+    /// - Skips persisting the input message because the `MessageBus` already
+    ///   wrote it to the session with `from_agent` metadata.
+    #[instrument(
+        level = "info",
+        skip(self, session_manager, input),
+        fields(
+            agent_id = %self.agent_id.0,
+            session_id = %session_id.0,
+            context_id = %context_id,
+            max_iterations = %self.config.max_iterations
+        )
+    )]
+    pub async fn run_on_session(
+        &self,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        context_id: &str,
+        input: &str,
+    ) -> AlmsResult<RunOutput> {
+        info!(
+            target: "agent::run_on_session_start",
+            agent_id = %self.agent_id.0,
+            session_id = %session_id.0,
+            context_id = %context_id,
+            input_len = input.len(),
+            "Agent run_on_session started (shared session, input already persisted)"
+        );
+
+        // Verify the session exists -- fail loudly if not.
+        session_manager.get(session_id)?;
+
+        // Build context: the input message is already in the session history
+        // (written by MessageBus), so we pass an empty string as the current
+        // input to avoid duplicating it in the context window.
+        let history = self
+            .build_context(session_manager, &session_id, context_id, "")
+            .await;
+
+        // Do NOT persist the input message -- it is already in the session.
+
+        self.finish_run(session_manager, session_id, context_id, history)
+            .await
+    }
+
+    /// Shared tail for `run()` and `run_on_session()`: executes the agent loop
+    /// and persists the result (assistant response, cancellation marker, or
+    /// error marker) to the session.
+    async fn finish_run(
+        &self,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        context_id: &str,
+        history: AlmsResult<Vec<LlmMessage>>,
+    ) -> AlmsResult<RunOutput> {
         let result = match history {
-            Ok(h) => self.agent_loop(session_manager, session.id, h).await,
+            Ok(h) => self.agent_loop(session_manager, session_id, h).await,
             Err(e) => Err(e),
         };
 
@@ -402,7 +466,7 @@ impl AgentRuntime {
                         timestamp: alms_core::Timestamp::now(),
                         metadata: None,
                     };
-                    session_manager.append_message(session.id, assistant_msg)?;
+                    session_manager.append_message(session_id, assistant_msg)?;
                 }
 
                 info!(
@@ -420,7 +484,7 @@ impl AgentRuntime {
                     timestamp: alms_core::Timestamp::now(),
                     metadata: None,
                 };
-                if let Err(append_err) = session_manager.append_message(session.id, cancel_msg) {
+                if let Err(append_err) = session_manager.append_message(session_id, cancel_msg) {
                     warn!(
                         "Failed to persist cancellation marker to session: {}",
                         append_err
@@ -439,7 +503,7 @@ impl AgentRuntime {
                     timestamp: alms_core::Timestamp::now(),
                     metadata: None,
                 };
-                if let Err(append_err) = session_manager.append_message(session.id, error_msg) {
+                if let Err(append_err) = session_manager.append_message(session_id, error_msg) {
                     warn!("Failed to persist error marker to session: {}", append_err);
                 }
 
@@ -1651,5 +1715,123 @@ mod tests {
             result.is_ok(),
             "Empty sandbox_root should mean unrestricted"
         );
+    }
+
+    /// Integration test for `run_on_session`: verifies that the agent uses
+    /// the shared DM session directly (no session split) and does not
+    /// duplicate the input message (which was already persisted by MessageBus).
+    #[tokio::test]
+    async fn test_run_on_session_uses_shared_session_no_duplicate() {
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let llm = LlmClient::new(config).unwrap();
+        let bob_id = AgentId::new();
+
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(bob_id, agent_config, llm)
+            .unwrap()
+            .with_agent_name("bob".to_string());
+
+        // Simulate what MessageBus does: create a shared DM session and
+        // write the sender's message into it.
+        let dm_context = "dm:alice:bob";
+        let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+        let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+        let sender_msg = alms_session::Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: alms_session::Role::User,
+            content: alms_session::Content::Text("Hello Bob!".to_string()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "from_agent": "alice",
+                "from_agent_id": AgentId::new().0.to_string(),
+                "message_type": "dm",
+            })),
+        };
+        session_manager
+            .append_message(session_id, sender_msg)
+            .unwrap();
+
+        // Before run: session has exactly 1 message (from alice via MessageBus).
+        let history_before = session_manager.get_history(session_id).unwrap();
+        assert_eq!(
+            history_before.len(),
+            1,
+            "Pre-condition: 1 message from MessageBus"
+        );
+
+        // Run on the shared session (as the recipient agent would).
+        let result = runtime
+            .run_on_session(&session_manager, session_id, dm_context, "Hello Bob!")
+            .await;
+        assert!(result.is_ok(), "run_on_session should succeed");
+
+        // After run: session should have the original message + the assistant
+        // response. Critically, it should NOT have a duplicate user message.
+        let history_after = session_manager.get_history(session_id).unwrap();
+
+        let user_messages: Vec<_> = history_after
+            .iter()
+            .filter(|m| m.role == alms_session::Role::User)
+            .collect();
+        assert_eq!(
+            user_messages.len(),
+            1,
+            "Should have exactly 1 user message (no duplicate). Found: {}",
+            user_messages.len()
+        );
+
+        // The user message should still have its metadata intact.
+        let meta = user_messages[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["from_agent"], "alice");
+
+        // There should be an assistant response (from mock LLM).
+        let assistant_messages: Vec<_> = history_after
+            .iter()
+            .filter(|m| m.role == alms_session::Role::Assistant)
+            .collect();
+        assert_eq!(
+            assistant_messages.len(),
+            1,
+            "Should have exactly 1 assistant message"
+        );
+    }
+
+    /// Verify that `run_on_session` fails with SessionNotFound if the session
+    /// does not exist (rather than silently creating a new empty session).
+    #[tokio::test]
+    async fn test_run_on_session_fails_if_session_missing() {
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let llm = LlmClient::new(config).unwrap();
+        let agent_id = AgentId::new();
+
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(agent_id, agent_config, llm)
+            .unwrap()
+            .with_agent_name("bob".to_string());
+
+        // Try to run on a non-existent session.
+        let fake_session_id = alms_core::SessionId::new();
+        let result = runtime
+            .run_on_session(&session_manager, fake_session_id, "dm:alice:bob", "hello")
+            .await;
+
+        assert!(result.is_err(), "Should fail if session does not exist");
     }
 }
