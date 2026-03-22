@@ -685,8 +685,12 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     info!("Job fired → run {}", run_id.0);
 
     // Execute the run (awaits completion; errors are handled inside execute_run).
-    // Scheduled jobs use a fresh token — cancellation is via job-level cancel, not run-level.
+    // Register the token so scheduled job runs are cancellable via POST /runs/{id}/cancel
+    // in addition to the job-level DELETE /jobs/{id} path.
     let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
     execute_run(
         state.clone(),
         run_id,

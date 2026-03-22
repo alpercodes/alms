@@ -38,8 +38,11 @@ CREATE TABLE IF NOT EXISTS messages (
     role       TEXT NOT NULL,
     content    TEXT NOT NULL,
     timestamp  TEXT NOT NULL,
-    metadata   TEXT
+    metadata   TEXT,
+    seq        INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,6 +122,15 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite schema init: {e}")))?;
         // Auto-migrate: add provider column if missing (existing DBs).
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN provider TEXT;");
+        // Auto-migrate: add seq column for stable message ordering (existing DBs).
+        let _ = conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;\
+             UPDATE messages SET seq = rowid WHERE seq = 0;",
+        );
+        // Auto-migrate: add (session_id, seq) index for message ordering queries.
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);",
+        );
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -310,7 +322,14 @@ impl SqliteStore {
 
     // ── Messages ─────────────────────────────────────────────────────────────
 
-    /// Upsert a single message row.
+    /// Persist a message for a session.
+    ///
+    /// On insert, `seq` is computed as `MAX(seq) + 1` for the session via a
+    /// subquery so the allocation only happens when the row is actually new.
+    ///
+    /// On conflict (same message `id` already exists), only `content` and
+    /// `metadata` are updated — `role`, `timestamp`, and `seq` are preserved
+    /// from the original insert.
     pub fn save_message(&self, session_id: SessionId, msg: &Message) -> AlmsResult<()> {
         let content_json = serde_json::to_string(&msg.content)?;
         let metadata_json = msg
@@ -318,32 +337,33 @@ impl SqliteStore {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        self.conn
-            .lock()
-            .execute(
-                "INSERT OR REPLACE INTO messages \
-             (id, session_id, role, content, timestamp, metadata) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    &msg.id,
-                    session_id.0.to_string(),
-                    role_to_str(msg.role),
-                    content_json,
-                    msg.timestamp.0.to_rfc3339(),
-                    metadata_json,
-                ],
-            )
-            .map_err(|e| AlmsError::Runtime(format!("SQLite save_message: {e}")))?;
+        let conn = self.conn.lock();
+        let sid = session_id.0.to_string();
+        conn.execute(
+            "INSERT INTO messages (id, session_id, role, content, timestamp, metadata, seq) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
+                     (SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE session_id = ?2)) \
+             ON CONFLICT(id) DO UPDATE SET content=excluded.content, metadata=excluded.metadata",
+            params![
+                &msg.id,
+                &sid,
+                role_to_str(msg.role),
+                content_json,
+                msg.timestamp.0.to_rfc3339(),
+                metadata_json,
+            ],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite save_message: {e}")))?;
         Ok(())
     }
 
-    /// Load all messages for a session in insertion order.
+    /// Load all messages for a session in logical order.
     pub fn load_messages(&self, session_id: SessionId) -> AlmsResult<Vec<Message>> {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT id, role, content, timestamp, metadata \
-                 FROM messages WHERE session_id = ?1 ORDER BY rowid",
+                 FROM messages WHERE session_id = ?1 ORDER BY seq",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare messages: {e}")))?;
 
@@ -1615,6 +1635,40 @@ mod tests {
         store.save_message(session.id, &new_message("one")).unwrap();
         store.save_message(session.id, &new_message("two")).unwrap();
         assert_eq!(store.message_count(session.id).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_reinsert_message_preserves_ordering() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        // Insert three messages; note the id of the first one.
+        let mut msg_a = new_message("first");
+        let msg_b = new_message("second");
+        let msg_c = new_message("third");
+        let id_a = msg_a.id.clone();
+
+        store.save_message(session.id, &msg_a).unwrap();
+        store.save_message(session.id, &msg_b).unwrap();
+        store.save_message(session.id, &msg_c).unwrap();
+
+        // Re-insert msg_a with updated content (same id).
+        msg_a.content = Content::Text("first-updated".to_string());
+        store.save_message(session.id, &msg_a).unwrap();
+
+        let messages = store.load_messages(session.id).unwrap();
+        assert_eq!(messages.len(), 3, "re-insert should not duplicate");
+
+        // msg_a must still be first (seq preserved on conflict).
+        assert_eq!(messages[0].id, id_a);
+        assert!(
+            matches!(&messages[0].content, Content::Text(t) if t == "first-updated"),
+            "content should be updated"
+        );
+        // Ordering must be: first-updated, second, third.
+        assert!(matches!(&messages[1].content, Content::Text(t) if t == "second"));
+        assert!(matches!(&messages[2].content, Content::Text(t) if t == "third"));
     }
 
     // ── create_agent_if_none_exist tests ─────────────────────────────────
