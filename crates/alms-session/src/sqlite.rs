@@ -42,8 +42,6 @@ CREATE TABLE IF NOT EXISTS messages (
     seq        INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
-
 CREATE TABLE IF NOT EXISTS audit_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
