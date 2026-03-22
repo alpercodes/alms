@@ -110,7 +110,6 @@ export function SettingsModal({ open, onClose }) {
     const model = useSignal('');
     const maxTokens = useSignal('');
     const posture = useSignal('');
-    const streamChunkTimeout = useSignal('');
     const saved = useSignal(false);
 
     useEffect(() => {
@@ -120,9 +119,6 @@ export function SettingsModal({ open, onClose }) {
                 ? String(localSettings.value.max_tokens)
                 : '';
             posture.value = localSettings.value.posture || '';
-            streamChunkTimeout.value = localSettings.value.stream_chunk_timeout_secs != null
-                ? String(localSettings.value.stream_chunk_timeout_secs)
-                : '';
             saved.value = false;
         }
     }, [open]);
@@ -137,19 +133,16 @@ export function SettingsModal({ open, onClose }) {
         const mt = parseInt(maxTokens.value, 10);
         updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
         updates.posture = posture.value || null;
-        const sct = parseInt(streamChunkTimeout.value, 10);
-        updates.stream_chunk_timeout_secs = (!isNaN(sct) && sct > 0) ? sct : null;
         saveSettings(updates);
         saved.value = true;
         setTimeout(() => onClose(), 600);
     };
 
     const onReset = () => {
-        saveSettings({ model: null, max_tokens: null, posture: null, stream_chunk_timeout_secs: null });
+        saveSettings({ model: null, max_tokens: null, posture: null });
         model.value = '';
         maxTokens.value = '';
         posture.value = '';
-        streamChunkTimeout.value = '';
         saved.value = true;
         setTimeout(() => onClose(), 600);
     };
@@ -196,14 +189,6 @@ export function SettingsModal({ open, onClose }) {
                             <option value="full_control">full_control</option>
                             <option value="guarded">guarded</option>
                         </select>
-                    </div>
-
-                    <div class="settings-row">
-                        <label class="settings-label">Stream chunk timeout (seconds)</label>
-                        <input class="settings-input" type="number" min="1"
-                               placeholder=${defaults.stream_chunk_timeout_secs || 60}
-                               value=${streamChunkTimeout.value}
-                               onInput=${e => { streamChunkTimeout.value = e.target.value; }} />
                     </div>
                 </div>
 

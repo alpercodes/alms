@@ -811,4 +811,36 @@ model = "claude-sonnet"
         };
         assert_eq!(config.workspace_dir(), PathBuf::from("/my/data/workspace"));
     }
+
+    #[test]
+    fn test_validation_zero_stream_chunk_timeout() {
+        let mut config = AlmsConfig::default();
+        config.llm.stream_chunk_timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stream_chunk_timeout_secs"),
+            "error should mention stream_chunk_timeout_secs: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_env_override_stream_chunk_timeout() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_LLM_STREAM_CHUNK_TIMEOUT", "90");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.llm.stream_chunk_timeout_secs, 90);
+    }
+
+    #[test]
+    fn test_toml_stream_chunk_timeout() {
+        let toml = r#"
+[llm]
+stream_chunk_timeout_secs = 120
+"#;
+        let config: AlmsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.llm.stream_chunk_timeout_secs, 120);
+    }
 }
