@@ -166,6 +166,7 @@ pub struct ListRunsQuery {
 }
 
 /// GET /runs/{run_id}/tool-calls — list tool call records for a run.
+#[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
 pub async fn get_run_tool_calls(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
@@ -617,20 +618,24 @@ async fn execute_run(
     drop(runtime);
     forwarder_handle.await.ok();
 
+    // Helper: persist tool call records (used by all outcome branches).
+    let persist_tool_calls = |records: &[alms_core::ToolCallRecord]| {
+        if !records.is_empty()
+            && let Some(store) = state.session_manager.store()
+            && let Err(e) = store.save_tool_calls(run_id, records)
+        {
+            warn!(
+                "Failed to persist {} tool call records for run {}: {}",
+                records.len(),
+                run_id.0,
+                e
+            );
+        }
+    };
+
     match result {
         Ok(output) => {
-            // Persist tool call records to the run_tool_calls table.
-            if !output.tool_calls.is_empty()
-                && let Some(store) = state.session_manager.store()
-                && let Err(e) = store.save_tool_calls(run_id, &output.tool_calls)
-            {
-                warn!(
-                    "Failed to persist {} tool call records for run {}: {}",
-                    output.tool_calls.len(),
-                    run_id.0,
-                    e
-                );
-            }
+            persist_tool_calls(&output.tool_calls);
 
             // token_delta events already emitted during streaming in the agent loop
             state
@@ -657,6 +662,47 @@ async fn execute_run(
             state.run_manager.mark_run_as_cancelled(run_id);
 
             info!("Run {} cancelled", run_id.0);
+        }
+        Err(alms_core::AlmsError::CancelledWithToolCalls { tool_calls }) => {
+            // Persist partial tool call records even though the run was cancelled.
+            persist_tool_calls(&tool_calls);
+
+            state
+                .run_manager
+                .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+                .await;
+
+            state.run_manager.mark_run_as_cancelled(run_id);
+
+            info!(
+                "Run {} cancelled ({} tool calls persisted)",
+                run_id.0,
+                tool_calls.len()
+            );
+        }
+        Err(alms_core::AlmsError::FailedWithToolCalls { source, tool_calls }) => {
+            // Persist partial tool call records even though the run failed.
+            persist_tool_calls(&tool_calls);
+
+            state
+                .run_manager
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_error(run_id, &source.to_string()),
+                )
+                .await;
+
+            state
+                .run_manager
+                .mark_run_as_failed(run_id, source.to_string());
+
+            error!(
+                "Run {} failed ({} tool calls persisted): {}",
+                run_id.0,
+                tool_calls.len(),
+                source
+            );
         }
         Err(e) => {
             state

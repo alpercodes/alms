@@ -242,7 +242,8 @@ Why not `POST /agent/run`?
   "ended_at": "2026-02-11T07:52:05Z",
   "usage": { "prompt_tokens": 150, "completion_tokens": 42 },
   "ts": "2026-02-11T07:52:05Z",
-  "job_id": null
+  "job_id": null,
+  "tool_call_count": 6
 }
 ```
 
@@ -250,6 +251,7 @@ Notes:
 - `response` and `error` use `skip_serializing_if = "Option::is_none"` — they are absent (not `null`) for in-flight runs, present only once the run reaches a terminal state.
 - `response` maps to the agent's text output (`Run.output`); renamed at the API boundary for clarity.
 - `usage` is `null` for failed/cancelled runs.
+- `tool_call_count` (optional integer) — number of tool call records stored for this run. Present when SQLite persistence is enabled. Use `GET /runs/{run_id}/tool-calls` to retrieve the full records.
 
 ### 5.3 Stream a run (SSE-first)
 `GET /runs/{run_id}/events`
@@ -354,7 +356,44 @@ The `source` field is omitted when not set. `is_notification` is `true` when the
 #### Reconnect
 Supported via `Last-Event-ID` header. The server replays missed events and deduplicates overlap with the live stream.
 
-### 5.4 Cancel a run
+### 5.4 Get run tool calls
+`GET /runs/{run_id}/tool-calls`
+
+Returns the full list of tool call and result records for a run, ordered by sequence number. Tool calls are persisted for completed, failed, and cancelled runs (partial records are saved when a run ends early).
+
+**Response 200**
+```json
+{
+  "run_id": "<uuid>",
+  "tool_calls": [
+    {
+      "seq": 0,
+      "role": "assistant",
+      "tool_name": "shell_exec",
+      "tool_id": "call_abc123",
+      "params": "{\"command\":\"ls\"}",
+      "timestamp": "2026-03-22T10:00:00Z"
+    },
+    {
+      "seq": 1,
+      "role": "tool",
+      "tool_name": "shell_exec",
+      "tool_id": "call_abc123",
+      "result": "\"file1.txt\\nfile2.txt\"",
+      "timestamp": "2026-03-22T10:00:01Z"
+    }
+  ]
+}
+```
+
+**Response 404** — run not found.
+
+Notes:
+- `role` is `"assistant"` for tool call requests and `"tool"` for tool results.
+- `params` and `result` are JSON-encoded strings (may be absent depending on the role).
+- For DM sessions, tool calls are stored per-run only (not in the session history).
+
+### 5.5 Cancel a run
 `POST /runs/{run_id}/cancel`
 
 Cancels a running or queued run. Returns 200 with `{"run_id":"...","status":"cancelling"}`.

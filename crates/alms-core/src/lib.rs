@@ -19,7 +19,7 @@ pub use registry::{
 };
 pub use run::{
     CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
-    TokenUsage, ToolCallRecord,
+    TokenUsage, ToolCallRecord, ToolCallRole,
 };
 
 use chrono::{DateTime, Utc};

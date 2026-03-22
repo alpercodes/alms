@@ -6,7 +6,7 @@
 use crate::types::{Content, ContextSummary, Message, Role, Session, SessionStatus};
 use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
 use alms_core::registry::AgentRecord;
-use alms_core::run::{Run, RunStatus, TokenUsage, ToolCallRecord};
+use alms_core::run::{Run, RunStatus, TokenUsage, ToolCallRecord, ToolCallRole};
 use alms_core::{
     AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, RunId, SessionId, Timestamp,
 };
@@ -217,7 +217,8 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Delete a session and all its related data (messages, audit, summaries).
+    /// Delete a session and all its related data (messages, audit, summaries,
+    /// runs, run tool calls).
     ///
     /// Wrapped in a transaction so a crash mid-delete cannot leave orphaned rows.
     pub fn delete_session(&self, session_id: SessionId) -> AlmsResult<()> {
@@ -242,6 +243,16 @@ impl SqliteStore {
             params![&id_str],
         )
         .map_err(|e| AlmsError::Runtime(format!("SQLite delete messages: {e}")))?;
+        // Delete tool call records for runs belonging to this session.
+        tx.execute(
+            "DELETE FROM run_tool_calls WHERE run_id IN \
+             (SELECT run_id FROM runs WHERE session_id = ?1)",
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete run tool calls: {e}")))?;
+        // Delete runs belonging to this session.
+        tx.execute("DELETE FROM runs WHERE session_id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete runs: {e}")))?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![&id_str])
             .map_err(|e| AlmsError::Runtime(format!("SQLite delete session: {e}")))?;
         tx.commit()
@@ -956,6 +967,18 @@ impl SqliteStore {
                 .map_err(|e| {
                     AlmsError::Runtime(format!("SQLite delete messages for session: {e}"))
                 })?;
+            // Delete tool call records for runs belonging to this session.
+            tx.execute(
+                "DELETE FROM run_tool_calls WHERE run_id IN \
+                 (SELECT run_id FROM runs WHERE session_id = ?1)",
+                params![sid],
+            )
+            .map_err(|e| {
+                AlmsError::Runtime(format!("SQLite delete run tool calls for session: {e}"))
+            })?;
+            // Delete runs belonging to this session.
+            tx.execute("DELETE FROM runs WHERE session_id = ?1", params![sid])
+                .map_err(|e| AlmsError::Runtime(format!("SQLite delete runs for session: {e}")))?;
         }
 
         // 3. Delete the sessions themselves
@@ -1158,7 +1181,7 @@ impl SqliteStore {
                 params![
                     run_id.0.to_string(),
                     record.seq as i64,
-                    &record.role,
+                    record.role.to_string(),
                     record.tool_name.as_deref(),
                     record.tool_id.as_deref(),
                     record.params.as_deref(),
@@ -1187,7 +1210,7 @@ impl SqliteStore {
                 params![
                     run_id.0.to_string(),
                     record.seq as i64,
-                    &record.role,
+                    record.role.to_string(),
                     record.tool_name.as_deref(),
                     record.tool_id.as_deref(),
                     record.params.as_deref(),
@@ -1226,7 +1249,16 @@ impl SqliteStore {
             })
             .map_err(|e| AlmsError::Runtime(format!("SQLite query load_tool_calls: {e}")))?
             .filter_map(|r| match r {
-                Ok((seq, role, tool_name, tool_id, params, result, ts_str)) => {
+                Ok((seq, role_str, tool_name, tool_id, params, result, ts_str)) => {
+                    let role: ToolCallRole = role_str
+                        .parse()
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                run_id = %run_id.0,
+                                "Skipping tool call record: bad role: {e}"
+                            );
+                        })
+                        .ok()?;
                     let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
                         .inspect_err(|e| {
                             tracing::warn!(
@@ -2369,18 +2401,18 @@ mod tests {
 
     // ── Run tool call tests ──────────────────────────────────────────────
 
-    fn new_tool_call_record(seq: u32, role: &str, name: &str) -> ToolCallRecord {
+    fn new_tool_call_record(seq: u32, role: ToolCallRole, name: &str) -> ToolCallRecord {
         ToolCallRecord {
             seq,
-            role: role.to_string(),
+            role,
             tool_name: Some(name.to_string()),
             tool_id: Some(format!("call_{seq}")),
-            params: if role == "assistant" {
+            params: if role == ToolCallRole::Assistant {
                 Some(r#"{"text":"hello"}"#.to_string())
             } else {
                 None
             },
-            result: if role == "tool" {
+            result: if role == ToolCallRole::Tool {
                 Some(r#""result_ok""#.to_string())
             } else {
                 None
@@ -2395,10 +2427,10 @@ mod tests {
         let run_id = RunId::new();
 
         let records = vec![
-            new_tool_call_record(0, "assistant", "echo"),
-            new_tool_call_record(1, "tool", "echo"),
-            new_tool_call_record(2, "assistant", "math"),
-            new_tool_call_record(3, "tool", "math"),
+            new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
+            new_tool_call_record(1, ToolCallRole::Tool, "echo"),
+            new_tool_call_record(2, ToolCallRole::Assistant, "math"),
+            new_tool_call_record(3, ToolCallRole::Tool, "math"),
         ];
 
         store.save_tool_calls(run_id, &records).unwrap();
@@ -2406,10 +2438,10 @@ mod tests {
 
         assert_eq!(loaded.len(), 4);
         assert_eq!(loaded[0].seq, 0);
-        assert_eq!(loaded[0].role, "assistant");
+        assert_eq!(loaded[0].role, ToolCallRole::Assistant);
         assert_eq!(loaded[0].tool_name.as_deref(), Some("echo"));
         assert_eq!(loaded[1].seq, 1);
-        assert_eq!(loaded[1].role, "tool");
+        assert_eq!(loaded[1].role, ToolCallRole::Tool);
         assert!(loaded[1].result.is_some());
         assert_eq!(loaded[2].tool_name.as_deref(), Some("math"));
         assert_eq!(loaded[3].seq, 3);
@@ -2423,8 +2455,8 @@ mod tests {
         assert_eq!(store.count_tool_calls(run_id).unwrap(), 0);
 
         let records = vec![
-            new_tool_call_record(0, "assistant", "echo"),
-            new_tool_call_record(1, "tool", "echo"),
+            new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
+            new_tool_call_record(1, ToolCallRole::Tool, "echo"),
         ];
         store.save_tool_calls(run_id, &records).unwrap();
 
@@ -2438,13 +2470,19 @@ mod tests {
         let run2 = RunId::new();
 
         store
-            .save_tool_call(run1, &new_tool_call_record(0, "assistant", "echo"))
+            .save_tool_call(
+                run1,
+                &new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
+            )
             .unwrap();
         store
-            .save_tool_call(run2, &new_tool_call_record(0, "assistant", "math"))
+            .save_tool_call(
+                run2,
+                &new_tool_call_record(0, ToolCallRole::Assistant, "math"),
+            )
             .unwrap();
         store
-            .save_tool_call(run2, &new_tool_call_record(1, "tool", "math"))
+            .save_tool_call(run2, &new_tool_call_record(1, ToolCallRole::Tool, "math"))
             .unwrap();
 
         assert_eq!(store.load_tool_calls(run1).unwrap().len(), 1);
@@ -2460,5 +2498,145 @@ mod tests {
         // Empty batch should succeed without error.
         store.save_tool_calls(run_id, &[]).unwrap();
         assert_eq!(store.load_tool_calls(run_id).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_delete_session_cascades_tool_calls_and_runs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        // Create a run and attach tool calls.
+        let run = new_run(session.id, session.agent_id);
+        let run_id = run.run_id;
+        store.save_run(&run).unwrap();
+        store
+            .save_tool_calls(
+                run_id,
+                &[
+                    new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
+                    new_tool_call_record(1, ToolCallRole::Tool, "echo"),
+                ],
+            )
+            .unwrap();
+
+        // A control run on a different session that should NOT be deleted.
+        let other_session = Session::new(AgentId::new(), "ctx-other");
+        store.save_session(&other_session).unwrap();
+        let other_run = new_run(other_session.id, other_session.agent_id);
+        let other_run_id = other_run.run_id;
+        store.save_run(&other_run).unwrap();
+        store
+            .save_tool_call(
+                other_run_id,
+                &new_tool_call_record(0, ToolCallRole::Assistant, "math"),
+            )
+            .unwrap();
+
+        // Pre-condition: tool calls and runs exist.
+        assert_eq!(store.count_tool_calls(run_id).unwrap(), 2);
+        assert_eq!(store.count_tool_calls(other_run_id).unwrap(), 1);
+
+        // Delete the first session.
+        store.delete_session(session.id).unwrap();
+
+        // Tool calls and runs for the deleted session are gone.
+        assert_eq!(store.count_tool_calls(run_id).unwrap(), 0);
+        assert_eq!(store.load_tool_calls(run_id).unwrap().len(), 0);
+        assert!(store.load_run(run_id).unwrap().is_none());
+
+        // Control session's data is untouched.
+        assert_eq!(store.count_tool_calls(other_run_id).unwrap(), 1);
+        assert!(store.load_run(other_run_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_delete_agent_cascades_tool_calls_and_runs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let doomed = new_agent("doomed");
+        let survivor = new_agent("survivor");
+        store.create_agent(&doomed).unwrap();
+        store.create_agent(&survivor).unwrap();
+
+        // Create sessions, runs, and tool calls for both agents.
+        let ds = Session::new(doomed.id, "ctx-doomed");
+        let ss = Session::new(survivor.id, "ctx-survivor");
+        store.save_session(&ds).unwrap();
+        store.save_session(&ss).unwrap();
+
+        let d_run = new_run(ds.id, doomed.id);
+        let d_run_id = d_run.run_id;
+        store.save_run(&d_run).unwrap();
+        store
+            .save_tool_calls(
+                d_run_id,
+                &[
+                    new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
+                    new_tool_call_record(1, ToolCallRole::Tool, "echo"),
+                ],
+            )
+            .unwrap();
+
+        let s_run = new_run(ss.id, survivor.id);
+        let s_run_id = s_run.run_id;
+        store.save_run(&s_run).unwrap();
+        store
+            .save_tool_call(
+                s_run_id,
+                &new_tool_call_record(0, ToolCallRole::Assistant, "math"),
+            )
+            .unwrap();
+
+        // Delete the doomed agent.
+        assert!(store.delete_agent(doomed.id).unwrap());
+
+        // Doomed agent's tool calls and runs are gone.
+        assert_eq!(store.count_tool_calls(d_run_id).unwrap(), 0);
+        assert!(store.load_run(d_run_id).unwrap().is_none());
+
+        // Survivor's data is untouched.
+        assert_eq!(store.count_tool_calls(s_run_id).unwrap(), 1);
+        assert!(store.load_run(s_run_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_tool_call_record_nullable_columns_roundtrip() {
+        // N4: verify that assistant records with params=None and tool records
+        // with result=None round-trip correctly through SQLite.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let run_id = RunId::new();
+
+        let records = vec![
+            ToolCallRecord {
+                seq: 0,
+                role: ToolCallRole::Assistant,
+                tool_name: Some("shell_exec".to_string()),
+                tool_id: Some("call_0".to_string()),
+                params: None, // Empty-args tool call
+                result: None,
+                timestamp: chrono::Utc::now(),
+            },
+            ToolCallRecord {
+                seq: 1,
+                role: ToolCallRole::Tool,
+                tool_name: Some("shell_exec".to_string()),
+                tool_id: Some("call_0".to_string()),
+                params: None,
+                result: None, // Tool returned nothing
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+
+        store.save_tool_calls(run_id, &records).unwrap();
+        let loaded = store.load_tool_calls(run_id).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].role, ToolCallRole::Assistant);
+        assert!(loaded[0].params.is_none());
+        assert!(loaded[0].result.is_none());
+        assert_eq!(loaded[1].role, ToolCallRole::Tool);
+        assert!(loaded[1].params.is_none());
+        assert!(loaded[1].result.is_none());
     }
 }

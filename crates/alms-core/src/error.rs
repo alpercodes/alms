@@ -1,3 +1,4 @@
+use crate::run::ToolCallRecord;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -34,6 +35,17 @@ pub enum AlmsError {
 
     #[error("Run cancelled")]
     Cancelled,
+
+    /// Run was cancelled but partial tool call records are available.
+    #[error("Run cancelled (with {n} tool call records)", n = tool_calls.len())]
+    CancelledWithToolCalls { tool_calls: Vec<ToolCallRecord> },
+
+    /// Run failed but partial tool call records are available.
+    #[error("{source}")]
+    FailedWithToolCalls {
+        source: Box<AlmsError>,
+        tool_calls: Vec<ToolCallRecord>,
+    },
 }
 
 pub type AlmsResult<T> = Result<T, AlmsError>;

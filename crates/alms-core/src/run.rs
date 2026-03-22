@@ -12,6 +12,38 @@ pub struct TokenUsage {
     pub completion_tokens: u32,
 }
 
+/// Discriminates tool call records: the LLM requesting a tool call vs. the
+/// tool returning a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ToolCallRole {
+    /// The LLM (assistant) requested a tool invocation.
+    #[serde(rename = "assistant")]
+    Assistant,
+    /// A tool returned its result.
+    #[serde(rename = "tool")]
+    Tool,
+}
+
+impl std::fmt::Display for ToolCallRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ToolCallRole::Assistant => write!(f, "assistant"),
+            ToolCallRole::Tool => write!(f, "tool"),
+        }
+    }
+}
+
+impl std::str::FromStr for ToolCallRole {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "assistant" => Ok(ToolCallRole::Assistant),
+            "tool" => Ok(ToolCallRole::Tool),
+            other => Err(format!("unknown ToolCallRole: {other:?}")),
+        }
+    }
+}
+
 /// A record of a single tool call or tool result within a run.
 ///
 /// Stored in the `run_tool_calls` table so that tool execution history is
@@ -20,9 +52,9 @@ pub struct TokenUsage {
 pub struct ToolCallRecord {
     /// Sequence number within the run (monotonically increasing).
     pub seq: u32,
-    /// "assistant" for tool calls, "tool" for tool results.
-    pub role: String,
-    /// Tool name (set for both calls and results).
+    /// Whether this record is a tool call (assistant) or tool result.
+    pub role: ToolCallRole,
+    /// Tool name — always set in practice; optional to allow future extension.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
     /// Provider-assigned tool call ID (correlates call to result).
