@@ -211,8 +211,17 @@ impl SessionManager {
     }
 
     /// Append a message to a session
+    ///
+    /// Lock ordering: `history` is scoped and released before acquiring
+    /// `sessions`, matching the `sessions` -> `history` ordering used by
+    /// `get_or_create` / `get_or_create_shared` and preventing AB/BA deadlocks.
     pub fn append_message(&self, session_id: SessionId, message: Message) -> AlmsResult<()> {
-        if let Some(mut history) = self.history.get_mut(&session_id) {
+        // Scope the history write lock so it is released before we touch `sessions`.
+        {
+            let mut history = self
+                .history
+                .get_mut(&session_id)
+                .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))?;
             if let Some(store) = &self.store
                 && let Err(e) = store.save_message(session_id, &message)
             {
@@ -221,37 +230,32 @@ impl SessionManager {
                     session_id.0, e
                 );
             }
-
             history.push(message);
+        } // history lock released here
 
-            // Update last_activity via the reverse index — O(1), no full scan.
-            // Clone the key out of `session_by_id` (releasing its read lock) before
-            // acquiring a write lock on `sessions`, avoiding cross-map lock nesting.
-            let session_key = self
-                .session_by_id
-                .get(&session_id)
-                .map(|r| r.value().clone());
-            if let Some(key) = session_key
-                && let Some(mut session) = self.sessions.get_mut(&key)
+        // Update last_activity via the reverse index — O(1), no full scan.
+        // Clone the key out of `session_by_id` (releasing its read lock) before
+        // acquiring a write lock on `sessions`, avoiding cross-map lock nesting.
+        let session_key = self
+            .session_by_id
+            .get(&session_id)
+            .map(|r| r.value().clone());
+        if let Some(key) = session_key
+            && let Some(mut session) = self.sessions.get_mut(&key)
+        {
+            session.touch();
+            // Write-through updated last_activity to SQLite
+            if let Some(store) = &self.store
+                && let Err(e) = store.save_session(&session)
             {
-                session.touch();
-                // Write-through updated last_activity to SQLite
-                if let Some(store) = &self.store
-                    && let Err(e) = store.save_session(&session)
-                {
-                    warn!(
-                        "Failed to persist last_activity for session {}: {}",
-                        session_id.0, e
-                    );
-                }
+                warn!(
+                    "Failed to persist last_activity for session {}: {}",
+                    session_id.0, e
+                );
             }
-
-            Ok(())
-        } else {
-            Err(alms_core::AlmsError::SessionNotFound(
-                session_id.0.to_string(),
-            ))
         }
+
+        Ok(())
     }
 
     /// Get session history
