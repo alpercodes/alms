@@ -105,31 +105,77 @@ fn dm_context_id(a: &str, b: &str) -> String {
 }
 ```
 
-A DM conversation between two agents works exactly like a user↔agent chat does today — **one shared session** with a persistent conversation history. When an agent receives a message, it sees the full chat history (subject to the same context strategies: truncate, full, sliding-summary).
+A DM conversation between two agents is a **single shared session** — just like a user↔agent chat. Both agents read from and write to the same session. When an agent receives a message, it sees the full conversation history (subject to the same context strategies: truncate, full, sliding-summary).
 
-The DM session is owned by the **receiving agent** at any given moment. When Agent A sends a message to Agent B:
+### Session key
 
-1. The MessageBus resolves the DM session: `(agent_b_id, "dm:agent-a:agent-b")`
-2. A's message is appended as `Role::User` (from B's perspective, A is the "user")
-3. A `RunTrigger` is created on B's DM session
-4. B's agent loop runs, sees the full DM conversation history, and responds
-5. B's response is appended as `Role::Assistant` (normal agent response)
+The shared DM session uses a deterministic `SessionId` derived from both participants (UUID v5 from the sorted name pair). It is **not** keyed by a single `AgentId` — both agents access the same session record.
 
-When B wants to reply back to A, the same flow reverses:
+For group chats: similarly, one shared session per group, identified by a deterministic ID from the group name.
 
-1. B calls `send_message(to="agent-a", message="...")`
-2. The MessageBus resolves the DM session: `(agent_a_id, "dm:agent-a:agent-b")`
-3. B's message is appended as `Role::User` in A's DM session
-4. A `RunTrigger` is created on A's DM session
-5. A processes it with full DM history
+### Message storage
 
-**Key point:** Each agent has its own DM session for the same conversation (`agent_a_id + context_id` vs `agent_b_id + context_id`). Messages are written to the **receiving** agent's session only. The sending agent's record of what it sent is in its own session's assistant responses (since it called `send_message` as a tool during its run).
+All messages in a shared session are stored with metadata identifying the sender:
 
-This means:
-- No dual-write complexity — messages are written once, to the recipient's session
-- Context building works unchanged (ContextBuilder reads the agent's session as normal)
-- Sliding-summary and token budgets work per-agent as they do today
-- The existing session model `(AgentId, context_id)` is unchanged
+```json
+{ "from_agent": "agent-a", "from_agent_id": "uuid-here" }
+```
+
+Messages are stored as `Role::User` regardless of who sent them. The actual role mapping happens at context-building time (see below).
+
+### Perspective mapping in ContextBuilder
+
+The LLM API requires `"assistant"` for "my previous responses" and `"user"` for "input from others." Since a shared session has messages from multiple agents, the ContextBuilder performs **perspective mapping** when building context for a specific agent:
+
+- Messages where `from_agent == current_agent` → mapped to `"assistant"` (the LLM sees them as its own previous responses)
+- Messages where `from_agent != current_agent` → mapped to `"user"` (the LLM sees them as input)
+
+This means the same raw session data looks different depending on who is reading it:
+
+```
+Raw session (shared):
+  [User, from=agent-a] "Please review PR #42"
+  [User, from=agent-b] "I found 3 issues..."
+  [User, from=agent-a] "Fixed issues 1 and 2, pushed update"
+
+Agent B's context (perspective mapping):
+  [user]      "Please review PR #42"          ← from A, so "user"
+  [assistant] "I found 3 issues..."           ← from B (me), so "assistant"
+  [user]      "Fixed issues 1 and 2, pushed"  ← from A, so "user"
+
+Agent A's context (perspective mapping):
+  [assistant] "Please review PR #42"          ← from A (me), so "assistant"
+  [user]      "I found 3 issues..."           ← from B, so "user"
+  [assistant] "Fixed issues 1 and 2, pushed"  ← from A (me), so "assistant"
+```
+
+### DM flow
+
+When Agent A sends a message to Agent B:
+
+1. The MessageBus resolves the shared DM session (deterministic ID from sorted names)
+2. A's message is appended to the shared session with metadata `{from_agent: "agent-a"}`
+3. A `RunTrigger` is created targeting Agent B
+4. B's agent loop runs, ContextBuilder loads the shared session with B's perspective (B's messages → assistant, A's → user)
+5. B responds, response appended to the same shared session with `{from_agent: "agent-b"}`
+6. If B calls `send_message` back to A, a new `RunTrigger` targets A on the same shared session
+
+### Required changes to existing code
+
+1. **`SessionManager`** — add methods to create/load sessions by `SessionId` directly, not requiring `(AgentId, context_id)`. The shared session is not owned by a single agent.
+2. **`ContextBuilder`** — accept a `perspective_agent: &str` parameter. When building context, use `from_agent` metadata to map roles: self → `"assistant"`, others → `"user"`.
+3. **`MessageBus`** — write to one shared session instead of per-agent sessions.
+
+### Why this works
+
+- One session, one conversation history — no sync issues, no dual-write
+- Both agents see the full conversation, just from their own perspective
+- Sliding-summary and token budgets work unchanged (ContextBuilder handles one session)
+- Group chats use the exact same model (one shared session, perspective mapping per agent)
+
+**Note:** Perspective mapping in ContextBuilder requires testing and system prompt tuning. The LLM needs to correctly interpret role-swapped messages, especially in multi-turn conversations. This should be validated with real LLM calls before relying on it in production. Edge cases to watch: tool call messages in shared sessions, system messages, and how sliding-summary handles multi-agent conversation compression.
+
+**Future cleanup:** Consider renaming the internal `Role::Assistant` to `Role::Agent` throughout the codebase to better reflect ALMS semantics. This is a separate refactor — the LLM API mapping (`Role::Agent` → `"assistant"`) would happen in the ContextBuilder output layer.
 
 ### 3.3 The MessageBus
 
@@ -489,16 +535,16 @@ CREATE TABLE IF NOT EXISTS group_members (
 
 ### 5.3 How Group Messages Work
 
-Group chats work like DM chats — each agent has a regular session for the group, and sees the full conversation history when it's their turn to respond.
+Group chats use the same **shared session** model as DMs (Section 3.2). One session per group, all members read from and write to it. The same perspective mapping applies — when Agent B reads the group session, B's own messages become `"assistant"` and everyone else's become `"user"`.
 
 When an agent sends a message to a group:
 
-1. The message is appended as `Role::User` to every OTHER member's group session (`context_id = "group:{group_name}"`) with metadata `{from: "sender-name"}`
-2. For @-mentioned agents (or `@everyone`): a `RunTrigger` is created on their group session
-3. Non-mentioned agents receive the message in their session (for context continuity) but no run is triggered
-4. When a mentioned agent responds, their response is broadcast to all other members' sessions as `Role::User` with `{from: "responder-name"}`
+1. The message is appended to the **shared group session** with metadata `{from_agent: "sender-name"}`
+2. For @-mentioned agents (or `@everyone`): a `RunTrigger` is created targeting them
+3. Non-mentioned agents are not triggered but will see the message next time they read the session
+4. When a mentioned agent responds, the response is appended to the same shared session with `{from_agent: "responder-name"}`
 
-Each agent has its own session for the group (`(agent_id, "group:{group_name}")`). When it's an agent's turn to respond, it sees the full group conversation history — all messages from all participants — just like a user↔agent chat. The ContextBuilder handles it normally with truncation/sliding-summary as needed.
+The group session uses a deterministic `SessionId` derived from the group name. When any agent's turn comes, ContextBuilder loads the shared session with that agent's perspective — their messages as `"assistant"`, all others as `"user"` with `{from_agent}` metadata visible in the content.
 
 Agents respond async — they process messages through their `AgentQueue` (Section 7) one at a time, so group participation is serialized with all their other work.
 
@@ -1100,7 +1146,7 @@ Layer 2 adds peer-to-peer communication to ALMS, aligned with the product vision
 
 Key design principles:
 - **Hybrid messaging**: structured data for routine info, natural language for reasoning (cost control)
-- **Per-agent sessions**: each agent has its own DM/group session, no changes to SessionManager/ContextBuilder
+- **Shared sessions with perspective mapping**: one session per conversation, ContextBuilder maps roles based on who is reading (requires minor ContextBuilder + SessionManager changes)
 - **RunTrigger generalization**: the existing completion notification pattern becomes a universal message delivery mechanism
 - **Ignore signal**: agents can decline invocations to avoid wasted LLM calls
 - **Conservative extension**: reuses existing session/run/SSE infrastructure, keeps each phase independently deployable
