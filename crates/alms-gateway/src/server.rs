@@ -86,26 +86,33 @@ impl RunManager {
 
     /// Load persisted runs from SQLite into the in-memory DashMap.
     ///
-    /// Only loads terminal runs (completed/failed/cancelled) -- queued/running
-    /// runs from a previous process are stale and should not be loaded.
+    /// First marks any stale `queued`/`running` rows as `failed` (leftovers
+    /// from a previous process that crashed or was killed), then loads recent
+    /// terminal runs (completed/failed/cancelled) from the last 7 days.
     pub fn hydrate_from_store(&self) {
         let Some(store) = &self.sqlite_store else {
             return;
         };
+
+        // Mark stale queued/running runs as failed before loading.
+        match store.mark_stale_runs_failed() {
+            Ok(count) if count > 0 => {
+                info!(
+                    "Marked {} stale queued/running runs as failed (gateway restarted)",
+                    count
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to mark stale runs as failed: {}", e);
+            }
+            _ => {}
+        }
+
         match store.load_all_runs() {
             Ok(runs) => {
-                let mut loaded = 0;
+                let loaded = runs.len();
                 for run in runs {
-                    // Skip non-terminal runs — they are leftovers from a previous
-                    // process that crashed or was killed.
-                    if matches!(
-                        run.status,
-                        alms_core::RunStatus::Queued | alms_core::RunStatus::Running
-                    ) {
-                        continue;
-                    }
                     self.runs.insert(run.run_id, run);
-                    loaded += 1;
                 }
                 if loaded > 0 {
                     info!("Loaded {} persisted runs from SQLite", loaded);
@@ -204,44 +211,53 @@ impl RunManager {
         self.runs.insert(run.run_id, run);
     }
 
-    /// Atomically transition a run to Running state.
+    /// Atomically transition a run to Running state and persist the snapshot.
+    ///
+    /// The run data is cloned while still holding the DashMap lock, so the
+    /// persisted state cannot reflect a concurrent mutation.
     pub fn mark_run_as_running(&self, run_id: RunId) {
-        self.runs.entry(run_id).and_modify(|r| r.mark_running());
-        self.persist_run(run_id);
+        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_running());
+        self.persist_snapshot(run_id, snapshot);
     }
 
-    /// Atomically transition a run to Completed state.
+    /// Atomically transition a run to Completed state and persist the snapshot.
     pub fn mark_run_as_completed(
         &self,
         run_id: RunId,
         output: String,
         usage: alms_core::TokenUsage,
     ) {
-        self.runs
-            .entry(run_id)
-            .and_modify(|r| r.mark_completed(output.clone(), usage));
-        self.persist_run(run_id);
+        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_completed(output, usage));
+        self.persist_snapshot(run_id, snapshot);
     }
 
-    /// Atomically transition a run to Failed state.
+    /// Atomically transition a run to Failed state and persist the snapshot.
     pub fn mark_run_as_failed(&self, run_id: RunId, error: String) {
-        self.runs
-            .entry(run_id)
-            .and_modify(|r| r.mark_failed(error.clone()));
-        self.persist_run(run_id);
+        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_failed(error));
+        self.persist_snapshot(run_id, snapshot);
     }
 
-    /// Atomically transition a run to Cancelled state.
+    /// Atomically transition a run to Cancelled state and persist the snapshot.
     pub fn mark_run_as_cancelled(&self, run_id: RunId) {
-        self.runs.entry(run_id).and_modify(|r| r.mark_cancelled());
-        self.persist_run(run_id);
+        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_cancelled());
+        self.persist_snapshot(run_id, snapshot);
     }
 
-    /// Persist the current state of a run to SQLite (if store is configured).
-    fn persist_run(&self, run_id: RunId) {
+    /// Modify a run in the DashMap and return a clone while still under lock.
+    ///
+    /// Returns `None` if the run does not exist (callers always `insert_run`
+    /// first, so this should not happen in practice).
+    fn modify_and_snapshot(&self, run_id: RunId, f: impl FnOnce(&mut Run)) -> Option<Run> {
+        let mut entry = self.runs.get_mut(&run_id)?;
+        f(entry.value_mut());
+        Some(entry.clone())
+    }
+
+    /// Persist a previously-snapshotted run to SQLite (if store is configured).
+    fn persist_snapshot(&self, run_id: RunId, snapshot: Option<Run>) {
         if let Some(store) = &self.sqlite_store
-            && let Some(run) = self.runs.get(&run_id)
-            && let Err(e) = store.save_run(run.value())
+            && let Some(run) = snapshot
+            && let Err(e) = store.save_run(&run)
         {
             tracing::warn!(run_id = %run_id.0, "Failed to persist run to SQLite: {e}");
         }

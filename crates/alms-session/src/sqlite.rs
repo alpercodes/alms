@@ -1080,19 +1080,28 @@ impl SqliteStore {
         Ok(rows)
     }
 
-    /// Load all runs (for startup hydration), oldest first.
+    /// Load runs for startup hydration, oldest first.
+    ///
+    /// Only loads runs created within the last `max_age` duration to prevent
+    /// unbounded memory growth after months of operation. Defaults to 7 days.
     pub fn load_all_runs(&self) -> AlmsResult<Vec<Run>> {
+        self.load_recent_runs(chrono::Duration::days(7))
+    }
+
+    /// Load runs created within the given `max_age` duration, oldest first.
+    pub fn load_recent_runs(&self, max_age: chrono::Duration) -> AlmsResult<Vec<Run>> {
+        let cutoff = (chrono::Utc::now() - max_age).to_rfc3339();
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT run_id, session_id, agent_id, input, response, error, status, \
                         started_at, ended_at, prompt_tokens, completion_tokens, job_id, created_at \
-                 FROM runs ORDER BY created_at ASC",
+                 FROM runs WHERE created_at >= ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_all_runs: {e}")))?;
 
         let rows = stmt
-            .query_map([], parse_run_row)
+            .query_map(params![cutoff], parse_run_row)
             .map_err(|e| AlmsError::Runtime(format!("SQLite query load_all_runs: {e}")))?
             .filter_map(|r| match r {
                 Ok(run) => Some(run),
@@ -1104,6 +1113,23 @@ impl SqliteStore {
             .collect();
 
         Ok(rows)
+    }
+
+    /// Mark any `queued` or `running` runs as `failed` in SQLite.
+    ///
+    /// These are stale leftovers from a previous process that crashed or was
+    /// killed. Returns the number of rows updated.
+    pub fn mark_stale_runs_failed(&self) -> AlmsResult<usize> {
+        let conn = self.conn.lock();
+        let now = chrono::Utc::now().to_rfc3339();
+        let count = conn
+            .execute(
+                "UPDATE runs SET status = 'failed', error = 'stale: gateway restarted', ended_at = ?1 \
+                 WHERE status IN ('queued', 'running')",
+                params![now],
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite mark_stale_runs_failed: {e}")))?;
+        Ok(count)
     }
 }
 
@@ -1324,15 +1350,27 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         })?
         .with_timezone(&chrono::Utc);
     let started_at = started_at_str
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .inspect_err(|e| {
+                    tracing::warn!(run_id = %run_id_str, "Corrupt started_at in DB: {e}");
+                })
+                .ok()
+        })
         .map(|dt| dt.with_timezone(&chrono::Utc));
     let ended_at = ended_at_str
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s)
+                .inspect_err(|e| {
+                    tracing::warn!(run_id = %run_id_str, "Corrupt ended_at in DB: {e}");
+                })
+                .ok()
+        })
         .map(|dt| dt.with_timezone(&chrono::Utc));
     let usage = match (prompt_tokens, completion_tokens) {
         (Some(pt), Some(ct)) => Some(TokenUsage {
-            prompt_tokens: pt as u32,
-            completion_tokens: ct as u32,
+            prompt_tokens: u32::try_from(pt).unwrap_or(u32::MAX),
+            completion_tokens: u32::try_from(ct).unwrap_or(u32::MAX),
         }),
         _ => None,
     };
@@ -2007,6 +2045,72 @@ mod tests {
         assert!(matches!(loaded.status, RunStatus::Failed));
         assert_eq!(loaded.error.as_deref(), Some("LLM error"));
         assert!(loaded.output.is_none());
+    }
+
+    #[test]
+    fn test_run_cancelled_roundtrip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let mut run = new_run(session.id, session.agent_id);
+        run.mark_running();
+        run.mark_cancelled();
+
+        store.save_run(&run).unwrap();
+
+        let loaded = store.load_run(run.run_id).unwrap().unwrap();
+        assert!(matches!(loaded.status, RunStatus::Cancelled));
+        assert!(loaded.output.is_none());
+        assert!(loaded.error.is_none());
+        assert!(loaded.started_at.is_some());
+        assert!(loaded.ended_at.is_some());
+        assert!(loaded.usage.is_none());
+    }
+
+    #[test]
+    fn test_mark_stale_runs_failed() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+
+        // Insert a queued run and a running run.
+        let queued_run = new_run(session.id, session.agent_id);
+        let queued_id = queued_run.run_id;
+        store.save_run(&queued_run).unwrap();
+
+        let mut running_run = new_run(session.id, session.agent_id);
+        running_run.mark_running();
+        let running_id = running_run.run_id;
+        store.save_run(&running_run).unwrap();
+
+        // Insert a completed run (should not be affected).
+        let mut completed_run = new_run(session.id, session.agent_id);
+        completed_run.mark_running();
+        completed_run.mark_completed(
+            "done".to_string(),
+            TokenUsage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+            },
+        );
+        let completed_id = completed_run.run_id;
+        store.save_run(&completed_run).unwrap();
+
+        let count = store.mark_stale_runs_failed().unwrap();
+        assert_eq!(count, 2);
+
+        // Queued and running should now be failed.
+        let q = store.load_run(queued_id).unwrap().unwrap();
+        assert!(matches!(q.status, RunStatus::Failed));
+        assert_eq!(q.error.as_deref(), Some("stale: gateway restarted"));
+        assert!(q.ended_at.is_some());
+
+        let r = store.load_run(running_id).unwrap().unwrap();
+        assert!(matches!(r.status, RunStatus::Failed));
+        assert_eq!(r.error.as_deref(), Some("stale: gateway restarted"));
+
+        // Completed run should be unchanged.
+        let c = store.load_run(completed_id).unwrap().unwrap();
+        assert!(matches!(c.status, RunStatus::Completed));
+        assert_eq!(c.output.as_deref(), Some("done"));
     }
 
     #[test]

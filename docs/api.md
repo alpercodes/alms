@@ -234,11 +234,22 @@ Why not `POST /agent/run`?
 {
   "run_id": "<uuid>",
   "session_id": "<uuid>",
-  "status": "running",
+  "agent_id": "<uuid>",
+  "status": "completed",
+  "response": "The agent's text output",
+  "error": null,
   "started_at": "2026-02-11T07:52:00Z",
-  "ended_at": null
+  "ended_at": "2026-02-11T07:52:05Z",
+  "usage": { "prompt_tokens": 150, "completion_tokens": 42 },
+  "ts": "2026-02-11T07:52:05Z",
+  "job_id": null
 }
 ```
+
+Notes:
+- `response` and `error` use `skip_serializing_if = "Option::is_none"` — they are absent (not `null`) for in-flight runs, present only once the run reaches a terminal state.
+- `response` maps to the agent's text output (`Run.output`); renamed at the API boundary for clarity.
+- `usage` is `null` for failed/cancelled runs.
 
 ### 5.3 Stream a run (SSE-first)
 `GET /runs/{run_id}/events`
