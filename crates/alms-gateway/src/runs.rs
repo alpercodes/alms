@@ -551,10 +551,12 @@ async fn execute_run(
             alms_runtime::ListAgentsTool::new(state.session_manager.clone(), name.clone());
         let read_tool =
             alms_runtime::ReadMessagesTool::new(state.session_manager.clone(), name.clone());
+        let ignore_tool = alms_runtime::IgnoreMessageTool::new();
         runtime = runtime
             .with_send_message(send_tool)
             .with_list_agents(list_tool)
-            .with_read_messages(read_tool);
+            .with_read_messages(read_tool)
+            .with_ignore_message(ignore_tool);
     }
 
     // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals).

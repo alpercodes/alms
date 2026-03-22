@@ -271,6 +271,12 @@ impl AgentRuntime {
         self
     }
 
+    /// Register the `ignore_message` tool so agents can decline to respond.
+    pub fn with_ignore_message(self, tool: crate::ignore_message_tool::IgnoreMessageTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
     /// Set the run ID for audit event correlation.
     pub fn with_run_id(mut self, run_id: alms_core::RunId) -> Self {
         self.run_id = Some(run_id);
@@ -385,14 +391,19 @@ impl AgentRuntime {
 
         match result {
             Ok((response, usage)) => {
-                let assistant_msg = SessionMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    role: SessionRole::Assistant,
-                    content: alms_session::Content::Text(response.clone()),
-                    timestamp: alms_core::Timestamp::now(),
-                    metadata: None,
-                };
-                session_manager.append_message(session.id, assistant_msg)?;
+                // Skip persisting an assistant message when the response is
+                // empty. This happens when the agent used `ignore_message` to
+                // decline responding — there is nothing to record.
+                if !response.is_empty() {
+                    let assistant_msg = SessionMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        role: SessionRole::Assistant,
+                        content: alms_session::Content::Text(response.clone()),
+                        timestamp: alms_core::Timestamp::now(),
+                        metadata: None,
+                    };
+                    session_manager.append_message(session.id, assistant_msg)?;
+                }
 
                 info!(
                     "Agent {} completed for context {} (prompt={} completion={} tokens)",
@@ -851,6 +862,16 @@ impl AgentRuntime {
                     ) {
                         warn!("Failed to persist tool result to session: {}", e);
                     }
+                }
+
+                // Check if any tool result is an ignore_message marker.
+                // When detected, end the run early without producing a response.
+                let ignored = tool_calls
+                    .iter()
+                    .any(|tc| tc.function.name == "ignore_message");
+                if ignored {
+                    info!("Agent declined to respond via ignore_message — ending run early");
+                    return Ok((String::new(), total_usage));
                 }
 
                 // Append tool_loop instructions to the system prompt for
