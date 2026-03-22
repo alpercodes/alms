@@ -188,10 +188,17 @@ impl SseEventData {
     }
 
     /// Session-level: a new run was created on this session.
+    ///
+    /// `source` indicates what triggered the run:
+    /// - `"user"` — normal user-initiated run
+    /// - `"peer:<agent_name>"` — DM from another agent
+    /// - `"job"` — scheduled job
+    /// - `"subagent"` — subagent completion notification
     pub fn run_created(
         run_id: RunId,
         session_id: alms_core::SessionId,
         is_notification: bool,
+        source: Option<String>,
     ) -> Self {
         Self::new(
             "run_created",
@@ -199,6 +206,7 @@ impl SseEventData {
                 run_id: run_id.0.to_string(),
                 session_id: session_id.0.to_string(),
                 is_notification,
+                source,
                 ts: Utc::now(),
             },
         )
@@ -419,6 +427,8 @@ struct RunCreatedData {
     run_id: String,
     session_id: String,
     is_notification: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     ts: DateTime<Utc>,
 }
 

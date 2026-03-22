@@ -76,8 +76,9 @@ export function openSessionStream(sessionId) {
         activeRunId.value = data.run_id;
 
         if (data.is_notification) {
-            // Notification run from subagent completion — show system indicator
-            chatMessages.value = [...chatMessages.value, { type: 'thinking' }];
+            // Notification run from subagent completion or peer message —
+            // show thinking indicator with source context
+            chatMessages.value = [...chatMessages.value, { type: 'thinking', source: data.source }];
         } else {
             // User-initiated run — thinking indicator already added by startRun
         }

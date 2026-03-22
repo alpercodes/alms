@@ -257,7 +257,7 @@ pub async fn create_run(
         .send_session_event(
             session_id,
             run_id,
-            SseEventData::run_created(run_id, session_id, false),
+            SseEventData::run_created(run_id, session_id, false, Some("user".to_string())),
         )
         .await;
 
@@ -706,7 +706,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
         .send_session_event(
             session_id,
             run_id,
-            SseEventData::run_created(run_id, session_id, false),
+            SseEventData::run_created(run_id, session_id, true, Some("job".to_string())),
         )
         .await;
     info!("Job fired → run {}", run_id.0);
@@ -856,7 +856,7 @@ pub(crate) async fn completion_notification_loop(
             .send_session_event(
                 session_id,
                 run_id,
-                SseEventData::run_created(run_id, session_id, true),
+                SseEventData::run_created(run_id, session_id, true, Some("subagent".to_string())),
             )
             .await;
 
@@ -950,7 +950,7 @@ pub(crate) async fn run_trigger_loop(
 
         let source_label = match &trigger.source {
             MessageSource::Agent { from_name, .. } => format!("peer:{from_name}"),
-            MessageSource::SubagentCompletion => "subagent-completion".to_string(),
+            MessageSource::SubagentCompletion => "subagent".to_string(),
         };
 
         info!(
@@ -974,7 +974,7 @@ pub(crate) async fn run_trigger_loop(
             .send_session_event(
                 session_id,
                 run_id,
-                SseEventData::run_created(run_id, session_id, true),
+                SseEventData::run_created(run_id, session_id, true, Some(source_label.clone())),
             )
             .await;
 

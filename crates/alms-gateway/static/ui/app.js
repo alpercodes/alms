@@ -58,10 +58,18 @@ function ChatView() {
                         return html`<${TokenBadge} key=${key} usage=${m.usage} />`;
                     }
                     if (m.type === 'thinking') {
+                        let label = 'Thinking';
+                        if (m.source && m.source.startsWith('peer:')) {
+                            label = 'Replying to message from ' + m.source.slice(5);
+                        } else if (m.source === 'job') {
+                            label = 'Running scheduled job';
+                        } else if (m.source === 'subagent') {
+                            label = 'Processing subagent result';
+                        }
                         return html`
                             <div key="thinking" class="msg agent">
                                 <div class="msg-label">Agent</div>
-                                <div class="msg-body thinking-indicator">Thinking</div>
+                                <div class="msg-body thinking-indicator">${label}</div>
                             </div>
                         `;
                     }
