@@ -95,18 +95,30 @@ pub(crate) fn agent_list(store: &SqliteStore, json: bool) -> anyhow::Result<()> 
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn agent_create(
-    store: &SqliteStore,
-    name: String,
-    description: Option<String>,
-    model: Option<String>,
-    posture: Option<String>,
-    provider: Option<String>,
-    default: bool,
-    json: bool,
-    workspace_dir: Option<&std::path::Path>,
-) -> anyhow::Result<()> {
+/// Options for creating a new agent via the CLI.
+pub(crate) struct AgentCreateOpts<'a> {
+    pub name: String,
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub posture: Option<String>,
+    pub provider: Option<String>,
+    pub default: bool,
+    pub json: bool,
+    pub workspace_dir: Option<&'a std::path::Path>,
+}
+
+pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> anyhow::Result<()> {
+    let AgentCreateOpts {
+        name,
+        description,
+        model,
+        posture,
+        provider,
+        default,
+        json,
+        workspace_dir,
+    } = opts;
+
     validate_agent_name(&name)?;
 
     let now = chrono::Utc::now();
@@ -289,14 +301,16 @@ mod tests {
         // Create
         agent_create(
             &store,
-            "test-agent".into(),
-            Some("desc".into()),
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
+            AgentCreateOpts {
+                name: "test-agent".into(),
+                description: Some("desc".into()),
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
         )
         .unwrap();
 
@@ -320,26 +334,30 @@ mod tests {
         let store = new_store();
         agent_create(
             &store,
-            "dup".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
+            AgentCreateOpts {
+                name: "dup".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
         )
         .unwrap();
         let err = agent_create(
             &store,
-            "dup".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
+            AgentCreateOpts {
+                name: "dup".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
         )
         .unwrap_err();
         assert!(err.to_string().contains("already exists"));
@@ -350,14 +368,16 @@ mod tests {
         let store = new_store();
         let err = agent_create(
             &store,
-            "Bad Name".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            None,
+            AgentCreateOpts {
+                name: "Bad Name".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
         )
         .unwrap_err();
         assert!(err.to_string().contains("lowercase"));
@@ -371,14 +391,16 @@ mod tests {
 
         agent_create(
             &store,
-            "reviewer".into(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            false,
-            Some(&ws_dir),
+            AgentCreateOpts {
+                name: "reviewer".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                default: false,
+                json: false,
+                workspace_dir: Some(&ws_dir),
+            },
         )
         .unwrap();
 

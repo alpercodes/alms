@@ -271,14 +271,16 @@ async fn main() -> anyhow::Result<()> {
                     let workspace_dir = config.server.workspace_dir();
                     cmd_agent::agent_create(
                         &store,
-                        name,
-                        description,
-                        model,
-                        posture,
-                        provider,
-                        default,
-                        json,
-                        Some(&workspace_dir),
+                        cmd_agent::AgentCreateOpts {
+                            name,
+                            description,
+                            model,
+                            posture,
+                            provider,
+                            default,
+                            json,
+                            workspace_dir: Some(&workspace_dir),
+                        },
                     )?;
                 }
                 AgentCommands::Show { name_or_id } => {
