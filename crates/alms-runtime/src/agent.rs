@@ -210,7 +210,35 @@ impl AgentRuntime {
         let tool = WorkspaceWriteTool::new(workspace.clone());
         self.tools.register(std::sync::Arc::new(tool));
 
-        let ws_root = workspace.dir().to_path_buf();
+        // Ensure the workspace directory exists before canonicalizing.
+        // Without this, canonicalize() fails on non-existent paths and the
+        // sandbox root falls back to a relative path — causing
+        // starts_with() mismatches on Windows (\\?\ prefix vs relative)
+        // and potential hangs in fs_write (see #273).
+        if let Err(e) = workspace.ensure_dir() {
+            warn!(
+                error = %e,
+                workspace_dir = %workspace.dir().display(),
+                "Failed to create workspace directory — fs tools may not work correctly"
+            );
+        }
+
+        // Canonicalize the workspace path so the sandbox root is always
+        // absolute. This prevents Windows \\?\ prefix mismatches when
+        // check_sandbox_path compares the sandbox root against resolved
+        // file paths.
+        let ws_root = match std::fs::canonicalize(workspace.dir()) {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    workspace_dir = %workspace.dir().display(),
+                    "Cannot canonicalize workspace dir — using as-is"
+                );
+                workspace.dir().to_path_buf()
+            }
+        };
+
         let enabled = &self.config.enabled_tools;
         let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
 
@@ -232,7 +260,7 @@ impl AgentRuntime {
         if tool_enabled("fs_list") {
             self.tools
                 .register(std::sync::Arc::new(alms_sandbox::FsListTool::sandboxed(
-                    ws_root,
+                    ws_root.clone(),
                 )));
         }
 
@@ -243,7 +271,7 @@ impl AgentRuntime {
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
-            .with_default_cwd(workspace.dir());
+            .with_default_cwd(ws_root);
             if !self.shell_default_env.is_empty() {
                 shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
             }
