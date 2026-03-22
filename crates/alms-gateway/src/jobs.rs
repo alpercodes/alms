@@ -17,7 +17,7 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// POST /jobs
 pub async fn create_job(
@@ -103,6 +103,18 @@ pub async fn cancel_job(
         Ok(Some(true)) => {
             // Also cancel in the scheduler so it doesn't fire again.
             state.scheduler.cancel(job_id).await;
+
+            // Cancel any in-progress run that was spawned by this job so
+            // we stop burning tokens on work the operator intended to halt.
+            let cancelled = state.run_manager.cancel_runs_for_job(job_id);
+            if cancelled > 0 {
+                info!(
+                    job_id = %job_id,
+                    cancelled_runs = cancelled,
+                    "Cancelled in-progress run(s) for job"
+                );
+            }
+
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(Some(false)) => api_error(
