@@ -5,7 +5,7 @@ Design document for agent-to-agent communication in ALMS.
 **Authors**: Heph + Atlas
 **Date**: 2026-03-22
 **Status**: Design (not yet implemented)
-**Relates to**: `docs/product-vision-core.md` (Layer 2), `docs/architecture.md` (Option 2 -- Peer Mesh)
+**Relates to**: `docs/product-vision-core.md` (Layer 2), `docs/communication-architecture.md` (product vision), `docs/architecture.md` (Option 2 -- Peer Mesh)
 
 ---
 
@@ -167,7 +167,73 @@ pub enum MessageSource {
 
 The gateway's event loop already has `completion_notification_loop` which creates runs from `SubagentCompletion` events. The `RunTrigger` pattern generalizes this: the gateway listens on an `mpsc::UnboundedReceiver<RunTrigger>` and creates runs for any trigger, whether from a subagent completion, a peer message, or a scheduled task.
 
-### 3.4 New Tool: `send_message`
+### 3.4 Hybrid Messaging: Structured Data vs Natural Language
+
+Per `communication-architecture.md`, not every agent interaction requires an LLM call. Messages are split into two types:
+
+**Structured messages** (no LLM required): routine, predictable data passed as typed JSON.
+- PR metadata (changed files, diff stats, branch info)
+- Test results (pass/fail, coverage)
+- Build status, merge readiness signals
+- Task status updates (in progress, blocked, done)
+
+**Natural language messages** (LLM required): interactions that need reasoning.
+- Code review discussions
+- Design decision debates
+- Meeting contributions
+- Situations requiring explanation or judgment
+
+The `send_message` tool supports both via an optional `structured` parameter:
+
+```rust
+pub enum MessagePayload {
+    /// Natural language — triggers a full agent run on the recipient.
+    Text(String),
+    /// Structured data — appended to session as a system message,
+    /// may or may not trigger a run depending on the recipient's config.
+    Structured { kind: String, data: Value },
+}
+```
+
+Structured messages are cheaper (no LLM call needed to "read" them — they go into context as data), easier to search/filter, and render natively in the UI as cards/badges.
+
+### 3.5 @-Mention Routing in Group Chats
+
+Group messages support @-mention routing (per `communication-architecture.md` Section 6.2):
+
+- `@agentname` — only that agent is invoked (others see the message in their session but don't trigger a run)
+- `@agentname @agentname2` — multiple specific agents invoked
+- `@everyone` — all group members invoked
+- No tag — message is logged to all sessions but no agent is invoked
+
+The MessageBus parses mentions from the message text and only creates `RunTrigger` events for mentioned agents. Non-mentioned agents still receive the message in their group session (for context continuity) but their SessionQueue is not triggered.
+
+Agents are informed about the mention system via their system prompt.
+
+### 3.6 Ignore Signal
+
+Agents can decline to respond to an invocation (per `communication-architecture.md` Section 7). When an agent receives a message (especially from an `@everyone` group mention), it evaluates whether it has something meaningful to contribute. If not, it returns a built-in ignore signal instead of a response.
+
+**Implementation**: A special tool `ignore_message` that the agent can call during its run:
+
+```json
+{
+  "name": "ignore_message",
+  "description": "Decline to respond to this message. Use when you have nothing meaningful to add.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "reason": { "type": "string", "description": "Brief reason for ignoring (logged, not sent)" }
+    }
+  }
+}
+```
+
+When called, the run ends early. The ignore is logged but no response is broadcast. The system prompt instructs agents on when this is appropriate.
+
+**Future optimization**: A cheaper pre-filter (smaller model or rule-based check) before the full LLM call to avoid paying for the ignore decision itself. Deferred — build the expensive correct version first.
+
+### 3.7 New Tool: `send_message`
 
 ```json
 {
@@ -225,7 +291,7 @@ impl Tool for SendMessageTool {
 
 The tool returns immediately (fire-and-forget from the sender's perspective). The sender does NOT block waiting for a response. If the sender wants to see the response, it reads the DM session later using a new tool or gets notified.
 
-### 3.5 New Tool: `list_agents`
+### 3.8 New Tool: `list_agents`
 
 Agents need to discover who they can talk to.
 
@@ -261,7 +327,7 @@ Returns:
 }
 ```
 
-### 3.6 New Tool: `read_messages`
+### 3.9 New Tool: `read_messages`
 
 Lets an agent check its DM conversation with another agent (analogous to `read_subagent_session` but for peer conversations).
 
@@ -472,7 +538,72 @@ This is intentional: it matches how the existing session model works and avoids 
 
 ---
 
-## 6. How This Integrates with Existing Systems
+## 6. Team Meetings (Layer 2.5 / Layer 3 Bridge)
+
+Per `communication-architecture.md`, meetings are the primary mechanism for team coordination. They bridge Layer 2 (communication pipes) and Layer 3 (emergent team dynamics).
+
+### 6.1 Meeting Model
+
+A meeting is a **structured group conversation** with:
+- A **facilitator** (manager role agent) who initiates, drives agenda, and concludes
+- A set of **participants** (all team members, or a subset)
+- A **summary block** prepended as context (previous meeting summary + current project stats)
+- A **maximum round count** to prevent infinite discussion
+- A **generated summary** at conclusion that feeds forward to the next meeting
+
+### 6.2 Meeting Lifecycle
+
+```
+Manager agent initiates meeting (scheduled or ad-hoc)
+  |
+  | Context block prepended: previous meeting summary + project stats
+  v
+Round 1: Manager sets agenda, @everyone
+  |
+  | Each agent responds (or ignores via ignore_message)
+  v
+Round 2-N: Discussion, facilitated by manager
+  |
+  | Manager directs questions: @developer, @reviewer
+  | Agents respond, use ignore signal if nothing to add
+  v
+Manager ends meeting (or hard cap hit)
+  |
+  | System generates meeting summary
+  | Summary persisted → feeds into next meeting's context block
+```
+
+### 6.3 Implementation
+
+Meetings are built on top of group sessions (Phase 4) with additional structure:
+- A `meeting` table tracking active/completed meetings with metadata
+- Meeting context builder that prepends summary blocks
+- Manager tool: `start_meeting`, `end_meeting`
+- Auto-summary generation at meeting conclusion
+
+**This is Phase 7** — it requires group sessions (Phase 4), @-mention routing, and the ignore signal to be in place first.
+
+### 6.4 Context Management for Meetings
+
+Per `communication-architecture.md` Section 5: agents in a meeting receive the **full conversation history** for that meeting (no truncation). Context limits are managed by:
+1. Curated summary blocks (not full prior meeting history)
+2. Meeting length caps (end meeting when context grows too large)
+3. Carry-forward of unresolved items to the next meeting
+
+---
+
+## 7. Task Queue Priority
+
+Per `communication-architecture.md` Section 8, the agent task queue (currently `SessionQueue`) supports priority levels:
+
+- **Normal**: FIFO. Default for all invocations.
+- **Urgent**: Jumps to front of queue. For blocking bugs, security incidents, or time-sensitive invocations.
+
+The existing `SessionQueue` already has a two-tier priority system (`enqueue()` vs `enqueue_low()`). This extends to three tiers: `urgent > normal > low`. The user or system can flag an invocation as urgent via a parameter on `send_message` or the HTTP API.
+
+---
+
+## 8. How This Integrates with Existing Systems
 
 ### 6.1 Coexistence with invoke_agent
 
@@ -515,9 +646,9 @@ No new endpoints are needed for observation -- the existing session/run/SSE infr
 
 ---
 
-## 7. Database Schema Changes
+## 9. Database Schema Changes
 
-### 7.1 New Tables
+### 9.1 New Tables
 
 ```sql
 -- Groups for multi-agent conversations
@@ -537,7 +668,7 @@ CREATE TABLE IF NOT EXISTS group_members (
 );
 ```
 
-### 7.2 Schema Migrations to Existing Tables
+### 9.2 Schema Migrations to Existing Tables
 
 ```sql
 -- Add daemon flag to agents table
@@ -548,7 +679,7 @@ ALTER TABLE agents ADD COLUMN daemon INTEGER NOT NULL DEFAULT 0;
 -- No schema change needed: metadata is already TEXT (JSON).
 ```
 
-### 7.3 Message Metadata Convention
+### 9.3 Message Metadata Convention
 
 Use the existing `metadata` JSON column on messages to track sender identity in DM/group contexts:
 
@@ -564,9 +695,9 @@ This avoids adding new columns to the messages table. The metadata column is alr
 
 ---
 
-## 8. API Changes
+## 10. API Changes
 
-### 8.1 New Endpoints
+### 10.1 New Endpoints
 
 ```
 POST   /messages              -- Send a message from one agent to another (or to a group)
@@ -578,14 +709,14 @@ POST   /groups/{name}/members -- Add a member to a group
 DELETE /groups/{name}/members/{agent} -- Remove a member
 ```
 
-### 8.2 Modified Endpoints
+### 10.2 Modified Endpoints
 
 ```
 GET /sessions -- Add filter params: ?type=dm|group|user to filter session types
 GET /agents   -- Add daemon flag to response, add status (idle/running/listening)
 ```
 
-### 8.3 New SSE Event Types
+### 10.3 New SSE Event Types
 
 ```json
 // Emitted on the recipient's session when a peer message arrives
@@ -601,7 +732,7 @@ GET /agents   -- Add daemon flag to response, add status (idle/running/listening
 
 ---
 
-## 9. Crate-Level Changes
+## 11. Crate-Level Changes
 
 ### alms-core
 
@@ -645,7 +776,7 @@ GET /agents   -- Add daemon flag to response, add status (idle/running/listening
 
 ---
 
-## 10. System Prompt Additions
+## 12. System Prompt Additions
 
 Agents need to know they can communicate with peers. The staged system prompt (`prompts/tool_loop.md`) should include:
 
@@ -676,9 +807,9 @@ This is injected by the runtime when it detects a `dm:*` context_id on the sessi
 
 ---
 
-## 11. Security Considerations
+## 13. Security Considerations
 
-### 11.1 Access Control
+### 13.1 Access Control
 
 **Phase 1 (open):** Any agent can message any other agent. This is simple and sufficient for small teams where all agents are trusted.
 
@@ -687,7 +818,7 @@ This is injected by the runtime when it detects a `dm:*` context_id on the sessi
 - `can_join_groups: true/false`
 - `can_create_groups: true/false`
 
-### 11.2 Message Rate Limiting
+### 13.2 Message Rate Limiting
 
 Agents could flood each other with messages, creating infinite loops:
 - Agent A sends to Agent B
@@ -701,7 +832,7 @@ Agents could flood each other with messages, creating infinite loops:
 3. **Max message depth**: Track how many times a message has been "forwarded" (A->B->A->B...). After depth N (default: 5), delivery is refused with an error
 4. **Token budget per DM pair per hour**: Configurable limit on total tokens spent on a DM conversation
 
-### 11.3 User Override
+### 13.3 User Override
 
 The user (via the API or UI) can:
 - Pause a daemon agent (stop processing incoming messages)
@@ -711,7 +842,7 @@ The user (via the API or UI) can:
 
 ---
 
-## 12. Implementation Phases
+## 14. Implementation Phases
 
 Each phase delivers independent value and is a PR-sized chunk.
 
@@ -818,12 +949,50 @@ Each phase delivers independent value and is a PR-sized chunk.
 - UI: "Send message to agent" action from the agent panel
 - UI: Group management panel
 - UI: Real-time message indicators (using `message_received` SSE event)
+- UI: Structured message rendering (cards/badges for PR metadata, test results, etc.)
 
 This phase is UI-only (HTML/JS/CSS) -- no Rust changes.
 
+### Phase 7: Team meetings (Layer 2.5)
+
+**Goal**: Manager-facilitated team meetings with summaries that feed forward.
+
+**Changes:**
+- `alms-session/sqlite`: `meetings` table (id, group_id, status, summary, round_count, max_rounds, created_at)
+- `alms-coordinator`: Meeting lifecycle management (start, round tracking, auto-end at round cap)
+- `alms-runtime`: `StartMeetingTool`, `EndMeetingTool` (manager-only tools)
+- `alms-runtime`: Meeting context builder — prepends summary block (previous meeting summary + project stats)
+- `alms-runtime`: Auto-summary generation at meeting conclusion
+- `alms-gateway`: Meeting API endpoints (`POST /meetings`, `GET /meetings/{id}`, `POST /meetings/{id}/end`)
+
+**Tests:**
+- Meeting lifecycle: start, rounds, end, summary generation
+- Summary feed-forward: meeting N's summary appears in meeting N+1's context
+- Hard cap: meeting ends when max_rounds reached
+
+**Estimated size:** ~600 lines, ~10 tests.
+
+### Phase 8: PR review loop (core workflow)
+
+**Goal**: The primary autonomous workflow — developer writes code, reviewer reviews, developer addresses, iterate until merge.
+
+Per `communication-architecture.md` Section 12, this is the core value proposition. Built on top of all previous phases:
+- Developer agent opens PR → sends structured message (PR metadata) to reviewer
+- Reviewer agent reviews → sends NL feedback via DM
+- Developer addresses findings → sends updated PR metadata
+- Loop until reviewer approves (ignore signal = "no more findings")
+- Merge signal emitted
+
+**Changes:**
+- `alms-runtime`: PR review workflow tools (`submit_review`, `address_findings`, `approve_pr`)
+- Prompt engineering: developer and reviewer system prompts with review loop instructions
+- Integration with `shell_exec` for actual git/GitHub operations
+
+**Estimated size:** ~400 lines, ~8 tests. Mostly prompt engineering + tool wiring.
+
 ---
 
-## 13. Migration Path from Current State
+## 15. Migration Path from Current State
 
 The transition from pure hierarchy to peer messaging is additive -- nothing is removed or changed in the existing system.
 
@@ -841,15 +1010,15 @@ The transition from pure hierarchy to peer messaging is additive -- nothing is r
 
 ---
 
-## 14. Open Questions and Future Directions
+## 16. Open Questions and Future Directions
 
-### 14.1 Response Notification
+### 16.1 Response Notification
 
 When Agent B responds to Agent A's message, Agent A is notified using the same pattern as background subagent completions: B's response is dual-written into A's DM session as a User message, and a `RunTrigger` is created on A's DM session. If A is a daemon or has an active listener, it processes B's response as a new run. If not, the response sits in A's DM session history and is visible on the next run.
 
 This is the push model — no polling needed. The `RunTrigger` mechanism handles delivery for both the initial message and the response symmetrically.
 
-### 14.2 Message Delivery Guarantees
+### 16.2 Message Delivery Guarantees
 
 What happens if the gateway restarts while a message is in the `RunTrigger` channel?
 
@@ -857,7 +1026,7 @@ What happens if the gateway restarts while a message is in the `RunTrigger` chan
 - **Future:** Persist RunTriggers to SQLite before processing. On restart, replay unprocessed triggers.
 - **Recommendation:** Accept in-memory delivery for Phase 1. The risk is low (single-process, restarts are rare) and the fix is straightforward when needed.
 
-### 14.3 Message Ordering in Groups
+### 16.3 Message Ordering in Groups
 
 Group messages are delivered independently to each member. Members process them at different speeds. This means:
 - Member A might see message 1, 2, 3 in order
@@ -865,7 +1034,7 @@ Group messages are delivered independently to each member. Members process them 
 
 This is acceptable for async agent communication. If strict ordering is needed, the SessionQueue already ensures serial processing per session.
 
-### 14.4 Relationship to Layer 3
+### 16.4 Relationship to Layer 3
 
 Layer 3 (emergent team dynamics) builds on Layer 2 infrastructure:
 
@@ -877,17 +1046,25 @@ Layer 2 provides the pipes. Layer 3 provides the behavior.
 
 ---
 
-## 15. Summary
+## 17. Summary
 
-Layer 2 adds peer-to-peer communication to ALMS through five key components:
+Layer 2 adds peer-to-peer communication to ALMS, aligned with the product vision in `communication-architecture.md`. Eight implementation phases build incrementally:
 
-1. **MessageBus** -- routes messages between agents, creating DM sessions and triggering runs
-2. **send_message / read_messages tools** -- agents interact with peers through familiar tool calls
-3. **Daemon agents** -- always-on agents that listen for incoming messages
-4. **Group sessions** -- multi-agent conversations with broadcast delivery
-5. **RunTrigger generalization** -- the existing completion notification pattern becomes a universal message delivery mechanism
+1. **MessageBus + DM messaging** -- core message routing with loop prevention
+2. **Daemon agents** -- always-on listeners
+3. **HTTP API** -- external messaging interface
+4. **Group sessions** -- multi-agent conversations with @-mention routing
+5. **Advanced rate limiting** -- token budgets, user controls
+6. **UI integration** -- DM/group session visibility, structured message rendering
+7. **Team meetings** -- manager-facilitated meetings with summary feed-forward
+8. **PR review loop** -- the core autonomous workflow
 
-The design is intentionally conservative: it extends the existing session model rather than replacing it, reuses the run/SSE/context infrastructure, and keeps each phase independently deployable. The biggest change is conceptual (agents can now talk to each other) rather than architectural (the plumbing is mostly reuse).
+Key design principles:
+- **Hybrid messaging**: structured data for routine info, natural language for reasoning (cost control)
+- **Dual-write sessions**: each agent has its own view, no changes to SessionManager/ContextBuilder
+- **RunTrigger generalization**: the existing completion notification pattern becomes a universal message delivery mechanism
+- **Ignore signal**: agents can decline invocations to avoid wasted LLM calls
+- **Conservative extension**: reuses existing session/run/SSE infrastructure, keeps each phase independently deployable
 
 ---
 
