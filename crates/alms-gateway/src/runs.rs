@@ -165,6 +165,38 @@ pub struct ListRunsQuery {
     pub limit: Option<usize>,
 }
 
+/// GET /runs/{run_id}/tool-calls — list tool call records for a run.
+#[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
+pub async fn get_run_tool_calls(
+    State(state): State<AppState>,
+    Path(run_id): Path<RunId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Verify the run exists.
+    state
+        .run_manager
+        .get_run(run_id)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Run not found"))?;
+
+    let records = state
+        .session_manager
+        .store()
+        .map(|store| store.load_tool_calls(run_id))
+        .transpose()
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                format!("Failed to load tool calls: {e}"),
+            )
+        })?
+        .unwrap_or_default();
+
+    Ok(Json(serde_json::json!({
+        "run_id": run_id.0.to_string(),
+        "tool_calls": records,
+    })))
+}
+
 /// POST /runs/{run_id}/cancel — cancel a running or queued run.
 #[instrument(level = "info", skip(state), fields(run_id = %run_id.0))]
 pub async fn cancel_run(
@@ -586,8 +618,25 @@ async fn execute_run(
     drop(runtime);
     forwarder_handle.await.ok();
 
+    // Helper: persist tool call records (used by all outcome branches).
+    let persist_tool_calls = |records: &[alms_core::ToolCallRecord]| {
+        if !records.is_empty()
+            && let Some(store) = state.session_manager.store()
+            && let Err(e) = store.save_tool_calls(run_id, records)
+        {
+            warn!(
+                "Failed to persist {} tool call records for run {}: {}",
+                records.len(),
+                run_id.0,
+                e
+            );
+        }
+    };
+
     match result {
         Ok(output) => {
+            persist_tool_calls(&output.tool_calls);
+
             // token_delta events already emitted during streaming in the agent loop
             state
                 .run_manager
@@ -613,6 +662,47 @@ async fn execute_run(
             state.run_manager.mark_run_as_cancelled(run_id);
 
             info!("Run {} cancelled", run_id.0);
+        }
+        Err(alms_core::AlmsError::CancelledWithToolCalls { tool_calls }) => {
+            // Persist partial tool call records even though the run was cancelled.
+            persist_tool_calls(&tool_calls);
+
+            state
+                .run_manager
+                .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+                .await;
+
+            state.run_manager.mark_run_as_cancelled(run_id);
+
+            info!(
+                "Run {} cancelled ({} tool calls persisted)",
+                run_id.0,
+                tool_calls.len()
+            );
+        }
+        Err(alms_core::AlmsError::FailedWithToolCalls { source, tool_calls }) => {
+            // Persist partial tool call records even though the run failed.
+            persist_tool_calls(&tool_calls);
+
+            state
+                .run_manager
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_error(run_id, &source.to_string()),
+                )
+                .await;
+
+            state
+                .run_manager
+                .mark_run_as_failed(run_id, source.to_string());
+
+            error!(
+                "Run {} failed ({} tool calls persisted): {}",
+                run_id.0,
+                tool_calls.len(),
+                source
+            );
         }
         Err(e) => {
             state
@@ -1113,7 +1203,14 @@ pub async fn get_run_status(
     Path(run_id): Path<RunId>,
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
     match state.run_manager.get_run(run_id) {
-        Some(run) => Ok(Json(RunStatusResponse::from(run))),
+        Some(run) => {
+            let mut resp = RunStatusResponse::from(run);
+            // Attach tool call count if SQLite is available.
+            if let Some(store) = state.session_manager.store() {
+                resp.tool_call_count = store.count_tool_calls(run_id).ok();
+            }
+            Ok(Json(resp))
+        }
         None => Err(api_error(
             StatusCode::NOT_FOUND,
             "NOT_FOUND",

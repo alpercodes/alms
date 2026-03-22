@@ -12,8 +12,8 @@ use crate::event_log::{EventLogManager, LoggedEvent};
 use crate::gateway::Gateway;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
-    cancel_run, completion_notification_loop, create_run, get_run_status, list_runs,
-    run_trigger_loop, scheduler_fire_loop, stream_run_events,
+    cancel_run, completion_notification_loop, create_run, get_run_status, get_run_tool_calls,
+    list_runs, run_trigger_loop, scheduler_fire_loop, stream_run_events,
 };
 use crate::session_queue::SessionQueue;
 use crate::settings::get_settings;
@@ -619,6 +619,7 @@ fn protected_router() -> Router<AppState> {
         .route("/runs/{run_id}", get(get_run_status))
         .route("/runs/{run_id}/events", get(stream_run_events))
         .route("/runs/{run_id}/cancel", post(cancel_run))
+        .route("/runs/{run_id}/tool-calls", get(get_run_tool_calls))
         // Approvals
         .route("/approvals", get(list_approvals))
         .route("/approvals/{approval_id}", post(resolve_approval))
