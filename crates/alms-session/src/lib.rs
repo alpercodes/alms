@@ -190,10 +190,18 @@ impl SessionManager {
         self.session_by_id.contains_key(&session_id)
     }
 
-    /// Get a session by ID
+    /// Get a session by ID.
+    ///
+    /// Clones the key out of `session_by_id` (releasing its read lock) before
+    /// looking up in `sessions`, so both maps are never locked simultaneously.
+    /// This maintains the same lock ordering as `get_or_create` / `get_or_create_shared`.
     pub fn get(&self, session_id: SessionId) -> AlmsResult<Session> {
-        if let Some(key) = self.session_by_id.get(&session_id)
-            && let Some(session) = self.sessions.get(key.value())
+        let key = self
+            .session_by_id
+            .get(&session_id)
+            .map(|r| r.value().clone());
+        if let Some(key) = key
+            && let Some(session) = self.sessions.get(&key)
         {
             return Ok(session.clone());
         }
@@ -217,8 +225,14 @@ impl SessionManager {
             history.push(message);
 
             // Update last_activity via the reverse index — O(1), no full scan.
-            if let Some(key) = self.session_by_id.get(&session_id)
-                && let Some(mut session) = self.sessions.get_mut(key.value())
+            // Clone the key out of `session_by_id` (releasing its read lock) before
+            // acquiring a write lock on `sessions`, avoiding cross-map lock nesting.
+            let session_key = self
+                .session_by_id
+                .get(&session_id)
+                .map(|r| r.value().clone());
+            if let Some(key) = session_key
+                && let Some(mut session) = self.sessions.get_mut(&key)
             {
                 session.touch();
                 // Write-through updated last_activity to SQLite
