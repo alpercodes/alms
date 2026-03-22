@@ -1,5 +1,7 @@
 # Persistent Named Agents & CLI System
 
+> **Note (2026-03-22):** The `system_prompt` field was removed from `AgentRecord` and the agent registry in PR #265. Per-agent system prompts are no longer supported; agent identity is defined through workspace files (personality.md, goals.md, etc.) instead. References to `system_prompt` below reflect the original design and are retained for historical context.
+
 Design for making ALMS support multiple persistent agents per deployment and a full CLI for managing them.
 
 ---

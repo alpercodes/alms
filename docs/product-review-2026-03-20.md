@@ -79,7 +79,7 @@ However, **the product is not yet aligned with its own UX vision**. The `ux-prin
 - **Impact**: Cluttered chat history, confusing visual noise.
 
 #### BUG-12: Telegram per-agent config overrides ignored (#106)
-- Telegram handler creates `AgentRuntime` with server defaults. Per-agent model/system_prompt/posture overrides are bypassed.
+- Telegram handler creates `AgentRuntime` with server defaults. Per-agent model/posture overrides are bypassed.
 - HTTP run path correctly applies overrides but Telegram path doesn't.
 - **Impact**: Switching default agent doesn't change model/prompt for Telegram.
 

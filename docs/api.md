@@ -400,7 +400,7 @@ Audit records should align with `docs/security-model.md`.
 
 ## 9) Agents (named persistent agents)
 
-Named agents are persistent entities stored in SQLite. Each agent has a unique slug name, optional per-agent config overrides (model, system_prompt, posture), and a default flag.
+Named agents are persistent entities stored in SQLite. Each agent has a unique slug name, optional per-agent config overrides (model, posture), and a default flag.
 
 ### 9.1 List agents
 `GET /agents`
@@ -414,7 +414,6 @@ Named agents are persistent entities stored in SQLite. Each agent has a unique s
       "name": "default",
       "description": "",
       "model": null,
-      "system_prompt": null,
       "posture": null,
       "is_default": true,
       "created_at": "2026-03-12T...",
@@ -461,7 +460,6 @@ Path parameter accepts either a UUID or a name slug. UUID is tried first.
 {
   "description": "Updated description",
   "model": "new-model",
-  "system_prompt": "You are a researcher.",
   "posture": "guarded"
 }
 ```
