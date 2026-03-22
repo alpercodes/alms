@@ -95,31 +95,37 @@ impl SessionManager {
         self.sessions.contains_key(key)
     }
 
-    /// Get or create a session
+    /// Get or create a session.
+    ///
+    /// Uses `DashMap::entry()` to make the check-and-insert atomic, preventing
+    /// a TOCTOU race where two threads could create duplicate sessions for the
+    /// same `(agent_id, context_id)` key.
     pub fn get_or_create(&self, agent_id: AgentId, context_id: impl Into<String>) -> Session {
         let context_id = context_id.into();
         let key = (agent_id, context_id.clone());
 
-        if let Some(entry) = self.sessions.get(&key) {
-            let session = entry.clone();
-            debug!("Found existing session: {:?}", session.id);
-            return session;
-        }
+        let session = self
+            .sessions
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let session = Session::new(agent_id, context_id);
+                self.session_by_id.insert(session.id, key);
+                self.history.insert(session.id, Vec::new());
+                self.audit.insert(session.id, Vec::new());
+                self.summaries.entry(session.id).or_default();
 
-        let session = Session::new(agent_id, context_id);
-        self.session_by_id.insert(session.id, key.clone());
-        self.sessions.insert(key, session.clone());
-        self.history.insert(session.id, Vec::new());
-        self.audit.insert(session.id, Vec::new());
-        self.summaries.entry(session.id).or_default();
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save_session(&session)
+                {
+                    warn!("Failed to persist session {}: {}", session.id.0, e);
+                }
 
-        if let Some(store) = &self.store
-            && let Err(e) = store.save_session(&session)
-        {
-            warn!("Failed to persist session {}: {}", session.id.0, e);
-        }
+                info!("Created new session: {:?}", session.id);
+                session
+            })
+            .clone();
 
-        info!("Created new session: {:?}", session.id);
+        debug!("get_or_create session: {:?}", session.id);
         session
     }
 
@@ -131,61 +137,57 @@ impl SessionManager {
     /// context_id)` in the internal map so it integrates with the existing
     /// session infrastructure.
     ///
-    /// `sentinel_agent_id` should be a stable ID associated with the conversation
-    /// (e.g., one of the participants, or a nil UUID). It is only used for the
-    /// internal DashMap key -- both participants access the session by `SessionId`.
+    /// Uses `DashMap::entry()` on the reverse index to make the check-and-insert
+    /// atomic, preventing a TOCTOU race where two threads could create duplicate
+    /// shared sessions for the same `SessionId`.
     pub fn get_or_create_shared(
         &self,
         session_id: SessionId,
         context_id: impl Into<String>,
     ) -> Session {
-        // Fast path: session already exists in the reverse index.
-        //
-        // TODO(TOCTOU): There is a race between this lookup and the insert below —
-        // two concurrent callers could both miss the fast path and both create the
-        // session. In practice this is benign for three reasons:
-        //   1. DashMap::insert is idempotent — the second insert overwrites with an
-        //      identical Session (same deterministic SessionId, same sentinel AgentId).
-        //   2. The agent queue in the gateway serializes runs per-agent, so concurrent
-        //      calls for the same session are unlikely outside of DM delivery.
-        //   3. A duplicate save_session to SQLite is a harmless upsert.
-        // For strict correctness, DashMap's `entry()` API could make this atomic,
-        // but the added complexity is not warranted given the above guarantees.
-        if let Some(key) = self.session_by_id.get(&session_id)
-            && let Some(session) = self.sessions.get(key.value())
-        {
-            debug!("Found existing shared session: {:?}", session_id);
-            return session.clone();
-        }
-
-        // Slow path: create the session with the provided deterministic SessionId.
         let context_id = context_id.into();
-        // Use a nil AgentId as sentinel for shared sessions.
-        let sentinel = AgentId(uuid::Uuid::nil());
-        let key = (sentinel, context_id.clone());
 
-        let session = Session {
-            id: session_id,
-            agent_id: sentinel,
-            context_id,
-            created_at: alms_core::Timestamp::now(),
-            last_activity: alms_core::Timestamp::now(),
-            status: types::SessionStatus::Active,
-        };
+        // Atomic check-and-insert on the reverse index. The `entry()` call holds
+        // the shard lock, so only one thread can create a session for a given
+        // `SessionId`.
+        let key_ref = self.session_by_id.entry(session_id).or_insert_with(|| {
+            let sentinel = AgentId(uuid::Uuid::nil());
+            let key = (sentinel, context_id.clone());
 
-        self.session_by_id.insert(session_id, key.clone());
-        self.sessions.insert(key, session.clone());
-        self.history.insert(session_id, Vec::new());
-        self.audit.insert(session_id, Vec::new());
-        self.summaries.entry(session_id).or_default();
+            let session = Session {
+                id: session_id,
+                agent_id: sentinel,
+                context_id,
+                created_at: alms_core::Timestamp::now(),
+                last_activity: alms_core::Timestamp::now(),
+                status: types::SessionStatus::Active,
+            };
 
-        if let Some(store) = &self.store
-            && let Err(e) = store.save_session(&session)
-        {
-            warn!("Failed to persist shared session {}: {}", session_id.0, e);
-        }
+            self.sessions.insert(key.clone(), session.clone());
+            self.history.insert(session_id, Vec::new());
+            self.audit.insert(session_id, Vec::new());
+            self.summaries.entry(session_id).or_default();
 
-        info!("Created new shared session: {:?}", session_id);
+            if let Some(store) = &self.store
+                && let Err(e) = store.save_session(&session)
+            {
+                warn!("Failed to persist shared session {}: {}", session_id.0, e);
+            }
+
+            info!("Created new shared session: {:?}", session_id);
+            key
+        });
+
+        // Now look up the session in the forward map using the key from the
+        // reverse index. This always succeeds because we just inserted it above
+        // (or it was already there).
+        let session = self
+            .sessions
+            .get(key_ref.value())
+            .expect("session must exist in forward map after reverse-index insert")
+            .clone();
+
+        debug!("get_or_create_shared session: {:?}", session_id);
         session
     }
 
