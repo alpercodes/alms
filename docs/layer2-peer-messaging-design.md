@@ -105,20 +105,12 @@ fn dm_context_id(a: &str, b: &str) -> String {
 }
 ```
 
-The session is **owned by the receiving agent** (the one whose run is triggered). Each side has its own session object for the same DM conversation, because sessions are keyed by `(agent_id, context_id)`. When Agent A sends to Agent B:
+Each side has its own session object for the DM, because sessions are keyed by `(agent_id, context_id)`:
 
 - Agent B's session: `(agent_b_id, "dm:agent-a:agent-b")` -- B is the agent, A's messages appear as Role::User
-- Agent A's session: `(agent_a_id, "dm:agent-a:agent-b")` -- A is the agent, B's responses are stored here
+- Agent A's session: `(agent_a_id, "dm:agent-a:agent-b")` -- A is the agent, B's responses appear as Role::User
 
-Wait -- this creates two separate session histories for the same conversation, which is wrong. Let me reconsider.
-
-**Revised approach: Shared DM sessions with sender metadata.**
-
-A DM session is a single session owned by one agent (the "host"), with a new metadata field on messages to identify the sender:
-
-Actually, the cleanest approach that avoids restructuring the session model is:
-
-**Each agent has its own view of the conversation, stored in its own session.** When A sends a message to B:
+**Dual-write model.** Each agent has its own view of the conversation, stored in its own session. When A sends a message to B:
 
 1. The message is appended to **B's DM session** as a User message (because from B's perspective, A is a "user" sending input)
 2. The message is also appended to **A's DM session** as an Assistant message with metadata `{forwarded: true}` (so A's context shows what it sent)
@@ -294,7 +286,7 @@ Lets an agent check its DM conversation with another agent (analogous to `read_s
 }
 ```
 
-This is essentially `read_subagent_session` but with a different session key derivation (DM context_id instead of subagent context_id).
+This is essentially `read_subagent_session` but with a different session key derivation (DM context_id instead of subagent context_id). **Implementation note:** `read_messages` and `read_subagent_session` should share their core logic (load session by context_id, format messages, optional summary). Consider refactoring into a shared `read_agent_session` helper that both tools call with different context_id derivations.
 
 ---
 
@@ -302,7 +294,13 @@ This is essentially `read_subagent_session` but with a different session key der
 
 ### 4.1 Concept
 
-An always-on agent is an agent that stays running indefinitely, processing incoming messages as they arrive. Unlike the current model where each run is a discrete request-response cycle, a daemon agent maintains a persistent event loop.
+An always-on agent is an agent that the gateway keeps "warm" — ready to process incoming messages immediately.
+
+**Important clarification:** The `RunTrigger` mechanism (Phase 1) creates runs for ANY agent, daemon or not. A non-daemon agent can still receive peer messages — they create runs just like a user's POST /runs does. The `daemon` flag adds:
+
+1. **Boot-time readiness**: The gateway pre-creates the agent's default session on startup
+2. **UI semantics**: The agent shows as "listening" in the UI, distinct from idle agents
+3. **Intent signal**: Tells the system this agent is designed to receive unsolicited messages
 
 ### 4.2 Implementation: Listener Loop
 
@@ -647,9 +645,40 @@ GET /agents   -- Add daemon flag to response, add status (idle/running/listening
 
 ---
 
-## 10. Security Considerations
+## 10. System Prompt Additions
 
-### 10.1 Access Control
+Agents need to know they can communicate with peers. The staged system prompt (`prompts/tool_loop.md`) should include:
+
+```
+## Peer Messaging
+
+You can communicate with other agents using these tools:
+- `send_message(to, message)` — send a message to another agent (fire-and-forget)
+- `list_agents()` — discover available agents and their roles
+- `read_messages(from, last_n)` — read your DM conversation with another agent
+
+Messages from other agents appear in your conversation as user messages with metadata
+indicating the sender. When you see `{from_agent: "reviewer"}`, that message came from
+the reviewer agent, not from the human user.
+
+Use peer messaging for collaboration, status updates, and requests. Use `invoke_agent`
+for task delegation where you need a result back.
+```
+
+For DM sessions, the system prompt should also include context about who the conversation partner is:
+
+```
+You are in a direct message conversation with agent "{peer_name}".
+Messages from them appear as user messages. Your responses will be delivered to them.
+```
+
+This is injected by the runtime when it detects a `dm:*` context_id on the session.
+
+---
+
+## 11. Security Considerations
+
+### 11.1 Access Control
 
 **Phase 1 (open):** Any agent can message any other agent. This is simple and sufficient for small teams where all agents are trusted.
 
@@ -658,7 +687,7 @@ GET /agents   -- Add daemon flag to response, add status (idle/running/listening
 - `can_join_groups: true/false`
 - `can_create_groups: true/false`
 
-### 10.2 Message Rate Limiting
+### 11.2 Message Rate Limiting
 
 Agents could flood each other with messages, creating infinite loops:
 - Agent A sends to Agent B
@@ -672,7 +701,7 @@ Agents could flood each other with messages, creating infinite loops:
 3. **Max message depth**: Track how many times a message has been "forwarded" (A->B->A->B...). After depth N (default: 5), delivery is refused with an error
 4. **Token budget per DM pair per hour**: Configurable limit on total tokens spent on a DM conversation
 
-### 10.3 User Override
+### 11.3 User Override
 
 The user (via the API or UI) can:
 - Pause a daemon agent (stop processing incoming messages)
@@ -682,7 +711,7 @@ The user (via the API or UI) can:
 
 ---
 
-## 11. Implementation Phases
+## 12. Implementation Phases
 
 Each phase delivers independent value and is a PR-sized chunk.
 
@@ -699,11 +728,16 @@ Each phase delivers independent value and is a PR-sized chunk.
 - `alms-runtime`: Add `ReadMessagesTool` (reads DM session history).
 - `alms-session`: No schema changes (DM sessions are regular sessions with a `dm:*` context_id).
 
+**Loop prevention (must ship with Phase 1):**
+- Message depth tracking: each message carries a `depth` counter incremented on each forward. MessageBus refuses delivery at `depth > MAX_DM_DEPTH` (default: 5).
+- Per-DM-pair cooldown: after delivering a message, the MessageBus rejects another message between the same pair for T seconds (default: 5). This prevents tight A→B→A loops from burning tokens.
+- These are simple counters/timers in the MessageBus, not separate infrastructure.
+
 **Tests:**
-- Unit: MessageBus send/receive, DM context_id derivation, dual-write consistency
+- Unit: MessageBus send/receive, DM context_id derivation, dual-write consistency, depth limit rejection, cooldown rejection
 - Integration: Agent A sends to Agent B, B's session gets a run with the message
 
-**Estimated size:** ~400 lines of new code, ~8 tests.
+**Estimated size:** ~500 lines of new code, ~12 tests.
 
 ### Phase 2: Daemon agents (always-on listeners)
 
@@ -758,20 +792,20 @@ Each phase delivers independent value and is a PR-sized chunk.
 
 **Estimated size:** ~500 lines, ~10 tests.
 
-### Phase 5: Loop prevention + rate limiting
+### Phase 5: Advanced rate limiting + user controls
 
-**Goal**: Prevent infinite message loops and token burn.
+**Goal**: Configurable rate limiting and user control over agent conversations. (Basic loop prevention — depth tracking and per-DM cooldown — ships in Phase 1.)
 
 **Changes:**
-- `alms-coordinator/message_bus`: Message depth tracking (header on each message)
-- `alms-coordinator/message_bus`: Per-DM-pair rate limiter
 - `alms-coordinator/message_bus`: Per-agent-per-hour token budget for DM/group runs
-- `alms-gateway`: User controls: pause agent, mute session
+- `alms-coordinator/message_bus`: Configurable rate limits per agent (via agent config or `alms.toml`)
+- `alms-gateway`: User controls: pause agent, mute session, kill runaway conversation
+- `alms-gateway`: Rate limit status in agent API response
 
 **Tests:**
-- A->B->A->B loop is stopped at max depth
-- Rate limiter rejects after N messages/minute
+- Token budget exceeded → delivery refused
 - Paused agent does not process messages
+- Muted session accepts but doesn't trigger runs
 
 **Estimated size:** ~300 lines, ~8 tests.
 
@@ -789,7 +823,7 @@ This phase is UI-only (HTML/JS/CSS) -- no Rust changes.
 
 ---
 
-## 12. Migration Path from Current State
+## 13. Migration Path from Current State
 
 The transition from pure hierarchy to peer messaging is additive -- nothing is removed or changed in the existing system.
 
@@ -807,17 +841,15 @@ The transition from pure hierarchy to peer messaging is additive -- nothing is r
 
 ---
 
-## 13. Open Questions and Future Directions
+## 14. Open Questions and Future Directions
 
-### 13.1 Response Notification
+### 14.1 Response Notification
 
-When Agent B responds to Agent A's message, should Agent A be automatically notified? Options:
+When Agent B responds to Agent A's message, Agent A is notified using the same pattern as background subagent completions: B's response is dual-written into A's DM session as a User message, and a `RunTrigger` is created on A's DM session. If A is a daemon or has an active listener, it processes B's response as a new run. If not, the response sits in A's DM session history and is visible on the next run.
 
-- **Option A (pull):** Agent A periodically calls `read_messages(from="agent-b")` to check for responses. Simple, but wastes LLM iterations.
-- **Option B (push):** Like background subagent completion, inject B's response into A's next context build. More complex, but more efficient.
-- **Recommendation:** Start with Option A (pull via `read_messages`). Add Option B later if the polling overhead is significant.
+This is the push model — no polling needed. The `RunTrigger` mechanism handles delivery for both the initial message and the response symmetrically.
 
-### 13.2 Message Delivery Guarantees
+### 14.2 Message Delivery Guarantees
 
 What happens if the gateway restarts while a message is in the `RunTrigger` channel?
 
@@ -825,7 +857,7 @@ What happens if the gateway restarts while a message is in the `RunTrigger` chan
 - **Future:** Persist RunTriggers to SQLite before processing. On restart, replay unprocessed triggers.
 - **Recommendation:** Accept in-memory delivery for Phase 1. The risk is low (single-process, restarts are rare) and the fix is straightforward when needed.
 
-### 13.3 Message Ordering in Groups
+### 14.3 Message Ordering in Groups
 
 Group messages are delivered independently to each member. Members process them at different speeds. This means:
 - Member A might see message 1, 2, 3 in order
@@ -833,7 +865,7 @@ Group messages are delivered independently to each member. Members process them 
 
 This is acceptable for async agent communication. If strict ordering is needed, the SessionQueue already ensures serial processing per session.
 
-### 13.4 Relationship to Layer 3
+### 14.4 Relationship to Layer 3
 
 Layer 3 (emergent team dynamics) builds on Layer 2 infrastructure:
 
@@ -845,7 +877,7 @@ Layer 2 provides the pipes. Layer 3 provides the behavior.
 
 ---
 
-## 14. Summary
+## 15. Summary
 
 Layer 2 adds peer-to-peer communication to ALMS through five key components:
 
