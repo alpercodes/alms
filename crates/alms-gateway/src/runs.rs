@@ -32,6 +32,21 @@ struct RunOverrides {
     posture: Option<String>,
 }
 
+/// Bundled parameters for [`execute_run`], avoiding a long positional argument list.
+struct RunParams {
+    run_id: RunId,
+    session_id: SessionId,
+    agent_id: alms_core::AgentId,
+    input: String,
+    overrides: RunOverrides,
+    context_id: String,
+    cancel_token: CancellationToken,
+    /// When true, the input message has already been persisted to the session
+    /// by the MessageBus. The agent loop uses `run_on_session` to look up the
+    /// shared session by `SessionId` directly and skips re-persisting the input.
+    is_peer_message: bool,
+}
+
 /// Result of resolving per-agent config from the agent registry.
 pub struct ResolvedAgentConfig {
     pub agent_config: alms_runtime::AgentConfig,
@@ -312,14 +327,16 @@ pub async fn create_run(
         Box::pin(async move {
             execute_run(
                 state_clone,
-                run_id,
-                session_id,
-                agent_id,
-                run.input,
-                overrides,
-                context_id,
-                cancel_token,
-                false, // user-initiated run — not a peer message
+                RunParams {
+                    run_id,
+                    session_id,
+                    agent_id,
+                    input: run.input,
+                    overrides,
+                    context_id,
+                    cancel_token,
+                    is_peer_message: false,
+                },
             )
             .await;
         }),
@@ -336,22 +353,18 @@ pub async fn create_run(
 }
 
 /// Execute a run in background, forwarding runtime events to SSE.
-#[instrument(level = "info", skip(state, input, overrides), fields(run_id = %run_id.0, session_id = %session_id.0))]
-#[allow(clippy::too_many_arguments)]
-async fn execute_run(
-    state: AppState,
-    run_id: RunId,
-    session_id: SessionId,
-    agent_id: alms_core::AgentId,
-    input: String,
-    overrides: RunOverrides,
-    context_id: String,
-    cancel_token: CancellationToken,
-    // When true, the input message has already been persisted to the session
-    // by the MessageBus. The agent loop uses `run_on_session` to look up the
-    // shared session by `SessionId` directly and skips re-persisting the input.
-    is_peer_message: bool,
-) {
+#[instrument(level = "info", skip(state, params), fields(run_id = %params.run_id.0, session_id = %params.session_id.0))]
+async fn execute_run(state: AppState, params: RunParams) {
+    let RunParams {
+        run_id,
+        session_id,
+        agent_id,
+        input,
+        overrides,
+        context_id,
+        cancel_token,
+        is_peer_message,
+    } = params;
     // Track this run for graceful shutdown drain.
     state.run_manager.track_in_flight();
 
@@ -816,14 +829,16 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
         .register_cancel_token(run_id, cancel_token.clone());
     execute_run(
         state.clone(),
-        run_id,
-        session_id,
-        job.agent_id,
-        run.input,
-        RunOverrides::default(),
-        context_id,
-        cancel_token,
-        false, // scheduled job — not a peer message
+        RunParams {
+            run_id,
+            session_id,
+            agent_id: job.agent_id,
+            input: run.input,
+            overrides: RunOverrides::default(),
+            context_id,
+            cancel_token,
+            is_peer_message: false,
+        },
     )
     .await;
 
@@ -977,14 +992,16 @@ pub(crate) async fn completion_notification_loop(
             Box::pin(async move {
                 execute_run(
                     state_clone,
-                    run_id,
-                    session_id,
-                    agent_id,
-                    notification,
-                    RunOverrides::default(),
-                    context_id,
-                    cancel_token,
-                    false, // subagent completion — not a peer message
+                    RunParams {
+                        run_id,
+                        session_id,
+                        agent_id,
+                        input: notification,
+                        overrides: RunOverrides::default(),
+                        context_id,
+                        cancel_token,
+                        is_peer_message: false,
+                    },
                 )
                 .await;
             }),
@@ -1087,14 +1104,16 @@ pub(crate) async fn run_trigger_loop(
             Box::pin(async move {
                 execute_run(
                     state_clone,
-                    run_id,
-                    session_id,
-                    agent_id,
-                    trigger.input,
-                    RunOverrides::default(),
-                    context_id,
-                    cancel_token,
-                    is_peer, // peer message — use shared session, skip input persist
+                    RunParams {
+                        run_id,
+                        session_id,
+                        agent_id,
+                        input: trigger.input,
+                        overrides: RunOverrides::default(),
+                        context_id,
+                        cancel_token,
+                        is_peer_message: is_peer,
+                    },
                 )
                 .await;
             }),
