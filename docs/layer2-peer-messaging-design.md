@@ -388,10 +388,10 @@ A daemon agent is not fundamentally different from a regular agent -- it is an a
                       | Loop       |
                       +-----+-----+
                             |
-                            | enqueue to SessionQueue
+                            | enqueue to AgentQueue
                             v
                       +-----+-----+
-                      | Session    |
+                      | Agent      |
                       | Queue      |
                       +-----+-----+
                             |
@@ -904,7 +904,7 @@ Each phase delivers independent value and is a PR-sized chunk.
 - These are simple counters/timers in the MessageBus, not separate infrastructure.
 
 **Tests:**
-- Unit: MessageBus send/receive, DM context_id derivation, dual-write consistency, depth limit rejection, cooldown rejection
+- Unit: MessageBus send/receive, DM context_id derivation, message delivery, depth limit rejection, cooldown rejection
 - Integration: Agent A sends to Agent B, B's session gets a run with the message
 
 **Estimated size:** ~500 lines of new code, ~12 tests.
@@ -1053,7 +1053,7 @@ The transition from pure hierarchy to peer messaging is additive -- nothing is r
 
 ### 17.1 Response Notification
 
-When Agent B responds to Agent A's message, Agent A is notified using the same pattern as background subagent completions: B's response is dual-written into A's DM session as a User message, and a `RunTrigger` is created on A's DM session. If A is a daemon or has an active listener, it processes B's response as a new run. If not, the response sits in A's DM session history and is visible on the next run.
+When Agent B responds to Agent A's message, Agent A is notified using the same pattern as background subagent completions: B's response is written into A's DM session as a User message, and a `RunTrigger` is created on A's DM session. If A is a daemon or has an active listener, it processes B's response as a new run. If not, the response sits in A's DM session history and is visible on the next run.
 
 This is the push model — no polling needed. The `RunTrigger` mechanism handles delivery for both the initial message and the response symmetrically.
 
@@ -1100,7 +1100,7 @@ Layer 2 adds peer-to-peer communication to ALMS, aligned with the product vision
 
 Key design principles:
 - **Hybrid messaging**: structured data for routine info, natural language for reasoning (cost control)
-- **Dual-write sessions**: each agent has its own view, no changes to SessionManager/ContextBuilder
+- **Per-agent sessions**: each agent has its own DM/group session, no changes to SessionManager/ContextBuilder
 - **RunTrigger generalization**: the existing completion notification pattern becomes a universal message delivery mechanism
 - **Ignore signal**: agents can decline invocations to avoid wasted LLM calls
 - **Conservative extension**: reuses existing session/run/SSE infrastructure, keeps each phase independently deployable
