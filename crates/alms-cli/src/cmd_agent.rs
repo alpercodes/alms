@@ -253,15 +253,26 @@ pub(crate) fn agent_set_default(
     Ok(())
 }
 
-pub(crate) fn agent_config(
-    store: &SqliteStore,
-    name_or_id: &str,
-    model: Option<String>,
-    posture: Option<String>,
-    provider: Option<String>,
-    description: Option<String>,
-    json: bool,
-) -> anyhow::Result<()> {
+/// Options for updating an agent's configuration via the CLI.
+pub(crate) struct AgentConfigOpts<'a> {
+    pub name_or_id: &'a str,
+    pub model: Option<String>,
+    pub posture: Option<String>,
+    pub provider: Option<String>,
+    pub description: Option<String>,
+    pub json: bool,
+}
+
+pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> anyhow::Result<()> {
+    let AgentConfigOpts {
+        name_or_id,
+        model,
+        posture,
+        provider,
+        description,
+        json,
+    } = opts;
+
     let mut agent = resolve_agent(store, name_or_id)?;
 
     if let Some(d) = description {
@@ -462,12 +473,14 @@ mod tests {
 
         agent_config(
             &store,
-            "configurable",
-            Some("new-model".into()),
-            Some("guarded".into()),
-            None,
-            Some("updated desc".into()),
-            false,
+            AgentConfigOpts {
+                name_or_id: "configurable",
+                model: Some("new-model".into()),
+                posture: Some("guarded".into()),
+                provider: None,
+                description: Some("updated desc".into()),
+                json: false,
+            },
         )
         .unwrap();
 
@@ -497,12 +510,14 @@ mod tests {
         // Clear model by passing empty string
         agent_config(
             &store,
-            "clearable",
-            Some(String::new()),
-            None,
-            None,
-            None,
-            false,
+            AgentConfigOpts {
+                name_or_id: "clearable",
+                model: Some(String::new()),
+                posture: None,
+                provider: None,
+                description: None,
+                json: false,
+            },
         )
         .unwrap();
         let updated = resolve_agent(&store, "clearable").unwrap();

@@ -301,12 +301,14 @@ async fn main() -> anyhow::Result<()> {
                 } => {
                     cmd_agent::agent_config(
                         &store,
-                        &name_or_id,
-                        model,
-                        posture,
-                        provider,
-                        description,
-                        json,
+                        cmd_agent::AgentConfigOpts {
+                            name_or_id: &name_or_id,
+                            model,
+                            posture,
+                            provider,
+                            description,
+                            json,
+                        },
                     )?;
                 }
             }
