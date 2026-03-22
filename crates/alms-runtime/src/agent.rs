@@ -448,6 +448,7 @@ impl AgentRuntime {
                 serde_json::json!({
                     "from_agent": name,
                     "from_agent_id": self.agent_id.0.to_string(),
+                    "message_type": "dm",
                 })
             })
         } else {
@@ -521,11 +522,17 @@ impl AgentRuntime {
                 Ok(RunOutput { response, usage })
             }
             Err(AlmsError::Cancelled) => {
-                // In DM sessions, attach from_agent metadata so read_messages
-                // can attribute the cancellation marker to this agent.
+                // In DM sessions, attach from_agent metadata and use Role::User
+                // so read_messages perspective mapping works consistently — all
+                // messages in a shared DM session must be Role::User.
+                let role = if is_dm && self.agent_name.is_some() {
+                    SessionRole::User
+                } else {
+                    SessionRole::Assistant
+                };
                 let cancel_msg = SessionMessage {
                     id: uuid::Uuid::new_v4().to_string(),
-                    role: SessionRole::Assistant,
+                    role,
                     content: alms_session::Content::Text("[Run cancelled by user]".to_string()),
                     timestamp: alms_core::Timestamp::now(),
                     metadata: self.dm_marker_metadata(is_dm),
@@ -541,12 +548,18 @@ impl AgentRuntime {
             Err(e) => {
                 // Write a sanitized error marker so the session reflects the failed attempt
                 // without leaking sensitive details (API keys, URLs) into LLM context.
-                // In DM sessions, attach from_agent metadata so read_messages
-                // can attribute the error marker to this agent.
+                // In DM sessions, use Role::User with from_agent metadata so
+                // perspective mapping works — all messages in shared DM sessions
+                // must be Role::User.
                 let safe_reason = sanitize_error_for_session(&e);
+                let role = if is_dm && self.agent_name.is_some() {
+                    SessionRole::User
+                } else {
+                    SessionRole::Assistant
+                };
                 let error_msg = SessionMessage {
                     id: uuid::Uuid::new_v4().to_string(),
-                    role: SessionRole::Assistant,
+                    role,
                     content: alms_session::Content::Text(format!("[Run failed: {}]", safe_reason)),
                     timestamp: alms_core::Timestamp::now(),
                     metadata: self.dm_marker_metadata(is_dm),
@@ -1906,6 +1919,7 @@ mod tests {
         let meta = meta.unwrap();
         assert_eq!(meta["from_agent"], "bob");
         assert_eq!(meta["from_agent_id"], agent_id.0.to_string());
+        assert_eq!(meta["message_type"], "dm");
 
         // Non-DM: no metadata even with agent_name set.
         assert!(rt_named.dm_marker_metadata(false).is_none());
