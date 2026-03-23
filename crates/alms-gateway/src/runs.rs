@@ -957,19 +957,17 @@ pub(crate) async fn completion_notification_loop(
         }
 
         let notification = format_completion_notification(&completion);
-        let run = Run::new(session_id, agent_id, notification.clone());
-        let run_id = run.run_id;
-        state.run_manager.insert_run(run);
 
-        // Notify session-level SSE subscribers about the notification run.
-        state
-            .run_manager
-            .send_session_event(
-                session_id,
-                run_id,
-                SseEventData::run_created(run_id, session_id, true, Some("subagent".to_string())),
-            )
-            .await;
+        let run_id = enqueue_triggered_run(
+            &state,
+            agent_id,
+            session_id,
+            notification,
+            context_id,
+            "subagent".to_string(),
+            false, // subagent completion — not a peer message
+        )
+        .await;
 
         info!(
             run_id = %run_id.0,
@@ -978,35 +976,63 @@ pub(crate) async fn completion_notification_loop(
             subagent = ?completion.subagent_name,
             "Subagent completion → auto-creating notification run"
         );
-
-        let cancel_token = CancellationToken::new();
-        state
-            .run_manager
-            .register_cancel_token(run_id, cancel_token.clone());
-
-        let state_clone = state.clone();
-        // Low priority: notification runs yield to user messages.
-        // If the user has queued messages, those execute first.
-        state.agent_queue.enqueue_low(
-            agent_id,
-            Box::pin(async move {
-                execute_run(
-                    state_clone,
-                    RunParams {
-                        run_id,
-                        session_id,
-                        agent_id,
-                        input: notification,
-                        overrides: RunOverrides::default(),
-                        context_id,
-                        cancel_token,
-                        is_peer_message: false,
-                    },
-                )
-                .await;
-            }),
-        );
     }
+}
+
+/// Creates a run, registers it, sends the SSE `run_created` event, and
+/// enqueues the run at low priority for execution.
+///
+/// Shared helper for [`completion_notification_loop`] and [`run_trigger_loop`],
+/// which both follow the same create-register-enqueue pattern.
+async fn enqueue_triggered_run(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    session_id: SessionId,
+    input: String,
+    context_id: String,
+    source_label: String,
+    is_peer_message: bool,
+) -> RunId {
+    let run = Run::new(session_id, agent_id, input.clone());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    state
+        .run_manager
+        .send_session_event(
+            session_id,
+            run_id,
+            SseEventData::run_created(run_id, session_id, true, Some(source_label)),
+        )
+        .await;
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    let state_clone = state.clone();
+    state.agent_queue.enqueue_low(
+        agent_id,
+        Box::pin(async move {
+            execute_run(
+                state_clone,
+                RunParams {
+                    run_id,
+                    session_id,
+                    agent_id,
+                    input,
+                    overrides: RunOverrides::default(),
+                    context_id,
+                    cancel_token,
+                    is_peer_message,
+                },
+            )
+            .await;
+        }),
+    );
+
+    run_id
 }
 
 /// Format a human-readable notification message for the parent agent.
@@ -1066,6 +1092,8 @@ pub(crate) async fn run_trigger_loop(
             MessageSource::SubagentCompletion => "subagent".to_string(),
         };
 
+        let is_peer = matches!(trigger.source, MessageSource::Agent { .. });
+
         info!(
             session_id = %session_id.0,
             agent_id = %agent_id.0,
@@ -1077,47 +1105,16 @@ pub(crate) async fn run_trigger_loop(
         // MessageBus. We still pass `input` to execute_run so the
         // agent loop knows what prompted this run (it reads from session
         // history, but the run record needs the input).
-        let run = alms_core::Run::new(session_id, agent_id, trigger.input.clone());
-        let run_id = run.run_id;
-        state.run_manager.insert_run(run);
-
-        // Notify session-level SSE subscribers.
-        state
-            .run_manager
-            .send_session_event(
-                session_id,
-                run_id,
-                SseEventData::run_created(run_id, session_id, true, Some(source_label.clone())),
-            )
-            .await;
-
-        let cancel_token = CancellationToken::new();
-        state
-            .run_manager
-            .register_cancel_token(run_id, cancel_token.clone());
-
-        let state_clone = state.clone();
-        let is_peer = matches!(trigger.source, MessageSource::Agent { .. });
-        // Peer messages use low priority so user-initiated runs take precedence.
-        state.agent_queue.enqueue_low(
+        enqueue_triggered_run(
+            &state,
             agent_id,
-            Box::pin(async move {
-                execute_run(
-                    state_clone,
-                    RunParams {
-                        run_id,
-                        session_id,
-                        agent_id,
-                        input: trigger.input,
-                        overrides: RunOverrides::default(),
-                        context_id,
-                        cancel_token,
-                        is_peer_message: is_peer,
-                    },
-                )
-                .await;
-            }),
-        );
+            session_id,
+            trigger.input,
+            context_id,
+            source_label,
+            is_peer,
+        )
+        .await;
     }
 }
 

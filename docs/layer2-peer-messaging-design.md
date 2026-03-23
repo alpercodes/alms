@@ -4,7 +4,7 @@ Design document for agent-to-agent communication in ALMS.
 
 **Authors**: Heph + Atlas
 **Date**: 2026-03-22
-**Status**: Design (not yet implemented)
+**Status**: Phase 1 implemented
 **Relates to**: `docs/product-vision-core.md` (Layer 2), `docs/communication-architecture.md` (product vision), `docs/architecture.md` (Option 2 -- Peer Mesh)
 
 ---
@@ -900,7 +900,7 @@ This is injected by the runtime when it detects a `dm:*` context_id on the sessi
 
 ### 14.2 Self-Messaging
 
-An agent sending a message to itself (`send_message(to="self-name")`) is currently allowed. This is a low-priority edge case — it could be used as a "leave a note for my next run" pattern. No explicit prevention for now; revisit if it causes issues.
+Self-messaging: rejected at the MessageBus level (SendError::SelfMessage). An agent sending a message to itself (`send_message(to="self-name")`) returns an error immediately, preventing accidental infinite loops and wasted tokens.
 
 ### 14.3 Message Rate Limiting
 
