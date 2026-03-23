@@ -136,6 +136,10 @@ impl Default for Timestamp {
 /// invoked by agents (via `shell_exec`) find the correct database and workspace
 /// regardless of the sandbox cwd.
 ///
+/// Paths are resolved to absolute form so that subprocesses running in a
+/// different working directory (e.g. an agent's workspace) don't interpret
+/// them relative to their own cwd and create stray `data/` directories.
+///
 /// Used by the HTTP run path, the Telegram message path, and the coordinator's
 /// subagent spawn path to avoid duplicating the same env-building logic.
 pub fn build_shell_default_env(
@@ -144,18 +148,32 @@ pub fn build_shell_default_env(
 ) -> std::collections::HashMap<String, String> {
     let mut env = std::collections::HashMap::new();
     if let Some(dd) = data_dir {
-        env.insert(
-            "ALMS_DATA_DIR".to_string(),
-            dd.to_string_lossy().into_owned(),
-        );
+        let abs = resolve_to_absolute(dd);
+        env.insert("ALMS_DATA_DIR".to_string(), abs);
     }
     if let Some(ws) = workspace_dir {
-        env.insert(
-            "ALMS_WORKSPACE_DIR".to_string(),
-            ws.to_string_lossy().into_owned(),
-        );
+        let abs = resolve_to_absolute(ws);
+        env.insert("ALMS_WORKSPACE_DIR".to_string(), abs);
     }
     env
+}
+
+/// Resolve a path to an absolute string.
+///
+/// Tries `std::fs::canonicalize()` first (follows symlinks, adds UNC prefix on
+/// Windows). Falls back to joining with `current_dir()` if the path doesn't
+/// exist yet. Returns the path as-is as a last resort.
+fn resolve_to_absolute(path: &std::path::Path) -> String {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical.to_string_lossy().into_owned();
+    }
+    // Path may not exist yet — make it absolute via current_dir + join.
+    if !path.is_absolute()
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        return cwd.join(path).to_string_lossy().into_owned();
+    }
+    path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -224,12 +242,28 @@ mod tests {
 
     #[test]
     fn test_build_shell_default_env_both() {
-        let env = build_shell_default_env(
-            Some(std::path::Path::new("/data")),
-            Some(std::path::Path::new("/data/workspace")),
+        // Use a real existing directory so canonicalize works cross-platform.
+        let tmp = std::env::temp_dir();
+        let data = tmp.join("alms_test_data");
+        let ws = tmp.join("alms_test_ws");
+        let _ = std::fs::create_dir_all(&data);
+        let _ = std::fs::create_dir_all(&ws);
+
+        let env = build_shell_default_env(Some(&data), Some(&ws));
+        let result_data = env.get("ALMS_DATA_DIR").unwrap();
+        let result_ws = env.get("ALMS_WORKSPACE_DIR").unwrap();
+        // Values must be absolute paths.
+        assert!(
+            std::path::Path::new(result_data).is_absolute(),
+            "ALMS_DATA_DIR should be absolute, got: {result_data}"
         );
-        assert_eq!(env.get("ALMS_DATA_DIR").unwrap(), "/data");
-        assert_eq!(env.get("ALMS_WORKSPACE_DIR").unwrap(), "/data/workspace");
+        assert!(
+            std::path::Path::new(result_ws).is_absolute(),
+            "ALMS_WORKSPACE_DIR should be absolute, got: {result_ws}"
+        );
+
+        let _ = std::fs::remove_dir(&data);
+        let _ = std::fs::remove_dir(&ws);
     }
 
     #[test]
@@ -240,9 +274,39 @@ mod tests {
 
     #[test]
     fn test_build_shell_default_env_data_only() {
-        let env = build_shell_default_env(Some(std::path::Path::new("/data")), None);
+        let tmp = std::env::temp_dir();
+        let data = tmp.join("alms_test_data_only");
+        let _ = std::fs::create_dir_all(&data);
+
+        let env = build_shell_default_env(Some(&data), None);
         assert_eq!(env.len(), 1);
-        assert_eq!(env.get("ALMS_DATA_DIR").unwrap(), "/data");
+        assert!(
+            std::path::Path::new(env.get("ALMS_DATA_DIR").unwrap()).is_absolute(),
+            "ALMS_DATA_DIR should be absolute"
+        );
         assert!(!env.contains_key("ALMS_WORKSPACE_DIR"));
+
+        let _ = std::fs::remove_dir(&data);
+    }
+
+    #[test]
+    fn test_build_shell_default_env_relative_path_becomes_absolute() {
+        // A relative path should be resolved to absolute even if it doesn't exist.
+        let env = build_shell_default_env(Some(std::path::Path::new("relative/data/dir")), None);
+        let result = env.get("ALMS_DATA_DIR").unwrap();
+        assert!(
+            std::path::Path::new(result).is_absolute(),
+            "Relative data_dir should be resolved to absolute, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_to_absolute_existing_dir() {
+        let tmp = std::env::temp_dir();
+        let result = resolve_to_absolute(&tmp);
+        assert!(
+            std::path::Path::new(&result).is_absolute(),
+            "Existing dir should resolve to absolute, got: {result}"
+        );
     }
 }

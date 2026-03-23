@@ -15,6 +15,9 @@ use helpers::{api_client, open_db};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{error, info, warn};
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Parser, Debug)]
 #[command(name = "alms")]
@@ -126,14 +129,70 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    // Parse CLI args first so we can gate file logging on the Gateway command.
     let cli = Cli::parse();
+    let is_gateway = matches!(cli.command, Commands::Gateway { .. });
+
+    // Load config early to resolve log directory.
+    // This config is reused in the Gateway branch to avoid a redundant second load.
+    let mut config = match alms_core::AlmsConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Warning: failed to load config for logging setup: {e}. Using defaults.");
+            let mut cfg = alms_core::AlmsConfig::default();
+            cfg.apply_env_overrides();
+            cfg
+        }
+    };
+
+    // Stderr layer — level from RUST_LOG, defaulting to info.
+    let stderr_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(stderr_filter);
+
+    // File layer — only for the long-running gateway command, and only when enabled.
+    // The guard must live for the process lifetime to flush pending log records.
+    let mut _file_log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
+    let file_layer = if is_gateway && config.logging.file_enabled {
+        let log_dir = config.logging.resolve_log_dir(&config.server.data_dir);
+        match std::fs::create_dir_all(&log_dir) {
+            Ok(()) => {
+                let file_appender = match config.logging.rotation.as_str() {
+                    "hourly" => tracing_appender::rolling::hourly(&log_dir, "alms.log"),
+                    "never" => tracing_appender::rolling::never(&log_dir, "alms.log"),
+                    _ => tracing_appender::rolling::daily(&log_dir, "alms.log"),
+                };
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                _file_log_guard = Some(guard);
+                let file_filter =
+                    tracing_subscriber::EnvFilter::try_new(&config.logging.file_level)
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .with_ansi(false)
+                        .with_filter(file_filter),
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARN: cannot create log directory {}: {} -- file logging disabled",
+                    log_dir.display(),
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
+        .init();
 
     match cli.command {
         Commands::Gateway { bind, api_key } => {
@@ -156,14 +215,12 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(key) = api_key {
                 unsafe {
-                    std::env::set_var("OPENROUTER_API_KEY", key);
+                    std::env::set_var("OPENROUTER_API_KEY", &key);
                 }
+                // Update the already-loaded config with the CLI-provided API key
+                // instead of loading config a second time.
+                config.llm.api_key = Some(key);
             }
-            // Load config once — used for bind address and passed to the gateway.
-            let config = alms_core::AlmsConfig::load().unwrap_or_else(|e| {
-                warn!("Failed to load config, using defaults: {}", e);
-                alms_core::AlmsConfig::default()
-            });
             // Resolve bind address: --bind flag > config (alms.toml / ALMS_BIND) > default
             let bind = bind.unwrap_or(config.server.bind.clone());
             alms_gateway::serve_with_config(&bind, &config).await?;
