@@ -129,6 +129,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Parse CLI args first so we can gate file logging on the Gateway command.
+    let cli = Cli::parse();
+    let is_gateway = matches!(cli.command, Commands::Gateway { .. });
+
     // Load config early to resolve log directory.
     let config = alms_core::AlmsConfig::load().unwrap_or_default();
 
@@ -139,28 +143,47 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .with_filter(stderr_filter);
 
-    // File layer — daily/hourly rolling logs to {data_dir}/logs/.
-    let log_dir = config.logging.resolve_log_dir(&config.server.data_dir);
-    std::fs::create_dir_all(&log_dir).ok();
-
-    let file_appender = match config.logging.rotation.as_str() {
-        "hourly" => tracing_appender::rolling::hourly(&log_dir, "alms.log"),
-        "never" => tracing_appender::rolling::never(&log_dir, "alms.log"),
-        _ => tracing_appender::rolling::daily(&log_dir, "alms.log"),
+    // File layer — only for the long-running gateway command, and only when enabled.
+    // The guard must live for the process lifetime to flush pending log records.
+    let mut _file_log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
+    let file_layer = if is_gateway && config.logging.file_enabled {
+        let log_dir = config.logging.resolve_log_dir(&config.server.data_dir);
+        match std::fs::create_dir_all(&log_dir) {
+            Ok(()) => {
+                let file_appender = match config.logging.rotation.as_str() {
+                    "hourly" => tracing_appender::rolling::hourly(&log_dir, "alms.log"),
+                    "never" => tracing_appender::rolling::never(&log_dir, "alms.log"),
+                    _ => tracing_appender::rolling::daily(&log_dir, "alms.log"),
+                };
+                let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+                _file_log_guard = Some(guard);
+                let file_filter =
+                    tracing_subscriber::EnvFilter::try_new(&config.logging.file_level)
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
+                Some(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(non_blocking)
+                        .with_ansi(false)
+                        .with_filter(file_filter),
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARN: cannot create log directory {}: {} -- file logging disabled",
+                    log_dir.display(),
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    let file_filter = tracing_subscriber::EnvFilter::new(&config.logging.file_level);
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_filter(file_filter);
 
     tracing_subscriber::registry()
         .with(stderr_layer)
         .with(file_layer)
         .init();
-
-    let cli = Cli::parse();
 
     match cli.command {
         Commands::Gateway { bind, api_key } => {

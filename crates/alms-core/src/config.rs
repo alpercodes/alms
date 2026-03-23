@@ -190,6 +190,9 @@ impl AlmsConfig {
         }
 
         // Logging settings
+        if let Ok(val) = std::env::var("ALMS_LOG_FILE_ENABLED") {
+            self.logging.file_enabled = matches!(val.to_lowercase().as_str(), "1" | "true" | "yes");
+        }
         if let Ok(val) = std::env::var("ALMS_LOG_DIR") {
             self.logging.log_dir = Some(val);
         }
@@ -514,6 +517,9 @@ impl Default for ChannelsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoggingConfig {
+    /// Whether file-based logging is enabled. Default: true.
+    /// Set to false (or env `ALMS_LOG_FILE_ENABLED=false`) to disable entirely.
+    pub file_enabled: bool,
     /// Directory for log files. Defaults to `{data_dir}/logs/`.
     /// Set to override the default location, or `None` to use the default.
     pub log_dir: Option<String>,
@@ -527,6 +533,7 @@ pub struct LoggingConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
+            file_enabled: true,
             log_dir: None,
             file_level: "debug".into(),
             rotation: "daily".into(),
@@ -915,5 +922,149 @@ stream_chunk_timeout_secs = 120
 "#;
         let config: AlmsConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.llm.stream_chunk_timeout_secs, 120);
+    }
+
+    // ---- LoggingConfig tests ----
+
+    #[test]
+    fn test_logging_config_defaults() {
+        let config = LoggingConfig::default();
+        assert!(config.file_enabled);
+        assert_eq!(config.file_level, "debug");
+        assert_eq!(config.rotation, "daily");
+        assert!(config.log_dir.is_none());
+    }
+
+    #[test]
+    fn test_logging_resolve_log_dir_default() {
+        let config = LoggingConfig::default();
+        let resolved = config.resolve_log_dir("./data");
+        assert_eq!(resolved, PathBuf::from("./data/logs"));
+    }
+
+    #[test]
+    fn test_logging_resolve_log_dir_override() {
+        let config = LoggingConfig {
+            log_dir: Some("/custom/logs".into()),
+            ..Default::default()
+        };
+        let resolved = config.resolve_log_dir("./data");
+        assert_eq!(resolved, PathBuf::from("/custom/logs"));
+    }
+
+    #[test]
+    fn test_validation_bad_rotation() {
+        let mut config = AlmsConfig::default();
+        config.logging.rotation = "weekly".into();
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("logging.rotation"),
+            "error should mention logging.rotation: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validation_bad_file_level() {
+        let mut config = AlmsConfig::default();
+        config.logging.file_level = "verbose".into();
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("logging.file_level"),
+            "error should mention logging.file_level: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validation_valid_rotations() {
+        for rotation in &["daily", "hourly", "never"] {
+            let mut config = AlmsConfig::default();
+            config.logging.rotation = (*rotation).into();
+            assert!(
+                config.validate().is_ok(),
+                "rotation '{}' should be valid",
+                rotation
+            );
+        }
+    }
+
+    #[test]
+    fn test_validation_valid_file_levels() {
+        for level in &["trace", "debug", "info", "warn", "error"] {
+            let mut config = AlmsConfig::default();
+            config.logging.file_level = (*level).into();
+            assert!(
+                config.validate().is_ok(),
+                "file_level '{}' should be valid",
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_env_override_log_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_LOG_DIR", "/tmp/alms-logs");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.logging.log_dir.as_deref(), Some("/tmp/alms-logs"));
+    }
+
+    #[test]
+    fn test_env_override_log_file_level() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_LOG_FILE_LEVEL", "warn");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.logging.file_level, "warn");
+    }
+
+    #[test]
+    fn test_env_override_log_rotation() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_LOG_ROTATION", "hourly");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.logging.rotation, "hourly");
+    }
+
+    #[test]
+    fn test_env_override_file_enabled_false() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_LOG_FILE_ENABLED", "false");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert!(!config.logging.file_enabled);
+    }
+
+    #[test]
+    fn test_env_override_file_enabled_true() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_LOG_FILE_ENABLED", "true");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert!(config.logging.file_enabled);
+    }
+
+    #[test]
+    fn test_logging_toml_round_trip() {
+        let toml = r#"
+[logging]
+file_enabled = false
+file_level = "info"
+rotation = "hourly"
+log_dir = "/var/log/alms"
+"#;
+        let config: AlmsConfig = toml::from_str(toml).unwrap();
+        assert!(!config.logging.file_enabled);
+        assert_eq!(config.logging.file_level, "info");
+        assert_eq!(config.logging.rotation, "hourly");
+        assert_eq!(config.logging.log_dir.as_deref(), Some("/var/log/alms"));
     }
 }

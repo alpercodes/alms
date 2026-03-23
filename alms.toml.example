@@ -85,6 +85,11 @@ sandbox_root = "."
 shell_policy = "sandboxed"
 
 [logging]
+# Enable/disable file-based logging. Only applies to the gateway command.
+# Set to false to disable file logging entirely (e.g., in containers with journal capture).
+# Override with: ALMS_LOG_FILE_ENABLED=false
+file_enabled = true
+
 # Directory for persistent log files. Default: "{data_dir}/logs/" (i.e. ./data/logs/).
 # Override with: ALMS_LOG_DIR=/custom/log/path
 # log_dir = "./data/logs"
