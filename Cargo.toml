@@ -77,6 +77,12 @@ async-trait = "0.1"
 # Futures
 futures = "0.3"
 
+# Crypto
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+
 # Testing
 tokio-test = "0.4"
 
