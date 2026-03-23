@@ -86,3 +86,8 @@ shell_policy = "sandboxed"
 # Set token via: export TELEGRAM_BOT_TOKEN=...
 # [channels.telegram]
 # poll_interval_secs = 5
+#
+# Per-agent Telegram tokens: instead of a global bot token, you can assign
+# a dedicated Telegram bot to each agent via the API or CLI:
+#   alms agent create --name my-agent --telegram-token "123456:ABC-DEF"
+# These are stored in the agent registry (SQLite), not in this config file.

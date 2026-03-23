@@ -1433,6 +1433,7 @@ mod tests {
             model: model.map(String::from),
             posture: posture.map(String::from),
             provider: None,
+            telegram_token: None,
             is_default: false,
             created_at: now,
             last_active: now,

@@ -131,7 +131,7 @@ Returns all active sessions.
     {
       "session_id": "<uuid>",
       "agent_id": "<uuid>",
-      "context_id": "telegram:1853446411",
+      "context_id": "telegram_main_1853446411",
       "created_at": "2026-02-11T07:00:00Z",
       "last_activity": "2026-02-11T07:52:00Z",
       "status": "active"
@@ -147,7 +147,7 @@ Returns all active sessions.
 ```json
 {
   "agent_id": "<uuid>",
-  "context_id": "telegram:1853446411"
+  "context_id": "telegram_main_1853446411"
 }
 ```
 
@@ -156,7 +156,7 @@ Returns all active sessions.
 {
   "session_id": "<uuid>",
   "agent_id": "<uuid>",
-  "context_id": "telegram:1853446411"
+  "context_id": "telegram_main_1853446411"
 }
 ```
 

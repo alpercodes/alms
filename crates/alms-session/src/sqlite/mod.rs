@@ -95,16 +95,17 @@ CREATE TABLE IF NOT EXISTS context_summaries (
 );
 
 CREATE TABLE IF NOT EXISTS agents (
-    id            TEXT PRIMARY KEY,
-    name          TEXT NOT NULL UNIQUE,
-    description   TEXT NOT NULL DEFAULT '',
-    model         TEXT,
-    system_prompt TEXT,
-    posture       TEXT,
-    provider      TEXT,
-    is_default    INTEGER NOT NULL DEFAULT 0,
-    created_at    TEXT NOT NULL,
-    last_active   TEXT NOT NULL
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL UNIQUE,
+    description     TEXT NOT NULL DEFAULT '',
+    model           TEXT,
+    system_prompt   TEXT,
+    posture         TEXT,
+    provider        TEXT,
+    telegram_token  TEXT,
+    is_default      INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL,
+    last_active     TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
@@ -183,6 +184,8 @@ impl SqliteStore {
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);",
         );
+        // Auto-migrate: add telegram_token column for per-agent Telegram bots.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN telegram_token TEXT;");
         // Auto-migrate: add run_tool_calls table for per-run tool call storage.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS run_tool_calls (\
@@ -370,18 +373,19 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let model: Option<String> = row.get(3)?;
     let posture: Option<String> = row.get(4)?;
     let provider: Option<String> = row.get(5)?;
-    let is_default: i32 = row.get(6)?;
-    let created_at_str: String = row.get(7)?;
-    let last_active_str: String = row.get(8)?;
+    let telegram_token: Option<String> = row.get(6)?;
+    let is_default: i32 = row.get(7)?;
+    let created_at_str: String = row.get(8)?;
+    let last_active_str: String = row.get(9)?;
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let last_active = chrono::DateTime::parse_from_rfc3339(&last_active_str).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(e))
+        rusqlite::Error::FromSqlConversionFailure(9, rusqlite::types::Type::Text, Box::new(e))
     })?;
 
     Ok(AgentRecord {
@@ -391,6 +395,7 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         model,
         posture,
         provider,
+        telegram_token,
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),

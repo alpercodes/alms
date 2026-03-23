@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, instrument, warn};
+use tracing::{Instrument, error, info, instrument, warn};
 use uuid::Uuid;
 
 /// Gateway configuration
@@ -188,10 +188,12 @@ fn resolve_default_agent_id(data_dir: &Path) -> AgentId {
     agent_id
 }
 
-/// Active channel connections
+/// A Telegram bot bound to a specific agent.
 #[derive(Debug)]
-struct Channels {
-    telegram: Option<Arc<TelegramChannel>>,
+struct AgentTelegramBot {
+    agent_id: AgentId,
+    agent_name: String,
+    channel: Arc<TelegramChannel>,
 }
 
 /// The ALMS Gateway - orchestrates channels, sessions, and agents
@@ -199,7 +201,9 @@ struct Channels {
 pub struct Gateway {
     config: GatewayConfig,
     session_manager: Arc<SessionManager>,
-    channels: Channels,
+    /// Per-agent Telegram bots. Each entry is a dedicated bot polling loop
+    /// bound to one agent. Messages from each bot route to its owning agent.
+    telegram_bots: Vec<AgentTelegramBot>,
     llm: LlmClient,
     /// Shared default agent ID — updated live when the default agent changes.
     agent_id: Arc<RwLock<AgentId>>,
@@ -250,7 +254,7 @@ impl Gateway {
         Ok(Self {
             config,
             session_manager,
-            channels: Channels { telegram: None },
+            telegram_bots: Vec::new(),
             llm,
             agent_id,
             secrets,
@@ -262,19 +266,90 @@ impl Gateway {
         Self::new(GatewayConfig::from_env()?)
     }
 
-    /// Initialize channels
+    /// Initialize Telegram channels.
+    ///
+    /// Spawns a dedicated polling loop for each agent that has a `telegram_token`
+    /// configured in the registry. Falls back to the global `TELEGRAM_BOT_TOKEN`
+    /// env var for the default agent if no per-agent tokens are found (backward
+    /// compatible).
     pub async fn initialize_channels(&mut self) -> AlmsResult<()> {
-        // Initialize Telegram if token is configured
-        if let Some(ref token) = self.config.telegram_token {
-            info!("Initializing Telegram channel");
+        // Phase 1: Collect per-agent Telegram tokens from the agent registry.
+        let mut agent_tokens: Vec<(AgentId, String, String)> = Vec::new(); // (id, name, token)
+
+        if let Some(store) = self.session_manager.store() {
+            match store.agents_with_telegram() {
+                Ok(agents) => {
+                    for agent in agents {
+                        if let Some(ref token) = agent.telegram_token {
+                            agent_tokens.push((agent.id, agent.name.clone(), token.clone()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to load agents with Telegram tokens: {e}");
+                }
+            }
+        }
+
+        // Phase 2: If no per-agent tokens found, fall back to the global
+        // TELEGRAM_BOT_TOKEN env var applied to the default agent.
+        if agent_tokens.is_empty()
+            && let Some(ref token) = self.config.telegram_token
+        {
+            let default_id = self.agent_id();
+            let default_name = self
+                .session_manager
+                .store()
+                .and_then(|store| store.load_agent_by_id(default_id).ok().flatten())
+                .map(|r| r.name)
+                .unwrap_or_else(|| "default".to_string());
+            agent_tokens.push((default_id, default_name, token.clone()));
+            info!(
+                "No per-agent Telegram tokens found, using global TELEGRAM_BOT_TOKEN for default agent"
+            );
+        }
+
+        if agent_tokens.is_empty() {
+            info!("No Telegram tokens configured, skipping Telegram channels");
+            return Ok(());
+        }
+
+        // Phase 2b: Migrate legacy session context IDs.
+        //
+        // Old format: `telegram_{chat_id}` -> new: `telegram_{agent_name}_{chat_id}`.
+        // Migration is idempotent and non-fatal.
+        if let Some(store) = self.session_manager.store() {
+            for (_agent_id, agent_name, _token) in &agent_tokens {
+                match store.migrate_telegram_context_ids(agent_name) {
+                    Ok(0) => {}
+                    Ok(n) => info!(
+                        "Migrated {n} legacy Telegram session(s) to new context ID format \
+                         for agent '{agent_name}'"
+                    ),
+                    Err(e) => warn!(
+                        "Failed to migrate Telegram session context IDs for agent \
+                         '{agent_name}': {e}"
+                    ),
+                }
+            }
+        }
+
+        // Phase 3: Initialize a TelegramChannel for each token.
+        for (agent_id, agent_name, token) in agent_tokens {
+            info!(
+                "Initializing Telegram channel for agent '{}' ({})",
+                agent_name, agent_id
+            );
             let mut telegram = TelegramChannel::new();
 
-            // Persist update offset alongside the DB file (e.g. ./data/telegram_offset)
+            // Persist update offset per agent alongside the DB file
+            // e.g. ./data/telegram_offset_{agent_name}
             if let Some(ref db_path) = self.config.db_path {
                 let data_dir = std::path::Path::new(db_path)
                     .parent()
                     .unwrap_or(std::path::Path::new("."));
-                telegram = telegram.with_offset_file(data_dir.join("telegram_offset"));
+                telegram = telegram
+                    .with_offset_file(data_dir.join(format!("telegram_offset_{agent_name}")));
             }
 
             let channel_config = ChannelConfig {
@@ -285,11 +360,23 @@ impl Gateway {
                 extra: Default::default(),
             };
 
-            telegram.initialize(channel_config).await?;
-            self.channels.telegram = Some(Arc::new(telegram));
-            info!("Telegram channel initialized");
-        } else {
-            warn!("No Telegram token configured, skipping Telegram channel");
+            match telegram.initialize(channel_config).await {
+                Ok(()) => {
+                    self.telegram_bots.push(AgentTelegramBot {
+                        agent_id,
+                        agent_name: agent_name.clone(),
+                        channel: Arc::new(telegram),
+                    });
+                    info!("Telegram channel initialized for agent '{}'", agent_name);
+                }
+                Err(e) => {
+                    // Non-fatal: skip this bot but continue with others.
+                    error!(
+                        "Failed to initialize Telegram channel for agent '{}': {}",
+                        agent_name, e
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -299,10 +386,16 @@ impl Gateway {
     pub async fn start(&mut self) -> AlmsResult<()> {
         info!("Starting ALMS Gateway");
 
-        // Start Telegram channel
-        if let Some(ref telegram) = self.channels.telegram {
-            telegram.start().await?;
-            info!("Telegram channel started");
+        // Start all Telegram channels (non-fatal per bot — log and continue)
+        for bot in &self.telegram_bots {
+            if let Err(e) = bot.channel.start().await {
+                error!(
+                    "Failed to start Telegram channel for agent '{}': {}",
+                    bot.agent_name, e
+                );
+                continue;
+            }
+            info!("Telegram channel started for agent '{}'", bot.agent_name);
         }
 
         Ok(())
@@ -321,6 +414,10 @@ impl Gateway {
     ///
     /// All runs for the same agent are serialized via `agent_queue` (FIFO).
     /// Different agents process concurrently.
+    ///
+    /// Per-agent Telegram bots each have their own polling loop. Messages from
+    /// all bots are merged into a single channel tagged with the owning agent,
+    /// so routing is deterministic: bot X's messages always go to agent X.
     pub async fn run_until_shutdown(
         &mut self,
         token: CancellationToken,
@@ -328,97 +425,135 @@ impl Gateway {
     ) -> AlmsResult<()> {
         info!("Starting message processing loop (shutdown-aware)");
 
-        let mut telegram_rx: Option<mpsc::Receiver<alms_channel::IncomingMessage>> = None;
-        if let Some(ref telegram) = self.channels.telegram {
-            telegram_rx = Some(telegram.receive_updates().await?);
+        // Merge all per-agent Telegram receivers into a single tagged channel.
+        // Each item is (agent_id, agent_name, telegram_channel, message).
+        let (merged_tx, mut merged_rx) = mpsc::channel::<(
+            AgentId,
+            String,
+            Arc<TelegramChannel>,
+            alms_channel::IncomingMessage,
+        )>(256);
+
+        for bot in &self.telegram_bots {
+            let mut rx = match bot.channel.receive_updates().await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    error!(
+                        "Failed to receive updates for agent '{}': {} — skipping bot",
+                        bot.agent_name, e
+                    );
+                    continue;
+                }
+            };
+            let tx = merged_tx.clone();
+            let agent_id = bot.agent_id;
+            let agent_name = bot.agent_name.clone();
+            let channel = Arc::clone(&bot.channel);
+
+            // Forward messages from this bot's receiver into the merged channel,
+            // tagging each with the owning agent.
+            let span = tracing::info_span!("telegram_forwarder", agent = %agent_name);
+            tokio::spawn(
+                async move {
+                    while let Some(msg) = rx.recv().await {
+                        if tx
+                            .send((agent_id, agent_name.clone(), Arc::clone(&channel), msg))
+                            .await
+                            .is_err()
+                        {
+                            break; // merged receiver dropped
+                        }
+                    }
+                }
+                .instrument(span),
+            );
         }
+        // Drop our copy so merged_rx closes when all forwarders are done.
+        drop(merged_tx);
 
         loop {
             tokio::select! {
-                Some(msg) = async {
-                    if let Some(ref mut rx) = telegram_rx {
-                        rx.recv().await
-                    } else {
-                        None
-                    }
-                } => {
-                    if let Some(ref telegram) = self.channels.telegram {
-                        // Read the live default agent ID per message so
-                        // set-default changes take effect immediately.
-                        // Apply per-agent config overrides (model, posture) from
-                        // the agent registry, same as the HTTP run path.
-                        let agent_id = self.agent_id();
-                        let secrets_guard = self.secrets.read().unwrap();
-                        let resolved = crate::runs::resolve_agent_config(
-                            agent_id,
-                            &self.session_manager,
-                            &self.config.agent_config,
-                            &self.llm,
-                            Some(&secrets_guard),
-                        );
-                        drop(secrets_guard);
-                        // Bootstrap detection: first-time agents get the
-                        // bootstrap interview prompt instead of their default.
-                        let mut agent_config = resolved.agent_config;
-                        if let (Some(ws_dir), Some(name)) =
-                            (&self.config.workspace_dir, &resolved.agent_name)
-                        {
-                            let workspace =
-                                alms_runtime::AgentWorkspace::new(ws_dir, name);
-                            if workspace.needs_bootstrap() {
-                                info!(
-                                    "Telegram: agent '{}' needs bootstrap — using interview prompt",
-                                    name
-                                );
-                                agent_config.system_prompt =
-                                    alms_runtime::AgentWorkspace::bootstrap_prompt().to_string();
-                            }
-                        }
-                        let mut runtime = match AgentRuntime::new(
-                            agent_id,
-                            agent_config,
-                            resolved.llm,
-                        ) {
-                            Ok(rt) => rt,
-                            Err(e) => {
-                                error!("Failed to create agent runtime: {}", e);
-                                continue;
-                            }
-                        };
-                        // Set agent name for perspective mapping in DM sessions.
-                        if let Some(ref name) = resolved.agent_name {
-                            runtime = runtime.with_agent_name(name.clone());
-                        }
-                        // Inject ALMS_DATA_DIR so CLI commands invoked via
-                        // shell_exec find the correct database.
-                        {
-                            let shell_env = alms_core::build_shell_default_env(
-                                self.config.data_dir.as_deref(),
-                                self.config.workspace_dir.as_deref(),
+                Some((agent_id, agent_name, telegram, msg)) = merged_rx.recv() => {
+                    // Route the message to the owning agent (not the default).
+                    let secrets_guard = self.secrets.read().unwrap();
+                    let resolved = crate::runs::resolve_agent_config(
+                        agent_id,
+                        &self.session_manager,
+                        &self.config.agent_config,
+                        &self.llm,
+                        Some(&secrets_guard),
+                    );
+                    drop(secrets_guard);
+                    // Bootstrap detection: first-time agents get the
+                    // bootstrap interview prompt instead of their default.
+                    let mut agent_config = resolved.agent_config;
+                    if let Some(ws_dir) = &self.config.workspace_dir {
+                        let effective_name = resolved
+                            .agent_name
+                            .as_deref()
+                            .unwrap_or(&agent_name);
+                        let workspace =
+                            alms_runtime::AgentWorkspace::new(ws_dir, effective_name);
+                        if workspace.needs_bootstrap() {
+                            info!(
+                                "Telegram: agent '{}' needs bootstrap — using interview prompt",
+                                effective_name
                             );
-                            if !shell_env.is_empty() {
-                                runtime = runtime.with_shell_default_env(shell_env);
-                            }
+                            agent_config.system_prompt =
+                                alms_runtime::AgentWorkspace::bootstrap_prompt().to_string();
                         }
-                        // Attach workspace so agent personality/goals/memories
-                        // are prepended to the system prompt (same as HTTP path).
-                        if let (Some(ws_dir), Some(name)) =
-                            (&self.config.workspace_dir, &resolved.agent_name)
-                        {
-                            let workspace =
-                                alms_runtime::AgentWorkspace::new(ws_dir, name);
-                            runtime = runtime.with_workspace(workspace);
-                        }
-                        let runtime = Arc::new(runtime);
-                        let sm = Arc::clone(&self.session_manager);
-                        let tg = Arc::clone(telegram);
-                        agent_queue.enqueue(
-                            agent_id,
-                            Box::pin(async move {
-                                process_telegram_message(runtime, sm, tg, msg).await;
-                            }),
-                        );
                     }
+                    let mut runtime = match AgentRuntime::new(
+                        agent_id,
+                        agent_config,
+                        resolved.llm,
+                    ) {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            error!("Failed to create agent runtime: {}", e);
+                            continue;
+                        }
+                    };
+                    // Set agent name for perspective mapping in DM sessions.
+                    let effective_name = resolved
+                        .agent_name
+                        .clone()
+                        .unwrap_or_else(|| agent_name.clone());
+                    runtime = runtime.with_agent_name(effective_name.clone());
+                    // Inject ALMS_DATA_DIR so CLI commands invoked via
+                    // shell_exec find the correct database.
+                    {
+                        let shell_env = alms_core::build_shell_default_env(
+                            self.config.data_dir.as_deref(),
+                            self.config.workspace_dir.as_deref(),
+                        );
+                        if !shell_env.is_empty() {
+                            runtime = runtime.with_shell_default_env(shell_env);
+                        }
+                    }
+                    // Attach workspace so agent personality/goals/memories
+                    // are prepended to the system prompt (same as HTTP path).
+                    if let Some(ws_dir) = &self.config.workspace_dir {
+                        let workspace =
+                            alms_runtime::AgentWorkspace::new(ws_dir, &effective_name);
+                        runtime = runtime.with_workspace(workspace);
+                    }
+                    let runtime = Arc::new(runtime);
+                    let sm = Arc::clone(&self.session_manager);
+                    let name_for_ctx = effective_name;
+                    agent_queue.enqueue(
+                        agent_id,
+                        Box::pin(async move {
+                            process_telegram_message(
+                                runtime,
+                                sm,
+                                telegram,
+                                msg,
+                                &name_for_ctx,
+                            )
+                            .await;
+                        }),
+                    );
                 }
                 _ = token.cancelled() => {
                     info!("Shutdown signal received, stopping message loop");
@@ -441,8 +576,14 @@ impl Gateway {
     pub async fn stop(&mut self) -> AlmsResult<()> {
         info!("Stopping ALMS Gateway");
 
-        if let Some(ref telegram) = self.channels.telegram {
-            telegram.stop().await?;
+        for bot in &self.telegram_bots {
+            info!("Stopping Telegram channel for agent '{}'", bot.agent_name);
+            if let Err(e) = bot.channel.stop().await {
+                error!(
+                    "Failed to stop Telegram channel for agent '{}': {}",
+                    bot.agent_name, e
+                );
+            }
         }
 
         Ok(())
@@ -512,15 +653,23 @@ impl Gateway {
 ///
 /// Takes owned `Arc`s so each message is processed concurrently without
 /// blocking the select loop (fixes head-of-line blocking).
+///
+/// The `agent_name` parameter is used to namespace the session context ID
+/// so each agent gets its own conversation history per chat:
+/// `telegram_{agent_name}_{chat_id}`.
 async fn process_telegram_message(
     runtime: Arc<AgentRuntime>,
     session_manager: Arc<SessionManager>,
     telegram: Arc<TelegramChannel>,
     msg: alms_channel::IncomingMessage,
+    agent_name: &str,
 ) {
-    info!("Received message from chat {}: {}", msg.chat_id.0, msg.text);
+    info!(
+        "Received message for agent '{}' from chat {}: {}",
+        agent_name, msg.chat_id.0, msg.text
+    );
 
-    let context_id = format!("telegram_{}", msg.chat_id.0);
+    let context_id = format!("telegram_{}_{}", agent_name, msg.chat_id.0);
 
     match runtime.run(&session_manager, &context_id, &msg.text).await {
         Ok(output) => {
@@ -582,6 +731,7 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         model: None,
         posture: None,
         provider: None,
+        telegram_token: None,
         is_default: false,
         created_at: now,
         last_active: now,
@@ -717,6 +867,7 @@ mod tests {
             model: None,
             posture: None,
             provider: None,
+            telegram_token: None,
             is_default: true,
             created_at: now,
             last_active: now,

@@ -173,6 +173,7 @@ pub(crate) fn make_agent(store: &SqliteStore, name: &str) -> AgentRecord {
         model: None,
         posture: None,
         provider: None,
+        telegram_token: None,
         is_default: false,
         created_at: now,
         last_active: now,

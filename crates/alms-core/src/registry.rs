@@ -21,6 +21,14 @@ pub struct AgentRecord {
     pub posture: Option<String>,
     /// Per-agent LLM provider override (None = use server default).
     pub provider: Option<String>,
+    /// Per-agent Telegram bot token (None = no dedicated Telegram bot).
+    ///
+    /// When set, the gateway spawns a dedicated polling loop for this agent's
+    /// bot and routes all messages from that bot to this agent.
+    /// Never serialized in list responses for security -- use `has_telegram`
+    /// in the API response instead.
+    #[serde(skip_serializing)]
+    pub telegram_token: Option<String>,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
@@ -35,6 +43,9 @@ pub struct CreateAgentRequest {
     pub model: Option<String>,
     pub posture: Option<String>,
     pub provider: Option<String>,
+    /// Per-agent Telegram bot token. Validated via `getMe` on gateway startup,
+    /// not at persist time.
+    pub telegram_token: Option<String>,
     #[serde(default)]
     pub is_default: Option<bool>,
 }
@@ -49,6 +60,8 @@ pub struct UpdateAgentRequest {
     pub model: Option<String>,
     pub posture: Option<String>,
     pub provider: Option<String>,
+    /// Per-agent Telegram bot token. Empty string = remove token.
+    pub telegram_token: Option<String>,
 }
 
 /// Validate an agent name slug.
