@@ -438,15 +438,21 @@ Cronjobs are “autonomy with persistence”. Even if implementation is minimal,
 ### 7.1 Create job
 `POST /jobs`
 
-**Request**
+**Request (recurring)**
 ```json
 {
-  "name": "daily-summary",
-  "schedule": { "kind": "cron", "expr": "0 9 * * *", "tz": "Europe/Berlin" },
-  "target": { "kind": "session", "session_id": "<uuid>" },
-  "payload": { "kind": "run", "input": {"type":"text","text":"Summarize yesterday"} },
-  "capabilities": ["net.http"],
-  "enabled": true
+  "agent_id": "<uuid>",
+  "prompt": "Summarize yesterday",
+  "schedule": { "type": "recurring", "cron": "0 9 * * *" }
+}
+```
+
+**Request (one-time)**
+```json
+{
+  "agent_id": "<uuid>",
+  "prompt": "Run a one-time health check",
+  "schedule": { "type": "once", "run_at": "2026-03-23T15:00:00Z" }
 }
 ```
 

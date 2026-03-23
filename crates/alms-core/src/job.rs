@@ -72,3 +72,40 @@ pub struct CreateJobRequest {
     pub prompt: String,
     pub schedule: JobSchedule,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_job_request_recurring_from_ui_json() {
+        let json = r#"{
+            "agent_id": "a1b2c3d4-e5f6-4789-abcd-ef0123456789",
+            "schedule": { "type": "recurring", "cron": "*/5 * * * *" },
+            "prompt": "test prompt"
+        }"#;
+        let req: CreateJobRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.prompt, "test prompt");
+        match req.schedule {
+            JobSchedule::Recurring { ref cron } => assert_eq!(cron, "*/5 * * * *"),
+            _ => panic!("Expected Recurring schedule"),
+        }
+    }
+
+    #[test]
+    fn test_create_job_request_once_from_ui_json() {
+        let json = r#"{
+            "agent_id": "a1b2c3d4-e5f6-4789-abcd-ef0123456789",
+            "schedule": { "type": "once", "run_at": "2026-03-23T15:30:00.000Z" },
+            "prompt": "one-time task"
+        }"#;
+        let req: CreateJobRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.prompt, "one-time task");
+        match req.schedule {
+            JobSchedule::Once { run_at } => {
+                assert_eq!(run_at.to_rfc3339(), "2026-03-23T15:30:00+00:00");
+            }
+            _ => panic!("Expected Once schedule"),
+        }
+    }
+}
