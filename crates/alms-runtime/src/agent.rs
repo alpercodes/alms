@@ -212,8 +212,15 @@ impl AgentRuntime {
     /// Also registers the `workspace_write` tool so the agent can update
     /// its `goals.md` and `memories.md` during runs, and re-registers
     /// `shell_exec` with the workspace directory as default cwd.
+    ///
+    /// **Note**: `workspace_write` registration goes through `ToolRegistry::register()`,
+    /// which checks the `enabled_filter`. If the operator has set `tools.enabled`
+    /// and `workspace_write` is not in the list, it will be silently skipped.
+    /// This is intentional — the operator's allowlist should be the single
+    /// source of truth for which tools are available.
     pub fn with_workspace(mut self, workspace: AgentWorkspace) -> Self {
         let tool = WorkspaceWriteTool::new(workspace.clone());
+        // Subject to enabled_filter — see doc comment above.
         self.tools.register(std::sync::Arc::new(tool));
 
         // Ensure the workspace directory exists before canonicalizing.

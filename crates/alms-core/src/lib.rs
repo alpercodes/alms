@@ -163,7 +163,7 @@ pub fn build_shell_default_env(
 /// Tries `std::fs::canonicalize()` first (follows symlinks, adds UNC prefix on
 /// Windows). Falls back to joining with `current_dir()` if the path doesn't
 /// exist yet. Returns the path as-is as a last resort.
-fn resolve_to_absolute(path: &std::path::Path) -> String {
+pub fn resolve_to_absolute(path: &std::path::Path) -> String {
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return canonical.to_string_lossy().into_owned();
     }

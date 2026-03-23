@@ -87,17 +87,12 @@ pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
         let entries: Vec<serde_json::Value> = VALID_PROVIDERS
             .iter()
             .map(|p| {
+                let configured = providers.contains(&p.to_string());
                 serde_json::json!({
                     "provider": p,
-                    "configured": providers.contains(&p.to_string()),
+                    "configured": configured,
                     "key": store.get_masked(p),
-                    "source": if providers.contains(&p.to_string()) {
-                        "secrets"
-                    } else if alms_core::config::select_llm_api_key_from_env(p).is_some() {
-                        "env"
-                    } else {
-                        "none"
-                    },
+                    "source": if configured { "secrets" } else { "none" },
                 })
             })
             .collect();
@@ -106,11 +101,8 @@ pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
         println!("{:<15} {:<12} KEY", "PROVIDER", "SOURCE");
         println!("{}", "-".repeat(50));
         for p in VALID_PROVIDERS {
-            let env_key = alms_core::config::select_llm_api_key_from_env(p);
             let (source, masked) = if providers.contains(&p.to_string()) {
                 ("secrets", store.get_masked(p).unwrap_or_default())
-            } else if let Some(k) = env_key {
-                ("env var", SecretsStore::masked_key(&k))
             } else {
                 ("not set", String::new())
             };

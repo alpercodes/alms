@@ -467,7 +467,7 @@ impl LlmClient {
 
         if let Some(key) = resolve_key(provider) {
             self.config.api_key = key;
-        } else {
+        } else if self.config.api_key.is_empty() {
             warn!(
                 "No API key found for provider '{}' — requests will fail",
                 provider
@@ -477,14 +477,18 @@ impl LlmClient {
         self.config.provider = provider.to_string();
     }
 
-    /// Override the LLM provider, resolving API key from env vars.
+    /// Override the LLM provider without resolving a new API key.
+    ///
+    /// The existing API key is preserved. Callers should prefer
+    /// `with_provider_and_secrets` when a secrets store is available.
     pub fn with_provider(mut self, provider: &str) -> Self {
-        self.apply_provider(provider, alms_core::config::select_llm_api_key_from_env);
+        // No key resolver — keeps the existing key. Callers should prefer
+        // `with_provider_and_secrets` when a secrets store is available.
+        self.apply_provider(provider, |_| None);
         self
     }
 
-    /// Override the LLM provider, resolving API key from secrets store
-    /// (falls back to env vars if not in secrets).
+    /// Override the LLM provider, resolving API key from secrets store.
     pub fn with_provider_and_secrets(
         mut self,
         provider: &str,
@@ -497,8 +501,7 @@ impl LlmClient {
     /// Re-resolve the API key from a `SecretsStore` for the current provider.
     ///
     /// Unlike `with_provider_and_secrets`, this does NOT change the provider or
-    /// base URL — it only refreshes the API key. Falls back to env vars if the
-    /// secrets store has no key for the active provider.
+    /// base URL — it only refreshes the API key from the secrets store.
     pub fn with_secrets(mut self, secrets: &alms_core::secrets::SecretsStore) -> Self {
         if let Some(key) = secrets.resolve_key(&self.config.provider) {
             self.config.api_key = key;

@@ -4,15 +4,42 @@ import { mapHistoryMessages } from '../utils/history.js';
 import { listRuns } from '../api/runs.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
-import { runs } from '../state/runs.js';
+import { activeRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
 import { chatMessages } from '../state/chat.js';
 import { messageQueue, bgRuns } from '../state/queue.js';
 import { wsFiles } from '../state/workspace.js';
 import { auditEvents } from '../state/audit.js';
 import { openSessionStream, closeSessionStream } from './use-session-stream.js';
+import { bumpSelectGeneration } from '../state/select-generation.js';
 
 const AGENT_KEY = 'alms_active_agent';
+
+/**
+ * Generation counter for loadAgentSessions() concurrency guard.
+ * Bumped at the start of each loadAgentSessions() call so that
+ * rapid agent switches (A -> B -> A) discard stale fetches.
+ */
+let switchGeneration = 0;
+
+function sessionStorageKey(agentId) {
+    return `alms_active_session_${agentId}`;
+}
+
+export function saveActiveSession(agentId, sessionId) {
+    if (agentId && sessionId) {
+        localStorage.setItem(sessionStorageKey(agentId), sessionId);
+    }
+}
+
+function loadActiveSession(agentId, agentSessions) {
+    const stored = localStorage.getItem(sessionStorageKey(agentId));
+    if (stored) {
+        const match = agentSessions.find(s => s.id === stored);
+        if (match) return match;
+    }
+    return agentSessions[0] || null;
+}
 
 /**
  * Boot sequence: load settings, agents, sessions, and chat history.
@@ -43,25 +70,33 @@ export async function boot() {
  * Load sessions for an agent, select the latest, load its history + runs.
  */
 async function loadAgentSessions(agentId) {
+    const gen = ++switchGeneration;
+
     try {
         const data = await listSessions(agentId);
+        if (gen !== switchGeneration) return; // stale — discard
         const agentSessions = data.sessions || [];
         sessions.value = agentSessions;
 
         if (agentSessions.length > 0) {
-            const latest = agentSessions[0];
-            activeSessionId.value = latest.id;
+            const selected = loadActiveSession(agentId, agentSessions);
+            activeSessionId.value = selected.id;
+            // Re-persist in case the session list changed
+            saveActiveSession(agentId, selected.id);
             await Promise.all([
-                loadHistory(latest.id),
-                loadRunHistory(latest.id),
+                loadHistory(selected.id),
+                loadRunHistory(selected.id),
             ]);
+            if (gen !== switchGeneration) return; // stale — discard
             // Open persistent session stream
-            openSessionStream(latest.id);
+            openSessionStream(selected.id);
         } else {
             // Create a first session
             const ctx = 'web-chat-' + Date.now();
             const resp = await createSession(agentId, ctx);
+            if (gen !== switchGeneration) return; // stale — discard
             const reloaded = await listSessions(agentId);
+            if (gen !== switchGeneration) return; // stale — discard
             sessions.value = reloaded.sessions || [];
             activeSessionId.value = resp.session_id;
             chatMessages.value = [];
@@ -70,6 +105,7 @@ async function loadAgentSessions(agentId) {
             openSessionStream(resp.session_id);
         }
     } catch (err) {
+        if (gen !== switchGeneration) return; // stale — discard
         console.error('[loadAgentSessions] failed:', err);
     }
 }
@@ -83,7 +119,7 @@ async function loadHistory(sessionId) {
         chatMessages.value = mapHistoryMessages(data.messages || []);
     } catch (err) {
         console.error('[loadHistory] failed:', err);
-        chatMessages.value = [];
+        chatMessages.value = [{ type: 'error', text: `Failed to load message history: ${err.message || 'unknown error'}` }];
     }
 }
 
@@ -107,12 +143,14 @@ export async function switchAgent(agentId) {
     if (!agent) return;
 
     closeSessionStream(); // close previous session stream
+    bumpSelectGeneration(); // invalidate any in-flight selectSession() fetches
 
     activeAgentId.value = agentId;
     localStorage.setItem(AGENT_KEY, agentId);
 
     // Reset all state
     activeSessionId.value = null;
+    activeRunId.value = null;
     sessions.value = [];
     runs.value = [];
     chatMessages.value = [];

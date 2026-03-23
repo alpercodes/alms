@@ -12,6 +12,12 @@ pub struct ToolRegistry {
     tools: Arc<DashMap<String, Arc<dyn Tool>>>,
     /// Default sandbox config for WASM tools
     default_config: SandboxConfig,
+    /// When non-empty, only tools whose name appears in this list can be
+    /// registered. This filter applies to **all** `register()` calls —
+    /// both initial builtins and dynamically added tools (invoke_agent,
+    /// send_message, workspace_write, etc.). An empty vec means all tools
+    /// are allowed.
+    enabled_filter: Arc<Vec<String>>,
 }
 
 impl ToolRegistry {
@@ -20,6 +26,7 @@ impl ToolRegistry {
         Self {
             tools: Arc::new(DashMap::new()),
             default_config: SandboxConfig::default(),
+            enabled_filter: Arc::new(Vec::new()),
         }
     }
 
@@ -28,12 +35,28 @@ impl ToolRegistry {
         Self {
             tools: Arc::new(DashMap::new()),
             default_config: config,
+            enabled_filter: Arc::new(Vec::new()),
         }
     }
 
-    /// Register a tool
+    /// Register a tool.
+    ///
+    /// When `enabled_filter` is non-empty, only tools whose name appears in
+    /// the list are accepted. This prevents dynamically registered tools
+    /// (invoke_agent, send_message, workspace_write, etc.) from bypassing the
+    /// operator's `tools.enabled` configuration.
     pub fn register(&self, tool: Arc<dyn Tool>) -> SandboxResult<()> {
         let name = tool.name().to_string();
+
+        // Enforce the enabled filter for ALL registrations — builtins and
+        // dynamically added tools alike.
+        if !self.enabled_filter.is_empty() && !self.enabled_filter.iter().any(|e| e == &name) {
+            debug!(
+                "Skipping registration of tool '{}' — not in enabled_filter",
+                name
+            );
+            return Ok(());
+        }
 
         if self.tools.contains_key(&name) {
             warn!("Tool '{}' already registered, replacing", name);
@@ -160,7 +183,11 @@ impl ToolRegistry {
         shell_unrestricted: bool,
         enabled: &[String],
     ) -> Self {
-        let registry = Self::new();
+        let mut registry = Self::new();
+        // Store the enabled filter so that subsequent register() calls
+        // (dynamic tools like invoke_agent, send_message, etc.) are also
+        // subject to the operator's allowlist.
+        registry.enabled_filter = Arc::new(enabled.to_vec());
         registry.register_builtin_tools_sandboxed(sandbox_root, shell_unrestricted, enabled);
         registry
     }
@@ -201,20 +228,38 @@ impl ToolRegistry {
         ];
 
         let builtin_names: Vec<String> = all_tools.iter().map(|t| t.name().to_string()).collect();
+
+        // Let register() handle the enabled_filter check uniformly for all
+        // tools — builtins and dynamically added tools alike.
         for tool in all_tools {
-            if enabled.is_empty() || enabled.iter().any(|e| e == tool.name()) {
-                if let Err(e) = self.register(tool) {
-                    error!("Failed to register {} tool: {}", "builtin", e);
-                }
-            } else {
-                debug!("Skipping disabled builtin tool: {}", tool.name());
+            if let Err(e) = self.register(tool) {
+                error!("Failed to register builtin tool: {}", e);
             }
         }
 
-        // Warn about enabled entries that don't match any builtin tool name.
+        // Warn about enabled entries that don't match any builtin tool name,
+        // but only if they are also not a known dynamic tool name.  Dynamic
+        // tools (invoke_agent, send_message, workspace_write, etc.) are
+        // registered later and are legitimately controlled by the same
+        // enabled_filter.
+        const KNOWN_DYNAMIC_TOOLS: &[&str] = &[
+            "invoke_agent",
+            "get_task_result",
+            "read_subagent_session",
+            "send_message",
+            "workspace_write",
+            "list_agents",
+            "read_messages",
+            "ignore_message",
+        ];
         for name in enabled {
-            if !builtin_names.iter().any(|b| b == name) {
-                warn!("tools.enabled contains unknown builtin '{}' — typo?", name);
+            if !builtin_names.iter().any(|b| b == name)
+                && !KNOWN_DYNAMIC_TOOLS.iter().any(|d| d == name)
+            {
+                warn!(
+                    "tools.enabled contains unknown tool '{}' — not a builtin or known dynamic tool; typo?",
+                    name
+                );
             }
         }
 
@@ -335,5 +380,42 @@ mod tests {
         assert!(registry.contains("fs_write"));
         assert!(registry.contains("fs_list"));
         assert_eq!(registry.len(), 7);
+    }
+
+    #[test]
+    fn test_enabled_filter_blocks_dynamic_tools() {
+        // When enabled_filter is set, dynamically registered tools that are
+        // not in the list should be silently skipped (issue #287).
+        let enabled = vec!["echo".to_string(), "math".to_string()];
+        let registry = ToolRegistry::with_builtin_tools_sandboxed(None, false, &enabled);
+        assert_eq!(registry.len(), 2);
+
+        // Attempt to register a dynamic tool not in the allowlist.
+        registry
+            .register_native("invoke_agent", |_| Ok(Value::Null))
+            .unwrap();
+        assert!(
+            !registry.contains("invoke_agent"),
+            "invoke_agent should be blocked by enabled_filter"
+        );
+        assert_eq!(registry.len(), 2);
+
+        // A tool that IS in the allowlist should be accepted (re-registration).
+        registry
+            .register_native("echo", |_| Ok(Value::Null))
+            .unwrap();
+        assert!(registry.contains("echo"));
+    }
+
+    #[test]
+    fn test_empty_enabled_filter_allows_dynamic_tools() {
+        // When enabled_filter is empty, all dynamic tools should be accepted.
+        let registry = ToolRegistry::with_builtin_tools_sandboxed(None, false, &[]);
+
+        registry
+            .register_native("invoke_agent", |_| Ok(Value::Null))
+            .unwrap();
+        assert!(registry.contains("invoke_agent"));
+        assert_eq!(registry.len(), 8); // 7 builtins + 1 dynamic
     }
 }

@@ -16,25 +16,20 @@ use axum::{
 use serde::Deserialize;
 
 /// GET /auth/keys — list which providers have keys (masked values only).
+///
+/// Only shows keys from the secrets store. Env var keys are ignored for
+/// security (agents can read env vars via shell_exec).
 pub async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
     let secrets = state.secrets.read().unwrap();
     let keys: Vec<serde_json::Value> = VALID_PROVIDERS
         .iter()
         .map(|p| {
             let stored = secrets.get_masked(p);
-            let env_key = alms_core::config::select_llm_api_key_from_env(p);
-            let source = if stored.is_some() {
-                "secrets"
-            } else if env_key.is_some() {
-                "env"
-            } else {
-                "none"
-            };
-            let masked = stored.or_else(|| env_key.map(|k| SecretsStore::masked_key(&k)));
+            let source = if stored.is_some() { "secrets" } else { "none" };
             serde_json::json!({
                 "provider": p,
-                "configured": masked.is_some(),
-                "key": masked,
+                "configured": stored.is_some(),
+                "key": stored,
                 "source": source,
             })
         })

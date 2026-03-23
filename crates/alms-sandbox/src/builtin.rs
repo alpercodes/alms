@@ -14,6 +14,19 @@ pub trait BuiltinTool: Tool {}
 /// reading secrets or other sensitive files.
 const DENIED_FILENAMES: &[&str] = &["secrets.json"];
 
+/// Environment variable names that must never be injected into shell_exec
+/// child processes. Belt-and-suspenders protection: `env_clear()` already
+/// strips the parent environment, but this ensures these names are also
+/// filtered from the tool-call `env` parameter and `default_env`.
+const SECRET_ENV_VARS: &[&str] = &[
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
+    "ALMS_MASTER_KEY",
+    "ALMS_AUTH_TOKEN",
+];
+
 /// Check whether a resolved path references a denied filename.
 ///
 /// Uses case-insensitive comparison so that `Secrets.JSON` and `SECRETS.json`
@@ -731,7 +744,7 @@ impl Tool for ShellExecTool {
             cmd.current_dir(root);
         }
 
-        // Clear the daemon's environment (which holds API keys, tokens, etc.)
+        // Clear the daemon's environment (which may hold sensitive config like ALMS_AUTH_TOKEN and ALMS_MASTER_KEY)
         // then re-inject platform-critical vars that don't contain secrets,
         // then inject gateway-provided defaults (ALMS_DATA_DIR, etc.),
         // then apply tool-call env params which override defaults on conflict.
@@ -748,10 +761,18 @@ impl Tool for ShellExecTool {
         }
 
         for (k, v) in &self.default_env {
+            if SECRET_ENV_VARS.iter().any(|s| s.eq_ignore_ascii_case(k)) {
+                warn!(env_var = %k, "Blocked secret env var from default_env injection");
+                continue;
+            }
             cmd.env(k, v);
         }
         if let Some(env_obj) = params.get("env").and_then(|v| v.as_object()) {
             for (k, v) in env_obj {
+                if SECRET_ENV_VARS.iter().any(|s| s.eq_ignore_ascii_case(k)) {
+                    warn!(env_var = %k, "Blocked secret env var from tool-call env injection");
+                    continue;
+                }
                 if let Some(val) = v.as_str() {
                     cmd.env(k, val);
                 }
@@ -1512,6 +1533,53 @@ mod tests {
         assert!(
             !stdout.contains("ALMS_DATA_DIR=/default/path"),
             "default value should be overridden"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_blocks_secret_env_in_tool_call() {
+        // Tool-call env params must not inject secret env vars.
+        let tool = ShellExecTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "argv": ["env"],
+                "env": {"OPENAI_API_KEY": "stolen-key", "SAFE_VAR": "ok"}
+            }))
+            .await
+            .unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            !stdout.contains("OPENAI_API_KEY"),
+            "Secret env vars must be blocked from tool-call injection"
+        );
+        assert!(
+            stdout.contains("SAFE_VAR=ok"),
+            "Non-secret env vars should pass through"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_blocks_secret_env_in_default_env() {
+        // default_env must not inject secret env vars.
+        let mut env = HashMap::new();
+        env.insert("ANTHROPIC_API_KEY".to_string(), "stolen-key".to_string());
+        env.insert("NORMAL_VAR".to_string(), "ok".to_string());
+
+        let tool = ShellExecTool::new().with_default_env(env);
+        let result = tool
+            .execute(serde_json::json!({"argv": ["env"]}))
+            .await
+            .unwrap();
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            !stdout.contains("ANTHROPIC_API_KEY"),
+            "Secret env vars must be blocked from default_env injection"
+        );
+        assert!(
+            stdout.contains("NORMAL_VAR=ok"),
+            "Non-secret env vars should pass through"
         );
     }
 
