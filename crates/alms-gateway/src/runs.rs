@@ -22,7 +22,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Per-run overrides that can be sent by the client to customise a single run.
 #[derive(Debug, Default)]
@@ -968,6 +968,13 @@ pub(crate) async fn completion_notification_loop(
 
         let notification = format_completion_notification(&completion);
 
+        info!(
+            session_id = %session_id.0,
+            task_id = %completion.task_id.0,
+            subagent = ?completion.subagent_name,
+            "Subagent completion → creating notification run"
+        );
+
         let run_id = enqueue_triggered_run(
             &state,
             agent_id,
@@ -979,12 +986,11 @@ pub(crate) async fn completion_notification_loop(
         )
         .await;
 
-        info!(
+        debug!(
             run_id = %run_id.0,
             session_id = %session_id.0,
             task_id = %completion.task_id.0,
-            subagent = ?completion.subagent_name,
-            "Subagent completion → auto-creating notification run"
+            "Notification run enqueued"
         );
     }
 }
