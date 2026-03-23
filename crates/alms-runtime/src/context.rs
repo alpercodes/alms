@@ -829,6 +829,97 @@ mod tests {
         assert_eq!(messages[6].content_str(), "Here's what I found.");
     }
 
+    // -----------------------------------------------------------------------
+    // apply_perspective tests
+    // -----------------------------------------------------------------------
+
+    fn make_msg_with_metadata(
+        role: Role,
+        text: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role,
+            content: Content::Text(text.to_string()),
+            timestamp: Timestamp::now(),
+            metadata,
+        }
+    }
+
+    fn default_builder() -> ContextBuilder {
+        ContextBuilder::new(ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+        })
+    }
+
+    #[test]
+    fn test_apply_perspective_no_metadata_stays_user() {
+        let builder = default_builder();
+        let msg = make_msg(Role::User, "hello from nowhere");
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(mapped.role, Role::User);
+        assert_eq!(
+            match &mapped.content {
+                Content::Text(t) => t.as_str(),
+                _ => "",
+            },
+            "hello from nowhere"
+        );
+    }
+
+    #[test]
+    fn test_apply_perspective_matching_agent_becomes_assistant() {
+        let builder = default_builder();
+        let msg = make_msg_with_metadata(
+            Role::User,
+            "I said this",
+            Some(serde_json::json!({"from_agent": "agent-alpha"})),
+        );
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::Assistant,
+            "own message should map to Assistant"
+        );
+    }
+
+    #[test]
+    fn test_apply_perspective_different_agent_stays_user() {
+        let builder = default_builder();
+        let msg = make_msg_with_metadata(
+            Role::User,
+            "someone else said this",
+            Some(serde_json::json!({"from_agent": "agent-beta"})),
+        );
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::User,
+            "other agent's message should stay User"
+        );
+    }
+
+    #[test]
+    fn test_apply_perspective_metadata_without_from_agent_stays_user() {
+        let builder = default_builder();
+        let msg = make_msg_with_metadata(
+            Role::User,
+            "some random metadata",
+            Some(serde_json::json!({"other_key": "other_value"})),
+        );
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::User,
+            "metadata without from_agent should stay User"
+        );
+    }
+
     #[test]
     fn test_group_tool_calls_does_not_merge_across_text() {
         // If there's an assistant text message between two tool call groups,
