@@ -228,20 +228,38 @@ impl ToolRegistry {
         ];
 
         let builtin_names: Vec<String> = all_tools.iter().map(|t| t.name().to_string()).collect();
+
+        // Let register() handle the enabled_filter check uniformly for all
+        // tools — builtins and dynamically added tools alike.
         for tool in all_tools {
-            if enabled.is_empty() || enabled.iter().any(|e| e == tool.name()) {
-                if let Err(e) = self.register(tool) {
-                    error!("Failed to register {} tool: {}", "builtin", e);
-                }
-            } else {
-                debug!("Skipping disabled builtin tool: {}", tool.name());
+            if let Err(e) = self.register(tool) {
+                error!("Failed to register builtin tool: {}", e);
             }
         }
 
-        // Warn about enabled entries that don't match any builtin tool name.
+        // Warn about enabled entries that don't match any builtin tool name,
+        // but only if they are also not a known dynamic tool name.  Dynamic
+        // tools (invoke_agent, send_message, workspace_write, etc.) are
+        // registered later and are legitimately controlled by the same
+        // enabled_filter.
+        const KNOWN_DYNAMIC_TOOLS: &[&str] = &[
+            "invoke_agent",
+            "get_task_result",
+            "read_subagent_session",
+            "send_message",
+            "workspace_write",
+            "list_agents",
+            "read_messages",
+            "ignore_message",
+        ];
         for name in enabled {
-            if !builtin_names.iter().any(|b| b == name) {
-                warn!("tools.enabled contains unknown builtin '{}' — typo?", name);
+            if !builtin_names.iter().any(|b| b == name)
+                && !KNOWN_DYNAMIC_TOOLS.iter().any(|d| d == name)
+            {
+                warn!(
+                    "tools.enabled contains unknown tool '{}' — not a builtin or known dynamic tool; typo?",
+                    name
+                );
             }
         }
 
