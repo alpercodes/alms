@@ -59,6 +59,7 @@ pub struct AlmsConfig {
     pub context: ContextConfig,
     pub tools: ToolsConfig,
     pub channels: ChannelsConfig,
+    pub logging: LoggingConfig,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -71,6 +72,7 @@ impl Default for AlmsConfig {
             context: ContextConfig::default(),
             tools: ToolsConfig::default(),
             channels: ChannelsConfig::default(),
+            logging: LoggingConfig::default(),
         }
     }
 }
@@ -186,6 +188,17 @@ impl AlmsConfig {
         {
             self.context.max_input_tokens = n;
         }
+
+        // Logging settings
+        if let Ok(val) = std::env::var("ALMS_LOG_DIR") {
+            self.logging.log_dir = Some(val);
+        }
+        if let Ok(val) = std::env::var("ALMS_LOG_FILE_LEVEL") {
+            self.logging.file_level = val;
+        }
+        if let Ok(val) = std::env::var("ALMS_LOG_ROTATION") {
+            self.logging.rotation = val;
+        }
     }
 
     /// Validate config. Returns error on invalid values.
@@ -261,6 +274,23 @@ impl AlmsConfig {
             return Err(AlmsError::InvalidConfig(format!(
                 "tools.shell_policy must be one of {:?}, got '{}'",
                 valid_policies, self.tools.shell_policy
+            )));
+        }
+
+        // Logging validation
+        let valid_rotations = ["daily", "hourly", "never"];
+        if !valid_rotations.contains(&self.logging.rotation.as_str()) {
+            return Err(AlmsError::InvalidConfig(format!(
+                "logging.rotation must be one of {:?}, got '{}'",
+                valid_rotations, self.logging.rotation
+            )));
+        }
+
+        let valid_levels = ["trace", "debug", "info", "warn", "error"];
+        if !valid_levels.contains(&self.logging.file_level.as_str()) {
+            return Err(AlmsError::InvalidConfig(format!(
+                "logging.file_level must be one of {:?}, got '{}'",
+                valid_levels, self.logging.file_level
             )));
         }
 
@@ -472,6 +502,46 @@ impl Default for ChannelsConfig {
         Self {
             telegram_token: None,
             telegram_poll_interval_secs: 5,
+        }
+    }
+}
+
+/// Logging configuration.
+///
+/// Controls file-based logging with daily rotation. Stderr output is always
+/// active (level controlled by `RUST_LOG`). File output provides a persistent
+/// debug-level log for post-hoc investigation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingConfig {
+    /// Directory for log files. Defaults to `{data_dir}/logs/`.
+    /// Set to override the default location, or `None` to use the default.
+    pub log_dir: Option<String>,
+    /// Log level for file output. Default: "debug".
+    /// Accepts standard tracing levels: trace, debug, info, warn, error.
+    pub file_level: String,
+    /// Log rotation policy: "daily" (default), "hourly", or "never".
+    pub rotation: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            log_dir: None,
+            file_level: "debug".into(),
+            rotation: "daily".into(),
+        }
+    }
+}
+
+impl LoggingConfig {
+    /// Resolve the log directory path.
+    ///
+    /// Precedence: `logging.log_dir` config > `{data_dir}/logs/`.
+    pub fn resolve_log_dir(&self, data_dir: &str) -> PathBuf {
+        match &self.log_dir {
+            Some(dir) => PathBuf::from(dir),
+            None => PathBuf::from(format!("{}/logs", data_dir)),
         }
     }
 }

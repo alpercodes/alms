@@ -84,6 +84,21 @@ sandbox_root = "."
 # Override with: ALMS_SHELL_POLICY=unrestricted
 shell_policy = "sandboxed"
 
+[logging]
+# Directory for persistent log files. Default: "{data_dir}/logs/" (i.e. ./data/logs/).
+# Override with: ALMS_LOG_DIR=/custom/log/path
+# log_dir = "./data/logs"
+
+# Log level for file output. Stderr level is controlled by RUST_LOG (default: info).
+# File output defaults to "debug" for more detail in post-hoc investigation.
+# Valid: trace, debug, info, warn, error
+# Override with: ALMS_LOG_FILE_LEVEL=info
+file_level = "debug"
+
+# Log rotation policy: "daily" (default), "hourly", or "never".
+# Override with: ALMS_LOG_ROTATION=hourly
+rotation = "daily"
+
 # Telegram channel (optional)
 # Set token via: export TELEGRAM_BOT_TOKEN=...
 # [channels.telegram]

@@ -15,6 +15,9 @@ use helpers::{api_client, open_db};
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use tracing::{error, info, warn};
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 #[derive(Parser, Debug)]
 #[command(name = "alms")]
@@ -126,11 +129,35 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    // Load config early to resolve log directory.
+    let config = alms_core::AlmsConfig::load().unwrap_or_default();
+
+    // Stderr layer — level from RUST_LOG, defaulting to info.
+    let stderr_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(stderr_filter);
+
+    // File layer — daily/hourly rolling logs to {data_dir}/logs/.
+    let log_dir = config.logging.resolve_log_dir(&config.server.data_dir);
+    std::fs::create_dir_all(&log_dir).ok();
+
+    let file_appender = match config.logging.rotation.as_str() {
+        "hourly" => tracing_appender::rolling::hourly(&log_dir, "alms.log"),
+        "never" => tracing_appender::rolling::never(&log_dir, "alms.log"),
+        _ => tracing_appender::rolling::daily(&log_dir, "alms.log"),
+    };
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+    let file_filter = tracing_subscriber::EnvFilter::new(&config.logging.file_level);
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_filter(file_filter);
+
+    tracing_subscriber::registry()
+        .with(stderr_layer)
+        .with(file_layer)
         .init();
 
     let cli = Cli::parse();
