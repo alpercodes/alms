@@ -857,7 +857,13 @@ header h1 {
   align-self: flex-start;
   transition: all var(--duration-fast);
 }
-.jobs-submit:hover { background: var(--accent-hover); }
+.jobs-submit:hover:not(:disabled) { background: var(--accent-hover); }
+.jobs-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: var(--surface-4);
+  color: var(--text-disabled);
+}
 .jobs-divider { border: none; border-top: 1px solid var(--border-subtle); margin: var(--space-1) 0; }
 .job-item {
   background: var(--surface-2);
@@ -891,6 +897,8 @@ header h1 {
 .job-status-pending   { color: var(--warning); }
 .jobs-empty { font-size: var(--text-xs); color: var(--text-disabled); font-style: italic; }
 .jobs-error { font-size: var(--text-xs); color: var(--error); }
+.jobs-success { font-size: var(--text-xs); color: var(--success); }
+.schedule-mode-toggle { display: flex; gap: var(--space-1); }
 
 /* ══════════════════════════════════════════════════════════════════════
    Settings Modal

@@ -26,6 +26,15 @@ function describeCron(expr) {
     return expr;
 }
 
+/** Round a Date up to the nearest future minute. */
+function defaultRunAt() {
+    const d = new Date(Date.now() + 5 * 60_000); // 5 minutes from now
+    d.setSeconds(0, 0);
+    // Format as local datetime-local input value (YYYY-MM-DDTHH:MM)
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 async function refreshJobs() {
     try {
         const data = await listJobs();
@@ -36,10 +45,13 @@ async function refreshJobs() {
 }
 
 export function JobsTab() {
+    const scheduleMode = useSignal('recurring'); // 'recurring' | 'once'
     const cron = useSignal('');
+    const runAt = useSignal(defaultRunAt());
     const prompt = useSignal('');
     const agentId = useSignal(activeAgentId.value || '');
     const error = useSignal('');
+    const success = useSignal('');
     const loading = useSignal(false);
     const customMode = useSignal(false);
 
@@ -51,22 +63,49 @@ export function JobsTab() {
 
     const cronDesc = describeCron(cron.value);
 
+    // Determine if the form is valid for submission.
+    const hasSchedule = scheduleMode.value === 'once'
+        ? !!runAt.value
+        : !!cron.value.trim();
+    const canSubmit = !!agentId.value && hasSchedule && !!prompt.value.trim();
+
     const onCreate = async () => {
-        if (!agentId.value || !cron.value.trim() || !prompt.value.trim()) return;
+        if (!canSubmit) return;
         error.value = '';
+        success.value = '';
         loading.value = true;
         try {
+            let schedule;
+            if (scheduleMode.value === 'once') {
+                // Convert local datetime to UTC ISO string for the backend.
+                const localDate = new Date(runAt.value);
+                if (isNaN(localDate.getTime())) {
+                    error.value = 'Invalid date/time. Please select a valid date.';
+                    loading.value = false;
+                    return;
+                }
+                schedule = { type: "once", run_at: localDate.toISOString() };
+            } else {
+                schedule = { type: "recurring", cron: cron.value.trim() };
+            }
             await createJob({
                 agent_id: agentId.value,
-                schedule: { type: "recurring", cron: cron.value.trim() },
+                schedule,
                 prompt: prompt.value.trim(),
             });
             cron.value = '';
             prompt.value = '';
             customMode.value = false;
+            runAt.value = defaultRunAt();
+            success.value = scheduleMode.value === 'once'
+                ? 'Job scheduled (one-time).'
+                : 'Recurring job created.';
+            // Clear success message after a few seconds.
+            setTimeout(() => { success.value = ''; }, 4000);
             await refreshJobs();
         } catch (err) {
-            error.value = err.error?.message || err.message || 'Failed to create job';
+            const msg = err.error?.message || err.message || '';
+            error.value = msg || 'Failed to create job. Check that all fields are filled and the schedule is valid.';
         } finally {
             loading.value = false;
         }
@@ -91,29 +130,46 @@ export function JobsTab() {
                     `)}
                 </select>
 
-                <div class="cron-presets">
-                    ${PRESETS.map(p => html`
-                        <button class="cron-btn ${cron.value === p.cron ? 'active' : ''}"
-                                title=${p.desc}
-                                onClick=${() => { cron.value = p.cron; customMode.value = false; }}>
-                            ${p.label}
-                        </button>
-                    `)}
-                    <button class="cron-btn ${customMode.value ? 'active' : ''}"
-                            title="Custom cron expression"
-                            onClick=${() => { customMode.value = true; cron.value = ''; }}>
-                        custom
+                <div class="schedule-mode-toggle">
+                    <button class="cron-btn ${scheduleMode.value === 'recurring' ? 'active' : ''}"
+                            onClick=${() => { scheduleMode.value = 'recurring'; }}>
+                        Recurring
+                    </button>
+                    <button class="cron-btn ${scheduleMode.value === 'once' ? 'active' : ''}"
+                            onClick=${() => { scheduleMode.value = 'once'; }}>
+                        Run once
                     </button>
                 </div>
 
-                ${customMode.value && html`
-                    <input class="jobs-input" type="text" placeholder="min hour dom mon dow"
-                           value=${cron.value}
-                           onInput=${e => { cron.value = e.target.value; }} />
-                `}
+                ${scheduleMode.value === 'recurring' ? html`
+                    <div class="cron-presets">
+                        ${PRESETS.map(p => html`
+                            <button class="cron-btn ${cron.value === p.cron ? 'active' : ''}"
+                                    title=${p.desc}
+                                    onClick=${() => { cron.value = p.cron; customMode.value = false; }}>
+                                ${p.label}
+                            </button>
+                        `)}
+                        <button class="cron-btn ${customMode.value ? 'active' : ''}"
+                                title="Custom cron expression"
+                                onClick=${() => { customMode.value = true; cron.value = ''; }}>
+                            custom
+                        </button>
+                    </div>
 
-                ${cron.value && html`
-                    <div class="cron-preview">${cronDesc}</div>
+                    ${customMode.value && html`
+                        <input class="jobs-input" type="text" placeholder="min hour dom mon dow"
+                               value=${cron.value}
+                               onInput=${e => { cron.value = e.target.value; }} />
+                    `}
+
+                    ${cron.value && html`
+                        <div class="cron-preview">${cronDesc}</div>
+                    `}
+                ` : html`
+                    <input class="jobs-input" type="datetime-local"
+                           value=${runAt.value}
+                           onInput=${e => { runAt.value = e.target.value; }} />
                 `}
 
                 <textarea class="jobs-textarea" rows="2" placeholder="Prompt for the agent..."
@@ -127,11 +183,12 @@ export function JobsTab() {
                 `}
 
                 <button class="jobs-submit" onClick=${onCreate}
-                        disabled=${loading.value || !agentId.value || !cron.value.trim() || !prompt.value.trim()}>
-                    ${loading.value ? '...' : 'Schedule'}
+                        disabled=${loading.value || !canSubmit}>
+                    ${loading.value ? 'Scheduling...' : 'Schedule'}
                 </button>
             </div>
 
+            ${success.value && html`<div class="jobs-success">${success.value}</div>`}
             ${error.value && html`<div class="jobs-error">${error.value}</div>`}
 
             <div class="jobs-divider"></div>
@@ -142,7 +199,7 @@ export function JobsTab() {
                     <div class="job-item">
                         <div class="job-prompt">${j.prompt || j.task || '(no prompt)'}</div>
                         <div class="job-meta">
-                            <span>${describeCron(j.schedule?.cron) || JSON.stringify(j.schedule)}</span>
+                            <span>${describeCron(j.schedule?.cron) || (j.schedule?.type === 'once' ? 'Once at ' + fmtDate(j.schedule.run_at) : JSON.stringify(j.schedule))}</span>
                             ${j.next_run_at && html`<span> | next: ${fmtDate(j.next_run_at)}</span>`}
                         </div>
                         <span class="job-status-${j.status || 'active'}">${j.status || 'active'}</span>
