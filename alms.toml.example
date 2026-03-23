@@ -1,6 +1,8 @@
 # ALMS Configuration
 # Copy to alms.toml and customize. All values shown are defaults.
-# Secrets (API keys, tokens) are loaded from environment variables, never this file.
+# Secrets (API keys, tokens) are stored in data/secrets.json (via `alms auth set`
+# or the UI) with env-var fallback. They are never stored in this file.
+# Set ALMS_MASTER_KEY to encrypt secrets at rest (AES-256-GCM).
 
 [server]
 bind = "127.0.0.1:8080"
