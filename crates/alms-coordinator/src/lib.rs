@@ -845,7 +845,9 @@ async fn run_agent_loop(
 
             (stable_id, stable_ctx, config, model, provider, true)
         } else {
-            // Ephemeral: fresh each invocation
+            // Ephemeral: fresh each invocation.
+            // Still attach a workspace scoped to a temporary directory so that
+            // fs_read/fs_write/fs_list are narrowed (preventing project-root access).
             let (config, _, _) = agent_config_for_subagent(None, base_agent_config);
             (
                 AgentId::new(),
@@ -853,7 +855,7 @@ async fn run_agent_loop(
                 config,
                 None,
                 None,
-                false,
+                true, // attach an ephemeral workspace to restrict fs_* sandbox
             )
         };
 
@@ -897,10 +899,21 @@ async fn run_agent_loop(
         }
     }
 
-    // Attach workspace for named subagents: {workspace_dir}/{name}/
-    if attach_workspace && let (Some(ws_dir), Some(name)) = (workspace_dir, &request.subagent_name)
-    {
-        let subagent_ws_dir = ws_dir.join(name);
+    // Attach workspace to scope the fs_* sandbox.
+    //
+    // Named subagents:    {workspace_dir}/{name}/
+    // Ephemeral subagents: {workspace_dir}/.ephemeral/{task_id}/
+    //
+    // Ephemeral subagents get a disposable workspace so their fs_read/fs_write/
+    // fs_list tools are sandboxed to a narrow directory instead of inheriting
+    // the project-root sandbox (which would expose data/secrets.json, the SQLite
+    // database, and other agents' workspace files).
+    if attach_workspace && let Some(ws_dir) = workspace_dir {
+        let subagent_ws_dir = if let Some(name) = &request.subagent_name {
+            ws_dir.join(name)
+        } else {
+            ws_dir.join(".ephemeral").join(task_id.0.to_string())
+        };
         let workspace = alms_runtime::AgentWorkspace::with_dir(subagent_ws_dir);
         runtime = runtime.with_workspace(workspace);
     }

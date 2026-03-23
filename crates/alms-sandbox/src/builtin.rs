@@ -7,6 +7,40 @@ use tracing::warn;
 /// Built-in tool trait marker
 pub trait BuiltinTool: Tool {}
 
+/// Filenames that must never be accessed by agent tools.
+///
+/// These are checked against the final component of resolved paths in fs_read,
+/// fs_write, and against argv elements in shell_exec to prevent agents from
+/// reading secrets or other sensitive files.
+const DENIED_FILENAMES: &[&str] = &["secrets.json"];
+
+/// Check whether a resolved path references a denied filename.
+fn is_denied_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|name| DENIED_FILENAMES.contains(&name))
+}
+
+/// Check whether any element in a shell argv references a denied filename.
+///
+/// This is a best-effort check: it catches obvious patterns like
+/// `cat data/secrets.json` or `cat /abs/path/secrets.json` but cannot prevent
+/// all indirect access (e.g. `cat $(echo secrets.json)`). For true shell
+/// isolation, use a restricted OS user or Landlock.
+fn argv_references_denied_file(argv: &[&str]) -> Option<&'static str> {
+    for arg in argv {
+        let p = Path::new(arg);
+        if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
+            for denied in DENIED_FILENAMES {
+                if name == *denied {
+                    return Some(denied);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Resolve a path and verify it falls within the sandbox root.
 ///
 /// Relative paths are joined to `sandbox_root`. Absolute paths are checked
@@ -639,6 +673,18 @@ impl Tool for ShellExecTool {
             })
             .collect::<SandboxResult<Vec<&str>>>()?;
 
+        // Deny-list check: block commands that reference sensitive files in argv.
+        // This is best-effort — it catches `cat data/secrets.json` but not
+        // indirect access. For true isolation, use ALMS_MASTER_KEY encryption.
+        let full_argv: Vec<&str> = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect();
+        if let Some(denied) = argv_references_denied_file(&full_argv) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Command references denied file '{denied}'"
+            )));
+        }
+
         let timeout_secs = params
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
@@ -780,11 +826,27 @@ impl Tool for FsReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
+        // Deny-list check: block access to sensitive files regardless of sandbox scope.
+        if is_denied_path(Path::new(path)) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Access to '{}' is denied",
+                path
+            )));
+        }
+
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
             check_sandbox_path_async(path, root).await?
         } else {
             PathBuf::from(path)
         };
+
+        // Also check the resolved path (handles relative traversals like ../data/secrets.json).
+        if is_denied_path(&resolved) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Access to '{}' is denied",
+                path
+            )));
+        }
 
         let content = tokio::fs::read_to_string(&resolved)
             .await
@@ -859,11 +921,27 @@ impl Tool for FsWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
+        // Deny-list check: block writes to sensitive files.
+        if is_denied_path(Path::new(path)) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Access to '{}' is denied",
+                path
+            )));
+        }
+
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
             check_sandbox_path_async(path, root).await?
         } else {
             PathBuf::from(path)
         };
+
+        // Also check the resolved path for denied filenames.
+        if is_denied_path(&resolved) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Access to '{}' is denied",
+                path
+            )));
+        }
 
         let content = params
             .get("content")
@@ -1549,5 +1627,86 @@ mod tests {
             .execute(serde_json::json!({"path": "nonexistent_dir_xyz"}))
             .await;
         assert!(result.is_err());
+    }
+
+    // ── Denylist tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_denied_path_secrets_json() {
+        assert!(is_denied_path(Path::new("secrets.json")));
+        assert!(is_denied_path(Path::new("data/secrets.json")));
+        assert!(is_denied_path(Path::new("/abs/path/data/secrets.json")));
+    }
+
+    #[test]
+    fn test_is_denied_path_allowed_files() {
+        assert!(!is_denied_path(Path::new("data.json")));
+        assert!(!is_denied_path(Path::new("my_secrets.json")));
+        assert!(!is_denied_path(Path::new("goals.md")));
+        assert!(!is_denied_path(Path::new("alms.db")));
+    }
+
+    #[test]
+    fn test_argv_references_denied_file() {
+        assert_eq!(
+            argv_references_denied_file(&["cat", "data/secrets.json"]),
+            Some("secrets.json")
+        );
+        assert_eq!(
+            argv_references_denied_file(&["cat", "/abs/path/secrets.json"]),
+            Some("secrets.json")
+        );
+        assert_eq!(argv_references_denied_file(&["ls", "-la"]), None);
+        assert_eq!(argv_references_denied_file(&["cat", "data.json"]), None);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_denied_secrets_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets.json");
+        std::fs::write(&secrets, r#"{"key": "sk-1234"}"#).unwrap();
+
+        let tool = FsReadTool::new();
+        let result = tool
+            .execute(serde_json::json!({"path": secrets.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_denied_secrets_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets.json");
+
+        let tool = FsWriteTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": secrets.to_str().unwrap(),
+                "content": "malicious"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_exec_denied_secrets_json() {
+        let tool = ShellExecTool::new();
+        let result = tool
+            .execute(serde_json::json!({"argv": ["cat", "data/secrets.json"]}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied"));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_exec_allowed_normal_files() {
+        let tool = ShellExecTool::new();
+        let result = tool
+            .execute(serde_json::json!({"argv": ["echo", "data.json"]}))
+            .await;
+        assert!(result.is_ok());
     }
 }
