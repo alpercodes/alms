@@ -13,6 +13,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -38,6 +39,8 @@ enum PriorityItem {
 #[derive(Debug)]
 pub struct SessionQueue<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> {
     senders: Arc<DashMap<K, mpsc::UnboundedSender<PriorityItem>>>,
+    /// Tracks how many items are pending (enqueued but not yet started) per key.
+    pending_counts: Arc<DashMap<K, Arc<AtomicUsize>>>,
     shutdown: CancellationToken,
 }
 
@@ -45,6 +48,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> SessionQueue<K> {
     pub fn new(shutdown: CancellationToken) -> Self {
         Self {
             senders: Arc::new(DashMap::new()),
+            pending_counts: Arc::new(DashMap::new()),
             shutdown,
         }
     }
@@ -60,7 +64,22 @@ impl<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> SessionQueue<K> {
         self.enqueue_item(key, PriorityItem::Low(work));
     }
 
+    /// Returns the number of items currently pending (enqueued but not yet
+    /// started) for the given key.
+    pub fn pending_count(&self, key: &K) -> usize {
+        self.pending_counts
+            .get(key)
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     fn enqueue_item(&self, key: K, item: PriorityItem) {
+        // Increment pending count.
+        self.pending_counts
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .fetch_add(1, Ordering::Relaxed);
+
         if let Some(sender) = self.senders.get(&key) {
             match sender.send(item) {
                 Ok(()) => return,
@@ -80,10 +99,15 @@ impl<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> SessionQueue<K> {
         let _ = tx.send(first_item);
 
         let senders = Arc::clone(&self.senders);
+        let pending = self
+            .pending_counts
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone();
         let shutdown = self.shutdown.clone();
         let handler_key = key.clone();
         tokio::spawn(async move {
-            handler_loop(handler_key, rx, senders, shutdown).await;
+            handler_loop(handler_key, rx, senders, pending, shutdown).await;
         });
 
         self.senders.insert(key, tx);
@@ -98,6 +122,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
     key: K,
     mut rx: mpsc::UnboundedReceiver<PriorityItem>,
     senders: Arc<DashMap<K, mpsc::UnboundedSender<PriorityItem>>>,
+    pending: Arc<AtomicUsize>,
     shutdown: CancellationToken,
 ) {
     let idle_timeout = Duration::from_secs(300);
@@ -111,6 +136,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
         while let Ok(item) = rx.try_recv() {
             match item {
                 PriorityItem::Normal(work) => {
+                    pending.fetch_sub(1, Ordering::Relaxed);
                     work.await;
                     got_normal = true;
                 }
@@ -128,6 +154,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
 
         // No normal items pending — process one low-priority item if available.
         if let Some(low_work) = low_queue.pop_front() {
+            pending.fetch_sub(1, Ordering::Relaxed);
             low_work.await;
             continue;
         }
@@ -140,6 +167,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
                 debug!(key = ?key, "Session queue handler shutting down, draining remaining items");
                 rx.close();
                 while let Some(item) = rx.recv().await {
+                    pending.fetch_sub(1, Ordering::Relaxed);
                     match item {
                         PriorityItem::Normal(work) | PriorityItem::Low(work) => work.await,
                     }
@@ -153,10 +181,12 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
             result = timeout(idle_timeout, rx.recv()) => {
                 match result {
                     Ok(Some(PriorityItem::Normal(work))) => {
+                        pending.fetch_sub(1, Ordering::Relaxed);
                         work.await;
                     }
                     Ok(Some(PriorityItem::Low(work))) => {
                         // Defer: loop back to check for normal items first.
+                        // Don't decrement yet — item hasn't started executing.
                         low_queue.push_back(work);
                     }
                     Ok(None) => {
@@ -172,6 +202,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
                         debug!(key = ?key, "Session queue handler exiting: idle timeout");
                         senders.remove(&key);
                         while let Ok(item) = rx.try_recv() {
+                            pending.fetch_sub(1, Ordering::Relaxed);
                             match item {
                                 PriorityItem::Normal(work) | PriorityItem::Low(work) => work.await,
                             }

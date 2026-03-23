@@ -59,7 +59,10 @@ function ChatView() {
                     }
                     if (m.type === 'thinking') {
                         let label = 'Thinking';
-                        if (m.source && m.source.startsWith('peer:')) {
+                        if (m.queuedBehind > 0) {
+                            const n = m.queuedBehind;
+                            label = 'Agent is busy — your message is queued (' + n + ' ahead)';
+                        } else if (m.source && m.source.startsWith('peer:')) {
                             label = 'Replying to message from ' + m.source.slice(5);
                         } else if (m.source === 'job') {
                             label = 'Running scheduled job';
