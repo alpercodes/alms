@@ -190,6 +190,10 @@ impl SecretsStore {
     fn load_with_key(path: impl Into<PathBuf>, master_key: Option<Vec<u8>>) -> AlmsResult<Self> {
         let path = path.into();
 
+        // Track whether the initial load found plaintext JSON so we can
+        // decide on migration without re-reading the file (avoids TOCTOU).
+        let mut was_plaintext = false;
+
         let keys = if path.exists() {
             let raw = std::fs::read(&path).map_err(|e| {
                 crate::AlmsError::Runtime(format!("Failed to read secrets file: {e}"))
@@ -198,6 +202,7 @@ impl SecretsStore {
             if raw.is_empty() {
                 HashMap::new()
             } else if is_plaintext_json(&raw) {
+                was_plaintext = true;
                 // Plain text JSON — parse it
                 let content = String::from_utf8(raw).map_err(|e| {
                     crate::AlmsError::Runtime(format!("Secrets file is not valid UTF-8: {e}"))
@@ -253,15 +258,11 @@ impl SecretsStore {
             master_key,
         };
 
-        // If we loaded plain text and have a master key, re-save to encrypt (migration)
-        if store.master_key.is_some() && store.path.exists() && !store.keys.is_empty() {
-            let raw = std::fs::read(&store.path).map_err(|e| {
-                crate::AlmsError::Runtime(format!("Failed to re-read secrets file: {e}"))
-            })?;
-            if is_plaintext_json(&raw) {
-                tracing::info!("Migrating secrets file to encrypted format");
-                store.save()?;
-            }
+        // If we loaded plain text and have a master key, encrypt in place (migration).
+        // Uses the `was_plaintext` flag from the initial parse — no re-read needed.
+        if was_plaintext && store.master_key.is_some() && !store.keys.is_empty() {
+            tracing::info!("Migrating secrets file to encrypted format");
+            store.save()?;
         }
 
         Ok(store)
@@ -320,6 +321,10 @@ impl SecretsStore {
     }
 
     /// Save secrets to disk, encrypting if a master key is available.
+    ///
+    /// Uses atomic write (write-to-temp, fsync, rename) so a crash mid-write
+    /// cannot corrupt the secrets file.  On Windows, where rename-over-existing
+    /// may fail, we fall back to a direct write.
     fn save(&self) -> AlmsResult<()> {
         let file = SecretsFile {
             api_keys: self.keys.clone(),
@@ -334,19 +339,39 @@ impl SecretsStore {
             })?;
         }
 
-        if let Some(ref mk) = self.master_key {
-            // Encrypt and write binary
-            let encrypted = encrypt_data(json.as_bytes(), mk)?;
-            std::fs::write(&self.path, &encrypted).map_err(|e| {
-                crate::AlmsError::Runtime(format!("Failed to write encrypted secrets file: {e}"))
-            })?;
+        let data = if let Some(ref mk) = self.master_key {
+            encrypt_data(json.as_bytes(), mk)?
         } else {
-            // Write plain text JSON
             tracing::warn!(
                 "Saving secrets unencrypted. Set {} for encryption at rest",
                 MASTER_KEY_ENV
             );
-            std::fs::write(&self.path, &json).map_err(|e| {
+            json.into_bytes()
+        };
+
+        // Atomic write: temp file -> fsync -> rename.
+        // If rename fails (Windows can reject rename-over-existing), fall back
+        // to a direct write so we don't lose the data entirely.
+        let tmp_path = self.path.with_extension("tmp");
+        let atomic_ok = (|| -> std::io::Result<()> {
+            {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&tmp_path)?;
+                f.write_all(&data)?;
+                f.sync_all()?;
+            }
+            std::fs::rename(&tmp_path, &self.path)?;
+            Ok(())
+        })();
+
+        if let Err(rename_err) = atomic_ok {
+            // Clean up temp file if it exists
+            let _ = std::fs::remove_file(&tmp_path);
+            tracing::warn!(
+                "Atomic rename failed ({}), falling back to direct write",
+                rename_err
+            );
+            std::fs::write(&self.path, &data).map_err(|e| {
                 crate::AlmsError::Runtime(format!("Failed to write secrets file: {e}"))
             })?;
         }
@@ -622,5 +647,30 @@ mod tests {
         let key1 = derive_key(master, salt1);
         let key2 = derive_key(master, salt2);
         assert_ne!(key1, key2, "Different salts must produce different keys");
+    }
+
+    #[test]
+    fn test_corrupted_ciphertext_fails_gracefully() {
+        let master_key = b"corruption-test-key-long-enough!";
+        let plaintext = b"sensitive data that must be authenticated";
+
+        let mut encrypted = encrypt_data(plaintext, master_key).unwrap();
+
+        // Flip a byte in the middle of the ciphertext body (past the header).
+        // This exercises the GCM authentication tag check specifically —
+        // the key is correct, but the ciphertext has been tampered with.
+        let flip_idx = HEADER_LEN + (encrypted.len() - HEADER_LEN) / 2;
+        encrypted[flip_idx] ^= 0xFF;
+
+        let result = decrypt_data(&encrypted, master_key);
+        assert!(
+            result.is_err(),
+            "Corrupted ciphertext must be rejected by GCM auth tag verification"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("ALMS_MASTER_KEY"),
+            "Error should hint at key/corruption issue: {err_msg}"
+        );
     }
 }
