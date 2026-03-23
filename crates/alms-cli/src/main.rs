@@ -132,15 +132,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Load config early to resolve log directory.
     // This config is reused in the Gateway branch to avoid a redundant second load.
-    let config = match alms_core::AlmsConfig::load() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Warning: failed to load config for logging setup: {e}. Using defaults.");
-            let mut cfg = alms_core::AlmsConfig::default();
-            cfg.apply_env_overrides();
-            cfg
-        }
-    };
+    // Uses load_or_default() to ensure data_dir is always absolute, even on
+    // config parse failure (see PR #317 review S1).
+    let config = alms_core::AlmsConfig::load_or_default();
 
     // Stderr layer — level from RUST_LOG, defaulting to info.
     let stderr_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -276,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Auth { cmd, json } => {
-            let config = alms_core::AlmsConfig::load().unwrap_or_default();
+            let config = alms_core::AlmsConfig::load_or_default();
             let data_dir: std::path::PathBuf = config.server.data_dir.into();
             match cmd {
                 AuthCommands::Set { provider, key } => {
