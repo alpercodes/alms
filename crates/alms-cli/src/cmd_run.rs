@@ -19,7 +19,7 @@ pub(crate) enum RunCommands {
         /// Max tokens override
         #[arg(long)]
         max_tokens: Option<u32>,
-        /// Posture override ("guarded" or "full_control")
+        /// Posture override ("guarded", "full_control", or "autonomous")
         #[arg(long)]
         posture: Option<String>,
     },

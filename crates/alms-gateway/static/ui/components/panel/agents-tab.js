@@ -80,6 +80,7 @@ function AgentEditModal({ agent, onClose }) {
                         <option value="">Server default (${serverDefaults.value.posture || 'guarded'})</option>
                         <option value="full_control">full_control</option>
                         <option value="guarded">guarded</option>
+                        <option value="autonomous">autonomous</option>
                     </select>
                 </div>
 
