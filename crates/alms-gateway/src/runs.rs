@@ -938,6 +938,7 @@ async fn notify_job_completion(
         s.agent_id == agent_id
             && !s.context_id.starts_with("job_")
             && !s.context_id.starts_with("subagent_")
+            && !s.context_id.starts_with("dm:")
     });
 
     let Some(target) = user_session else {
@@ -974,12 +975,15 @@ async fn notify_job_completion(
     };
     let marker = alms_session::Message {
         id: uuid::Uuid::new_v4().to_string(),
-        role: alms_session::Role::Assistant,
+        role: alms_session::Role::System,
         content: alms_session::Content::Text(format!(
             "[Scheduled job {label}] {job_name}\n{summary}"
         )),
         timestamp: alms_core::Timestamp::now(),
-        metadata: None,
+        metadata: Some(serde_json::json!({
+            "synthetic": true,
+            "type": "job_notification"
+        })),
     };
     if let Err(e) = state
         .session_manager

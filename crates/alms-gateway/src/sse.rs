@@ -511,6 +511,45 @@ mod tests {
         assert_eq!(event.event_type, "tool_end");
     }
 
+    #[test]
+    fn test_job_completed_event() {
+        let session_id = alms_core::SessionId::new();
+        let event = SseEventData::job_completed(
+            session_id,
+            "Summarize yesterday",
+            "success",
+            "All systems operational. Summary generated.",
+        );
+
+        assert_eq!(event.event_type, "job_completed");
+
+        // Verify the inner data has the expected fields.
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["job_name"], "Summarize yesterday");
+        assert_eq!(event.data["status"], "success");
+        assert_eq!(
+            event.data["summary"],
+            "All systems operational. Summary generated."
+        );
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+    }
+
+    #[test]
+    fn test_job_completed_truncates_long_fields() {
+        let session_id = alms_core::SessionId::new();
+        let long_name = "x".repeat(150);
+        let long_summary = "y".repeat(300);
+        let event = SseEventData::job_completed(session_id, &long_name, "error", &long_summary);
+
+        let name_len = event.data["job_name"].as_str().unwrap().len();
+        let summary_len = event.data["summary"].as_str().unwrap().len();
+        assert!(name_len <= 100, "job_name should be truncated to 100 chars");
+        assert!(
+            summary_len <= 200,
+            "summary should be truncated to 200 chars"
+        );
+    }
+
     #[tokio::test]
     async fn test_dedup_filters_replayed_events() {
         use tokio_stream::StreamExt as _;

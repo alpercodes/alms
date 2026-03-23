@@ -204,7 +204,8 @@ export function openSessionStream(sessionId) {
     es.addEventListener('job_completed', (e) => {
         const data = JSON.parse(e.data);
         const name = data.job_name || 'job';
-        const status = data.status === 'success' ? 'completed' : 'failed';
+        const status = data.status === 'success' ? 'completed'
+            : data.status === 'cancelled' ? 'cancelled' : 'failed';
         const summary = data.summary ? `: ${data.summary}` : '';
         chatMessages.value = [...chatMessages.value, {
             type: 'system',
