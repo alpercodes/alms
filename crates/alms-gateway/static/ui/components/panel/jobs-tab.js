@@ -26,13 +26,24 @@ function describeCron(expr) {
     return expr;
 }
 
+/** Format a Date as a datetime-local input value (YYYY-MM-DDTHH:MM). */
+function formatLocalDatetime(d) {
+    const pad = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 /** Round a Date up to the nearest future minute. */
 function defaultRunAt() {
     const d = new Date(Date.now() + 5 * 60_000); // 5 minutes from now
     d.setSeconds(0, 0);
-    // Format as local datetime-local input value (YYYY-MM-DDTHH:MM)
-    const pad = n => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    return formatLocalDatetime(d);
+}
+
+/** Current local datetime (floored to the minute) for the min attribute. */
+function nowLocal() {
+    const d = new Date();
+    d.setSeconds(0, 0);
+    return formatLocalDatetime(d);
 }
 
 async function refreshJobs() {
@@ -169,6 +180,7 @@ export function JobsTab() {
                 ` : html`
                     <input class="jobs-input" type="datetime-local"
                            value=${runAt.value}
+                           min=${nowLocal()}
                            onInput=${e => { runAt.value = e.target.value; }} />
                 `}
 
