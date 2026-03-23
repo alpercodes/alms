@@ -9,6 +9,10 @@ import { listSessions, createSession, getSessionMessages } from '../../api/sessi
 import { listRuns } from '../../api/runs.js';
 import { mapHistoryMessages } from '../../utils/history.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
+import { saveActiveSession } from '../../hooks/use-boot.js';
+
+// Generation counter to guard against concurrent selectSession() calls.
+let selectGeneration = 0;
 
 function hasActiveRun(sessionId) {
     if (sessionId === activeSessionId.value && activeRunId.value) return true;
@@ -19,27 +23,38 @@ function hasActiveRun(sessionId) {
 async function selectSession(sessionId) {
     if (sessionId === activeSessionId.value) return;
 
+    const gen = ++selectGeneration;
+
     closeSessionStream();
     activeSessionId.value = sessionId;
+    activeRunId.value = null;
     chatMessages.value = [];
     auditEvents.value = null;
+
+    // Persist the selection for this agent
+    saveActiveSession(activeAgentId.value, sessionId);
 
     // Load runs for new session
     try {
         const data = await listRuns(sessionId);
+        if (gen !== selectGeneration) return; // stale — discard
         runs.value = data.runs || [];
     } catch {
+        if (gen !== selectGeneration) return;
         runs.value = [];
     }
 
     // Load chat history
     try {
         const data = await getSessionMessages(sessionId);
+        if (gen !== selectGeneration) return; // stale — discard
         chatMessages.value = mapHistoryMessages(data.messages || []);
-    } catch {
-        chatMessages.value = [];
+    } catch (err) {
+        if (gen !== selectGeneration) return;
+        chatMessages.value = [{ type: 'error', text: `Failed to load message history: ${err.message || 'unknown error'}` }];
     }
 
+    if (gen !== selectGeneration) return; // final guard before opening stream
     openSessionStream(sessionId);
 }
 
@@ -52,6 +67,7 @@ async function newSession() {
         const data = await listSessions(activeAgentId.value);
         sessions.value = data.sessions || [];
         activeSessionId.value = resp.session_id;
+        saveActiveSession(activeAgentId.value, resp.session_id);
         chatMessages.value = [];
         runs.value = [];
         openSessionStream(resp.session_id);

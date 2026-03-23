@@ -4,7 +4,7 @@ import { mapHistoryMessages } from '../utils/history.js';
 import { listRuns } from '../api/runs.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
-import { runs } from '../state/runs.js';
+import { activeRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
 import { chatMessages } from '../state/chat.js';
 import { messageQueue, bgRuns } from '../state/queue.js';
@@ -13,6 +13,25 @@ import { auditEvents } from '../state/audit.js';
 import { openSessionStream, closeSessionStream } from './use-session-stream.js';
 
 const AGENT_KEY = 'alms_active_agent';
+
+function sessionStorageKey(agentId) {
+    return `alms_active_session_${agentId}`;
+}
+
+export function saveActiveSession(agentId, sessionId) {
+    if (agentId && sessionId) {
+        localStorage.setItem(sessionStorageKey(agentId), sessionId);
+    }
+}
+
+function loadActiveSession(agentId, agentSessions) {
+    const stored = localStorage.getItem(sessionStorageKey(agentId));
+    if (stored) {
+        const match = agentSessions.find(s => s.id === stored);
+        if (match) return match;
+    }
+    return agentSessions[0] || null;
+}
 
 /**
  * Boot sequence: load settings, agents, sessions, and chat history.
@@ -49,14 +68,15 @@ async function loadAgentSessions(agentId) {
         sessions.value = agentSessions;
 
         if (agentSessions.length > 0) {
-            const latest = agentSessions[0];
-            activeSessionId.value = latest.id;
+            const selected = loadActiveSession(agentId, agentSessions);
+            activeSessionId.value = selected.id;
+            saveActiveSession(agentId, selected.id);
             await Promise.all([
-                loadHistory(latest.id),
-                loadRunHistory(latest.id),
+                loadHistory(selected.id),
+                loadRunHistory(selected.id),
             ]);
             // Open persistent session stream
-            openSessionStream(latest.id);
+            openSessionStream(selected.id);
         } else {
             // Create a first session
             const ctx = 'web-chat-' + Date.now();
@@ -83,7 +103,7 @@ async function loadHistory(sessionId) {
         chatMessages.value = mapHistoryMessages(data.messages || []);
     } catch (err) {
         console.error('[loadHistory] failed:', err);
-        chatMessages.value = [];
+        chatMessages.value = [{ type: 'error', text: `Failed to load message history: ${err.message || 'unknown error'}` }];
     }
 }
 
@@ -113,6 +133,7 @@ export async function switchAgent(agentId) {
 
     // Reset all state
     activeSessionId.value = null;
+    activeRunId.value = null;
     sessions.value = [];
     runs.value = [];
     chatMessages.value = [];
