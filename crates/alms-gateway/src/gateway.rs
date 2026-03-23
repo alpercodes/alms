@@ -314,11 +314,10 @@ impl Gateway {
             return Ok(());
         }
 
-        // Phase 2b: Migrate legacy session context IDs and offset files.
+        // Phase 2b: Migrate legacy session context IDs.
         //
         // Old format: `telegram_{chat_id}` -> new: `telegram_{agent_name}_{chat_id}`.
-        // Old offset file: `telegram_offset` -> new: `telegram_offset_{agent_name}`.
-        // Both migrations are idempotent and non-fatal.
+        // Migration is idempotent and non-fatal.
         if let Some(store) = self.session_manager.store() {
             for (_agent_id, agent_name, _token) in &agent_tokens {
                 match store.migrate_telegram_context_ids(agent_name) {
@@ -331,33 +330,6 @@ impl Gateway {
                         "Failed to migrate Telegram session context IDs for agent \
                          '{agent_name}': {e}"
                     ),
-                }
-            }
-        }
-        if let Some(ref db_path) = self.config.db_path {
-            let data_dir = std::path::Path::new(db_path)
-                .parent()
-                .unwrap_or(std::path::Path::new("."));
-            let old_offset = data_dir.join("telegram_offset");
-            if old_offset.exists() {
-                // Only migrate if there's exactly one agent (unambiguous target).
-                if agent_tokens.len() == 1 {
-                    let new_offset =
-                        data_dir.join(format!("telegram_offset_{}", agent_tokens[0].1));
-                    if !new_offset.exists() {
-                        match std::fs::rename(&old_offset, &new_offset) {
-                            Ok(()) => info!(
-                                "Migrated legacy telegram_offset to {}",
-                                new_offset.display()
-                            ),
-                            Err(e) => warn!("Failed to migrate legacy telegram_offset: {e}"),
-                        }
-                    }
-                } else {
-                    warn!(
-                        "Legacy telegram_offset file exists but multiple agents configured — \
-                         skipping offset migration (ambiguous target). Please rename manually."
-                    );
                 }
             }
         }
