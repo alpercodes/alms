@@ -190,22 +190,8 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::{new_message, new_session};
     use super::super::*;
-    use crate::types::{Content, Message, Role, Session};
-
-    fn new_session() -> Session {
-        Session::new(AgentId::new(), "test-ctx")
-    }
-
-    fn new_message(text: &str) -> Message {
-        Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: Role::User,
-            content: Content::Text(text.to_string()),
-            timestamp: Timestamp::now(),
-            metadata: None,
-        }
-    }
 
     #[test]
     fn test_session_roundtrip() {

@@ -300,6 +300,7 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::new_message;
     use super::super::*;
     use crate::types::Session;
     use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
@@ -393,13 +394,6 @@ mod tests {
         store.save_session(&ss).unwrap();
 
         // Add messages to both sessions
-        let new_message = |text: &str| crate::types::Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: crate::types::Role::User,
-            content: crate::types::Content::Text(text.to_string()),
-            timestamp: Timestamp::now(),
-            metadata: None,
-        };
         store
             .save_message(ds.id, &new_message("doomed msg"))
             .unwrap();

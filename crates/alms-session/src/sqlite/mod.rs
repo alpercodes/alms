@@ -20,6 +20,8 @@ mod messages;
 mod runs;
 mod sessions;
 mod summaries;
+#[cfg(test)]
+mod test_helpers;
 mod tool_calls;
 
 use crate::types::{Content, ContextSummary, Message, Role, Session, SessionStatus};
