@@ -26,7 +26,11 @@ export function OnboardingView() {
             const data = await listAgents();
             agents.value = data.agents || [];
             const newId = resp.id || (agents.value.find(a => a.name === val) || {}).id;
-            if (newId) await switchAgent(newId);
+            if (newId) {
+                await switchAgent(newId);
+            } else {
+                console.warn('[onboarding] POST /agents returned no id for agent:', val, resp);
+            }
         } catch (err) {
             error.value = err.message || 'Failed to create agent';
         } finally {

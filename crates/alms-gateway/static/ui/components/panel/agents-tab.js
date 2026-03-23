@@ -169,7 +169,10 @@ export function AgentsTab() {
         error.value = '';
         loading.value = true;
         try {
-            await createAgent({ name });
+            const resp = await createAgent({ name });
+            if (!resp.id) {
+                console.warn('[agents] POST /agents returned no id for agent:', name, resp);
+            }
             newName.value = '';
             await refreshAgents();
         } catch (err) {
