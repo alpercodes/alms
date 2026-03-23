@@ -70,17 +70,39 @@ export function openSessionStream(sessionId) {
     activeSessionEs = es;
     sessionRetryCount = 0;
 
-    // ── run_created: a new run started on this session ──
+    // ── run_created: a new run was created on this session ──
     es.addEventListener('run_created', (e) => {
         const data = JSON.parse(e.data);
         activeRunId.value = data.run_id;
+        const queuedBehind = data.queued_behind || 0;
 
         if (data.is_notification) {
             // Notification run from subagent completion or peer message —
             // show thinking indicator with source context
-            chatMessages.value = [...chatMessages.value, { type: 'thinking', source: data.source }];
-        } else {
-            // User-initiated run — thinking indicator already added by startRun
+            chatMessages.value = [...chatMessages.value, {
+                type: 'thinking', source: data.source, queuedBehind,
+            }];
+        } else if (queuedBehind > 0) {
+            // User-initiated run but agent is busy — update the existing
+            // thinking indicator (added by startRun) with queue position
+            const msgs = [...chatMessages.value];
+            const idx = msgs.findLastIndex(m => m.type === 'thinking');
+            if (idx >= 0) {
+                msgs[idx] = { ...msgs[idx], queuedBehind };
+            }
+            chatMessages.value = msgs;
+        }
+        // else: user-initiated, queue empty — thinking indicator from startRun is fine
+    });
+
+    // ── run_started: the run has been dequeued and is now executing ──
+    es.addEventListener('run_started', (e) => {
+        // Transition thinking indicator from "queued" to active "Thinking..."
+        const msgs = [...chatMessages.value];
+        const idx = msgs.findLastIndex(m => m.type === 'thinking');
+        if (idx >= 0 && msgs[idx].queuedBehind > 0) {
+            msgs[idx] = { ...msgs[idx], queuedBehind: 0 };
+            chatMessages.value = msgs;
         }
     });
 

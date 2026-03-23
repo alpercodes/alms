@@ -305,12 +305,21 @@ pub async fn create_run(
     state.run_manager.insert_run(run.clone());
 
     // Notify session-level SSE subscribers that a new run was created.
+    // Check how many items are already queued for this agent so the UI
+    // can show "queued (N ahead)" instead of a misleading "Thinking...".
+    let queued_behind = state.agent_queue.pending_count(&agent_id);
     state
         .run_manager
         .send_session_event(
             session_id,
             run_id,
-            SseEventData::run_created(run_id, session_id, false, Some("user".to_string())),
+            SseEventData::run_created(
+                run_id,
+                session_id,
+                false,
+                Some("user".to_string()),
+                queued_behind,
+            ),
         )
         .await;
 
@@ -810,12 +819,13 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     let run = Run::for_job(session_id, job.agent_id, job.prompt.clone(), job_id);
     let run_id = run.run_id;
     state.run_manager.insert_run(run.clone());
+    // Job runs execute inline (not via agent_queue) so queued_behind is 0.
     state
         .run_manager
         .send_session_event(
             session_id,
             run_id,
-            SseEventData::run_created(run_id, session_id, true, Some("job".to_string())),
+            SseEventData::run_created(run_id, session_id, true, Some("job".to_string()), 0),
         )
         .await;
     info!("Job fired → run {}", run_id.0);
@@ -997,12 +1007,13 @@ async fn enqueue_triggered_run(
     let run_id = run.run_id;
     state.run_manager.insert_run(run);
 
+    let queued_behind = state.agent_queue.pending_count(&agent_id);
     state
         .run_manager
         .send_session_event(
             session_id,
             run_id,
-            SseEventData::run_created(run_id, session_id, true, Some(source_label)),
+            SseEventData::run_created(run_id, session_id, true, Some(source_label), queued_behind),
         )
         .await;
 

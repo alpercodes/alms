@@ -194,11 +194,15 @@ impl SseEventData {
     /// - `"peer:<agent_name>"` — DM from another agent
     /// - `"job"` — scheduled job
     /// - `"subagent"` — subagent completion notification
+    ///
+    /// `queued_behind` indicates how many runs are ahead of this one in the
+    /// agent's queue. 0 means the run will start immediately.
     pub fn run_created(
         run_id: RunId,
         session_id: alms_core::SessionId,
         is_notification: bool,
         source: Option<String>,
+        queued_behind: usize,
     ) -> Self {
         Self::new(
             "run_created",
@@ -207,6 +211,7 @@ impl SseEventData {
                 session_id: session_id.0.to_string(),
                 is_notification,
                 source,
+                queued_behind,
                 ts: Utc::now(),
             },
         )
@@ -429,6 +434,9 @@ struct RunCreatedData {
     is_notification: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     source: Option<String>,
+    /// Number of runs ahead of this one in the agent's queue.
+    /// 0 means the run will start immediately.
+    queued_behind: usize,
     ts: DateTime<Utc>,
 }
 
