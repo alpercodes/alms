@@ -139,7 +139,9 @@ async fn main() -> anyhow::Result<()> {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Warning: failed to load config for logging setup: {e}. Using defaults.");
-            alms_core::AlmsConfig::default()
+            let mut cfg = alms_core::AlmsConfig::default();
+            cfg.apply_env_overrides();
+            cfg
         }
     };
 

@@ -134,7 +134,7 @@ impl AlmsConfig {
 
     /// Apply environment variable overrides.
     /// Secrets are ONLY loaded here, never from config files.
-    fn apply_env_overrides(&mut self) {
+    pub fn apply_env_overrides(&mut self) {
         // LLM settings
         if let Ok(provider) = std::env::var("ALMS_LLM_PROVIDER") {
             self.llm.provider = provider.to_lowercase();
