@@ -115,17 +115,9 @@ impl GatewayConfig {
             tracing::warn!("Could not create data directory {}: {}", data_dir, e);
         }
 
-        // Resolve data_dir to an absolute path so shell_exec children inherit
-        // the correct ALMS_DATA_DIR regardless of their cwd.
-        let data_dir_path = std::path::PathBuf::from(data_dir);
-        gateway_config.data_dir =
-            Some(std::fs::canonicalize(&data_dir_path).unwrap_or_else(|_| {
-                // canonicalize can fail if the dir doesn't exist yet (edge case).
-                // Fall back to making it absolute via current_dir + join.
-                std::env::current_dir()
-                    .map(|cwd| cwd.join(&data_dir_path))
-                    .unwrap_or(data_dir_path)
-            }));
+        // data_dir is already resolved to an absolute path by
+        // AlmsConfig::load(). Store it for shell_exec env injection.
+        gateway_config.data_dir = Some(std::path::PathBuf::from(data_dir));
 
         gateway_config.agent_id = Some(resolve_default_agent_id(Path::new(data_dir)));
 

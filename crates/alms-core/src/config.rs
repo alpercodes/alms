@@ -88,6 +88,12 @@ impl AlmsConfig {
         // Apply env var overrides
         config.apply_env_overrides();
 
+        // Resolve data_dir to an absolute path so that downstream consumers
+        // (db_path(), workspace_dir(), shell_exec env) never interpret it
+        // relative to a changed cwd. This is the canonical fix for issue #300
+        // (stray data/alms.db inside agent workspace directories).
+        config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
+
         // Validate
         config.validate()?;
 
@@ -1080,5 +1086,55 @@ log_dir = "/var/log/alms"
         assert_eq!(config.logging.file_level, "info");
         assert_eq!(config.logging.rotation, "hourly");
         assert_eq!(config.logging.log_dir.as_deref(), Some("/var/log/alms"));
+    }
+
+    #[test]
+    fn test_load_produces_absolute_data_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Use mock LLM to avoid API key validation failure.
+        let _mock_guard = SingleEnvGuard::set("ALMS_LLM_MOCK", "1");
+        // Clear ALMS_DATA_DIR to ensure the default `./data` is used.
+        let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
+
+        let config = AlmsConfig::load().expect("load should succeed with mock LLM");
+        let data_path = std::path::Path::new(&config.server.data_dir);
+        assert!(
+            data_path.is_absolute(),
+            "data_dir should be absolute after load(), got: {}",
+            config.server.data_dir
+        );
+    }
+
+    #[test]
+    fn test_load_with_env_override_data_dir_is_absolute() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _mock_guard = SingleEnvGuard::set("ALMS_LLM_MOCK", "1");
+        // Set a relative ALMS_DATA_DIR — load() should still resolve to absolute.
+        let _data_guard = SingleEnvGuard::set("ALMS_DATA_DIR", "relative/data/dir");
+
+        let config = AlmsConfig::load().expect("load should succeed with mock LLM");
+        let data_path = std::path::Path::new(&config.server.data_dir);
+        assert!(
+            data_path.is_absolute(),
+            "data_dir should be absolute even with relative env override, got: {}",
+            config.server.data_dir
+        );
+    }
+
+    #[test]
+    fn test_db_path_is_absolute_after_load() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _mock_guard = SingleEnvGuard::set("ALMS_LLM_MOCK", "1");
+        let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
+        let _db_guard = SingleEnvGuard::remove("ALMS_DB_PATH");
+
+        let config = AlmsConfig::load().expect("load should succeed with mock LLM");
+        let db_path = config.server.db_path();
+        let db_path_obj = std::path::Path::new(&db_path);
+        assert!(
+            db_path_obj.is_absolute(),
+            "db_path() should be absolute after load(), got: {}",
+            db_path
+        );
     }
 }
