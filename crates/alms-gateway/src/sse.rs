@@ -235,6 +235,25 @@ impl SseEventData {
             },
         )
     }
+
+    /// Session-level: a scheduled job completed (sent to the agent's user-facing session).
+    pub fn job_completed(
+        session_id: alms_core::SessionId,
+        job_name: &str,
+        status: &str,
+        summary: &str,
+    ) -> Self {
+        Self::new(
+            "job_completed",
+            JobCompletedData {
+                session_id: session_id.0.to_string(),
+                job_name: job_name.chars().take(100).collect(),
+                status: status.to_string(),
+                summary: summary.chars().take(200).collect(),
+                ts: Utc::now(),
+            },
+        )
+    }
 }
 
 /// SSE event stream wrapper
@@ -445,6 +464,15 @@ struct SubagentCompletedData {
     session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     subagent_name: Option<String>,
+    status: String,
+    summary: String,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct JobCompletedData {
+    session_id: String,
+    job_name: String,
     status: String,
     summary: String,
     ts: DateTime<Utc>,
