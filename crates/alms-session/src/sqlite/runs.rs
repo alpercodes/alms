@@ -149,13 +149,9 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::new_session;
     use super::super::*;
-    use crate::types::Session;
     use alms_core::run::{Run, RunStatus, TokenUsage};
-
-    fn new_session() -> Session {
-        Session::new(AgentId::new(), "test-ctx")
-    }
 
     fn new_run(session_id: SessionId, agent_id: AgentId) -> Run {
         Run::new(session_id, agent_id, "hello".to_string())

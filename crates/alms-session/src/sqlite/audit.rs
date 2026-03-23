@@ -142,12 +142,8 @@ impl SqliteStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::new_session;
     use super::super::*;
-    use crate::types::Session;
-
-    fn new_session() -> Session {
-        Session::new(AgentId::new(), "test-ctx")
-    }
 
     #[test]
     fn test_audit_allow_roundtrip() {
