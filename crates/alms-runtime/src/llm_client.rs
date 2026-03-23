@@ -467,7 +467,7 @@ impl LlmClient {
 
         if let Some(key) = resolve_key(provider) {
             self.config.api_key = key;
-        } else {
+        } else if self.config.api_key.is_empty() {
             warn!(
                 "No API key found for provider '{}' — requests will fail",
                 provider
@@ -477,10 +477,10 @@ impl LlmClient {
         self.config.provider = provider.to_string();
     }
 
-    /// Override the LLM provider, resolving API key from a secrets store.
+    /// Override the LLM provider without resolving a new API key.
     ///
-    /// Env var fallback has been removed for security. If no secrets store
-    /// is available, use `with_provider_no_key` (the key will remain unchanged).
+    /// The existing API key is preserved. Callers should prefer
+    /// `with_provider_and_secrets` when a secrets store is available.
     pub fn with_provider(mut self, provider: &str) -> Self {
         // No key resolver — keeps the existing key. Callers should prefer
         // `with_provider_and_secrets` when a secrets store is available.

@@ -116,7 +116,7 @@ Multi-provider LLM support with streaming. Provider selected via `llm.provider` 
 - **OpenAI / OpenRouter** — OpenAI-compatible chat completions API (default)
 - **Anthropic** — Messages API with full streaming, tool use, and response format mapping
 
-API keys loaded from env vars only (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`). Provider-aware key selection: each provider prefers its own key, falls back to others.
+API keys loaded exclusively from `data/secrets.json` via `alms auth set`. Provider-aware key selection: each provider prefers its own key, falls back to others.
 
 ### Session Manager (`alms-session`)
 

@@ -744,7 +744,7 @@ impl Tool for ShellExecTool {
             cmd.current_dir(root);
         }
 
-        // Clear the daemon's environment (which holds API keys, tokens, etc.)
+        // Clear the daemon's environment (which may hold sensitive config like ALMS_AUTH_TOKEN and ALMS_MASTER_KEY)
         // then re-inject platform-critical vars that don't contain secrets,
         // then inject gateway-provided defaults (ALMS_DATA_DIR, etc.),
         // then apply tool-call env params which override defaults on conflict.

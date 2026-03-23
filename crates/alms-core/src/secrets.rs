@@ -694,11 +694,24 @@ mod tests {
     #[test]
     fn test_resolve_key_no_env_fallback() {
         // resolve_key must NOT fall back to env vars — only secrets store.
+        // Set the env var first, then verify resolve_key ignores it.
+        let original = std::env::var("OPENAI_API_KEY").ok();
+        unsafe {
+            std::env::set_var("OPENAI_API_KEY", "sk-env-should-be-ignored");
+        }
+
         let store = SecretsStore::empty();
-        // Even if the env var is set, resolve_key should return None.
+        let result = store.resolve_key("openai");
+
+        // Restore original env var before asserting (panic-safe cleanup).
+        match &original {
+            Some(v) => unsafe { std::env::set_var("OPENAI_API_KEY", v) },
+            None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+        }
+
         assert!(
-            store.resolve_key("openai").is_none(),
-            "resolve_key must not fall back to env vars"
+            result.is_none(),
+            "resolve_key must not fall back to env vars, even when OPENAI_API_KEY is set"
         );
     }
 

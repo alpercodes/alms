@@ -26,7 +26,10 @@ use tracing::{info, warn};
 ///
 /// This preserves single-key setups by falling back to any available key when
 /// the preferred provider-specific key is absent.
-pub fn select_llm_api_key(
+///
+/// Used only in tests — runtime key resolution goes through `SecretsStore`.
+#[cfg(test)]
+pub(crate) fn select_llm_api_key(
     provider: &str,
     openrouter_key: Option<String>,
     openai_key: Option<String>,
@@ -38,21 +41,6 @@ pub fn select_llm_api_key(
         "openrouter" => openrouter_key.or(openai_key).or(anthropic_key),
         _ => openai_key.or(openrouter_key).or(anthropic_key),
     }
-}
-
-/// Resolve the LLM API key from environment variables using provider-aware
-/// selection rules.
-///
-/// **Deprecated**: API keys should be stored via `alms auth set`, not env vars.
-/// This function is retained only for the `auth list` display source column.
-/// It is NOT used for actual key resolution at runtime.
-pub fn select_llm_api_key_from_env(provider: &str) -> Option<String> {
-    select_llm_api_key(
-        provider,
-        std::env::var("OPENROUTER_API_KEY").ok(),
-        std::env::var("OPENAI_API_KEY").ok(),
-        std::env::var("ANTHROPIC_API_KEY").ok(),
-    )
 }
 
 /// Top-level ALMS configuration
@@ -521,7 +509,7 @@ impl Default for ToolsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChannelsConfig {
-    /// Telegram bot token — loaded from env only.
+    /// Telegram bot token — loaded from secrets store at runtime.
     // TODO: wrap in a `Secret<String>` newtype that redacts Display/Debug output,
     // similar to `alms_channel::telegram::Secret`. Currently raw `String` here,
     // in `GatewayConfig`, and throughout the config layer — see PR #259 discussion.
