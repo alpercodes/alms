@@ -688,6 +688,30 @@ async fn run_subagent(
     // The guard also handles panic cleanup via Drop.
     drop(_named_guard);
 
+    // Clean up ephemeral workspace directory to prevent unbounded disk growth.
+    // Named subagents keep their workspace (persistent identity files).
+    if request.subagent_name.is_none()
+        && let Some(ref ws_dir) = workspace_dir
+    {
+        let ephemeral_dir = ws_dir.join(".ephemeral").join(task_id.0.to_string());
+        if ephemeral_dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&ephemeral_dir) {
+                warn!(
+                    task_id = %task_id.0,
+                    path = %ephemeral_dir.display(),
+                    error = %e,
+                    "Failed to clean up ephemeral workspace directory"
+                );
+            } else {
+                debug!(
+                    task_id = %task_id.0,
+                    path = %ephemeral_dir.display(),
+                    "Cleaned up ephemeral workspace directory"
+                );
+            }
+        }
+    }
+
     // Deliver result to dispatch() caller (foreground mode — may already be dropped)
     let _ = result_tx.send(task_result);
 
@@ -777,7 +801,8 @@ fn agent_config_for_subagent(
 /// (UUID v5 from parent session + name) — conversation history preserved.
 ///
 /// **Ephemeral subagents** (`subagent_name` is None): fresh agent ID,
-/// fresh session, default config, no workspace.
+/// fresh session, default config, disposable workspace at
+/// `{workspace_dir}/.ephemeral/{task_id}/` for fs sandbox scoping.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     task_id: TaskId,
@@ -908,14 +933,24 @@ async fn run_agent_loop(
     // fs_list tools are sandboxed to a narrow directory instead of inheriting
     // the project-root sandbox (which would expose data/secrets.json, the SQLite
     // database, and other agents' workspace files).
-    if attach_workspace && let Some(ws_dir) = workspace_dir {
-        let subagent_ws_dir = if let Some(name) = &request.subagent_name {
-            ws_dir.join(name)
+    if attach_workspace {
+        if let Some(ws_dir) = workspace_dir {
+            let subagent_ws_dir = if let Some(name) = &request.subagent_name {
+                ws_dir.join(name)
+            } else {
+                ws_dir.join(".ephemeral").join(task_id.0.to_string())
+            };
+            let workspace = alms_runtime::AgentWorkspace::with_dir(subagent_ws_dir);
+            runtime = runtime.with_workspace(workspace);
         } else {
-            ws_dir.join(".ephemeral").join(task_id.0.to_string())
-        };
-        let workspace = alms_runtime::AgentWorkspace::with_dir(subagent_ws_dir);
-        runtime = runtime.with_workspace(workspace);
+            warn!(
+                task_id = %task_id.0,
+                subagent_name = ?request.subagent_name,
+                "attach_workspace is true but workspace_dir is None — subagent will \
+                 inherit the project-root sandbox. Set workspace_dir on the Coordinator \
+                 to enable per-subagent sandbox scoping."
+            );
+        }
     }
 
     // Forward subagent tool events into the parent run's event stream,

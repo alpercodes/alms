@@ -141,8 +141,14 @@ Three agents work in parallel using git worktree isolation (`.claude/agents/`):
 
 ## Known Issues
 
-- `fs_*` tools are sandboxed via `canonicalize()` + prefix check against `tools.sandbox_root` (default: cwd). When a workspace is attached (via `with_workspace()`), `fs_read`/`fs_write`/`fs_list` are re-sandboxed to the agent's workspace directory, which is more restrictive than `tools.sandbox_root`. Ephemeral subagents (without a named workspace) get a disposable workspace at `{workspace_dir}/.ephemeral/{task_id}/` to prevent project-root access. `shell_exec` cwd is restricted in sandboxed mode, but the executed command itself can still access files outside the sandbox — for true shell isolation, use a restricted OS user or Landlock (future task)
-- `data/secrets.json` is protected by a filename denylist in `fs_read`, `fs_write`, and `shell_exec` (argv check). This is best-effort — indirect access via shell_exec is still possible. For production deployments, set `ALMS_MASTER_KEY` to enable AES-256-GCM encryption of secrets at rest
+- `fs_*` tools are sandboxed via `canonicalize()` + prefix check against `tools.sandbox_root` (default: cwd)
+  - When a workspace is attached (via `with_workspace()`), `fs_read`/`fs_write`/`fs_list` are re-sandboxed to the agent's workspace directory, which is more restrictive than `tools.sandbox_root`
+  - Ephemeral subagents (without a named workspace) get a disposable workspace at `{workspace_dir}/.ephemeral/{task_id}/` to prevent project-root access; these are cleaned up automatically after the subagent completes
+  - `shell_exec` cwd is restricted in sandboxed mode, but the executed command itself can still access files outside the sandbox — for true shell isolation, use a restricted OS user or Landlock (future task)
+- `data/secrets.json` is protected by a filename denylist in `fs_read`, `fs_write`, `fs_list`, and `shell_exec` (argv + substring check)
+  - Denylist uses case-insensitive comparison to prevent bypass on Windows
+  - `fs_list` filters denied filenames from directory listings to prevent information disclosure
+  - This is best-effort — indirect access via shell variable expansion or encoding is still possible. For production deployments, set `ALMS_MASTER_KEY` to enable AES-256-GCM encryption of secrets at rest
 - Run cancellation does not propagate to active subagents — cancelling a parent run drops the `join_all` future but subagent tasks in the Coordinator continue running to completion (or timeout). This means subagent LLM calls keep burning tokens after the user cancels. Fix requires threading the parent's `CancellationToken` into `spawn_subagent`.
 
 ## Current State (as of 2026-03-22)

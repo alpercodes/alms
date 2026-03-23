@@ -180,7 +180,7 @@ Response fields:
 - **`bubblewrap`/`nsjail`**: lightweight containers — new mount namespace with only the workspace visible. Linux-only, external dependency.
 
 **Later:**
-- Per-session temp workspaces (ephemeral sandboxes)
+- Per-session temp workspaces (ephemeral sandboxes) — **partially implemented**: ephemeral subagents now get a disposable workspace at `{workspace_dir}/.ephemeral/{task_id}/` that scopes their `fs_*` tools and is cleaned up after the subagent completes. Not yet extended to top-level sessions.
 - MicroVMs for high-risk environments
 - Platform-specific alternatives: Windows Job Objects, macOS Sandbox profiles
 
