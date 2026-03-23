@@ -38,6 +38,7 @@ crates/
 docs/                # Design docs — api.md, architecture.md, security-model.md, etc.
                      #   agent-runtime-design.md — detailed design for config/context/workspace
                      #   agent-ux-requirements.md — Alper's UX requirements
+                     #   system-prompts.md — prompt file inventory and assembly order
 _quarantine/         # Archived/superseded docs
 research/            # Competitive analysis and tech-stack decisions
 ```
