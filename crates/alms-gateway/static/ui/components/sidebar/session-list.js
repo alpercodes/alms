@@ -10,9 +10,7 @@ import { listRuns } from '../../api/runs.js';
 import { mapHistoryMessages } from '../../utils/history.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
 import { saveActiveSession } from '../../hooks/use-boot.js';
-
-// Generation counter to guard against concurrent selectSession() calls.
-let selectGeneration = 0;
+import { selectGeneration, bumpSelectGeneration } from '../../state/select-generation.js';
 
 function hasActiveRun(sessionId) {
     if (sessionId === activeSessionId.value && activeRunId.value) return true;
@@ -23,7 +21,7 @@ function hasActiveRun(sessionId) {
 async function selectSession(sessionId) {
     if (sessionId === activeSessionId.value) return;
 
-    const gen = ++selectGeneration;
+    const gen = bumpSelectGeneration();
 
     closeSessionStream();
     activeSessionId.value = sessionId;
@@ -68,6 +66,7 @@ async function newSession() {
         sessions.value = data.sessions || [];
         activeSessionId.value = resp.session_id;
         saveActiveSession(activeAgentId.value, resp.session_id);
+        activeRunId.value = null;
         chatMessages.value = [];
         runs.value = [];
         openSessionStream(resp.session_id);

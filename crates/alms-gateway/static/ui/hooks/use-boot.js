@@ -11,6 +11,7 @@ import { messageQueue, bgRuns } from '../state/queue.js';
 import { wsFiles } from '../state/workspace.js';
 import { auditEvents } from '../state/audit.js';
 import { openSessionStream, closeSessionStream } from './use-session-stream.js';
+import { bumpSelectGeneration } from '../state/select-generation.js';
 
 const AGENT_KEY = 'alms_active_agent';
 
@@ -127,6 +128,7 @@ export async function switchAgent(agentId) {
     if (!agent) return;
 
     closeSessionStream(); // close previous session stream
+    bumpSelectGeneration(); // invalidate any in-flight selectSession() fetches
 
     activeAgentId.value = agentId;
     localStorage.setItem(AGENT_KEY, agentId);
