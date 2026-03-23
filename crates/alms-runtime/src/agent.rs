@@ -690,9 +690,10 @@ impl AgentRuntime {
             && let Some(peer) = self.dm_peer_name(context_id)
         {
             let dm_addendum = format!(
-                "\n\n---\nYou received a direct message from agent \"{peer}\". \
-                 To reply, use the send_message tool. Your text response will not be delivered to the other agent. \
-                 To decline responding, use the ignore_message tool."
+                "\n\n---\n**IMPORTANT: This is a direct message from agent \"{peer}\".**\n\
+                 You MUST use the `send_message` tool to reply — your plain text response is NOT delivered to the other agent.\n\
+                 If you do not wish to respond, use the `ignore_message` tool.\n\
+                 Do NOT respond with text only; that message will be lost."
             );
             system_prompt.push_str(&dm_addendum);
             debug!(
