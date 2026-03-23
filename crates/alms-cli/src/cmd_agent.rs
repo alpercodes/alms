@@ -18,7 +18,7 @@ pub(crate) enum AgentCommands {
         /// Model override
         #[arg(long)]
         model: Option<String>,
-        /// Posture override ("guarded" or "full_control")
+        /// Posture override ("guarded", "full_control", or "autonomous")
         #[arg(long)]
         posture: Option<String>,
         /// LLM provider override ("openai", "anthropic", "openrouter")

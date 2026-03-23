@@ -55,6 +55,9 @@ export function Header({ onOpenSettings, status }) {
             ${posture === 'guarded' && html`
                 <span id="posture-badge" class="guarded">guarded</span>
             `}
+            ${posture === 'autonomous' && html`
+                <span id="posture-badge" class="autonomous">autonomous</span>
+            `}
 
             <div class="header-spacer"></div>
 

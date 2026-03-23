@@ -181,7 +181,7 @@ pub struct CreateRunRequest {
     /// Optional max_tokens override.
     #[serde(default)]
     pub max_tokens: Option<u32>,
-    /// Optional posture override: "full_control" | "guarded".
+    /// Optional posture override: "full_control" | "guarded" | "autonomous".
     #[serde(default)]
     pub posture: Option<String>,
 }

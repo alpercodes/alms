@@ -272,6 +272,7 @@ header h1 {
   letter-spacing: 0.05em;
 }
 #posture-badge.guarded { color: var(--warning); background: var(--warning-muted); }
+#posture-badge.autonomous { color: var(--info); background: var(--info-muted); }
 
 .header-icon-btn {
   display: flex;

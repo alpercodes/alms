@@ -64,6 +64,11 @@ The user can set an agent (or a session/job) to one of these postures:
   - ALMS still emits `policy_decision` events and still records audit entries
   - intended for trusted environments and power users
 
+- **`autonomous` (no approvals, no human-in-the-loop)**
+  - behaves identically to `full_control` for approval logic (tools execute without pausing)
+  - semantically signals that no human is expected to be watching — suitable for background agents, scheduled jobs, DM-triggered runs, and subagents
+  - future differentiation (e.g., stricter sandboxing, automatic rollback) tracked separately
+
 Notes:
 - `full_control` does **not** mean “no policy”: capability checks, scopes, limits, and audit still apply.
 - The main behavioral difference is: **no `approval_required` gate**; decisions become `allow`/`deny` only.

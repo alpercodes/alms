@@ -188,6 +188,7 @@ export function SettingsModal({ open, onClose }) {
                             <option value="">Default (${defaults.posture || 'guarded'})</option>
                             <option value="full_control">full_control</option>
                             <option value="guarded">guarded</option>
+                            <option value="autonomous">autonomous</option>
                         </select>
                     </div>
                 </div>

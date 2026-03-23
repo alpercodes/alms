@@ -26,6 +26,10 @@ pub enum Posture {
     /// Require explicit user approval before each tool execution (default).
     #[default]
     Guarded,
+    /// Fully autonomous — tools execute without approval, no human-in-the-loop
+    /// expected. Suitable for background agents, scheduled jobs, DM-triggered
+    /// runs, and subagents that should run completely independently.
+    Autonomous,
 }
 
 impl std::fmt::Display for Posture {
@@ -33,6 +37,7 @@ impl std::fmt::Display for Posture {
         match self {
             Posture::FullControl => write!(f, "full_control"),
             Posture::Guarded => write!(f, "guarded"),
+            Posture::Autonomous => write!(f, "autonomous"),
         }
     }
 }
@@ -44,8 +49,9 @@ impl std::str::FromStr for Posture {
         match s {
             "full_control" => Ok(Posture::FullControl),
             "guarded" => Ok(Posture::Guarded),
+            "autonomous" => Ok(Posture::Autonomous),
             other => Err(format!(
-                "Invalid posture '{other}'. Must be one of: full_control, guarded"
+                "Invalid posture '{other}'. Must be one of: full_control, guarded, autonomous"
             )),
         }
     }
@@ -92,7 +98,7 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     /// Context window management config
     pub context_config: ContextConfig,
-    /// Execution posture (full_control or guarded)
+    /// Execution posture (full_control, guarded, or autonomous)
     pub posture: Posture,
     /// Filesystem sandbox root (default "."). Empty string = unrestricted.
     pub sandbox_root: String,
@@ -1043,9 +1049,9 @@ impl AgentRuntime {
 
                 // Checkpoint C: tool execution with cancellation support.
                 //
-                // Full-control posture: run all tool calls concurrently so background
-                // invoke_agent calls don't block each other and independent tools
-                // finish in parallel.
+                // Full-control / Autonomous posture: run all tool calls concurrently
+                // so background invoke_agent calls don't block each other and
+                // independent tools finish in parallel.
                 //
                 // Guarded posture: run tool calls sequentially so the user sees one
                 // approval prompt at a time rather than all at once.
@@ -1068,7 +1074,7 @@ impl AgentRuntime {
                         }
                         results
                     }
-                    Posture::FullControl => {
+                    Posture::FullControl | Posture::Autonomous => {
                         let tool_future = futures::future::join_all(
                             tool_calls
                                 .iter()
@@ -2263,6 +2269,10 @@ mod tests {
             "full_control".parse::<Posture>().unwrap(),
             Posture::FullControl
         );
+        assert_eq!(
+            "autonomous".parse::<Posture>().unwrap(),
+            Posture::Autonomous
+        );
         assert!("unknown".parse::<Posture>().is_err());
         assert!("".parse::<Posture>().is_err());
     }
@@ -2271,11 +2281,12 @@ mod tests {
     fn test_posture_display() {
         assert_eq!(Posture::Guarded.to_string(), "guarded");
         assert_eq!(Posture::FullControl.to_string(), "full_control");
+        assert_eq!(Posture::Autonomous.to_string(), "autonomous");
     }
 
     #[test]
     fn test_posture_roundtrip() {
-        for posture in [Posture::Guarded, Posture::FullControl] {
+        for posture in [Posture::Guarded, Posture::FullControl, Posture::Autonomous] {
             let s = posture.to_string();
             let parsed: Posture = s.parse().unwrap();
             assert_eq!(parsed, posture);
