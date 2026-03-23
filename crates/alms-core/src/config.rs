@@ -100,6 +100,25 @@ impl AlmsConfig {
         Ok(config)
     }
 
+    /// Load config, falling back to defaults on error.
+    ///
+    /// Unlike `AlmsConfig::load().unwrap_or_default()`, this ensures that
+    /// `data_dir` is resolved to an absolute path even in the fallback case.
+    /// Use this whenever a best-effort config is acceptable (e.g. CLI
+    /// subcommands that just need a database path).
+    pub fn load_or_default() -> Self {
+        match Self::load() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Warning: failed to load config: {e}. Using defaults.");
+                let mut cfg = Self::default();
+                cfg.apply_env_overrides();
+                cfg.server.data_dir = crate::resolve_to_absolute(Path::new(&cfg.server.data_dir));
+                cfg
+            }
+        }
+    }
+
     /// Load from a specific file path
     pub fn from_file(path: &Path) -> AlmsResult<Self> {
         let content = std::fs::read_to_string(path).map_err(|e| {
@@ -1135,6 +1154,23 @@ log_dir = "/var/log/alms"
             db_path_obj.is_absolute(),
             "db_path() should be absolute after load(), got: {}",
             db_path
+        );
+    }
+
+    #[test]
+    fn test_load_or_default_resolves_data_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Clear data dir env to use the relative default "./data".
+        let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
+        // Mock LLM irrelevant here -- load_or_default() swallows errors.
+        let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+
+        let config = AlmsConfig::load_or_default();
+        let data_path = std::path::Path::new(&config.server.data_dir);
+        assert!(
+            data_path.is_absolute(),
+            "data_dir should be absolute after load_or_default(), got: {}",
+            config.server.data_dir
         );
     }
 }
