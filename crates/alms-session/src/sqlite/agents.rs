@@ -28,8 +28,8 @@ impl SqliteStore {
 
         tx.execute(
             "INSERT INTO agents \
-             (id, name, description, model, posture, provider, is_default, created_at, last_active) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (id, name, description, model, posture, provider, telegram_token, is_default, created_at, last_active) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 agent.id.0.to_string(),
                 &agent.name,
@@ -37,6 +37,7 @@ impl SqliteStore {
                 agent.model.as_deref(),
                 agent.posture.as_deref(),
                 agent.provider.as_deref(),
+                agent.telegram_token.as_deref(),
                 1i32,
                 agent.created_at.to_rfc3339(),
                 agent.last_active.to_rfc3339(),
@@ -55,8 +56,8 @@ impl SqliteStore {
             .lock()
             .execute(
                 "INSERT INTO agents \
-                 (id, name, description, model, posture, provider, is_default, created_at, last_active) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (id, name, description, model, posture, provider, telegram_token, is_default, created_at, last_active) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     agent.id.0.to_string(),
                     &agent.name,
@@ -64,6 +65,7 @@ impl SqliteStore {
                     agent.model.as_deref(),
                     agent.posture.as_deref(),
                     agent.provider.as_deref(),
+                    agent.telegram_token.as_deref(),
                     agent.is_default as i32,
                     agent.created_at.to_rfc3339(),
                     agent.last_active.to_rfc3339(),
@@ -90,12 +92,13 @@ impl SqliteStore {
             .lock()
             .execute(
                 "UPDATE agents SET description = ?1, model = ?2, \
-                 posture = ?3, provider = ?4, last_active = ?5 WHERE id = ?6",
+                 posture = ?3, provider = ?4, telegram_token = ?5, last_active = ?6 WHERE id = ?7",
                 params![
                     &agent.description,
                     agent.model.as_deref(),
                     agent.posture.as_deref(),
                     agent.provider.as_deref(),
+                    agent.telegram_token.as_deref(),
                     agent.last_active.to_rfc3339(),
                     agent.id.0.to_string(),
                 ],
@@ -111,7 +114,8 @@ impl SqliteStore {
     pub fn load_agent_by_id(&self, id: AgentId) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, name, description, model, posture, provider, is_default, created_at, last_active \
+            "SELECT id, name, description, model, posture, provider, telegram_token, \
+             is_default, created_at, last_active \
              FROM agents WHERE id = ?1",
             params![id.0.to_string()],
             parse_agent_row,
@@ -127,7 +131,8 @@ impl SqliteStore {
     pub fn load_agent_by_name(&self, name: &str) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, name, description, model, posture, provider, is_default, created_at, last_active \
+            "SELECT id, name, description, model, posture, provider, telegram_token, \
+             is_default, created_at, last_active \
              FROM agents WHERE name = ?1",
             params![name],
             parse_agent_row,
@@ -145,7 +150,8 @@ impl SqliteStore {
     pub fn get_default_agent(&self) -> AlmsResult<Option<AgentRecord>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT id, name, description, model, posture, provider, is_default, created_at, last_active \
+            "SELECT id, name, description, model, posture, provider, telegram_token, \
+             is_default, created_at, last_active \
              FROM agents WHERE is_default = 1 LIMIT 1",
             [],
             parse_agent_row,
@@ -162,7 +168,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, description, model, posture, provider, is_default, created_at, last_active \
+                "SELECT id, name, description, model, posture, provider, telegram_token, \
+                 is_default, created_at, last_active \
                  FROM agents ORDER BY created_at",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
@@ -170,6 +177,35 @@ impl SqliteStore {
         let rows = stmt
             .query_map([], parse_agent_row)
             .map_err(|e| AlmsError::Runtime(format!("SQLite query agents: {e}")))?
+            .filter_map(|r| match r {
+                Ok(agent) => Some(agent),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable agent row: {}", e);
+                    None
+                }
+            })
+            .collect();
+
+        Ok(rows)
+    }
+
+    /// Load all agents that have a Telegram bot token configured.
+    ///
+    /// Used by the gateway to spawn per-agent polling loops at startup.
+    pub fn agents_with_telegram(&self) -> AlmsResult<Vec<AgentRecord>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, description, model, posture, provider, telegram_token, \
+                 is_default, created_at, last_active \
+                 FROM agents WHERE telegram_token IS NOT NULL AND telegram_token != '' \
+                 ORDER BY created_at",
+            )
+            .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents_with_telegram: {e}")))?;
+
+        let rows = stmt
+            .query_map([], parse_agent_row)
+            .map_err(|e| AlmsError::Runtime(format!("SQLite query agents_with_telegram: {e}")))?
             .filter_map(|r| match r {
                 Ok(agent) => Some(agent),
                 Err(e) => {
@@ -315,6 +351,7 @@ mod tests {
             model: None,
             posture: None,
             provider: None,
+            telegram_token: None,
             is_default: false,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
@@ -719,5 +756,44 @@ mod tests {
         // Survivor's data is untouched.
         assert_eq!(store.count_tool_calls(s_run_id).unwrap(), 1);
         assert!(store.load_run(s_run_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_agent_telegram_token_roundtrip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("tg-agent");
+        agent.telegram_token = Some("123456:ABC-DEF".to_string());
+        store.create_agent(&agent).unwrap();
+
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.telegram_token.as_deref(), Some("123456:ABC-DEF"));
+
+        // Update to remove token
+        let mut updated = loaded;
+        updated.telegram_token = None;
+        store.update_agent(&updated).unwrap();
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(reloaded.telegram_token.is_none());
+    }
+
+    #[test]
+    fn test_agents_with_telegram() {
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let mut a1 = new_agent("with-tg");
+        a1.telegram_token = Some("token1".to_string());
+        store.create_agent(&a1).unwrap();
+
+        let a2 = new_agent("no-tg");
+        store.create_agent(&a2).unwrap();
+
+        let mut a3 = new_agent("also-tg");
+        a3.telegram_token = Some("token2".to_string());
+        store.create_agent(&a3).unwrap();
+
+        let tg_agents = store.agents_with_telegram().unwrap();
+        assert_eq!(tg_agents.len(), 2);
+        assert_eq!(tg_agents[0].name, "with-tg");
+        assert_eq!(tg_agents[1].name, "also-tg");
     }
 }

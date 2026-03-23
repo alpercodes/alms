@@ -81,20 +81,53 @@ pub(crate) fn resolve_agent(
     }
 }
 
+/// Build a safe JSON representation of an agent for API responses.
+///
+/// The `telegram_token` is never exposed -- instead a `has_telegram` boolean
+/// flag is included so the UI can show connection status.
+fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": agent.id.0.to_string(),
+        "name": agent.name,
+        "description": agent.description,
+        "model": agent.model,
+        "posture": agent.posture,
+        "provider": agent.provider,
+        "has_telegram": agent.telegram_token.is_some(),
+        "is_default": agent.is_default,
+        "created_at": agent.created_at.to_rfc3339(),
+        "last_active": agent.last_active.to_rfc3339(),
+    });
+    // Strip null fields for cleaner output (match existing serde behavior)
+    if agent.model.is_none() {
+        v.as_object_mut().unwrap().remove("model");
+    }
+    if agent.posture.is_none() {
+        v.as_object_mut().unwrap().remove("posture");
+    }
+    if agent.provider.is_none() {
+        v.as_object_mut().unwrap().remove("provider");
+    }
+    v
+}
+
 /// GET /agents — list all agents.
 pub async fn list_agents(State(state): State<AppState>) -> impl IntoResponse {
     let store = get_store(&state)?;
     let agents = store
         .list_agents()
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
-    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(serde_json::json!({ "agents": agents })))
+    let agents_json: Vec<_> = agents.iter().map(agent_to_json).collect();
+    Ok::<_, (StatusCode, Json<serde_json::Value>)>(Json(
+        serde_json::json!({ "agents": agents_json }),
+    ))
 }
 
 /// POST /agents — create a new agent.
 pub async fn create_agent(
     State(state): State<AppState>,
     Json(req): Json<CreateAgentRequest>,
-) -> Result<(StatusCode, Json<AgentRecord>), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     let store = get_store(&state)?;
 
     // Validate name
@@ -117,6 +150,7 @@ pub async fn create_agent(
         model: req.model,
         posture: req.posture,
         provider: req.provider,
+        telegram_token: req.telegram_token,
         // Always INSERT with is_default=false; set_default_agent atomically
         // clears old default + sets new one in a single transaction.
         is_default: false,
@@ -153,17 +187,17 @@ pub async fn create_agent(
         }
     }
 
-    Ok((StatusCode::CREATED, Json(agent)))
+    Ok((StatusCode::CREATED, Json(agent_to_json(&agent))))
 }
 
 /// GET /agents/{id_or_name} — get agent details.
 pub async fn get_agent(
     State(state): State<AppState>,
     Path(id_or_name): Path<String>,
-) -> Result<Json<AgentRecord>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let store = get_store(&state)?;
     let agent = resolve_agent(store, &id_or_name)?;
-    Ok(Json(agent))
+    Ok(Json(agent_to_json(&agent)))
 }
 
 /// PUT /agents/{id_or_name} — update agent config.
@@ -171,7 +205,7 @@ pub async fn update_agent(
     State(state): State<AppState>,
     Path(id_or_name): Path<String>,
     Json(req): Json<UpdateAgentRequest>,
-) -> Result<Json<AgentRecord>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let store = get_store(&state)?;
     let mut agent = resolve_agent(store, &id_or_name)?;
 
@@ -200,13 +234,21 @@ pub async fn update_agent(
         };
     }
 
+    if let Some(telegram_token) = req.telegram_token {
+        agent.telegram_token = if telegram_token.is_empty() {
+            None
+        } else {
+            Some(telegram_token)
+        };
+    }
+
     agent.last_active = Utc::now();
 
     store
         .update_agent(&agent)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
 
-    Ok(Json(agent))
+    Ok(Json(agent_to_json(&agent)))
 }
 
 /// DELETE /agents/{id_or_name} — delete an agent.
@@ -269,6 +311,7 @@ mod tests {
             model: None,
             posture: None,
             provider: None,
+            telegram_token: None,
             is_default: false,
             created_at: now,
             last_active: now,
