@@ -3,9 +3,11 @@
 //! Loads config with layered precedence:
 //! 1. Compiled defaults
 //! 2. Config file (alms.toml)
-//! 3. Environment variables (ALMS_* prefix)
+//! 3. Environment variables (non-secret `ALMS_*` prefix)
 //!
-//! Secrets (API keys) are ONLY loaded from env vars, never from config files.
+//! Secrets (API keys, tokens) are loaded exclusively from `data/secrets.json`
+//! via `alms auth set`. Environment variable fallback has been removed for
+//! security — agents can read env vars via `shell_exec`.
 
 use crate::{AlmsError, AlmsResult};
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,10 @@ pub fn select_llm_api_key(
 
 /// Resolve the LLM API key from environment variables using provider-aware
 /// selection rules.
+///
+/// **Deprecated**: API keys should be stored via `alms auth set`, not env vars.
+/// This function is retained only for the `auth list` display source column.
+/// It is NOT used for actual key resolution at runtime.
 pub fn select_llm_api_key_from_env(provider: &str) -> Option<String> {
     select_llm_api_key(
         provider,
@@ -132,14 +138,16 @@ impl AlmsConfig {
         None
     }
 
-    /// Apply environment variable overrides.
-    /// Secrets are ONLY loaded here, never from config files.
+    /// Apply environment variable overrides for non-secret settings.
+    ///
+    /// API keys and tokens are NOT loaded from env vars — they must be
+    /// configured via `alms auth set` and stored in `data/secrets.json`.
     pub fn apply_env_overrides(&mut self) {
-        // LLM settings
+        // LLM settings (non-secret only)
         if let Ok(provider) = std::env::var("ALMS_LLM_PROVIDER") {
             self.llm.provider = provider.to_lowercase();
         }
-        self.llm.api_key = select_llm_api_key_from_env(&self.llm.provider);
+        // NOTE: API key is NOT loaded from env vars. Use `alms auth set`.
         if let Ok(url) = std::env::var("LLM_BASE_URL") {
             self.llm.base_url = url;
         }
@@ -166,10 +174,7 @@ impl AlmsConfig {
             self.server.auth_token = Some(token);
         }
 
-        // Channels
-        if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
-            self.channels.telegram_token = Some(token);
-        }
+        // NOTE: Telegram token is NOT loaded from env vars. Use `alms auth set telegram <token>`.
 
         // Tools / sandbox settings
         if let Ok(val) = std::env::var("ALMS_SANDBOX_ROOT") {
@@ -209,7 +214,7 @@ impl AlmsConfig {
         // LLM validation
         if !self.llm.mock && self.llm.api_key.is_none() {
             warn!(
-                "No LLM API key configured. Set OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY, or enable mock mode with ALMS_LLM_MOCK=1"
+                "No LLM API key configured. Run `alms auth set <provider> <key>` to store a key, or enable mock mode with ALMS_LLM_MOCK=1"
             );
         }
 
@@ -298,6 +303,31 @@ impl AlmsConfig {
         }
 
         Ok(())
+    }
+
+    /// Check for deprecated API key environment variables and log warnings.
+    ///
+    /// Should be called at startup (e.g. in `main.rs`). Detects env vars that
+    /// were previously used to configure secrets and warns the user to migrate
+    /// to `alms auth set`.
+    pub fn warn_deprecated_secret_env_vars() {
+        let deprecated = crate::secrets::SecretsStore::detect_deprecated_env_keys();
+        if deprecated.is_empty() {
+            return;
+        }
+        for (var, provider) in &deprecated {
+            warn!(
+                env_var = %var,
+                provider = %provider,
+                "API key env var detected but IGNORED for security. \
+                 Migrate to: alms auth set {provider} <key>"
+            );
+        }
+        warn!(
+            "API key environment variables are no longer used. \
+             Store keys securely with `alms auth set <provider> <key>` \
+             (encrypted with ALMS_MASTER_KEY)."
+        );
     }
 }
 
@@ -797,7 +827,7 @@ model = "claude-sonnet"
     }
 
     #[test]
-    fn test_apply_env_overrides_selects_openai_key_for_openai_provider() {
+    fn test_apply_env_overrides_does_not_load_api_keys_from_env() {
         let _guard = EnvGuard::set(&[
             ("ALMS_LLM_PROVIDER", Some("openai")),
             ("OPENROUTER_API_KEY", Some("openrouter-key")),
@@ -809,23 +839,19 @@ model = "claude-sonnet"
         config.apply_env_overrides();
 
         assert_eq!(config.llm.provider, "openai");
-        assert_eq!(config.llm.api_key.as_deref(), Some("openai-key"));
+        // API key must NOT be loaded from env vars (security: agents can read env vars)
+        assert_eq!(config.llm.api_key, None);
     }
 
     #[test]
-    fn test_apply_env_overrides_selects_anthropic_key_for_anthropic_provider() {
-        let _guard = EnvGuard::set(&[
-            ("ALMS_LLM_PROVIDER", Some("anthropic")),
-            ("OPENROUTER_API_KEY", Some("openrouter-key")),
-            ("OPENAI_API_KEY", Some("openai-key")),
-            ("ANTHROPIC_API_KEY", Some("anthropic-key")),
-        ]);
+    fn test_apply_env_overrides_provider_without_key() {
+        let _guard = EnvGuard::set(&[("ALMS_LLM_PROVIDER", Some("anthropic"))]);
 
         let mut config = AlmsConfig::default();
         config.apply_env_overrides();
 
         assert_eq!(config.llm.provider, "anthropic");
-        assert_eq!(config.llm.api_key.as_deref(), Some("anthropic-key"));
+        assert_eq!(config.llm.api_key, None);
     }
 
     #[test]

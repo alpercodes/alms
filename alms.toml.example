@@ -1,8 +1,8 @@
 # ALMS Configuration
 # Copy to alms.toml and customize. All values shown are defaults.
-# Secrets (API keys, tokens) are stored in data/secrets.json (via `alms auth set`
-# or the UI) with env-var fallback. They are never stored in this file.
-# Set ALMS_MASTER_KEY to encrypt secrets at rest (AES-256-GCM).
+# Secrets (API keys, tokens) are stored in data/secrets.json via `alms auth set`
+# or the web UI. They are never stored in this file or read from env vars.
+# Set ALMS_MASTER_KEY env var to encrypt secrets at rest (AES-256-GCM).
 
 [server]
 bind = "127.0.0.1:8080"
@@ -30,12 +30,15 @@ mock = false
 # slow reasoning models or high-latency connections.
 stream_chunk_timeout_secs = 60
 
-# Set API key via environment variable:
-#   export OPENROUTER_API_KEY=sk-...
-#   export OPENAI_API_KEY=sk-...        (alternative for OpenAI-compatible)
-#   export ANTHROPIC_API_KEY=sk-ant-... (for Anthropic provider)
-#   export ALMS_LLM_PROVIDER=anthropic  (switch provider)
-#   export ALMS_LLM_MOCK=1             (mock mode, no key needed)
+# Set API key via `alms auth set`:
+#   alms auth set openrouter sk-...
+#   alms auth set openai sk-...
+#   alms auth set anthropic sk-ant-...
+# Switch provider: export ALMS_LLM_PROVIDER=anthropic
+# Mock mode (no key needed): export ALMS_LLM_MOCK=1
+#
+# NOTE: API key env vars (OPENROUTER_API_KEY, etc.) are NO LONGER used.
+# They are ignored for security — agents can read env vars via shell_exec.
 
 [session]
 idle_timeout_secs = 86400            # 24 hours
@@ -105,7 +108,7 @@ file_level = "debug"
 rotation = "daily"
 
 # Telegram channel (optional)
-# Set token via: export TELEGRAM_BOT_TOKEN=...
+# Set token via: alms auth set telegram 123456:ABC-DEF
 # [channels.telegram]
 # poll_interval_secs = 5
 #
@@ -113,3 +116,6 @@ rotation = "daily"
 # a dedicated Telegram bot to each agent via the API or CLI:
 #   alms agent create --name my-agent --telegram-token "123456:ABC-DEF"
 # These are stored in the agent registry (SQLite), not in this config file.
+#
+# NOTE: TELEGRAM_BOT_TOKEN env var is NO LONGER used.
+# Use `alms auth set telegram <token>` instead.

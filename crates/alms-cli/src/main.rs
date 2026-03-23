@@ -14,7 +14,7 @@ use helpers::{api_client, open_db};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use tracing::{error, info, warn};
+use tracing::info;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -35,9 +35,6 @@ enum Commands {
         /// Bind address (defaults to config value or 127.0.0.1:8080)
         #[arg(short, long)]
         bind: Option<String>,
-        /// OpenRouter/OpenAI API key (overrides OPENROUTER_API_KEY env var)
-        #[arg(long, env = "OPENROUTER_API_KEY")]
-        api_key: Option<String>,
     },
     /// Check system health
     Health {
@@ -135,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Load config early to resolve log directory.
     // This config is reused in the Gateway branch to avoid a redundant second load.
-    let mut config = match alms_core::AlmsConfig::load() {
+    let config = match alms_core::AlmsConfig::load() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Warning: failed to load config for logging setup: {e}. Using defaults.");
@@ -195,32 +192,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
-        Commands::Gateway { bind, api_key } => {
+        Commands::Gateway { bind } => {
             info!("Starting ALMS Gateway...");
-            match &api_key {
-                Some(k) => info!("API key provided ({} chars)", k.len()),
-                None => {
-                    let found: Vec<String> = std::env::vars()
-                        .filter(|(k, _)| k.contains("API_KEY") || k.contains("OPENROUTER"))
-                        .map(|(k, v)| format!("{}=({} chars)", k, v.len()))
-                        .collect();
-                    if found.is_empty() {
-                        error!(
-                            "No API key found. Pass --api-key sk-or-... or set OPENROUTER_API_KEY."
-                        );
-                    } else {
-                        warn!("API key env vars visible to process: {}", found.join(", "));
-                    }
-                }
-            }
-            if let Some(key) = api_key {
-                unsafe {
-                    std::env::set_var("OPENROUTER_API_KEY", &key);
-                }
-                // Update the already-loaded config with the CLI-provided API key
-                // instead of loading config a second time.
-                config.llm.api_key = Some(key);
-            }
+
+            // Warn about deprecated API key env vars (ignored for security).
+            alms_core::AlmsConfig::warn_deprecated_secret_env_vars();
+
             // Resolve bind address: --bind flag > config (alms.toml / ALMS_BIND) > default
             let bind = bind.unwrap_or(config.server.bind.clone());
             alms_gateway::serve_with_config(&bind, &config).await?;

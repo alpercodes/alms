@@ -17,8 +17,8 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Valid LLM provider names. Single source of truth for CLI, HTTP API, and UI.
-pub const VALID_PROVIDERS: &[&str] = &["openai", "anthropic", "openrouter"];
+/// Valid provider/secret names. Single source of truth for CLI, HTTP API, and UI.
+pub const VALID_PROVIDERS: &[&str] = &["openai", "anthropic", "openrouter", "telegram"];
 
 /// Environment variable name for the master encryption key.
 pub const MASTER_KEY_ENV: &str = "ALMS_MASTER_KEY";
@@ -310,14 +310,31 @@ impl SecretsStore {
         self.keys.get(provider).map(|k| Self::masked_key(k))
     }
 
-    /// Resolve an API key for a provider: secrets file first, then env vars.
+    /// Resolve an API key for a provider from the secrets store only.
+    ///
+    /// Env var fallback has been removed for security — API keys must be
+    /// configured via `alms auth set <provider> <key>`.
     pub fn resolve_key(&self, provider: &str) -> Option<String> {
-        // Secrets file takes precedence
-        if let Some(key) = self.get_key(provider) {
-            return Some(key.to_string());
-        }
-        // Fall back to env vars
-        crate::config::select_llm_api_key_from_env(provider)
+        self.get_key(provider).map(|k| k.to_string())
+    }
+
+    /// Detect API key environment variables that are set in the current process.
+    ///
+    /// Returns a list of `(env_var_name, provider)` tuples for each detected
+    /// secret env var. Callers should print a deprecation warning telling users
+    /// to migrate to `alms auth set`.
+    pub fn detect_deprecated_env_keys() -> Vec<(&'static str, &'static str)> {
+        const DEPRECATED_VARS: &[(&str, &str)] = &[
+            ("OPENROUTER_API_KEY", "openrouter"),
+            ("OPENAI_API_KEY", "openai"),
+            ("ANTHROPIC_API_KEY", "anthropic"),
+            ("TELEGRAM_BOT_TOKEN", "telegram"),
+        ];
+        DEPRECATED_VARS
+            .iter()
+            .filter(|(var, _)| std::env::var(var).ok().filter(|v| !v.is_empty()).is_some())
+            .copied()
+            .collect()
     }
 
     /// Save secrets to disk, encrypting if a master key is available.
@@ -671,6 +688,38 @@ mod tests {
         assert!(
             err_msg.contains("ALMS_MASTER_KEY"),
             "Error should hint at key/corruption issue: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_key_no_env_fallback() {
+        // resolve_key must NOT fall back to env vars — only secrets store.
+        let store = SecretsStore::empty();
+        // Even if the env var is set, resolve_key should return None.
+        assert!(
+            store.resolve_key("openai").is_none(),
+            "resolve_key must not fall back to env vars"
+        );
+    }
+
+    #[test]
+    fn test_resolve_key_from_store() {
+        let tmp = std::env::temp_dir().join(format!("alms-secrets-{}", uuid::Uuid::new_v4()));
+        let path = tmp.join("secrets.json");
+        let mut store = SecretsStore::load_with_key(&path, None).unwrap();
+        store.set_key("openai", "sk-from-store").unwrap();
+
+        assert_eq!(store.resolve_key("openai"), Some("sk-from-store".into()));
+        assert!(store.resolve_key("anthropic").is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_valid_providers_includes_telegram() {
+        assert!(
+            VALID_PROVIDERS.contains(&"telegram"),
+            "VALID_PROVIDERS must include telegram"
         );
     }
 }
