@@ -242,7 +242,7 @@ impl Gateway {
                 alms_core::secrets::SecretsStore::empty()
             });
 
-        // Resolve API key from secrets file if available, overriding env vars
+        // Resolve API key from secrets store (the only source — no env var fallback).
         let mut llm_config = config.llm_config.clone();
         if let Some(key) = secrets_store.resolve_key(&llm_config.provider) {
             llm_config.api_key = key;
@@ -269,9 +269,9 @@ impl Gateway {
     /// Initialize Telegram channels.
     ///
     /// Spawns a dedicated polling loop for each agent that has a `telegram_token`
-    /// configured in the registry. Falls back to the global `TELEGRAM_BOT_TOKEN`
-    /// env var for the default agent if no per-agent tokens are found (backward
-    /// compatible).
+    /// configured in the registry. Falls back to the global telegram token from
+    /// the secrets store (`alms auth set telegram <token>`) for the default
+    /// agent if no per-agent tokens are found.
     pub async fn initialize_channels(&mut self) -> AlmsResult<()> {
         // Phase 1: Collect per-agent Telegram tokens from the agent registry.
         let mut agent_tokens: Vec<(AgentId, String, String)> = Vec::new(); // (id, name, token)
@@ -292,21 +292,26 @@ impl Gateway {
         }
 
         // Phase 2: If no per-agent tokens found, fall back to the global
-        // TELEGRAM_BOT_TOKEN env var applied to the default agent.
-        if agent_tokens.is_empty()
-            && let Some(ref token) = self.config.telegram_token
-        {
-            let default_id = self.agent_id();
-            let default_name = self
-                .session_manager
-                .store()
-                .and_then(|store| store.load_agent_by_id(default_id).ok().flatten())
-                .map(|r| r.name)
-                .unwrap_or_else(|| "default".to_string());
-            agent_tokens.push((default_id, default_name, token.clone()));
-            info!(
-                "No per-agent Telegram tokens found, using global TELEGRAM_BOT_TOKEN for default agent"
-            );
+        // telegram token from secrets store (set via `alms auth set telegram <token>`).
+        if agent_tokens.is_empty() {
+            let global_token = self
+                .config
+                .telegram_token
+                .clone()
+                .or_else(|| self.secrets.read().unwrap().resolve_key("telegram"));
+            if let Some(token) = global_token {
+                let default_id = self.agent_id();
+                let default_name = self
+                    .session_manager
+                    .store()
+                    .and_then(|store| store.load_agent_by_id(default_id).ok().flatten())
+                    .map(|r| r.name)
+                    .unwrap_or_else(|| "default".to_string());
+                agent_tokens.push((default_id, default_name, token));
+                info!(
+                    "No per-agent Telegram tokens found, using global telegram token from secrets store for default agent"
+                );
+            }
         }
 
         if agent_tokens.is_empty() {

@@ -307,9 +307,7 @@ impl LlmConfig {
         if let Ok(provider) = std::env::var("ALMS_LLM_PROVIDER") {
             config.provider = provider.to_lowercase();
         }
-        if let Some(api_key) = alms_core::config::select_llm_api_key_from_env(&config.provider) {
-            config.api_key = api_key;
-        }
+        // NOTE: API key is NOT loaded from env vars. Use `alms auth set`.
 
         if let Ok(base_url) = std::env::var("LLM_BASE_URL") {
             config.base_url = base_url;
@@ -398,7 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_env_prefers_openai_key_for_openai_provider() {
+    fn test_from_env_does_not_load_api_keys() {
         let _guard = EnvGuard::set(&[
             ("ALMS_LLM_PROVIDER", Some("openai")),
             ("OPENROUTER_API_KEY", Some("openrouter-key")),
@@ -408,20 +406,16 @@ mod tests {
 
         let config = LlmConfig::from_env();
         assert_eq!(config.provider, "openai");
-        assert_eq!(config.api_key, "openai-key");
+        // API key must NOT be loaded from env vars (security fix).
+        assert_eq!(config.api_key, "");
     }
 
     #[test]
-    fn test_from_env_prefers_anthropic_key_for_anthropic_provider() {
-        let _guard = EnvGuard::set(&[
-            ("ALMS_LLM_PROVIDER", Some("anthropic")),
-            ("OPENROUTER_API_KEY", Some("openrouter-key")),
-            ("OPENAI_API_KEY", Some("openai-key")),
-            ("ANTHROPIC_API_KEY", Some("anthropic-key")),
-        ]);
+    fn test_from_env_sets_provider_without_key() {
+        let _guard = EnvGuard::set(&[("ALMS_LLM_PROVIDER", Some("anthropic"))]);
 
         let config = LlmConfig::from_env();
         assert_eq!(config.provider, "anthropic");
-        assert_eq!(config.api_key, "anthropic-key");
+        assert_eq!(config.api_key, "");
     }
 }

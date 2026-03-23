@@ -23,7 +23,7 @@ bind = "127.0.0.1:8080"
 # provider = "openrouter"           # openrouter | openai | anthropic | local
 # base_url = "https://openrouter.ai/api/v1"
 # model = "openrouter/moonshotai/kimi-k2.5"
-# api_key loaded from OPENROUTER_API_KEY env var (never in config file)
+# api_key loaded from secrets store via `alms auth set` (never in config file)
 timeout_secs = 120
 max_retries = 2
 # Token budget per run (0 = unlimited)
@@ -53,12 +53,12 @@ timeout_secs = 30
 max_output_bytes = 65536
 
 [channels.telegram]
-# token loaded from TELEGRAM_BOT_TOKEN env var
+# token loaded from secrets store via `alms auth set telegram <token>`
 poll_interval_secs = 5
 ```
 
 **Principles:**
-- Secrets (API keys, tokens) come from **env vars only**, never config files
+- Secrets (API keys, tokens) come from **`data/secrets.json`** via `alms auth set`, never config files or env vars
 - Every field has a default — zero-config startup should work (with mock LLM)
 - Human-readable durations (`"24h"`, `"30d"`, `"5m"`)
 - Validation on startup: reject invalid values with clear messages before starting
