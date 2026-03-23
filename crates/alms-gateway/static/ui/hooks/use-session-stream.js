@@ -200,6 +200,19 @@ export function openSessionStream(sessionId) {
         }];
     });
 
+    // ── job_completed ──
+    es.addEventListener('job_completed', (e) => {
+        const data = JSON.parse(e.data);
+        const name = data.job_name || 'job';
+        const status = data.status === 'success' ? 'completed'
+            : data.status === 'cancelled' ? 'cancelled' : 'failed';
+        const summary = data.summary ? `: ${data.summary}` : '';
+        chatMessages.value = [...chatMessages.value, {
+            type: 'system',
+            text: `Scheduled job ${status} — ${name}${summary}`,
+        }];
+    });
+
     // ── approval_resolved ──
     es.addEventListener('approval_resolved', (e) => {
         const data = JSON.parse(e.data);

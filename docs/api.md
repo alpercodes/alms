@@ -354,6 +354,20 @@ The `source` field is omitted when not set. `is_notification` is `true` when the
 { "run_id": "<uuid>", "ts": "..." }
 ```
 
+`job_completed`
+Emitted on the agent's user-facing session when a scheduled job run finishes. The event is informational only (no new LLM run is triggered).
+```json
+{
+  "session_id": "<uuid>",
+  "job_name": "Summarize yesterday...",
+  "status": "success",
+  "summary": "Truncated output (max 200 chars)...",
+  "ts": "..."
+}
+```
+
+`status` values: `"success"`, `"error"`, `"cancelled"`, `"unknown"`.
+
 #### Reconnect
 Supported via `Last-Event-ID` header. The server replays missed events and deduplicates overlap with the live stream.
 

@@ -852,6 +852,12 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     )
     .await;
 
+    // ── Job completion notification ──
+    // Send a notification to the agent's most recent user-facing session
+    // so the user can see that the job ran (even if they weren't watching
+    // the hidden job_* session).
+    notify_job_completion(&state, job.agent_id, &job.prompt, run_id).await;
+
     // Guard: if the job was cancelled while the run was in progress, do not
     // overwrite the Cancelled status or re-arm the scheduler.
     if state
@@ -890,6 +896,106 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     }
 
     Ok(())
+}
+
+/// Send a job-completion notification to the agent's most recent user-facing
+/// session. This makes job runs visible in the chat without creating a full
+/// notification run (which would trigger another LLM call).
+async fn notify_job_completion(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    job_prompt: &str,
+    run_id: RunId,
+) {
+    // Determine outcome from the completed run.
+    let (status, summary) = match state.run_manager.get_run(run_id) {
+        Some(run) => match run.status {
+            RunStatus::Completed => {
+                let output = run.output.unwrap_or_default();
+                let summary: String = if output.len() > 200 {
+                    format!("{}...", output.chars().take(200).collect::<String>())
+                } else {
+                    output
+                };
+                ("success", summary)
+            }
+            RunStatus::Failed => {
+                let err = run.error.unwrap_or_else(|| "unknown error".to_string());
+                ("error", err)
+            }
+            RunStatus::Cancelled => ("cancelled", "run was cancelled".to_string()),
+            RunStatus::Queued | RunStatus::Running => {
+                // Shouldn't happen — execute_run already returned.
+                ("unknown", "run still in progress".to_string())
+            }
+        },
+        None => ("error", "run record not found".to_string()),
+    };
+
+    // Find the agent's most recent user-facing session (exclude job_* and subagent_*).
+    let all_sessions = state.session_manager.list_all();
+    let user_session = all_sessions.iter().find(|s| {
+        s.agent_id == agent_id
+            && !s.context_id.starts_with("job_")
+            && !s.context_id.starts_with("subagent_")
+            && !s.context_id.starts_with("dm:")
+    });
+
+    let Some(target) = user_session else {
+        debug!(
+            "No user-facing session for agent {} — skipping job notification",
+            agent_id
+        );
+        return;
+    };
+    let target_session_id = target.id;
+
+    // Truncate the prompt for display.
+    let job_name: String = if job_prompt.len() > 60 {
+        format!("{}...", job_prompt.chars().take(60).collect::<String>())
+    } else {
+        job_prompt.to_string()
+    };
+
+    // Send SSE event to the target session so connected UI clients see it.
+    state
+        .run_manager
+        .send_session_event(
+            target_session_id,
+            alms_core::RunId::new(), // no associated run on this session
+            SseEventData::job_completed(target_session_id, &job_name, status, &summary),
+        )
+        .await;
+
+    // Persist a marker message to the session history so it appears on reload.
+    let label = match status {
+        "success" => "completed",
+        "error" => "failed",
+        _ => "finished",
+    };
+    let marker = alms_session::Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: alms_session::Role::System,
+        content: alms_session::Content::Text(format!(
+            "[Scheduled job {label}] {job_name}\n{summary}"
+        )),
+        timestamp: alms_core::Timestamp::now(),
+        metadata: Some(serde_json::json!({
+            "synthetic": true,
+            "type": "job_notification"
+        })),
+    };
+    if let Err(e) = state
+        .session_manager
+        .append_message(target_session_id, marker)
+    {
+        warn!("Failed to persist job completion marker: {e}");
+    }
+
+    info!(
+        "Job notification sent to session {} (status={status})",
+        target_session_id.0
+    );
 }
 
 // ---------------------------------------------------------------------------

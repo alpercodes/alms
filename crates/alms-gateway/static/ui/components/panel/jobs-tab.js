@@ -213,6 +213,7 @@ export function JobsTab() {
                         <div class="job-meta">
                             <span>${describeCron(j.schedule?.cron) || (j.schedule?.type === 'once' ? 'Once at ' + fmtDate(j.schedule.run_at) : JSON.stringify(j.schedule))}</span>
                             ${j.next_run_at && html`<span> | next: ${fmtDate(j.next_run_at)}</span>`}
+                            ${j.last_run_at && html`<span> | last run: ${fmtDate(j.last_run_at)}</span>`}
                         </div>
                         <span class="job-status-${j.status || 'active'}">${j.status || 'active'}</span>
                         ${j.status !== 'cancelled' && html`
