@@ -43,7 +43,8 @@ pub struct CreateAgentRequest {
     pub model: Option<String>,
     pub posture: Option<String>,
     pub provider: Option<String>,
-    /// Per-agent Telegram bot token. Validated via `getMe` before persisting.
+    /// Per-agent Telegram bot token. Validated via `getMe` on gateway startup,
+    /// not at persist time.
     pub telegram_token: Option<String>,
     #[serde(default)]
     pub is_default: Option<bool>,

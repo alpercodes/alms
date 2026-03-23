@@ -174,6 +174,67 @@ impl SqliteStore {
         Ok(rows)
     }
 
+    /// Migrate Telegram session context IDs from the old format (`telegram_{chat_id}`)
+    /// to the new per-agent format (`telegram_{agent_name}_{chat_id}`).
+    ///
+    /// This is a one-time, idempotent migration for backward compatibility after
+    /// the per-agent Telegram feature was introduced. Only sessions whose
+    /// `context_id` matches `telegram_` followed by a purely numeric chat ID
+    /// (possibly negative) are migrated. Sessions already using the new
+    /// `telegram_{agent_name}_{chat_id}` format are unaffected.
+    ///
+    /// Returns the number of sessions migrated.
+    pub fn migrate_telegram_context_ids(&self, agent_name: &str) -> AlmsResult<usize> {
+        let conn = self.conn.lock();
+
+        // Collect old-format sessions: context_id = "telegram_" + digits/dash only.
+        // We load them first, then update, because SQLite GLOB doesn't support
+        // the "only digits after prefix" assertion we need. Instead we filter
+        // in Rust for exact matching.
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, context_id FROM sessions \
+                 WHERE context_id LIKE 'telegram_%'",
+            )
+            .map_err(|e| {
+                AlmsError::Runtime(format!("SQLite prepare migrate_telegram_context_ids: {e}"))
+            })?;
+
+        let old_sessions: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                let id: String = row.get(0)?;
+                let ctx: String = row.get(1)?;
+                Ok((id, ctx))
+            })
+            .map_err(|e| {
+                AlmsError::Runtime(format!("SQLite query migrate_telegram_context_ids: {e}"))
+            })?
+            .filter_map(|r| r.ok())
+            .filter(|(_id, ctx)| {
+                // Old format: "telegram_" + (optional "-") + digits
+                let suffix = &ctx["telegram_".len()..];
+                let numeric_part = suffix.strip_prefix('-').unwrap_or(suffix);
+                !numeric_part.is_empty() && numeric_part.chars().all(|c| c.is_ascii_digit())
+            })
+            .collect();
+
+        let mut migrated = 0usize;
+        for (session_id, old_ctx) in &old_sessions {
+            let chat_id_part = &old_ctx["telegram_".len()..];
+            let new_ctx = format!("telegram_{agent_name}_{chat_id_part}");
+            let affected = conn
+                .execute(
+                    "UPDATE sessions SET context_id = ?1 WHERE id = ?2",
+                    params![&new_ctx, session_id],
+                )
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite update migrate_telegram_context_ids: {e}"))
+                })?;
+            migrated += affected;
+        }
+        Ok(migrated)
+    }
+
     /// Count messages in a session without loading them.
     pub fn message_count(&self, session_id: SessionId) -> AlmsResult<usize> {
         let conn = self.conn.lock();
@@ -298,6 +359,58 @@ mod tests {
         store.save_message(session.id, &new_message("one")).unwrap();
         store.save_message(session.id, &new_message("two")).unwrap();
         assert_eq!(store.message_count(session.id).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_migrate_telegram_context_ids() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent_id = AgentId::new();
+
+        // Old-format sessions
+        let s1 = Session::new(agent_id, "telegram_123456");
+        let s2 = Session::new(agent_id, "telegram_-789");
+        // New-format session (should NOT be migrated)
+        let s3 = Session::new(agent_id, "telegram_mybot_999");
+        // Non-Telegram session (should NOT be migrated)
+        let s4 = Session::new(agent_id, "web_session_1");
+        store.save_session(&s1).unwrap();
+        store.save_session(&s2).unwrap();
+        store.save_session(&s3).unwrap();
+        store.save_session(&s4).unwrap();
+
+        let migrated = store.migrate_telegram_context_ids("main").unwrap();
+        assert_eq!(migrated, 2);
+
+        // Verify old-format sessions were renamed
+        let loaded_s1 = store.load_session_by_id(s1.id).unwrap().unwrap();
+        assert_eq!(loaded_s1.context_id, "telegram_main_123456");
+
+        let loaded_s2 = store.load_session_by_id(s2.id).unwrap().unwrap();
+        assert_eq!(loaded_s2.context_id, "telegram_main_-789");
+
+        // New-format session unchanged
+        let loaded_s3 = store.load_session_by_id(s3.id).unwrap().unwrap();
+        assert_eq!(loaded_s3.context_id, "telegram_mybot_999");
+
+        // Non-telegram session unchanged
+        let loaded_s4 = store.load_session_by_id(s4.id).unwrap().unwrap();
+        assert_eq!(loaded_s4.context_id, "web_session_1");
+    }
+
+    #[test]
+    fn test_migrate_telegram_context_ids_idempotent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent_id = AgentId::new();
+
+        let s1 = Session::new(agent_id, "telegram_123456");
+        store.save_session(&s1).unwrap();
+
+        let first = store.migrate_telegram_context_ids("main").unwrap();
+        assert_eq!(first, 1);
+
+        // Second call should migrate zero (already in new format)
+        let second = store.migrate_telegram_context_ids("main").unwrap();
+        assert_eq!(second, 0);
     }
 
     #[test]

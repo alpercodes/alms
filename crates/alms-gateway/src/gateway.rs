@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, instrument, warn};
+use tracing::{Instrument, error, info, instrument, warn};
 use uuid::Uuid;
 
 /// Gateway configuration
@@ -314,6 +314,54 @@ impl Gateway {
             return Ok(());
         }
 
+        // Phase 2b: Migrate legacy session context IDs and offset files.
+        //
+        // Old format: `telegram_{chat_id}` -> new: `telegram_{agent_name}_{chat_id}`.
+        // Old offset file: `telegram_offset` -> new: `telegram_offset_{agent_name}`.
+        // Both migrations are idempotent and non-fatal.
+        if let Some(store) = self.session_manager.store() {
+            for (_agent_id, agent_name, _token) in &agent_tokens {
+                match store.migrate_telegram_context_ids(agent_name) {
+                    Ok(0) => {}
+                    Ok(n) => info!(
+                        "Migrated {n} legacy Telegram session(s) to new context ID format \
+                         for agent '{agent_name}'"
+                    ),
+                    Err(e) => warn!(
+                        "Failed to migrate Telegram session context IDs for agent \
+                         '{agent_name}': {e}"
+                    ),
+                }
+            }
+        }
+        if let Some(ref db_path) = self.config.db_path {
+            let data_dir = std::path::Path::new(db_path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."));
+            let old_offset = data_dir.join("telegram_offset");
+            if old_offset.exists() {
+                // Only migrate if there's exactly one agent (unambiguous target).
+                if agent_tokens.len() == 1 {
+                    let new_offset =
+                        data_dir.join(format!("telegram_offset_{}", agent_tokens[0].1));
+                    if !new_offset.exists() {
+                        match std::fs::rename(&old_offset, &new_offset) {
+                            Ok(()) => info!(
+                                "Migrated legacy telegram_offset to {}",
+                                new_offset.display()
+                            ),
+                            Err(e) => warn!("Failed to migrate legacy telegram_offset: {e}"),
+                        }
+                    }
+                } else {
+                    warn!(
+                        "Legacy telegram_offset file exists but multiple agents configured — \
+                         skipping offset migration (ambiguous target). Please rename manually."
+                    );
+                }
+            }
+        }
+
         // Phase 3: Initialize a TelegramChannel for each token.
         for (agent_id, agent_name, token) in agent_tokens {
             info!(
@@ -366,9 +414,15 @@ impl Gateway {
     pub async fn start(&mut self) -> AlmsResult<()> {
         info!("Starting ALMS Gateway");
 
-        // Start all Telegram channels
+        // Start all Telegram channels (non-fatal per bot — log and continue)
         for bot in &self.telegram_bots {
-            bot.channel.start().await?;
+            if let Err(e) = bot.channel.start().await {
+                error!(
+                    "Failed to start Telegram channel for agent '{}': {}",
+                    bot.agent_name, e
+                );
+                continue;
+            }
             info!("Telegram channel started for agent '{}'", bot.agent_name);
         }
 
@@ -409,7 +463,16 @@ impl Gateway {
         )>(256);
 
         for bot in &self.telegram_bots {
-            let mut rx = bot.channel.receive_updates().await?;
+            let mut rx = match bot.channel.receive_updates().await {
+                Ok(rx) => rx,
+                Err(e) => {
+                    error!(
+                        "Failed to receive updates for agent '{}': {} — skipping bot",
+                        bot.agent_name, e
+                    );
+                    continue;
+                }
+            };
             let tx = merged_tx.clone();
             let agent_id = bot.agent_id;
             let agent_name = bot.agent_name.clone();
@@ -417,17 +480,21 @@ impl Gateway {
 
             // Forward messages from this bot's receiver into the merged channel,
             // tagging each with the owning agent.
-            tokio::spawn(async move {
-                while let Some(msg) = rx.recv().await {
-                    if tx
-                        .send((agent_id, agent_name.clone(), Arc::clone(&channel), msg))
-                        .await
-                        .is_err()
-                    {
-                        break; // merged receiver dropped
+            let span = tracing::info_span!("telegram_forwarder", agent = %agent_name);
+            tokio::spawn(
+                async move {
+                    while let Some(msg) = rx.recv().await {
+                        if tx
+                            .send((agent_id, agent_name.clone(), Arc::clone(&channel), msg))
+                            .await
+                            .is_err()
+                        {
+                            break; // merged receiver dropped
+                        }
                     }
                 }
-            });
+                .instrument(span),
+            );
         }
         // Drop our copy so merged_rx closes when all forwarders are done.
         drop(merged_tx);

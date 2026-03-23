@@ -377,4 +377,28 @@ mod tests {
         assert!(validate_agent_name("My Agent").is_err());
         assert!(validate_agent_name("-leading").is_err());
     }
+
+    #[test]
+    fn test_agent_to_json_has_telegram_no_token() {
+        let mut agent = new_agent("tg-bot");
+        agent.telegram_token = Some("123456:ABC-DEF".to_string());
+
+        let json = agent_to_json(&agent);
+        // has_telegram should be true
+        assert_eq!(json["has_telegram"], serde_json::json!(true));
+        // telegram_token must NEVER appear in the output
+        assert!(
+            json.get("telegram_token").is_none(),
+            "telegram_token must not be exposed in API responses"
+        );
+    }
+
+    #[test]
+    fn test_agent_to_json_no_telegram() {
+        let agent = new_agent("no-tg");
+
+        let json = agent_to_json(&agent);
+        assert_eq!(json["has_telegram"], serde_json::json!(false));
+        assert!(json.get("telegram_token").is_none());
+    }
 }
