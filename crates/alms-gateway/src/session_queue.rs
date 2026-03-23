@@ -173,6 +173,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
                     }
                 }
                 for work in low_queue.drain(..) {
+                    pending.fetch_sub(1, Ordering::Relaxed);
                     work.await;
                 }
                 break;
@@ -193,6 +194,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
                         // Channel closed — drain any remaining low-priority items.
                         debug!(key = ?key, "Session queue handler exiting: channel closed");
                         for work in low_queue.drain(..) {
+                            pending.fetch_sub(1, Ordering::Relaxed);
                             work.await;
                         }
                         senders.remove(&key);
@@ -208,6 +210,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
                             }
                         }
                         for work in low_queue.drain(..) {
+                            pending.fetch_sub(1, Ordering::Relaxed);
                             work.await;
                         }
                         break;

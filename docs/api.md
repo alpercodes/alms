@@ -276,13 +276,14 @@ data: {"run_id":"...","session_id":"...","ts":"..."}
 #### Event types (MVP)
 
 `run_created`
-Emitted immediately when a run is accepted and queued, before the agent loop starts. Includes an optional `source` field indicating what triggered the run.
+Emitted immediately when a run is accepted and queued, before the agent loop starts. Includes an optional `source` field indicating what triggered the run and `queued_behind` indicating queue position.
 ```json
 {
   "run_id": "<uuid>",
   "session_id": "<uuid>",
   "is_notification": false,
   "source": "user",
+  "queued_behind": 0,
   "ts": "..."
 }
 ```
@@ -293,7 +294,7 @@ Emitted immediately when a run is accepted and queued, before the agent loop sta
 - `"job"` — scheduled job
 - `"subagent"` — subagent completion notification
 
-The `source` field is omitted when not set. `is_notification` is `true` when the run was triggered by a background event (e.g. a DM delivery or subagent completion) rather than an explicit user action.
+The `source` field is omitted when not set. `is_notification` is `true` when the run was triggered by a background event (e.g. a DM delivery or subagent completion) rather than an explicit user action. `queued_behind` (integer) is the number of runs ahead of this one in the agent's queue; 0 means the run starts immediately.
 
 `run_started`
 ```json
