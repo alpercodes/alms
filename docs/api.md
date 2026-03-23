@@ -554,6 +554,8 @@ Path parameter accepts either a UUID or a name slug. UUID is tried first.
 }
 ```
 
+Valid `posture` values: `"guarded"` (default — requires approval for risky tools), `"full_control"` (no approvals), `"autonomous"` (no approvals, no human-in-the-loop expected — for background agents, scheduled jobs, and subagents).
+
 To clear an override, pass an empty string: `"model": ""`.
 
 **Response 200** — updated `AgentRecord`
