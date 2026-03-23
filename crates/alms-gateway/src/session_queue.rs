@@ -99,6 +99,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> SessionQueue<K> {
         let _ = tx.send(first_item);
 
         let senders = Arc::clone(&self.senders);
+        let pending_counts = Arc::clone(&self.pending_counts);
         let pending = self
             .pending_counts
             .entry(key.clone())
@@ -107,7 +108,7 @@ impl<K: Hash + Eq + Clone + Send + Sync + Debug + 'static> SessionQueue<K> {
         let shutdown = self.shutdown.clone();
         let handler_key = key.clone();
         tokio::spawn(async move {
-            handler_loop(handler_key, rx, senders, pending, shutdown).await;
+            handler_loop(handler_key, rx, senders, pending, pending_counts, shutdown).await;
         });
 
         self.senders.insert(key, tx);
@@ -123,6 +124,7 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
     mut rx: mpsc::UnboundedReceiver<PriorityItem>,
     senders: Arc<DashMap<K, mpsc::UnboundedSender<PriorityItem>>>,
     pending: Arc<AtomicUsize>,
+    pending_counts: Arc<DashMap<K, Arc<AtomicUsize>>>,
     shutdown: CancellationToken,
 ) {
     let idle_timeout = Duration::from_secs(300);
@@ -176,6 +178,8 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
                     pending.fetch_sub(1, Ordering::Relaxed);
                     work.await;
                 }
+                senders.remove(&key);
+                pending_counts.remove(&key);
                 break;
             }
 
@@ -198,11 +202,13 @@ async fn handler_loop<K: Hash + Eq + Clone + Send + Sync + Debug + 'static>(
                             work.await;
                         }
                         senders.remove(&key);
+                        pending_counts.remove(&key);
                         break;
                     }
                     Err(_) => {
                         debug!(key = ?key, "Session queue handler exiting: idle timeout");
                         senders.remove(&key);
+                        pending_counts.remove(&key);
                         while let Ok(item) = rx.try_recv() {
                             pending.fetch_sub(1, Ordering::Relaxed);
                             match item {
@@ -376,7 +382,11 @@ mod tests {
 
         assert!(
             !queue.senders.contains_key(&42),
-            "DashMap entry should be removed after idle timeout"
+            "senders entry should be removed after idle timeout"
+        );
+        assert!(
+            !queue.pending_counts.contains_key(&42),
+            "pending_counts entry should be removed after idle timeout"
         );
     }
 
@@ -445,6 +455,36 @@ mod tests {
             executed.load(Ordering::SeqCst),
             2,
             "Both items should have been drained on shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_counts_cleaned_up_on_shutdown() {
+        let shutdown = CancellationToken::new();
+        let queue = SessionQueue::<u64>::new(shutdown.clone());
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+        queue.enqueue(
+            99,
+            Box::pin(async move {
+                let _ = tx.send(());
+            }),
+        );
+
+        // Wait for the item to execute.
+        rx.recv().await;
+
+        // Signal shutdown so the handler drains and exits.
+        shutdown.cancel();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !queue.pending_counts.contains_key(&99),
+            "pending_counts entry should be removed after shutdown"
+        );
+        assert!(
+            !queue.senders.contains_key(&99),
+            "senders entry should be removed after shutdown"
         );
     }
 }
