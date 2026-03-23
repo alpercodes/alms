@@ -134,7 +134,14 @@ async fn main() -> anyhow::Result<()> {
     let is_gateway = matches!(cli.command, Commands::Gateway { .. });
 
     // Load config early to resolve log directory.
-    let config = alms_core::AlmsConfig::load().unwrap_or_default();
+    // This config is reused in the Gateway branch to avoid a redundant second load.
+    let mut config = match alms_core::AlmsConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Warning: failed to load config for logging setup: {e}. Using defaults.");
+            alms_core::AlmsConfig::default()
+        }
+    };
 
     // Stderr layer — level from RUST_LOG, defaulting to info.
     let stderr_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -206,14 +213,12 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(key) = api_key {
                 unsafe {
-                    std::env::set_var("OPENROUTER_API_KEY", key);
+                    std::env::set_var("OPENROUTER_API_KEY", &key);
                 }
+                // Update the already-loaded config with the CLI-provided API key
+                // instead of loading config a second time.
+                config.llm.api_key = Some(key);
             }
-            // Load config once — used for bind address and passed to the gateway.
-            let config = alms_core::AlmsConfig::load().unwrap_or_else(|e| {
-                warn!("Failed to load config, using defaults: {}", e);
-                alms_core::AlmsConfig::default()
-            });
             // Resolve bind address: --bind flag > config (alms.toml / ALMS_BIND) > default
             let bind = bind.unwrap_or(config.server.bind.clone());
             alms_gateway::serve_with_config(&bind, &config).await?;
