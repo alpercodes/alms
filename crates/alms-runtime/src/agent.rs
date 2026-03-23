@@ -689,12 +689,8 @@ impl AgentRuntime {
         if context_id.starts_with("dm:")
             && let Some(peer) = self.dm_peer_name(context_id)
         {
-            let dm_addendum = format!(
-                "\n\n---\n**IMPORTANT: This is a direct message from agent \"{peer}\".**\n\
-                 You MUST use the `send_message` tool to reply — your plain text response is NOT delivered to the other agent.\n\
-                 If you do not wish to respond, use the `ignore_message` tool.\n\
-                 Do NOT respond with text only; that message will be lost."
-            );
+            let dm_template = include_str!("../prompts/dm_recipient.md");
+            let dm_addendum = format!("\n\n{}", dm_template.trim().replace("{peer}", &peer));
             system_prompt.push_str(&dm_addendum);
             debug!(
                 peer = %peer,
@@ -800,10 +796,7 @@ impl AgentRuntime {
 
         // Build summarization prompt
         let mut sum_messages = vec![LlmMessage::system(
-            "You are a conversation summarizer. \
-             Given a sequence of messages, produce a concise factual summary \
-             (3–7 sentences) capturing key decisions, facts learned, and actions taken. \
-             No pleasantries or meta-commentary.",
+            include_str!("../prompts/summarizer.md").trim(),
         )];
 
         let user_prefix = if current.text.is_empty() {

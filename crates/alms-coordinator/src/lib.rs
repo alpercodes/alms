@@ -722,9 +722,10 @@ fn truncate_for_notification(result: &serde_json::Value) -> String {
 }
 
 /// Default system prompt for ephemeral (unnamed) subagents.
-const DEFAULT_SUBAGENT_PROMPT: &str = "You are a general-purpose assistant. Complete the given task thoroughly and accurately. \
-     You can run `alms --help` via shell_exec to discover CLI commands \
-     for managing agents, sessions, and runs.";
+///
+/// Loaded at compile time from `crates/alms-runtime/prompts/subagent.md`.
+const DEFAULT_SUBAGENT_PROMPT: &str =
+    include_str!("../../alms-runtime/prompts/subagent.md").trim_ascii();
 
 /// Config extracted from an agent registry record for a named subagent.
 struct SubagentRecordConfig {
