@@ -224,6 +224,14 @@ pub async fn cancel_run(
     State(state): State<AppState>,
     Path(run_id): Path<RunId>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let already_finished = || {
+        api_error(
+            StatusCode::CONFLICT,
+            "ALREADY_FINISHED",
+            "Run already finished",
+        )
+    };
+
     let run = state
         .run_manager
         .get_run(run_id)
@@ -232,21 +240,13 @@ pub async fn cancel_run(
     match run.status {
         RunStatus::Queued | RunStatus::Running => {}
         _ => {
-            return Err(api_error(
-                StatusCode::CONFLICT,
-                "ALREADY_FINISHED",
-                "Run already finished",
-            ));
+            return Err(already_finished());
         }
     }
 
     let found = state.run_manager.cancel_run(run_id);
     if !found {
-        return Err(api_error(
-            StatusCode::CONFLICT,
-            "ALREADY_FINISHED",
-            "Run already finished",
-        ));
+        return Err(already_finished());
     }
 
     info!("Cancel requested for run {}", run_id.0);
