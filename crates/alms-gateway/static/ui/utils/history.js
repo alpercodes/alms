@@ -1,11 +1,26 @@
 /**
  * Map API message history to chatMessages entries.
- * Pairs consecutive tool_call + tool_result into single tool entries.
+ *
+ * Pairs tool_call messages with their matching tool_result by
+ * tool_call_id / tool_id rather than positional lookahead. This
+ * correctly handles parallel tool calls where the stored order is
+ * [call_A, call_B, result_A, result_B].
  */
 export function mapHistoryMessages(msgs) {
+    // First pass: index all tool_result messages by their tool_id so we
+    // can match them to tool_call messages regardless of position.
+    const resultMap = new Map();
+    for (const m of msgs) {
+        if (m.type === 'tool_result' && m.tool_id) {
+            resultMap.set(m.tool_id, m);
+        }
+    }
+
+    // Second pass: build the chat entries. Tool results are consumed via
+    // the map lookup — any that remain unmatched are skipped (same as the
+    // old "standalone tool_result" behavior).
     const entries = [];
-    for (let i = 0; i < msgs.length; i++) {
-        const m = msgs[i];
+    for (const m of msgs) {
         if (m.type === 'text' || !m.type) {
             // Legacy messages without type field, or explicit text
             entries.push({
@@ -15,20 +30,18 @@ export function mapHistoryMessages(msgs) {
                 sealed: true,
             });
         } else if (m.type === 'tool_call') {
-            // Look ahead for matching tool_result
-            const next = msgs[i + 1];
-            const hasResult = next && next.type === 'tool_result';
+            const callId = (m.metadata && m.metadata.tool_call_id) || null;
+            const matched = callId ? resultMap.get(callId) : null;
             entries.push({
                 type: 'tool',
                 tool: m.tool,
                 params: m.params,
-                status: hasResult ? (next.ok ? 'done' : 'fail') : 'done',
-                result: hasResult ? next.result : null,
-                id: (m.metadata && m.metadata.tool_call_id) || m.tool,
+                status: matched ? (matched.ok ? 'done' : 'fail') : 'done',
+                result: matched ? matched.result : null,
+                id: callId || m.tool,
             });
-            if (hasResult) i++; // skip the paired tool_result
         }
-        // Standalone tool_result without preceding tool_call — skip
+        // tool_result entries are consumed via resultMap — skip them here
     }
     return entries;
 }

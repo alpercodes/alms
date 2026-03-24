@@ -1468,16 +1468,30 @@ pub async fn stream_run_events(
     }
 }
 
+/// Query parameters for the session-level SSE endpoint.
+#[derive(Debug, Deserialize)]
+pub struct SessionEventsQuery {
+    /// Client-supplied last event ID — used when the browser's EventSource
+    /// cannot send the `Last-Event-Id` header (i.e. the initial connection).
+    /// Takes precedence over the header when both are present.
+    pub last_event_id: Option<u64>,
+}
+
 /// GET /sessions/{session_id}/events — persistent session-level SSE stream.
 ///
 /// Unlike the per-run endpoint, this stream stays open across runs.
 /// All events from any run on this session are forwarded, including
 /// notification runs from subagent completions.
-#[instrument(level = "info", skip(state, headers), fields(session_id = %session_id.0))]
+///
+/// Supports `Last-Event-Id` header (browser auto-reconnect) **and**
+/// `?last_event_id=<n>` query parameter (initial connection after REST
+/// history load). Query parameter takes precedence when both are present.
+#[instrument(level = "info", skip(state, headers, query), fields(session_id = %session_id.0))]
 pub async fn stream_session_events(
     State(state): State<AppState>,
     Path(session_id): Path<SessionId>,
     headers: HeaderMap,
+    Query(query): Query<SessionEventsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     // Verify session exists
     state
@@ -1485,10 +1499,14 @@ pub async fn stream_session_events(
         .get(session_id)
         .map_err(|_| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found"))?;
 
-    let last_event_id = headers
-        .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+    // Query parameter takes precedence over header (the header is only sent
+    // by the browser on automatic reconnects, not on the initial connection).
+    let last_event_id = query.last_event_id.or_else(|| {
+        headers
+            .get("last-event-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+    });
     let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
 
     let (tx, rx) = event_channel();

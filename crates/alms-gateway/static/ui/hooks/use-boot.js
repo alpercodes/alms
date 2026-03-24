@@ -83,13 +83,14 @@ async function loadAgentSessions(agentId) {
             activeSessionId.value = selected.id;
             // Re-persist in case the session list changed
             saveActiveSession(agentId, selected.id);
-            await Promise.all([
+            const [lastEventId] = await Promise.all([
                 loadHistory(selected.id),
                 loadRunHistory(selected.id),
             ]);
             if (gen !== switchGeneration) return; // stale — discard
-            // Open persistent session stream
-            openSessionStream(selected.id);
+            // Open persistent session stream — skip replay of events
+            // already reflected in the loaded message history.
+            openSessionStream(selected.id, { lastEventId });
         } else {
             // Create a first session
             const ctx = 'web-chat-' + Date.now();
@@ -112,14 +113,18 @@ async function loadAgentSessions(agentId) {
 
 /**
  * Load chat history for a session.
+ * Returns the last SSE event ID from the server (if available) so the
+ * caller can pass it to openSessionStream and skip duplicate replay.
  */
 async function loadHistory(sessionId) {
     try {
         const data = await getSessionMessages(sessionId);
         chatMessages.value = mapHistoryMessages(data.messages || []);
+        return data.last_event_id ?? null;
     } catch (err) {
         console.error('[loadHistory] failed:', err);
         chatMessages.value = [{ type: 'error', text: `Failed to load message history: ${err.message || 'unknown error'}` }];
+        return null;
     }
 }
 

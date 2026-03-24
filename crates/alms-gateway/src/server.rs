@@ -452,6 +452,14 @@ impl RunManager {
             .events_from(session_id, from_id)
             .await
     }
+
+    /// Return the highest session-level event ID, or `None` if no events exist.
+    ///
+    /// Exposed to the REST messages endpoint so the client can pass
+    /// `?last_event_id=<n>` when opening the SSE stream.
+    pub async fn latest_session_event_id(&self, session_id: SessionId) -> Option<u64> {
+        self.session_event_log.latest_event_id(session_id).await
+    }
 }
 
 impl Default for RunManager {
@@ -760,11 +768,23 @@ async fn get_session(
 }
 
 /// GET /sessions/{session_id}/messages — return chat history including tool calls
+///
+/// Response includes `last_event_id` — the current high-water mark of the
+/// session's SSE event log. Clients should pass this value as
+/// `?last_event_id=<n>` when opening the SSE stream to skip replay of
+/// events that are already reflected in the returned messages.
 async fn get_session_messages(
     State(state): State<AppState>,
     Path(session_id): Path<SessionId>,
 ) -> impl IntoResponse {
     tracing::debug!("GET /sessions/{}/messages", session_id.0);
+
+    // Read the SSE high-water mark FIRST, before loading messages.
+    // If an event arrives between these two reads, worst case is the
+    // client replays a few events it already has (harmless duplicates)
+    // rather than missing events entirely.
+    let last_event_id = state.run_manager.latest_session_event_id(session_id).await;
+
     match state.session_manager.get_history(session_id) {
         Ok(messages) => {
             tracing::debug!(
@@ -816,7 +836,12 @@ async fn get_session_messages(
                     _ => None, // skip system messages
                 })
                 .collect();
-            Json(serde_json::json!({ "messages": visible })).into_response()
+
+            Json(serde_json::json!({
+                "messages": visible,
+                "last_event_id": last_event_id,
+            }))
+            .into_response()
         }
         Err(_) => {
             api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response()
