@@ -51,8 +51,9 @@ impl LlmClient {
             config.provider, config.base_url
         );
         if config.api_key.is_empty() {
-            error!(
-                "LLM api_key is empty — calls will fail with 401. Set OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY."
+            warn!(
+                "LLM api_key is empty at construction — will be resolved from secrets later. \
+                 If this persists, run `alms auth set <provider> <key>` or enable mock mode."
             );
         } else {
             info!("LLM api_key loaded ({} chars)", config.api_key.len());
@@ -504,7 +505,18 @@ impl LlmClient {
     /// base URL — it only refreshes the API key from the secrets store.
     pub fn with_secrets(mut self, secrets: &alms_core::secrets::SecretsStore) -> Self {
         if let Some(key) = secrets.resolve_key(&self.config.provider) {
+            debug!(
+                provider = %self.config.provider,
+                key_len = key.len(),
+                "API key resolved from secrets store"
+            );
             self.config.api_key = key;
+        } else {
+            debug!(
+                provider = %self.config.provider,
+                existing_key_empty = self.config.api_key.is_empty(),
+                "No key found in secrets store for provider, keeping existing"
+            );
         }
         self
     }
