@@ -508,6 +508,12 @@ pub struct AppState {
     pub secrets: Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>,
     /// Agent-to-agent message bus for peer messaging (Layer 2).
     pub message_bus: Arc<alms_coordinator::message_bus::MessageBus>,
+    /// Session config snapshot — exposed via GET /settings for UI display.
+    pub session_config: alms_session::SessionConfig,
+    /// Logging config snapshot — exposed via GET /settings for UI display.
+    pub logging_config: alms_core::config::LoggingConfig,
+    /// Tools config snapshot (timeout, max_output_bytes) — for UI display.
+    pub tools_config: alms_core::config::ToolsConfig,
 }
 
 impl AppState {
@@ -536,6 +542,9 @@ impl AppState {
         let llm_config = gateway.llm_config().clone();
         let agent_config = gateway.agent_config().clone();
         let auth_token_value = gateway.auth_token().map(String::from);
+        let session_config = gateway.session_config().clone();
+        let logging_config = gateway.logging_config().clone();
+        let tools_config = gateway.tools_config().clone();
         let db_path_str = gateway.db_path().map(String::from);
         let job_store = match db_path_str.as_deref() {
             Some(path) => {
@@ -623,6 +632,9 @@ impl AppState {
             auth_token_value,
             secrets,
             message_bus,
+            session_config,
+            logging_config,
+            tools_config,
         })
     }
 }
