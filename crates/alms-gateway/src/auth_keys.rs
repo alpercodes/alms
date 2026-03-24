@@ -19,17 +19,24 @@ use serde::Deserialize;
 ///
 /// Only shows keys from the secrets store. Env var keys are ignored for
 /// security (agents can read env vars via shell_exec).
+///
+/// Each entry includes:
+/// - `configured`: true only if a key is **directly stored** under this provider
+/// - `key`: masked key value (present when directly stored or resolved via alias)
+/// - `source`: `"secrets"` (direct), `"alias:<provider>"` (via alias), or `"none"`
+///
+/// The `alias:*` source prevents the UI from showing aliased keys as if they
+/// were independently configured (fixes #343).
 pub async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
     let secrets = state.secrets.read();
     let keys: Vec<serde_json::Value> = VALID_PROVIDERS
         .iter()
         .map(|p| {
-            let stored = secrets.get_masked(p);
-            let source = if stored.is_some() { "secrets" } else { "none" };
+            let (configured, masked, source) = secrets.key_status(p);
             serde_json::json!({
                 "provider": p,
-                "configured": stored.is_some(),
-                "key": stored,
+                "configured": configured,
+                "key": masked,
                 "source": source,
             })
         })
