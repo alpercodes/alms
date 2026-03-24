@@ -51,8 +51,9 @@ impl LlmClient {
             config.provider, config.base_url
         );
         if config.api_key.is_empty() {
-            error!(
-                "LLM api_key is empty — calls will fail with 401. Set OPENROUTER_API_KEY, OPENAI_API_KEY, or ANTHROPIC_API_KEY."
+            warn!(
+                "LLM api_key is empty at construction — will be resolved from secrets later. \
+                 If this persists, run `alms auth set <provider> <key>` or enable mock mode."
             );
         } else {
             info!("LLM api_key loaded ({} chars)", config.api_key.len());
@@ -445,7 +446,13 @@ impl LlmClient {
     }
 
     /// Internal: switch provider, base_url, and resolve API key.
+    ///
+    /// When switching to a new provider and no key is found, the existing
+    /// (wrong-provider) key is cleared to prevent silent 401 errors from
+    /// sending one provider's key to another.
     fn apply_provider(&mut self, provider: &str, resolve_key: impl FnOnce(&str) -> Option<String>) {
+        let old_provider = self.config.provider.clone();
+
         self.provider = match provider {
             "anthropic" => Provider::Anthropic,
             "openrouter" => Provider::OpenAi,
@@ -467,6 +474,16 @@ impl LlmClient {
 
         if let Some(key) = resolve_key(provider) {
             self.config.api_key = key;
+        } else if old_provider != provider && !self.config.api_key.is_empty() {
+            // Switching providers but no key found for the new one.
+            // Clear the old key to avoid sending the wrong provider's
+            // credentials (which would cause confusing 401 errors).
+            warn!(
+                old_provider = %old_provider,
+                new_provider = %provider,
+                "Provider changed but no API key found — clearing stale key"
+            );
+            self.config.api_key.clear();
         } else if self.config.api_key.is_empty() {
             warn!(
                 "No API key found for provider '{}' — requests will fail",
@@ -504,7 +521,18 @@ impl LlmClient {
     /// base URL — it only refreshes the API key from the secrets store.
     pub fn with_secrets(mut self, secrets: &alms_core::secrets::SecretsStore) -> Self {
         if let Some(key) = secrets.resolve_key(&self.config.provider) {
+            debug!(
+                provider = %self.config.provider,
+                key_len = key.len(),
+                "API key resolved from secrets store"
+            );
             self.config.api_key = key;
+        } else {
+            debug!(
+                provider = %self.config.provider,
+                existing_key_empty = self.config.api_key.is_empty(),
+                "No key found in secrets store for provider, keeping existing"
+            );
         }
         self
     }
@@ -762,5 +790,47 @@ mod tests {
         assert_eq!(switched.provider(), "openrouter");
         assert_eq!(switched.base_url(), "https://openrouter.ai/api/v1");
         assert_eq!(switched.api_key(), "sk-or-test-key");
+    }
+
+    #[test]
+    fn test_provider_switch_clears_stale_key_when_no_new_key() {
+        // Start with an OpenRouter client that has a valid key
+        let config = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-or-valid-key".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+        assert_eq!(client.api_key(), "sk-or-valid-key");
+
+        // Switch to Anthropic but secrets store has NO Anthropic key.
+        // The old OpenRouter key must be cleared to prevent sending it
+        // to the Anthropic API (which would cause a confusing 401).
+        let secrets = alms_core::secrets::SecretsStore::empty();
+        let switched = client.with_provider_and_secrets("anthropic", &secrets);
+        assert_eq!(switched.provider(), "anthropic");
+        assert_eq!(switched.base_url(), "https://api.anthropic.com/v1");
+        // Key must be empty, not the old OpenRouter key
+        assert_eq!(switched.api_key(), "");
+    }
+
+    #[test]
+    fn test_same_provider_no_key_keeps_existing() {
+        // When re-applying the SAME provider and no key is found,
+        // the existing key should be preserved (not cleared).
+        let config = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "sk-or-existing".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+
+        let secrets = alms_core::secrets::SecretsStore::empty();
+        let same = client.with_provider_and_secrets("openrouter", &secrets);
+        assert_eq!(same.provider(), "openrouter");
+        // Same provider, no new key found -- existing key preserved
+        assert_eq!(same.api_key(), "sk-or-existing");
     }
 }

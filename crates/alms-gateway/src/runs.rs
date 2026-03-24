@@ -126,15 +126,35 @@ pub fn resolve_agent_config(
     if let Some(ref record) = agent_record
         && let Some(ref provider) = record.provider
     {
+        info!(
+            agent_id = %agent_id,
+            provider = %provider,
+            "Applying per-agent provider override with secrets resolution"
+        );
         llm = if let Some(s) = secrets {
             llm.with_provider_and_secrets(provider, s)
         } else {
+            warn!(
+                agent_id = %agent_id,
+                provider = %provider,
+                "No secrets store available for per-agent provider override — API key may be missing"
+            );
             llm.with_provider(provider)
         };
     } else if let Some(s) = secrets {
         // No per-agent provider override — re-resolve the key for the
         // server-default provider from the live secrets store.
+        info!(
+            agent_id = %agent_id,
+            provider = %llm.provider(),
+            "Re-resolving API key from secrets for default provider"
+        );
         llm = llm.with_secrets(s);
+    } else {
+        warn!(
+            agent_id = %agent_id,
+            "No secrets store and no per-agent provider — using base LLM client key as-is"
+        );
     }
     if let Some(model) = merged.model_override {
         llm = llm.with_model(model);
