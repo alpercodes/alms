@@ -193,7 +193,7 @@ export function SettingsModal({ open, onClose }) {
                     <div class="settings-row">
                         <label class="settings-label">Max tokens</label>
                         <input class="settings-input" type="number" min="1"
-                               placeholder=${defaults.max_tokens || 4096}
+                               placeholder=${defaults.max_tokens || 100000}
                                value=${maxTokens.value}
                                onInput=${e => { maxTokens.value = e.target.value; }} />
                     </div>
