@@ -30,7 +30,8 @@ function Section({ title, defaultOpen = false, children }) {
                 <span class="settings-section-arrow ${open.value ? 'open' : ''}">\u25B6</span>
                 <span class="settings-section-title">${title}</span>
             </button>
-            <div class="settings-section-body ${open.value ? 'open' : ''}">
+            <div class="settings-section-body ${open.value ? 'open' : ''}"
+                 aria-hidden=${!open.value}>
                 ${children}
             </div>
         </div>
