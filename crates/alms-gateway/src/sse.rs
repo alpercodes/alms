@@ -165,13 +165,35 @@ impl SseEventData {
     }
 
     pub fn run_error(run_id: RunId, error: &str) -> Self {
+        Self::run_error_with_code(run_id, &classify_error(error), error)
+    }
+
+    /// Emit a `run_error` with an explicit error code for the frontend to
+    /// style differently (e.g. `AUTH`, `RATE_LIMIT`, `TIMEOUT`, `INTERNAL`).
+    pub fn run_error_with_code(run_id: RunId, code: &str, message: &str) -> Self {
         Self::new(
             "run_error",
             RunErrorData {
                 run_id: run_id.0.to_string(),
                 error: ErrorData {
-                    code: "INTERNAL".to_string(),
-                    message: error.to_string(),
+                    code: code.to_string(),
+                    message: message.to_string(),
+                },
+            },
+        )
+    }
+
+    /// Emit a `run_warning` event for non-fatal conditions like max iterations
+    /// reached. The frontend should style these as warnings (yellow), not
+    /// errors (red).
+    pub fn run_warning(run_id: RunId, code: &str, message: &str) -> Self {
+        Self::new(
+            "run_warning",
+            RunWarningData {
+                run_id: run_id.0.to_string(),
+                warning: WarningData {
+                    code: code.to_string(),
+                    message: message.to_string(),
                 },
             },
         )
@@ -457,6 +479,18 @@ struct ErrorData {
 }
 
 #[derive(Debug, Serialize)]
+struct RunWarningData {
+    run_id: String,
+    warning: WarningData,
+}
+
+#[derive(Debug, Serialize)]
+struct WarningData {
+    code: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
 struct RunCancelledData {
     run_id: String,
     ts: DateTime<Utc>,
@@ -501,6 +535,35 @@ struct JobCompletedData {
     status: String,
     summary: String,
     ts: DateTime<Utc>,
+}
+
+/// Classify an error message into an error code for the frontend.
+///
+/// The code is used by the UI to pick appropriate styling:
+/// - `AUTH` — authentication failure (red, actionable hint)
+/// - `RATE_LIMIT` — rate-limited by the LLM provider (yellow/warning)
+/// - `TIMEOUT` — request or connection timeout (yellow/warning)
+/// - `INTERNAL` — catch-all for unexpected errors (red)
+fn classify_error(msg: &str) -> String {
+    let lower = msg.to_lowercase();
+    if lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("authentication")
+        || lower.contains("invalid api key")
+        || lower.contains("invalid x-api-key")
+    {
+        "AUTH".to_string()
+    } else if lower.contains("429")
+        || lower.contains("rate limit")
+        || lower.contains("rate_limit")
+        || lower.contains("too many requests")
+    {
+        "RATE_LIMIT".to_string()
+    } else if lower.contains("timeout") || lower.contains("timed out") {
+        "TIMEOUT".to_string()
+    } else {
+        "INTERNAL".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -618,5 +681,66 @@ mod tests {
         let events: Vec<_> = live_stream.collect().await;
         assert_eq!(events.len(), 1, "only event_id=4 should pass dedup filter");
         assert_eq!(events[0].event_id, Some(4));
+    }
+
+    #[test]
+    fn test_classify_error_auth() {
+        assert_eq!(classify_error("401 Unauthorized"), "AUTH");
+        assert_eq!(classify_error("authentication failed"), "AUTH");
+        assert_eq!(classify_error("Invalid API key provided"), "AUTH");
+        assert_eq!(classify_error("invalid x-api-key"), "AUTH");
+    }
+
+    #[test]
+    fn test_classify_error_rate_limit() {
+        assert_eq!(classify_error("429 Too Many Requests"), "RATE_LIMIT");
+        assert_eq!(classify_error("rate limit exceeded"), "RATE_LIMIT");
+        assert_eq!(classify_error("rate_limit_error"), "RATE_LIMIT");
+    }
+
+    #[test]
+    fn test_classify_error_timeout() {
+        assert_eq!(classify_error("connection timed out"), "TIMEOUT");
+        assert_eq!(classify_error("request timeout after 120s"), "TIMEOUT");
+    }
+
+    #[test]
+    fn test_classify_error_internal() {
+        assert_eq!(classify_error("something went wrong"), "INTERNAL");
+    }
+
+    #[test]
+    fn test_run_warning_event() {
+        let run_id = RunId::new();
+        let event = SseEventData::run_warning(run_id, "MAX_ITERATIONS", "Max iterations reached");
+        assert_eq!(event.event_type, "run_warning");
+        assert_eq!(event.data["warning"]["code"], "MAX_ITERATIONS");
+        assert_eq!(event.data["warning"]["message"], "Max iterations reached");
+    }
+
+    #[test]
+    fn test_run_error_with_code() {
+        let run_id = RunId::new();
+        let event = SseEventData::run_error_with_code(run_id, "AUTH", "401 Unauthorized");
+        assert_eq!(event.event_type, "run_error");
+        assert_eq!(event.data["error"]["code"], "AUTH");
+        assert_eq!(event.data["error"]["message"], "401 Unauthorized");
+    }
+
+    #[test]
+    fn test_run_error_auto_classifies() {
+        let run_id = RunId::new();
+
+        let auth_event = SseEventData::run_error(run_id, "401 Unauthorized");
+        assert_eq!(auth_event.data["error"]["code"], "AUTH");
+
+        let rate_event = SseEventData::run_error(run_id, "429 Too Many Requests");
+        assert_eq!(rate_event.data["error"]["code"], "RATE_LIMIT");
+
+        let timeout_event = SseEventData::run_error(run_id, "connection timed out");
+        assert_eq!(timeout_event.data["error"]["code"], "TIMEOUT");
+
+        let generic_event = SseEventData::run_error(run_id, "unknown failure");
+        assert_eq!(generic_event.data["error"]["code"], "INTERNAL");
     }
 }

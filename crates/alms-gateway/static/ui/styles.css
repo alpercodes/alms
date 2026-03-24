@@ -508,6 +508,70 @@ header h1 {
   padding: 0 var(--space-1);
 }
 
+/* ── Error messages ── */
+.msg.msg-error {
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--error-muted);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-sm);
+  margin: var(--space-2) 0;
+}
+.msg-error-icon {
+  flex-shrink: 0;
+  font-size: var(--text-base);
+  color: var(--error);
+  line-height: 1.4;
+}
+.msg-error-body { flex: 1; min-width: 0; }
+.msg-error-title {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--error);
+  margin-bottom: var(--space-1);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.msg-error-text {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+/* ── Warning messages ── */
+.msg.msg-warning {
+  display: flex;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--warning-muted);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-sm);
+  margin: var(--space-2) 0;
+}
+.msg-warning-icon {
+  flex-shrink: 0;
+  font-size: var(--text-base);
+  color: var(--warning);
+  line-height: 1.4;
+}
+.msg-warning-body { flex: 1; min-width: 0; }
+.msg-warning-title {
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--warning);
+  margin-bottom: var(--space-1);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.msg-warning-text {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
 /* ── Tool events ── */
 .tool-row {
   align-self: flex-start;

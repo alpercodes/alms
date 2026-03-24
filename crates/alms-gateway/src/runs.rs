@@ -723,6 +723,24 @@ async fn execute_run(state: AppState, params: RunParams) {
         Ok(output) => {
             persist_tool_calls(&output.tool_calls);
 
+            // Detect max-iterations sentinel and emit a warning event so the
+            // frontend can style it distinctly (yellow) instead of as a normal
+            // agent message.
+            if output.response == "[Max iterations reached]" {
+                state
+                    .run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_warning(
+                            run_id,
+                            "MAX_ITERATIONS",
+                            "Max iterations reached — the agent hit its iteration limit before finishing. You can continue the conversation to pick up where it left off.",
+                        ),
+                    )
+                    .await;
+            }
+
             // token_delta events already emitted during streaming in the agent loop
             state
                 .run_manager
