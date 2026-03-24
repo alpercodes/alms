@@ -727,6 +727,10 @@ impl AgentRuntime {
     /// (web chat, Telegram, etc.) where `user.md` should be included in the
     /// system prompt.  Non-user-facing contexts (DM, subagent, job) return
     /// false.
+    ///
+    /// NOTE: This function is **default-open** — unknown context_id prefixes
+    /// are treated as user-facing.  When adding a new non-user-facing context
+    /// type, add its prefix to the exclusion list below.
     fn is_user_facing_context(context_id: &str) -> bool {
         // These prefixes indicate non-user-facing sessions.
         !(context_id.starts_with("dm:")

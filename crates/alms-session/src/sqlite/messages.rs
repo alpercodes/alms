@@ -50,6 +50,12 @@ impl SqliteStore {
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare messages: {e}")))?;
 
+        // `skipped` is incremented in two sequential phases below:
+        // 1. During `query_map` — rows that fail SQLite column extraction.
+        // 2. During the second `filter_map` — rows with valid columns but
+        //    unparseable content JSON or timestamps.
+        // Both phases run sequentially, so no concurrency concern; the split
+        // across two closures is just due to the two-pass processing.
         let mut skipped: usize = 0;
         let raw_rows: Vec<_> = stmt
             .query_map([session_id.0.to_string()], |row| {
