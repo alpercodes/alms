@@ -2,7 +2,7 @@ import { html, useSignal, useEffect } from '../deps.js';
 import { serverDefaults, localSettings, saveSettings } from '../state/settings.js';
 import { listKeys, setKey, removeKey } from '../api/auth.js';
 
-const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'telegram'];
+const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
 
 function ApiKeysSection() {
     const keys = useSignal([]);
@@ -171,7 +171,7 @@ export function SettingsModal({ open, onClose }) {
                                 value=${provider.value}
                                 onChange=${e => { provider.value = e.target.value; }}>
                             <option value="">Default (${defaults.provider || 'openai'})</option>
-                            <option value="openai">OpenAI / OpenRouter</option>
+                            <option value="openai">OpenAI</option>
                             <option value="anthropic">Anthropic</option>
                             <option value="openrouter">OpenRouter</option>
                         </select>

@@ -126,15 +126,35 @@ pub fn resolve_agent_config(
     if let Some(ref record) = agent_record
         && let Some(ref provider) = record.provider
     {
+        info!(
+            agent_id = %agent_id,
+            provider = %provider,
+            "Applying per-agent provider override with secrets resolution"
+        );
         llm = if let Some(s) = secrets {
             llm.with_provider_and_secrets(provider, s)
         } else {
+            warn!(
+                agent_id = %agent_id,
+                provider = %provider,
+                "No secrets store available for per-agent provider override — API key may be missing"
+            );
             llm.with_provider(provider)
         };
     } else if let Some(s) = secrets {
         // No per-agent provider override — re-resolve the key for the
         // server-default provider from the live secrets store.
+        info!(
+            agent_id = %agent_id,
+            provider = %llm.provider(),
+            "Re-resolving API key from secrets for default provider"
+        );
         llm = llm.with_secrets(s);
+    } else {
+        warn!(
+            agent_id = %agent_id,
+            "No secrets store and no per-agent provider — using base LLM client key as-is"
+        );
     }
     if let Some(model) = merged.model_override {
         llm = llm.with_model(model);
@@ -1489,9 +1509,24 @@ pub async fn stream_run_events(
                 "Run {} became terminal during SSE subscription — cleaned up orphaned sender",
                 run_id.0
             );
-            // Fall through to replay-only: the sender's rx will see
-            // channel closed immediately, so stream_with_replay will
-            // emit the replay events and then close.
+            let logged_events = state.run_manager.events_from(run_id, from_id).await;
+            let replay_events: Vec<SseEventData> = logged_events
+                .into_iter()
+                .map(|e| SseEventData {
+                    event_type: e.event_type,
+                    data: e.data,
+                    ts: e.ts,
+                    event_id: Some(e.event_id),
+                })
+                .collect();
+            if !replay_events.is_empty() {
+                info!(
+                    "Replaying {} events for terminal run {}",
+                    replay_events.len(),
+                    run_id.0
+                );
+            }
+            return Ok(RunEventStream::stream_replay_only(replay_events).into_response());
         }
 
         let logged_events = state.run_manager.events_from(run_id, from_id).await;
