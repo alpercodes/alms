@@ -1,7 +1,5 @@
 //! Telegram Bot API types
 
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 
 /// Telegram Update object
@@ -10,6 +8,8 @@ pub struct Update {
     pub update_id: i64,
     pub message: Option<Message>,
     pub edited_message: Option<Message>,
+    // Deserialized from Telegram API; callback processing not yet implemented
+    #[allow(dead_code)]
     pub callback_query: Option<CallbackQuery>,
 }
 
@@ -18,9 +18,13 @@ pub struct Update {
 pub struct Message {
     pub message_id: i64,
     pub from: Option<User>,
+    // Deserialized from Telegram API but not yet used in logic
+    #[allow(dead_code)]
     pub date: i64,
     pub chat: Chat,
     pub text: Option<String>,
+    // Deserialized from Telegram API; entity-based command parsing not yet implemented
+    #[allow(dead_code)]
     pub entities: Option<Vec<MessageEntity>>,
 }
 
@@ -48,7 +52,9 @@ pub struct Chat {
 }
 
 /// Telegram MessageEntity object
+// Deserialized from Telegram API for Message.entities; fields not yet used
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct MessageEntity {
     #[serde(rename = "type")]
     pub entity_type: String,
@@ -57,7 +63,9 @@ pub struct MessageEntity {
 }
 
 /// Telegram CallbackQuery object
+// Deserialized from Telegram API for Update.callback_query; callback handling not yet implemented
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct CallbackQuery {
     pub id: String,
     pub from: User,
@@ -71,6 +79,8 @@ pub struct TelegramResponse<T> {
     pub ok: bool,
     pub result: Option<T>,
     pub description: Option<String>,
+    // Deserialized from Telegram API error responses but not yet read
+    #[allow(dead_code)]
     pub error_code: Option<i32>,
 }
 
@@ -103,6 +113,8 @@ impl SendMessageRequest {
         self
     }
 
+    // TODO: use when sending Markdown/HTML-formatted messages
+    #[allow(dead_code)]
     pub fn parse_mode(mut self, mode: impl Into<String>) -> Self {
         self.parse_mode = Some(mode.into());
         self
