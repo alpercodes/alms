@@ -543,6 +543,16 @@ impl AgentRuntime {
         }
     }
 
+    /// Build the DM recipient addendum for a given peer name.
+    ///
+    /// Returns the formatted template from `dm_recipient.md` with the peer
+    /// name substituted.  This is appended to the system prompt so the agent
+    /// knows it must use `send_message` to reply.
+    fn dm_addendum(peer: &str) -> String {
+        let dm_template = include_str!("../prompts/dm_recipient.md");
+        format!("\n\n{}", dm_template.trim().replace("{peer}", peer))
+    }
+
     /// Build `from_agent` metadata for DM sessions so that `read_messages`
     /// can attribute system markers (errors, cancellations) to the correct
     /// agent.  Returns `None` for non-DM sessions or when `agent_name` is
@@ -576,11 +586,23 @@ impl AgentRuntime {
     ) -> AlmsResult<RunOutput> {
         let is_dm = context_id.starts_with("dm:");
         let include_user = Self::is_user_facing_context(context_id);
+        let dm_peer = if is_dm {
+            self.dm_peer_name(context_id)
+        } else {
+            None
+        };
 
         let (tool_calls, result) = match history {
             Ok(h) => {
-                self.agent_loop(session_manager, session_id, h, is_dm, include_user)
-                    .await
+                self.agent_loop(
+                    session_manager,
+                    session_id,
+                    h,
+                    is_dm,
+                    include_user,
+                    dm_peer.as_deref(),
+                )
+                .await
             }
             Err(e) => (Vec::new(), Err(e)),
         };
@@ -737,9 +759,7 @@ impl AgentRuntime {
         if context_id.starts_with("dm:")
             && let Some(peer) = self.dm_peer_name(context_id)
         {
-            let dm_template = include_str!("../prompts/dm_recipient.md");
-            let dm_addendum = format!("\n\n{}", dm_template.trim().replace("{peer}", &peer));
-            system_prompt.push_str(&dm_addendum);
+            system_prompt.push_str(&Self::dm_addendum(&peer));
             debug!(
                 peer = %peer,
                 context_id = %context_id,
@@ -928,6 +948,7 @@ impl AgentRuntime {
         mut messages: Vec<LlmMessage>,
         is_dm: bool,
         include_user: bool,
+        dm_peer: Option<&str>,
     ) -> (
         Vec<alms_core::ToolCallRecord>,
         AlmsResult<(String, TokenUsage)>,
@@ -1206,12 +1227,19 @@ impl AgentRuntime {
                 // subsequent iterations. The agent's identity (initial prompt +
                 // workspace prefix) is preserved; tool_loop adds continuation
                 // guidance on top.
+                //
+                // For DM sessions, re-inject the DM recipient addendum so the
+                // agent remembers to use `send_message` on every iteration —
+                // not just the first one (fixes #346).
                 if !messages.is_empty() && messages[0].role == "system" {
                     let combined = format!(
                         "{}\n\n{}",
                         self.config.system_prompt, self.config.prompts.tool_loop
                     );
-                    let tool_loop_prompt = self.assemble_system_prompt(&combined, include_user);
+                    let mut tool_loop_prompt = self.assemble_system_prompt(&combined, include_user);
+                    if let Some(peer) = dm_peer {
+                        tool_loop_prompt.push_str(&Self::dm_addendum(peer));
+                    }
                     messages[0] = LlmMessage::system(tool_loop_prompt);
                 }
 
@@ -2368,5 +2396,37 @@ mod tests {
         assert!(AgentRuntime::is_user_facing_context("dmx:something"));
         assert!(AgentRuntime::is_user_facing_context("subagentx_something"));
         assert!(AgentRuntime::is_user_facing_context("jobs_something"));
+    }
+
+    #[test]
+    fn test_dm_addendum_contains_peer_name() {
+        let addendum = AgentRuntime::dm_addendum("alice");
+        assert!(
+            addendum.contains("\"alice\""),
+            "DM addendum should contain the peer name in quotes. Got: {}",
+            addendum
+        );
+        assert!(
+            addendum.contains("send_message"),
+            "DM addendum should instruct agent to use send_message. Got: {}",
+            addendum
+        );
+        assert!(
+            addendum.contains("direct message from agent"),
+            "DM addendum should identify the message as a DM. Got: {}",
+            addendum
+        );
+    }
+
+    #[test]
+    fn test_dm_addendum_substitutes_different_peers() {
+        let addendum_alice = AgentRuntime::dm_addendum("alice");
+        let addendum_charlie = AgentRuntime::dm_addendum("charlie");
+
+        assert!(addendum_alice.contains("\"alice\""));
+        assert!(!addendum_alice.contains("\"charlie\""));
+
+        assert!(addendum_charlie.contains("\"charlie\""));
+        assert!(!addendum_charlie.contains("\"alice\""));
     }
 }
