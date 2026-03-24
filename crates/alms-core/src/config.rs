@@ -231,7 +231,7 @@ impl AlmsConfig {
             );
         }
 
-        let valid_providers = ["openai", "anthropic"];
+        let valid_providers = ["openai", "anthropic", "openrouter"];
         if !valid_providers.contains(&self.llm.provider.as_str()) {
             return Err(AlmsError::InvalidConfig(format!(
                 "llm.provider must be one of {:?}, got '{}'",
@@ -390,7 +390,7 @@ impl ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
-    /// Provider: "openai" (default, OpenRouter-compatible) or "anthropic"
+    /// Provider: "openai" (default), "openrouter", or "anthropic"
     pub provider: String,
     pub base_url: String,
     pub model: String,
