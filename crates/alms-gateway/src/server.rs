@@ -787,55 +787,73 @@ async fn get_session_messages(
 
     match state.session_manager.get_history(session_id) {
         Ok(messages) => {
-            tracing::debug!(
-                "Session {} has {} total messages",
-                session_id.0,
-                messages.len()
-            );
+            let total = messages.len();
+            tracing::debug!("Session {} has {} total messages", session_id.0, total);
+            let mut skipped: usize = 0;
             let visible: Vec<serde_json::Value> = messages
                 .into_iter()
-                .filter_map(|m| match (&m.role, &m.content) {
-                    (Role::User, Content::Text(t)) => Some(serde_json::json!({
-                        "role": "user",
-                        "type": "text",
-                        "content": t,
-                        "timestamp": m.timestamp,
-                    })),
-                    (Role::Assistant, Content::Text(t)) => Some(serde_json::json!({
-                        "role": "assistant",
-                        "type": "text",
-                        "content": t,
-                        "timestamp": m.timestamp,
-                    })),
-                    (Role::Assistant, Content::ToolCall { name, params }) => {
-                        Some(serde_json::json!({
-                            "role": "assistant",
+                .filter_map(|m| {
+                    let role_str = match m.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "tool",
+                        Role::System => {
+                            // System messages are internal — skip them from API output
+                            skipped += 1;
+                            return None;
+                        }
+                    };
+                    let json = match &m.content {
+                        Content::Text(t) => serde_json::json!({
+                            "role": role_str,
+                            "type": "text",
+                            "content": t,
+                            "timestamp": m.timestamp,
+                        }),
+                        Content::ToolCall { name, params } => serde_json::json!({
+                            "role": role_str,
                             "type": "tool_call",
                             "tool": name,
                             "params": params,
                             "timestamp": m.timestamp,
                             "metadata": m.metadata,
-                        }))
-                    }
-                    (Role::Tool, Content::ToolResult { tool_id, result }) => {
-                        let ok = m
-                            .metadata
-                            .as_ref()
-                            .and_then(|md| md.get("ok"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        Some(serde_json::json!({
-                            "role": "tool",
-                            "type": "tool_result",
-                            "tool_id": tool_id,
-                            "result": result,
-                            "ok": ok,
+                        }),
+                        Content::ToolResult { tool_id, result } => {
+                            let ok = m
+                                .metadata
+                                .as_ref()
+                                .and_then(|md| md.get("ok"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            serde_json::json!({
+                                "role": role_str,
+                                "type": "tool_result",
+                                "tool_id": tool_id,
+                                "result": result,
+                                "ok": ok,
+                                "timestamp": m.timestamp,
+                            })
+                        }
+                        Content::Image { url, alt } => serde_json::json!({
+                            "role": role_str,
+                            "type": "image",
+                            "url": url,
+                            "alt": alt,
                             "timestamp": m.timestamp,
-                        }))
-                    }
-                    _ => None, // skip system messages
+                        }),
+                    };
+                    Some(json)
                 })
                 .collect();
+            if skipped > 0 {
+                tracing::debug!(
+                    "Session {}: returned {} of {} messages ({} system messages excluded)",
+                    session_id.0,
+                    visible.len(),
+                    total,
+                    skipped,
+                );
+            }
 
             Json(serde_json::json!({
                 "messages": visible,

@@ -50,7 +50,8 @@ impl SqliteStore {
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare messages: {e}")))?;
 
-        let rows = stmt
+        let mut skipped: usize = 0;
+        let raw_rows: Vec<_> = stmt
             .query_map([session_id.0.to_string()], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -65,14 +66,20 @@ impl SqliteStore {
                 Ok(v) => Some(v),
                 Err(e) => {
                     tracing::warn!("Skipping unparseable message row: {e}");
+                    skipped += 1;
                     None
                 }
             })
+            .collect();
+
+        let rows: Vec<Message> = raw_rows
+            .into_iter()
             .filter_map(|(id, role_str, content_json, ts_str, metadata_str)| {
                 let content: Content = match serde_json::from_str(&content_json) {
                     Ok(c) => c,
                     Err(e) => {
                         tracing::warn!("Skipping message {id}: bad content JSON: {e}");
+                        skipped += 1;
                         return None;
                     }
                 };
@@ -80,6 +87,7 @@ impl SqliteStore {
                     Ok(t) => t,
                     Err(e) => {
                         tracing::warn!("Skipping message {id}: bad timestamp: {e}");
+                        skipped += 1;
                         return None;
                     }
                 };
@@ -99,6 +107,15 @@ impl SqliteStore {
                 })
             })
             .collect();
+
+        if skipped > 0 {
+            tracing::warn!(
+                "Session {}: loaded {} messages, skipped {} unparseable rows",
+                session_id.0,
+                rows.len(),
+                skipped,
+            );
+        }
 
         Ok(rows)
     }
