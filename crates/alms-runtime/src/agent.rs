@@ -397,6 +397,16 @@ impl AgentRuntime {
         self
     }
 
+    /// Emit a status event to the gateway layer (best-effort, never fails).
+    fn emit_status(&self, phase: &str, detail: Option<&str>) {
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(crate::events::RuntimeEvent::Status {
+                phase: phase.to_string(),
+                detail: detail.map(|d| d.to_string()),
+            });
+        }
+    }
+
     /// Create with default config
     pub fn with_defaults(agent_id: AgentId) -> AlmsResult<Self> {
         let llm = LlmClient::from_env()?;
@@ -437,6 +447,7 @@ impl AgentRuntime {
 
         // Build context first (reads history without current input to avoid double-counting),
         // then persist the user message so it survives agent loop failures.
+        self.emit_status("building_context", None);
         let history = self
             .build_context(session_manager, &session.id, context_id, &input)
             .await;
@@ -494,6 +505,7 @@ impl AgentRuntime {
         // Build context: the input message is already in the session history
         // (written by MessageBus), so we pass an empty string as the current
         // input to avoid duplicating it in the context window.
+        self.emit_status("building_context", None);
         let history = self
             .build_context(session_manager, &session_id, context_id, "")
             .await;
@@ -738,6 +750,7 @@ impl AgentRuntime {
         // On failure we log a warning and fall back (None summary → truncate behaviour).
         let summary_text: Option<String> =
             if self.config.context_config.strategy == "sliding-summary" {
+                self.emit_status("summarizing", None);
                 let current = session_manager.get_summary(*session_id).unwrap_or_default();
                 match self
                     .maybe_summarize(session_manager, *session_id, &history, current)
@@ -954,6 +967,7 @@ impl AgentRuntime {
             // Checkpoint B: LLM call with cancellation support.
             // Stream the LLM call, emitting token_delta events as chunks arrive.
             // Falls back to buffered mode if streaming fails.
+            self.emit_status("calling_llm", None);
             let streaming_future = self.stream_llm_call(request.clone());
             let stream_result = if let Some(ref token) = self.cancel_token {
                 tokio::select! {
@@ -1068,6 +1082,14 @@ impl AgentRuntime {
                     });
                     tool_seq += 1;
                 }
+
+                // Emit status: list tool names being executed.
+                let tool_names: Vec<&str> = tool_calls
+                    .iter()
+                    .map(|tc| tc.function.name.as_str())
+                    .collect();
+                let detail = tool_names.join(", ");
+                self.emit_status("executing_tools", Some(&detail));
 
                 // Checkpoint C: tool execution with cancellation support.
                 //

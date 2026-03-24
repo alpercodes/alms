@@ -84,6 +84,16 @@ function ChatView() {
                             label = 'Running scheduled job';
                         } else if (m.source === 'subagent') {
                             label = 'Processing subagent result';
+                        } else if (m.phase === 'building_context') {
+                            label = 'Building context';
+                        } else if (m.phase === 'summarizing') {
+                            label = 'Summarizing history';
+                        } else if (m.phase === 'calling_llm') {
+                            label = 'Thinking';
+                        } else if (m.phase === 'executing_tools') {
+                            label = m.phaseDetail
+                                ? 'Running ' + m.phaseDetail
+                                : 'Running tools';
                         }
                         return html`
                             <div key="thinking" class="msg agent">

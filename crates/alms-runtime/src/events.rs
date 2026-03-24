@@ -31,6 +31,17 @@ pub enum RuntimeEvent {
         /// When set, this delta originated from a subagent's LLM stream.
         source_agent: Option<String>,
     },
+    /// A status update indicating the current phase of the agent run.
+    ///
+    /// Emitted at key moments so the gateway can forward a `status` SSE event
+    /// and the UI can show what the agent is doing during dead-air phases
+    /// (e.g. "Building context...", "Thinking...", "Running shell_exec...").
+    Status {
+        /// Phase identifier: `building_context`, `summarizing`, `calling_llm`, `executing_tools`.
+        phase: String,
+        /// Optional detail (e.g. tool name for `executing_tools`).
+        detail: Option<String>,
+    },
     /// Approval is required before executing a tool (guarded posture).
     ///
     /// The gateway stores the `decision_tx` and emits an `approval_required`
@@ -137,5 +148,36 @@ mod tests {
         // If sender is dropped without sending, receiver gets Err
         drop(_tx);
         assert!(decision_rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_status_event_roundtrip() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+
+        tx.send(RuntimeEvent::Status {
+            phase: "calling_llm".to_string(),
+            detail: None,
+        })
+        .unwrap();
+
+        tx.send(RuntimeEvent::Status {
+            phase: "executing_tools".to_string(),
+            detail: Some("shell_exec".to_string()),
+        })
+        .unwrap();
+
+        drop(tx);
+
+        let first = rx.recv().await.unwrap();
+        assert!(
+            matches!(&first, RuntimeEvent::Status { phase, detail } if phase == "calling_llm" && detail.is_none())
+        );
+
+        let second = rx.recv().await.unwrap();
+        assert!(
+            matches!(&second, RuntimeEvent::Status { phase, detail } if phase == "executing_tools" && detail.as_deref() == Some("shell_exec"))
+        );
+
+        assert!(rx.recv().await.is_none());
     }
 }

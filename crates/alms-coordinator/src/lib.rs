@@ -972,6 +972,8 @@ async fn run_agent_loop(
                     | RuntimeEvent::ApprovalRequired { source_agent, .. } => {
                         *source_agent = Some(label.clone());
                     }
+                    // Status events don't carry source_agent — pass through as-is.
+                    RuntimeEvent::Status { .. } => {}
                 }
                 let _ = parent_tx.send(event);
             }

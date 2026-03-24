@@ -1308,6 +1308,15 @@ async fn forward_runtime_events(
                     )
                     .await;
             }
+            RuntimeEvent::Status { phase, detail } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::status(run_id, &phase, detail),
+                    )
+                    .await;
+            }
             RuntimeEvent::ApprovalRequired {
                 approval_id,
                 tool,
