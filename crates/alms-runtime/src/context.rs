@@ -921,6 +921,123 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_perspective_system_role_unchanged() {
+        // System messages should pass through unchanged even with from_agent
+        // metadata, because the function only checks from_agent == perspective_agent
+        // to map to Assistant. A matching from_agent on a System message is an
+        // unusual edge case but documents the current behavior.
+        let builder = default_builder();
+
+        // System message without metadata -> stays System
+        let msg = make_msg_with_metadata(Role::System, "system prompt text", None);
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::System,
+            "System message without metadata should stay System"
+        );
+
+        // System message with non-matching from_agent -> stays System
+        let msg = make_msg_with_metadata(
+            Role::System,
+            "system instructions",
+            Some(serde_json::json!({"from_agent": "agent-beta"})),
+        );
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::System,
+            "System message from another agent should stay System"
+        );
+    }
+
+    #[test]
+    fn test_apply_perspective_tool_role_unchanged() {
+        // Tool-result messages should pass through unchanged when from_agent
+        // does not match the perspective agent (the common case).
+        let builder = default_builder();
+
+        // Tool message without metadata -> stays Tool
+        let msg = make_msg_with_metadata(Role::Tool, "tool output", None);
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::Tool,
+            "Tool message without metadata should stay Tool"
+        );
+
+        // Tool message with non-matching from_agent -> stays Tool
+        let msg = make_msg_with_metadata(
+            Role::Tool,
+            "tool result payload",
+            Some(serde_json::json!({"from_agent": "agent-beta"})),
+        );
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::Tool,
+            "Tool message from another agent should stay Tool"
+        );
+    }
+
+    #[test]
+    fn test_apply_perspective_assistant_role_unchanged_no_match() {
+        // An Assistant message with non-matching (or absent) from_agent should
+        // keep its role. This can happen when an Assistant message from one
+        // agent is loaded into a DM session that is then viewed from a
+        // different agent's perspective.
+        let builder = default_builder();
+
+        let msg = make_msg_with_metadata(
+            Role::Assistant,
+            "I replied earlier",
+            Some(serde_json::json!({"from_agent": "agent-beta"})),
+        );
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::Assistant,
+            "Assistant message from another agent should stay Assistant"
+        );
+    }
+
+    #[test]
+    fn test_apply_perspective_non_user_role_with_matching_agent_becomes_assistant() {
+        // Documents current behavior: if from_agent matches the perspective
+        // agent, the role is unconditionally overwritten to Assistant,
+        // regardless of the original role. This is an edge case -- in practice
+        // DM messages are always stored as Role::User -- but the test locks
+        // down the behavior so any future change is intentional.
+        let builder = default_builder();
+
+        // System message with matching from_agent -> mapped to Assistant
+        let msg = make_msg_with_metadata(
+            Role::System,
+            "system from self",
+            Some(serde_json::json!({"from_agent": "agent-alpha"})),
+        );
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::Assistant,
+            "matching from_agent should override even System role to Assistant"
+        );
+
+        // Tool message with matching from_agent -> mapped to Assistant
+        let msg = make_msg_with_metadata(
+            Role::Tool,
+            "tool from self",
+            Some(serde_json::json!({"from_agent": "agent-alpha"})),
+        );
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::Assistant,
+            "matching from_agent should override even Tool role to Assistant"
+        );
+    }
+
+    #[test]
     fn test_group_tool_calls_does_not_merge_across_text() {
         // If there's an assistant text message between two tool call groups,
         // they should NOT be merged.
