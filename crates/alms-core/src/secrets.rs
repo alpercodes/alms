@@ -369,11 +369,28 @@ impl SecretsStore {
         // Atomic write: temp file -> fsync -> rename.
         // If rename fails (Windows can reject rename-over-existing), fall back
         // to a direct write so we don't lose the data entirely.
+        //
+        // On Unix, the temp file is created with mode 0600 to prevent any
+        // window where the secrets file is world-readable (TOCTOU fix).
         let tmp_path = self.path.with_extension("tmp");
         let atomic_ok = (|| -> std::io::Result<()> {
             {
                 use std::io::Write;
+
+                #[cfg(unix)]
+                let mut f = {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&tmp_path)?
+                };
+
+                #[cfg(not(unix))]
                 let mut f = std::fs::File::create(&tmp_path)?;
+
                 f.write_all(&data)?;
                 f.sync_all()?;
             }
