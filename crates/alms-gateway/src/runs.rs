@@ -415,6 +415,23 @@ pub async fn create_run(
     Ok((StatusCode::CREATED, Json(response)))
 }
 
+/// Resolve the effective posture for a run.
+///
+/// Peer-message-triggered runs (DMs from other agents) have no human in the
+/// loop, so Guarded posture would hang forever waiting for approval. This
+/// function overrides Guarded to Autonomous for those runs while leaving all
+/// other postures unchanged.
+fn resolve_posture_for_run(
+    posture: alms_runtime::Posture,
+    is_peer_message: bool,
+) -> alms_runtime::Posture {
+    if is_peer_message && posture == alms_runtime::Posture::Guarded {
+        alms_runtime::Posture::Autonomous
+    } else {
+        posture
+    }
+}
+
 /// Execute a run in background, forwarding runtime events to SSE.
 #[instrument(level = "info", skip(state, params), fields(run_id = %params.run_id.0, session_id = %params.session_id.0))]
 async fn execute_run(state: AppState, params: RunParams) {
@@ -500,13 +517,14 @@ async fn execute_run(state: AppState, params: RunParams) {
     // Peer-message-triggered runs (DMs from other agents) have no human in
     // the loop, so Guarded posture would hang forever waiting for approval.
     // Force Autonomous posture for these runs.
-    if is_peer_message && agent_config.posture == alms_runtime::Posture::Guarded {
+    let resolved = resolve_posture_for_run(agent_config.posture, is_peer_message);
+    if resolved != agent_config.posture {
         info!(
-            "Run {} is peer-message-triggered — overriding Guarded posture to Autonomous",
-            run_id.0
+            "Run {} is peer-message-triggered — overriding {:?} posture to {:?}",
+            run_id.0, agent_config.posture, resolved
         );
-        agent_config.posture = alms_runtime::Posture::Autonomous;
     }
+    agent_config.posture = resolved;
 
     // Create a runtime event channel so we can forward tool events to SSE.
     // Clone before moving into `with_event_sender` so invoke_agent can forward
@@ -1799,55 +1817,40 @@ mod tests {
 
     #[test]
     fn test_peer_message_overrides_guarded_to_autonomous() {
-        // Simulate the posture override logic in execute_run for peer-message runs.
-        let mut cfg = AgentConfig {
-            posture: Posture::Guarded,
-            ..AgentConfig::default()
-        };
-        let is_peer_message = true;
-
-        // This mirrors the logic in execute_run:
-        if is_peer_message && cfg.posture == Posture::Guarded {
-            cfg.posture = Posture::Autonomous;
-        }
-        assert!(
-            matches!(cfg.posture, Posture::Autonomous),
+        let result = resolve_posture_for_run(Posture::Guarded, true);
+        assert_eq!(
+            result,
+            Posture::Autonomous,
             "Guarded posture should be overridden to Autonomous for peer-message runs"
         );
     }
 
     #[test]
     fn test_peer_message_does_not_override_full_control() {
-        // If the agent is already FullControl, peer-message should not change it.
-        let mut cfg = AgentConfig {
-            posture: Posture::FullControl,
-            ..AgentConfig::default()
-        };
-        let is_peer_message = true;
-
-        if is_peer_message && cfg.posture == Posture::Guarded {
-            cfg.posture = Posture::Autonomous;
-        }
-        assert!(
-            matches!(cfg.posture, Posture::FullControl),
+        let result = resolve_posture_for_run(Posture::FullControl, true);
+        assert_eq!(
+            result,
+            Posture::FullControl,
             "FullControl posture should NOT be overridden for peer-message runs"
         );
     }
 
     #[test]
-    fn test_non_peer_message_keeps_guarded() {
-        // Non-peer-message runs (user-initiated) should keep Guarded posture.
-        let mut cfg = AgentConfig {
-            posture: Posture::Guarded,
-            ..AgentConfig::default()
-        };
-        let is_peer_message = false;
+    fn test_peer_message_does_not_override_autonomous() {
+        let result = resolve_posture_for_run(Posture::Autonomous, true);
+        assert_eq!(
+            result,
+            Posture::Autonomous,
+            "Autonomous posture should remain unchanged for peer-message runs"
+        );
+    }
 
-        if is_peer_message && cfg.posture == Posture::Guarded {
-            cfg.posture = Posture::Autonomous;
-        }
-        assert!(
-            matches!(cfg.posture, Posture::Guarded),
+    #[test]
+    fn test_non_peer_message_keeps_guarded() {
+        let result = resolve_posture_for_run(Posture::Guarded, false);
+        assert_eq!(
+            result,
+            Posture::Guarded,
             "Guarded posture should be preserved for non-peer-message runs"
         );
     }
