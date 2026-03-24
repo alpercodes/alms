@@ -171,7 +171,7 @@ pub async fn create_agent(
         store
             .set_default_agent(agent.id)
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
-        *state.default_agent_id.write().unwrap() = agent.id;
+        *state.default_agent_id.write() = agent.id;
         agent.is_default = true;
     }
 
@@ -290,7 +290,7 @@ pub async fn set_default(
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
 
     // Update the live default agent ID so the running gateway uses it immediately.
-    *state.default_agent_id.write().unwrap() = agent.id;
+    *state.default_agent_id.write() = agent.id;
 
     Ok(Json(
         serde_json::json!({ "ok": true, "default_agent": agent.name }),

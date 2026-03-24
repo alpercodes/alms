@@ -145,7 +145,7 @@ pub struct Coordinator {
     /// The gateway listens on the receiving end and creates follow-up runs.
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
     /// Secrets store for API key resolution (per-agent provider overrides).
-    secrets: Option<Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>>,
+    secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
 }
 
 impl Coordinator {
@@ -204,7 +204,7 @@ impl Coordinator {
     /// Set the secrets store for API key resolution in subagent provider overrides.
     pub fn with_secrets(
         mut self,
-        secrets: Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>,
+        secrets: Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>,
     ) -> Self {
         self.secrets = Some(secrets);
         self
@@ -540,7 +540,7 @@ async fn run_subagent(
     subagent_prompts: Arc<DashMap<String, String>>,
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
     parent_cancel_token: Option<CancellationToken>,
-    secrets: Option<Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>>,
+    secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
 ) {
     // RAII guard: removes the name from active_named on drop (including panics).
     let _named_guard = NamedSubagentGuard {
@@ -815,7 +815,7 @@ async fn run_agent_loop(
     data_dir: Option<&std::path::Path>,
     subagent_prompts: &DashMap<String, String>,
     cancel_token: CancellationToken,
-    secrets: Option<&Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>>,
+    secrets: Option<&Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
 ) -> AlmsResult<RunOutput> {
     // Derive identity and config based on whether the subagent is named
     let (agent_id, context_id, config, model_override, provider_override, attach_workspace) =
@@ -892,14 +892,14 @@ async fn run_agent_loop(
     if let Some(ref provider) = provider_override {
         info!("Named subagent using provider override: {provider}");
         subagent_llm = if let Some(s) = secrets {
-            subagent_llm.with_provider_and_secrets(provider, &s.read().unwrap())
+            subagent_llm.with_provider_and_secrets(provider, &s.read())
         } else {
             subagent_llm.with_provider(provider)
         };
     } else if let Some(s) = secrets {
         // No per-agent provider override — re-resolve the key for the
         // server-default provider from the live secrets store.
-        subagent_llm = subagent_llm.with_secrets(&s.read().unwrap());
+        subagent_llm = subagent_llm.with_secrets(&s.read());
     }
     if let Some(model) = model_override {
         info!("Named subagent using model override: {model}");

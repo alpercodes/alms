@@ -20,7 +20,7 @@ use serde::Deserialize;
 /// Only shows keys from the secrets store. Env var keys are ignored for
 /// security (agents can read env vars via shell_exec).
 pub async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
-    let secrets = state.secrets.read().unwrap();
+    let secrets = state.secrets.read();
     let keys: Vec<serde_json::Value> = VALID_PROVIDERS
         .iter()
         .map(|p| {
@@ -71,7 +71,6 @@ pub async fn set_key(
     state
         .secrets
         .write()
-        .unwrap()
         .set_key(&req.provider, &req.key)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
 
@@ -101,7 +100,6 @@ pub async fn remove_key(
     let existed = state
         .secrets
         .write()
-        .unwrap()
         .remove_key(&provider)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
 
