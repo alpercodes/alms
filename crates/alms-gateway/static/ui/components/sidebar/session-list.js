@@ -43,17 +43,21 @@ async function selectSession(sessionId) {
     }
 
     // Load chat history
+    let lastEventId = null;
     try {
         const data = await getSessionMessages(sessionId);
         if (gen !== selectGeneration) return; // stale — discard
         chatMessages.value = mapHistoryMessages(data.messages || []);
+        // Capture the SSE high-water mark so we can skip replay of events
+        // that are already reflected in the loaded messages.
+        if (data.last_event_id != null) lastEventId = data.last_event_id;
     } catch (err) {
         if (gen !== selectGeneration) return;
         chatMessages.value = [{ type: 'error', text: `Failed to load message history: ${err.message || 'unknown error'}` }];
     }
 
     if (gen !== selectGeneration) return; // final guard before opening stream
-    openSessionStream(sessionId);
+    openSessionStream(sessionId, { lastEventId });
 }
 
 async function newSession() {

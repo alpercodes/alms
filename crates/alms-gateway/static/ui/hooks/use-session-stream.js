@@ -57,15 +57,23 @@ function sealLastAgent() {
 /**
  * Open a persistent session-level SSE stream.
  * Stays open across runs — all events for this session arrive here.
+ *
+ * @param {string} sessionId
+ * @param {object} [opts]
+ * @param {number} [opts.lastEventId] — skip replay of events up to (and
+ *   including) this ID. Used when the client already loaded history via
+ *   the REST API and only needs new live events going forward.
  */
-export function openSessionStream(sessionId) {
+export function openSessionStream(sessionId, opts) {
     closeSessionStream();
     if (!sessionId) return;
 
     const token = localStorage.getItem('alms_auth_token');
-    const url = token
-        ? `/sessions/${sessionId}/events?token=${encodeURIComponent(token)}`
-        : `/sessions/${sessionId}/events`;
+    const params = new URLSearchParams();
+    if (token) params.set('token', token);
+    if (opts && opts.lastEventId != null) params.set('last_event_id', String(opts.lastEventId));
+    const qs = params.toString();
+    const url = `/sessions/${sessionId}/events${qs ? '?' + qs : ''}`;
     const es = new EventSource(url);
     activeSessionEs = es;
     sessionRetryCount = 0;

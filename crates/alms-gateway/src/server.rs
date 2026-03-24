@@ -452,6 +452,14 @@ impl RunManager {
             .events_from(session_id, from_id)
             .await
     }
+
+    /// Return the highest session-level event ID, or `None` if no events exist.
+    ///
+    /// Exposed to the REST messages endpoint so the client can pass
+    /// `?last_event_id=<n>` when opening the SSE stream.
+    pub async fn latest_session_event_id(&self, session_id: SessionId) -> Option<u64> {
+        self.session_event_log.latest_event_id(session_id).await
+    }
 }
 
 impl Default for RunManager {
@@ -760,6 +768,11 @@ async fn get_session(
 }
 
 /// GET /sessions/{session_id}/messages — return chat history including tool calls
+///
+/// Response includes `last_event_id` — the current high-water mark of the
+/// session's SSE event log. Clients should pass this value as
+/// `?last_event_id=<n>` when opening the SSE stream to skip replay of
+/// events that are already reflected in the returned messages.
 async fn get_session_messages(
     State(state): State<AppState>,
     Path(session_id): Path<SessionId>,
@@ -816,7 +829,16 @@ async fn get_session_messages(
                     _ => None, // skip system messages
                 })
                 .collect();
-            Json(serde_json::json!({ "messages": visible })).into_response()
+
+            // Include the latest SSE event ID so the client can open the
+            // stream with ?last_event_id=<n> and avoid duplicate replay.
+            let last_event_id = state.run_manager.latest_session_event_id(session_id).await;
+
+            Json(serde_json::json!({
+                "messages": visible,
+                "last_event_id": last_event_id,
+            }))
+            .into_response()
         }
         Err(_) => {
             api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response()

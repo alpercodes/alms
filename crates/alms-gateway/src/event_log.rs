@@ -176,4 +176,16 @@ impl SessionEventLogManager {
             None => Vec::new(),
         }
     }
+
+    /// Return the highest event ID for a session, or `None` if no events exist.
+    ///
+    /// Used by the REST messages endpoint to tell the client the current
+    /// high-water mark so it can open an SSE stream with
+    /// `?last_event_id=<n>` and skip replay of already-loaded history.
+    pub async fn latest_event_id(&self, session_id: SessionId) -> Option<u64> {
+        let logs = self.logs.read().await;
+        let log = logs.get(&session_id)?;
+        let events = log.events.read().await;
+        events.last().map(|e| e.event_id)
+    }
 }
