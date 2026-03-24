@@ -24,7 +24,9 @@ function Section({ title, defaultOpen = false, children }) {
     const open = useSignal(defaultOpen);
     return html`
         <div class="settings-section">
-            <button class="settings-section-toggle" onClick=${() => { open.value = !open.value; }}>
+            <button class="settings-section-toggle"
+                    aria-expanded=${open.value}
+                    onClick=${() => { open.value = !open.value; }}>
                 <span class="settings-section-arrow ${open.value ? 'open' : ''}">\u25B6</span>
                 <span class="settings-section-title">${title}</span>
             </button>

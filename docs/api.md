@@ -632,17 +632,49 @@ Returns current server defaults for UI pre-population.
 **Response 200**
 ```json
 {
+  "version": "0.1.1",
+  "provider": "openai",
   "model": "openai/gpt-4o",
   "base_url": "https://openrouter.ai/api/v1",
   "max_tokens": 4096,
   "posture": "guarded",
   "context_strategy": "truncate",
+  "stream_chunk_timeout_secs": 60,
   "enabled_tools": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write"],
   "agent_id": "<uuid>",
-  "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null}],
-  "workspace_dir": "./data/workspace"
+  "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null, "needs_bootstrap": false}],
+  "workspace_dir": "./data/workspace",
+  "context": {
+    "strategy": "truncate",
+    "max_input_tokens": 100000,
+    "recent_window": 20,
+    "summary_interval": 10,
+    "summary_model": null
+  },
+  "session": {
+    "max_messages": 200,
+    "max_context_tokens": 100000,
+    "idle_timeout_secs": 86400,
+    "auto_archive": true,
+    "archive_ttl_secs": 2592000
+  },
+  "logging": {
+    "file_enabled": true,
+    "file_level": "debug",
+    "rotation": "daily",
+    "log_dir": null
+  },
+  "tools": {
+    "sandbox_root": ".",
+    "shell_policy": "sandboxed",
+    "timeout_secs": 30,
+    "max_output_bytes": null,
+    "enabled": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write"]
+  }
 }
 ```
+
+Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved for backward compatibility alongside the new nested objects (`context`, `session`, `logging`, `tools`). The nested objects contain the same data in a structured form. New consumers should prefer the nested objects.
 
 ---
 
