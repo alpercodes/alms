@@ -123,6 +123,22 @@ export function openSessionStream(sessionId, opts) {
         }
     });
 
+    // ── status: agent phase update ──
+    // Phase values correspond to constants in alms-runtime/src/events.rs:
+    //   PHASE_BUILDING_CONTEXT = "building_context"
+    //   PHASE_SUMMARIZING      = "summarizing"
+    //   PHASE_CALLING_LLM      = "calling_llm"
+    //   PHASE_EXECUTING_TOOLS  = "executing_tools"
+    on('status', (e) => {
+        const data = JSON.parse(e.data);
+        const msgs = [...chatMessages.value];
+        const idx = msgs.findLastIndex(m => m.type === 'thinking');
+        if (idx >= 0) {
+            msgs[idx] = { ...msgs[idx], phase: data.phase, phaseDetail: data.detail || null };
+            chatMessages.value = msgs;
+        }
+    });
+
     // ── token_delta ──
     on('token_delta', (e) => {
         const data = JSON.parse(e.data);

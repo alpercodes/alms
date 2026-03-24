@@ -334,11 +334,14 @@ impl RunManager {
     /// Dead subscribers (closed channels) are pruned automatically.
     /// Fans out to both per-run and per-session subscribers.
     pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
-        let is_delta = event.event_type == "token_delta";
+        let is_ephemeral = event.event_type == "token_delta" || event.event_type == "status";
 
-        // Per-run event log — skip token_delta to reduce lock contention.
-        // Live per-run subscribers still receive deltas via fan-out below.
-        if !is_delta {
+        // Per-run event log — skip ephemeral events (token_delta, status) to
+        // avoid persisting high-frequency or transient data. Status events are
+        // superseded within milliseconds by the next phase or by run_finished,
+        // so replaying stale ones on SSE reconnect would be confusing.
+        // Live subscribers still receive these events via fan-out below.
+        if !is_ephemeral {
             let event_id = self
                 .event_log
                 .log_event(run_id, session_id, &event.event_type, event.data.clone())
@@ -356,11 +359,11 @@ impl RunManager {
         }
 
         // Per-session fan-out: forward to session subscribers.
-        // Skip session event LOG for token_delta — these are high-frequency
-        // (50-100 per response) and the extra lock acquisitions + clones
-        // cause noticeable latency. Session reconnect doesn't need individual
-        // deltas — the chat history is loaded via getSessionMessages instead.
-        let session_event = if is_delta {
+        // Skip session event LOG for ephemeral events (token_delta, status) —
+        // deltas are high-frequency and status events are transient.
+        // Session reconnect doesn't need individual deltas — the chat history
+        // is loaded via getSessionMessages instead.
+        let session_event = if is_ephemeral {
             // Fast path: no logging, just fan out. Leave event_id as None
             // so the dedup filter in stream_with_replay passes it through
             // (dedup only drops Some(id) where id <= max_replay_id).

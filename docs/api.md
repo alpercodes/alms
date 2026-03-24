@@ -312,6 +312,14 @@ The `source` field is omitted when not set. `is_notification` is `true` when the
 { "run_id": "<uuid>", "delta": "text chunk" }
 ```
 
+`status`
+Transient phase indicator emitted at key moments during the agent loop so the UI can show what the agent is doing during silent periods. Not persisted to the event log; not replayed on SSE reconnect.
+```json
+{ "run_id": "<uuid>", "phase": "calling_llm", "detail": null, "ts": "..." }
+```
+`phase` values: `building_context`, `summarizing`, `calling_llm`, `executing_tools`.
+`detail` is present only for `executing_tools` (comma-separated tool names being executed).
+
 `tool_start`
 ```json
 {
