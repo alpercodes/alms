@@ -371,6 +371,13 @@ impl ServerConfig {
     /// Return the resolved path to the SQLite database file.
     ///
     /// Precedence: `ALMS_DB_PATH` env var > `{data_dir}/alms.db`.
+    ///
+    /// Known limitation: `to_string_lossy()` silently replaces non-UTF-8 path
+    /// segments with U+FFFD, which could corrupt the path on Linux filesystems
+    /// that allow arbitrary byte sequences in filenames. This is not an issue on
+    /// Windows (paths are always UTF-16). The proper fix is changing the return
+    /// type to `PathBuf`, but that requires updating callers in `alms-session`
+    /// and `alms-gateway` which expect `String` for SQLite connection strings.
     pub fn db_path(&self) -> String {
         std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| {
             Path::new(&self.data_dir)
