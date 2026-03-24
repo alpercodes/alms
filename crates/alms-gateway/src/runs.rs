@@ -1489,9 +1489,24 @@ pub async fn stream_run_events(
                 "Run {} became terminal during SSE subscription — cleaned up orphaned sender",
                 run_id.0
             );
-            // Fall through to replay-only: the sender's rx will see
-            // channel closed immediately, so stream_with_replay will
-            // emit the replay events and then close.
+            let logged_events = state.run_manager.events_from(run_id, from_id).await;
+            let replay_events: Vec<SseEventData> = logged_events
+                .into_iter()
+                .map(|e| SseEventData {
+                    event_type: e.event_type,
+                    data: e.data,
+                    ts: e.ts,
+                    event_id: Some(e.event_id),
+                })
+                .collect();
+            if !replay_events.is_empty() {
+                info!(
+                    "Replaying {} events for terminal run {}",
+                    replay_events.len(),
+                    run_id.0
+                );
+            }
+            return Ok(RunEventStream::stream_replay_only(replay_events).into_response());
         }
 
         let logged_events = state.run_manager.events_from(run_id, from_id).await;
