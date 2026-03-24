@@ -558,9 +558,13 @@ impl AgentRuntime {
         history: AlmsResult<Vec<LlmMessage>>,
     ) -> AlmsResult<RunOutput> {
         let is_dm = context_id.starts_with("dm:");
+        let include_user = Self::is_user_facing_context(context_id);
 
         let (tool_calls, result) = match history {
-            Ok(h) => self.agent_loop(session_manager, session_id, h, is_dm).await,
+            Ok(h) => {
+                self.agent_loop(session_manager, session_id, h, is_dm, include_user)
+                    .await
+            }
             Err(e) => (Vec::new(), Err(e)),
         };
 
@@ -660,9 +664,12 @@ impl AgentRuntime {
 
     /// Assemble the full system prompt for a given stage, prepending workspace
     /// files if attached.
-    fn assemble_system_prompt(&self, base_prompt: &str) -> String {
+    ///
+    /// When `include_user` is false, `user.md` is omitted from the workspace
+    /// prefix. This is used for non-user-facing sessions (DM, subagent, job).
+    fn assemble_system_prompt(&self, base_prompt: &str, include_user: bool) -> String {
         if let Some(ref ws) = self.workspace {
-            let prefix = ws.build_system_prompt_prefix();
+            let prefix = ws.build_system_prompt_prefix(include_user);
             if prefix.is_empty() {
                 base_prompt.to_string()
             } else {
@@ -671,6 +678,17 @@ impl AgentRuntime {
         } else {
             base_prompt.to_string()
         }
+    }
+
+    /// Returns true if the given context_id represents a user-facing session
+    /// (web chat, Telegram, etc.) where `user.md` should be included in the
+    /// system prompt.  Non-user-facing contexts (DM, subagent, job) return
+    /// false.
+    fn is_user_facing_context(context_id: &str) -> bool {
+        // These prefixes indicate non-user-facing sessions.
+        !(context_id.starts_with("dm:")
+            || context_id.starts_with("subagent_")
+            || context_id.starts_with("job_"))
     }
 
     /// Build context window for LLM using ContextBuilder.
@@ -688,7 +706,9 @@ impl AgentRuntime {
         context_id: &str,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
-        let mut system_prompt = self.assemble_system_prompt(&self.config.system_prompt);
+        let include_user = Self::is_user_facing_context(context_id);
+        let mut system_prompt =
+            self.assemble_system_prompt(&self.config.system_prompt, include_user);
 
         // For DM sessions, append instructions telling the agent how to reply.
         // The agent's text response will NOT be stored in the shared session,
@@ -885,6 +905,7 @@ impl AgentRuntime {
         session_id: alms_core::SessionId,
         mut messages: Vec<LlmMessage>,
         is_dm: bool,
+        include_user: bool,
     ) -> (
         Vec<alms_core::ToolCallRecord>,
         AlmsResult<(String, TokenUsage)>,
@@ -1159,7 +1180,7 @@ impl AgentRuntime {
                         "{}\n\n{}",
                         self.config.system_prompt, self.config.prompts.tool_loop
                     );
-                    let tool_loop_prompt = self.assemble_system_prompt(&combined);
+                    let tool_loop_prompt = self.assemble_system_prompt(&combined, include_user);
                     messages[0] = LlmMessage::system(tool_loop_prompt);
                 }
 
