@@ -8,8 +8,8 @@ use crate::cron_utils;
 use crate::server::AppState;
 use crate::sse::{RunEventStream, SseEventData, ToolInvocationId, event_channel};
 use alms_core::{
-    CreateRunRequest, CreateRunResponse, JobId, JobSchedule, JobStatus, Run, RunId, RunInput,
-    RunStatus, RunStatusResponse, SessionId,
+    CreateRunRequest, CreateRunResponse, JobId, JobSchedule, JobStatus, MAX_ITERATIONS_SENTINEL,
+    Run, RunId, RunInput, RunStatus, RunStatusResponse, SessionId,
 };
 use alms_runtime::RuntimeEvent;
 use axum::{
@@ -726,7 +726,7 @@ async fn execute_run(state: AppState, params: RunParams) {
             // Detect max-iterations sentinel and emit a warning event so the
             // frontend can style it distinctly (yellow) instead of as a normal
             // agent message.
-            if output.response == "[Max iterations reached]" {
+            if output.response == MAX_ITERATIONS_SENTINEL {
                 state
                     .run_manager
                     .send_event(

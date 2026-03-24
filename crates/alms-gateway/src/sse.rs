@@ -547,7 +547,9 @@ struct JobCompletedData {
 fn classify_error(msg: &str) -> String {
     let lower = msg.to_lowercase();
     if lower.contains("401")
+        || lower.contains("403")
         || lower.contains("unauthorized")
+        || lower.contains("forbidden")
         || lower.contains("authentication")
         || lower.contains("invalid api key")
         || lower.contains("invalid x-api-key")
@@ -686,6 +688,7 @@ mod tests {
     #[test]
     fn test_classify_error_auth() {
         assert_eq!(classify_error("401 Unauthorized"), "AUTH");
+        assert_eq!(classify_error("403 Forbidden"), "AUTH");
         assert_eq!(classify_error("authentication failed"), "AUTH");
         assert_eq!(classify_error("Invalid API key provided"), "AUTH");
         assert_eq!(classify_error("invalid x-api-key"), "AUTH");

@@ -22,6 +22,11 @@ pub use run::{
     TokenUsage, ToolCallRecord, ToolCallRole,
 };
 
+/// Sentinel string returned by the agent loop when the max-iterations limit is
+/// hit.  Defined once so that the runtime (`agent.rs`) and the gateway
+/// (`runs.rs`) stay in sync.
+pub const MAX_ITERATIONS_SENTINEL: &str = "[Max iterations reached]";
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
