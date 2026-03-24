@@ -149,8 +149,8 @@ async fn main() -> anyhow::Result<()> {
     // MUST be held for the entire process lifetime. If the guard is dropped,
     // the background writer thread shuts down and all subsequent log writes
     // are silently lost. We use an explicit `drop(file_log_guard)` at the
-    // end of main() to guarantee the compiler keeps the guard alive across
-    // all `.await` points in the async state machine.
+    // end of main() to document that the guard must outlive all `.await`
+    // points and to guarantee a flush on the happy-path exit.
     let (file_layer, file_log_guard) = if is_gateway && config.logging.file_enabled {
         let log_dir = config.logging.resolve_log_dir(&config.server.data_dir);
         match std::fs::create_dir_all(&log_dir) {
@@ -169,7 +169,7 @@ async fn main() -> anyhow::Result<()> {
                     .with_ansi(false)
                     .with_filter(file_filter);
                 eprintln!(
-                    "File logging enabled: {} (level={}, rotation={})",
+                    "[alms] File logging enabled: {} (level={}, rotation={})",
                     log_dir.display(),
                     config.logging.file_level,
                     config.logging.rotation,
@@ -397,10 +397,10 @@ async fn main() -> anyhow::Result<()> {
         },
     }
 
-    // Explicitly drop the file log guard at the end of main() to guarantee
-    // the non-blocking writer's background thread is flushed. This reference
-    // also prevents the compiler from dropping the guard early in the async
-    // state machine (before the .await on serve_with_config completes).
+    // Explicitly drop the file log guard on the happy path to guarantee a
+    // flush of the non-blocking writer's background thread. On error paths
+    // (early return via `?`), the guard drops naturally as part of the
+    // future's cleanup — the OS will flush file handles on process exit.
     drop(file_log_guard);
 
     Ok(())
