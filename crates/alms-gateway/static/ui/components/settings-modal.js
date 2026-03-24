@@ -122,21 +122,14 @@ function ApiKeysSection() {
                     `;
                 }
 
-                const isAlias = source.startsWith('alias:');
-                const aliasFrom = isAlias ? source.split(':')[1] : null;
-                const hasKey = configured || isAlias;
-
                 return html`
                     <div class="api-key-row" key=${p}>
                         <span class="api-key-provider">${p}</span>
-                        <span class="api-key-value ${hasKey ? 'set' : 'unset'}">
-                            ${hasKey ? masked : 'not configured'}
+                        <span class="api-key-value ${configured ? 'set' : 'unset'}">
+                            ${configured ? masked : 'not configured'}
                         </span>
                         ${configured && source === 'secrets' && html`
                             <span class="api-key-source">stored</span>
-                        `}
-                        ${isAlias && html`
-                            <span class="api-key-source">via ${aliasFrom}</span>
                         `}
                         <div class="api-key-actions">
                             <button class="api-key-btn" onClick=${() => { editing.value = p; newKey.value = ''; }}>

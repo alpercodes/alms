@@ -22,11 +22,8 @@ use serde::Deserialize;
 ///
 /// Each entry includes:
 /// - `configured`: true only if a key is **directly stored** under this provider
-/// - `key`: masked key value (present when directly stored or resolved via alias)
-/// - `source`: `"secrets"` (direct), `"alias:<provider>"` (via alias), or `"none"`
-///
-/// The `alias:*` source prevents the UI from showing aliased keys as if they
-/// were independently configured (fixes #343).
+/// - `key`: masked key value (present when directly stored)
+/// - `source`: `"secrets"` (direct) or `"none"` (not set)
 pub async fn list_keys(State(state): State<AppState>) -> impl IntoResponse {
     let secrets = state.secrets.read();
     let keys: Vec<serde_json::Value> = VALID_PROVIDERS

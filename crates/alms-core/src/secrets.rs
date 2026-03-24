@@ -305,34 +305,10 @@ impl SecretsStore {
     /// Env var fallback has been removed for security — API keys must be
     /// configured via `alms auth set <provider> <key>`.
     ///
-    /// When no key is found for the exact provider, `"openai"` and
-    /// `"openrouter"` are treated as fallback aliases of each other because
-    /// they use the same OpenAI-compatible API format.  This prevents a
-    /// silent auth failure when the config-level provider is `"openai"`
-    /// (the default) but the user stored their key under `"openrouter"`
-    /// via `alms auth set openrouter <key>`, or vice-versa.
+    /// Each provider is independent — no cross-provider alias fallback.
+    /// OpenAI and OpenRouter are separate services with incompatible keys.
     pub fn resolve_key(&self, provider: &str) -> Option<String> {
-        self.resolve_key_with_source(provider)
-            .map(|(key, _source)| key)
-    }
-
-    /// Like [`resolve_key`](Self::resolve_key), but also returns which provider
-    /// the key was actually stored under.
-    ///
-    /// Returns `Some((key, source_provider))` where `source_provider` is the
-    /// provider name the key is stored under (may differ from `provider` when
-    /// the openai/openrouter alias kicks in).
-    pub fn resolve_key_with_source(&self, provider: &str) -> Option<(String, String)> {
-        if let Some(k) = self.get_key(provider) {
-            return Some((k.to_string(), provider.to_string()));
-        }
-        // Fallback: openai <-> openrouter (both OpenAI-compatible).
-        let fallback = match provider {
-            "openai" => Some("openrouter"),
-            "openrouter" => Some("openai"),
-            _ => None,
-        };
-        fallback.and_then(|fb| self.get_key(fb).map(|k| (k.to_string(), fb.to_string())))
+        self.get_key(provider).map(|k| k.to_string())
     }
 
     /// Return the display status for a provider in the key-listing UI.
@@ -340,21 +316,10 @@ impl SecretsStore {
     /// Returns a tuple of `(configured, masked_key, source)`:
     /// - `configured`: true if a key is directly stored for this provider
     /// - `masked_key`: the masked key value, or `None` if not stored
-    /// - `source`: `"secrets"` if directly stored, `"alias:<provider>"` if
-    ///   resolved via alias, `"none"` if no key at all
-    ///
-    /// Delegates to [`resolve_key_with_source`](Self::resolve_key_with_source)
-    /// so the alias fallback logic lives in a single place.
+    /// - `source`: `"secrets"` if directly stored, `"none"` if no key
     pub fn key_status(&self, provider: &str) -> (bool, Option<String>, String) {
-        match self.resolve_key_with_source(provider) {
-            Some((key, source)) if source == provider => {
-                (true, Some(Self::masked_key(&key)), "secrets".to_string())
-            }
-            Some((key, source)) => (
-                false,
-                Some(Self::masked_key(&key)),
-                format!("alias:{source}"),
-            ),
+        match self.get_key(provider) {
+            Some(key) => (true, Some(Self::masked_key(key)), "secrets".to_string()),
             None => (false, None, "none".to_string()),
         }
     }
@@ -772,53 +737,39 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_key_openai_falls_back_to_openrouter() {
-        // When the config provider is "openai" but the key is stored under
-        // "openrouter", resolve_key should find it via fallback.
+    fn test_resolve_key_openai_does_not_fall_back_to_openrouter() {
+        // OpenAI and OpenRouter are separate services — no alias fallback.
         let mut store = SecretsStore::empty();
         store.keys.insert("openrouter".into(), "sk-or-key".into());
 
-        assert_eq!(
-            store.resolve_key("openai"),
-            Some("sk-or-key".into()),
-            "resolve_key('openai') should fall back to 'openrouter' key"
+        assert!(
+            store.resolve_key("openai").is_none(),
+            "resolve_key('openai') must NOT fall back to openrouter"
         );
     }
 
     #[test]
-    fn test_resolve_key_openrouter_falls_back_to_openai() {
+    fn test_resolve_key_openrouter_does_not_fall_back_to_openai() {
         // Reverse direction: key stored under "openai", queried as "openrouter".
         let mut store = SecretsStore::empty();
         store.keys.insert("openai".into(), "sk-oai-key".into());
 
-        assert_eq!(
-            store.resolve_key("openrouter"),
-            Some("sk-oai-key".into()),
-            "resolve_key('openrouter') should fall back to 'openai' key"
+        assert!(
+            store.resolve_key("openrouter").is_none(),
+            "resolve_key('openrouter') must NOT fall back to openai"
         );
     }
 
     #[test]
-    fn test_resolve_key_exact_match_takes_priority() {
-        // When both "openai" and "openrouter" keys exist, exact match wins.
+    fn test_resolve_key_each_provider_independent() {
+        // When both keys exist, each resolves only its own.
         let mut store = SecretsStore::empty();
         store.keys.insert("openai".into(), "sk-oai".into());
         store.keys.insert("openrouter".into(), "sk-or".into());
 
         assert_eq!(store.resolve_key("openai"), Some("sk-oai".into()));
         assert_eq!(store.resolve_key("openrouter"), Some("sk-or".into()));
-    }
-
-    #[test]
-    fn test_resolve_key_no_fallback_for_anthropic() {
-        // Anthropic has no fallback alias — missing key stays missing.
-        let mut store = SecretsStore::empty();
-        store.keys.insert("openrouter".into(), "sk-or-key".into());
-
-        assert!(
-            store.resolve_key("anthropic").is_none(),
-            "resolve_key('anthropic') must not fall back to openrouter"
-        );
+        assert!(store.resolve_key("anthropic").is_none());
     }
 
     #[test]
@@ -826,43 +777,6 @@ mod tests {
         assert!(
             VALID_PROVIDERS.contains(&"telegram"),
             "VALID_PROVIDERS must include telegram"
-        );
-    }
-
-    #[test]
-    fn test_resolve_key_with_source_direct() {
-        let mut store = SecretsStore::empty();
-        store.keys.insert("openrouter".into(), "sk-or-key".into());
-
-        let (key, source) = store.resolve_key_with_source("openrouter").unwrap();
-        assert_eq!(key, "sk-or-key");
-        assert_eq!(
-            source, "openrouter",
-            "Direct lookup should report own provider as source"
-        );
-    }
-
-    #[test]
-    fn test_resolve_key_with_source_alias() {
-        let mut store = SecretsStore::empty();
-        store.keys.insert("openrouter".into(), "sk-or-key".into());
-
-        let (key, source) = store.resolve_key_with_source("openai").unwrap();
-        assert_eq!(key, "sk-or-key");
-        assert_eq!(
-            source, "openrouter",
-            "Alias lookup should report the actual storage provider"
-        );
-    }
-
-    #[test]
-    fn test_resolve_key_with_source_no_fallback_for_anthropic() {
-        let mut store = SecretsStore::empty();
-        store.keys.insert("openrouter".into(), "sk-or-key".into());
-
-        assert!(
-            store.resolve_key_with_source("anthropic").is_none(),
-            "Anthropic has no alias fallback"
         );
     }
 
@@ -880,22 +794,17 @@ mod tests {
     }
 
     #[test]
-    fn test_key_status_alias() {
+    fn test_key_status_no_alias() {
+        // Storing an openrouter key should NOT make openai appear configured.
         let mut store = SecretsStore::empty();
         store
             .keys
             .insert("openrouter".into(), "sk-or-test-key-abcd".into());
 
         let (configured, masked, source) = store.key_status("openai");
-        assert!(
-            !configured,
-            "Aliased key should NOT be reported as configured"
-        );
-        assert!(
-            masked.is_some(),
-            "Aliased key should still show a masked value"
-        );
-        assert_eq!(source, "alias:openrouter");
+        assert!(!configured, "openai should not be configured");
+        assert!(masked.is_none(), "No masked key for unconfigured provider");
+        assert_eq!(source, "none");
     }
 
     #[test]
@@ -909,20 +818,9 @@ mod tests {
     }
 
     #[test]
-    fn test_key_status_no_cross_alias_to_anthropic() {
-        let mut store = SecretsStore::empty();
-        store.keys.insert("openrouter".into(), "sk-or-key".into());
-
-        let (configured, masked, source) = store.key_status("anthropic");
-        assert!(!configured, "Anthropic should not alias from openrouter");
-        assert!(masked.is_none(), "No masked key for anthropic");
-        assert_eq!(source, "none");
-    }
-
-    #[test]
-    fn test_key_status_both_direct_no_alias() {
+    fn test_key_status_both_direct() {
         // When both openai and openrouter have directly stored keys,
-        // each should report source="secrets" (not alias).
+        // each should report source="secrets" independently.
         let mut store = SecretsStore::empty();
         store
             .keys
@@ -934,17 +832,11 @@ mod tests {
         let (configured, masked, source) = store.key_status("openai");
         assert!(configured, "openai should be directly configured");
         assert_eq!(masked, Some("sk-o...1234".into()));
-        assert_eq!(
-            source, "secrets",
-            "openai should report 'secrets', not alias"
-        );
+        assert_eq!(source, "secrets");
 
         let (configured, masked, source) = store.key_status("openrouter");
         assert!(configured, "openrouter should be directly configured");
         assert_eq!(masked, Some("sk-o...5678".into()));
-        assert_eq!(
-            source, "secrets",
-            "openrouter should report 'secrets', not alias"
-        );
+        assert_eq!(source, "secrets");
     }
 }
