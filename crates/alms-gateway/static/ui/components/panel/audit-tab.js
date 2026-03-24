@@ -36,7 +36,7 @@ export function AuditTab() {
     return html`
         <div>
             ${auditEvents.value.map((ev, i) => html`
-                <div class="audit-event" key=${i}>
+                <div class="audit-event" key=${ev.id || `audit-${ev.timestamp || ''}-${i}`}>
                     <span class="audit-tool">${ev.tool || ev.action || 'unknown'}</span>
                     <span class="${ev.decision === 'deny' ? 'audit-deny' : 'audit-allow'}">
                         ${ev.decision === 'deny' ? 'denied' : 'allowed'}
