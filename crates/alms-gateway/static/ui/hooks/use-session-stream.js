@@ -17,6 +17,8 @@ let sessionRetryCount = 0;
 const MAX_SESSION_RETRIES = 10;
 let deltaBuffer = '';
 let flushTimer = null;
+/** Highest SSE event ID seen on the current stream — used for manual reconnect. */
+let lastSeenEventId = null;
 
 function flushDeltaBuffer() {
     flushTimer = null;
@@ -57,21 +59,36 @@ function sealLastAgent() {
 /**
  * Open a persistent session-level SSE stream.
  * Stays open across runs — all events for this session arrive here.
+ *
+ * @param {string} sessionId
+ * @param {object} [opts]
+ * @param {number} [opts.lastEventId] — skip replay of events up to (and
+ *   including) this ID. Used when the client already loaded history via
+ *   the REST API and only needs new live events going forward.
  */
-export function openSessionStream(sessionId) {
+export function openSessionStream(sessionId, opts) {
     closeSessionStream();
     if (!sessionId) return;
 
     const token = localStorage.getItem('alms_auth_token');
-    const url = token
-        ? `/sessions/${sessionId}/events?token=${encodeURIComponent(token)}`
-        : `/sessions/${sessionId}/events`;
+    const params = new URLSearchParams();
+    if (token) params.set('token', token);
+    if (opts && opts.lastEventId != null) params.set('last_event_id', String(opts.lastEventId));
+    const qs = params.toString();
+    const url = `/sessions/${sessionId}/events${qs ? '?' + qs : ''}`;
     const es = new EventSource(url);
     activeSessionEs = es;
     sessionRetryCount = 0;
+    lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
+
+    /** Wrap an event handler to track the highest seen SSE event ID. */
+    const on = (type, handler) => es.addEventListener(type, (e) => {
+        if (e.lastEventId) lastSeenEventId = e.lastEventId;
+        handler(e);
+    });
 
     // ── run_created: a new run was created on this session ──
-    es.addEventListener('run_created', (e) => {
+    on('run_created', (e) => {
         const data = JSON.parse(e.data);
         activeRunId.value = data.run_id;
         const queuedBehind = data.queued_behind || 0;
@@ -96,7 +113,7 @@ export function openSessionStream(sessionId) {
     });
 
     // ── run_started: the run has been dequeued and is now executing ──
-    es.addEventListener('run_started', (e) => {
+    on('run_started', (e) => {
         // Transition thinking indicator from "queued" to active "Thinking..."
         const msgs = [...chatMessages.value];
         const idx = msgs.findLastIndex(m => m.type === 'thinking');
@@ -106,8 +123,24 @@ export function openSessionStream(sessionId) {
         }
     });
 
+    // ── status: agent phase update ──
+    // Phase values correspond to constants in alms-runtime/src/events.rs:
+    //   PHASE_BUILDING_CONTEXT = "building_context"
+    //   PHASE_SUMMARIZING      = "summarizing"
+    //   PHASE_CALLING_LLM      = "calling_llm"
+    //   PHASE_EXECUTING_TOOLS  = "executing_tools"
+    on('status', (e) => {
+        const data = JSON.parse(e.data);
+        const msgs = [...chatMessages.value];
+        const idx = msgs.findLastIndex(m => m.type === 'thinking');
+        if (idx >= 0) {
+            msgs[idx] = { ...msgs[idx], phase: data.phase, phaseDetail: data.detail || null };
+            chatMessages.value = msgs;
+        }
+    });
+
     // ── token_delta ──
-    es.addEventListener('token_delta', (e) => {
+    on('token_delta', (e) => {
         const data = JSON.parse(e.data);
         if (data.source_agent) return; // suppress subagent interleaving
         deltaBuffer += data.delta;
@@ -115,7 +148,7 @@ export function openSessionStream(sessionId) {
     });
 
     // ── tool_start ──
-    es.addEventListener('tool_start', (e) => {
+    on('tool_start', (e) => {
         flushDeltaBuffer();
         const data = JSON.parse(e.data);
         const toolId = data.tool_invocation_id || data.call_id || data.tool;
@@ -143,7 +176,7 @@ export function openSessionStream(sessionId) {
     });
 
     // ── tool_end ──
-    es.addEventListener('tool_end', (e) => {
+    on('tool_end', (e) => {
         const data = JSON.parse(e.data);
         const matchId = data.tool_invocation_id;
         const status = data.ok ? 'done' : 'fail';
@@ -171,7 +204,7 @@ export function openSessionStream(sessionId) {
     });
 
     // ── approval_required ──
-    es.addEventListener('approval_required', (e) => {
+    on('approval_required', (e) => {
         flushDeltaBuffer();
         const data = JSON.parse(e.data);
         chatMessages.value = [...chatMessages.value, {
@@ -182,7 +215,7 @@ export function openSessionStream(sessionId) {
     });
 
     // ── subagent_completed ──
-    es.addEventListener('subagent_completed', (e) => {
+    on('subagent_completed', (e) => {
         const data = JSON.parse(e.data);
         const name = data.subagent_name || 'subagent';
         const status = data.status || 'done';
@@ -201,7 +234,7 @@ export function openSessionStream(sessionId) {
     });
 
     // ── job_completed ──
-    es.addEventListener('job_completed', (e) => {
+    on('job_completed', (e) => {
         const data = JSON.parse(e.data);
         const name = data.job_name || 'job';
         const status = data.status === 'success' ? 'completed'
@@ -214,7 +247,7 @@ export function openSessionStream(sessionId) {
     });
 
     // ── approval_resolved ──
-    es.addEventListener('approval_resolved', (e) => {
+    on('approval_resolved', (e) => {
         const data = JSON.parse(e.data);
         const msgs = [...chatMessages.value];
         const idx = msgs.findLastIndex(m => m.type === 'approval' && m.approvalId === data.approval_id);
@@ -262,9 +295,9 @@ export function openSessionStream(sessionId) {
         }
     };
 
-    es.addEventListener('run_finished', handleRunEnd('finished'));
-    es.addEventListener('run_error', handleRunEnd('error'));
-    es.addEventListener('run_cancelled', handleRunEnd('cancelled'));
+    on('run_finished', handleRunEnd('finished'));
+    on('run_error', handleRunEnd('error'));
+    on('run_cancelled', handleRunEnd('cancelled'));
 
     es.onerror = () => {
         if (es.readyState === EventSource.CLOSED) {
@@ -276,7 +309,7 @@ export function openSessionStream(sessionId) {
             const delay = Math.min(2000 * Math.pow(2, sessionRetryCount - 1), 30000);
             setTimeout(() => {
                 if (activeSessionId.value === sessionId) {
-                    openSessionStream(sessionId);
+                    openSessionStream(sessionId, { lastEventId: lastSeenEventId });
                 }
             }, delay);
         }

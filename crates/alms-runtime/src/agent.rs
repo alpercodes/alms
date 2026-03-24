@@ -1,5 +1,8 @@
 use crate::context::{ContextBuilder, content_to_string};
-use crate::events::{RuntimeEvent, RuntimeEventSender};
+use crate::events::{
+    PHASE_BUILDING_CONTEXT, PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS, PHASE_SUMMARIZING,
+    RuntimeEvent, RuntimeEventSender,
+};
 use crate::get_task_result_tool::GetTaskResultTool;
 use crate::invoke_agent_tool::InvokeAgentTool;
 use crate::llm_client::LlmClient;
@@ -397,6 +400,16 @@ impl AgentRuntime {
         self
     }
 
+    /// Emit a status event to the gateway layer (best-effort, never fails).
+    fn emit_status(&self, phase: &str, detail: Option<&str>) {
+        if let Some(ref tx) = self.event_sender {
+            let _ = tx.send(crate::events::RuntimeEvent::Status {
+                phase: phase.to_string(),
+                detail: detail.map(|d| d.to_string()),
+            });
+        }
+    }
+
     /// Create with default config
     pub fn with_defaults(agent_id: AgentId) -> AlmsResult<Self> {
         let llm = LlmClient::from_env()?;
@@ -437,6 +450,7 @@ impl AgentRuntime {
 
         // Build context first (reads history without current input to avoid double-counting),
         // then persist the user message so it survives agent loop failures.
+        self.emit_status(PHASE_BUILDING_CONTEXT, None);
         let history = self
             .build_context(session_manager, &session.id, context_id, &input)
             .await;
@@ -494,6 +508,7 @@ impl AgentRuntime {
         // Build context: the input message is already in the session history
         // (written by MessageBus), so we pass an empty string as the current
         // input to avoid duplicating it in the context window.
+        self.emit_status(PHASE_BUILDING_CONTEXT, None);
         let history = self
             .build_context(session_manager, &session_id, context_id, "")
             .await;
@@ -558,9 +573,13 @@ impl AgentRuntime {
         history: AlmsResult<Vec<LlmMessage>>,
     ) -> AlmsResult<RunOutput> {
         let is_dm = context_id.starts_with("dm:");
+        let include_user = Self::is_user_facing_context(context_id);
 
         let (tool_calls, result) = match history {
-            Ok(h) => self.agent_loop(session_manager, session_id, h, is_dm).await,
+            Ok(h) => {
+                self.agent_loop(session_manager, session_id, h, is_dm, include_user)
+                    .await
+            }
             Err(e) => (Vec::new(), Err(e)),
         };
 
@@ -660,9 +679,12 @@ impl AgentRuntime {
 
     /// Assemble the full system prompt for a given stage, prepending workspace
     /// files if attached.
-    fn assemble_system_prompt(&self, base_prompt: &str) -> String {
+    ///
+    /// When `include_user` is false, `user.md` is omitted from the workspace
+    /// prefix. This is used for non-user-facing sessions (DM, subagent, job).
+    fn assemble_system_prompt(&self, base_prompt: &str, include_user: bool) -> String {
         if let Some(ref ws) = self.workspace {
-            let prefix = ws.build_system_prompt_prefix();
+            let prefix = ws.build_system_prompt_prefix(include_user);
             if prefix.is_empty() {
                 base_prompt.to_string()
             } else {
@@ -671,6 +693,17 @@ impl AgentRuntime {
         } else {
             base_prompt.to_string()
         }
+    }
+
+    /// Returns true if the given context_id represents a user-facing session
+    /// (web chat, Telegram, etc.) where `user.md` should be included in the
+    /// system prompt.  Non-user-facing contexts (DM, subagent, job) return
+    /// false.
+    fn is_user_facing_context(context_id: &str) -> bool {
+        // These prefixes indicate non-user-facing sessions.
+        !(context_id.starts_with("dm:")
+            || context_id.starts_with("subagent_")
+            || context_id.starts_with("job_"))
     }
 
     /// Build context window for LLM using ContextBuilder.
@@ -688,7 +721,9 @@ impl AgentRuntime {
         context_id: &str,
         input: &str,
     ) -> AlmsResult<Vec<LlmMessage>> {
-        let mut system_prompt = self.assemble_system_prompt(&self.config.system_prompt);
+        let include_user = Self::is_user_facing_context(context_id);
+        let mut system_prompt =
+            self.assemble_system_prompt(&self.config.system_prompt, include_user);
 
         // For DM sessions, append instructions telling the agent how to reply.
         // The agent's text response will NOT be stored in the shared session,
@@ -718,6 +753,7 @@ impl AgentRuntime {
         // On failure we log a warning and fall back (None summary → truncate behaviour).
         let summary_text: Option<String> =
             if self.config.context_config.strategy == "sliding-summary" {
+                self.emit_status(PHASE_SUMMARIZING, None);
                 let current = session_manager.get_summary(*session_id).unwrap_or_default();
                 match self
                     .maybe_summarize(session_manager, *session_id, &history, current)
@@ -885,6 +921,7 @@ impl AgentRuntime {
         session_id: alms_core::SessionId,
         mut messages: Vec<LlmMessage>,
         is_dm: bool,
+        include_user: bool,
     ) -> (
         Vec<alms_core::ToolCallRecord>,
         AlmsResult<(String, TokenUsage)>,
@@ -933,6 +970,7 @@ impl AgentRuntime {
             // Checkpoint B: LLM call with cancellation support.
             // Stream the LLM call, emitting token_delta events as chunks arrive.
             // Falls back to buffered mode if streaming fails.
+            self.emit_status(PHASE_CALLING_LLM, None);
             let streaming_future = self.stream_llm_call(request.clone());
             let stream_result = if let Some(ref token) = self.cancel_token {
                 tokio::select! {
@@ -1048,6 +1086,14 @@ impl AgentRuntime {
                     tool_seq += 1;
                 }
 
+                // Emit status: list tool names being executed.
+                let tool_names: Vec<&str> = tool_calls
+                    .iter()
+                    .map(|tc| tc.function.name.as_str())
+                    .collect();
+                let detail = tool_names.join(", ");
+                self.emit_status(PHASE_EXECUTING_TOOLS, Some(&detail));
+
                 // Checkpoint C: tool execution with cancellation support.
                 //
                 // Full-control / Autonomous posture: run all tool calls concurrently
@@ -1159,7 +1205,7 @@ impl AgentRuntime {
                         "{}\n\n{}",
                         self.config.system_prompt, self.config.prompts.tool_loop
                     );
-                    let tool_loop_prompt = self.assemble_system_prompt(&combined);
+                    let tool_loop_prompt = self.assemble_system_prompt(&combined, include_user);
                     messages[0] = LlmMessage::system(tool_loop_prompt);
                 }
 
@@ -2292,5 +2338,29 @@ mod tests {
             let parsed: Posture = s.parse().unwrap();
             assert_eq!(parsed, posture);
         }
+    }
+
+    #[test]
+    fn test_is_user_facing_context() {
+        // User-facing: web UI, Telegram
+        assert!(AgentRuntime::is_user_facing_context("web-chat-123"));
+        assert!(AgentRuntime::is_user_facing_context("telegram_agent_456"));
+
+        // Non-user-facing: DM, subagent, job
+        assert!(!AgentRuntime::is_user_facing_context("dm:alice:bob"));
+        assert!(!AgentRuntime::is_user_facing_context("subagent_task123"));
+        assert!(!AgentRuntime::is_user_facing_context(
+            "subagent_task123_reviewer"
+        ));
+        assert!(!AgentRuntime::is_user_facing_context("job_abc"));
+
+        // Edge cases: empty string and unknown prefix default to user-facing
+        assert!(AgentRuntime::is_user_facing_context(""));
+        assert!(AgentRuntime::is_user_facing_context("unknown_prefix"));
+
+        // Near-miss prefixes must NOT match (prefix must be exact)
+        assert!(AgentRuntime::is_user_facing_context("dmx:something"));
+        assert!(AgentRuntime::is_user_facing_context("subagentx_something"));
+        assert!(AgentRuntime::is_user_facing_context("jobs_something"));
     }
 }

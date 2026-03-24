@@ -48,6 +48,22 @@ function ChatView() {
                     if (m.type === 'approval') {
                         return html`<${ApprovalCard} key=${key} ...${m} />`;
                     }
+                    if (m.type === 'image') {
+                        const cls = m.role === 'user' ? 'user' : 'agent';
+                        const label = m.role === 'user' ? '>' : '$';
+                        return html`
+                            <div key=${key} class="msg ${cls}">
+                                <div class="msg-label">${label}</div>
+                                <div class="msg-body">
+                                    ${m.url
+                                        ? html`<img src=${m.url} alt=${m.alt || ''} style="max-width:100%;border-radius:8px;" />`
+                                        : `[Image${m.alt ? ': ' + m.alt : ''}]`
+                                    }
+                                    ${m.alt && html`<div style="font-size:var(--text-xs);color:var(--text-secondary);margin-top:var(--space-2);">${m.alt}</div>`}
+                                </div>
+                            </div>
+                        `;
+                    }
                     if (m.type === 'error') {
                         return html`<${ErrorMessage} key=${key} text=${m.text} />`;
                     }
@@ -68,6 +84,18 @@ function ChatView() {
                             label = 'Running scheduled job';
                         } else if (m.source === 'subagent') {
                             label = 'Processing subagent result';
+                        // Phase values match constants in alms-runtime/src/events.rs
+                        // (PHASE_BUILDING_CONTEXT, PHASE_SUMMARIZING, PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS)
+                        } else if (m.phase === 'building_context') {
+                            label = 'Building context';
+                        } else if (m.phase === 'summarizing') {
+                            label = 'Summarizing history';
+                        } else if (m.phase === 'calling_llm') {
+                            label = 'Thinking';
+                        } else if (m.phase === 'executing_tools') {
+                            label = m.phaseDetail
+                                ? 'Running ' + m.phaseDetail
+                                : 'Running tools';
                         }
                         return html`
                             <div key="thinking" class="msg agent">

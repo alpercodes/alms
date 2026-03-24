@@ -187,6 +187,22 @@ impl SseEventData {
         )
     }
 
+    /// Transient status update for the UI to show what the agent is doing.
+    ///
+    /// Phases: `building_context`, `summarizing`, `calling_llm`, `executing_tools`.
+    /// `detail` carries extra info such as tool names for the `executing_tools` phase.
+    pub fn status(run_id: RunId, phase: &str, detail: Option<String>) -> Self {
+        Self::new(
+            "status",
+            StatusData {
+                run_id: run_id.0.to_string(),
+                phase: phase.to_string(),
+                detail,
+                ts: Utc::now(),
+            },
+        )
+    }
+
     /// Session-level: a new run was created on this session.
     ///
     /// `source` indicates what triggered the run:
@@ -447,6 +463,15 @@ struct RunCancelledData {
 }
 
 #[derive(Debug, Serialize)]
+struct StatusData {
+    run_id: String,
+    phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
 struct RunCreatedData {
     run_id: String,
     session_id: String,
@@ -509,6 +534,25 @@ mod tests {
         );
 
         assert_eq!(event.event_type, "tool_end");
+    }
+
+    #[test]
+    fn test_status_event() {
+        let run_id = RunId::new();
+
+        let event = SseEventData::status(run_id, "calling_llm", None);
+        assert_eq!(event.event_type, "status");
+        assert_eq!(event.data["phase"], "calling_llm");
+        assert!(event.data["detail"].is_null());
+        assert!(event.data["ts"].is_string());
+
+        let event_with_detail = SseEventData::status(
+            run_id,
+            "executing_tools",
+            Some("shell_exec, fs_read".into()),
+        );
+        assert_eq!(event_with_detail.data["phase"], "executing_tools");
+        assert_eq!(event_with_detail.data["detail"], "shell_exec, fs_read");
     }
 
     #[test]

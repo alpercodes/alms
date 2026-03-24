@@ -334,11 +334,14 @@ impl RunManager {
     /// Dead subscribers (closed channels) are pruned automatically.
     /// Fans out to both per-run and per-session subscribers.
     pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
-        let is_delta = event.event_type == "token_delta";
+        let is_ephemeral = event.event_type == "token_delta" || event.event_type == "status";
 
-        // Per-run event log — skip token_delta to reduce lock contention.
-        // Live per-run subscribers still receive deltas via fan-out below.
-        if !is_delta {
+        // Per-run event log — skip ephemeral events (token_delta, status) to
+        // avoid persisting high-frequency or transient data. Status events are
+        // superseded within milliseconds by the next phase or by run_finished,
+        // so replaying stale ones on SSE reconnect would be confusing.
+        // Live subscribers still receive these events via fan-out below.
+        if !is_ephemeral {
             let event_id = self
                 .event_log
                 .log_event(run_id, session_id, &event.event_type, event.data.clone())
@@ -356,11 +359,11 @@ impl RunManager {
         }
 
         // Per-session fan-out: forward to session subscribers.
-        // Skip session event LOG for token_delta — these are high-frequency
-        // (50-100 per response) and the extra lock acquisitions + clones
-        // cause noticeable latency. Session reconnect doesn't need individual
-        // deltas — the chat history is loaded via getSessionMessages instead.
-        let session_event = if is_delta {
+        // Skip session event LOG for ephemeral events (token_delta, status) —
+        // deltas are high-frequency and status events are transient.
+        // Session reconnect doesn't need individual deltas — the chat history
+        // is loaded via getSessionMessages instead.
+        let session_event = if is_ephemeral {
             // Fast path: no logging, just fan out. Leave event_id as None
             // so the dedup filter in stream_with_replay passes it through
             // (dedup only drops Some(id) where id <= max_replay_id).
@@ -452,6 +455,14 @@ impl RunManager {
             .events_from(session_id, from_id)
             .await
     }
+
+    /// Return the highest session-level event ID, or `None` if no events exist.
+    ///
+    /// Exposed to the REST messages endpoint so the client can pass
+    /// `?last_event_id=<n>` when opening the SSE stream.
+    pub async fn latest_session_event_id(&self, session_id: SessionId) -> Option<u64> {
+        self.session_event_log.latest_event_id(session_id).await
+    }
 }
 
 impl Default for RunManager {
@@ -488,13 +499,13 @@ pub struct AppState {
     /// Snapshot of agent config — read once at startup so handlers avoid locking the gateway.
     pub agent_config: alms_runtime::AgentConfig,
     /// Default agent ID — shared with Gateway, updated live on set-default.
-    pub default_agent_id: Arc<std::sync::RwLock<AgentId>>,
+    pub default_agent_id: Arc<parking_lot::RwLock<AgentId>>,
     /// LLM client clone — read once at startup so run execution avoids locking the gateway.
     pub llm: alms_runtime::LlmClient,
     /// Auth token — read once at startup.
     pub auth_token_value: Option<String>,
     /// Shared secrets store for API key management.
-    pub secrets: Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>,
+    pub secrets: Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>,
     /// Agent-to-agent message bus for peer messaging (Layer 2).
     pub message_bus: Arc<alms_coordinator::message_bus::MessageBus>,
 }
@@ -760,63 +771,98 @@ async fn get_session(
 }
 
 /// GET /sessions/{session_id}/messages — return chat history including tool calls
+///
+/// Response includes `last_event_id` — the current high-water mark of the
+/// session's SSE event log. Clients should pass this value as
+/// `?last_event_id=<n>` when opening the SSE stream to skip replay of
+/// events that are already reflected in the returned messages.
 async fn get_session_messages(
     State(state): State<AppState>,
     Path(session_id): Path<SessionId>,
 ) -> impl IntoResponse {
     tracing::debug!("GET /sessions/{}/messages", session_id.0);
+
+    // Read the SSE high-water mark FIRST, before loading messages.
+    // If an event arrives between these two reads, worst case is the
+    // client replays a few events it already has (harmless duplicates)
+    // rather than missing events entirely.
+    let last_event_id = state.run_manager.latest_session_event_id(session_id).await;
+
     match state.session_manager.get_history(session_id) {
         Ok(messages) => {
-            tracing::debug!(
-                "Session {} has {} total messages",
-                session_id.0,
-                messages.len()
-            );
+            let total = messages.len();
+            tracing::debug!("Session {} has {} total messages", session_id.0, total);
+            let mut skipped: usize = 0;
             let visible: Vec<serde_json::Value> = messages
                 .into_iter()
-                .filter_map(|m| match (&m.role, &m.content) {
-                    (Role::User, Content::Text(t)) => Some(serde_json::json!({
-                        "role": "user",
-                        "type": "text",
-                        "content": t,
-                        "timestamp": m.timestamp,
-                    })),
-                    (Role::Assistant, Content::Text(t)) => Some(serde_json::json!({
-                        "role": "assistant",
-                        "type": "text",
-                        "content": t,
-                        "timestamp": m.timestamp,
-                    })),
-                    (Role::Assistant, Content::ToolCall { name, params }) => {
-                        Some(serde_json::json!({
-                            "role": "assistant",
+                .filter_map(|m| {
+                    let role_str = match m.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::Tool => "tool",
+                        Role::System => {
+                            // System messages are internal — skip them from API output
+                            skipped += 1;
+                            return None;
+                        }
+                    };
+                    let json = match &m.content {
+                        Content::Text(t) => serde_json::json!({
+                            "role": role_str,
+                            "type": "text",
+                            "content": t,
+                            "timestamp": m.timestamp,
+                        }),
+                        Content::ToolCall { name, params } => serde_json::json!({
+                            "role": role_str,
                             "type": "tool_call",
                             "tool": name,
                             "params": params,
                             "timestamp": m.timestamp,
                             "metadata": m.metadata,
-                        }))
-                    }
-                    (Role::Tool, Content::ToolResult { tool_id, result }) => {
-                        let ok = m
-                            .metadata
-                            .as_ref()
-                            .and_then(|md| md.get("ok"))
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        Some(serde_json::json!({
-                            "role": "tool",
-                            "type": "tool_result",
-                            "tool_id": tool_id,
-                            "result": result,
-                            "ok": ok,
+                        }),
+                        Content::ToolResult { tool_id, result } => {
+                            let ok = m
+                                .metadata
+                                .as_ref()
+                                .and_then(|md| md.get("ok"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            serde_json::json!({
+                                "role": role_str,
+                                "type": "tool_result",
+                                "tool_id": tool_id,
+                                "result": result,
+                                "ok": ok,
+                                "timestamp": m.timestamp,
+                            })
+                        }
+                        Content::Image { url, alt } => serde_json::json!({
+                            "role": role_str,
+                            "type": "image",
+                            "url": url,
+                            "alt": alt,
                             "timestamp": m.timestamp,
-                        }))
-                    }
-                    _ => None, // skip system messages
+                        }),
+                    };
+                    Some(json)
                 })
                 .collect();
-            Json(serde_json::json!({ "messages": visible })).into_response()
+            if skipped > 0 {
+                tracing::debug!(
+                    "Session {}: returned {} of {} messages ({} system messages excluded)",
+                    session_id.0,
+                    visible.len(),
+                    total,
+                    skipped,
+                );
+            }
+
+            Json(serde_json::json!({
+                "messages": visible,
+                "last_event_id": last_event_id,
+            }))
+            .into_response()
         }
         Err(_) => {
             api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response()

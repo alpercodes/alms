@@ -8,8 +8,9 @@ use alms_channel::{Channel, ChannelConfig};
 use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult, validate_agent_name};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
 use alms_session::{SessionConfig, SessionManager, SqliteStore};
+use parking_lot::RwLock;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, error, info, instrument, warn};
@@ -216,7 +217,7 @@ impl Gateway {
                 // Auto-migrate sidecar agent into the agents registry — only
                 // if a sidecar file existed (actual migration, not first run).
                 if SIDECAR_EXISTED.load(std::sync::atomic::Ordering::Relaxed) {
-                    migrate_sidecar_agent(&store, *agent_id.read().unwrap());
+                    migrate_sidecar_agent(&store, *agent_id.read());
                 }
                 Arc::new(SessionManager::with_store(
                     config.session_config.clone(),
@@ -290,7 +291,7 @@ impl Gateway {
                 .config
                 .telegram_token
                 .clone()
-                .or_else(|| self.secrets.read().unwrap().resolve_key("telegram"));
+                .or_else(|| self.secrets.read().resolve_key("telegram"));
             if let Some(token) = global_token {
                 let default_id = self.agent_id();
                 let default_name = self
@@ -472,7 +473,7 @@ impl Gateway {
             tokio::select! {
                 Some((agent_id, agent_name, telegram, msg)) = merged_rx.recv() => {
                     // Route the message to the owning agent (not the default).
-                    let secrets_guard = self.secrets.read().unwrap();
+                    let secrets_guard = self.secrets.read();
                     let resolved = crate::runs::resolve_agent_config(
                         agent_id,
                         &self.session_manager,
@@ -599,7 +600,7 @@ impl Gateway {
 
     /// Read the current default agent ID.
     pub fn agent_id(&self) -> AgentId {
-        *self.agent_id.read().unwrap()
+        *self.agent_id.read()
     }
 
     /// Get LLM client reference

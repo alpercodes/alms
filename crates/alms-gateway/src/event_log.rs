@@ -176,4 +176,110 @@ impl SessionEventLogManager {
             None => Vec::new(),
         }
     }
+
+    /// Return the highest event ID for a session, or `None` if no events exist.
+    ///
+    /// Used by the REST messages endpoint to tell the client the current
+    /// high-water mark so it can open an SSE stream with
+    /// `?last_event_id=<n>` and skip replay of already-loaded history.
+    pub async fn latest_event_id(&self, session_id: SessionId) -> Option<u64> {
+        let logs = self.logs.read().await;
+        let log = logs.get(&session_id)?;
+        let events = log.events.read().await;
+        events.last().map(|e| e.event_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alms_core::{RunId, SessionId};
+    use uuid::Uuid;
+
+    fn test_session_id() -> SessionId {
+        SessionId(Uuid::new_v4())
+    }
+
+    fn test_run_id() -> RunId {
+        RunId(Uuid::new_v4())
+    }
+
+    #[tokio::test]
+    async fn latest_event_id_empty_session() {
+        let mgr = SessionEventLogManager::new();
+        let sid = test_session_id();
+        assert_eq!(mgr.latest_event_id(sid).await, None);
+    }
+
+    #[tokio::test]
+    async fn latest_event_id_after_single_event() {
+        let mgr = SessionEventLogManager::new();
+        let sid = test_session_id();
+        let rid = test_run_id();
+
+        let id = mgr
+            .log_event(sid, rid, "token_delta", serde_json::json!({"delta": "hi"}))
+            .await;
+
+        assert_eq!(mgr.latest_event_id(sid).await, Some(id));
+    }
+
+    #[tokio::test]
+    async fn latest_event_id_returns_highest_after_multiple_events() {
+        let mgr = SessionEventLogManager::new();
+        let sid = test_session_id();
+        let rid = test_run_id();
+
+        mgr.log_event(sid, rid, "run_started", serde_json::json!({}))
+            .await;
+        mgr.log_event(sid, rid, "token_delta", serde_json::json!({"delta": "a"}))
+            .await;
+        let last = mgr
+            .log_event(sid, rid, "run_finished", serde_json::json!({}))
+            .await;
+
+        assert_eq!(mgr.latest_event_id(sid).await, Some(last));
+    }
+
+    #[tokio::test]
+    async fn latest_event_id_independent_across_sessions() {
+        let mgr = SessionEventLogManager::new();
+        let sid1 = test_session_id();
+        let sid2 = test_session_id();
+        let rid = test_run_id();
+
+        let id1 = mgr
+            .log_event(sid1, rid, "token_delta", serde_json::json!({"delta": "x"}))
+            .await;
+
+        // sid2 has no events
+        assert_eq!(mgr.latest_event_id(sid1).await, Some(id1));
+        assert_eq!(mgr.latest_event_id(sid2).await, None);
+    }
+
+    #[tokio::test]
+    async fn events_from_filters_correctly() {
+        let mgr = SessionEventLogManager::new();
+        let sid = test_session_id();
+        let rid = test_run_id();
+
+        let id1 = mgr
+            .log_event(sid, rid, "run_started", serde_json::json!({}))
+            .await;
+        let id2 = mgr
+            .log_event(sid, rid, "token_delta", serde_json::json!({"delta": "a"}))
+            .await;
+        let _id3 = mgr
+            .log_event(sid, rid, "run_finished", serde_json::json!({}))
+            .await;
+
+        // from_id = id2 should return events at id2 and above
+        let events = mgr.events_from(sid, id2).await;
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| e.event_id >= id2));
+
+        // from_id = id1 + 1 should skip the first event
+        let events = mgr.events_from(sid, id1 + 1).await;
+        assert_eq!(events.len(), 2);
+    }
 }

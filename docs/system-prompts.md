@@ -86,7 +86,8 @@ The full system prompt seen by the LLM is assembled in layers:
    `build_system_prompt_prefix()` reads workspace files in this order:
    - `personality.md` (raw content)
    - `goals.md` (prefixed with `## Current Goals`)
-   - `user.md` (prefixed with `## About the User`)
+   - `user.md` (prefixed with `## About the User`) — **conditional**: skipped for
+     non-user-facing sessions (DM, subagent, and job contexts) to save tokens
    - `memories.md` (prefixed with `## Memories`, truncated at 4000 chars)
 
 2. **Base prompt**: Either `initial.md` (normal runs) or `bootstrap.md` (first-time
