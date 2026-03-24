@@ -24,9 +24,6 @@ pub enum SendError {
     #[error("Message depth exceeded maximum -- possible loop")]
     DepthExceeded,
 
-    #[error("Cooldown active for DM pair -- wait before sending again")]
-    CooldownActive,
-
     #[error("Cannot send message to self")]
     SelfMessage,
 
@@ -43,9 +40,8 @@ pub trait MessageSender: Send + Sync + std::fmt::Debug {
     /// Send a text message from one agent to another.
     ///
     /// The message is written to the shared DM session and a run trigger
-    /// is emitted for the recipient. Depth tracking and cooldown enforcement
-    /// are handled internally by the implementation -- agents are unaware of
-    /// these mechanisms.
+    /// is emitted for the recipient. Depth tracking is handled internally
+    /// by the implementation -- agents are unaware of these mechanisms.
     async fn send(
         &self,
         sender_name: &str,
