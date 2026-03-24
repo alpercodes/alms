@@ -12,6 +12,23 @@ import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearCompleted
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
 
+/**
+ * Map error codes to user-friendly messages.
+ * Falls back to the raw message if the code is not recognised.
+ */
+function friendlyErrorMessage(code, rawMsg) {
+    switch (code) {
+        case 'AUTH':
+            return 'Authentication failed \u2014 check your API key in Settings.';
+        case 'RATE_LIMIT':
+            return 'Rate limited by the LLM provider \u2014 wait a moment and try again.';
+        case 'TIMEOUT':
+            return 'Request timed out \u2014 the LLM provider did not respond in time.';
+        default:
+            return rawMsg;
+    }
+}
+
 let activeSessionEs = null;
 let sessionRetryCount = 0;
 const MAX_SESSION_RETRIES = 10;
@@ -257,6 +274,16 @@ export function openSessionStream(sessionId, opts) {
         chatMessages.value = msgs;
     });
 
+    // ── run_warning (non-fatal, e.g. max iterations) ──
+    on('run_warning', (e) => {
+        flushDeltaBuffer();
+        sealLastAgent();
+        const data = JSON.parse(e.data);
+        const code = data.warning?.code || 'UNKNOWN';
+        const msg = data.warning?.message || 'Warning';
+        chatMessages.value = [...chatMessages.value, { type: 'warning', code, text: msg }];
+    });
+
     // ── run_finished / run_error / run_cancelled ──
     const handleRunEnd = (status) => (e) => {
         flushDeltaBuffer();
@@ -264,9 +291,11 @@ export function openSessionStream(sessionId, opts) {
         const data = e.data ? JSON.parse(e.data) : {};
 
         if (status === 'error') {
-            const errMsg = typeof data.error === 'string'
+            const code = data.error?.code || 'INTERNAL';
+            const rawMsg = typeof data.error === 'string'
                 ? data.error : (data.error?.message || 'Run failed');
-            chatMessages.value = [...chatMessages.value, { type: 'error', text: errMsg }];
+            const text = friendlyErrorMessage(code, rawMsg);
+            chatMessages.value = [...chatMessages.value, { type: 'error', code, text }];
         }
         if (status === 'cancelled') {
             chatMessages.value = [...chatMessages.value, { type: 'system', text: '(run cancelled)' }];

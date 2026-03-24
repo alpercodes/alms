@@ -12,7 +12,9 @@ use crate::tools::ToolRegistry;
 use crate::workspace::AgentWorkspace;
 use crate::workspace_tool::WorkspaceWriteTool;
 use alms_core::config::ContextConfig;
-use alms_core::{AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
+use alms_core::{
+    AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, MAX_ITERATIONS_SENTINEL, TokenUsage,
+};
 use alms_session::{
     Content as SessionContent, ContextSummary, Message as SessionMessage, Role as SessionRole,
     SessionManager,
@@ -589,13 +591,17 @@ impl AgentRuntime {
                 // empty. This happens when the agent used `ignore_message` to
                 // decline responding — there is nothing to record.
                 //
+                // Also skip persisting the max-iterations sentinel — it is
+                // surfaced as a `run_warning` SSE event by the gateway and
+                // should not appear as a normal assistant bubble on reload.
+                //
                 // For DM sessions: do NOT persist the agent's final text
                 // response. The only messages in the shared DM session should
                 // be those written via `send_message` (through MessageBus) and
                 // error/cancellation markers. The agent's text response is
                 // internal processing noise — the agent was told to use
                 // `send_message` to reply.
-                if !response.is_empty() && !is_dm {
+                if !response.is_empty() && response != MAX_ITERATIONS_SENTINEL && !is_dm {
                     let reply_msg = SessionMessage {
                         id: uuid::Uuid::new_v4().to_string(),
                         role: SessionRole::Assistant,
@@ -950,7 +956,7 @@ impl AgentRuntime {
                 );
                 return (
                     tool_call_records,
-                    Ok(("[Max iterations reached]".to_string(), total_usage)),
+                    Ok((MAX_ITERATIONS_SENTINEL.to_string(), total_usage)),
                 );
             }
             iterations += 1;
