@@ -1278,11 +1278,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_named_subagent_persistent_session() {
-        // Use a unique temp directory as workspace_dir so we can verify that
-        // the named subagent's workspace is actually created on disk.
+        // Use tempfile::TempDir for RAII cleanup — automatic drop even on panic.
         // (Previously this test used workspace_dir: None — see #55.)
-        let workspace_dir =
-            std::env::temp_dir().join(format!("alms-test-workspace-{}", uuid::Uuid::new_v4()));
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = workspace_tmp.path().to_path_buf();
         let coord = test_coordinator().with_workspace_dir(workspace_dir.clone());
         let parent_session = test_session_id();
 
@@ -1338,9 +1337,7 @@ mod tests {
             "Named subagent workspace directory should exist at {}",
             reviewer_ws.display()
         );
-
-        // Clean up temp directory
-        let _ = std::fs::remove_dir_all(&workspace_dir);
+        // workspace_tmp drops here — automatic cleanup even on panic
     }
 
     // -- (l) concurrent named subagent invocations are rejected -----------------
