@@ -1278,7 +1278,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_named_subagent_persistent_session() {
-        let coord = test_coordinator();
+        // Use a unique temp directory as workspace_dir so we can verify that
+        // the named subagent's workspace is actually created on disk.
+        // (Previously this test used workspace_dir: None — see #55.)
+        let workspace_dir =
+            std::env::temp_dir().join(format!("alms-test-workspace-{}", uuid::Uuid::new_v4()));
+        let coord = test_coordinator().with_workspace_dir(workspace_dir.clone());
         let parent_session = test_session_id();
 
         // First invocation with name "reviewer"
@@ -1324,6 +1329,18 @@ mod tests {
             "Named subagent should have 4 messages (2 turns), got {}",
             messages.len()
         );
+
+        // Verify workspace attachment: the named subagent's workspace directory
+        // should have been created at {workspace_dir}/reviewer/
+        let reviewer_ws = workspace_dir.join("reviewer");
+        assert!(
+            reviewer_ws.exists(),
+            "Named subagent workspace directory should exist at {}",
+            reviewer_ws.display()
+        );
+
+        // Clean up temp directory
+        let _ = std::fs::remove_dir_all(&workspace_dir);
     }
 
     // -- (l) concurrent named subagent invocations are rejected -----------------
