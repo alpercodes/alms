@@ -371,8 +371,20 @@ impl ServerConfig {
     /// Return the resolved path to the SQLite database file.
     ///
     /// Precedence: `ALMS_DB_PATH` env var > `{data_dir}/alms.db`.
+    ///
+    /// Known limitation: `to_string_lossy()` silently replaces non-UTF-8 path
+    /// segments with U+FFFD, which could corrupt the path on Linux filesystems
+    /// that allow arbitrary byte sequences in filenames. This is not an issue on
+    /// Windows (paths are always UTF-16). The proper fix is changing the return
+    /// type to `PathBuf`, but that requires updating callers in `alms-session`
+    /// and `alms-gateway` which expect `String` for SQLite connection strings.
     pub fn db_path(&self) -> String {
-        std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| format!("{}/alms.db", self.data_dir))
+        std::env::var("ALMS_DB_PATH").unwrap_or_else(|_| {
+            Path::new(&self.data_dir)
+                .join("alms.db")
+                .to_string_lossy()
+                .into_owned()
+        })
     }
 
     /// Return the resolved path to the agent workspace directory.
@@ -381,7 +393,7 @@ impl ServerConfig {
     pub fn workspace_dir(&self) -> PathBuf {
         std::env::var("ALMS_WORKSPACE_DIR")
             .map(Into::into)
-            .unwrap_or_else(|_| PathBuf::from(format!("{}/workspace", self.data_dir)))
+            .unwrap_or_else(|_| Path::new(&self.data_dir).join("workspace"))
     }
 }
 
@@ -591,7 +603,7 @@ impl LoggingConfig {
     pub fn resolve_log_dir(&self, data_dir: &str) -> PathBuf {
         match &self.log_dir {
             Some(dir) => PathBuf::from(dir),
-            None => PathBuf::from(format!("{}/logs", data_dir)),
+            None => Path::new(data_dir).join("logs"),
         }
     }
 }
@@ -979,6 +991,17 @@ stream_chunk_timeout_secs = 120
         let config = LoggingConfig::default();
         let resolved = config.resolve_log_dir("./data");
         assert_eq!(resolved, PathBuf::from("./data/logs"));
+    }
+
+    /// Verify that `resolve_log_dir` produces valid paths even when
+    /// `data_dir` uses Windows backslash separators (no forward-slash mixing).
+    #[cfg(windows)]
+    #[test]
+    fn test_logging_resolve_log_dir_windows_backslash() {
+        let config = LoggingConfig::default();
+        let resolved = config.resolve_log_dir(r"C:\Users\test\data");
+        // Path::join produces backslash-separated path on Windows
+        assert_eq!(resolved, PathBuf::from(r"C:\Users\test\data\logs"));
     }
 
     #[test]

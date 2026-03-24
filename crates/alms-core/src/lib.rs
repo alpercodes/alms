@@ -169,7 +169,20 @@ pub fn build_shell_default_env(
 /// exist yet. Returns the path as-is as a last resort.
 pub fn resolve_to_absolute(path: &std::path::Path) -> String {
     if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical.to_string_lossy().into_owned();
+        let s = canonical.to_string_lossy().into_owned();
+        // On Windows, `canonicalize` returns extended-length paths (`\\?\C:\...`).
+        // This prefix requires pure backslash separators and breaks code that
+        // does string-based path construction with `/`.  Strip it when the
+        // remaining path is a normal absolute path (e.g. `C:\...`).
+        #[cfg(windows)]
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            // Only strip when what follows is a drive-letter path (e.g. "C:\…"),
+            // so we don't accidentally mangle UNC paths like `\\?\UNC\…`.
+            if stripped.len() >= 3 && stripped.as_bytes()[1] == b':' {
+                return stripped.to_owned();
+            }
+        }
+        return s;
     }
     // Path may not exist yet — make it absolute via current_dir + join.
     if !path.is_absolute()
@@ -311,6 +324,23 @@ mod tests {
         assert!(
             std::path::Path::new(&result).is_absolute(),
             "Existing dir should resolve to absolute, got: {result}"
+        );
+    }
+
+    /// On Windows, `canonicalize` returns `\\?\C:\...` paths which break
+    /// string-based path construction.  Verify we strip the prefix.
+    #[cfg(windows)]
+    #[test]
+    fn test_resolve_to_absolute_no_extended_prefix() {
+        let tmp = std::env::temp_dir();
+        let result = resolve_to_absolute(&tmp);
+        assert!(
+            !result.starts_with(r"\\?\"),
+            "Extended-length prefix should be stripped, got: {result}"
+        );
+        assert!(
+            std::path::Path::new(&result).is_absolute(),
+            "Result should still be an absolute path, got: {result}"
         );
     }
 }

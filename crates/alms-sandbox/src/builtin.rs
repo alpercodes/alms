@@ -562,6 +562,13 @@ pub struct ShellExecTool {
     /// Default working directory when no explicit `cwd` param is provided.
     /// Used to set the agent's workspace as the "home directory".
     /// Takes precedence over `sandbox_root` as default cwd.
+    ///
+    /// NOTE: On Windows this may carry a `\\?\` extended-length prefix from
+    /// `canonicalize()`. This is safe because the value is only ever passed to
+    /// `Command::current_dir()` (which accepts `AsRef<Path>` and delegates to
+    /// the OS) or compared via `Path::starts_with()`. No string concatenation
+    /// or `format!`-based path building is done with this field.
+    /// Audited 2026-03-24 for PR #338.
     default_cwd: Option<PathBuf>,
     /// Default environment variables injected into spawned processes.
     /// Applied after `env_clear()` — the tool call's `env` parameter
