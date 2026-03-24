@@ -288,11 +288,6 @@ impl SecretsStore {
         Ok(existed)
     }
 
-    /// List providers that have keys set (no values exposed).
-    pub fn list_providers(&self) -> Vec<String> {
-        self.keys.keys().cloned().collect()
-    }
-
     /// Mask a key for display: show first 4 and last 4 chars.
     /// Safe for non-ASCII keys (uses char boundaries).
     pub fn masked_key(key: &str) -> String {
@@ -303,11 +298,6 @@ impl SecretsStore {
         let prefix: String = chars[..4].iter().collect();
         let suffix: String = chars[chars.len() - 4..].iter().collect();
         format!("{prefix}...{suffix}")
-    }
-
-    /// Get a masked version of a key for a provider.
-    pub fn get_masked(&self, provider: &str) -> Option<String> {
-        self.keys.get(provider).map(|k| Self::masked_key(k))
     }
 
     /// Resolve an API key for a provider from the secrets store only.
@@ -352,22 +342,21 @@ impl SecretsStore {
     /// - `masked_key`: the masked key value, or `None` if not stored
     /// - `source`: `"secrets"` if directly stored, `"alias:<provider>"` if
     ///   resolved via alias, `"none"` if no key at all
+    ///
+    /// Delegates to [`resolve_key_with_source`](Self::resolve_key_with_source)
+    /// so the alias fallback logic lives in a single place.
     pub fn key_status(&self, provider: &str) -> (bool, Option<String>, String) {
-        if let Some(k) = self.get_key(provider) {
-            return (true, Some(Self::masked_key(k)), "secrets".to_string());
+        match self.resolve_key_with_source(provider) {
+            Some((key, source)) if source == provider => {
+                (true, Some(Self::masked_key(&key)), "secrets".to_string())
+            }
+            Some((key, source)) => (
+                false,
+                Some(Self::masked_key(&key)),
+                format!("alias:{source}"),
+            ),
+            None => (false, None, "none".to_string()),
         }
-        // Check alias fallback (openai <-> openrouter only).
-        let fallback = match provider {
-            "openai" => Some("openrouter"),
-            "openrouter" => Some("openai"),
-            _ => None,
-        };
-        if let Some(fb) = fallback
-            && let Some(k) = self.get_key(fb)
-        {
-            return (false, Some(Self::masked_key(k)), format!("alias:{fb}"));
-        }
-        (false, None, "none".to_string())
     }
 
     /// Detect API key environment variables that are set in the current process.
@@ -511,21 +500,6 @@ mod tests {
             "sk-t...5678"
         );
         assert_eq!(SecretsStore::masked_key("short"), "*****");
-    }
-
-    #[test]
-    fn test_list_providers() {
-        let tmp = std::env::temp_dir().join(format!("alms-secrets-{}", uuid::Uuid::new_v4()));
-        let path = tmp.join("secrets.json");
-        let mut store = SecretsStore::load_with_key(&path, None).unwrap();
-
-        store.set_key("openai", "key1").unwrap();
-        store.set_key("anthropic", "key2").unwrap();
-        let mut providers = store.list_providers();
-        providers.sort();
-        assert_eq!(providers, vec!["anthropic", "openai"]);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -943,5 +917,34 @@ mod tests {
         assert!(!configured, "Anthropic should not alias from openrouter");
         assert!(masked.is_none(), "No masked key for anthropic");
         assert_eq!(source, "none");
+    }
+
+    #[test]
+    fn test_key_status_both_direct_no_alias() {
+        // When both openai and openrouter have directly stored keys,
+        // each should report source="secrets" (not alias).
+        let mut store = SecretsStore::empty();
+        store
+            .keys
+            .insert("openai".into(), "sk-oai-direct-key-1234".into());
+        store
+            .keys
+            .insert("openrouter".into(), "sk-or-direct-key-5678".into());
+
+        let (configured, masked, source) = store.key_status("openai");
+        assert!(configured, "openai should be directly configured");
+        assert_eq!(masked, Some("sk-o...1234".into()));
+        assert_eq!(
+            source, "secrets",
+            "openai should report 'secrets', not alias"
+        );
+
+        let (configured, masked, source) = store.key_status("openrouter");
+        assert!(configured, "openrouter should be directly configured");
+        assert_eq!(masked, Some("sk-o...5678".into()));
+        assert_eq!(
+            source, "secrets",
+            "openrouter should report 'secrets', not alias"
+        );
     }
 }
