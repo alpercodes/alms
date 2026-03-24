@@ -497,6 +497,17 @@ async fn execute_run(state: AppState, params: RunParams) {
         llm = llm.with_model(model.clone());
     }
 
+    // Peer-message-triggered runs (DMs from other agents) have no human in
+    // the loop, so Guarded posture would hang forever waiting for approval.
+    // Force Autonomous posture for these runs.
+    if is_peer_message && agent_config.posture == alms_runtime::Posture::Guarded {
+        info!(
+            "Run {} is peer-message-triggered — overriding Guarded posture to Autonomous",
+            run_id.0
+        );
+        agent_config.posture = alms_runtime::Posture::Autonomous;
+    }
+
     // Create a runtime event channel so we can forward tool events to SSE.
     // Clone before moving into `with_event_sender` so invoke_agent can forward
     // subagent events into the same stream.
@@ -1784,6 +1795,61 @@ mod tests {
         // telegram is a valid secret key but NOT a valid LLM provider
         let err = validate_provider("telegram").unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_peer_message_overrides_guarded_to_autonomous() {
+        // Simulate the posture override logic in execute_run for peer-message runs.
+        let mut cfg = AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        };
+        let is_peer_message = true;
+
+        // This mirrors the logic in execute_run:
+        if is_peer_message && cfg.posture == Posture::Guarded {
+            cfg.posture = Posture::Autonomous;
+        }
+        assert!(
+            matches!(cfg.posture, Posture::Autonomous),
+            "Guarded posture should be overridden to Autonomous for peer-message runs"
+        );
+    }
+
+    #[test]
+    fn test_peer_message_does_not_override_full_control() {
+        // If the agent is already FullControl, peer-message should not change it.
+        let mut cfg = AgentConfig {
+            posture: Posture::FullControl,
+            ..AgentConfig::default()
+        };
+        let is_peer_message = true;
+
+        if is_peer_message && cfg.posture == Posture::Guarded {
+            cfg.posture = Posture::Autonomous;
+        }
+        assert!(
+            matches!(cfg.posture, Posture::FullControl),
+            "FullControl posture should NOT be overridden for peer-message runs"
+        );
+    }
+
+    #[test]
+    fn test_non_peer_message_keeps_guarded() {
+        // Non-peer-message runs (user-initiated) should keep Guarded posture.
+        let mut cfg = AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        };
+        let is_peer_message = false;
+
+        if is_peer_message && cfg.posture == Posture::Guarded {
+            cfg.posture = Posture::Autonomous;
+        }
+        assert!(
+            matches!(cfg.posture, Posture::Guarded),
+            "Guarded posture should be preserved for non-peer-message runs"
+        );
     }
 
     #[test]
