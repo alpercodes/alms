@@ -24,6 +24,32 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+/// Valid LLM provider identifiers accepted in per-run overrides.
+///
+/// This is intentionally separate from `alms_core::secrets::VALID_PROVIDERS`
+/// which also includes non-LLM keys like `"telegram"`.
+const VALID_LLM_PROVIDERS: &[&str] = &["openai", "anthropic", "openrouter"];
+
+/// Validate that a provider string is a known LLM provider.
+///
+/// Returns `Ok(())` if valid, or an API error tuple suitable for returning
+/// from an Axum handler if the provider is unrecognised.
+fn validate_provider(provider: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if VALID_LLM_PROVIDERS.contains(&provider) {
+        Ok(())
+    } else {
+        Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PROVIDER",
+            format!(
+                "Unknown provider '{}'. Valid providers: {}",
+                provider,
+                VALID_LLM_PROVIDERS.join(", ")
+            ),
+        ))
+    }
+}
+
 /// Per-run overrides that can be sent by the client to customise a single run.
 #[derive(Debug, Default)]
 struct RunOverrides {
@@ -280,6 +306,12 @@ pub async fn create_run(
     let input_text = match req.input {
         RunInput::Text { text } => text,
     };
+
+    // Validate provider override early so the user gets a clear 400 instead
+    // of a confusing "invalid API key" error from a wrong provider.
+    if let Some(ref p) = req.provider {
+        validate_provider(p)?;
+    }
 
     let overrides = RunOverrides {
         model: req.model.clone(),
@@ -1670,5 +1702,76 @@ mod tests {
         let merged = apply_overrides(base_config(), None, &overrides);
         // Unknown per-run posture keeps server default
         assert!(matches!(merged.agent_config.posture, Posture::FullControl));
+    }
+
+    #[test]
+    fn test_validate_provider_accepts_valid_providers() {
+        assert!(validate_provider("openai").is_ok());
+        assert!(validate_provider("anthropic").is_ok());
+        assert!(validate_provider("openrouter").is_ok());
+    }
+
+    #[test]
+    fn test_validate_provider_rejects_unknown() {
+        let err = validate_provider("anthrpoic").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let body = err.1.0;
+        assert_eq!(body["error"]["code"], "INVALID_PROVIDER");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("anthrpoic"),
+            "error message should mention the invalid provider"
+        );
+    }
+
+    #[test]
+    fn test_validate_provider_rejects_telegram() {
+        // telegram is a valid secret key but NOT a valid LLM provider
+        let err = validate_provider("telegram").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_per_run_provider_override_wires_through() {
+        // Verify that setting provider in RunOverrides is carried through
+        // to execute_run's LlmClient reconfiguration. We test the building
+        // block (with_provider_and_secrets) since execute_run requires full
+        // AppState; the wiring in execute_run is:
+        //   if let Some(ref provider) = overrides.provider {
+        //       llm = llm.with_provider_and_secrets(provider, &secrets);
+        //   }
+        use alms_runtime::LlmClient;
+        use alms_runtime::llm_types::LlmConfig;
+
+        let config = LlmConfig {
+            provider: "openai".into(),
+            api_key: "openai-key".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+        assert_eq!(client.provider(), "openai");
+
+        // Simulate what execute_run does when overrides.provider is Some
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_path = dir.path().join("secrets.json");
+        let mut secrets = alms_core::secrets::SecretsStore::load(secrets_path)
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-override").unwrap();
+
+        let overrides = RunOverrides {
+            provider: Some("anthropic".into()),
+            ..RunOverrides::default()
+        };
+
+        // Apply provider override the same way execute_run does
+        let mut llm = client;
+        if let Some(ref provider) = overrides.provider {
+            llm = llm.with_provider_and_secrets(provider, &secrets);
+        }
+
+        assert_eq!(llm.provider(), "anthropic");
     }
 }
