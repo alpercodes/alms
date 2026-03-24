@@ -24,13 +24,16 @@ function Section({ title, defaultOpen = false, children }) {
     const open = useSignal(defaultOpen);
     return html`
         <div class="settings-section">
-            <button class="settings-section-toggle"
+            <button type="button" class="settings-section-toggle"
                     aria-expanded=${open.value}
-                    onClick=${() => { open.value = !open.value; }}>
+                    onClick=${(e) => { e.stopPropagation(); open.value = !open.value; }}>
                 <span class="settings-section-arrow ${open.value ? 'open' : ''}">\u25B6</span>
                 <span class="settings-section-title">${title}</span>
             </button>
-            ${open.value && html`<div class="settings-section-body">${children}</div>`}
+            <div class="settings-section-body ${open.value ? 'open' : ''}"
+                 aria-hidden=${!open.value}>
+                ${children}
+            </div>
         </div>
     `;
 }
@@ -270,7 +273,7 @@ export function SettingsModal({ open, onClose }) {
                 <div class="settings-divider"></div>
 
                 <!-- ── Context (server-level, read-only) ── -->
-                <${Section} title="Context" defaultOpen=${false}>
+                <${Section} key="ctx" title="Context" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
                         Controls how conversation history is assembled for each LLM request. Edit in alms.toml under [context].
                     </span>
@@ -287,7 +290,7 @@ export function SettingsModal({ open, onClose }) {
                 <//>
 
                 <!-- ── Session (server-level, read-only) ── -->
-                <${Section} title="Session" defaultOpen=${false}>
+                <${Section} key="sess" title="Session" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
                         Controls session storage and retention. Edit in alms.toml under [session].
                     </span>
@@ -304,7 +307,7 @@ export function SettingsModal({ open, onClose }) {
                 <//>
 
                 <!-- ── Tools (server-level, read-only) ── -->
-                <${Section} title="Tools" defaultOpen=${false}>
+                <${Section} key="tools" title="Tools" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
                         Tool execution settings. Edit in alms.toml under [tools].
                     </span>
@@ -321,7 +324,7 @@ export function SettingsModal({ open, onClose }) {
                 <//>
 
                 <!-- ── Logging (server-level, read-only) ── -->
-                <${Section} title="Logging" defaultOpen=${false}>
+                <${Section} key="log" title="Logging" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
                         File-based logging settings. Edit in alms.toml under [logging]. Requires restart.
                     </span>
