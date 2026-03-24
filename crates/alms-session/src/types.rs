@@ -169,4 +169,20 @@ mod tests {
             other => panic!("expected Image, got {other:?}"),
         }
     }
+
+    #[test]
+    fn image_content_alt_key_absent() {
+        // When the `alt` key is entirely missing from the JSON (not null, just absent),
+        // serde should still deserialize successfully with alt = None.
+        let json: serde_json::Value =
+            serde_json::from_str(r#"{"image": {"url": "https://example.com/photo.png"}}"#).unwrap();
+        let content: Content = serde_json::from_value(json).unwrap();
+        match &content {
+            Content::Image { url, alt } => {
+                assert_eq!(url, "https://example.com/photo.png");
+                assert!(alt.is_none());
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
 }
