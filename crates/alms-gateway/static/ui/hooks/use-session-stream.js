@@ -136,6 +136,12 @@ export function openSessionStream(sessionId, opts) {
         if (idx >= 0) {
             msgs[idx] = { ...msgs[idx], phase: data.phase, phaseDetail: data.detail || null };
             chatMessages.value = msgs;
+        } else {
+            // Thinking indicator was removed by token_delta flush or tool_start
+            // (e.g. on iteration 2+ of the agent loop). Re-add it so the user
+            // sees the current phase ("Running tools...", "Thinking...", etc.).
+            msgs.push({ type: 'thinking', phase: data.phase, phaseDetail: data.detail || null });
+            chatMessages.value = msgs;
         }
     });
 
