@@ -1278,7 +1278,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_named_subagent_persistent_session() {
-        let coord = test_coordinator();
+        // Use tempfile::TempDir for RAII cleanup — automatic drop even on panic.
+        // (Previously this test used workspace_dir: None — see #55.)
+        let workspace_tmp = tempfile::TempDir::new().unwrap();
+        let workspace_dir = workspace_tmp.path().to_path_buf();
+        let coord = test_coordinator().with_workspace_dir(workspace_dir.clone());
         let parent_session = test_session_id();
 
         // First invocation with name "reviewer"
@@ -1324,6 +1328,16 @@ mod tests {
             "Named subagent should have 4 messages (2 turns), got {}",
             messages.len()
         );
+
+        // Verify workspace attachment: the named subagent's workspace directory
+        // should have been created at {workspace_dir}/reviewer/
+        let reviewer_ws = workspace_dir.join("reviewer");
+        assert!(
+            reviewer_ws.exists(),
+            "Named subagent workspace directory should exist at {}",
+            reviewer_ws.display()
+        );
+        // workspace_tmp drops here — automatic cleanup even on panic
     }
 
     // -- (l) concurrent named subagent invocations are rejected -----------------
