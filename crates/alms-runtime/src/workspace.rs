@@ -156,8 +156,11 @@ impl AgentWorkspace {
     }
 
     /// Build system prompt prefix from workspace files.
-    /// Returns the assembled text to prepend to the system prompt.
-    pub fn build_system_prompt_prefix(&self) -> String {
+    ///
+    /// When `include_user` is false, `user.md` is omitted from the prefix.
+    /// This saves tokens and avoids confusion in non-user-facing contexts
+    /// (DM sessions, subagent runs, scheduled jobs).
+    pub fn build_system_prompt_prefix(&self, include_user: bool) -> String {
         let mut parts = Vec::new();
 
         if let Some(personality) = self.read_file(WorkspaceFile::Personality) {
@@ -168,7 +171,7 @@ impl AgentWorkspace {
             parts.push(format!("## Current Goals\n{}", goals));
         }
 
-        if let Some(user) = self.read_file(WorkspaceFile::User) {
+        if include_user && let Some(user) = self.read_file(WorkspaceFile::User) {
             parts.push(format!("## About the User\n{}", user));
         }
 
@@ -267,7 +270,7 @@ mod tests {
     #[test]
     fn test_build_system_prompt_prefix_empty() {
         let (_dir, ws) = test_workspace();
-        assert!(ws.build_system_prompt_prefix().is_empty());
+        assert!(ws.build_system_prompt_prefix(true).is_empty());
     }
 
     #[test]
@@ -284,11 +287,33 @@ mod tests {
         ws.write_file(WorkspaceFile::User, "Name: Alper. Prefers concise answers.")
             .unwrap();
 
-        let prefix = ws.build_system_prompt_prefix();
+        let prefix = ws.build_system_prompt_prefix(true);
         assert!(prefix.contains("concise and technical"));
         assert!(prefix.contains("Help with Rust"));
         assert!(prefix.contains("About the User"));
         assert!(prefix.contains("Alper"));
+    }
+
+    #[test]
+    fn test_build_system_prompt_prefix_skip_user() {
+        let (_dir, ws) = test_workspace();
+        ws.ensure_dir().unwrap();
+        std::fs::write(
+            ws.dir().join("personality.md"),
+            "I am concise and technical.",
+        )
+        .unwrap();
+        ws.write_file(WorkspaceFile::Goals, "Help with Rust")
+            .unwrap();
+        ws.write_file(WorkspaceFile::User, "Name: Alper. Prefers concise answers.")
+            .unwrap();
+
+        let prefix = ws.build_system_prompt_prefix(false);
+        assert!(prefix.contains("concise and technical"));
+        assert!(prefix.contains("Help with Rust"));
+        // user.md should be omitted for non-user-facing sessions
+        assert!(!prefix.contains("About the User"));
+        assert!(!prefix.contains("Alper"));
     }
 
     #[test]
