@@ -10,11 +10,11 @@
 //!
 //! ## Loop prevention
 //!
-//! The MessageBus internally tracks two mechanisms:
-//! 1. **Depth tracking**: per DM pair, counts consecutive bounces (A->B->A->B...).
-//!    Delivery is refused when depth exceeds `MAX_DM_DEPTH`.
-//! 2. **Per-DM-pair cooldown**: after delivering a message, the same pair cannot
-//!    send another for `DM_COOLDOWN_SECS` seconds.
+//! The MessageBus tracks a **depth counter** per DM pair that counts
+//! consecutive bounces (A->B->A->B...). Delivery is refused when depth
+//! exceeds `MAX_DM_DEPTH`. The depth counter resets automatically when
+//! no messages have been exchanged for `DEPTH_EXPIRY_SECS` seconds,
+//! allowing fresh conversation bursts after a quiet period.
 
 use alms_core::{AgentId, SessionId, dm_context_id};
 use alms_runtime::message_sender::{DeliveryReceipt, MessageSender, SendError};
@@ -28,10 +28,10 @@ use tokio::sync::mpsc;
 use tracing::{info, instrument, warn};
 
 /// Maximum message forwarding depth. Prevents infinite A -> B -> A loops.
-const MAX_DM_DEPTH: u32 = 5;
+const MAX_DM_DEPTH: u32 = 20;
 
-/// Minimum seconds between messages in the same DM pair.
-const DM_COOLDOWN_SECS: u64 = 5;
+/// Seconds of inactivity after which the depth counter resets for a DM pair.
+const DEPTH_EXPIRY_SECS: u64 = 60;
 
 // ---------------------------------------------------------------------------
 // RunTrigger -- sent to the gateway to create runs
@@ -75,11 +75,11 @@ pub struct MessageBus {
     session_manager: Arc<SessionManager>,
     /// Channel to trigger runs on the gateway.
     run_trigger_tx: mpsc::UnboundedSender<RunTrigger>,
-    /// Per-DM-pair cooldown tracker: "dm:a:b" -> last send instant.
-    cooldowns: DashMap<String, Instant>,
     /// Per-DM-pair depth tracker: "dm:a:b" -> (last_sender_name, depth).
     /// Depth increments each time the sender changes within the same pair.
     depths: DashMap<String, (String, u32)>,
+    /// Per-DM-pair last activity timestamp for depth expiry.
+    last_activity: DashMap<String, Instant>,
 }
 
 impl MessageBus {
@@ -91,8 +91,8 @@ impl MessageBus {
         Self {
             session_manager,
             run_trigger_tx,
-            cooldowns: DashMap::new(),
             depths: DashMap::new(),
+            last_activity: DashMap::new(),
         }
     }
 }
@@ -101,7 +101,7 @@ impl MessageBus {
 impl MessageSender for MessageBus {
     /// Send a message from one agent to another via a shared DM session.
     ///
-    /// 1. Validates the send (self-message, cooldown, depth).
+    /// 1. Validates the send (self-message, depth).
     /// 2. Gets-or-creates the shared DM session (deterministic SessionId).
     /// 3. Appends the message as `Role::User` with `{from_agent}` metadata.
     /// 4. Emits a `RunTrigger` for the recipient.
@@ -129,19 +129,26 @@ impl MessageSender for MessageBus {
 
         let dm_context = dm_context_id(sender_name, recipient_name);
 
-        // Per-DM-pair cooldown check. When the cooldown has expired, also
-        // reset the depth counter so agents can have separate conversation
-        // bursts over time (depth tracks bouncing within a single burst,
-        // not all-time exchanges).
-        if let Some(last_send) = self.cooldowns.get(&dm_context) {
-            let elapsed = last_send.elapsed().as_secs();
-            if elapsed < DM_COOLDOWN_SECS {
-                return Err(SendError::CooldownActive);
-            }
-            // Cooldown expired — reset depth for this pair so a new
-            // conversation burst can start fresh.
+        // Time-based depth expiry: if no messages have been exchanged in
+        // this DM pair for DEPTH_EXPIRY_SECS, reset the depth counter so
+        // a new conversation burst can start fresh.
+        if let Some(last) = self.last_activity.get(&dm_context)
+            && last.elapsed().as_secs() >= DEPTH_EXPIRY_SECS
+        {
             self.depths.remove(&dm_context);
         }
+
+        // Opportunistic cleanup: remove expired entries from both DashMaps
+        // to prevent unbounded growth from accumulated DM pairs. We only
+        // retain entries that have been active within the expiry window.
+        self.last_activity.retain(|key, last| {
+            if last.elapsed().as_secs() >= DEPTH_EXPIRY_SECS {
+                self.depths.remove(key);
+                false
+            } else {
+                true
+            }
+        });
 
         // Internal depth tracking: increments each time a different sender
         // sends to the same DM pair. If Alice sends, then Bob replies, then
@@ -191,8 +198,9 @@ impl MessageSender for MessageBus {
             .append_message(session.id, msg)
             .map_err(|e| SendError::Internal(e.to_string()))?;
 
-        // --- Update cooldown ---
-        self.cooldowns.insert(dm_context.clone(), Instant::now());
+        // --- Update last activity for depth expiry ---
+        self.last_activity
+            .insert(dm_context.clone(), Instant::now());
 
         // --- Trigger run on recipient ---
         let trigger = RunTrigger {
@@ -281,9 +289,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Manually clear cooldown for testing
-        bus.cooldowns.clear();
-
         // Bob sends to Alice (same shared session, reversed order)
         let r2 = bus
             .send("bob", bob_id, "alice", alice_id, "Hi Alice!")
@@ -326,7 +331,6 @@ mod tests {
         // Send MAX_DM_DEPTH alternating messages (depth reaches MAX_DM_DEPTH).
         // Each sender change increments depth: alice(1), bob(2), alice(3), ...
         for i in 0..MAX_DM_DEPTH {
-            bus.cooldowns.clear();
             if i % 2 == 0 {
                 bus.send("alice", a, "bob", b, "ping").await.unwrap();
             } else {
@@ -335,7 +339,6 @@ mod tests {
         }
 
         // Next alternating message should be rejected (depth > MAX_DM_DEPTH)
-        bus.cooldowns.clear();
         let err = bus
             .send(
                 if MAX_DM_DEPTH.is_multiple_of(2) {
@@ -358,21 +361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cooldown_enforced() {
-        let (bus, _rx) = setup();
-        let a = AgentId::new();
-        let b = AgentId::new();
-
-        // First message should succeed
-        bus.send("alice", a, "bob", b, "msg1").await.unwrap();
-
-        // Immediate second message should be rejected (cooldown)
-        let err = bus.send("alice", a, "bob", b, "msg2").await.unwrap_err();
-        assert!(matches!(err, SendError::CooldownActive));
-    }
-
-    #[tokio::test]
-    async fn test_cooldown_symmetric() {
+    async fn test_reply_not_blocked() {
         let (bus, _rx) = setup();
         let a = AgentId::new();
         let b = AgentId::new();
@@ -380,9 +369,8 @@ mod tests {
         // A -> B succeeds
         bus.send("alice", a, "bob", b, "msg1").await.unwrap();
 
-        // B -> A should also be blocked (same DM pair)
-        let err = bus.send("bob", b, "alice", a, "reply").await.unwrap_err();
-        assert!(matches!(err, SendError::CooldownActive));
+        // B -> A should succeed immediately (no cooldown blocking replies)
+        bus.send("bob", b, "alice", a, "reply").await.unwrap();
     }
 
     #[tokio::test]
@@ -414,14 +402,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_depth_resets_after_cooldown_expires() {
+    async fn test_depth_resets_after_activity_expires() {
         let (bus, _rx) = setup();
         let a = AgentId::new();
         let b = AgentId::new();
 
         // Exhaust depth: send MAX_DM_DEPTH alternating messages
         for i in 0..MAX_DM_DEPTH {
-            bus.cooldowns.clear();
             if i % 2 == 0 {
                 bus.send("alice", a, "bob", b, "ping").await.unwrap();
             } else {
@@ -430,7 +417,6 @@ mod tests {
         }
 
         // Next message should be rejected (depth exceeded)
-        bus.cooldowns.clear();
         let err = bus
             .send(
                 if MAX_DM_DEPTH.is_multiple_of(2) {
@@ -451,14 +437,14 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
 
-        // Simulate cooldown expiry: insert a cooldown timestamp in the past.
+        // Simulate activity expiry: insert a last_activity timestamp in the past.
         let dm_ctx = dm_context_id("alice", "bob");
-        bus.cooldowns.insert(
+        bus.last_activity.insert(
             dm_ctx.clone(),
-            Instant::now() - std::time::Duration::from_secs(DM_COOLDOWN_SECS + 1),
+            Instant::now() - std::time::Duration::from_secs(DEPTH_EXPIRY_SECS + 1),
         );
 
-        // After cooldown expires, depth should be reset — sending should succeed.
+        // After activity expires, depth should be reset -- sending should succeed.
         let receipt = bus.send("alice", a, "bob", b, "fresh start").await.unwrap();
         assert_eq!(
             receipt.session_id,
@@ -525,7 +511,6 @@ mod tests {
         assert_eq!(session.id, expected_session_id);
 
         // Step 6: A second message from Bob should use the SAME session.
-        bus.cooldowns.clear();
         let receipt2 = bus
             .send("bob", bob_id, "alice", alice_id, "I'm fine, thanks!")
             .await
@@ -546,5 +531,53 @@ mod tests {
             "alice"
         );
         assert_eq!(history2[1].metadata.as_ref().unwrap()["from_agent"], "bob");
+    }
+
+    #[tokio::test]
+    async fn test_expired_entries_cleaned_up() {
+        let (bus, _rx) = setup();
+        let a = AgentId::new();
+        let b = AgentId::new();
+        let c = AgentId::new();
+
+        // Create two DM pairs: alice-bob and alice-charlie
+        bus.send("alice", a, "bob", b, "hi bob").await.unwrap();
+        bus.send("alice", a, "charlie", c, "hi charlie")
+            .await
+            .unwrap();
+
+        let ab_ctx = dm_context_id("alice", "bob");
+        let ac_ctx = dm_context_id("alice", "charlie");
+
+        // Both pairs should have entries in the DashMaps
+        assert!(bus.depths.contains_key(&ab_ctx));
+        assert!(bus.depths.contains_key(&ac_ctx));
+        assert!(bus.last_activity.contains_key(&ab_ctx));
+        assert!(bus.last_activity.contains_key(&ac_ctx));
+
+        // Expire alice-bob by backdating its last_activity
+        bus.last_activity.insert(
+            ab_ctx.clone(),
+            Instant::now() - std::time::Duration::from_secs(DEPTH_EXPIRY_SECS + 1),
+        );
+
+        // Sending any message triggers opportunistic cleanup of expired pairs
+        bus.send("alice", a, "charlie", c, "still here")
+            .await
+            .unwrap();
+
+        // alice-bob should have been cleaned up (expired)
+        assert!(
+            !bus.depths.contains_key(&ab_ctx),
+            "expired depths entry should be removed"
+        );
+        assert!(
+            !bus.last_activity.contains_key(&ab_ctx),
+            "expired last_activity entry should be removed"
+        );
+
+        // alice-charlie should still be present (active)
+        assert!(bus.depths.contains_key(&ac_ctx));
+        assert!(bus.last_activity.contains_key(&ac_ctx));
     }
 }

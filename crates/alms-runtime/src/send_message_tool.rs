@@ -125,13 +125,6 @@ impl Tool for SendMessageTool {
                 "dm_session_id": receipt.session_id.0.to_string(),
                 "note": "Message delivered. The recipient will process it asynchronously."
             })),
-            Err(SendError::CooldownActive) => {
-                warn!("send_message cooldown active for {to}");
-                Ok(serde_json::json!({
-                    "error": "Cooldown active -- wait a few seconds before sending another message to this agent.",
-                    "cooldown": true,
-                }))
-            }
             Err(SendError::DepthExceeded) => {
                 warn!("send_message depth exceeded for {to}");
                 Ok(serde_json::json!({
