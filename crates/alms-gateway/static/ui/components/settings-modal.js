@@ -2,7 +2,7 @@ import { html, useSignal, useEffect } from '../deps.js';
 import { serverDefaults, localSettings, saveSettings } from '../state/settings.js';
 import { listKeys, setKey, removeKey } from '../api/auth.js';
 
-const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
+const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'telegram'];
 
 function ApiKeysSection() {
     const keys = useSignal([]);
@@ -107,6 +107,7 @@ function ApiKeysSection() {
 }
 
 export function SettingsModal({ open, onClose }) {
+    const provider = useSignal('');
     const model = useSignal('');
     const maxTokens = useSignal('');
     const posture = useSignal('');
@@ -114,6 +115,7 @@ export function SettingsModal({ open, onClose }) {
 
     useEffect(() => {
         if (open) {
+            provider.value = localSettings.value.provider || '';
             model.value = localSettings.value.model || '';
             maxTokens.value = localSettings.value.max_tokens != null
                 ? String(localSettings.value.max_tokens)
@@ -129,6 +131,7 @@ export function SettingsModal({ open, onClose }) {
 
     const onSave = () => {
         const updates = {};
+        updates.provider = provider.value || null;
         updates.model = model.value.trim() || null;
         const mt = parseInt(maxTokens.value, 10);
         updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
@@ -139,7 +142,8 @@ export function SettingsModal({ open, onClose }) {
     };
 
     const onReset = () => {
-        saveSettings({ model: null, max_tokens: null, posture: null });
+        saveSettings({ provider: null, model: null, max_tokens: null, posture: null });
+        provider.value = '';
         model.value = '';
         maxTokens.value = '';
         posture.value = '';
@@ -160,15 +164,29 @@ export function SettingsModal({ open, onClose }) {
 
                 <div class="settings-divider"></div>
 
-                <div class="settings-row">
-                    <label class="settings-label">Model override</label>
-                    <input class="settings-input" type="text"
-                           placeholder=${defaults.model || 'server default'}
-                           value=${model.value}
-                           onInput=${e => { model.value = e.target.value; }} />
-                    <span class="settings-hint">
-                        Override for all runs. Leave empty to use server default (${defaults.model || 'unknown'}).
-                    </span>
+                <div class="settings-grid">
+                    <div class="settings-row">
+                        <label class="settings-label">Provider override</label>
+                        <select class="settings-select"
+                                value=${provider.value}
+                                onChange=${e => { provider.value = e.target.value; }}>
+                            <option value="">Default (${defaults.provider || 'openai'})</option>
+                            <option value="openai">OpenAI / OpenRouter</option>
+                            <option value="anthropic">Anthropic</option>
+                            <option value="openrouter">OpenRouter</option>
+                        </select>
+                    </div>
+
+                    <div class="settings-row">
+                        <label class="settings-label">Model override</label>
+                        <input class="settings-input" type="text"
+                               placeholder=${defaults.model || 'server default'}
+                               value=${model.value}
+                               onInput=${e => { model.value = e.target.value; }} />
+                        <span class="settings-hint">
+                            Leave empty to use server default (${defaults.model || 'unknown'}).
+                        </span>
+                    </div>
                 </div>
 
                 <div class="settings-grid">
@@ -199,6 +217,7 @@ export function SettingsModal({ open, onClose }) {
                     <label class="settings-label">Server info</label>
                     <div class="settings-info">
                         <div>Version: <span class="settings-info-value">${defaults.version || 'unknown'}</span></div>
+                        <div>Provider: <span class="settings-info-value">${defaults.provider || 'openai'}</span></div>
                         <div>Model: <span class="settings-info-value">${defaults.model || 'unknown'}</span></div>
                         <div>Base URL: <span class="settings-info-value">${defaults.base_url || 'unknown'}</span></div>
                         <div>Context: <span class="settings-info-value">${defaults.context_strategy || 'truncate'}</span></div>

@@ -184,6 +184,9 @@ pub struct CreateRunRequest {
     /// Optional posture override: "full_control" | "guarded" | "autonomous".
     #[serde(default)]
     pub posture: Option<String>,
+    /// Optional provider override: "openai" | "anthropic" | "openrouter".
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// Input to a run

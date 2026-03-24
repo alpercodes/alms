@@ -524,6 +524,12 @@ impl LlmClient {
     pub fn api_key(&self) -> &str {
         &self.config.api_key
     }
+
+    /// Get the current base URL (test-only).
+    #[cfg(test)]
+    pub fn base_url(&self) -> &str {
+        &self.config.base_url
+    }
 }
 
 #[cfg(test)]
@@ -707,5 +713,54 @@ mod tests {
         assert_eq!(updated.provider(), "openrouter");
         // Key must remain the original value when secrets store has nothing
         assert_eq!(updated.api_key(), "original-key");
+    }
+
+    #[test]
+    fn test_with_provider_and_secrets_switches_provider() {
+        // Start with an OpenAI client
+        let config = LlmConfig {
+            provider: "openai".into(),
+            api_key: "openai-key".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+        assert_eq!(client.provider(), "openai");
+        assert_eq!(client.base_url(), "https://api.openai.com/v1");
+
+        // Create a secrets store with an Anthropic key
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_path = dir.path().join("secrets.json");
+        let mut secrets = alms_core::secrets::SecretsStore::load(secrets_path)
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-test-key").unwrap();
+
+        // Switch to Anthropic via with_provider_and_secrets
+        let switched = client.with_provider_and_secrets("anthropic", &secrets);
+        assert_eq!(switched.provider(), "anthropic");
+        assert_eq!(switched.base_url(), "https://api.anthropic.com/v1");
+        assert_eq!(switched.api_key(), "sk-ant-test-key");
+    }
+
+    #[test]
+    fn test_with_provider_and_secrets_switches_to_openrouter() {
+        let config = LlmConfig {
+            provider: "openai".into(),
+            api_key: "openai-key".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            ..LlmConfig::default()
+        };
+        let client = LlmClient::new(config).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_path = dir.path().join("secrets.json");
+        let mut secrets = alms_core::secrets::SecretsStore::load(secrets_path)
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("openrouter", "sk-or-test-key").unwrap();
+
+        let switched = client.with_provider_and_secrets("openrouter", &secrets);
+        assert_eq!(switched.provider(), "openrouter");
+        assert_eq!(switched.base_url(), "https://openrouter.ai/api/v1");
+        assert_eq!(switched.api_key(), "sk-or-test-key");
     }
 }
