@@ -138,6 +138,18 @@ impl MessageSender for MessageBus {
             self.depths.remove(&dm_context);
         }
 
+        // Opportunistic cleanup: remove expired entries from both DashMaps
+        // to prevent unbounded growth from accumulated DM pairs. We only
+        // retain entries that have been active within the expiry window.
+        self.last_activity.retain(|key, last| {
+            if last.elapsed().as_secs() >= DEPTH_EXPIRY_SECS {
+                self.depths.remove(key);
+                false
+            } else {
+                true
+            }
+        });
+
         // Internal depth tracking: increments each time a different sender
         // sends to the same DM pair. If Alice sends, then Bob replies, then
         // Alice replies again, depth goes 1 -> 2 -> 3.
@@ -519,5 +531,53 @@ mod tests {
             "alice"
         );
         assert_eq!(history2[1].metadata.as_ref().unwrap()["from_agent"], "bob");
+    }
+
+    #[tokio::test]
+    async fn test_expired_entries_cleaned_up() {
+        let (bus, _rx) = setup();
+        let a = AgentId::new();
+        let b = AgentId::new();
+        let c = AgentId::new();
+
+        // Create two DM pairs: alice-bob and alice-charlie
+        bus.send("alice", a, "bob", b, "hi bob").await.unwrap();
+        bus.send("alice", a, "charlie", c, "hi charlie")
+            .await
+            .unwrap();
+
+        let ab_ctx = dm_context_id("alice", "bob");
+        let ac_ctx = dm_context_id("alice", "charlie");
+
+        // Both pairs should have entries in the DashMaps
+        assert!(bus.depths.contains_key(&ab_ctx));
+        assert!(bus.depths.contains_key(&ac_ctx));
+        assert!(bus.last_activity.contains_key(&ab_ctx));
+        assert!(bus.last_activity.contains_key(&ac_ctx));
+
+        // Expire alice-bob by backdating its last_activity
+        bus.last_activity.insert(
+            ab_ctx.clone(),
+            Instant::now() - std::time::Duration::from_secs(DEPTH_EXPIRY_SECS + 1),
+        );
+
+        // Sending any message triggers opportunistic cleanup of expired pairs
+        bus.send("alice", a, "charlie", c, "still here")
+            .await
+            .unwrap();
+
+        // alice-bob should have been cleaned up (expired)
+        assert!(
+            !bus.depths.contains_key(&ab_ctx),
+            "expired depths entry should be removed"
+        );
+        assert!(
+            !bus.last_activity.contains_key(&ab_ctx),
+            "expired last_activity entry should be removed"
+        );
+
+        // alice-charlie should still be present (active)
+        assert!(bus.depths.contains_key(&ac_ctx));
+        assert!(bus.last_activity.contains_key(&ac_ctx));
     }
 }

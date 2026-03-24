@@ -912,9 +912,8 @@ Agents could flood each other with messages, creating infinite loops:
 
 **Mitigations:**
 1. **Per-session rate limit**: Max N runs per minute per session (configurable, default: 10)
-2. **DM cooldown**: After sending a message, an agent cannot send another message to the same recipient for T seconds (default: 5)
-3. **Max message depth**: Track how many times a message has been "forwarded" (A->B->A->B...). After depth N (default: 5), delivery is refused with an error
-4. **Token budget per DM pair per hour**: Configurable limit on total tokens spent on a DM conversation
+2. **Max message depth**: Track how many times a message has been "forwarded" (A->B->A->B...). After depth N (default: 20), delivery is refused with an error. The depth counter resets automatically after 60 seconds of inactivity in the DM pair, allowing fresh conversation bursts after a quiet period.
+3. **Token budget per DM pair per hour**: Configurable limit on total tokens spent on a DM conversation
 
 ### 14.4 User Override
 
@@ -945,12 +944,12 @@ Each phase delivers independent value and is a PR-sized chunk.
 - `alms-session`: No schema changes (DM sessions are regular sessions with a `dm:*` context_id).
 
 **Loop prevention (must ship with Phase 1):**
-- Message depth tracking: the MessageBus internally tracks a `depth` counter per DM conversation chain, incremented each time a message bounces between the same pair (A→B = 1, B→A = 2, A→B = 3...). Delivery is refused at `depth > MAX_DM_DEPTH` (default: 5). This counter is managed entirely by the MessageBus — it is **not** exposed as a parameter on `send_message` and agents are unaware of it.
-- Per-DM-pair cooldown: after delivering a message, the MessageBus rejects another message between the same pair for T seconds (default: 5). This prevents tight A→B→A loops from burning tokens.
+- Message depth tracking: the MessageBus internally tracks a `depth` counter per DM conversation chain, incremented each time a message bounces between the same pair (A->B = 1, B->A = 2, A->B = 3...). Delivery is refused at `depth > MAX_DM_DEPTH` (default: 20). This counter is managed entirely by the MessageBus -- it is **not** exposed as a parameter on `send_message` and agents are unaware of it.
+- Depth expiry: if no messages are exchanged in a DM pair for 60 seconds, the depth counter resets automatically, allowing fresh conversation bursts after a quiet period. This replaces the previous per-DM cooldown approach, which blocked legitimate replies.
 - These are simple counters/timers in the MessageBus, not separate infrastructure.
 
 **Tests:**
-- Unit: MessageBus send/receive, DM context_id derivation, message delivery, depth limit rejection, cooldown rejection
+- Unit: MessageBus send/receive, DM context_id derivation, message delivery, depth limit rejection, depth expiry reset
 - Integration: Agent A sends to Agent B, B's session gets a run with the message
 
 **Estimated size:** ~500 lines of new code, ~12 tests.
@@ -1010,7 +1009,7 @@ Each phase delivers independent value and is a PR-sized chunk.
 
 ### Phase 5: Advanced rate limiting + user controls
 
-**Goal**: Configurable rate limiting and user control over agent conversations. (Basic loop prevention — depth tracking and per-DM cooldown — ships in Phase 1.)
+**Goal**: Configurable rate limiting and user control over agent conversations. (Basic loop prevention -- depth tracking with time-based expiry -- ships in Phase 1.)
 
 **Changes:**
 - `alms-coordinator/message_bus`: Per-agent-per-hour token budget for DM/group runs
