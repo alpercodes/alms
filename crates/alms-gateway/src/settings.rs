@@ -76,6 +76,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         .map(|p| p.display().to_string());
 
     Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
         "model": llm.default_model,
         "base_url": llm.base_url,
         "max_tokens": agent.max_tokens,

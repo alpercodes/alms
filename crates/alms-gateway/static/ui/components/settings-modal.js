@@ -198,6 +198,7 @@ export function SettingsModal({ open, onClose }) {
                 <div class="settings-row">
                     <label class="settings-label">Server info</label>
                     <div class="settings-info">
+                        <div>Version: <span class="settings-info-value">${defaults.version || 'unknown'}</span></div>
                         <div>Model: <span class="settings-info-value">${defaults.model || 'unknown'}</span></div>
                         <div>Base URL: <span class="settings-info-value">${defaults.base_url || 'unknown'}</span></div>
                         <div>Context: <span class="settings-info-value">${defaults.context_strategy || 'truncate'}</span></div>
