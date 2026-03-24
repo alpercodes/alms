@@ -59,7 +59,10 @@ peer agent's name and appends the DM addendum to the system prompt. The `{peer}`
 placeholder in the template is replaced with the actual peer name.
 
 **Code path**: `build_context()` in `agent.rs` -- after assembling the base system
-prompt with workspace prefix, if the context is a DM session.
+prompt with workspace prefix, if the context is a DM session. Additionally,
+`agent_loop()` re-injects the addendum via the `dm_addendum()` helper on every
+tool-loop system prompt rebuild, so the agent retains DM awareness across
+tool-call iterations (see #346).
 
 ### `subagent.md` -- Ephemeral Subagents
 
@@ -99,6 +102,10 @@ The full system prompt seen by the LLM is assembled in layers:
 4. **Tool loop addendum** (after first tool round): On subsequent LLM calls in the
    same agent loop, the system message is rebuilt as:
    `{workspace_prefix}\n\n{base_prompt}\n\n{tool_loop_prompt}`
+   For DM sessions, the DM addendum is also re-injected after the tool loop prompt:
+   `{workspace_prefix}\n\n{base_prompt}\n\n{tool_loop_prompt}\n\n{dm_addendum}`
+   This ensures the agent retains awareness that it must use `send_message` to reply,
+   even after processing tool calls (fixes #346).
 
 The assembly is handled by `assemble_system_prompt()` which prepends the workspace
 prefix to any base prompt string.

@@ -415,6 +415,23 @@ pub async fn create_run(
     Ok((StatusCode::CREATED, Json(response)))
 }
 
+/// Resolve the effective posture for a run.
+///
+/// Peer-message-triggered runs (DMs from other agents) have no human in the
+/// loop, so Guarded posture would hang forever waiting for approval. This
+/// function overrides Guarded to Autonomous for those runs while leaving all
+/// other postures unchanged.
+fn resolve_posture_for_run(
+    posture: alms_runtime::Posture,
+    is_peer_message: bool,
+) -> alms_runtime::Posture {
+    if is_peer_message && posture == alms_runtime::Posture::Guarded {
+        alms_runtime::Posture::Autonomous
+    } else {
+        posture
+    }
+}
+
 /// Execute a run in background, forwarding runtime events to SSE.
 #[instrument(level = "info", skip(state, params), fields(run_id = %params.run_id.0, session_id = %params.session_id.0))]
 async fn execute_run(state: AppState, params: RunParams) {
@@ -496,6 +513,18 @@ async fn execute_run(state: AppState, params: RunParams) {
         info!("Run {} using model override: {}", run_id.0, model);
         llm = llm.with_model(model.clone());
     }
+
+    // Peer-message-triggered runs (DMs from other agents) have no human in
+    // the loop, so Guarded posture would hang forever waiting for approval.
+    // Force Autonomous posture for these runs.
+    let resolved = resolve_posture_for_run(agent_config.posture, is_peer_message);
+    if resolved != agent_config.posture {
+        info!(
+            "Run {} is peer-message-triggered — overriding {:?} posture to {:?}",
+            run_id.0, agent_config.posture, resolved
+        );
+    }
+    agent_config.posture = resolved;
 
     // Create a runtime event channel so we can forward tool events to SSE.
     // Clone before moving into `with_event_sender` so invoke_agent can forward
@@ -1784,6 +1813,46 @@ mod tests {
         // telegram is a valid secret key but NOT a valid LLM provider
         let err = validate_provider("telegram").unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_peer_message_overrides_guarded_to_autonomous() {
+        let result = resolve_posture_for_run(Posture::Guarded, true);
+        assert_eq!(
+            result,
+            Posture::Autonomous,
+            "Guarded posture should be overridden to Autonomous for peer-message runs"
+        );
+    }
+
+    #[test]
+    fn test_peer_message_does_not_override_full_control() {
+        let result = resolve_posture_for_run(Posture::FullControl, true);
+        assert_eq!(
+            result,
+            Posture::FullControl,
+            "FullControl posture should NOT be overridden for peer-message runs"
+        );
+    }
+
+    #[test]
+    fn test_peer_message_does_not_override_autonomous() {
+        let result = resolve_posture_for_run(Posture::Autonomous, true);
+        assert_eq!(
+            result,
+            Posture::Autonomous,
+            "Autonomous posture should remain unchanged for peer-message runs"
+        );
+    }
+
+    #[test]
+    fn test_non_peer_message_keeps_guarded() {
+        let result = resolve_posture_for_run(Posture::Guarded, false);
+        assert_eq!(
+            result,
+            Posture::Guarded,
+            "Guarded posture should be preserved for non-peer-message runs"
+        );
     }
 
     #[test]
