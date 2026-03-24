@@ -1,12 +1,28 @@
 /**
- * Session-level SSE stream — persistent connection across runs.
+ * Session-level SSE stream -- persistent connection across runs.
  *
  * Opens EventSource to /sessions/{sessionId}/events and handles all
- * event types. Stays open across runs — notification runs, background
+ * event types. Stays open across runs -- notification runs, background
  * subagent completions, and job runs all arrive on the same stream.
+ *
+ * Key invariants enforced by this module:
+ *
+ *   1. Every message object written to chatMessages has a stable `id`
+ *      (via nextMsgId()) so that Preact's VDOM reconciler can correctly
+ *      match DOM nodes when messages are inserted or removed.
+ *
+ *   2. When multiple signal writes happen in the same synchronous
+ *      handler, they are wrapped in batch() to collapse Preact
+ *      re-renders into a single pass and avoid intermediate visual
+ *      states.
+ *
+ *   3. tool_end only writes chatMessages.value when a matching tool
+ *      message was actually found (avoids unnecessary re-renders for
+ *      subagent-only tool events).
  */
 
-import { chatMessages } from '../state/chat.js';
+import { batch } from '../deps.js';
+import { chatMessages, nextMsgId } from '../state/chat.js';
 import { activeRunId } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearCompletedSubagents } from '../state/subagents.js';
 import { messageQueue } from '../state/queue.js';
@@ -19,11 +35,11 @@ import { activeSessionId } from '../state/sessions.js';
 function friendlyErrorMessage(code, rawMsg) {
     switch (code) {
         case 'AUTH':
-            return 'Authentication failed \u2014 check your API key in Settings.';
+            return 'Authentication failed -- check your API key in Settings.';
         case 'RATE_LIMIT':
-            return 'Rate limited by the LLM provider \u2014 wait a moment and try again.';
+            return 'Rate limited by the LLM provider -- wait a moment and try again.';
         case 'TIMEOUT':
-            return 'Request timed out \u2014 the LLM provider did not respond in time.';
+            return 'Request timed out -- the LLM provider did not respond in time.';
         default:
             return rawMsg;
     }
@@ -35,7 +51,7 @@ const MAX_SESSION_RETRIES = 10;
 let deltaBuffer = '';
 let flushTimer = null;
 /**
- * Highest SSE event ID seen on the current stream — used for manual reconnect.
+ * Highest SSE event ID seen on the current stream -- used for manual reconnect.
  *
  * Type note: this value may be a number (when seeded from the REST API's
  * `last_event_id` integer field) or a string (when updated from the SSE
@@ -56,7 +72,7 @@ function flushDeltaBuffer() {
     if (last && last.type === 'agent' && !last.sealed) {
         copy[copy.length - 1] = { ...last, text: last.text + pending };
     } else {
-        copy.push({ type: 'agent', role: 'assistant', text: pending, sealed: false });
+        copy.push({ id: nextMsgId(), type: 'agent', role: 'assistant', text: pending, sealed: false });
     }
     chatMessages.value = copy;
 }
@@ -83,11 +99,11 @@ function sealLastAgent() {
 
 /**
  * Open a persistent session-level SSE stream.
- * Stays open across runs — all events for this session arrive here.
+ * Stays open across runs -- all events for this session arrive here.
  *
  * @param {string} sessionId
  * @param {object} [opts]
- * @param {number} [opts.lastEventId] — skip replay of events up to (and
+ * @param {number} [opts.lastEventId] -- skip replay of events up to (and
  *   including) this ID. Used when the client already loaded history via
  *   the REST API and only needs new live events going forward.
  */
@@ -112,33 +128,40 @@ export function openSessionStream(sessionId, opts) {
         handler(e);
     });
 
-    // ── run_created: a new run was created on this session ──
+    // -- run_created: a new run was created on this session --
     on('run_created', (e) => {
         const data = JSON.parse(e.data);
-        activeRunId.value = data.run_id;
         const queuedBehind = data.queued_behind || 0;
 
         if (data.is_notification) {
-            // Notification run from subagent completion or peer message —
+            // Notification run from subagent completion or peer message --
             // show thinking indicator with source context
-            chatMessages.value = [...chatMessages.value, {
-                type: 'thinking', source: data.source, queuedBehind,
-            }];
+            batch(() => {
+                activeRunId.value = data.run_id;
+                chatMessages.value = [...chatMessages.value, {
+                    id: nextMsgId(), type: 'thinking', source: data.source, queuedBehind,
+                }];
+            });
         } else if (queuedBehind > 0) {
-            // User-initiated run but agent is busy — update the existing
+            // User-initiated run but agent is busy -- update the existing
             // thinking indicator (added by startRun) with queue position
-            const msgs = [...chatMessages.value];
-            const idx = msgs.findLastIndex(m => m.type === 'thinking');
-            if (idx >= 0) {
-                msgs[idx] = { ...msgs[idx], queuedBehind };
-            }
-            chatMessages.value = msgs;
+            batch(() => {
+                activeRunId.value = data.run_id;
+                const msgs = [...chatMessages.value];
+                const idx = msgs.findLastIndex(m => m.type === 'thinking');
+                if (idx >= 0) {
+                    msgs[idx] = { ...msgs[idx], queuedBehind };
+                }
+                chatMessages.value = msgs;
+            });
+        } else {
+            activeRunId.value = data.run_id;
         }
-        // else: user-initiated, queue empty — thinking indicator from startRun is fine
+        // else: user-initiated, queue empty -- thinking indicator from startRun is fine
     });
 
-    // ── run_started: the run has been dequeued and is now executing ──
-    on('run_started', (e) => {
+    // -- run_started: the run has been dequeued and is now executing --
+    on('run_started', (_e) => {
         // Transition thinking indicator from "queued" to active "Thinking..."
         const msgs = [...chatMessages.value];
         const idx = msgs.findLastIndex(m => m.type === 'thinking');
@@ -148,7 +171,7 @@ export function openSessionStream(sessionId, opts) {
         }
     });
 
-    // ── status: agent phase update ──
+    // -- status: agent phase update --
     // Phase values correspond to constants in alms-runtime/src/events.rs:
     //   PHASE_BUILDING_CONTEXT = "building_context"
     //   PHASE_SUMMARIZING      = "summarizing"
@@ -165,12 +188,12 @@ export function openSessionStream(sessionId, opts) {
             // Thinking indicator was removed by token_delta flush or tool_start
             // (e.g. on iteration 2+ of the agent loop). Re-add it so the user
             // sees the current phase ("Running tools...", "Thinking...", etc.).
-            msgs.push({ type: 'thinking', phase: data.phase, phaseDetail: data.detail || null });
+            msgs.push({ id: nextMsgId(), type: 'thinking', phase: data.phase, phaseDetail: data.detail || null });
             chatMessages.value = msgs;
         }
     });
 
-    // ── token_delta ──
+    // -- token_delta --
     on('token_delta', (e) => {
         const data = JSON.parse(e.data);
         if (data.source_agent) return; // suppress subagent interleaving
@@ -178,7 +201,7 @@ export function openSessionStream(sessionId, opts) {
         scheduleFlush();
     });
 
-    // ── tool_start ──
+    // -- tool_start --
     on('tool_start', (e) => {
         flushDeltaBuffer();
         const data = JSON.parse(e.data);
@@ -189,8 +212,8 @@ export function openSessionStream(sessionId, opts) {
             const name = data.params?.name || data.params?.subagent_name || 'subagent';
             const task = data.params?.task || '';
             chatMessages.value = [...chatMessages.value, {
-                type: 'tool', tool: 'invoke_agent', params: data.params,
-                status: 'running', id: toolId,
+                id: toolId, type: 'tool', tool: 'invoke_agent', params: data.params,
+                status: 'running',
             }];
             trackSubagentStart(name, task);
         } else if (data.source_agent) {
@@ -200,13 +223,13 @@ export function openSessionStream(sessionId, opts) {
         } else {
             sealLastAgent();
             chatMessages.value = [...chatMessages.value, {
-                type: 'tool', tool: data.tool, params: data.params,
-                status: 'running', id: toolId,
+                id: toolId, type: 'tool', tool: data.tool, params: data.params,
+                status: 'running',
             }];
         }
     });
 
-    // ── tool_end ──
+    // -- tool_end --
     on('tool_end', (e) => {
         const data = JSON.parse(e.data);
         const matchId = data.tool_invocation_id;
@@ -230,22 +253,25 @@ export function openSessionStream(sessionId, opts) {
                     trackSubagentEnd(name, status);
                 }
             }
+            chatMessages.value = msgs;
         }
-        chatMessages.value = msgs;
+        // When no matching tool message was found (e.g. subagent-only tool
+        // events), skip the chatMessages write to avoid an unnecessary
+        // re-render with a new array reference.
     });
 
-    // ── approval_required ──
+    // -- approval_required --
     on('approval_required', (e) => {
         flushDeltaBuffer();
+        sealLastAgent();
         const data = JSON.parse(e.data);
         chatMessages.value = [...chatMessages.value, {
-            type: 'approval', approvalId: data.approval_id,
+            id: nextMsgId(), type: 'approval', approvalId: data.approval_id,
             tool: data.capability, params: data.request, resolved: false,
         }];
-        sealLastAgent();
     });
 
-    // ── subagent_completed ──
+    // -- subagent_completed --
     on('subagent_completed', (e) => {
         const data = JSON.parse(e.data);
         const name = data.subagent_name || 'subagent';
@@ -259,12 +285,12 @@ export function openSessionStream(sessionId, opts) {
             : status === 'fail' ? 'failed'
             : status === 'cancelled' ? 'cancelled' : 'completed';
         chatMessages.value = [...chatMessages.value, {
-            type: 'system',
+            id: nextMsgId(), type: 'system',
             text: `Subagent '${name}' ${label}.`,
         }];
     });
 
-    // ── job_completed ──
+    // -- job_completed --
     on('job_completed', (e) => {
         const data = JSON.parse(e.data);
         const name = data.job_name || 'job';
@@ -272,57 +298,67 @@ export function openSessionStream(sessionId, opts) {
             : data.status === 'cancelled' ? 'cancelled' : 'failed';
         const summary = data.summary ? `: ${data.summary}` : '';
         chatMessages.value = [...chatMessages.value, {
-            type: 'system',
-            text: `Scheduled job ${status} — ${name}${summary}`,
+            id: nextMsgId(), type: 'system',
+            text: `Scheduled job ${status} -- ${name}${summary}`,
         }];
     });
 
-    // ── approval_resolved ──
+    // -- approval_resolved --
     on('approval_resolved', (e) => {
         const data = JSON.parse(e.data);
         const msgs = [...chatMessages.value];
         const idx = msgs.findLastIndex(m => m.type === 'approval' && m.approvalId === data.approval_id);
         if (idx >= 0) {
             msgs[idx] = { ...msgs[idx], resolved: true, decision: data.decision };
+            chatMessages.value = msgs;
         }
-        chatMessages.value = msgs;
     });
 
-    // ── run_warning (non-fatal, e.g. max iterations) ──
+    // -- run_warning (non-fatal, e.g. max iterations) --
     on('run_warning', (e) => {
         flushDeltaBuffer();
         sealLastAgent();
         const data = JSON.parse(e.data);
         const code = data.warning?.code || 'UNKNOWN';
         const msg = data.warning?.message || 'Warning';
-        chatMessages.value = [...chatMessages.value, { type: 'warning', code, text: msg }];
+        chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'warning', code, text: msg }];
     });
 
-    // ── run_finished / run_error / run_cancelled ──
+    // -- run_finished / run_error / run_cancelled --
     const handleRunEnd = (status) => (e) => {
         flushDeltaBuffer();
         sealLastAgent();
         const data = e.data ? JSON.parse(e.data) : {};
+
+        // Collect all new messages to append in a single batch to avoid
+        // multiple intermediate re-renders (error + tokens + activeRunId).
+        const append = [];
 
         if (status === 'error') {
             const code = data.error?.code || 'INTERNAL';
             const rawMsg = typeof data.error === 'string'
                 ? data.error : (data.error?.message || 'Run failed');
             const text = friendlyErrorMessage(code, rawMsg);
-            chatMessages.value = [...chatMessages.value, { type: 'error', code, text }];
+            append.push({ id: nextMsgId(), type: 'error', code, text });
         }
         if (status === 'cancelled') {
-            chatMessages.value = [...chatMessages.value, { type: 'system', text: '(run cancelled)' }];
+            append.push({ id: nextMsgId(), type: 'system', text: '(run cancelled)' });
         }
 
         const usage = (data.prompt_tokens || data.completion_tokens)
             ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
             : data.usage;
         if (usage) {
-            chatMessages.value = [...chatMessages.value, { type: 'tokens', usage }];
+            append.push({ id: nextMsgId(), type: 'tokens', usage });
         }
 
-        activeRunId.value = null;
+        batch(() => {
+            if (append.length > 0) {
+                chatMessages.value = [...chatMessages.value, ...append];
+            }
+            activeRunId.value = null;
+        });
+
         clearCompletedSubagents();
 
         // Process queued user messages via dynamic import
