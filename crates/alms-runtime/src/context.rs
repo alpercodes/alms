@@ -153,7 +153,7 @@ impl ContextBuilder {
                 mapped
             }
             _ => {
-                // Someone else's message (or no metadata) -> keep as User
+                // Someone else's message (or no metadata) -> keep original role
                 msg.clone()
             }
         }
@@ -936,18 +936,38 @@ mod tests {
             Role::System,
             "System message without metadata should stay System"
         );
+        assert_eq!(
+            match &mapped.content {
+                Content::Text(t) => t.as_str(),
+                _ => "",
+            },
+            "system prompt text",
+            "content should be preserved"
+        );
+        assert_eq!(mapped.metadata, None, "metadata should be preserved");
 
         // System message with non-matching from_agent -> stays System
-        let msg = make_msg_with_metadata(
-            Role::System,
-            "system instructions",
-            Some(serde_json::json!({"from_agent": "agent-beta"})),
-        );
+        let metadata = serde_json::json!({"from_agent": "agent-beta"});
+        let msg =
+            make_msg_with_metadata(Role::System, "system instructions", Some(metadata.clone()));
         let mapped = builder.apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::System,
             "System message from another agent should stay System"
+        );
+        assert_eq!(
+            match &mapped.content {
+                Content::Text(t) => t.as_str(),
+                _ => "",
+            },
+            "system instructions",
+            "content should be preserved"
+        );
+        assert_eq!(
+            mapped.metadata,
+            Some(metadata),
+            "metadata should be preserved"
         );
     }
 
@@ -965,18 +985,37 @@ mod tests {
             Role::Tool,
             "Tool message without metadata should stay Tool"
         );
+        assert_eq!(
+            match &mapped.content {
+                Content::Text(t) => t.as_str(),
+                _ => "",
+            },
+            "tool output",
+            "content should be preserved"
+        );
+        assert_eq!(mapped.metadata, None, "metadata should be preserved");
 
         // Tool message with non-matching from_agent -> stays Tool
-        let msg = make_msg_with_metadata(
-            Role::Tool,
-            "tool result payload",
-            Some(serde_json::json!({"from_agent": "agent-beta"})),
-        );
+        let metadata = serde_json::json!({"from_agent": "agent-beta"});
+        let msg = make_msg_with_metadata(Role::Tool, "tool result payload", Some(metadata.clone()));
         let mapped = builder.apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Tool,
             "Tool message from another agent should stay Tool"
+        );
+        assert_eq!(
+            match &mapped.content {
+                Content::Text(t) => t.as_str(),
+                _ => "",
+            },
+            "tool result payload",
+            "content should be preserved"
+        );
+        assert_eq!(
+            mapped.metadata,
+            Some(metadata),
+            "metadata should be preserved"
         );
     }
 
@@ -988,16 +1027,59 @@ mod tests {
         // different agent's perspective.
         let builder = default_builder();
 
-        let msg = make_msg_with_metadata(
-            Role::Assistant,
-            "I replied earlier",
-            Some(serde_json::json!({"from_agent": "agent-beta"})),
-        );
+        let metadata = serde_json::json!({"from_agent": "agent-beta"});
+        let msg =
+            make_msg_with_metadata(Role::Assistant, "I replied earlier", Some(metadata.clone()));
         let mapped = builder.apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Assistant,
             "Assistant message from another agent should stay Assistant"
+        );
+        assert_eq!(
+            match &mapped.content {
+                Content::Text(t) => t.as_str(),
+                _ => "",
+            },
+            "I replied earlier",
+            "content should be preserved"
+        );
+        assert_eq!(
+            mapped.metadata,
+            Some(metadata),
+            "metadata should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_apply_perspective_assistant_role_with_matching_agent_stays_assistant() {
+        // Idempotent case: an Assistant message whose from_agent matches the
+        // perspective agent should remain Assistant. The match arm unconditionally
+        // sets role = Assistant, so this is a no-op, but the test documents
+        // completeness across the role matrix.
+        let builder = default_builder();
+
+        let metadata = serde_json::json!({"from_agent": "agent-alpha"});
+        let msg =
+            make_msg_with_metadata(Role::Assistant, "I already replied", Some(metadata.clone()));
+        let mapped = builder.apply_perspective(&msg, "agent-alpha");
+        assert_eq!(
+            mapped.role,
+            Role::Assistant,
+            "Assistant message with matching from_agent should stay Assistant"
+        );
+        assert_eq!(
+            match &mapped.content {
+                Content::Text(t) => t.as_str(),
+                _ => "",
+            },
+            "I already replied",
+            "content should be preserved"
+        );
+        assert_eq!(
+            mapped.metadata,
+            Some(metadata),
+            "metadata should be preserved"
         );
     }
 
@@ -1011,29 +1093,49 @@ mod tests {
         let builder = default_builder();
 
         // System message with matching from_agent -> mapped to Assistant
-        let msg = make_msg_with_metadata(
-            Role::System,
-            "system from self",
-            Some(serde_json::json!({"from_agent": "agent-alpha"})),
-        );
+        let metadata = serde_json::json!({"from_agent": "agent-alpha"});
+        let msg = make_msg_with_metadata(Role::System, "system from self", Some(metadata.clone()));
         let mapped = builder.apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Assistant,
             "matching from_agent should override even System role to Assistant"
         );
+        assert_eq!(
+            match &mapped.content {
+                Content::Text(t) => t.as_str(),
+                _ => "",
+            },
+            "system from self",
+            "content should be preserved"
+        );
+        assert_eq!(
+            mapped.metadata,
+            Some(metadata),
+            "metadata should be preserved"
+        );
 
         // Tool message with matching from_agent -> mapped to Assistant
-        let msg = make_msg_with_metadata(
-            Role::Tool,
-            "tool from self",
-            Some(serde_json::json!({"from_agent": "agent-alpha"})),
-        );
+        let metadata = serde_json::json!({"from_agent": "agent-alpha"});
+        let msg = make_msg_with_metadata(Role::Tool, "tool from self", Some(metadata.clone()));
         let mapped = builder.apply_perspective(&msg, "agent-alpha");
         assert_eq!(
             mapped.role,
             Role::Assistant,
             "matching from_agent should override even Tool role to Assistant"
+        );
+        assert_eq!(
+            match &mapped.content {
+                Content::Text(t) => t.as_str(),
+                _ => "",
+            },
+            "tool from self",
+            "content should be preserved"
+        );
+        assert_eq!(
+            mapped.metadata,
+            Some(metadata),
+            "metadata should be preserved"
         );
     }
 
