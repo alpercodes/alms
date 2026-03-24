@@ -125,3 +125,48 @@ impl Default for SessionConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_content_serialization_roundtrip() {
+        let img_with_alt = Content::Image {
+            url: "https://example.com/photo.png".to_string(),
+            alt: Some("A sunset".to_string()),
+        };
+        let json = serde_json::to_value(&img_with_alt).unwrap();
+        assert_eq!(json["image"]["url"], "https://example.com/photo.png");
+        assert_eq!(json["image"]["alt"], "A sunset");
+
+        let roundtrip: Content = serde_json::from_value(json).unwrap();
+        match &roundtrip {
+            Content::Image { url, alt } => {
+                assert_eq!(url, "https://example.com/photo.png");
+                assert_eq!(alt.as_deref(), Some("A sunset"));
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_content_without_alt() {
+        let img = Content::Image {
+            url: "https://example.com/photo.png".to_string(),
+            alt: None,
+        };
+        let json = serde_json::to_value(&img).unwrap();
+        assert_eq!(json["image"]["url"], "https://example.com/photo.png");
+        assert!(json["image"]["alt"].is_null());
+
+        let roundtrip: Content = serde_json::from_value(json).unwrap();
+        match &roundtrip {
+            Content::Image { url, alt } => {
+                assert_eq!(url, "https://example.com/photo.png");
+                assert!(alt.is_none());
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+}

@@ -396,6 +396,8 @@ Supported via `Last-Event-ID` header (automatic browser reconnect) or `?last_eve
 
 For session-level streams (`GET /sessions/{session_id}/events`), clients should pass the `last_event_id` value returned by `GET /sessions/{session_id}/messages` to avoid replaying events that are already reflected in the loaded chat history.
 
+> **Note:** The event log is held in memory. After a daemon restart, `last_event_id` in the messages response will be `null` because no SSE events have been emitted yet. Clients should treat `null` the same as "no prior events" and open the SSE stream without a `last_event_id` parameter (which means they may see duplicates of messages already loaded via REST — this is harmless).
+
 ### 5.4 Get run tool calls
 `GET /runs/{run_id}/tool-calls`
 
