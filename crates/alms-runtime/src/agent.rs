@@ -2314,4 +2314,28 @@ mod tests {
             assert_eq!(parsed, posture);
         }
     }
+
+    #[test]
+    fn test_is_user_facing_context() {
+        // User-facing: web UI, Telegram
+        assert!(AgentRuntime::is_user_facing_context("web-chat-123"));
+        assert!(AgentRuntime::is_user_facing_context("telegram_agent_456"));
+
+        // Non-user-facing: DM, subagent, job
+        assert!(!AgentRuntime::is_user_facing_context("dm:alice:bob"));
+        assert!(!AgentRuntime::is_user_facing_context("subagent_task123"));
+        assert!(!AgentRuntime::is_user_facing_context(
+            "subagent_task123_reviewer"
+        ));
+        assert!(!AgentRuntime::is_user_facing_context("job_abc"));
+
+        // Edge cases: empty string and unknown prefix default to user-facing
+        assert!(AgentRuntime::is_user_facing_context(""));
+        assert!(AgentRuntime::is_user_facing_context("unknown_prefix"));
+
+        // Near-miss prefixes must NOT match (prefix must be exact)
+        assert!(AgentRuntime::is_user_facing_context("dmx:something"));
+        assert!(AgentRuntime::is_user_facing_context("subagentx_something"));
+        assert!(AgentRuntime::is_user_facing_context("jobs_something"));
+    }
 }
