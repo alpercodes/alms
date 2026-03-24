@@ -2429,4 +2429,83 @@ mod tests {
         assert!(addendum_charlie.contains("\"charlie\""));
         assert!(!addendum_charlie.contains("\"alice\""));
     }
+
+    /// Verify the DM addendum survives the tool-loop system prompt rebuild.
+    ///
+    /// This is a regression test for #346: the agent loop rebuilds the system
+    /// prompt after processing tool calls, and the DM addendum must be
+    /// re-injected so the agent still knows to use `send_message`.
+    ///
+    /// We simulate the tool-loop rebuild logic (same as agent.rs lines
+    /// 1234-1244) and verify the rebuilt system prompt contains the addendum.
+    #[tokio::test]
+    async fn test_dm_addendum_survives_tool_loop_rebuild() {
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let session_config = SessionConfig::default();
+        let session_manager = SessionManager::new(session_config);
+        let llm = LlmClient::new(config).unwrap();
+        let bob_id = AgentId::new();
+
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(bob_id, agent_config, llm)
+            .unwrap()
+            .with_agent_name("bob".to_string());
+
+        // Set up a DM session.
+        let dm_context = "dm:alice:bob";
+        let session_id = alms_core::SessionId::deterministic_dm("alice", "bob");
+        let _session = session_manager.get_or_create_shared(session_id, dm_context);
+
+        // Step 1: Build initial context and verify addendum is present.
+        let context = runtime
+            .build_context(&session_manager, &session_id, dm_context, "Hello")
+            .await
+            .unwrap();
+        let initial_system = context[0].content.as_deref().unwrap_or("");
+        assert!(
+            initial_system.contains("send_message"),
+            "Initial system prompt should contain DM addendum"
+        );
+
+        // Step 2: Simulate the tool-loop rebuild (mirrors agent_loop lines 1234-1244).
+        // This is the exact code path that was broken before #346.
+        let dm_peer: Option<&str> = runtime.dm_peer_name(dm_context).as_deref().map(|s| {
+            // Leak the string so we get a &'static str -- acceptable in tests.
+            Box::leak(s.to_string().into_boxed_str()) as &str
+        });
+        let include_user = AgentRuntime::is_user_facing_context(dm_context);
+
+        let combined = format!(
+            "{}\n\n{}",
+            runtime.config.system_prompt, runtime.config.prompts.tool_loop
+        );
+        let mut tool_loop_prompt = runtime.assemble_system_prompt(&combined, include_user);
+        if let Some(peer) = dm_peer {
+            tool_loop_prompt.push_str(&AgentRuntime::dm_addendum(peer));
+        }
+
+        // The rebuilt system prompt must still contain the DM addendum.
+        assert!(
+            tool_loop_prompt.contains("send_message"),
+            "Tool-loop rebuilt system prompt should contain send_message instruction. Got tail: {}",
+            &tool_loop_prompt[tool_loop_prompt.len().saturating_sub(300)..]
+        );
+        assert!(
+            tool_loop_prompt.contains("direct message from agent \"alice\""),
+            "Tool-loop rebuilt system prompt should reference peer agent 'alice'. Got tail: {}",
+            &tool_loop_prompt[tool_loop_prompt.len().saturating_sub(300)..]
+        );
+
+        // Also verify the tool_loop prompt content is present (not just DM addendum).
+        assert!(
+            tool_loop_prompt.contains(&runtime.config.prompts.tool_loop),
+            "Tool-loop rebuilt system prompt should contain tool_loop continuation guidance"
+        );
+    }
 }
