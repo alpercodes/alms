@@ -363,6 +363,15 @@ Transient phase indicator emitted at key moments during the agent loop so the UI
 { "run_id": "<uuid>", "error": {"code":"INTERNAL","message":"..."} }
 ```
 
+`code` values: `AUTH` (authentication/authorization failure, e.g. 401/403), `RATE_LIMIT` (provider rate limit, e.g. 429), `TIMEOUT` (request or connection timeout), `INTERNAL` (catch-all for unexpected errors). The code is auto-classified from the error message when not set explicitly.
+
+`run_warning`
+```json
+{ "run_id": "<uuid>", "warning": {"code":"MAX_ITERATIONS","message":"..."} }
+```
+
+Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Currently used when the agent hits its iteration limit before finishing.
+
 `run_cancelled`
 ```json
 { "run_id": "<uuid>", "ts": "..." }

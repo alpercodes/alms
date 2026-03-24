@@ -20,12 +20,27 @@ export function TokenBadge({ usage }) {
     return html`<div class="msg-tokens">${p}p + ${c}c tokens</div>`;
 }
 
-export function ErrorMessage({ text }) {
+export function ErrorMessage({ text, code }) {
+    const codeCls = code ? `msg-error--${code.toLowerCase()}` : '';
     return html`
-        <div class="msg agent">
-            <div class="msg-label" style="color: var(--error);">!</div>
-            <div class="msg-body" style="border-left-color: var(--error); color: var(--error);">
-                ${text}
+        <div class="msg msg-error ${codeCls}" data-code=${code || ''}>
+            <div class="msg-error-icon">\u274C</div>
+            <div class="msg-error-body">
+                <div class="msg-error-title">Error</div>
+                <div class="msg-error-text">${text}</div>
+            </div>
+        </div>
+    `;
+}
+
+export function WarningMessage({ text, code }) {
+    const codeCls = code ? `msg-warning--${code.toLowerCase()}` : '';
+    return html`
+        <div class="msg msg-warning ${codeCls}" data-code=${code || ''}>
+            <div class="msg-warning-icon">\u26A0</div>
+            <div class="msg-warning-body">
+                <div class="msg-warning-title">Warning</div>
+                <div class="msg-warning-text">${text}</div>
             </div>
         </div>
     `;
