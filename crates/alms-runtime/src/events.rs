@@ -7,6 +7,21 @@
 use serde_json::Value;
 use uuid::Uuid;
 
+// ── Phase constants for RuntimeEvent::Status ──
+// Keep these in sync with the frontend (use-session-stream.js and app.js).
+
+/// Agent is assembling the token-budgeted context window.
+pub const PHASE_BUILDING_CONTEXT: &str = "building_context";
+
+/// Agent is summarizing old conversation history (sliding-summary strategy).
+pub const PHASE_SUMMARIZING: &str = "summarizing";
+
+/// Agent is waiting for the LLM to respond.
+pub const PHASE_CALLING_LLM: &str = "calling_llm";
+
+/// Agent is executing tool calls returned by the LLM.
+pub const PHASE_EXECUTING_TOOLS: &str = "executing_tools";
+
 /// Events emitted by the agent runtime during a run.
 pub enum RuntimeEvent {
     /// A tool is about to be executed.
@@ -155,13 +170,13 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<RuntimeEvent>();
 
         tx.send(RuntimeEvent::Status {
-            phase: "calling_llm".to_string(),
+            phase: PHASE_CALLING_LLM.to_string(),
             detail: None,
         })
         .unwrap();
 
         tx.send(RuntimeEvent::Status {
-            phase: "executing_tools".to_string(),
+            phase: PHASE_EXECUTING_TOOLS.to_string(),
             detail: Some("shell_exec".to_string()),
         })
         .unwrap();
@@ -170,12 +185,12 @@ mod tests {
 
         let first = rx.recv().await.unwrap();
         assert!(
-            matches!(&first, RuntimeEvent::Status { phase, detail } if phase == "calling_llm" && detail.is_none())
+            matches!(&first, RuntimeEvent::Status { phase, detail } if phase == PHASE_CALLING_LLM && detail.is_none())
         );
 
         let second = rx.recv().await.unwrap();
         assert!(
-            matches!(&second, RuntimeEvent::Status { phase, detail } if phase == "executing_tools" && detail.as_deref() == Some("shell_exec"))
+            matches!(&second, RuntimeEvent::Status { phase, detail } if phase == PHASE_EXECUTING_TOOLS && detail.as_deref() == Some("shell_exec"))
         );
 
         assert!(rx.recv().await.is_none());

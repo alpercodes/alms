@@ -84,6 +84,8 @@ function ChatView() {
                             label = 'Running scheduled job';
                         } else if (m.source === 'subagent') {
                             label = 'Processing subagent result';
+                        // Phase values match constants in alms-runtime/src/events.rs
+                        // (PHASE_BUILDING_CONTEXT, PHASE_SUMMARIZING, PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS)
                         } else if (m.phase === 'building_context') {
                             label = 'Building context';
                         } else if (m.phase === 'summarizing') {

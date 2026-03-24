@@ -972,8 +972,11 @@ async fn run_agent_loop(
                     | RuntimeEvent::ApprovalRequired { source_agent, .. } => {
                         *source_agent = Some(label.clone());
                     }
-                    // Status events don't carry source_agent — pass through as-is.
-                    RuntimeEvent::Status { .. } => {}
+                    // Suppress subagent status events — they would overwrite
+                    // the parent's thinking indicator with the subagent's phase,
+                    // which is confusing. The user doesn't need to know that a
+                    // subagent is "building context" or "calling LLM".
+                    RuntimeEvent::Status { .. } => continue,
                 }
                 let _ = parent_tx.send(event);
             }
