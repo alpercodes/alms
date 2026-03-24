@@ -994,7 +994,7 @@ header h1 {
   box-shadow: var(--shadow-overlay);
 }
 .settings-modal h2 { font-size: var(--text-xl); font-weight: 600; color: var(--text-primary); }
-.settings-row { display: flex; flex-direction: column; gap: var(--space-1); }
+.settings-row { display: flex; flex-direction: column; gap: var(--space-1); flex-shrink: 0; }
 .settings-label {
   font-size: var(--text-2xs);
   font-weight: 600;
@@ -1017,7 +1017,7 @@ header h1 {
 }
 .settings-select option { background: var(--surface-1); }
 .settings-input:focus, .settings-select:focus { border-color: var(--accent); }
-.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); flex-shrink: 0; }
 
 
 .api-key-row {
@@ -1068,6 +1068,7 @@ header h1 {
 .settings-divider {
   border-top: 1px solid var(--border-subtle);
   margin: var(--space-1) 0;
+  flex-shrink: 0;
 }
 .settings-info {
   font-size: var(--text-xs);
@@ -1078,7 +1079,7 @@ header h1 {
   color: var(--text-secondary);
   font-family: var(--font-mono);
 }
-.settings-footer { display: flex; gap: var(--space-2); justify-content: flex-end; margin-top: var(--space-2); }
+.settings-footer { display: flex; gap: var(--space-2); justify-content: flex-end; margin-top: var(--space-2); flex-shrink: 0; }
 .settings-save {
   padding: var(--space-2) var(--space-5);
   font-size: var(--text-sm);
@@ -1111,7 +1112,7 @@ header h1 {
 .settings-section {
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  overflow: hidden;
+  flex-shrink: 0;
 }
 .settings-section-toggle {
   display: flex;
@@ -1139,10 +1140,18 @@ header h1 {
 .settings-section-arrow.open { transform: rotate(90deg); }
 .settings-section-title { flex: 1; text-align: left; }
 .settings-section-body {
-  padding: var(--space-2) var(--space-3) var(--space-3);
+  padding: 0 var(--space-3);
+  max-height: 0;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+  transition: max-height var(--duration-normal) ease, padding var(--duration-normal) ease;
+}
+.settings-section-body.open {
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  max-height: 600px;
+  overflow: visible;
 }
 .settings-section-desc {
   margin-bottom: var(--space-1);
