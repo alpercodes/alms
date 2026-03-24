@@ -31,6 +31,10 @@ use uuid::Uuid;
 pub struct AgentId(pub Uuid);
 
 /// ALMS namespace UUID for deterministic v5 derivation.
+///
+/// **STABILITY: Do not change this value.** All persisted subagent session IDs
+/// and agent-to-agent DM session IDs are derived from this namespace via UUID v5.
+/// Changing it would invalidate all existing deterministic IDs in the database.
 const ALMS_NAMESPACE: Uuid = Uuid::from_bytes([
     0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x47, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
 ]);
