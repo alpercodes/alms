@@ -496,13 +496,13 @@ pub struct AppState {
     /// Snapshot of agent config — read once at startup so handlers avoid locking the gateway.
     pub agent_config: alms_runtime::AgentConfig,
     /// Default agent ID — shared with Gateway, updated live on set-default.
-    pub default_agent_id: Arc<std::sync::RwLock<AgentId>>,
+    pub default_agent_id: Arc<parking_lot::RwLock<AgentId>>,
     /// LLM client clone — read once at startup so run execution avoids locking the gateway.
     pub llm: alms_runtime::LlmClient,
     /// Auth token — read once at startup.
     pub auth_token_value: Option<String>,
     /// Shared secrets store for API key management.
-    pub secrets: Arc<std::sync::RwLock<alms_core::secrets::SecretsStore>>,
+    pub secrets: Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>,
     /// Agent-to-agent message bus for peer messaging (Layer 2).
     pub message_bus: Arc<alms_coordinator::message_bus::MessageBus>,
 }

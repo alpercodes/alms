@@ -413,7 +413,7 @@ async fn execute_run(state: AppState, params: RunParams) {
         &state.session_manager,
         &state.agent_config,
         &state.llm,
-        Some(&state.secrets.read().unwrap()),
+        Some(&state.secrets.read()),
     );
     let agent_name = resolved.agent_name;
     if state.workspace_dir.is_some() && agent_name.is_none() {

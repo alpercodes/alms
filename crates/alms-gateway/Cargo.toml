@@ -16,6 +16,7 @@ axum.workspace = true
 chrono.workspace = true
 cron.workspace = true
 dashmap.workspace = true
+parking_lot.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tokio-stream = { version = "0.1", features = ["sync"] }
