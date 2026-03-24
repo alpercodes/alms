@@ -144,9 +144,14 @@ async fn main() -> anyhow::Result<()> {
         .with_filter(stderr_filter);
 
     // File layer — only for the long-running gateway command, and only when enabled.
-    // The guard must live for the process lifetime to flush pending log records.
-    let mut _file_log_guard: Option<tracing_appender::non_blocking::WorkerGuard> = None;
-    let file_layer = if is_gateway && config.logging.file_enabled {
+    //
+    // IMPORTANT: The WorkerGuard returned by `tracing_appender::non_blocking`
+    // MUST be held for the entire process lifetime. If the guard is dropped,
+    // the background writer thread shuts down and all subsequent log writes
+    // are silently lost. We use an explicit `drop(file_log_guard)` at the
+    // end of main() to guarantee the compiler keeps the guard alive across
+    // all `.await` points in the async state machine.
+    let (file_layer, file_log_guard) = if is_gateway && config.logging.file_enabled {
         let log_dir = config.logging.resolve_log_dir(&config.server.data_dir);
         match std::fs::create_dir_all(&log_dir) {
             Ok(()) => {
@@ -156,16 +161,20 @@ async fn main() -> anyhow::Result<()> {
                     _ => tracing_appender::rolling::daily(&log_dir, "alms.log"),
                 };
                 let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-                _file_log_guard = Some(guard);
                 let file_filter =
                     tracing_subscriber::EnvFilter::try_new(&config.logging.file_level)
                         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
-                Some(
-                    tracing_subscriber::fmt::layer()
-                        .with_writer(non_blocking)
-                        .with_ansi(false)
-                        .with_filter(file_filter),
-                )
+                let layer = tracing_subscriber::fmt::layer()
+                    .with_writer(non_blocking)
+                    .with_ansi(false)
+                    .with_filter(file_filter);
+                eprintln!(
+                    "File logging enabled: {} (level={}, rotation={})",
+                    log_dir.display(),
+                    config.logging.file_level,
+                    config.logging.rotation,
+                );
+                (Some(layer), Some(guard))
             }
             Err(e) => {
                 eprintln!(
@@ -173,11 +182,11 @@ async fn main() -> anyhow::Result<()> {
                     log_dir.display(),
                     e
                 );
-                None
+                (None, None)
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     tracing_subscriber::registry()
@@ -387,6 +396,12 @@ async fn main() -> anyhow::Result<()> {
             }
         },
     }
+
+    // Explicitly drop the file log guard at the end of main() to guarantee
+    // the non-blocking writer's background thread is flushed. This reference
+    // also prevents the compiler from dropping the guard early in the async
+    // state machine (before the .await on serve_with_config completes).
+    drop(file_log_guard);
 
     Ok(())
 }
