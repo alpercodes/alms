@@ -205,7 +205,7 @@ export function openSessionStream(sessionId, opts) {
     on('tool_start', (e) => {
         flushDeltaBuffer();
         const data = JSON.parse(e.data);
-        const toolId = data.tool_invocation_id || data.call_id || data.tool;
+        const toolId = data.tool_invocation_id || data.call_id || nextMsgId();
 
         if (data.tool === 'invoke_agent') {
             sealLastAgent();
@@ -262,13 +262,15 @@ export function openSessionStream(sessionId, opts) {
 
     // -- approval_required --
     on('approval_required', (e) => {
-        flushDeltaBuffer();
-        sealLastAgent();
-        const data = JSON.parse(e.data);
-        chatMessages.value = [...chatMessages.value, {
-            id: nextMsgId(), type: 'approval', approvalId: data.approval_id,
-            tool: data.capability, params: data.request, resolved: false,
-        }];
+        batch(() => {
+            flushDeltaBuffer();
+            sealLastAgent();
+            const data = JSON.parse(e.data);
+            chatMessages.value = [...chatMessages.value, {
+                id: nextMsgId(), type: 'approval', approvalId: data.approval_id,
+                tool: data.capability, params: data.request, resolved: false,
+            }];
+        });
     });
 
     // -- subagent_completed --
@@ -316,43 +318,45 @@ export function openSessionStream(sessionId, opts) {
 
     // -- run_warning (non-fatal, e.g. max iterations) --
     on('run_warning', (e) => {
-        flushDeltaBuffer();
-        sealLastAgent();
-        const data = JSON.parse(e.data);
-        const code = data.warning?.code || 'UNKNOWN';
-        const msg = data.warning?.message || 'Warning';
-        chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'warning', code, text: msg }];
+        batch(() => {
+            flushDeltaBuffer();
+            sealLastAgent();
+            const data = JSON.parse(e.data);
+            const code = data.warning?.code || 'UNKNOWN';
+            const msg = data.warning?.message || 'Warning';
+            chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'warning', code, text: msg }];
+        });
     });
 
     // -- run_finished / run_error / run_cancelled --
     const handleRunEnd = (status) => (e) => {
-        flushDeltaBuffer();
-        sealLastAgent();
-        const data = e.data ? JSON.parse(e.data) : {};
-
-        // Collect all new messages to append in a single batch to avoid
-        // multiple intermediate re-renders (error + tokens + activeRunId).
-        const append = [];
-
-        if (status === 'error') {
-            const code = data.error?.code || 'INTERNAL';
-            const rawMsg = typeof data.error === 'string'
-                ? data.error : (data.error?.message || 'Run failed');
-            const text = friendlyErrorMessage(code, rawMsg);
-            append.push({ id: nextMsgId(), type: 'error', code, text });
-        }
-        if (status === 'cancelled') {
-            append.push({ id: nextMsgId(), type: 'system', text: '(run cancelled)' });
-        }
-
-        const usage = (data.prompt_tokens || data.completion_tokens)
-            ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
-            : data.usage;
-        if (usage) {
-            append.push({ id: nextMsgId(), type: 'tokens', usage });
-        }
-
         batch(() => {
+            flushDeltaBuffer();
+            sealLastAgent();
+            const data = e.data ? JSON.parse(e.data) : {};
+
+            // Collect all new messages to append in a single batch to avoid
+            // multiple intermediate re-renders (error + tokens + activeRunId).
+            const append = [];
+
+            if (status === 'error') {
+                const code = data.error?.code || 'INTERNAL';
+                const rawMsg = typeof data.error === 'string'
+                    ? data.error : (data.error?.message || 'Run failed');
+                const text = friendlyErrorMessage(code, rawMsg);
+                append.push({ id: nextMsgId(), type: 'error', code, text });
+            }
+            if (status === 'cancelled') {
+                append.push({ id: nextMsgId(), type: 'system', text: '(run cancelled)' });
+            }
+
+            const usage = (data.prompt_tokens || data.completion_tokens)
+                ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
+                : data.usage;
+            if (usage) {
+                append.push({ id: nextMsgId(), type: 'tokens', usage });
+            }
+
             if (append.length > 0) {
                 chatMessages.value = [...chatMessages.value, ...append];
             }
