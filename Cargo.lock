@@ -75,7 +75,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "alms-channel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alms-core",
  "async-trait",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "alms-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alms-core",
  "alms-gateway",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "alms-coordinator"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alms-core",
  "alms-runtime",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "alms-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "alms-gateway"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alms-channel",
  "alms-coordinator",
@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "alms-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alms-core",
  "alms-sandbox",
@@ -212,7 +212,7 @@ dependencies = [
 
 [[package]]
 name = "alms-sandbox"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alms-core",
  "async-trait",
@@ -233,7 +233,7 @@ dependencies = [
 
 [[package]]
 name = "alms-session"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alms-core",
  "async-trait",
