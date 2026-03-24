@@ -195,6 +195,7 @@ Returns the full chat history for a session, including tool calls and results.
 - `text` — plain text message (user or assistant)
 - `tool_call` — assistant requested a tool execution (includes `tool`, `params`, `metadata.tool_call_id`)
 - `tool_result` — tool execution result (includes `tool_id`, `result`, `ok`)
+- `image` — image message (includes `url`, `alt`). The `url` field is the image URL. The `alt` field is an optional description string (`null` when absent).
 
 System messages are excluded from the response.
 

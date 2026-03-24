@@ -40,6 +40,14 @@ export function mapHistoryMessages(msgs) {
                 result: matched ? matched.result : null,
                 id: callId || m.tool,
             });
+        } else if (m.type === 'image') {
+            entries.push({
+                type: 'image',
+                role: m.role,
+                url: m.url || '',
+                alt: m.alt || '',
+                sealed: true,
+            });
         }
         // tool_result entries are consumed via resultMap — skip them here
     }
