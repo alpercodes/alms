@@ -778,6 +778,13 @@ async fn get_session_messages(
     Path(session_id): Path<SessionId>,
 ) -> impl IntoResponse {
     tracing::debug!("GET /sessions/{}/messages", session_id.0);
+
+    // Read the SSE high-water mark FIRST, before loading messages.
+    // If an event arrives between these two reads, worst case is the
+    // client replays a few events it already has (harmless duplicates)
+    // rather than missing events entirely.
+    let last_event_id = state.run_manager.latest_session_event_id(session_id).await;
+
     match state.session_manager.get_history(session_id) {
         Ok(messages) => {
             tracing::debug!(
@@ -829,10 +836,6 @@ async fn get_session_messages(
                     _ => None, // skip system messages
                 })
                 .collect();
-
-            // Include the latest SSE event ID so the client can open the
-            // stream with ?last_event_id=<n> and avoid duplicate replay.
-            let last_event_id = state.run_manager.latest_session_event_id(session_id).await;
 
             Json(serde_json::json!({
                 "messages": visible,

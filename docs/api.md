@@ -182,9 +182,14 @@ Returns the full chat history for a session, including tool calls and results.
     { "role": "assistant", "type": "tool_call",   "tool": "shell_exec", "params": {"argv":["ls"]}, "timestamp": "...", "metadata": {"tool_call_id": "call_123"} },
     { "role": "tool",      "type": "tool_result", "tool_id": "call_123", "result": "file1.txt\nfile2.txt", "ok": true, "timestamp": "..." },
     { "role": "assistant", "type": "text",        "content": "Here are the files.", "timestamp": "..." }
-  ]
+  ],
+  "last_event_id": 42
 }
 ```
+
+**Fields:**
+- `messages` — array of chat messages (see types below)
+- `last_event_id` — the current high-water mark of the session's SSE event log, or `null` if no SSE events have been emitted yet. Clients should pass this value as `?last_event_id=<n>` when opening the session SSE stream (`GET /sessions/{session_id}/events`) to skip replay of events already reflected in the returned messages.
 
 **Message types:**
 - `text` — plain text message (user or assistant)
@@ -369,7 +374,9 @@ Emitted on the agent's user-facing session when a scheduled job run finishes. Th
 `status` values: `"success"`, `"error"`, `"cancelled"`, `"unknown"`.
 
 #### Reconnect
-Supported via `Last-Event-ID` header. The server replays missed events and deduplicates overlap with the live stream.
+Supported via `Last-Event-ID` header (automatic browser reconnect) or `?last_event_id=<n>` query parameter (initial connection after loading history via REST). The query parameter takes precedence when both are present. The server replays events with IDs greater than the supplied value.
+
+For session-level streams (`GET /sessions/{session_id}/events`), clients should pass the `last_event_id` value returned by `GET /sessions/{session_id}/messages` to avoid replaying events that are already reflected in the loaded chat history.
 
 ### 5.4 Get run tool calls
 `GET /runs/{run_id}/tool-calls`

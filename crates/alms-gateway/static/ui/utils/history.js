@@ -19,7 +19,6 @@ export function mapHistoryMessages(msgs) {
     // Second pass: build the chat entries. Tool results are consumed via
     // the map lookup — any that remain unmatched are skipped (same as the
     // old "standalone tool_result" behavior).
-    const consumed = new Set();
     const entries = [];
     for (const m of msgs) {
         if (m.type === 'text' || !m.type) {
@@ -33,7 +32,6 @@ export function mapHistoryMessages(msgs) {
         } else if (m.type === 'tool_call') {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;
             const matched = callId ? resultMap.get(callId) : null;
-            if (matched) consumed.add(callId);
             entries.push({
                 type: 'tool',
                 tool: m.tool,

@@ -17,6 +17,8 @@ let sessionRetryCount = 0;
 const MAX_SESSION_RETRIES = 10;
 let deltaBuffer = '';
 let flushTimer = null;
+/** Highest SSE event ID seen on the current stream — used for manual reconnect. */
+let lastSeenEventId = null;
 
 function flushDeltaBuffer() {
     flushTimer = null;
@@ -77,9 +79,16 @@ export function openSessionStream(sessionId, opts) {
     const es = new EventSource(url);
     activeSessionEs = es;
     sessionRetryCount = 0;
+    lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
+
+    /** Wrap an event handler to track the highest seen SSE event ID. */
+    const on = (type, handler) => es.addEventListener(type, (e) => {
+        if (e.lastEventId) lastSeenEventId = e.lastEventId;
+        handler(e);
+    });
 
     // ── run_created: a new run was created on this session ──
-    es.addEventListener('run_created', (e) => {
+    on('run_created', (e) => {
         const data = JSON.parse(e.data);
         activeRunId.value = data.run_id;
         const queuedBehind = data.queued_behind || 0;
@@ -104,7 +113,7 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // ── run_started: the run has been dequeued and is now executing ──
-    es.addEventListener('run_started', (e) => {
+    on('run_started', (e) => {
         // Transition thinking indicator from "queued" to active "Thinking..."
         const msgs = [...chatMessages.value];
         const idx = msgs.findLastIndex(m => m.type === 'thinking');
@@ -115,7 +124,7 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // ── token_delta ──
-    es.addEventListener('token_delta', (e) => {
+    on('token_delta', (e) => {
         const data = JSON.parse(e.data);
         if (data.source_agent) return; // suppress subagent interleaving
         deltaBuffer += data.delta;
@@ -123,7 +132,7 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // ── tool_start ──
-    es.addEventListener('tool_start', (e) => {
+    on('tool_start', (e) => {
         flushDeltaBuffer();
         const data = JSON.parse(e.data);
         const toolId = data.tool_invocation_id || data.call_id || data.tool;
@@ -151,7 +160,7 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // ── tool_end ──
-    es.addEventListener('tool_end', (e) => {
+    on('tool_end', (e) => {
         const data = JSON.parse(e.data);
         const matchId = data.tool_invocation_id;
         const status = data.ok ? 'done' : 'fail';
@@ -179,7 +188,7 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // ── approval_required ──
-    es.addEventListener('approval_required', (e) => {
+    on('approval_required', (e) => {
         flushDeltaBuffer();
         const data = JSON.parse(e.data);
         chatMessages.value = [...chatMessages.value, {
@@ -190,7 +199,7 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // ── subagent_completed ──
-    es.addEventListener('subagent_completed', (e) => {
+    on('subagent_completed', (e) => {
         const data = JSON.parse(e.data);
         const name = data.subagent_name || 'subagent';
         const status = data.status || 'done';
@@ -209,7 +218,7 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // ── job_completed ──
-    es.addEventListener('job_completed', (e) => {
+    on('job_completed', (e) => {
         const data = JSON.parse(e.data);
         const name = data.job_name || 'job';
         const status = data.status === 'success' ? 'completed'
@@ -222,7 +231,7 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // ── approval_resolved ──
-    es.addEventListener('approval_resolved', (e) => {
+    on('approval_resolved', (e) => {
         const data = JSON.parse(e.data);
         const msgs = [...chatMessages.value];
         const idx = msgs.findLastIndex(m => m.type === 'approval' && m.approvalId === data.approval_id);
@@ -270,9 +279,9 @@ export function openSessionStream(sessionId, opts) {
         }
     };
 
-    es.addEventListener('run_finished', handleRunEnd('finished'));
-    es.addEventListener('run_error', handleRunEnd('error'));
-    es.addEventListener('run_cancelled', handleRunEnd('cancelled'));
+    on('run_finished', handleRunEnd('finished'));
+    on('run_error', handleRunEnd('error'));
+    on('run_cancelled', handleRunEnd('cancelled'));
 
     es.onerror = () => {
         if (es.readyState === EventSource.CLOSED) {
@@ -284,7 +293,7 @@ export function openSessionStream(sessionId, opts) {
             const delay = Math.min(2000 * Math.pow(2, sessionRetryCount - 1), 30000);
             setTimeout(() => {
                 if (activeSessionId.value === sessionId) {
-                    openSessionStream(sessionId);
+                    openSessionStream(sessionId, { lastEventId: lastSeenEventId });
                 }
             }, delay);
         }
