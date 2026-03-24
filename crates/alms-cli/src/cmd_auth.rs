@@ -100,12 +100,9 @@ pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
         println!("{:<15} {:<16} KEY", "PROVIDER", "SOURCE");
         println!("{}", "-".repeat(55));
         for p in VALID_PROVIDERS {
-            let (configured, masked, source) = store.key_status(p);
+            let (configured, masked, _source) = store.key_status(p);
             let display_source = if configured {
                 "secrets".to_string()
-            } else if source.starts_with("alias:") {
-                let alias_from = source.strip_prefix("alias:").unwrap_or(&source);
-                format!("via {alias_from}")
             } else {
                 "not set".to_string()
             };
