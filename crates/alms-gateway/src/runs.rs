@@ -1648,7 +1648,7 @@ mod tests {
     fn base_config() -> AgentConfig {
         AgentConfig {
             system_prompt: "server default prompt".into(),
-            max_tokens: 4096,
+            max_tokens: 100_000,
             posture: Posture::FullControl,
             ..AgentConfig::default()
         }
@@ -1675,7 +1675,7 @@ mod tests {
         let base = base_config();
         let merged = apply_overrides(base.clone(), None, &RunOverrides::default());
         assert_eq!(merged.agent_config.system_prompt, "server default prompt");
-        assert_eq!(merged.agent_config.max_tokens, 4096);
+        assert_eq!(merged.agent_config.max_tokens, 100_000);
         assert!(matches!(merged.agent_config.posture, Posture::FullControl));
         assert!(merged.model_override.is_none());
     }
@@ -1687,7 +1687,7 @@ mod tests {
         assert!(matches!(merged.agent_config.posture, Posture::Guarded));
         assert_eq!(merged.model_override.as_deref(), Some("custom-model"));
         // max_tokens not overridden by agent
-        assert_eq!(merged.agent_config.max_tokens, 4096);
+        assert_eq!(merged.agent_config.max_tokens, 100_000);
         // system_prompt is never overridden by agent — always server default
         assert_eq!(merged.agent_config.system_prompt, "server default prompt");
     }
@@ -1735,7 +1735,7 @@ mod tests {
             ..RunOverrides::default()
         };
         let merged = apply_overrides(base_config(), None, &overrides);
-        assert_eq!(merged.agent_config.max_tokens, 4096); // unchanged
+        assert_eq!(merged.agent_config.max_tokens, 100_000); // unchanged
     }
 
     #[test]

@@ -119,7 +119,7 @@ impl Default for AgentConfig {
             system_prompt: include_str!("../prompts/initial.md").trim().to_string(),
             prompts: SystemPrompts::default(),
             max_iterations: 10,
-            max_tokens: 4096,
+            max_tokens: 100_000,
             context_config: ContextConfig::default(),
             posture: Posture::default(),
             sandbox_root: ".".into(),
