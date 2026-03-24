@@ -30,6 +30,7 @@ struct RunOverrides {
     model: Option<String>,
     max_tokens: Option<u32>,
     posture: Option<String>,
+    provider: Option<String>,
 }
 
 /// Bundled parameters for [`execute_run`], avoiding a long positional argument list.
@@ -284,6 +285,7 @@ pub async fn create_run(
         model: req.model.clone(),
         max_tokens: req.max_tokens,
         posture: req.posture.clone(),
+        provider: req.provider.clone(),
     };
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;
@@ -433,6 +435,10 @@ async fn execute_run(state: AppState, params: RunParams) {
         && let Ok(posture) = p.parse::<alms_runtime::Posture>()
     {
         agent_config.posture = posture;
+    }
+    if let Some(ref provider) = overrides.provider {
+        info!("Run {} using provider override: {}", run_id.0, provider);
+        llm = llm.with_provider_and_secrets(provider, &state.secrets.read());
     }
     if let Some(ref model) = overrides.model {
         info!("Run {} using model override: {}", run_id.0, model);
@@ -1608,6 +1614,7 @@ mod tests {
             model: Some("run-model".into()),
             max_tokens: Some(8192),
             posture: Some("full_control".into()),
+            ..RunOverrides::default()
         };
         let merged = apply_overrides(base_config(), Some(&agent), &overrides);
         // Per-run model wins over per-agent
@@ -1626,6 +1633,7 @@ mod tests {
             model: Some("run-model".into()),
             max_tokens: Some(256),
             posture: Some("guarded".into()),
+            ..RunOverrides::default()
         };
         let merged = apply_overrides(base_config(), None, &overrides);
         assert_eq!(merged.model_override.as_deref(), Some("run-model"));

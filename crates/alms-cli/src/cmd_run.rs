@@ -60,6 +60,7 @@ pub(crate) async fn run_create(
         model,
         max_tokens,
         posture,
+        provider: None,
     };
     let (_status, val) = api_post(client, url, "runs", &req).await?;
     if json {
