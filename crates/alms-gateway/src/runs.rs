@@ -126,7 +126,7 @@ pub fn resolve_agent_config(
     if let Some(ref record) = agent_record
         && let Some(ref provider) = record.provider
     {
-        debug!(
+        info!(
             agent_id = %agent_id,
             provider = %provider,
             "Applying per-agent provider override with secrets resolution"
@@ -144,7 +144,7 @@ pub fn resolve_agent_config(
     } else if let Some(s) = secrets {
         // No per-agent provider override — re-resolve the key for the
         // server-default provider from the live secrets store.
-        debug!(
+        info!(
             agent_id = %agent_id,
             provider = %llm.provider(),
             "Re-resolving API key from secrets for default provider"
