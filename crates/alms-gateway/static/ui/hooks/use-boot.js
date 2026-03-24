@@ -6,7 +6,7 @@ import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
 import { activeRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
-import { chatMessages } from '../state/chat.js';
+import { chatMessages, nextMsgId } from '../state/chat.js';
 import { messageQueue, bgRuns } from '../state/queue.js';
 import { wsFiles } from '../state/workspace.js';
 import { auditEvents } from '../state/audit.js';
@@ -123,7 +123,7 @@ async function loadHistory(sessionId) {
         return data.last_event_id ?? null;
     } catch (err) {
         console.error('[loadHistory] failed:', err);
-        chatMessages.value = [{ type: 'error', text: `Failed to load message history: ${err.message || 'unknown error'}` }];
+        chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.message || 'unknown error'}` }];
         return null;
     }
 }

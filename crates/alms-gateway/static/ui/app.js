@@ -37,22 +37,21 @@ function ChatView() {
                         No messages yet. Send a message to start.
                     </div>
                 `}
-                ${chatMessages.value.map((m, i) => {
-                    const key = m.id || i;
+                ${chatMessages.value.map((m) => {
                     if (m.type === 'user' || m.type === 'agent') {
-                        return html`<${Message} key=${key} type=${m.type} text=${m.text} sealed=${m.sealed} />`;
+                        return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} />`;
                     }
                     if (m.type === 'tool') {
-                        return html`<${ToolRow} key=${key} ...${m} />`;
+                        return html`<${ToolRow} key=${m.id} ...${m} />`;
                     }
                     if (m.type === 'approval') {
-                        return html`<${ApprovalCard} key=${key} ...${m} />`;
+                        return html`<${ApprovalCard} key=${m.id} ...${m} />`;
                     }
                     if (m.type === 'image') {
                         const cls = m.role === 'user' ? 'user' : 'agent';
                         const label = m.role === 'user' ? '>' : '$';
                         return html`
-                            <div key=${key} class="msg ${cls}">
+                            <div key=${m.id} class="msg ${cls}">
                                 <div class="msg-label">${label}</div>
                                 <div class="msg-body">
                                     ${m.url
@@ -65,22 +64,22 @@ function ChatView() {
                         `;
                     }
                     if (m.type === 'error') {
-                        return html`<${ErrorMessage} key=${key} text=${m.text} code=${m.code} />`;
+                        return html`<${ErrorMessage} key=${m.id} text=${m.text} code=${m.code} />`;
                     }
                     if (m.type === 'warning') {
-                        return html`<${WarningMessage} key=${key} text=${m.text} code=${m.code} />`;
+                        return html`<${WarningMessage} key=${m.id} text=${m.text} code=${m.code} />`;
                     }
                     if (m.type === 'system') {
-                        return html`<${SystemMessage} key=${key} text=${m.text} />`;
+                        return html`<${SystemMessage} key=${m.id} text=${m.text} />`;
                     }
                     if (m.type === 'tokens') {
-                        return html`<${TokenBadge} key=${key} usage=${m.usage} />`;
+                        return html`<${TokenBadge} key=${m.id} usage=${m.usage} />`;
                     }
                     if (m.type === 'thinking') {
                         let label = 'Thinking';
                         if (m.queuedBehind > 0) {
                             const n = m.queuedBehind;
-                            label = 'Agent is busy — your message is queued (' + n + ' ahead)';
+                            label = 'Agent is busy -- your message is queued (' + n + ' ahead)';
                         } else if (m.source && m.source.startsWith('peer:')) {
                             label = 'Replying to message from ' + m.source.slice(5);
                         } else if (m.source === 'job') {
@@ -101,7 +100,7 @@ function ChatView() {
                                 : 'Running tools';
                         }
                         return html`
-                            <div key="thinking" class="msg agent">
+                            <div key=${m.id} class="msg agent">
                                 <div class="msg-label">Agent</div>
                                 <div class="msg-body thinking-indicator">${label}</div>
                             </div>

@@ -1,3 +1,5 @@
+import { nextMsgId } from '../state/chat.js';
+
 /**
  * Map API message history to chatMessages entries.
  *
@@ -5,6 +7,9 @@
  * tool_call_id / tool_id rather than positional lookahead. This
  * correctly handles parallel tool calls where the stored order is
  * [call_A, call_B, result_A, result_B].
+ *
+ * Every entry receives a stable `id` via nextMsgId() so that Preact's
+ * VDOM reconciler can correctly match DOM nodes across re-renders.
  */
 export function mapHistoryMessages(msgs) {
     // First pass: index all tool_result messages by their tool_id so we
@@ -17,13 +22,14 @@ export function mapHistoryMessages(msgs) {
     }
 
     // Second pass: build the chat entries. Tool results are consumed via
-    // the map lookup — any that remain unmatched are skipped (same as the
+    // the map lookup -- any that remain unmatched are skipped (same as the
     // old "standalone tool_result" behavior).
     const entries = [];
     for (const m of msgs) {
         if (m.type === 'text' || !m.type) {
             // Legacy messages without type field, or explicit text
             entries.push({
+                id: nextMsgId(),
                 type: m.role === 'user' ? 'user' : 'agent',
                 role: m.role,
                 text: m.content || '',
@@ -33,15 +39,16 @@ export function mapHistoryMessages(msgs) {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;
             const matched = callId ? resultMap.get(callId) : null;
             entries.push({
+                id: callId || nextMsgId(),
                 type: 'tool',
                 tool: m.tool,
                 params: m.params,
                 status: matched ? (matched.ok ? 'done' : 'fail') : 'done',
                 result: matched ? matched.result : null,
-                id: callId || m.tool,
             });
         } else if (m.type === 'image') {
             entries.push({
+                id: nextMsgId(),
                 type: 'image',
                 role: m.role,
                 url: m.url || '',
@@ -49,7 +56,7 @@ export function mapHistoryMessages(msgs) {
                 sealed: true,
             });
         }
-        // tool_result entries are consumed via resultMap — skip them here
+        // tool_result entries are consumed via resultMap -- skip them here
     }
     return entries;
 }

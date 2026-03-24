@@ -2,7 +2,7 @@ import { html, useRef } from '../../deps.js';
 import { activeSessionId } from '../../state/sessions.js';
 import { activeAgentId, agents } from '../../state/agents.js';
 import { activeRunId, runs } from '../../state/runs.js';
-import { chatMessages } from '../../state/chat.js';
+import { chatMessages, nextMsgId } from '../../state/chat.js';
 import { messageQueue } from '../../state/queue.js';
 import { localSettings } from '../../state/settings.js';
 import { createRun, cancelRun as apiCancelRun } from '../../api/runs.js';
@@ -10,8 +10,8 @@ import { IconSend, IconStop } from '../../utils/icons.js';
 
 export async function startRun(text) {
     chatMessages.value = [...chatMessages.value,
-        { type: 'user', role: 'user', text },
-        { type: 'thinking' },
+        { id: nextMsgId(), type: 'user', role: 'user', text },
+        { id: nextMsgId(), type: 'thinking' },
     ];
 
     try {
@@ -32,7 +32,7 @@ export async function startRun(text) {
     } catch (err) {
         chatMessages.value = chatMessages.value
             .filter(m => m.type !== 'thinking')
-            .concat([{ type: 'error', text: `Failed to start run: ${err.message || err.status || 'unknown error'}` }]);
+            .concat([{ id: nextMsgId(), type: 'error', text: `Failed to start run: ${err.message || err.status || 'unknown error'}` }]);
         console.error('[startRun] failed:', err);
     }
 }
