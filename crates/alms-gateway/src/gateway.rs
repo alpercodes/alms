@@ -39,6 +39,10 @@ pub struct GatewayConfig {
     pub agent_id: Option<AgentId>,
     /// Bearer token for API authentication (None = auth disabled)
     pub auth_token: Option<String>,
+    /// Logging configuration snapshot — exposed via GET /settings for UI display.
+    pub logging_config: alms_core::config::LoggingConfig,
+    /// Tools configuration snapshot — timeout and max_output_bytes for UI display.
+    pub tools_config: alms_core::config::ToolsConfig,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -54,6 +58,8 @@ impl Default for GatewayConfig {
             workspace_dir: None,
             agent_id: None,
             auth_token: None,
+            logging_config: alms_core::config::LoggingConfig::default(),
+            tools_config: alms_core::config::ToolsConfig::default(),
         }
     }
 }
@@ -93,6 +99,8 @@ impl GatewayConfig {
             workspace_dir: None,
             agent_id: None,
             auth_token: config.server.auth_token.clone(),
+            logging_config: config.logging.clone(),
+            tools_config: config.tools.clone(),
         }
     }
 
@@ -636,6 +644,21 @@ impl Gateway {
     /// Get auth token (None = auth disabled)
     pub fn auth_token(&self) -> Option<&str> {
         self.config.auth_token.as_deref()
+    }
+
+    /// Get session config reference (for exposing server defaults)
+    pub fn session_config(&self) -> &SessionConfig {
+        &self.config.session_config
+    }
+
+    /// Get logging config reference (for exposing server defaults)
+    pub fn logging_config(&self) -> &alms_core::config::LoggingConfig {
+        &self.config.logging_config
+    }
+
+    /// Get tools config reference (for exposing server defaults)
+    pub fn tools_config(&self) -> &alms_core::config::ToolsConfig {
+        &self.config.tools_config
     }
 
     /// Get a clone of the shared secrets store handle.

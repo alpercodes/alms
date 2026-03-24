@@ -34,7 +34,15 @@ let sessionRetryCount = 0;
 const MAX_SESSION_RETRIES = 10;
 let deltaBuffer = '';
 let flushTimer = null;
-/** Highest SSE event ID seen on the current stream — used for manual reconnect. */
+/**
+ * Highest SSE event ID seen on the current stream — used for manual reconnect.
+ *
+ * Type note: this value may be a number (when seeded from the REST API's
+ * `last_event_id` integer field) or a string (when updated from the SSE
+ * spec's `e.lastEventId`).  Both are coerced to a string via `String()`
+ * before being sent as the `?last_event_id` query parameter, so the mixed
+ * representation is harmless in practice.
+ */
 let lastSeenEventId = null;
 
 function flushDeltaBuffer() {

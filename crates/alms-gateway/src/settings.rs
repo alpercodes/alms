@@ -75,6 +75,11 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         .as_ref()
         .map(|p| p.display().to_string());
 
+    let ctx = &agent.context_config;
+    let sess = &state.session_config;
+    let log = &state.logging_config;
+    let tools_cfg = &state.tools_config;
+
     Json(serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
         "provider": llm.provider,
@@ -82,11 +87,42 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "base_url": llm.base_url,
         "max_tokens": agent.max_tokens,
         "posture": posture_str,
-        "context_strategy": agent.context_config.strategy,
+        "context_strategy": ctx.strategy,
         "stream_chunk_timeout_secs": llm.stream_chunk_timeout_secs,
         "enabled_tools": tools,
         "agent_id": agent_id,
         "agents": agents_list,
         "workspace_dir": workspace_dir,
+        // Context settings
+        "context": {
+            "strategy": ctx.strategy,
+            "max_input_tokens": ctx.max_input_tokens,
+            "recent_window": ctx.recent_window,
+            "summary_interval": ctx.summary_interval,
+            "summary_model": ctx.summary_model,
+        },
+        // Session settings
+        "session": {
+            "max_messages": sess.max_messages,
+            "max_context_tokens": sess.max_context_tokens,
+            "idle_timeout_secs": sess.idle_timeout_secs,
+            "auto_archive": sess.auto_archive,
+            "archive_ttl_secs": sess.archive_ttl_secs,
+        },
+        // Logging settings
+        "logging": {
+            "file_enabled": log.file_enabled,
+            "file_level": log.file_level,
+            "rotation": log.rotation,
+            "log_dir": log.log_dir,
+        },
+        // Tools settings
+        "tools": {
+            "sandbox_root": tools_cfg.sandbox_root,
+            "shell_policy": tools_cfg.shell_policy,
+            "timeout_secs": tools_cfg.timeout_secs,
+            "max_output_bytes": tools_cfg.max_output_bytes,
+            "enabled": tools,
+        },
     }))
 }

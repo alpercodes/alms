@@ -396,6 +396,8 @@ Supported via `Last-Event-ID` header (automatic browser reconnect) or `?last_eve
 
 For session-level streams (`GET /sessions/{session_id}/events`), clients should pass the `last_event_id` value returned by `GET /sessions/{session_id}/messages` to avoid replaying events that are already reflected in the loaded chat history.
 
+> **Note:** The event log is held in memory. After a daemon restart, `last_event_id` in the messages response will be `null` because no SSE events have been emitted yet. Clients should treat `null` the same as "no prior events" and open the SSE stream without a `last_event_id` parameter (which means they may see duplicates of messages already loaded via REST — this is expected and typically harmless, but clients that accumulate history incrementally should deduplicate by message ID).
+
 ### 5.4 Get run tool calls
 `GET /runs/{run_id}/tool-calls`
 
@@ -632,17 +634,49 @@ Returns current server defaults for UI pre-population.
 **Response 200**
 ```json
 {
+  "version": "0.1.1",
+  "provider": "openai",
   "model": "openai/gpt-4o",
   "base_url": "https://openrouter.ai/api/v1",
   "max_tokens": 4096,
   "posture": "guarded",
   "context_strategy": "truncate",
+  "stream_chunk_timeout_secs": 60,
   "enabled_tools": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write"],
   "agent_id": "<uuid>",
-  "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null}],
-  "workspace_dir": "./data/workspace"
+  "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null, "needs_bootstrap": false}],
+  "workspace_dir": "./data/workspace",
+  "context": {
+    "strategy": "truncate",
+    "max_input_tokens": 100000,
+    "recent_window": 20,
+    "summary_interval": 10,
+    "summary_model": null
+  },
+  "session": {
+    "max_messages": 200,
+    "max_context_tokens": 100000,
+    "idle_timeout_secs": 86400,
+    "auto_archive": true,
+    "archive_ttl_secs": 2592000
+  },
+  "logging": {
+    "file_enabled": true,
+    "file_level": "debug",
+    "rotation": "daily",
+    "log_dir": null
+  },
+  "tools": {
+    "sandbox_root": ".",
+    "shell_policy": "sandboxed",
+    "timeout_secs": 30,
+    "max_output_bytes": null,
+    "enabled": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write"]
+  }
 }
 ```
+
+Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved for backward compatibility alongside the new nested objects (`context`, `session`, `logging`, `tools`). The nested objects contain the same data in a structured form. New consumers should prefer the nested objects.
 
 ---
 

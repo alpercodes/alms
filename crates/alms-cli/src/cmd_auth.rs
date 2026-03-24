@@ -81,32 +81,36 @@ pub(crate) fn auth_set(
 
 pub(crate) fn auth_list(data_dir: &Path, json: bool) -> anyhow::Result<()> {
     let store = SecretsStore::load(secrets::secrets_path(data_dir))?;
-    let providers = store.list_providers();
 
     if json {
         let entries: Vec<serde_json::Value> = VALID_PROVIDERS
             .iter()
             .map(|p| {
-                let configured = providers.contains(&p.to_string());
+                let (configured, masked, source) = store.key_status(p);
                 serde_json::json!({
                     "provider": p,
                     "configured": configured,
-                    "key": store.get_masked(p),
-                    "source": if configured { "secrets" } else { "none" },
+                    "key": masked,
+                    "source": source,
                 })
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&entries)?);
     } else {
-        println!("{:<15} {:<12} KEY", "PROVIDER", "SOURCE");
-        println!("{}", "-".repeat(50));
+        println!("{:<15} {:<16} KEY", "PROVIDER", "SOURCE");
+        println!("{}", "-".repeat(55));
         for p in VALID_PROVIDERS {
-            let (source, masked) = if providers.contains(&p.to_string()) {
-                ("secrets", store.get_masked(p).unwrap_or_default())
+            let (configured, masked, source) = store.key_status(p);
+            let display_source = if configured {
+                "secrets".to_string()
+            } else if source.starts_with("alias:") {
+                let alias_from = source.strip_prefix("alias:").unwrap_or(&source);
+                format!("via {alias_from}")
             } else {
-                ("not set", String::new())
+                "not set".to_string()
             };
-            println!("{:<15} {:<12} {}", p, source, masked);
+            let display_key = masked.unwrap_or_default();
+            println!("{:<15} {:<16} {}", p, display_source, display_key);
         }
     }
     Ok(())
