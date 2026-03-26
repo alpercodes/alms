@@ -370,7 +370,7 @@ Transient phase indicator emitted at key moments during the agent loop so the UI
 { "run_id": "<uuid>", "warning": {"code":"MAX_ITERATIONS","message":"..."} }
 ```
 
-Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Currently used when the agent hits its iteration limit before finishing.
+Emitted for non-fatal conditions that the frontend should display distinctly (yellow warning styling). Warning codes: `MAX_ITERATIONS` (agent hit its iteration limit before finishing), `DM_TEXT_ONLY_RETRY` (DM agent responded with text only instead of using `send_message`/`ignore_message` -- retrying), `DM_TEXT_ONLY_DROPPED` (DM retry also failed -- text response was dropped). When the warning originates from a subagent, the payload includes a `source_agent` field identifying which subagent emitted it.
 
 `run_cancelled`
 ```json

@@ -977,8 +977,12 @@ async fn run_agent_loop(
                     // which is confusing. The user doesn't need to know that a
                     // subagent is "building context" or "calling LLM".
                     RuntimeEvent::Status { .. } => continue,
-                    // Forward warnings from subagents so the operator sees them.
-                    RuntimeEvent::Warning { .. } => {}
+                    // Forward warnings from subagents, tagged with the
+                    // subagent label so the operator can tell them apart
+                    // from parent warnings.
+                    RuntimeEvent::Warning { source_agent, .. } => {
+                        *source_agent = Some(label.clone());
+                    }
                 }
                 let _ = parent_tx.send(event);
             }
