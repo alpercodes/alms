@@ -278,6 +278,8 @@ Agents can decline to respond to an invocation (per `communication-architecture.
 
 When called, the run ends early. The ignore is logged but no response is broadcast. The system prompt instructs agents on when this is appropriate.
 
+`send_message` and `ignore_message` are mutually exclusive within a single tool-call batch. If both appear in the same LLM response, neither executes -- both receive error results, and the agent gets another iteration to choose one. Other non-conflicting tools in the same batch still execute normally. (See #364.)
+
 **Future optimization**: A cheaper pre-filter (smaller model or rule-based check) before the full LLM call to avoid paying for the ignore decision itself. Deferred — build the expensive correct version first.
 
 ### 3.7 New Tool: `send_message`
