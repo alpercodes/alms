@@ -186,7 +186,12 @@ impl SseEventData {
     /// Emit a `run_warning` event for non-fatal conditions like max iterations
     /// reached. The frontend should style these as warnings (yellow), not
     /// errors (red).
-    pub fn run_warning(run_id: RunId, code: &str, message: &str) -> Self {
+    pub fn run_warning(
+        run_id: RunId,
+        code: &str,
+        message: &str,
+        source_agent: Option<String>,
+    ) -> Self {
         Self::new(
             "run_warning",
             RunWarningData {
@@ -195,6 +200,7 @@ impl SseEventData {
                     code: code.to_string(),
                     message: message.to_string(),
                 },
+                source_agent,
             },
         )
     }
@@ -482,6 +488,9 @@ struct ErrorData {
 struct RunWarningData {
     run_id: String,
     warning: WarningData,
+    /// When set, this warning originated from a subagent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -715,7 +724,8 @@ mod tests {
     #[test]
     fn test_run_warning_event() {
         let run_id = RunId::new();
-        let event = SseEventData::run_warning(run_id, "MAX_ITERATIONS", "Max iterations reached");
+        let event =
+            SseEventData::run_warning(run_id, "MAX_ITERATIONS", "Max iterations reached", None);
         assert_eq!(event.event_type, "run_warning");
         assert_eq!(event.data["warning"]["code"], "MAX_ITERATIONS");
         assert_eq!(event.data["warning"]["message"], "Max iterations reached");
