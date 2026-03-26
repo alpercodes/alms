@@ -1125,6 +1125,26 @@ impl AgentRuntime {
                 let detail = tool_names.join(", ");
                 self.emit_status(PHASE_EXECUTING_TOOLS, Some(&detail));
 
+                // Pre-execution conflict detection: send_message and
+                // ignore_message are mutually exclusive. If both appear in
+                // the same tool-call batch, execute neither — return error
+                // results for both so the LLM can retry with just one.
+                // Other non-conflicting tools in the batch still execute
+                // normally. (Fixes #364)
+                let has_send = tool_calls
+                    .iter()
+                    .any(|tc| tc.function.name == "send_message");
+                let has_ignore = tool_calls
+                    .iter()
+                    .any(|tc| tc.function.name == "ignore_message");
+                let dm_conflict = has_send && has_ignore;
+                if dm_conflict {
+                    warn!(
+                        "Agent called both send_message and ignore_message in same batch — \
+                         rejecting both; the agent will retry with one"
+                    );
+                }
+
                 // Checkpoint C: tool execution with cancellation support.
                 //
                 // Full-control / Autonomous posture: run all tool calls concurrently
@@ -1133,6 +1153,18 @@ impl AgentRuntime {
                 //
                 // Guarded posture: run tool calls sequentially so the user sees one
                 // approval prompt at a time rather than all at once.
+                //
+                // When dm_conflict is true, send_message and ignore_message
+                // are skipped (replaced with error results); other tools in
+                // the batch still execute.
+                let conflicting_tools: &[&str] = if dm_conflict {
+                    &["send_message", "ignore_message"]
+                } else {
+                    &[]
+                };
+                const DM_CONFLICT_MSG: &str = "send_message and ignore_message are mutually exclusive \
+                     — you can only use one per turn. Choose one.";
+
                 let results = match self.config.posture {
                     Posture::Guarded => {
                         // Note: cancellation during active tool execution (post-approval)
@@ -1140,6 +1172,12 @@ impl AgentRuntime {
                         // since guarded tools block on approval (which IS cancellation-aware).
                         let mut results = Vec::with_capacity(tool_calls.len());
                         for tc in &tool_calls {
+                            if conflicting_tools.contains(&tc.function.name.as_str()) {
+                                results.push(Err(AlmsError::ToolExecution(
+                                    DM_CONFLICT_MSG.to_string(),
+                                )));
+                                continue;
+                            }
                             if let Some(ref token) = self.cancel_token
                                 && token.is_cancelled()
                             {
@@ -1153,19 +1191,48 @@ impl AgentRuntime {
                         results
                     }
                     Posture::FullControl | Posture::Autonomous => {
-                        let tool_future = futures::future::join_all(
-                            tool_calls
-                                .iter()
-                                .map(|tc| self.execute_tool_call(tc, session_manager, session_id)),
-                        );
-                        if let Some(ref token) = self.cancel_token {
-                            tokio::select! {
-                                r = tool_future => r,
-                                _ = token.cancelled() => return (tool_call_records, Err(AlmsError::Cancelled)),
-                            }
+                        // Indices of non-conflicting tools to execute.
+                        let exec_indices: Vec<usize> = tool_calls
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, tc)| {
+                                !conflicting_tools.contains(&tc.function.name.as_str())
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+
+                        // Execute non-conflicting tools concurrently.
+                        let exec_results = if exec_indices.is_empty() {
+                            Vec::new()
                         } else {
-                            tool_future.await
-                        }
+                            let exec_futures = exec_indices.iter().map(|&i| {
+                                self.execute_tool_call(&tool_calls[i], session_manager, session_id)
+                            });
+                            if let Some(ref token) = self.cancel_token {
+                                tokio::select! {
+                                    r = futures::future::join_all(exec_futures) => r,
+                                    _ = token.cancelled() => return (tool_call_records, Err(AlmsError::Cancelled)),
+                                }
+                            } else {
+                                futures::future::join_all(exec_futures).await
+                            }
+                        };
+
+                        // Assemble final results: conflict errors for
+                        // conflicting tools, execution results for the rest.
+                        let mut exec_iter = exec_results.into_iter();
+                        tool_calls
+                            .iter()
+                            .map(|tc| {
+                                if conflicting_tools.contains(&tc.function.name.as_str()) {
+                                    Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string()))
+                                } else {
+                                    exec_iter.next().unwrap_or_else(|| {
+                                        Err(AlmsError::Runtime("missing tool result".into()))
+                                    })
+                                }
+                            })
+                            .collect()
                     }
                 };
 
@@ -1217,12 +1284,14 @@ impl AgentRuntime {
                     tool_seq += 1;
                 }
 
-                // Check if any tool result is an ignore_message marker.
-                // When detected, end the run early without producing a response.
-                let ignored = tool_calls
-                    .iter()
-                    .any(|tc| tc.function.name == "ignore_message");
-                if ignored {
+                // Check if any tool call is an ignore_message marker.
+                // When detected (and it was NOT blocked by a conflict),
+                // end the run early without producing a response.
+                if !dm_conflict
+                    && tool_calls
+                        .iter()
+                        .any(|tc| tc.function.name == "ignore_message")
+                {
                     info!("Agent declined to respond via ignore_message — ending run early");
                     return (tool_call_records, Ok((String::new(), total_usage)));
                 }
@@ -2511,5 +2580,170 @@ mod tests {
             tool_loop_prompt.contains(&runtime.config.prompts.tool_loop),
             "Tool-loop rebuilt system prompt should contain tool_loop continuation guidance"
         );
+    }
+
+    // ---- send_message / ignore_message conflict detection tests (#364) ----
+
+    /// When both `send_message` and `ignore_message` appear in the same
+    /// tool-call batch, both should be blocked with error results.
+    /// Neither tool should execute, and the run should NOT terminate
+    /// early (the agent gets another iteration to choose one).
+    #[test]
+    fn test_dm_conflict_blocks_both_tools() {
+        use crate::llm_types::{FunctionCall, ToolCall};
+
+        let tool_calls = vec![
+            ToolCall {
+                id: "tc_send".to_string(),
+                function: FunctionCall {
+                    name: "send_message".to_string(),
+                    arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "tc_ignore".to_string(),
+                function: FunctionCall {
+                    name: "ignore_message".to_string(),
+                    arguments: r#"{"reason":"nothing to add"}"#.to_string(),
+                },
+            },
+        ];
+
+        // Replicate the conflict detection logic from agent_loop.
+        let has_send = tool_calls
+            .iter()
+            .any(|tc| tc.function.name == "send_message");
+        let has_ignore = tool_calls
+            .iter()
+            .any(|tc| tc.function.name == "ignore_message");
+        let dm_conflict = has_send && has_ignore;
+
+        assert!(
+            dm_conflict,
+            "Conflict should be detected when both tools are present"
+        );
+
+        let conflicting_tools: &[&str] = &["send_message", "ignore_message"];
+
+        // Verify both tools would be blocked.
+        for tc in &tool_calls {
+            assert!(
+                conflicting_tools.contains(&tc.function.name.as_str()),
+                "{} should be in the conflicting set",
+                tc.function.name
+            );
+        }
+
+        // Verify the ignore_message early-termination is suppressed.
+        let should_terminate = !dm_conflict
+            && tool_calls
+                .iter()
+                .any(|tc| tc.function.name == "ignore_message");
+        assert!(
+            !should_terminate,
+            "Run must NOT terminate early when both tools conflict"
+        );
+    }
+
+    /// When `ignore_message` is called alone (no `send_message`), the run
+    /// should still terminate early as before.
+    #[test]
+    fn test_ignore_message_alone_terminates() {
+        use crate::llm_types::{FunctionCall, ToolCall};
+
+        let tool_calls = vec![ToolCall {
+            id: "tc_ignore".to_string(),
+            function: FunctionCall {
+                name: "ignore_message".to_string(),
+                arguments: r#"{"reason":"not relevant"}"#.to_string(),
+            },
+        }];
+
+        let has_send = tool_calls
+            .iter()
+            .any(|tc| tc.function.name == "send_message");
+        let has_ignore = tool_calls
+            .iter()
+            .any(|tc| tc.function.name == "ignore_message");
+        let dm_conflict = has_send && has_ignore;
+
+        assert!(
+            !dm_conflict,
+            "No conflict when only ignore_message is present"
+        );
+
+        let should_terminate = !dm_conflict
+            && tool_calls
+                .iter()
+                .any(|tc| tc.function.name == "ignore_message");
+        assert!(
+            should_terminate,
+            "ignore_message alone should terminate the run early"
+        );
+    }
+
+    /// When both conflicting tools appear alongside a normal tool (e.g.
+    /// `echo`), only the conflicting tools should be blocked. The normal
+    /// tool should still be eligible for execution.
+    #[test]
+    fn test_dm_conflict_preserves_non_conflicting_tools() {
+        use crate::llm_types::{FunctionCall, ToolCall};
+
+        let tool_calls = vec![
+            ToolCall {
+                id: "tc_echo".to_string(),
+                function: FunctionCall {
+                    name: "echo".to_string(),
+                    arguments: r#"{"message":"hello"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "tc_send".to_string(),
+                function: FunctionCall {
+                    name: "send_message".to_string(),
+                    arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "tc_ignore".to_string(),
+                function: FunctionCall {
+                    name: "ignore_message".to_string(),
+                    arguments: r#"{"reason":"nothing to add"}"#.to_string(),
+                },
+            },
+        ];
+
+        let has_send = tool_calls
+            .iter()
+            .any(|tc| tc.function.name == "send_message");
+        let has_ignore = tool_calls
+            .iter()
+            .any(|tc| tc.function.name == "ignore_message");
+        let dm_conflict = has_send && has_ignore;
+        assert!(dm_conflict);
+
+        let conflicting_tools: &[&str] = &["send_message", "ignore_message"];
+
+        // Partition: echo should be in the "execute" set, the other two
+        // should be in the "conflict error" set.
+        let exec_indices: Vec<usize> = tool_calls
+            .iter()
+            .enumerate()
+            .filter(|(_, tc)| !conflicting_tools.contains(&tc.function.name.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+
+        assert_eq!(exec_indices, vec![0], "Only echo (index 0) should execute");
+        assert_eq!(tool_calls[exec_indices[0]].function.name, "echo");
+
+        // The two DM tools should be blocked.
+        let blocked: Vec<&str> = tool_calls
+            .iter()
+            .filter(|tc| conflicting_tools.contains(&tc.function.name.as_str()))
+            .map(|tc| tc.function.name.as_str())
+            .collect();
+        assert_eq!(blocked.len(), 2);
+        assert!(blocked.contains(&"send_message"));
+        assert!(blocked.contains(&"ignore_message"));
     }
 }
