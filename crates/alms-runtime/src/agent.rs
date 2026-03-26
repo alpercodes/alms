@@ -723,6 +723,33 @@ impl AgentRuntime {
         }
     }
 
+    /// Rebuild the system prompt for tool-loop continuation or DM retry.
+    ///
+    /// Combines the agent's initial prompt with the `tool_loop` continuation
+    /// guidance, assembles workspace prefix, and (for DM sessions) appends the
+    /// DM addendum so the agent remembers to use `send_message`.
+    ///
+    /// This is extracted as a helper to avoid three copies of the same pattern
+    /// (initial tool-loop rebuild, DM text-only retry rebuild).
+    fn rebuild_system_prompt_for_tool_loop(
+        &self,
+        messages: &mut [LlmMessage],
+        include_user: bool,
+        dm_peer: Option<&str>,
+    ) {
+        if !messages.is_empty() && messages[0].role == "system" {
+            let combined = format!(
+                "{}\n\n{}",
+                self.config.system_prompt, self.config.prompts.tool_loop
+            );
+            let mut prompt = self.assemble_system_prompt(&combined, include_user);
+            if let Some(peer) = dm_peer {
+                prompt.push_str(&Self::dm_addendum(peer));
+            }
+            messages[0] = LlmMessage::system(prompt);
+        }
+    }
+
     /// Returns true if the given context_id represents a user-facing session
     /// (web chat, Telegram, etc.) where `user.md` should be included in the
     /// system prompt.  Non-user-facing contexts (DM, subagent, job) return
@@ -961,6 +988,9 @@ impl AgentRuntime {
         let mut total_usage = TokenUsage::default();
         let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
         let mut tool_seq: u32 = 0;
+        // Tracks how many times we have retried after a DM text-only response.
+        // Capped at DM_TEXT_ONLY_MAX_RETRIES to prevent infinite loops.
+        let mut dm_text_only_retries: u32 = 0;
 
         loop {
             // Checkpoint A: check cancellation between iterations.
@@ -1293,19 +1323,89 @@ impl AgentRuntime {
                 // For DM sessions, re-inject the DM recipient addendum so the
                 // agent remembers to use `send_message` on every iteration —
                 // not just the first one (fixes #346).
-                if !messages.is_empty() && messages[0].role == "system" {
-                    let combined = format!(
-                        "{}\n\n{}",
-                        self.config.system_prompt, self.config.prompts.tool_loop
-                    );
-                    let mut tool_loop_prompt = self.assemble_system_prompt(&combined, include_user);
-                    if let Some(peer) = dm_peer {
-                        tool_loop_prompt.push_str(&Self::dm_addendum(peer));
-                    }
-                    messages[0] = LlmMessage::system(tool_loop_prompt);
-                }
+                self.rebuild_system_prompt_for_tool_loop(&mut messages, include_user, dm_peer);
 
                 continue;
+            }
+
+            // --- DM text-only response retry (#361) ---
+            //
+            // When a DM-triggered run ends with a text-only response and
+            // neither `send_message` nor `ignore_message` was called during
+            // the entire run, the agent's response will be silently dropped
+            // (by design — DM responses must go through `send_message`).
+            //
+            // Instead of accepting this silently, re-invoke the LLM with an
+            // error message so it gets one more chance to use the correct
+            // tool. We cap retries at DM_TEXT_ONLY_MAX_RETRIES to avoid
+            // infinite loops.
+            if is_dm
+                && !dm_tool_was_called(&tool_call_records)
+                && dm_text_only_retries < DM_TEXT_ONLY_MAX_RETRIES
+            {
+                dm_text_only_retries += 1;
+                warn!(
+                    agent_id = %self.agent_id.0,
+                    retry = dm_text_only_retries,
+                    "DM run ended with text-only response — retrying with error prompt"
+                );
+
+                // Emit a warning event so the operator/UI is aware.
+                if let Some(ref tx) = self.event_sender {
+                    let _ = tx.send(crate::events::RuntimeEvent::Warning {
+                        code: "DM_TEXT_ONLY_RETRY".to_string(),
+                        message: "Agent responded with text only in a DM session. \
+                                  Text responses are not delivered — retrying with \
+                                  instructions to use send_message or ignore_message."
+                            .to_string(),
+                        source_agent: None,
+                    });
+                }
+
+                // Push the agent's text response as an assistant message so
+                // the LLM sees what it said, then append the error as a user
+                // message so it knows what went wrong.
+                if let Some(ref text) = content
+                    && !text.is_empty()
+                {
+                    messages.push(LlmMessage {
+                        role: "assistant".to_string(),
+                        content: Some(text.clone()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
+                messages.push(LlmMessage::user(DM_TEXT_ONLY_RETRY_MSG));
+
+                // Re-inject the DM addendum into the system prompt so the
+                // agent is reminded of the tool requirement.
+                self.rebuild_system_prompt_for_tool_loop(&mut messages, include_user, dm_peer);
+
+                continue;
+            }
+
+            // If this is a DM run and the retry was exhausted without the
+            // agent calling send_message/ignore_message, the text response
+            // will be silently dropped by finish_run. Emit a warning so
+            // the operator has visibility into the failure.
+            if is_dm
+                && !dm_tool_was_called(&tool_call_records)
+                && dm_text_only_retries >= DM_TEXT_ONLY_MAX_RETRIES
+            {
+                warn!(
+                    agent_id = %self.agent_id.0,
+                    retries = dm_text_only_retries,
+                    "DM text-only retry exhausted — response will be dropped"
+                );
+                if let Some(ref tx) = self.event_sender {
+                    let _ = tx.send(crate::events::RuntimeEvent::Warning {
+                        code: "DM_TEXT_ONLY_DROPPED".to_string(),
+                        message: "Agent failed to use send_message or ignore_message \
+                                  after retry. The text-only response has been dropped."
+                            .to_string(),
+                        source_agent: None,
+                    });
+                }
             }
 
             return (
@@ -1705,6 +1805,52 @@ pub(crate) fn should_terminate_on_ignore(tool_calls: &[ToolCall], dm_conflict: b
         && tool_calls
             .iter()
             .any(|tc| tc.function.name == IGNORE_MESSAGE_TOOL)
+}
+
+/// Maximum number of times the agent loop will retry when a DM-triggered
+/// run ends with a text-only response (no `send_message` / `ignore_message`).
+const DM_TEXT_ONLY_MAX_RETRIES: u32 = 1;
+
+/// Error message injected into the conversation when the agent responds
+/// with text only in a DM session instead of using `send_message` or
+/// `ignore_message`.
+const DM_TEXT_ONLY_RETRY_MSG: &str = "ERROR: Your text-only response was NOT delivered to the other agent. \
+     In a direct message conversation you MUST use either the `send_message` tool \
+     to reply or the `ignore_message` tool to explicitly decline. \
+     Plain text responses are discarded. Please try again using the correct tool.";
+
+/// Check whether `send_message` or `ignore_message` was **successfully**
+/// called at any point during the run by inspecting the accumulated tool
+/// call records.
+///
+/// A DM tool is only counted as "called" if:
+/// 1. An `Assistant`-role record exists for `send_message` or `ignore_message`, AND
+/// 2. A corresponding `Tool`-role result record (matched by `tool_id`) exists
+///    whose result does NOT contain the DM conflict error message.
+///
+/// This prevents a false positive when both tools appear in a conflict
+/// batch (PR #365) — both are blocked and receive error results, but
+/// the function must return `false` so the text-only retry (PR #369)
+/// can trigger on the next iteration.
+pub(crate) fn dm_tool_was_called(records: &[alms_core::ToolCallRecord]) -> bool {
+    records.iter().any(|r| {
+        r.role == alms_core::ToolCallRole::Assistant
+            && r.tool_name
+                .as_deref()
+                .is_some_and(|n| n == SEND_MESSAGE_TOOL || n == IGNORE_MESSAGE_TOOL)
+            && r.tool_id.as_ref().is_some_and(|call_id| {
+                // Find the matching Tool-role result record and verify it
+                // was not a conflict-blocked error.
+                records.iter().any(|result| {
+                    result.role == alms_core::ToolCallRole::Tool
+                        && result.tool_id.as_deref() == Some(call_id.as_str())
+                        && !result
+                            .result
+                            .as_deref()
+                            .is_some_and(|res| res.contains(DM_CONFLICT_MSG))
+                })
+            })
+    })
 }
 
 #[cfg(test)]
@@ -2596,14 +2742,11 @@ mod tests {
         });
         let include_user = AgentRuntime::is_user_facing_context(dm_context);
 
-        let combined = format!(
-            "{}\n\n{}",
-            runtime.config.system_prompt, runtime.config.prompts.tool_loop
-        );
-        let mut tool_loop_prompt = runtime.assemble_system_prompt(&combined, include_user);
-        if let Some(peer) = dm_peer {
-            tool_loop_prompt.push_str(&AgentRuntime::dm_addendum(peer));
-        }
+        // Use the extracted helper (rebuild_system_prompt_for_tool_loop) —
+        // mirrors the exact code path in agent_loop.
+        let mut messages = vec![LlmMessage::system(initial_system.to_string())];
+        runtime.rebuild_system_prompt_for_tool_loop(&mut messages, include_user, dm_peer);
+        let tool_loop_prompt = messages[0].content.as_deref().unwrap_or("");
 
         // The rebuilt system prompt must still contain the DM addendum.
         assert!(
@@ -2809,5 +2952,264 @@ mod tests {
         assert!(!check.conflict);
         assert!(check.conflicting_tools.is_empty());
         assert!(!should_terminate_on_ignore(&tool_calls, check.conflict));
+    }
+
+    // ---- dm_tool_was_called tests (#361) ----
+
+    /// Returns false when no tool call records exist.
+    #[test]
+    fn test_dm_tool_was_called_empty_records() {
+        assert!(
+            !dm_tool_was_called(&[]),
+            "No records should mean no DM tool was called"
+        );
+    }
+
+    /// Returns false when only non-DM tools were called.
+    #[test]
+    fn test_dm_tool_was_called_only_non_dm_tools() {
+        let records = vec![
+            alms_core::ToolCallRecord {
+                seq: 0,
+                role: alms_core::ToolCallRole::Assistant,
+                tool_name: Some("echo".to_string()),
+                tool_id: Some("tc_echo".to_string()),
+                params: Some(r#"{"message":"hi"}"#.to_string()),
+                result: None,
+                timestamp: chrono::Utc::now(),
+            },
+            alms_core::ToolCallRecord {
+                seq: 1,
+                role: alms_core::ToolCallRole::Tool,
+                tool_name: Some("echo".to_string()),
+                tool_id: Some("tc_echo".to_string()),
+                params: None,
+                result: Some(r#"{"output":"hi"}"#.to_string()),
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+        assert!(
+            !dm_tool_was_called(&records),
+            "echo tool should not count as a DM tool"
+        );
+    }
+
+    /// Returns true when send_message was called and succeeded.
+    #[test]
+    fn test_dm_tool_was_called_send_message() {
+        let records = vec![
+            alms_core::ToolCallRecord {
+                seq: 0,
+                role: alms_core::ToolCallRole::Assistant,
+                tool_name: Some("send_message".to_string()),
+                tool_id: Some("tc_send".to_string()),
+                params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
+                result: None,
+                timestamp: chrono::Utc::now(),
+            },
+            alms_core::ToolCallRecord {
+                seq: 1,
+                role: alms_core::ToolCallRole::Tool,
+                tool_name: Some("send_message".to_string()),
+                tool_id: Some("tc_send".to_string()),
+                params: None,
+                result: Some(r#"{"ok":true}"#.to_string()),
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+        assert!(
+            dm_tool_was_called(&records),
+            "send_message should be detected"
+        );
+    }
+
+    /// Returns true when ignore_message was called and succeeded.
+    #[test]
+    fn test_dm_tool_was_called_ignore_message() {
+        let records = vec![
+            alms_core::ToolCallRecord {
+                seq: 0,
+                role: alms_core::ToolCallRole::Assistant,
+                tool_name: Some("ignore_message".to_string()),
+                tool_id: Some("tc_ignore".to_string()),
+                params: Some(r#"{"reason":"not relevant"}"#.to_string()),
+                result: None,
+                timestamp: chrono::Utc::now(),
+            },
+            alms_core::ToolCallRecord {
+                seq: 1,
+                role: alms_core::ToolCallRole::Tool,
+                tool_name: Some("ignore_message".to_string()),
+                tool_id: Some("tc_ignore".to_string()),
+                params: None,
+                result: Some(r#"{"ok":true}"#.to_string()),
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+        assert!(
+            dm_tool_was_called(&records),
+            "ignore_message should be detected"
+        );
+    }
+
+    /// Only checks Assistant-role records paired with Tool-role results
+    /// (not Tool-role results alone).
+    #[test]
+    fn test_dm_tool_was_called_ignores_tool_role_only() {
+        let records = vec![alms_core::ToolCallRecord {
+            seq: 0,
+            role: alms_core::ToolCallRole::Tool,
+            tool_name: Some("send_message".to_string()),
+            tool_id: Some("tc_send".to_string()),
+            params: None,
+            result: Some(r#"{"ok":true}"#.to_string()),
+            timestamp: chrono::Utc::now(),
+        }];
+        assert!(
+            !dm_tool_was_called(&records),
+            "Tool-role records alone should not count — need an Assistant-role call too"
+        );
+    }
+
+    /// Returns false when send_message has an Assistant record but no
+    /// corresponding Tool result (tool never executed).
+    #[test]
+    fn test_dm_tool_was_called_no_tool_result() {
+        let records = vec![alms_core::ToolCallRecord {
+            seq: 0,
+            role: alms_core::ToolCallRole::Assistant,
+            tool_name: Some("send_message".to_string()),
+            tool_id: Some("tc_send".to_string()),
+            params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
+            result: None,
+            timestamp: chrono::Utc::now(),
+        }];
+        assert!(
+            !dm_tool_was_called(&records),
+            "Assistant record without Tool result should not count"
+        );
+    }
+
+    /// Returns false when both send_message and ignore_message were
+    /// recorded as Assistant calls but both received DM conflict error
+    /// results (neither actually executed). This is the critical scenario
+    /// from PR #365 + #369 interaction.
+    #[test]
+    fn test_dm_tool_was_called_conflict_batch_false_positive() {
+        let conflict_error = format!("Error: {}", DM_CONFLICT_MSG);
+        let records = vec![
+            // Assistant records for both tools (recorded before conflict check)
+            alms_core::ToolCallRecord {
+                seq: 0,
+                role: alms_core::ToolCallRole::Assistant,
+                tool_name: Some("send_message".to_string()),
+                tool_id: Some("tc_send".to_string()),
+                params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
+                result: None,
+                timestamp: chrono::Utc::now(),
+            },
+            alms_core::ToolCallRecord {
+                seq: 1,
+                role: alms_core::ToolCallRole::Assistant,
+                tool_name: Some("ignore_message".to_string()),
+                tool_id: Some("tc_ignore".to_string()),
+                params: Some(r#"{"reason":"spam"}"#.to_string()),
+                result: None,
+                timestamp: chrono::Utc::now(),
+            },
+            // Tool results for both — both contain the conflict error
+            alms_core::ToolCallRecord {
+                seq: 2,
+                role: alms_core::ToolCallRole::Tool,
+                tool_name: Some("send_message".to_string()),
+                tool_id: Some("tc_send".to_string()),
+                params: None,
+                result: Some(conflict_error.clone()),
+                timestamp: chrono::Utc::now(),
+            },
+            alms_core::ToolCallRecord {
+                seq: 3,
+                role: alms_core::ToolCallRole::Tool,
+                tool_name: Some("ignore_message".to_string()),
+                tool_id: Some("tc_ignore".to_string()),
+                params: None,
+                result: Some(conflict_error),
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+        assert!(
+            !dm_tool_was_called(&records),
+            "Conflict-blocked tool calls should not count as successfully called — \
+             the DM text-only retry must still trigger"
+        );
+    }
+
+    /// Returns true when send_message was conflict-blocked but then
+    /// succeeded on a subsequent attempt (second batch after conflict).
+    #[test]
+    fn test_dm_tool_was_called_conflict_then_success() {
+        let conflict_error = format!("Error: {}", DM_CONFLICT_MSG);
+        let records = vec![
+            // First batch: conflict — both tools blocked
+            alms_core::ToolCallRecord {
+                seq: 0,
+                role: alms_core::ToolCallRole::Assistant,
+                tool_name: Some("send_message".to_string()),
+                tool_id: Some("tc_send_1".to_string()),
+                params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
+                result: None,
+                timestamp: chrono::Utc::now(),
+            },
+            alms_core::ToolCallRecord {
+                seq: 1,
+                role: alms_core::ToolCallRole::Assistant,
+                tool_name: Some("ignore_message".to_string()),
+                tool_id: Some("tc_ignore_1".to_string()),
+                params: Some(r#"{"reason":"spam"}"#.to_string()),
+                result: None,
+                timestamp: chrono::Utc::now(),
+            },
+            alms_core::ToolCallRecord {
+                seq: 2,
+                role: alms_core::ToolCallRole::Tool,
+                tool_name: Some("send_message".to_string()),
+                tool_id: Some("tc_send_1".to_string()),
+                params: None,
+                result: Some(conflict_error.clone()),
+                timestamp: chrono::Utc::now(),
+            },
+            alms_core::ToolCallRecord {
+                seq: 3,
+                role: alms_core::ToolCallRole::Tool,
+                tool_name: Some("ignore_message".to_string()),
+                tool_id: Some("tc_ignore_1".to_string()),
+                params: None,
+                result: Some(conflict_error),
+                timestamp: chrono::Utc::now(),
+            },
+            // Second batch: LLM picked just send_message — succeeds
+            alms_core::ToolCallRecord {
+                seq: 4,
+                role: alms_core::ToolCallRole::Assistant,
+                tool_name: Some("send_message".to_string()),
+                tool_id: Some("tc_send_2".to_string()),
+                params: Some(r#"{"to":"alice","message":"hello"}"#.to_string()),
+                result: None,
+                timestamp: chrono::Utc::now(),
+            },
+            alms_core::ToolCallRecord {
+                seq: 5,
+                role: alms_core::ToolCallRole::Tool,
+                tool_name: Some("send_message".to_string()),
+                tool_id: Some("tc_send_2".to_string()),
+                params: None,
+                result: Some(r#"{"ok":true}"#.to_string()),
+                timestamp: chrono::Utc::now(),
+            },
+        ];
+        assert!(
+            dm_tool_was_called(&records),
+            "After conflict resolution, a successful send_message should be detected"
+        );
     }
 }

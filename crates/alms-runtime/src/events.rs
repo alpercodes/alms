@@ -72,6 +72,18 @@ pub enum RuntimeEvent {
         /// When set, this approval originated from a subagent.
         source_agent: Option<String>,
     },
+    /// A non-fatal warning condition during the run.
+    ///
+    /// The gateway converts this to a `run_warning` SSE event so the
+    /// operator/UI is informed. The run continues after the warning.
+    Warning {
+        /// Machine-readable warning code (e.g. `DM_TEXT_ONLY_RETRY`).
+        code: String,
+        /// Human-readable warning message.
+        message: String,
+        /// When set, this warning originated from a subagent (not the parent).
+        source_agent: Option<String>,
+    },
 }
 
 /// Sender half of the runtime event channel.
@@ -191,6 +203,30 @@ mod tests {
         let second = rx.recv().await.unwrap();
         assert!(
             matches!(&second, RuntimeEvent::Status { phase, detail } if phase == PHASE_EXECUTING_TOOLS && detail.as_deref() == Some("shell_exec"))
+        );
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_warning_event_roundtrip() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+
+        tx.send(RuntimeEvent::Warning {
+            code: "DM_TEXT_ONLY_RETRY".to_string(),
+            message: "Agent responded with text only in DM — retrying".to_string(),
+            source_agent: None,
+        })
+        .unwrap();
+
+        drop(tx);
+
+        let event = rx.recv().await.unwrap();
+        assert!(
+            matches!(&event, RuntimeEvent::Warning { code, message, source_agent }
+                if code == "DM_TEXT_ONLY_RETRY"
+                && message.contains("text only")
+                && source_agent.is_none())
         );
 
         assert!(rx.recv().await.is_none());

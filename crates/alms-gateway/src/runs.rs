@@ -765,6 +765,7 @@ async fn execute_run(state: AppState, params: RunParams) {
                             run_id,
                             "MAX_ITERATIONS",
                             "Max iterations reached — the agent hit its iteration limit before finishing. You can continue the conversation to pick up where it left off.",
+                            None,
                         ),
                     )
                     .await;
@@ -1449,6 +1450,19 @@ async fn forward_runtime_events(
                             request,
                             source_agent,
                         ),
+                    )
+                    .await;
+            }
+            RuntimeEvent::Warning {
+                code,
+                message,
+                source_agent,
+            } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_warning(run_id, &code, &message, source_agent),
                     )
                     .await;
             }
