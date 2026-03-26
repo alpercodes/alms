@@ -18,13 +18,16 @@ mod audit;
 mod jobs;
 mod messages;
 mod runs;
+mod session_summaries;
 mod sessions;
 mod summaries;
 #[cfg(test)]
 mod test_helpers;
 mod tool_calls;
 
-use crate::types::{Content, ContextSummary, Message, Role, Session, SessionStatus};
+use crate::types::{
+    Content, ContextSummary, Message, Role, Session, SessionStatus, SessionSummary,
+};
 use alms_core::job::{Job, JobId, JobSchedule, JobStatus};
 use alms_core::registry::AgentRecord;
 use alms_core::run::{Run, RunStatus, TokenUsage, ToolCallRecord, ToolCallRole};
@@ -141,6 +144,18 @@ CREATE TABLE IF NOT EXISTS run_tool_calls (
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run ON run_tool_calls(run_id, seq);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    agent_id    TEXT NOT NULL,
+    session_id  TEXT NOT NULL REFERENCES sessions(id),
+    summary     TEXT NOT NULL DEFAULT '',
+    last_run_id TEXT,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (agent_id, session_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_session_summaries_agent
+    ON session_summaries(agent_id, updated_at DESC);
 ";
 
 // ---------------------------------------------------------------------------
@@ -201,6 +216,19 @@ impl SqliteStore {
              ); \
              CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run \
                  ON run_tool_calls(run_id, seq);",
+        );
+        // Auto-migrate: add session_summaries table for cross-session episodic memory.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_summaries (\
+                 agent_id    TEXT NOT NULL, \
+                 session_id  TEXT NOT NULL REFERENCES sessions(id), \
+                 summary     TEXT NOT NULL DEFAULT '', \
+                 last_run_id TEXT, \
+                 updated_at  TEXT NOT NULL, \
+                 PRIMARY KEY (agent_id, session_id)\
+             ); \
+             CREATE INDEX IF NOT EXISTS idx_session_summaries_agent \
+                 ON session_summaries(agent_id, updated_at DESC);",
         );
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

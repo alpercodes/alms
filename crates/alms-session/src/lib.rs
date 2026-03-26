@@ -7,9 +7,11 @@ pub use alms_core::AuditEvent;
 pub use job_store::JobStore;
 pub use sqlite::SqliteStore;
 pub use store::{MemoryStore, SessionStore};
-pub use types::{Content, ContextSummary, Message, Role, Session, SessionConfig, SessionStatus};
+pub use types::{
+    Content, ContextSummary, Message, Role, Session, SessionConfig, SessionStatus, SessionSummary,
+};
 
-use alms_core::{AgentId, AlmsResult, SessionId};
+use alms_core::{AgentId, AlmsResult, RunId, SessionId};
 use dashmap::DashMap;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -397,6 +399,71 @@ impl SessionManager {
         Ok(())
     }
 
+    // -- Episodic session summaries (cross-session memory) --------------------
+
+    /// Insert or update the episodic summary for a `(agent_id, session_id)` pair.
+    ///
+    /// No-op (with a warning) when no SQLite store is configured.
+    pub fn upsert_session_summary(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+        summary_text: &str,
+        run_id: Option<RunId>,
+    ) -> AlmsResult<()> {
+        if let Some(store) = &self.store {
+            store.upsert_session_summary(agent_id, session_id, summary_text, run_id)?;
+        } else {
+            warn!("upsert_session_summary called without SQLite store -- skipping");
+        }
+        Ok(())
+    }
+
+    /// Load all episodic summaries for an agent, ordered by `updated_at DESC`,
+    /// up to `limit`.
+    ///
+    /// Returns an empty vec when no SQLite store is configured.
+    pub fn load_session_summaries(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+    ) -> AlmsResult<Vec<SessionSummary>> {
+        if let Some(store) = &self.store {
+            store.load_session_summaries(agent_id, limit)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Load a single episodic summary by `(agent_id, session_id)`.
+    ///
+    /// Returns `None` when no SQLite store is configured.
+    pub fn load_session_summary(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> AlmsResult<Option<SessionSummary>> {
+        if let Some(store) = &self.store {
+            store.load_session_summary(agent_id, session_id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Delete the episodic summary for a `(agent_id, session_id)` pair.
+    ///
+    /// No-op when no SQLite store is configured.
+    pub fn delete_session_summary(
+        &self,
+        agent_id: AgentId,
+        session_id: SessionId,
+    ) -> AlmsResult<()> {
+        if let Some(store) = &self.store {
+            store.delete_session_summary(agent_id, session_id)?;
+        }
+        Ok(())
+    }
+
     /// Get config
     pub fn config(&self) -> &SessionConfig {
         &self.config
@@ -476,6 +543,60 @@ mod tests {
         let store = mgr.store.as_ref().unwrap();
         let reloaded = store.load_all_sessions().unwrap();
         assert_eq!(reloaded[0].status, SessionStatus::Idle);
+    }
+
+    #[test]
+    fn test_session_summary_delegation_roundtrip() {
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+        let session = mgr.get_or_create(agent_id, "ctx-summary");
+
+        let run_id = alms_core::RunId::new();
+        mgr.upsert_session_summary(agent_id, session.id, "Debugged CORS headers.", Some(run_id))
+            .unwrap();
+
+        // Single lookup
+        let loaded = mgr
+            .load_session_summary(agent_id, session.id)
+            .unwrap()
+            .expect("summary should exist");
+        assert_eq!(loaded.summary, "Debugged CORS headers.");
+        assert_eq!(loaded.last_run_id, Some(run_id));
+
+        // Batch load
+        let all = mgr.load_session_summaries(agent_id, 10).unwrap();
+        assert_eq!(all.len(), 1);
+
+        // Delete
+        mgr.delete_session_summary(agent_id, session.id).unwrap();
+        assert!(
+            mgr.load_session_summary(agent_id, session.id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_session_summary_no_store_graceful() {
+        // Without a SQLite store, delegation methods should succeed gracefully.
+        let mgr = SessionManager::new(SessionConfig::default());
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+
+        // upsert is a no-op
+        mgr.upsert_session_summary(agent_id, session_id, "test", None)
+            .unwrap();
+
+        // load returns empty / None
+        assert!(mgr.load_session_summaries(agent_id, 10).unwrap().is_empty());
+        assert!(
+            mgr.load_session_summary(agent_id, session_id)
+                .unwrap()
+                .is_none()
+        );
+
+        // delete is a no-op
+        mgr.delete_session_summary(agent_id, session_id).unwrap();
     }
 
     #[test]

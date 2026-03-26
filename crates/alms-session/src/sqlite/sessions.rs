@@ -38,6 +38,11 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite begin delete_session: {e}")))?;
         // Delete dependent rows first (foreign key order)
         tx.execute(
+            "DELETE FROM session_summaries WHERE session_id = ?1",
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete session_summaries: {e}")))?;
+        tx.execute(
             "DELETE FROM context_summaries WHERE session_id = ?1",
             params![&id_str],
         )
@@ -411,6 +416,49 @@ mod tests {
         // Second call should migrate zero (already in new format)
         let second = store.migrate_telegram_context_ids("main").unwrap();
         assert_eq!(second, 0);
+    }
+
+    #[test]
+    fn test_delete_session_cascades_session_summaries() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        // Create a session summary for this session.
+        store
+            .upsert_session_summary(session.agent_id, session.id, "summary to be cascaded", None)
+            .unwrap();
+        assert!(
+            store
+                .load_session_summary(session.agent_id, session.id)
+                .unwrap()
+                .is_some()
+        );
+
+        // A second session + summary that should NOT be deleted.
+        let other = Session::new(AgentId::new(), "ctx-other");
+        store.save_session(&other).unwrap();
+        store
+            .upsert_session_summary(other.agent_id, other.id, "other summary", None)
+            .unwrap();
+
+        store.delete_session(session.id).unwrap();
+
+        // The deleted session's summary is gone.
+        assert!(
+            store
+                .load_session_summary(session.agent_id, session.id)
+                .unwrap()
+                .is_none()
+        );
+
+        // The other session's summary is untouched.
+        assert!(
+            store
+                .load_session_summary(other.agent_id, other.id)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
