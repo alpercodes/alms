@@ -1452,6 +1452,15 @@ async fn forward_runtime_events(
                     )
                     .await;
             }
+            RuntimeEvent::Warning { code, message } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::run_warning(run_id, &code, &message),
+                    )
+                    .await;
+            }
         }
     }
 }
