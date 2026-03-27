@@ -405,6 +405,78 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
 }
 
 // ---------------------------------------------------------------------------
+// Context injection formatting
+// ---------------------------------------------------------------------------
+
+use crate::context::estimate_tokens;
+use alms_session::SessionSummary;
+
+/// Format a list of [`SessionSummary`] records into the episodic injection
+/// string, respecting a token budget.
+///
+/// Summaries are expected to arrive in `updated_at DESC` order (most recent
+/// first).  This function preserves that order so the most recently active
+/// session appears closest to the current conversation in the context window,
+/// giving it the strongest LLM recency bias.
+///
+/// When the formatted summaries would exceed `budget_tokens`, the oldest
+/// summaries (at the end of the list) are dropped first.  If even the header
+/// alone exceeds the budget, `None` is returned.
+///
+/// Returns `None` when `summaries` is empty or all summaries are empty strings.
+pub fn format_episodic_for_injection(
+    summaries: &[SessionSummary],
+    budget_tokens: usize,
+) -> Option<String> {
+    if summaries.is_empty() || budget_tokens == 0 {
+        return None;
+    }
+
+    let header = "[Your conversation history across sessions — most recent first]\n";
+    let header_tokens = estimate_tokens(header);
+    if header_tokens >= budget_tokens {
+        return None;
+    }
+
+    let mut remaining = budget_tokens - header_tokens;
+    let mut entries: Vec<String> = Vec::new();
+
+    for summary in summaries {
+        if summary.summary.is_empty() {
+            continue;
+        }
+
+        // Format: **Session: <source_label> (last active: <date>)**\n<summary>
+        let updated = summary.updated_at.0.format("%Y-%m-%d %H:%M UTC");
+        // Derive a label from context_id if we could, but SessionSummary
+        // doesn't carry context_id.  Use a generic label.
+        let entry = format!(
+            "\n**Session (last active: {updated})**\n{}",
+            summary.summary
+        );
+
+        let entry_tokens = estimate_tokens(&entry);
+        if entry_tokens > remaining {
+            // Budget exhausted -- stop adding entries.
+            break;
+        }
+        remaining -= entry_tokens;
+        entries.push(entry);
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    let mut result = String::from(header);
+    for entry in &entries {
+        result.push_str(entry);
+    }
+
+    Some(result)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -748,5 +820,97 @@ mod tests {
                 "Expected None for context_id={ctx}"
             );
         }
+    }
+
+    // -- format_episodic_for_injection ----------------------------------------
+
+    use alms_core::Timestamp;
+    use alms_session::SessionSummary;
+
+    fn make_summary(summary: &str, minutes_ago: i64) -> SessionSummary {
+        let ts = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
+        SessionSummary {
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            summary: summary.to_string(),
+            last_run_id: None,
+            updated_at: Timestamp(ts),
+        }
+    }
+
+    #[test]
+    fn test_format_episodic_empty_input() {
+        assert!(format_episodic_for_injection(&[], 1000).is_none());
+    }
+
+    #[test]
+    fn test_format_episodic_zero_budget() {
+        let summaries = vec![make_summary("Hello world", 5)];
+        assert!(format_episodic_for_injection(&summaries, 0).is_none());
+    }
+
+    #[test]
+    fn test_format_episodic_single_summary() {
+        let summaries = vec![make_summary("Debugged CORS issue in gateway.rs.", 10)];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        assert!(result.starts_with("[Your conversation history across sessions"));
+        assert!(result.contains("Debugged CORS issue"));
+        assert!(result.contains("**Session (last active:"));
+    }
+
+    #[test]
+    fn test_format_episodic_multiple_summaries_preserves_order() {
+        let summaries = vec![
+            make_summary("Most recent session activity.", 5),
+            make_summary("Older session activity.", 60),
+        ];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        // Most recent should appear before older in the string
+        let pos_recent = result.find("Most recent").unwrap();
+        let pos_older = result.find("Older session").unwrap();
+        assert!(
+            pos_recent < pos_older,
+            "Most recent summary should appear first in the output"
+        );
+    }
+
+    #[test]
+    fn test_format_episodic_budget_trims_oldest() {
+        // Create summaries where fitting all of them would exceed a small budget.
+        let summaries = vec![
+            make_summary("Summary A with some text.", 5),
+            make_summary("Summary B with some text.", 10),
+            make_summary("Summary C with some text.", 15),
+        ];
+        // Each summary entry is roughly: "\n**Session (last active: ...)**\n<text>"
+        // which is about 70-80 chars => ~25 tokens.  Header is ~20 tokens.
+        // Budget of 70 should fit header + 1-2 entries but not all 3.
+        let result = format_episodic_for_injection(&summaries, 70).unwrap();
+        assert!(result.contains("Summary A"), "Newest must be included");
+        // Oldest (C) should be dropped
+        assert!(
+            !result.contains("Summary C"),
+            "Oldest summary should be dropped when budget is tight"
+        );
+    }
+
+    #[test]
+    fn test_format_episodic_skips_empty_summaries() {
+        let summaries = vec![
+            make_summary("", 5),
+            make_summary("Real summary here.", 10),
+            make_summary("", 15),
+        ];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        assert!(result.contains("Real summary here."));
+        // Only the header and one entry -- no blank entries
+        let session_count = result.matches("**Session").count();
+        assert_eq!(session_count, 1, "Only non-empty summaries should appear");
+    }
+
+    #[test]
+    fn test_format_episodic_all_empty_returns_none() {
+        let summaries = vec![make_summary("", 5), make_summary("", 10)];
+        assert!(format_episodic_for_injection(&summaries, 5000).is_none());
     }
 }

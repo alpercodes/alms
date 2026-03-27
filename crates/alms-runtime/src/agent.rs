@@ -11,7 +11,7 @@ use crate::read_subagent_session_tool::ReadSubagentSessionTool;
 use crate::tools::ToolRegistry;
 use crate::workspace::AgentWorkspace;
 use crate::workspace_tool::WorkspaceWriteTool;
-use alms_core::config::ContextConfig;
+use alms_core::config::{ContextConfig, RunSummaryMode};
 use alms_core::{
     AgentId, AlmsError, AlmsResult, AuditDecision, AuditEvent, MAX_ITERATIONS_SENTINEL, TokenUsage,
 };
@@ -829,6 +829,16 @@ impl AgentRuntime {
                 None
             };
 
+        // Load episodic summaries from other sessions when enabled.
+        // This gives the agent cross-session awareness — it can see what it was
+        // doing in other conversations without re-reading full transcripts.
+        let episodic_text: Option<String> =
+            if self.config.context_config.run_summary_mode != RunSummaryMode::Off {
+                self.load_episodic_summaries(session_manager, session_id)
+            } else {
+                None
+            };
+
         let builder = ContextBuilder::new(self.config.context_config.clone());
 
         // For DM sessions, apply perspective mapping so the LLM sees its own
@@ -858,7 +868,48 @@ impl AgentRuntime {
             input,
             summary_text.as_deref(),
             perspective,
+            episodic_text.as_deref(),
         ))
+    }
+
+    /// Load episodic summaries from other sessions and format them for
+    /// injection into the context window.
+    ///
+    /// Returns `None` when no summaries are available, the feature is off,
+    /// or no SQLite store is configured.
+    fn load_episodic_summaries(
+        &self,
+        session_manager: &SessionManager,
+        current_session_id: &alms_core::SessionId,
+    ) -> Option<String> {
+        // Use a generous DB limit — budget trimming happens in the formatter.
+        const DB_LIMIT: usize = 50;
+
+        let summaries = match session_manager.load_session_summaries(
+            self.agent_id,
+            DB_LIMIT,
+            Some(current_session_id),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to load episodic summaries: {e}");
+                return None;
+            }
+        };
+
+        if summaries.is_empty() {
+            return None;
+        }
+
+        let budget = self.config.context_config.run_summary_budget;
+
+        debug!(
+            summary_count = summaries.len(),
+            budget_tokens = budget,
+            "Formatting episodic summaries for injection"
+        );
+
+        crate::episodic::format_episodic_for_injection(&summaries, budget)
     }
 
     /// Check whether history has grown past the summarization threshold and, if so,
