@@ -23,15 +23,21 @@ use alms_core::{AgentId, RunId, SessionId};
 use alms_session::SessionManager;
 use tracing::{debug, error, info, instrument, warn};
 
-/// Maximum character length for the heuristic input snippet.
-const HEURISTIC_INPUT_CHARS: usize = 120;
+/// Maximum byte length for the heuristic input snippet.
+///
+/// This is a byte budget, not a character count.  For ASCII text the two are
+/// equivalent; multi-byte UTF-8 sequences may result in fewer characters.
+/// `truncate_to_char_boundary` ensures we never split mid-codepoint.
+const HEURISTIC_INPUT_BYTES: usize = 120;
 
-/// Maximum total character length for accumulated heuristic summaries.
+/// Maximum total byte length for accumulated heuristic summaries.
 /// Oldest entries are trimmed when the total exceeds this.
-const HEURISTIC_MAX_TOTAL_CHARS: usize = 500;
+const HEURISTIC_MAX_TOTAL_BYTES: usize = 500;
 
-/// Maximum character length for run input/output sent to the LLM summarizer.
-const LLM_CONTEXT_CHARS: usize = 2000;
+/// Maximum byte length for run input/output sent to the LLM summarizer.
+///
+/// Same byte-budget caveat as [`HEURISTIC_INPUT_BYTES`].
+const LLM_CONTEXT_BYTES: usize = 2000;
 
 /// Maximum output tokens for the LLM summarizer call.
 const LLM_MAX_OUTPUT_TOKENS: u32 = 150;
@@ -76,7 +82,8 @@ pub fn derive_source_label(context_id: &str) -> Option<SourceLabel> {
     // Job sessions: "job_{jobid}"
     if let Some(job_part) = context_id.strip_prefix("job_") {
         let label = if job_part.len() > 40 {
-            format!("Scheduled job: {}...", &job_part[..37])
+            let truncated = truncate_to_char_boundary(job_part, 37);
+            format!("Scheduled job: {truncated}...")
         } else {
             format!("Scheduled job: {job_part}")
         };
@@ -156,6 +163,13 @@ pub struct PersistSummaryRequest {
 /// Called from the gateway after a successful run.  Loads the existing summary
 /// (if any), generates a new one, and upserts it to the database.  All errors
 /// are logged and swallowed -- summary failure must never fail the run.
+///
+/// **Known race condition:** Two concurrent runs for the same session can both
+/// load the same base summary, generate independently, and the last writer
+/// wins -- one update is silently lost.  This mirrors the existing within-run
+/// rolling-summary race and is acceptable for MVP because concurrent runs on
+/// the same session are rare.  A future fix could add optimistic locking
+/// (check `last_run_id` before upsert, retry on conflict).
 #[instrument(
     level = "info",
     skip(session_manager, llm, req),
@@ -246,7 +260,7 @@ pub async fn generate_and_persist_summary(
 ///
 /// When an existing summary exists, the new entry is appended on a new line.
 /// The total is trimmed line-by-line (oldest first) to stay under
-/// [`HEURISTIC_MAX_TOTAL_CHARS`].
+/// [`HEURISTIC_MAX_TOTAL_BYTES`].
 fn generate_heuristic(params: &SummaryParams) -> Option<String> {
     if params.run_input.is_empty() {
         return None;
@@ -255,7 +269,7 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
     let source = derive_source_label(&params.context_id)?;
 
     // Build the new entry line.
-    let snippet = truncate_to_char_boundary(&params.run_input, HEURISTIC_INPUT_CHARS);
+    let snippet = truncate_to_char_boundary(&params.run_input, HEURISTIC_INPUT_BYTES);
     let ellipsis = if params.run_input.len() > snippet.len() {
         "..."
     } else {
@@ -272,7 +286,7 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
     };
 
     // Trim oldest lines to keep total under the cap.
-    Some(trim_oldest_lines(&combined, HEURISTIC_MAX_TOTAL_CHARS))
+    Some(trim_oldest_lines(&combined, HEURISTIC_MAX_TOTAL_BYTES))
 }
 
 /// Trim a multi-line string by removing the oldest (first) lines until total
@@ -336,7 +350,7 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
     }
 
     // Truncated run input.
-    let input_snippet = truncate_to_char_boundary(&params.run_input, LLM_CONTEXT_CHARS);
+    let input_snippet = truncate_to_char_boundary(&params.run_input, LLM_CONTEXT_BYTES);
     user_content.push_str("User input:\n");
     user_content.push_str(input_snippet);
     if params.run_input.len() > input_snippet.len() {
@@ -345,7 +359,7 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
 
     // Truncated run output.
     if !params.run_output.is_empty() {
-        let output_snippet = truncate_to_char_boundary(&params.run_output, LLM_CONTEXT_CHARS);
+        let output_snippet = truncate_to_char_boundary(&params.run_output, LLM_CONTEXT_BYTES);
         user_content.push_str("\n\nAgent response:\n");
         user_content.push_str(output_snippet);
         if params.run_output.len() > output_snippet.len() {
@@ -521,10 +535,29 @@ mod tests {
             Some(&existing),
         );
         let result = generate_heuristic(&params).unwrap();
-        // Result must be within budget
-        assert!(result.len() <= HEURISTIC_MAX_TOTAL_CHARS + 100); // small slack for last kept line
+
+        // trim_oldest_lines keeps lines from the end until the next line would
+        // exceed the budget, with the guarantee that at least the last line is
+        // always kept.  Therefore either:
+        //   (a) the result fits within the budget, or
+        //   (b) the result is exactly one line (the newest) which exceeds the
+        //       budget by itself.
+        let line_count = result.lines().count();
+        if line_count > 1 {
+            assert!(
+                result.len() <= HEURISTIC_MAX_TOTAL_BYTES,
+                "Multi-line result ({} bytes) should fit within budget ({})",
+                result.len(),
+                HEURISTIC_MAX_TOTAL_BYTES,
+            );
+        }
         // Must contain the newest entry
         assert!(result.contains("New question after many old ones"));
+        // Must have trimmed at least some old entries (we started with 10).
+        assert!(
+            line_count < 11,
+            "Expected some old entries trimmed, got {line_count} lines"
+        );
     }
 
     #[test]
