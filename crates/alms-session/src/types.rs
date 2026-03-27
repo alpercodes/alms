@@ -1,4 +1,26 @@
-use alms_core::{AgentId, SessionId, Timestamp};
+use alms_core::{AgentId, RunId, SessionId, Timestamp};
+
+/// Per-session episodic summary for cross-session memory.
+///
+/// Stores one evolving summary per `(agent_id, session_id)` pair, updated at
+/// run boundaries.  These summaries are injected into the system prompt of
+/// *other* sessions so the agent has cross-session awareness.
+///
+/// Distinct from [`ContextSummary`], which is used for within-session rolling
+/// compression by the `sliding-summary` context strategy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    /// The agent this summary belongs to.
+    pub agent_id: AgentId,
+    /// The session being summarised.
+    pub session_id: SessionId,
+    /// The accumulated summary text.
+    pub summary: String,
+    /// The run that last updated this summary (for debugging / auditing).
+    pub last_run_id: Option<RunId>,
+    /// When this summary was last updated.
+    pub updated_at: Timestamp,
+}
 
 /// Rolling context summary for a session (used by the sliding-summary strategy).
 ///
