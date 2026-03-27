@@ -564,6 +564,11 @@ async fn execute_run(state: AppState, params: RunParams) {
         .clone()
         .or_else(|| Some(llm.default_model().to_string()));
 
+    // S6 fix: clone the per-agent resolved LLM client *before* AgentRuntime::new
+    // consumes it.  The summary task needs the agent's provider/base_url/api_key,
+    // not the server-default `state.llm`.
+    let llm_for_summary = llm.clone();
+
     let mut runtime = match alms_runtime::AgentRuntime::new(agent_id, agent_config, llm) {
         Ok(rt) => rt,
         Err(e) => {
@@ -821,7 +826,7 @@ async fn execute_run(state: AppState, params: RunParams) {
                 (run_input_for_summary, run_output_for_summary)
             {
                 let sm = state.session_manager.clone();
-                let llm_clone = state.llm.clone();
+                let llm_clone = llm_for_summary.clone();
                 let ctx_id = context_id.clone();
                 let run_mgr = state.run_manager.clone();
                 let req = alms_runtime::episodic::PersistSummaryRequest {
