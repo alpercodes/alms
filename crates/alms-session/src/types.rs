@@ -20,6 +20,15 @@ pub struct SessionSummary {
     pub last_run_id: Option<RunId>,
     /// When this summary was last updated.
     pub updated_at: Timestamp,
+    /// Human-readable source label (e.g. "User chat", "Telegram chat").
+    ///
+    /// Derived from the session's `context_id` at summary generation time.
+    /// Used by the episodic injection formatter to produce distinct headers
+    /// like `**User chat (last active: ...)**` instead of generic `**Session ...**`.
+    ///
+    /// `None` indicates an unknown or excluded source — entries with `None`
+    /// are filtered out at injection time as a defense-in-depth measure.
+    pub source_label: Option<String>,
 }
 
 /// Rolling context summary for a session (used by the sliding-summary strategy).

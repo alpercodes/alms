@@ -234,13 +234,14 @@ pub async fn generate_and_persist_summary(
         "Session summary generated"
     );
 
-    // Upsert to database.
+    // Upsert to database (with source label for injection formatting).
     if let Some(store) = session_manager.store() {
         if let Err(e) = store.upsert_session_summary(
             params.agent_id,
             params.session_id,
             &summary_text,
             Some(params.run_id),
+            Some(&source.source_label),
         ) {
             error!("Failed to persist session summary: {e}");
         }
@@ -424,6 +425,17 @@ use alms_session::SessionSummary;
 /// alone exceeds the budget, `None` is returned.
 ///
 /// Returns `None` when `summaries` is empty or all summaries are empty strings.
+///
+/// **Defense-in-depth filtering:** Entries whose `source_label` is `None` are
+/// silently skipped.  Under normal operation DM/subagent sessions never get a
+/// summary row, but this guard prevents manually-inserted or corrupt rows from
+/// leaking into the episodic context.
+///
+/// **Budget contract:** The caller is responsible for ensuring `budget_tokens`
+/// is already clamped to the configured percentage cap (15% of
+/// `max_input_tokens` by default, enforced in
+/// [`ContextConfig::normalize_episodic`]).  This function does not re-enforce
+/// the cap — it trusts the budget it receives.
 pub fn format_episodic_for_injection(
     summaries: &[SessionSummary],
     budget_tokens: usize,
@@ -446,12 +458,19 @@ pub fn format_episodic_for_injection(
             continue;
         }
 
-        // Format: **Session: <source_label> (last active: <date>)**\n<summary>
+        // S2: Defense-in-depth -- skip entries without a source_label.
+        // Under normal operation DM/subagent sessions never get a summary row,
+        // but if one is manually inserted (or exists from before source_label
+        // was added), filtering here prevents it from appearing in the context.
+        let label = match &summary.source_label {
+            Some(l) if !l.is_empty() => l.as_str(),
+            _ => continue,
+        };
+
+        // Format: **<source_label> (last active: <date>)**\n<summary>
         let updated = summary.updated_at.0.format("%Y-%m-%d %H:%M UTC");
-        // Derive a label from context_id if we could, but SessionSummary
-        // doesn't carry context_id.  Use a generic label.
         let entry = format!(
-            "\n**Session (last active: {updated})**\n{}",
+            "\n**{label} (last active: {updated})**\n{}",
             summary.summary
         );
 
@@ -468,7 +487,10 @@ pub fn format_episodic_for_injection(
         return None;
     }
 
-    let mut result = String::from(header);
+    // Pre-allocate: budget_tokens * 3 approximates the char capacity since
+    // estimate_tokens uses chars/3.
+    let mut result = String::with_capacity(budget_tokens * 3);
+    result.push_str(header);
     for entry in &entries {
         result.push_str(entry);
     }
@@ -828,6 +850,14 @@ mod tests {
     use alms_session::SessionSummary;
 
     fn make_summary(summary: &str, minutes_ago: i64) -> SessionSummary {
+        make_summary_with_label(summary, minutes_ago, Some("User chat"))
+    }
+
+    fn make_summary_with_label(
+        summary: &str,
+        minutes_ago: i64,
+        label: Option<&str>,
+    ) -> SessionSummary {
         let ts = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
         SessionSummary {
             agent_id: AgentId::new(),
@@ -835,6 +865,7 @@ mod tests {
             summary: summary.to_string(),
             last_run_id: None,
             updated_at: Timestamp(ts),
+            source_label: label.map(|s| s.to_string()),
         }
     }
 
@@ -855,7 +886,7 @@ mod tests {
         let result = format_episodic_for_injection(&summaries, 5000).unwrap();
         assert!(result.starts_with("[Your conversation history across sessions"));
         assert!(result.contains("Debugged CORS issue"));
-        assert!(result.contains("**Session (last active:"));
+        assert!(result.contains("**User chat (last active:"));
     }
 
     #[test]
@@ -904,7 +935,7 @@ mod tests {
         let result = format_episodic_for_injection(&summaries, 5000).unwrap();
         assert!(result.contains("Real summary here."));
         // Only the header and one entry -- no blank entries
-        let session_count = result.matches("**Session").count();
+        let session_count = result.matches("**User chat").count();
         assert_eq!(session_count, 1, "Only non-empty summaries should appear");
     }
 
@@ -912,5 +943,177 @@ mod tests {
     fn test_format_episodic_all_empty_returns_none() {
         let summaries = vec![make_summary("", 5), make_summary("", 10)];
         assert!(format_episodic_for_injection(&summaries, 5000).is_none());
+    }
+
+    // -- S1: source label in headers ------------------------------------------
+
+    #[test]
+    fn test_format_episodic_uses_source_label_in_header() {
+        let summaries = vec![
+            make_summary_with_label("Web session.", 5, Some("User chat")),
+            make_summary_with_label("Telegram session.", 10, Some("Telegram chat")),
+        ];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        assert!(
+            result.contains("**User chat (last active:"),
+            "Should use 'User chat' label"
+        );
+        assert!(
+            result.contains("**Telegram chat (last active:"),
+            "Should use 'Telegram chat' label"
+        );
+    }
+
+    // -- S2: defense-in-depth: entries without source_label are skipped --------
+
+    #[test]
+    fn test_format_episodic_skips_no_source_label() {
+        let summaries = vec![
+            make_summary_with_label("Labelled entry.", 5, Some("User chat")),
+            make_summary_with_label("No label entry.", 10, None),
+            make_summary_with_label("Empty label entry.", 15, Some("")),
+        ];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        assert!(result.contains("Labelled entry."));
+        assert!(
+            !result.contains("No label entry."),
+            "Entries without source_label should be filtered out"
+        );
+        assert!(
+            !result.contains("Empty label entry."),
+            "Entries with empty source_label should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_format_episodic_all_missing_labels_returns_none() {
+        let summaries = vec![
+            make_summary_with_label("Entry A.", 5, None),
+            make_summary_with_label("Entry B.", 10, None),
+        ];
+        assert!(
+            format_episodic_for_injection(&summaries, 5000).is_none(),
+            "All entries without labels should result in None"
+        );
+    }
+
+    // -- S4: integration test (DB -> format -> inject) -------------------------
+
+    /// Integration test: insert summaries into a real (in-memory) SQLite store,
+    /// load them, format them, and verify the episodic content that would be
+    /// injected into the context window.
+    #[test]
+    fn test_integration_db_to_formatted_injection() {
+        use alms_session::Session;
+        use alms_session::sqlite::SqliteStore;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent_id = AgentId::new();
+
+        // Create three sessions from different channels.
+        let s_web = Session::new(agent_id, "web-chat-1");
+        let s_tg = Session::new(agent_id, "telegram_bot_123");
+        let s_current = Session::new(agent_id, "web-chat-2");
+        store.save_session(&s_web).unwrap();
+        store.save_session(&s_tg).unwrap();
+        store.save_session(&s_current).unwrap();
+
+        // Insert summaries with source labels (as the generation code would).
+        store
+            .upsert_session_summary(
+                agent_id,
+                s_web.id,
+                "Debugged CORS issue in gateway config.",
+                None,
+                Some("User chat"),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store
+            .upsert_session_summary(
+                agent_id,
+                s_tg.id,
+                "Discussed deployment on VPS.",
+                None,
+                Some("Telegram chat"),
+            )
+            .unwrap();
+
+        // Load summaries excluding the current session.
+        let summaries = store
+            .load_session_summaries(agent_id, 50, Some(&s_current.id))
+            .unwrap();
+        assert_eq!(
+            summaries.len(),
+            2,
+            "Should load 2 summaries (current excluded)"
+        );
+
+        // Format for injection.
+        let formatted =
+            format_episodic_for_injection(&summaries, 5000).expect("Should produce formatted text");
+
+        // Verify structure.
+        assert!(
+            formatted.starts_with("[Your conversation history across sessions"),
+            "Should start with the header"
+        );
+        assert!(
+            formatted.contains("**Telegram chat (last active:"),
+            "Telegram summary should have correct source label"
+        );
+        assert!(
+            formatted.contains("**User chat (last active:"),
+            "Web summary should have correct source label"
+        );
+        assert!(
+            formatted.contains("Debugged CORS issue"),
+            "Web summary content should be present"
+        );
+        assert!(
+            formatted.contains("Discussed deployment"),
+            "Telegram summary content should be present"
+        );
+
+        // Verify ordering: most recent (Telegram, inserted second) should appear first.
+        let tg_pos = formatted.find("Discussed deployment").unwrap();
+        let web_pos = formatted.find("Debugged CORS").unwrap();
+        assert!(
+            tg_pos < web_pos,
+            "Most recent summary (Telegram) should appear before older one (web)"
+        );
+
+        // Now verify that summaries WITHOUT source_label are filtered out.
+        // Simulate a manually-inserted DM summary with no label.
+        let s_dm = Session::new(agent_id, "dm:alice:bob");
+        store.save_session(&s_dm).unwrap();
+        store
+            .upsert_session_summary(
+                agent_id,
+                s_dm.id,
+                "DM content that should not appear.",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let summaries2 = store
+            .load_session_summaries(agent_id, 50, Some(&s_current.id))
+            .unwrap();
+        // DB returns 3 rows (DM row has no label but is present in table).
+        assert_eq!(summaries2.len(), 3);
+
+        let formatted2 = format_episodic_for_injection(&summaries2, 5000)
+            .expect("Should still produce text from labelled entries");
+        assert!(
+            !formatted2.contains("DM content that should not appear"),
+            "DM entry without source_label must be filtered out"
+        );
+        // Only two labelled entries should produce headers.
+        let header_count = formatted2.matches("(last active:").count();
+        assert_eq!(
+            header_count, 2,
+            "Only labelled entries should produce headers"
+        );
     }
 }

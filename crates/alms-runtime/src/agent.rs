@@ -882,12 +882,19 @@ impl AgentRuntime {
         session_manager: &SessionManager,
         current_session_id: &alms_core::SessionId,
     ) -> Option<String> {
-        // Use a generous DB limit — budget trimming happens in the formatter.
-        const DB_LIMIT: usize = 50;
+        let budget = self.config.context_config.run_summary_budget;
+
+        // S5: Derive the DB limit from the budget instead of a hardcoded 50.
+        // A typical formatted entry is ~50-100 tokens.  We use a conservative
+        // 30 tokens-per-entry estimate (plus some margin) so we fetch enough
+        // rows but avoid pulling far more than the formatter can use.
+        const MIN_TOKENS_PER_ENTRY: usize = 30;
+        const MARGIN: usize = 5;
+        let db_limit = (budget / MIN_TOKENS_PER_ENTRY) + MARGIN;
 
         let summaries = match session_manager.load_session_summaries(
             self.agent_id,
-            DB_LIMIT,
+            db_limit,
             Some(current_session_id),
         ) {
             Ok(s) => s,
@@ -901,15 +908,19 @@ impl AgentRuntime {
             return None;
         }
 
-        let budget = self.config.context_config.run_summary_budget;
+        // S3: Subtract 4 tokens from the budget to account for the per-message
+        // overhead that build_with_perspective adds when injecting the episodic
+        // text as a system message (+4 for message framing).
+        let effective_budget = budget.saturating_sub(4);
 
         debug!(
             summary_count = summaries.len(),
-            budget_tokens = budget,
+            budget_tokens = effective_budget,
+            db_limit = db_limit,
             "Formatting episodic summaries for injection"
         );
 
-        crate::episodic::format_episodic_for_injection(&summaries, budget)
+        crate::episodic::format_episodic_for_injection(&summaries, effective_budget)
     }
 
     /// Check whether history has grown past the summarization threshold and, if so,

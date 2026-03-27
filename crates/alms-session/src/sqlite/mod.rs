@@ -147,11 +147,12 @@ CREATE TABLE IF NOT EXISTS run_tool_calls (
 CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run ON run_tool_calls(run_id, seq);
 
 CREATE TABLE IF NOT EXISTS session_summaries (
-    agent_id    TEXT NOT NULL,
-    session_id  TEXT NOT NULL REFERENCES sessions(id),
-    summary     TEXT NOT NULL DEFAULT '',
-    last_run_id TEXT,
-    updated_at  TEXT NOT NULL,
+    agent_id     TEXT NOT NULL,
+    session_id   TEXT NOT NULL REFERENCES sessions(id),
+    summary      TEXT NOT NULL DEFAULT '',
+    last_run_id  TEXT,
+    updated_at   TEXT NOT NULL,
+    source_label TEXT,
     PRIMARY KEY (agent_id, session_id)
 );
 
@@ -221,16 +222,19 @@ impl SqliteStore {
         // Auto-migrate: add session_summaries table for cross-session episodic memory.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_summaries (\
-                 agent_id    TEXT NOT NULL, \
-                 session_id  TEXT NOT NULL REFERENCES sessions(id), \
-                 summary     TEXT NOT NULL DEFAULT '', \
-                 last_run_id TEXT, \
-                 updated_at  TEXT NOT NULL, \
+                 agent_id     TEXT NOT NULL, \
+                 session_id   TEXT NOT NULL REFERENCES sessions(id), \
+                 summary      TEXT NOT NULL DEFAULT '', \
+                 last_run_id  TEXT, \
+                 updated_at   TEXT NOT NULL, \
+                 source_label TEXT, \
                  PRIMARY KEY (agent_id, session_id)\
              ); \
              CREATE INDEX IF NOT EXISTS idx_session_summaries_agent \
                  ON session_summaries(agent_id, updated_at DESC);",
         );
+        // Auto-migrate: add source_label column to session_summaries (existing DBs).
+        let _ = conn.execute_batch("ALTER TABLE session_summaries ADD COLUMN source_label TEXT;");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })

@@ -426,7 +426,13 @@ mod tests {
 
         // Create a session summary for this session.
         store
-            .upsert_session_summary(session.agent_id, session.id, "summary to be cascaded", None)
+            .upsert_session_summary(
+                session.agent_id,
+                session.id,
+                "summary to be cascaded",
+                None,
+                Some("User chat"),
+            )
             .unwrap();
         assert!(
             store
@@ -439,7 +445,13 @@ mod tests {
         let other = Session::new(AgentId::new(), "ctx-other");
         store.save_session(&other).unwrap();
         store
-            .upsert_session_summary(other.agent_id, other.id, "other summary", None)
+            .upsert_session_summary(
+                other.agent_id,
+                other.id,
+                "other summary",
+                None,
+                Some("User chat"),
+            )
             .unwrap();
 
         store.delete_session(session.id).unwrap();

@@ -73,7 +73,7 @@ impl ContextBuilder {
         let system_tokens = estimate_tokens(system_prompt);
         messages.push(LlmMessage::system(system_prompt));
 
-        // 1.5. Episodic summaries from other sessions (injected between system
+        // 2. Episodic summaries from other sessions (injected between system
         // prompt and session history so current session gets LLM recency bias).
         let episodic_tokens = match episodic_summaries.filter(|s| !s.is_empty()) {
             Some(text) => {
@@ -85,10 +85,10 @@ impl ContextBuilder {
             None => 0,
         };
 
-        // 2. Current input (always included)
+        // 3. Current input (always included)
         let input_tokens = estimate_tokens(current_input);
 
-        // 3. Budget for history — episodic tokens are subtracted from the
+        // 4. Budget for history — episodic tokens are subtracted from the
         // available space so they do not eat into the history budget.
         let reserved = system_tokens + input_tokens + episodic_tokens + 500;
         let history_budget = self.config.max_input_tokens.saturating_sub(reserved);
@@ -130,11 +130,11 @@ impl ContextBuilder {
             }
         }
 
-        // 3.5. Group consecutive assistant tool-call messages into single messages
+        // 5. Group consecutive assistant tool-call messages into single messages
         // with multiple tool_calls entries (required by OpenAI/Anthropic APIs).
         Self::group_tool_calls(&mut messages);
 
-        // 4. Current input (skip if empty — avoids sending a blank user message to the LLM)
+        // 6. Current input (skip if empty — avoids sending a blank user message to the LLM)
         if !current_input.is_empty() {
             messages.push(LlmMessage::user(current_input));
         }
