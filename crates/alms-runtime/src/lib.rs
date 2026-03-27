@@ -8,6 +8,7 @@
 pub mod agent;
 pub(crate) mod anthropic;
 pub mod context;
+pub mod episodic;
 pub mod events;
 pub mod get_task_result_tool;
 pub mod ignore_message_tool;

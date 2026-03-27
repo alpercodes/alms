@@ -552,6 +552,23 @@ async fn execute_run(state: AppState, params: RunParams) {
             agent_config
         };
 
+    // Capture summary config before agent_config and llm are consumed.
+    // C1 fix: resolve the summary model *from the per-agent LLM client* so
+    // that when `summary_model` is None we fall back to the agent's configured
+    // model, not the server default.  After this line `llm` is consumed by
+    // `AgentRuntime::new` and no longer available.
+    let run_summary_mode = agent_config.context_config.run_summary_mode.clone();
+    let summary_model_resolved = agent_config
+        .context_config
+        .summary_model
+        .clone()
+        .or_else(|| Some(llm.default_model().to_string()));
+
+    // S6 fix: clone the per-agent resolved LLM client *before* AgentRuntime::new
+    // consumes it.  The summary task needs the agent's provider/base_url/api_key,
+    // not the server-default `state.llm`.
+    let llm_for_summary = llm.clone();
+
     let mut runtime = match alms_runtime::AgentRuntime::new(agent_id, agent_config, llm) {
         Ok(rt) => rt,
         Err(e) => {
@@ -713,6 +730,18 @@ async fn execute_run(state: AppState, params: RunParams) {
         forwarder_state.approval_store.clone(),
     ));
 
+    // Save input for episodic summary generation (input is consumed by run()).
+    // S3 optimisation: only clone when summary mode is enabled AND the session
+    // type is eligible (not a DM, subagent, or episodic session).
+    let should_summarize = run_summary_mode != alms_core::config::RunSummaryMode::Off
+        && alms_runtime::episodic::derive_source_label(&context_id).is_some();
+
+    let run_input_for_summary = if should_summarize {
+        Some(input.clone())
+    } else {
+        None
+    };
+
     let result = if is_peer_message {
         // Peer-triggered run: the input message is already in the shared
         // session (written by MessageBus with from_agent metadata).
@@ -781,9 +810,42 @@ async fn execute_run(state: AppState, params: RunParams) {
                 )
                 .await;
 
+            // Clone the response before mark_run_as_completed consumes it.
+            let run_output_for_summary = run_input_for_summary
+                .as_ref()
+                .map(|_| output.response.clone());
+
             state
                 .run_manager
                 .mark_run_as_completed(run_id, output.response, output.usage);
+
+            // Fire-and-forget episodic summary generation.
+            // Runs in a separate task so it never blocks the SSE cleanup path.
+            // S4: tracked by `in_flight` so graceful shutdown waits for it.
+            if let (Some(run_input), Some(run_output)) =
+                (run_input_for_summary, run_output_for_summary)
+            {
+                let sm = state.session_manager.clone();
+                let llm_clone = llm_for_summary.clone();
+                let ctx_id = context_id.clone();
+                let run_mgr = state.run_manager.clone();
+                let req = alms_runtime::episodic::PersistSummaryRequest {
+                    mode: run_summary_mode.clone(),
+                    agent_id,
+                    session_id,
+                    run_id,
+                    run_input,
+                    run_output,
+                    context_id: ctx_id,
+                    summary_model: summary_model_resolved.clone(),
+                };
+                run_mgr.track_in_flight();
+                tokio::spawn(async move {
+                    alms_runtime::episodic::generate_and_persist_summary(&sm, &llm_clone, req)
+                        .await;
+                    run_mgr.untrack_in_flight();
+                });
+            }
 
             info!("Run {} completed successfully", run_id.0);
         }
