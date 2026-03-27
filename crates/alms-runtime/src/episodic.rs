@@ -53,11 +53,24 @@ pub struct SourceLabel {
 
 /// Derive a human-readable source label from a `context_id`.
 ///
+/// `agent_name` is the name of the current agent — used to determine the peer
+/// in DM sessions (format: `dm:{name1}:{name2}`, alphabetically sorted).
+///
 /// Returns `None` for session types that should be excluded from summary
-/// generation (DM and subagent sessions).
-pub fn derive_source_label(context_id: &str) -> Option<SourceLabel> {
-    // DM sessions -- excluded
-    if context_id.starts_with("dm:") {
+/// generation (subagent and episodic sessions).  DM sessions are included
+/// with a label like "DM with {peer_name}".
+pub fn derive_source_label(context_id: &str, agent_name: &str) -> Option<SourceLabel> {
+    // DM sessions: "dm:{name1}:{name2}" (alphabetically sorted).
+    // Determine the peer by finding the name that isn't ours.
+    if let Some(rest) = context_id.strip_prefix("dm:") {
+        if let Some((a, b)) = rest.split_once(':') {
+            let peer = if a == agent_name { b } else { a };
+            return Some(SourceLabel {
+                source_type: "dm".into(),
+                source_label: format!("DM with {peer}"),
+            });
+        }
+        // Malformed dm: context_id — exclude to be safe.
         return None;
     }
 
@@ -113,6 +126,8 @@ pub struct SummaryParams {
     pub existing_summary: Option<String>,
     /// Model to use for LLM mode.  Falls back to the LLM client's default.
     pub summary_model: Option<String>,
+    /// Agent name — used to derive the peer in DM sessions.
+    pub agent_name: String,
 }
 
 /// Generate or update a session summary.
@@ -156,6 +171,8 @@ pub struct PersistSummaryRequest {
     pub run_output: String,
     pub context_id: String,
     pub summary_model: Option<String>,
+    /// Agent name — used to derive the peer in DM sessions.
+    pub agent_name: String,
 }
 
 /// Fire-and-forget summary generation + persistence.
@@ -186,7 +203,7 @@ pub async fn generate_and_persist_summary(
     req: PersistSummaryRequest,
 ) {
     // Check if the session type should be summarised.
-    let source = match derive_source_label(&req.context_id) {
+    let source = match derive_source_label(&req.context_id, &req.agent_name) {
         Some(s) => s,
         None => {
             debug!(
@@ -220,6 +237,7 @@ pub async fn generate_and_persist_summary(
         context_id: req.context_id.clone(),
         existing_summary,
         summary_model: req.summary_model,
+        agent_name: req.agent_name,
     };
 
     let summary_text = match generate_session_summary(llm, &params).await {
@@ -267,7 +285,7 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
         return None;
     }
 
-    let source = derive_source_label(&params.context_id)?;
+    let source = derive_source_label(&params.context_id, &params.agent_name)?;
 
     // Build the new entry line.
     let snippet = truncate_to_char_boundary(&params.run_input, HEURISTIC_INPUT_BYTES);
@@ -427,7 +445,7 @@ use alms_session::SessionSummary;
 /// Returns `None` when `summaries` is empty or all summaries are empty strings.
 ///
 /// **Defense-in-depth filtering:** Entries whose `source_label` is `None` are
-/// silently skipped.  Under normal operation DM/subagent sessions never get a
+/// silently skipped.  Under normal operation subagent sessions never get a
 /// summary row, but this guard prevents manually-inserted or corrupt rows from
 /// leaking into the episodic context.
 ///
@@ -459,7 +477,7 @@ pub fn format_episodic_for_injection(
         }
 
         // S2: Defense-in-depth -- skip entries without a source_label.
-        // Under normal operation DM/subagent sessions never get a summary row,
+        // Under normal operation subagent sessions never get a summary row,
         // but if one is manually inserted (or exists from before source_label
         // was added), filtering here prevents it from appearing in the context.
         let label = match &summary.source_label {
@@ -511,21 +529,21 @@ mod tests {
 
     #[test]
     fn test_source_label_web_chat() {
-        let label = derive_source_label("web-chat-2026-03-25").unwrap();
+        let label = derive_source_label("web-chat-2026-03-25", "myagent").unwrap();
         assert_eq!(label.source_type, "web");
         assert_eq!(label.source_label, "User chat");
     }
 
     #[test]
     fn test_source_label_telegram() {
-        let label = derive_source_label("telegram_mybot_123456").unwrap();
+        let label = derive_source_label("telegram_mybot_123456", "myagent").unwrap();
         assert_eq!(label.source_type, "telegram");
         assert_eq!(label.source_label, "Telegram chat");
     }
 
     #[test]
     fn test_source_label_job() {
-        let label = derive_source_label("job_abc123").unwrap();
+        let label = derive_source_label("job_abc123", "myagent").unwrap();
         assert_eq!(label.source_type, "job");
         assert_eq!(label.source_label, "Scheduled job: abc123");
     }
@@ -533,7 +551,7 @@ mod tests {
     #[test]
     fn test_source_label_job_long_id() {
         let long_id = "a".repeat(50);
-        let label = derive_source_label(&format!("job_{long_id}")).unwrap();
+        let label = derive_source_label(&format!("job_{long_id}"), "myagent").unwrap();
         assert_eq!(label.source_type, "job");
         // Should be truncated to 37 chars + "..."
         assert!(label.source_label.ends_with("..."));
@@ -541,23 +559,40 @@ mod tests {
     }
 
     #[test]
-    fn test_source_label_dm_excluded() {
-        assert!(derive_source_label("dm:alice:bob").is_none());
+    fn test_source_label_dm_alice_perspective() {
+        // alice sees "DM with bob"
+        let label = derive_source_label("dm:alice:bob", "alice").unwrap();
+        assert_eq!(label.source_type, "dm");
+        assert_eq!(label.source_label, "DM with bob");
+    }
+
+    #[test]
+    fn test_source_label_dm_bob_perspective() {
+        // bob sees "DM with alice"
+        let label = derive_source_label("dm:alice:bob", "bob").unwrap();
+        assert_eq!(label.source_type, "dm");
+        assert_eq!(label.source_label, "DM with alice");
+    }
+
+    #[test]
+    fn test_source_label_dm_malformed_excluded() {
+        // Malformed DM context_id (no second colon) should be excluded.
+        assert!(derive_source_label("dm:alice", "alice").is_none());
     }
 
     #[test]
     fn test_source_label_subagent_excluded() {
-        assert!(derive_source_label("subagent_task_123").is_none());
+        assert!(derive_source_label("subagent_task_123", "myagent").is_none());
     }
 
     #[test]
     fn test_source_label_episodic_excluded() {
-        assert!(derive_source_label("episodic:myagent").is_none());
+        assert!(derive_source_label("episodic:myagent", "myagent").is_none());
     }
 
     #[test]
     fn test_source_label_unknown_defaults_to_web() {
-        let label = derive_source_label("some-random-context").unwrap();
+        let label = derive_source_label("some-random-context", "myagent").unwrap();
         assert_eq!(label.source_type, "web");
         assert_eq!(label.source_label, "User chat");
     }
@@ -565,6 +600,15 @@ mod tests {
     // -- heuristic mode -----------------------------------------------------
 
     fn heuristic_params(input: &str, context_id: &str, existing: Option<&str>) -> SummaryParams {
+        heuristic_params_with_name(input, context_id, existing, "myagent")
+    }
+
+    fn heuristic_params_with_name(
+        input: &str,
+        context_id: &str,
+        existing: Option<&str>,
+        agent_name: &str,
+    ) -> SummaryParams {
         SummaryParams {
             mode: RunSummaryMode::Heuristic,
             agent_id: AgentId::new(),
@@ -575,6 +619,7 @@ mod tests {
             context_id: context_id.to_string(),
             existing_summary: existing.map(|s| s.to_string()),
             summary_model: None,
+            agent_name: agent_name.to_string(),
         }
     }
 
@@ -655,9 +700,13 @@ mod tests {
     }
 
     #[test]
-    fn test_heuristic_dm_session_skipped() {
-        let params = heuristic_params("Hello", "dm:alice:bob", None);
-        assert!(generate_heuristic(&params).is_none());
+    fn test_heuristic_dm_session_included() {
+        let params = heuristic_params_with_name("Hello", "dm:alice:bob", None, "alice");
+        let result = generate_heuristic(&params).unwrap();
+        assert!(
+            result.starts_with("DM with bob:"),
+            "DM session should produce a summary with peer label, got: {result}"
+        );
     }
 
     #[test]
@@ -744,6 +793,7 @@ mod tests {
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
+            agent_name: "myagent".into(),
         };
         assert!(generate_session_summary(&llm, &params).await.is_none());
     }
@@ -765,6 +815,7 @@ mod tests {
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
+            agent_name: "myagent".into(),
         };
         let result = generate_session_summary(&llm, &params).await.unwrap();
         assert!(result.contains("How do I set up CORS?"));
@@ -788,6 +839,7 @@ mod tests {
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
+            agent_name: "myagent".into(),
         };
         // Mock LLM returns a canned response -- we just verify it doesn't panic
         // and returns Some.
@@ -812,6 +864,7 @@ mod tests {
             context_id: "web-chat-1".into(),
             existing_summary: Some("Debugged CORS issue in gateway.rs.".into()),
             summary_model: None,
+            agent_name: "myagent".into(),
         };
         // Should not panic, should return Some
         let result = generate_session_summary(&llm, &params).await;
@@ -825,7 +878,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        for ctx in &["dm:alice:bob", "subagent_task_1", "episodic:myagent"] {
+        // DM sessions are now included (not excluded), only subagent and episodic
+        // sessions should return None.
+        for ctx in &["subagent_task_1", "episodic:myagent"] {
             let params = SummaryParams {
                 mode: RunSummaryMode::Heuristic,
                 agent_id: AgentId::new(),
@@ -836,12 +891,41 @@ mod tests {
                 context_id: ctx.to_string(),
                 existing_summary: None,
                 summary_model: None,
+                agent_name: "myagent".into(),
             };
             assert!(
                 generate_session_summary(&llm, &params).await.is_none(),
                 "Expected None for context_id={ctx}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_summary_dm_session_produces_summary() {
+        let llm = LlmClient::new(crate::llm_types::LlmConfig {
+            mock: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let params = SummaryParams {
+            mode: RunSummaryMode::Heuristic,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "hello from DM".into(),
+            run_output: "hi back".into(),
+            context_id: "dm:alice:bob".into(),
+            existing_summary: None,
+            summary_model: None,
+            agent_name: "alice".into(),
+        };
+        let result = generate_session_summary(&llm, &params).await;
+        assert!(result.is_some(), "DM sessions should now produce summaries");
+        let text = result.unwrap();
+        assert!(
+            text.starts_with("DM with bob:"),
+            "DM summary should use peer label, got: {text}"
+        );
     }
 
     // -- format_episodic_for_injection ----------------------------------------
@@ -1083,36 +1167,75 @@ mod tests {
             "Most recent summary (Telegram) should appear before older one (web)"
         );
 
-        // Now verify that summaries WITHOUT source_label are filtered out.
-        // Simulate a manually-inserted DM summary with no label.
+        // Verify that DM sessions WITH a proper source label ARE included.
         let s_dm = Session::new(agent_id, "dm:alice:bob");
         store.save_session(&s_dm).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
         store
             .upsert_session_summary(
                 agent_id,
                 s_dm.id,
-                "DM content that should not appear.",
+                "Discussed project architecture with bob.",
                 None,
-                None,
+                Some("DM with bob"),
             )
             .unwrap();
 
         let summaries2 = store
             .load_session_summaries(agent_id, 50, Some(&s_current.id))
             .unwrap();
-        // DB returns 3 rows (DM row has no label but is present in table).
-        assert_eq!(summaries2.len(), 3);
+        assert_eq!(
+            summaries2.len(),
+            3,
+            "Should load 3 summaries (web + tg + dm)"
+        );
 
         let formatted2 = format_episodic_for_injection(&summaries2, 5000)
-            .expect("Should still produce text from labelled entries");
+            .expect("Should produce text including DM entry");
         assert!(
-            !formatted2.contains("DM content that should not appear"),
-            "DM entry without source_label must be filtered out"
+            formatted2.contains("Discussed project architecture with bob"),
+            "DM entry with source_label should be included"
         );
-        // Only two labelled entries should produce headers.
+        assert!(
+            formatted2.contains("**DM with bob (last active:"),
+            "DM entry should have correct source label header"
+        );
+        // Three labelled entries should produce headers.
         let header_count = formatted2.matches("(last active:").count();
         assert_eq!(
-            header_count, 2,
+            header_count, 3,
+            "All three labelled entries should produce headers"
+        );
+
+        // Defense-in-depth: entries WITHOUT source_label are still filtered out.
+        // Simulate a corrupt or manually-inserted row with no label.
+        let s_orphan = Session::new(agent_id, "orphan-session");
+        store.save_session(&s_orphan).unwrap();
+        store
+            .upsert_session_summary(
+                agent_id,
+                s_orphan.id,
+                "Orphan content that should not appear.",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let summaries3 = store
+            .load_session_summaries(agent_id, 50, Some(&s_current.id))
+            .unwrap();
+        assert_eq!(summaries3.len(), 4);
+
+        let formatted3 = format_episodic_for_injection(&summaries3, 5000)
+            .expect("Should still produce text from labelled entries");
+        assert!(
+            !formatted3.contains("Orphan content that should not appear"),
+            "Entry without source_label must be filtered out"
+        );
+        // Only three labelled entries should produce headers.
+        let header_count3 = formatted3.matches("(last active:").count();
+        assert_eq!(
+            header_count3, 3,
             "Only labelled entries should produce headers"
         );
     }

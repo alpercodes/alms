@@ -732,9 +732,12 @@ async fn execute_run(state: AppState, params: RunParams) {
 
     // Save input for episodic summary generation (input is consumed by run()).
     // S3 optimisation: only clone when summary mode is enabled AND the session
-    // type is eligible (not a DM, subagent, or episodic session).
+    // type is eligible (not a subagent or episodic session).
+    // DM sessions are included — the agent_name is needed to derive the peer.
+    let agent_name_for_summary = agent_name.clone().unwrap_or_default();
     let should_summarize = run_summary_mode != alms_core::config::RunSummaryMode::Off
-        && alms_runtime::episodic::derive_source_label(&context_id).is_some();
+        && alms_runtime::episodic::derive_source_label(&context_id, &agent_name_for_summary)
+            .is_some();
 
     let run_input_for_summary = if should_summarize {
         Some(input.clone())
@@ -838,6 +841,7 @@ async fn execute_run(state: AppState, params: RunParams) {
                     run_output,
                     context_id: ctx_id,
                     summary_model: summary_model_resolved.clone(),
+                    agent_name: agent_name_for_summary.clone(),
                 };
                 run_mgr.track_in_flight();
                 tokio::spawn(async move {
