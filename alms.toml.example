@@ -65,6 +65,16 @@ max_input_tokens = 128000
 recent_window = 20
 # how often to update rolling summary (in messages, for sliding-summary)
 summary_interval = 30
+# Episodic memory: how run summaries are generated after each run.
+#   "off"       - disabled (default). No summaries, no episodic context injection.
+#   "heuristic" - one-line summary from first ~120 chars of input. Zero LLM cost.
+#   "llm"       - rich summary via agent's model (or summary_model if configured).
+# Override with: ALMS_RUN_SUMMARY_MODE=heuristic
+run_summary_mode = "off"
+# Max tokens for episodic run summaries injected into context window.
+# Hard-capped at 15% of max_input_tokens — values above the cap are clamped.
+# Override with: ALMS_RUN_SUMMARY_BUDGET=4000
+run_summary_budget = 2000
 
 [tools]
 # which builtin tools to enable

@@ -94,6 +94,9 @@ impl AlmsConfig {
         // (stray data/alms.db inside agent workspace directories).
         config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
 
+        // Normalize episodic memory settings (soft corrections with warnings)
+        config.context.normalize_episodic();
+
         // Validate
         config.validate()?;
 
@@ -114,6 +117,7 @@ impl AlmsConfig {
                 let mut cfg = Self::default();
                 cfg.apply_env_overrides();
                 cfg.server.data_dir = crate::resolve_to_absolute(Path::new(&cfg.server.data_dir));
+                cfg.context.normalize_episodic();
                 cfg
             }
         }
@@ -205,6 +209,14 @@ impl AlmsConfig {
             && let Ok(n) = val.parse()
         {
             self.context.max_input_tokens = n;
+        }
+        if let Ok(val) = std::env::var("ALMS_RUN_SUMMARY_MODE") {
+            self.context.run_summary_mode = val;
+        }
+        if let Ok(val) = std::env::var("ALMS_RUN_SUMMARY_BUDGET")
+            && let Ok(n) = val.parse()
+        {
+            self.context.run_summary_budget = n;
         }
 
         // Logging settings
@@ -497,6 +509,15 @@ pub struct ContextConfig {
     /// Optional separate (cheaper) model for generating summaries.
     /// Falls back to the agent's default model when None.
     pub summary_model: Option<String>,
+    /// How run summaries are generated for episodic memory:
+    /// - `"off"` (default) — no summaries generated, no episodic injection
+    /// - `"heuristic"` — one-line summary from first ~120 chars of input (no LLM call)
+    /// - `"llm"` — rich summary via agent's model (or `summary_model` if configured)
+    pub run_summary_mode: String,
+    /// Maximum token budget for episodic run summaries injected into context.
+    /// Hard-capped at 15% of `max_input_tokens` — values exceeding the cap
+    /// are clamped down with a warning at load time.
+    pub run_summary_budget: usize,
 }
 
 impl Default for ContextConfig {
@@ -507,6 +528,40 @@ impl Default for ContextConfig {
             recent_window: 20,
             summary_interval: 30,
             summary_model: None,
+            run_summary_mode: "off".into(),
+            run_summary_budget: 2000,
+        }
+    }
+}
+
+impl ContextConfig {
+    /// Valid values for `run_summary_mode`.
+    const VALID_SUMMARY_MODES: [&str; 3] = ["off", "heuristic", "llm"];
+
+    /// Normalize episodic memory settings: validate mode and enforce the 15%
+    /// budget cap. Called during config loading, before hard validation.
+    pub fn normalize_episodic(&mut self) {
+        // Validate run_summary_mode — fall back to "off" with warning
+        if !Self::VALID_SUMMARY_MODES.contains(&self.run_summary_mode.as_str()) {
+            warn!(
+                mode = %self.run_summary_mode,
+                "Invalid run_summary_mode (expected one of {:?}), falling back to \"off\"",
+                Self::VALID_SUMMARY_MODES,
+            );
+            self.run_summary_mode = "off".into();
+        }
+
+        // Enforce 15% hard cap on run_summary_budget
+        let cap = self.max_input_tokens * 15 / 100;
+        if self.run_summary_budget > cap {
+            warn!(
+                configured = self.run_summary_budget,
+                cap = cap,
+                max_input_tokens = self.max_input_tokens,
+                "run_summary_budget exceeds 15% of max_input_tokens, clamping to {}",
+                cap,
+            );
+            self.run_summary_budget = cap;
         }
     }
 }
@@ -1195,5 +1250,153 @@ log_dir = "/var/log/alms"
             "data_dir should be absolute after load_or_default(), got: {}",
             config.server.data_dir
         );
+    }
+
+    // ---- Episodic memory config tests ----
+
+    #[test]
+    fn test_context_config_defaults_episodic() {
+        let config = ContextConfig::default();
+        assert_eq!(config.run_summary_mode, "off");
+        assert_eq!(config.run_summary_budget, 2000);
+    }
+
+    #[test]
+    fn test_normalize_episodic_valid_modes() {
+        for mode in &["off", "heuristic", "llm"] {
+            let mut config = ContextConfig {
+                run_summary_mode: (*mode).into(),
+                ..Default::default()
+            };
+            config.normalize_episodic();
+            assert_eq!(
+                config.run_summary_mode, *mode,
+                "valid mode '{}' should be preserved",
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_episodic_invalid_mode_falls_back_to_off() {
+        let mut config = ContextConfig {
+            run_summary_mode: "invalid".into(),
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        assert_eq!(
+            config.run_summary_mode, "off",
+            "invalid mode should fall back to 'off'"
+        );
+    }
+
+    #[test]
+    fn test_normalize_episodic_empty_mode_falls_back_to_off() {
+        let mut config = ContextConfig {
+            run_summary_mode: "".into(),
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        assert_eq!(
+            config.run_summary_mode, "off",
+            "empty mode should fall back to 'off'"
+        );
+    }
+
+    #[test]
+    fn test_normalize_episodic_budget_within_cap() {
+        let mut config = ContextConfig {
+            max_input_tokens: 128_000,
+            run_summary_budget: 2000,
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        // 15% of 128_000 = 19_200, so 2000 is well within the cap
+        assert_eq!(config.run_summary_budget, 2000);
+    }
+
+    #[test]
+    fn test_normalize_episodic_budget_exactly_at_cap() {
+        let mut config = ContextConfig {
+            max_input_tokens: 20_000,
+            run_summary_budget: 3000, // 15% of 20_000 = 3_000
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        assert_eq!(
+            config.run_summary_budget, 3000,
+            "budget exactly at 15% cap should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_normalize_episodic_budget_exceeds_cap_is_clamped() {
+        let mut config = ContextConfig {
+            max_input_tokens: 20_000,
+            run_summary_budget: 5000, // 15% of 20_000 = 3_000
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        assert_eq!(
+            config.run_summary_budget, 3000,
+            "budget exceeding 15% cap should be clamped to 3000"
+        );
+    }
+
+    #[test]
+    fn test_normalize_episodic_budget_clamp_with_small_context() {
+        let mut config = ContextConfig {
+            max_input_tokens: 4_000,
+            run_summary_budget: 2000, // 15% of 4_000 = 600
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        assert_eq!(
+            config.run_summary_budget, 600,
+            "budget should be clamped to 15% of 4_000 = 600"
+        );
+    }
+
+    #[test]
+    fn test_toml_episodic_config() {
+        let toml = r#"
+[context]
+run_summary_mode = "heuristic"
+run_summary_budget = 4000
+"#;
+        let config: AlmsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.context.run_summary_mode, "heuristic");
+        assert_eq!(config.context.run_summary_budget, 4000);
+    }
+
+    #[test]
+    fn test_env_override_run_summary_mode() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_RUN_SUMMARY_MODE", "llm");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.context.run_summary_mode, "llm");
+    }
+
+    #[test]
+    fn test_env_override_run_summary_budget() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_RUN_SUMMARY_BUDGET", "5000");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.context.run_summary_budget, 5000);
+    }
+
+    #[test]
+    fn test_env_override_run_summary_budget_invalid_ignored() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_RUN_SUMMARY_BUDGET", "not-a-number");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        // Invalid parse should be silently ignored, keeping the default
+        assert_eq!(config.context.run_summary_budget, 2000);
     }
 }
