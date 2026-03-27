@@ -100,6 +100,8 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
             "recent_window": ctx.recent_window,
             "summary_interval": ctx.summary_interval,
             "summary_model": ctx.summary_model,
+            "run_summary_mode": ctx.run_summary_mode.to_string(),
+            "run_summary_budget": ctx.run_summary_budget,
         },
         // Session settings
         "session": {

@@ -1233,6 +1233,7 @@ mod tests {
                 recent_window: 5,
                 summary_interval: 10,
                 summary_model: Some("cheap-model".into()),
+                ..Default::default()
             },
             posture: alms_runtime::Posture::Guarded,
             sandbox_root: "/sandbox".into(),

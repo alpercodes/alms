@@ -479,6 +479,7 @@ mod tests {
             recent_window: 20,
             summary_interval: 30,
             summary_model: None,
+            ..Default::default()
         };
         let builder = ContextBuilder::new(config);
 
@@ -505,6 +506,7 @@ mod tests {
             recent_window: 20,
             summary_interval: 30,
             summary_model: None,
+            ..Default::default()
         };
         let builder = ContextBuilder::new(config);
 
@@ -531,6 +533,7 @@ mod tests {
             recent_window: 3,
             summary_interval: 30,
             summary_model: None,
+            ..Default::default()
         };
         let builder = ContextBuilder::new(config);
 
@@ -565,6 +568,7 @@ mod tests {
             recent_window: 100, // allow many messages
             summary_interval: 30,
             summary_model: None,
+            ..Default::default()
         };
         let builder = ContextBuilder::new(config);
 
@@ -602,6 +606,7 @@ mod tests {
             recent_window: 3,
             summary_interval: 30,
             summary_model: None,
+            ..Default::default()
         };
         let builder = ContextBuilder::new(config);
 
@@ -625,6 +630,7 @@ mod tests {
             recent_window: 3,
             summary_interval: 30,
             summary_model: None,
+            ..Default::default()
         };
         let builder = ContextBuilder::new(config);
 
@@ -671,6 +677,7 @@ mod tests {
             recent_window: 20,
             summary_interval: 30,
             summary_model: None,
+            ..Default::default()
         };
         let builder = ContextBuilder::new(config);
 
@@ -728,6 +735,7 @@ mod tests {
             recent_window: 20,
             summary_interval: 30,
             summary_model: None,
+            ..Default::default()
         };
         let builder = ContextBuilder::new(config);
 
@@ -854,6 +862,7 @@ mod tests {
             recent_window: 20,
             summary_interval: 30,
             summary_model: None,
+            ..Default::default()
         })
     }
 
