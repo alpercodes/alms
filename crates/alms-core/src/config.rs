@@ -14,6 +14,52 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// How run summaries are generated for episodic memory.
+///
+/// Serializes to/from lowercase strings (`"off"`, `"heuristic"`, `"llm"`)
+/// for TOML and env-var compatibility.
+///
+/// Unknown/invalid values deserialize to [`RunSummaryMode::Unknown`] and are
+/// normalized to [`RunSummaryMode::Off`] with a warning during config loading.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunSummaryMode {
+    /// No summaries generated, no episodic injection (default).
+    #[default]
+    Off,
+    /// One-line summary from first ~120 chars of input (no LLM call).
+    Heuristic,
+    /// Rich summary via agent's model (or `summary_model` if configured).
+    Llm,
+    /// Catch-all for unrecognized values — normalized to `Off` during loading.
+    #[serde(other, rename = "unknown")]
+    Unknown,
+}
+
+impl std::fmt::Display for RunSummaryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Off => write!(f, "off"),
+            Self::Heuristic => write!(f, "heuristic"),
+            Self::Llm => write!(f, "llm"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl std::str::FromStr for RunSummaryMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "heuristic" => Ok(Self::Heuristic),
+            "llm" => Ok(Self::Llm),
+            _ => Ok(Self::Unknown),
+        }
+    }
+}
+
 /// Select an API key for the requested LLM provider.
 ///
 /// Preference order:
@@ -211,7 +257,9 @@ impl AlmsConfig {
             self.context.max_input_tokens = n;
         }
         if let Ok(val) = std::env::var("ALMS_RUN_SUMMARY_MODE") {
-            self.context.run_summary_mode = val;
+            // FromStr always succeeds — unrecognized values become Unknown,
+            // which normalize_episodic() will convert to Off with a warning.
+            self.context.run_summary_mode = val.parse().unwrap_or_default();
         }
         if let Ok(val) = std::env::var("ALMS_RUN_SUMMARY_BUDGET")
             && let Ok(n) = val.parse()
@@ -509,11 +557,9 @@ pub struct ContextConfig {
     /// Optional separate (cheaper) model for generating summaries.
     /// Falls back to the agent's default model when None.
     pub summary_model: Option<String>,
-    /// How run summaries are generated for episodic memory:
-    /// - `"off"` (default) — no summaries generated, no episodic injection
-    /// - `"heuristic"` — one-line summary from first ~120 chars of input (no LLM call)
-    /// - `"llm"` — rich summary via agent's model (or `summary_model` if configured)
-    pub run_summary_mode: String,
+    /// How run summaries are generated for episodic memory.
+    /// See [`RunSummaryMode`] for valid values.
+    pub run_summary_mode: RunSummaryMode,
     /// Maximum token budget for episodic run summaries injected into context.
     /// Hard-capped at 15% of `max_input_tokens` — values exceeding the cap
     /// are clamped down with a warning at load time.
@@ -528,27 +574,20 @@ impl Default for ContextConfig {
             recent_window: 20,
             summary_interval: 30,
             summary_model: None,
-            run_summary_mode: "off".into(),
+            run_summary_mode: RunSummaryMode::Off,
             run_summary_budget: 2000,
         }
     }
 }
 
 impl ContextConfig {
-    /// Valid values for `run_summary_mode`.
-    const VALID_SUMMARY_MODES: [&str; 3] = ["off", "heuristic", "llm"];
-
     /// Normalize episodic memory settings: validate mode and enforce the 15%
     /// budget cap. Called during config loading, before hard validation.
     pub fn normalize_episodic(&mut self) {
-        // Validate run_summary_mode — fall back to "off" with warning
-        if !Self::VALID_SUMMARY_MODES.contains(&self.run_summary_mode.as_str()) {
-            warn!(
-                mode = %self.run_summary_mode,
-                "Invalid run_summary_mode (expected one of {:?}), falling back to \"off\"",
-                Self::VALID_SUMMARY_MODES,
-            );
-            self.run_summary_mode = "off".into();
+        // Normalize Unknown variant (from unrecognized TOML/env values) to Off
+        if self.run_summary_mode == RunSummaryMode::Unknown {
+            warn!("Unrecognized run_summary_mode, falling back to \"off\"");
+            self.run_summary_mode = RunSummaryMode::Off;
         }
 
         // Enforce 15% hard cap on run_summary_budget
@@ -1257,50 +1296,53 @@ log_dir = "/var/log/alms"
     #[test]
     fn test_context_config_defaults_episodic() {
         let config = ContextConfig::default();
-        assert_eq!(config.run_summary_mode, "off");
+        assert_eq!(config.run_summary_mode, RunSummaryMode::Off);
         assert_eq!(config.run_summary_budget, 2000);
     }
 
     #[test]
     fn test_normalize_episodic_valid_modes() {
-        for mode in &["off", "heuristic", "llm"] {
+        for mode in &[
+            RunSummaryMode::Off,
+            RunSummaryMode::Heuristic,
+            RunSummaryMode::Llm,
+        ] {
             let mut config = ContextConfig {
-                run_summary_mode: (*mode).into(),
+                run_summary_mode: mode.clone(),
                 ..Default::default()
             };
             config.normalize_episodic();
             assert_eq!(
                 config.run_summary_mode, *mode,
-                "valid mode '{}' should be preserved",
-                mode
+                "valid mode '{mode}' should be preserved",
             );
         }
     }
 
     #[test]
-    fn test_normalize_episodic_invalid_mode_falls_back_to_off() {
+    fn test_normalize_episodic_unknown_mode_falls_back_to_off() {
         let mut config = ContextConfig {
-            run_summary_mode: "invalid".into(),
+            run_summary_mode: RunSummaryMode::Unknown,
             ..Default::default()
         };
         config.normalize_episodic();
         assert_eq!(
-            config.run_summary_mode, "off",
-            "invalid mode should fall back to 'off'"
+            config.run_summary_mode,
+            RunSummaryMode::Off,
+            "unknown mode should fall back to Off"
         );
     }
 
     #[test]
-    fn test_normalize_episodic_empty_mode_falls_back_to_off() {
-        let mut config = ContextConfig {
-            run_summary_mode: "".into(),
-            ..Default::default()
-        };
-        config.normalize_episodic();
-        assert_eq!(
-            config.run_summary_mode, "off",
-            "empty mode should fall back to 'off'"
-        );
+    fn test_run_summary_mode_from_str_invalid() {
+        let mode: RunSummaryMode = "invalid".parse().unwrap();
+        assert_eq!(mode, RunSummaryMode::Unknown);
+    }
+
+    #[test]
+    fn test_run_summary_mode_from_str_empty() {
+        let mode: RunSummaryMode = "".parse().unwrap();
+        assert_eq!(mode, RunSummaryMode::Unknown);
     }
 
     #[test]
@@ -1365,8 +1407,18 @@ run_summary_mode = "heuristic"
 run_summary_budget = 4000
 "#;
         let config: AlmsConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.context.run_summary_mode, "heuristic");
+        assert_eq!(config.context.run_summary_mode, RunSummaryMode::Heuristic);
         assert_eq!(config.context.run_summary_budget, 4000);
+    }
+
+    #[test]
+    fn test_toml_episodic_config_invalid_mode_deserializes_as_unknown() {
+        let toml = r#"
+[context]
+run_summary_mode = "bogus"
+"#;
+        let config: AlmsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.context.run_summary_mode, RunSummaryMode::Unknown);
     }
 
     #[test]
@@ -1376,7 +1428,7 @@ run_summary_budget = 4000
 
         let mut config = AlmsConfig::default();
         config.apply_env_overrides();
-        assert_eq!(config.context.run_summary_mode, "llm");
+        assert_eq!(config.context.run_summary_mode, RunSummaryMode::Llm);
     }
 
     #[test]
