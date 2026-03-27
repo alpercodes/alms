@@ -41,27 +41,45 @@ impl SqliteStore {
 
     /// Load all episodic summaries for an agent, ordered by `updated_at DESC`
     /// (most recently active session first), up to `limit`.
+    ///
+    /// When `exclude_session_id` is `Some`, that session's summary is omitted
+    /// from results (useful for excluding the current session when injecting
+    /// cross-session context).
     pub fn load_session_summaries(
         &self,
         agent_id: AgentId,
         limit: usize,
+        exclude_session_id: Option<&SessionId>,
     ) -> AlmsResult<Vec<SessionSummary>> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT agent_id, session_id, summary, last_run_id, updated_at \
-                 FROM session_summaries \
-                 WHERE agent_id = ?1 \
-                 ORDER BY updated_at DESC \
-                 LIMIT ?2",
-            )
-            .map_err(|e| {
-                AlmsError::Runtime(format!("SQLite prepare load_session_summaries: {e}"))
-            })?;
 
-        let rows = stmt
-            .query_map(
-                params![agent_id.0.to_string(), limit as i64],
+        let (sql, exclude_str);
+        if let Some(exclude) = exclude_session_id {
+            exclude_str = exclude.0.to_string();
+            sql = "SELECT agent_id, session_id, summary, last_run_id, updated_at \
+                   FROM session_summaries \
+                   WHERE agent_id = ?1 AND session_id != ?3 \
+                   ORDER BY updated_at DESC \
+                   LIMIT ?2";
+        } else {
+            exclude_str = String::new(); // unused
+            sql = "SELECT agent_id, session_id, summary, last_run_id, updated_at \
+                   FROM session_summaries \
+                   WHERE agent_id = ?1 \
+                   ORDER BY updated_at DESC \
+                   LIMIT ?2";
+        }
+
+        let mut stmt = conn.prepare(sql).map_err(|e| {
+            AlmsError::Runtime(format!("SQLite prepare load_session_summaries: {e}"))
+        })?;
+
+        let agent_str = agent_id.0.to_string();
+        let limit_val = limit as i64;
+
+        let rows: Vec<SessionSummary> = if exclude_session_id.is_some() {
+            stmt.query_map(
+                params![&agent_str, limit_val, &exclude_str],
                 parse_session_summary_row,
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite query load_session_summaries: {e}")))?
@@ -72,7 +90,21 @@ impl SqliteStore {
                     None
                 }
             })
-            .collect();
+            .collect()
+        } else {
+            stmt.query_map(params![&agent_str, limit_val], parse_session_summary_row)
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite query load_session_summaries: {e}"))
+                })?
+                .filter_map(|r| match r {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::warn!("Skipping unparseable session_summary row: {e}");
+                        None
+                    }
+                })
+                .collect()
+        };
 
         Ok(rows)
     }
@@ -239,7 +271,7 @@ mod tests {
             .upsert_session_summary(agent_id, s3.id, "newest", None)
             .unwrap();
 
-        let all = store.load_session_summaries(agent_id, 10).unwrap();
+        let all = store.load_session_summaries(agent_id, 10, None).unwrap();
         assert_eq!(all.len(), 3);
         // Newest first
         assert_eq!(all[0].summary, "newest");
@@ -260,7 +292,7 @@ mod tests {
                 .unwrap();
         }
 
-        let limited = store.load_session_summaries(agent_id, 2).unwrap();
+        let limited = store.load_session_summaries(agent_id, 2, None).unwrap();
         assert_eq!(limited.len(), 2);
     }
 
@@ -282,13 +314,50 @@ mod tests {
             .upsert_session_summary(agent_b, sb.id, "agent B summary", None)
             .unwrap();
 
-        let a_summaries = store.load_session_summaries(agent_a, 10).unwrap();
+        let a_summaries = store.load_session_summaries(agent_a, 10, None).unwrap();
         assert_eq!(a_summaries.len(), 1);
         assert_eq!(a_summaries[0].summary, "agent A summary");
 
-        let b_summaries = store.load_session_summaries(agent_b, 10).unwrap();
+        let b_summaries = store.load_session_summaries(agent_b, 10, None).unwrap();
         assert_eq!(b_summaries.len(), 1);
         assert_eq!(b_summaries[0].summary, "agent B summary");
+    }
+
+    #[test]
+    fn test_load_session_summaries_excludes_session() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent_id = AgentId::new();
+
+        let s1 = Session::new(agent_id, "ctx-1");
+        let s2 = Session::new(agent_id, "ctx-2");
+        let s3 = Session::new(agent_id, "ctx-3");
+        store.save_session(&s1).unwrap();
+        store.save_session(&s2).unwrap();
+        store.save_session(&s3).unwrap();
+
+        store
+            .upsert_session_summary(agent_id, s1.id, "summary-1", None)
+            .unwrap();
+        store
+            .upsert_session_summary(agent_id, s2.id, "summary-2", None)
+            .unwrap();
+        store
+            .upsert_session_summary(agent_id, s3.id, "summary-3", None)
+            .unwrap();
+
+        // Without exclusion: all three returned
+        let all = store.load_session_summaries(agent_id, 10, None).unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Exclude s2: should return only s1 and s3
+        let filtered = store
+            .load_session_summaries(agent_id, 10, Some(&s2.id))
+            .unwrap();
+        assert_eq!(filtered.len(), 2);
+        let ids: Vec<SessionId> = filtered.iter().map(|s| s.session_id).collect();
+        assert!(!ids.contains(&s2.id));
+        assert!(ids.contains(&s1.id));
+        assert!(ids.contains(&s3.id));
     }
 
     #[test]

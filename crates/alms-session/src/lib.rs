@@ -422,14 +422,19 @@ impl SessionManager {
     /// Load all episodic summaries for an agent, ordered by `updated_at DESC`,
     /// up to `limit`.
     ///
+    /// When `exclude_session_id` is `Some`, that session's summary is omitted
+    /// from results (useful for excluding the current session when injecting
+    /// cross-session context).
+    ///
     /// Returns an empty vec when no SQLite store is configured.
     pub fn load_session_summaries(
         &self,
         agent_id: AgentId,
         limit: usize,
+        exclude_session_id: Option<&SessionId>,
     ) -> AlmsResult<Vec<SessionSummary>> {
         if let Some(store) = &self.store {
-            store.load_session_summaries(agent_id, limit)
+            store.load_session_summaries(agent_id, limit, exclude_session_id)
         } else {
             Ok(Vec::new())
         }
@@ -564,7 +569,7 @@ mod tests {
         assert_eq!(loaded.last_run_id, Some(run_id));
 
         // Batch load
-        let all = mgr.load_session_summaries(agent_id, 10).unwrap();
+        let all = mgr.load_session_summaries(agent_id, 10, None).unwrap();
         assert_eq!(all.len(), 1);
 
         // Delete
@@ -588,7 +593,11 @@ mod tests {
             .unwrap();
 
         // load returns empty / None
-        assert!(mgr.load_session_summaries(agent_id, 10).unwrap().is_empty());
+        assert!(
+            mgr.load_session_summaries(agent_id, 10, None)
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             mgr.load_session_summary(agent_id, session_id)
                 .unwrap()
