@@ -9,6 +9,7 @@
 //! - `audit` -- audit event storage
 //! - `jobs` -- job CRUD
 //! - `summaries` -- rolling context summaries
+//! - `session_summaries` -- per-session episodic summaries (cross-session memory)
 //! - `agents` -- agent registry (CRUD, migration, etc.)
 //! - `runs` -- run persistence (save, load, mark_stale)
 //! - `tool_calls` -- per-run tool call records
