@@ -9,30 +9,38 @@ impl SqliteStore {
     ///
     /// Each session has at most one summary row.  Successive runs in the same
     /// session call this to extend or replace the summary text.
+    ///
+    /// `source_label` is a human-readable label derived from the session's
+    /// `context_id` (e.g. "User chat", "Telegram chat").  It is stored
+    /// alongside the summary so the injection formatter can produce
+    /// distinguished headers without needing access to the session table.
     pub fn upsert_session_summary(
         &self,
         agent_id: AgentId,
         session_id: SessionId,
         summary_text: &str,
         run_id: Option<RunId>,
+        source_label: Option<&str>,
     ) -> AlmsResult<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn
             .lock()
             .execute(
                 "INSERT INTO session_summaries \
-                     (agent_id, session_id, summary, last_run_id, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                     (agent_id, session_id, summary, last_run_id, updated_at, source_label) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT(agent_id, session_id) DO UPDATE SET \
-                     summary     = excluded.summary, \
-                     last_run_id = excluded.last_run_id, \
-                     updated_at  = excluded.updated_at",
+                     summary      = excluded.summary, \
+                     last_run_id  = excluded.last_run_id, \
+                     updated_at   = excluded.updated_at, \
+                     source_label = excluded.source_label",
                 params![
                     agent_id.0.to_string(),
                     session_id.0.to_string(),
                     summary_text,
                     run_id.map(|r| r.0.to_string()),
                     &now,
+                    source_label,
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite upsert_session_summary: {e}")))?;
@@ -56,14 +64,14 @@ impl SqliteStore {
         let (sql, exclude_str);
         if let Some(exclude) = exclude_session_id {
             exclude_str = exclude.0.to_string();
-            sql = "SELECT agent_id, session_id, summary, last_run_id, updated_at \
+            sql = "SELECT agent_id, session_id, summary, last_run_id, updated_at, source_label \
                    FROM session_summaries \
                    WHERE agent_id = ?1 AND session_id != ?3 \
                    ORDER BY updated_at DESC \
                    LIMIT ?2";
         } else {
             exclude_str = String::new(); // unused
-            sql = "SELECT agent_id, session_id, summary, last_run_id, updated_at \
+            sql = "SELECT agent_id, session_id, summary, last_run_id, updated_at, source_label \
                    FROM session_summaries \
                    WHERE agent_id = ?1 \
                    ORDER BY updated_at DESC \
@@ -117,7 +125,7 @@ impl SqliteStore {
     ) -> AlmsResult<Option<SessionSummary>> {
         let conn = self.conn.lock();
         let result = conn.query_row(
-            "SELECT agent_id, session_id, summary, last_run_id, updated_at \
+            "SELECT agent_id, session_id, summary, last_run_id, updated_at, source_label \
              FROM session_summaries \
              WHERE agent_id = ?1 AND session_id = ?2",
             params![agent_id.0.to_string(), session_id.0.to_string()],
@@ -152,13 +160,15 @@ impl SqliteStore {
 /// Parse a `session_summaries` row into a [`SessionSummary`].
 ///
 /// Expected column order:
-///   0: agent_id, 1: session_id, 2: summary, 3: last_run_id, 4: updated_at
+///   0: agent_id, 1: session_id, 2: summary, 3: last_run_id, 4: updated_at,
+///   5: source_label
 fn parse_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionSummary> {
     let agent_id_str: String = row.get(0)?;
     let session_id_str: String = row.get(1)?;
     let summary: String = row.get(2)?;
     let last_run_id_str: Option<String> = row.get(3)?;
     let updated_at_str: String = row.get(4)?;
+    let source_label: Option<String> = row.get(5)?;
 
     let agent_uuid = uuid::Uuid::parse_str(&agent_id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -181,6 +191,7 @@ fn parse_session_summary_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Sessio
         summary,
         last_run_id,
         updated_at: Timestamp(updated_at),
+        source_label,
     })
 }
 
@@ -202,6 +213,7 @@ mod tests {
                 session.id,
                 "Helped debug CORS issue.",
                 Some(run_id),
+                Some("User chat"),
             )
             .unwrap();
 
@@ -213,6 +225,7 @@ mod tests {
         assert_eq!(loaded.session_id, session.id);
         assert_eq!(loaded.summary, "Helped debug CORS issue.");
         assert_eq!(loaded.last_run_id, Some(run_id));
+        assert_eq!(loaded.source_label.as_deref(), Some("User chat"));
     }
 
     #[test]
@@ -223,7 +236,13 @@ mod tests {
 
         let run1 = RunId::new();
         store
-            .upsert_session_summary(session.agent_id, session.id, "First summary.", Some(run1))
+            .upsert_session_summary(
+                session.agent_id,
+                session.id,
+                "First summary.",
+                Some(run1),
+                Some("User chat"),
+            )
             .unwrap();
 
         let run2 = RunId::new();
@@ -233,6 +252,7 @@ mod tests {
                 session.id,
                 "Extended summary with more detail.",
                 Some(run2),
+                Some("User chat"),
             )
             .unwrap();
 
@@ -259,16 +279,16 @@ mod tests {
 
         // Insert in order; each subsequent call gets a later timestamp.
         store
-            .upsert_session_summary(agent_id, s1.id, "oldest", None)
+            .upsert_session_summary(agent_id, s1.id, "oldest", None, Some("User chat"))
             .unwrap();
         // Small sleep so timestamps differ (SQLite TEXT comparison)
         std::thread::sleep(std::time::Duration::from_millis(10));
         store
-            .upsert_session_summary(agent_id, s2.id, "middle", None)
+            .upsert_session_summary(agent_id, s2.id, "middle", None, Some("User chat"))
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
         store
-            .upsert_session_summary(agent_id, s3.id, "newest", None)
+            .upsert_session_summary(agent_id, s3.id, "newest", None, Some("User chat"))
             .unwrap();
 
         let all = store.load_session_summaries(agent_id, 10, None).unwrap();
@@ -288,7 +308,13 @@ mod tests {
             let s = Session::new(agent_id, format!("ctx-{i}"));
             store.save_session(&s).unwrap();
             store
-                .upsert_session_summary(agent_id, s.id, &format!("summary {i}"), None)
+                .upsert_session_summary(
+                    agent_id,
+                    s.id,
+                    &format!("summary {i}"),
+                    None,
+                    Some("User chat"),
+                )
                 .unwrap();
         }
 
@@ -308,10 +334,10 @@ mod tests {
         store.save_session(&sb).unwrap();
 
         store
-            .upsert_session_summary(agent_a, sa.id, "agent A summary", None)
+            .upsert_session_summary(agent_a, sa.id, "agent A summary", None, Some("User chat"))
             .unwrap();
         store
-            .upsert_session_summary(agent_b, sb.id, "agent B summary", None)
+            .upsert_session_summary(agent_b, sb.id, "agent B summary", None, Some("User chat"))
             .unwrap();
 
         let a_summaries = store.load_session_summaries(agent_a, 10, None).unwrap();
@@ -336,13 +362,13 @@ mod tests {
         store.save_session(&s3).unwrap();
 
         store
-            .upsert_session_summary(agent_id, s1.id, "summary-1", None)
+            .upsert_session_summary(agent_id, s1.id, "summary-1", None, Some("User chat"))
             .unwrap();
         store
-            .upsert_session_summary(agent_id, s2.id, "summary-2", None)
+            .upsert_session_summary(agent_id, s2.id, "summary-2", None, Some("User chat"))
             .unwrap();
         store
-            .upsert_session_summary(agent_id, s3.id, "summary-3", None)
+            .upsert_session_summary(agent_id, s3.id, "summary-3", None, Some("User chat"))
             .unwrap();
 
         // Without exclusion: all three returned
@@ -376,7 +402,13 @@ mod tests {
         store.save_session(&session).unwrap();
 
         store
-            .upsert_session_summary(session.agent_id, session.id, "to be deleted", None)
+            .upsert_session_summary(
+                session.agent_id,
+                session.id,
+                "to be deleted",
+                None,
+                Some("User chat"),
+            )
             .unwrap();
         assert!(
             store
@@ -412,7 +444,13 @@ mod tests {
         store.save_session(&session).unwrap();
 
         store
-            .upsert_session_summary(session.agent_id, session.id, "heuristic summary", None)
+            .upsert_session_summary(
+                session.agent_id,
+                session.id,
+                "heuristic summary",
+                None,
+                None,
+            )
             .unwrap();
 
         let loaded = store
@@ -421,5 +459,6 @@ mod tests {
             .expect("summary should exist");
         assert!(loaded.last_run_id.is_none());
         assert_eq!(loaded.summary, "heuristic summary");
+        assert!(loaded.source_label.is_none());
     }
 }

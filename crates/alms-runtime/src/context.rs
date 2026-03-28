@@ -21,7 +21,7 @@ impl ContextBuilder {
     /// Build the message list for an LLM call.
     ///
     /// Takes the full session history and produces a token-budgeted context window:
-    /// `[system_prompt, (summary if needed), recent_messages, current_input]`
+    /// `[system_prompt, (episodic?), (summary if needed), recent_messages, current_input]`
     ///
     /// `existing_summary` is only used when `strategy == "sliding-summary"`.
     /// Pass `None` for all other strategies.
@@ -38,10 +38,12 @@ impl ContextBuilder {
             current_input,
             existing_summary,
             None,
+            None,
         )
     }
 
-    /// Build the message list with optional perspective mapping.
+    /// Build the message list with optional perspective mapping and episodic
+    /// context injection.
     ///
     /// When `perspective_agent` is `Some("agent-name")`, messages in the session
     /// are role-mapped based on `from_agent` metadata:
@@ -50,6 +52,12 @@ impl ContextBuilder {
     ///
     /// This is used for shared DM/group sessions where all messages are stored
     /// as `Role::User` and the actual role depends on who is reading.
+    ///
+    /// When `episodic_summaries` is `Some(text)`, the text is injected as a
+    /// system message between the main system prompt and the session history.
+    /// Its token cost comes from the caller's pre-computed budget (via
+    /// `run_summary_budget`) and is subtracted from the available history
+    /// budget so episodic content never starves the current conversation.
     pub fn build_with_perspective(
         &self,
         system_prompt: &str,
@@ -57,6 +65,7 @@ impl ContextBuilder {
         current_input: &str,
         existing_summary: Option<&str>,
         perspective_agent: Option<&str>,
+        episodic_summaries: Option<&str>,
     ) -> Vec<LlmMessage> {
         let mut messages = Vec::new();
 
@@ -64,20 +73,28 @@ impl ContextBuilder {
         let system_tokens = estimate_tokens(system_prompt);
         messages.push(LlmMessage::system(system_prompt));
 
-        // 2. Current input (always included)
+        // 2. Episodic summaries from other sessions (injected between system
+        // prompt and session history so current session gets LLM recency bias).
+        let episodic_tokens = match episodic_summaries.filter(|s| !s.is_empty()) {
+            Some(text) => {
+                let tokens = estimate_tokens(text) + 4; // +4 for message overhead
+                messages.push(LlmMessage::system(text));
+                debug!(episodic_tokens = tokens, "Injected episodic summaries");
+                tokens
+            }
+            None => 0,
+        };
+
+        // 3. Current input (always included)
         let input_tokens = estimate_tokens(current_input);
 
-        // 3. Budget for history
-        let reserved = system_tokens + input_tokens + 500; // 500 token buffer for response
+        // 4. Budget for history — episodic tokens are subtracted from the
+        // available space so they do not eat into the history budget.
+        let reserved = system_tokens + input_tokens + episodic_tokens + 500;
         let history_budget = self.config.max_input_tokens.saturating_sub(reserved);
 
-        // Store perspective for use in session_msg_to_llm calls during strategy execution.
-        // Since the strategies call session_msg_to_llm internally, we thread the
-        // perspective through by temporarily storing it. This is a bit awkward but
-        // avoids modifying every strategy method signature.
-        //
-        // For now, we pre-map the history if perspective is set, then pass the
-        // mapped messages through the standard strategies.
+        // Pre-map the history if perspective is set, then pass the mapped
+        // messages through the standard strategies.
         let mapped_history: Vec<Message>;
         let history_ref = if let Some(agent) = perspective_agent {
             mapped_history = history
@@ -113,11 +130,11 @@ impl ContextBuilder {
             }
         }
 
-        // 3.5. Group consecutive assistant tool-call messages into single messages
+        // 5. Group consecutive assistant tool-call messages into single messages
         // with multiple tool_calls entries (required by OpenAI/Anthropic APIs).
         Self::group_tool_calls(&mut messages);
 
-        // 4. Current input (skip if empty — avoids sending a blank user message to the LLM)
+        // 6. Current input (skip if empty — avoids sending a blank user message to the LLM)
         if !current_input.is_empty() {
             messages.push(LlmMessage::user(current_input));
         }
@@ -1194,5 +1211,168 @@ mod tests {
             1,
             "second tool call should stay separate"
         );
+    }
+
+    // -- Episodic injection tests ------------------------------------------------
+
+    #[test]
+    fn test_episodic_injected_between_system_and_history() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "Hello"),
+            make_msg(Role::Assistant, "Hi there!"),
+        ];
+
+        let episodic = "Previous session: helped debug CORS.";
+        let messages = builder.build_with_perspective(
+            "You are helpful.",
+            &history,
+            "What's up?",
+            None,
+            None,
+            Some(episodic),
+        );
+
+        // system + episodic + 2 history + current input = 5
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0].role, "system"); // main system prompt
+        assert_eq!(messages[1].role, "system"); // episodic
+        assert!(messages[1].content_str().contains("CORS"));
+        assert_eq!(messages[2].role, "user"); // history
+        assert_eq!(messages[3].role, "assistant"); // history
+        assert_eq!(messages[4].role, "user"); // current input
+    }
+
+    #[test]
+    fn test_episodic_none_produces_no_extra_message() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![make_msg(Role::User, "Hello")];
+
+        let messages =
+            builder.build_with_perspective("System.", &history, "Input", None, None, None);
+
+        // system + 1 history + current input = 3 (no episodic)
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user"); // history
+        assert_eq!(messages[2].role, "user"); // input
+    }
+
+    #[test]
+    fn test_episodic_empty_string_produces_no_extra_message() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![make_msg(Role::User, "Hello")];
+
+        let messages =
+            builder.build_with_perspective("System.", &history, "Input", None, None, Some(""));
+
+        // system + 1 history + current input = 3 (empty episodic is skipped)
+        assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn test_episodic_budget_does_not_eat_history() {
+        // Budget: 600 tokens.  System ~5 tokens, input ~2 tokens, episodic ~33 tokens.
+        // Reserved = 5 + 2 + 33 + 500 = 540.  History budget = 600 - 540 = 60 tokens.
+        // Without episodic, history budget would be 600 - 507 = 93 tokens.
+        // This verifies that episodic tokens come from the total budget, not history.
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 600,
+            recent_window: 100,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        // Create many short history messages (~7 tokens each at chars/3)
+        let history: Vec<Message> = (0..20)
+            .map(|i| make_msg(Role::User, &format!("Short message number {i}")))
+            .collect();
+
+        // Without episodic
+        let msgs_no_episodic =
+            builder.build_with_perspective("System", &history, "Input", None, None, None);
+
+        // With a ~100-char (~33 token) episodic blob
+        let episodic = "This is a somewhat long episodic summary that takes up about one hundred characters in total size";
+        let msgs_with_episodic =
+            builder.build_with_perspective("System", &history, "Input", None, None, Some(episodic));
+
+        // With episodic, fewer history messages should fit (episodic takes from total budget)
+        let history_no = msgs_no_episodic.len() - 2; // subtract system + input
+        let history_with = msgs_with_episodic.len() - 3; // subtract system + episodic + input
+        assert!(
+            history_with < history_no,
+            "Episodic injection should reduce available history slots: \
+             without={history_no}, with={history_with}"
+        );
+    }
+
+    #[test]
+    fn test_episodic_with_sliding_summary() {
+        // When both episodic and sliding-summary are used, the context order
+        // should be: system -> episodic -> sliding-summary -> recent history -> input.
+        let config = ContextConfig {
+            strategy: "sliding-summary".into(),
+            max_input_tokens: 32000,
+            recent_window: 3,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history: Vec<Message> = (0..6)
+            .map(|i| make_msg(Role::User, &format!("msg {i}")))
+            .collect();
+
+        let episodic = "Cross-session: debugged CORS issue.";
+        let sliding = "Earlier the user asked about config.";
+        let messages = builder.build_with_perspective(
+            "System",
+            &history,
+            "current",
+            Some(sliding),
+            None,
+            Some(episodic),
+        );
+
+        // system + episodic + sliding-summary + 3 recent + current = 7
+        assert_eq!(messages.len(), 7);
+        assert_eq!(messages[0].role, "system"); // main system prompt
+        assert_eq!(messages[1].role, "system"); // episodic
+        assert!(messages[1].content_str().contains("CORS"));
+        assert_eq!(messages[2].role, "system"); // sliding-summary
+        assert!(messages[2].content_str().contains("Context summary"));
+        assert_eq!(messages[6].role, "user"); // current input
     }
 }
