@@ -462,7 +462,7 @@ impl ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
-    /// Provider: "openai" (default), "openrouter", or "anthropic"
+    /// Provider: "openrouter" (default), "openai", or "anthropic"
     pub provider: String,
     pub base_url: String,
     pub model: String,
@@ -481,7 +481,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            provider: "openai".into(),
+            provider: "openrouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             model: "moonshotai/kimi-k2.5".into(),
             api_key: None,

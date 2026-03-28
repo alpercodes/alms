@@ -275,7 +275,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            provider: "openai".to_string(),
+            provider: "openrouter".to_string(),
             api_key: String::new(),
             base_url: "https://openrouter.ai/api/v1".to_string(),
             default_model: "moonshotai/kimi-k2.5".to_string(),

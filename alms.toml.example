@@ -11,8 +11,8 @@ bind = "127.0.0.1:8080"
 # data_dir = "./data"
 
 [llm]
-# LLM provider: "openai" (OpenRouter-compatible, default) or "anthropic"
-provider = "openai"
+# LLM provider: "openrouter" (default), "openai", or "anthropic"
+provider = "openrouter"
 # provider base URL
 base_url = "https://openrouter.ai/api/v1"
 # model identifier
