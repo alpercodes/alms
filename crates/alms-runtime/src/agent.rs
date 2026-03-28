@@ -336,6 +336,15 @@ impl AgentRuntime {
         self
     }
 
+    /// Register the `list_my_sessions` tool for session self-awareness.
+    pub fn with_list_my_sessions(
+        self,
+        tool: crate::list_my_sessions_tool::ListMySessionsTool,
+    ) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
     /// Register the `read_messages` tool for reading DM conversation history.
     pub fn with_read_messages(self, tool: crate::read_messages_tool::ReadMessagesTool) -> Self {
         self.tools.register(std::sync::Arc::new(tool));

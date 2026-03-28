@@ -32,9 +32,18 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     };
     // Runtime-added tools (agent infrastructure, not subject to enabled filter)
     tools.extend(
-        ["invoke_agent", "get_task_result", "read_subagent_session"]
-            .iter()
-            .map(|s| s.to_string()),
+        [
+            "invoke_agent",
+            "get_task_result",
+            "read_subagent_session",
+            "send_message",
+            "list_agents",
+            "read_messages",
+            "ignore_message",
+            "list_my_sessions",
+        ]
+        .iter()
+        .map(|s| s.to_string()),
     );
     if state.workspace_dir.is_some() {
         tools.push("workspace_write".to_string());

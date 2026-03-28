@@ -711,11 +711,18 @@ async fn execute_run(state: AppState, params: RunParams) {
         let read_tool =
             alms_runtime::ReadMessagesTool::new(state.session_manager.clone(), name.clone());
         let ignore_tool = alms_runtime::IgnoreMessageTool::new();
+        let list_sessions_tool = alms_runtime::ListMySessionsTool::new(
+            state.session_manager.clone(),
+            agent_id,
+            session_id,
+            name.clone(),
+        );
         runtime = runtime
             .with_send_message(send_tool)
             .with_list_agents(list_tool)
             .with_read_messages(read_tool)
-            .with_ignore_message(ignore_tool);
+            .with_ignore_message(ignore_tool)
+            .with_list_my_sessions(list_sessions_tool);
     }
 
     // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals).
