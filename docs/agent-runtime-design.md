@@ -103,7 +103,13 @@ ALMS currently hardcodes `take(50)` messages in `agent.rs:158`. No compression, 
 │  │ (personality + goals + tool schemas)  │   │
 │  └──────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────┐   │
-│  │ Rolling Summary                       │   │
+│  │ Episodic Summaries (cross-session)    │   │
+│  │ "[Your conversation history...]"      │   │
+│  │ **User chat (last active: ...)**      │   │
+│  │  Helped debug CORS issue.             │   │
+│  └──────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────┐   │
+│  │ Rolling Summary (within-session)      │   │
 │  │ "Previously: user asked about X,      │   │
 │  │  agent built Y, decided Z..."         │   │
 │  └──────────────────────────────────────┘   │
@@ -220,7 +226,85 @@ On first interaction with an agent that has **empty/missing workspace files**, t
 
 ---
 
-## 4) How these connect
+## 4) Episodic Memory (Cross-Session Awareness)
+
+### Problem
+Agents have no awareness of what happened in previous sessions. Each new session starts from scratch with only workspace files for long-term identity. If the user discussed topic X in a Telegram chat yesterday, the agent in today's web session has no idea.
+
+### Design
+
+**Two distinct summary systems serve different purposes:**
+
+| System | Table | Scope | Purpose |
+|--------|-------|-------|---------|
+| **Context summaries** | `context_summaries` | Within a single session | Compress old messages so the current session fits in the context window. Used by `sliding-summary` strategy. |
+| **Session summaries** | `session_summaries` | Cross-session | One summary per session, updated after each run. Injected into *other* sessions to provide cross-session awareness. |
+
+**How session summaries are generated:**
+
+After each successful run, the gateway spawns a fire-and-forget `tokio::spawn` task that:
+1. Checks if the session type is eligible (subagent and episodic sessions are excluded via `derive_source_label`)
+2. Derives a human-readable source label from the `context_id` (e.g. "User chat", "Telegram chat", "DM with bob", "Scheduled job: ...")
+3. Loads the existing summary from `session_summaries` (if any)
+4. Generates a new or updated summary via the configured mode
+5. Upserts the result to `session_summaries` with the source label
+
+**Summary modes** (controlled by `context.run_summary_mode` in `alms.toml` or `ALMS_RUN_SUMMARY_MODE` env var):
+
+- **`off`** (default) — No summaries generated. No episodic injection.
+- **`heuristic`** — Deterministic, no LLM call. Produces a one-liner from the first ~120 chars of run input. Successive runs in the same session append entries; oldest lines are trimmed when total exceeds ~500 chars.
+- **`llm`** — Lightweight LLM call using `session_summarizer.md` prompt. Receives run input (~2000 chars), agent output (~2000 chars), and existing summary. Produces a concise 1-3 sentence evolving summary. Max 150 output tokens.
+
+**How episodic context is injected:**
+
+At the start of each run (in `build_context`), when `run_summary_mode != off`:
+1. Load all session summaries for this agent (excluding the current session) from SQLite
+2. Format them into a token-budgeted block with header and source-labelled entries (most recent first)
+3. Pass the formatted text to `build_with_perspective()` which injects it as a system message
+
+**Context assembly order:**
+```
+[System prompt] -> [Episodic summaries*] -> [Rolling summary*] -> [Recent messages] -> [Current input]
+```
+
+**Budget control:**
+- `context.run_summary_budget` (default: 2000 tokens) controls how many tokens episodic summaries can consume
+- Hard-capped at 15% of `max_input_tokens` — values exceeding the cap are clamped with a warning at config load time (`ContextConfig::normalize_episodic()`)
+- The episodic token cost is subtracted from the total context budget, reducing the space available for session history. This ensures episodic content never starves the current conversation.
+- Entries are added most-recent-first until the budget is exhausted; remaining entries are dropped.
+
+**Agent self-recall tools:**
+
+Two built-in tools let agents actively query their own session history (rather than passively receiving injected summaries):
+
+- **`list_my_sessions`** — Lists the agent's sessions across all channels (web, Telegram, DM, job). Returns session ID, context type, source label, message count, last activity, and episodic summary. Excludes internal sessions (subagent, episodic). Current session excluded by default.
+- **`read_session`** — Reads conversation history from a specific session by UUID. Returns last N messages and the episodic/context summary. Security: verifies session ownership (`agent_id` match or DM participant check with exact segment matching to prevent substring bypass).
+
+**Storage schema:**
+
+```sql
+CREATE TABLE session_summaries (
+    agent_id     TEXT NOT NULL,
+    session_id   TEXT NOT NULL REFERENCES sessions(id),
+    summary      TEXT NOT NULL DEFAULT '',
+    last_run_id  TEXT,
+    updated_at   TEXT NOT NULL,
+    source_label TEXT,
+    PRIMARY KEY (agent_id, session_id)
+);
+CREATE INDEX idx_session_summaries_agent
+    ON session_summaries(agent_id, updated_at DESC);
+```
+
+### Known limitations
+
+- **Race condition on concurrent runs:** Two concurrent runs for the same session can both load the same base summary, generate independently, and the last writer wins. Acceptable for MVP since concurrent runs on the same session are rare.
+- **No summary eviction:** Summaries accumulate indefinitely. A future cleanup job should prune summaries for sessions that have been idle beyond a threshold.
+- **Heuristic mode is input-only:** It captures what the user asked, not what the agent did. LLM mode produces more useful summaries but costs tokens.
+
+---
+
+## 5) How these connect
 
 ```
 alms.toml (config)
@@ -248,7 +332,7 @@ ContextBuilder (per run)
 
 ---
 
-## 5) Implementation order
+## 6) Implementation order
 
 1. **Config system** — `AlmsConfig` struct, `alms.toml` loading, validation. Small, foundational, unblocks everything.
 2. **ContextBuilder** — token counting, sliding window, replaces hardcoded `take(50)`. This is the core improvement.
@@ -258,4 +342,4 @@ ContextBuilder (per run)
 
 ---
 
-*Design by Atlas (2026-02-14). Implements requirements from `docs/agent-ux-requirements.md`.*
+*Design by Atlas (2026-02-14). Episodic memory section added 2026-03-28. Implements requirements from `docs/agent-ux-requirements.md`.*
