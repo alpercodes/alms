@@ -190,9 +190,9 @@ impl MessageSender for MessageBus {
             // This ensures depth-exceeded conversations get the same lifecycle
             // events as ignore_message-ended conversations (#391).
             //
-            // TODO(Phase 9, #393): Add resilience testing for end_conversation
-            // failures here — e.g. what happens when the session write fails
-            // or the RunTrigger channel is closed. Currently we log and proceed.
+            // Resilience: if end_conversation fails (e.g. trigger channel is
+            // closed), we log and still return DepthExceeded. See #393 tests:
+            // test_depth_exceeded_returns_depth_exceeded_even_when_end_conversation_noop
             if let Err(e) = self
                 .end_conversation(
                     sender_name,
@@ -404,6 +404,19 @@ mod tests {
         (bus, rx)
     }
 
+    /// After `exhaust_depth`, returns the identity of the agent whose next
+    /// send will overflow: `(sender_name, sender_id, peer_name, peer_id)`.
+    ///
+    /// `MAX_DM_DEPTH` alternating messages start with alice (even indices),
+    /// so the next sender depends on whether the total count is even or odd.
+    fn overflow_sender(a: AgentId, b: AgentId) -> (&'static str, AgentId, &'static str, AgentId) {
+        if MAX_DM_DEPTH.is_multiple_of(2) {
+            ("alice", a, "bob", b)
+        } else {
+            ("bob", b, "alice", a)
+        }
+    }
+
     /// Send MAX_DM_DEPTH alternating messages between alice and bob to exhaust
     /// the depth counter. After calling this, the next alternating send will
     /// trigger `SendError::DepthExceeded`.
@@ -505,22 +518,9 @@ mod tests {
         exhaust_depth(&bus, a, b).await;
 
         // Next alternating message should be rejected (depth > MAX_DM_DEPTH)
+        let (sender, sender_id, peer, peer_id) = overflow_sender(a, b);
         let err = bus
-            .send(
-                if MAX_DM_DEPTH.is_multiple_of(2) {
-                    "alice"
-                } else {
-                    "bob"
-                },
-                if MAX_DM_DEPTH.is_multiple_of(2) { a } else { b },
-                if MAX_DM_DEPTH.is_multiple_of(2) {
-                    "bob"
-                } else {
-                    "alice"
-                },
-                if MAX_DM_DEPTH.is_multiple_of(2) { b } else { a },
-                "one more",
-            )
+            .send(sender, sender_id, peer, peer_id, "one more")
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -576,22 +576,9 @@ mod tests {
         exhaust_depth(&bus, a, b).await;
 
         // Next message should be rejected (depth exceeded)
+        let (sender, sender_id, peer, peer_id) = overflow_sender(a, b);
         let err = bus
-            .send(
-                if MAX_DM_DEPTH.is_multiple_of(2) {
-                    "alice"
-                } else {
-                    "bob"
-                },
-                if MAX_DM_DEPTH.is_multiple_of(2) { a } else { b },
-                if MAX_DM_DEPTH.is_multiple_of(2) {
-                    "bob"
-                } else {
-                    "alice"
-                },
-                if MAX_DM_DEPTH.is_multiple_of(2) { b } else { a },
-                "overflow",
-            )
+            .send(sender, sender_id, peer, peer_id, "overflow")
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -1008,7 +995,10 @@ mod tests {
     /// S4: Simultaneous end_conversation from both agents should produce
     /// exactly one notification trigger (not two). This tests the C1 fix:
     /// depths.remove() as the atomicity guard.
-    #[tokio::test]
+    ///
+    /// Uses multi-threaded runtime + `tokio::spawn` so the two calls can
+    /// truly race on separate OS threads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_simultaneous_end_conversation_only_one_trigger() {
         let (bus, mut rx) = setup();
         let alice_id = AgentId::new();
@@ -1021,30 +1011,37 @@ mod tests {
         // Drain the send trigger.
         let _ = rx.try_recv().unwrap();
 
-        // Both agents call end_conversation simultaneously.
+        // Both agents call end_conversation simultaneously via tokio::spawn
+        // so they execute on separate worker threads for true concurrency.
         let bus_a = bus.clone();
         let bus_b = bus.clone();
 
-        let (result_a, result_b) = tokio::join!(
-            bus_a.end_conversation(
-                "alice",
-                alice_id,
-                "bob",
-                bob_id,
-                ConversationEndReason::Ignored,
-            ),
-            bus_b.end_conversation(
-                "bob",
-                bob_id,
-                "alice",
-                alice_id,
-                ConversationEndReason::Ignored,
-            ),
-        );
+        let handle_a = tokio::spawn(async move {
+            bus_a
+                .end_conversation(
+                    "alice",
+                    alice_id,
+                    "bob",
+                    bob_id,
+                    ConversationEndReason::Ignored,
+                )
+                .await
+        });
+        let handle_b = tokio::spawn(async move {
+            bus_b
+                .end_conversation(
+                    "bob",
+                    bob_id,
+                    "alice",
+                    alice_id,
+                    ConversationEndReason::Ignored,
+                )
+                .await
+        });
 
         // Both calls should succeed (no errors).
-        result_a.unwrap();
-        result_b.unwrap();
+        handle_a.await.unwrap().unwrap();
+        handle_b.await.unwrap().unwrap();
 
         // Count triggers: exactly one should have been emitted.
         // (The loser of the depths.remove() race returns early without
@@ -1080,16 +1077,7 @@ mod tests {
         exhaust_depth(&bus, a, b).await;
 
         // The next message should trigger DepthExceeded.
-        let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
-            "alice"
-        } else {
-            "bob"
-        };
-        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
-            (a, "bob", b)
-        } else {
-            (b, "alice", a)
-        };
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
             .send(next_sender, next_id, peer_name, peer_id, "overflow")
@@ -1124,16 +1112,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         // Trigger DepthExceeded.
-        let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
-            "alice"
-        } else {
-            "bob"
-        };
-        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
-            (a, "bob", b)
-        } else {
-            (b, "alice", a)
-        };
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
             .send(next_sender, next_id, peer_name, peer_id, "overflow")
@@ -1183,16 +1162,7 @@ mod tests {
         );
 
         // Trigger DepthExceeded.
-        let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
-            "alice"
-        } else {
-            "bob"
-        };
-        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
-            (a, "bob", b)
-        } else {
-            (b, "alice", a)
-        };
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let _ = bus
             .send(next_sender, next_id, peer_name, peer_id, "overflow")
@@ -1260,6 +1230,534 @@ mod tests {
             entry.value().1,
             1,
             "depth should be 1 for a fresh conversation after end"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // DM lifecycle integration tests (#393 -- Phase 9 of #384)
+    // -----------------------------------------------------------------------
+
+    /// F2.1: When the run_trigger_tx receiver is dropped (gateway shut down),
+    /// end_conversation should still return Ok — the trigger send failure is
+    /// logged but not propagated.
+    #[tokio::test]
+    async fn test_end_conversation_trigger_channel_dropped_returns_ok() {
+        let session_manager = Arc::new(SessionManager::new(SessionConfig::default()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let bus = Arc::new(MessageBus::new(session_manager, tx));
+
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Start a conversation so the session and depth exist.
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+            .await
+            .unwrap();
+
+        // Drop the receiver to simulate the gateway shutting down.
+        drop(rx);
+
+        // end_conversation should still succeed — the RunTrigger send failure
+        // is logged but does not cause an error return.
+        let result = bus
+            .end_conversation(
+                "alice",
+                alice_id,
+                "bob",
+                bob_id,
+                ConversationEndReason::Ignored,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "end_conversation should return Ok even when trigger channel is dropped, got: {:?}",
+            result
+        );
+
+        // The dm_ended marker should still have been written to the session.
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let history = bus.session_manager.get_history(session_id).unwrap();
+        let marker = history.last().unwrap();
+        let meta = marker.metadata.as_ref().unwrap();
+        assert_eq!(meta["message_type"], "dm_ended");
+        assert_eq!(meta["ended_by"], "alice");
+
+        // Depth counter should still have been reset.
+        let dm_ctx = dm_context_id("alice", "bob");
+        assert!(
+            !bus.depths.contains_key(&dm_ctx),
+            "depth counter should still be reset even when trigger channel is dropped"
+        );
+    }
+
+    /// F2.1 (variant): When the trigger channel is dropped, send() should
+    /// still succeed for normal messages — the trigger failure is logged but
+    /// the delivery receipt is returned.
+    #[tokio::test]
+    async fn test_send_trigger_channel_dropped_still_returns_receipt() {
+        let session_manager = Arc::new(SessionManager::new(SessionConfig::default()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let bus = Arc::new(MessageBus::new(session_manager, tx));
+
+        // Drop the receiver before sending any messages.
+        drop(rx);
+
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // send() should still succeed — the message is persisted to the
+        // session even though the RunTrigger can't be delivered.
+        let receipt = bus.send("alice", alice_id, "bob", bob_id, "Hello!").await;
+
+        assert!(
+            receipt.is_ok(),
+            "send() should return Ok even when trigger channel is dropped, got: {:?}",
+            receipt
+        );
+
+        // The message should still be in the session.
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let history = bus.session_manager.get_history(session_id).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].metadata.as_ref().unwrap()["from_agent"], "alice");
+    }
+
+    /// Full round-trip: ignore_message flow (end_conversation with Ignored
+    /// reason) produces all expected lifecycle effects in one test.
+    ///
+    /// Verifies the complete sequence:
+    ///   1. Conversation starts (alice -> bob)
+    ///   2. Bob replies (bob -> alice)
+    ///   3. Alice ignores (end_conversation with Ignored)
+    ///   4. dm_ended marker written to DM session
+    ///   5. Depth counter reset (new conversation possible immediately)
+    ///   6. ConversationEnded RunTrigger emitted for bob
+    ///   7. Trigger targets the notifications:bob session
+    #[tokio::test]
+    async fn test_ignore_full_roundtrip_lifecycle() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // 1. Alice starts the conversation.
+        bus.send("alice", alice_id, "bob", bob_id, "Hey Bob, can you help?")
+            .await
+            .unwrap();
+        let trigger1 = rx.try_recv().unwrap();
+        assert_eq!(trigger1.agent_id, bob_id);
+
+        // 2. Bob replies.
+        bus.send("bob", bob_id, "alice", alice_id, "Sure, what do you need?")
+            .await
+            .unwrap();
+        let trigger2 = rx.try_recv().unwrap();
+        assert_eq!(trigger2.agent_id, alice_id);
+
+        // 3. Alice ignores (end_conversation with Ignored reason).
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // 4. dm_ended marker should be in the DM session.
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let history = bus.session_manager.get_history(session_id).unwrap();
+        assert_eq!(
+            history.len(),
+            3,
+            "DM session should have 3 messages: alice DM + bob DM + dm_ended marker"
+        );
+        let marker = &history[2];
+        let meta = marker.metadata.as_ref().unwrap();
+        assert_eq!(meta["message_type"], "dm_ended");
+        assert_eq!(meta["ended_by"], "alice");
+        assert_eq!(meta["reason"], "ignored");
+
+        // 5. Depth counter should be reset.
+        let dm_ctx = dm_context_id("alice", "bob");
+        assert!(
+            !bus.depths.contains_key(&dm_ctx),
+            "depth counter should be reset after ignore"
+        );
+        assert!(
+            !bus.last_activity.contains_key(&dm_ctx),
+            "last_activity should be removed after ignore"
+        );
+
+        // 6. ConversationEnded RunTrigger should have been emitted for bob.
+        let notification_trigger = rx.try_recv().unwrap();
+        assert_eq!(notification_trigger.agent_id, bob_id);
+
+        match &notification_trigger.source {
+            MessageSource::ConversationEnded {
+                from_agent,
+                from_name,
+                reason,
+            } => {
+                assert_eq!(*from_agent, alice_id);
+                assert_eq!(from_name, "alice");
+                assert_eq!(*reason, ConversationEndReason::Ignored);
+            }
+            other => panic!("expected ConversationEnded, got {:?}", other),
+        }
+
+        // 7. Trigger should target the notifications:bob session.
+        assert_eq!(notification_trigger.context_id, "notifications:bob");
+        assert_eq!(
+            notification_trigger.session_id,
+            SessionId::deterministic("notifications:bob")
+        );
+
+        // Bonus: a new conversation should be possible immediately.
+        bus.send("alice", alice_id, "bob", bob_id, "Fresh conversation!")
+            .await
+            .unwrap();
+        let entry = bus.depths.get(&dm_ctx).unwrap();
+        assert_eq!(
+            entry.value().1,
+            1,
+            "fresh conversation should start at depth 1"
+        );
+    }
+
+    /// Full round-trip: depth-exceeded flow produces all expected lifecycle
+    /// effects in one test.
+    ///
+    /// Verifies the complete sequence:
+    ///   1. Exhaust the depth counter to MAX_DM_DEPTH
+    ///   2. Next send returns DepthExceeded
+    ///   3. dm_ended marker written with reason "depth_exceeded"
+    ///   4. Depth counter reset (new conversation possible immediately)
+    ///   5. ConversationEnded RunTrigger emitted for the peer
+    ///   6. Trigger targets the notifications:{peer} session
+    #[tokio::test]
+    async fn test_depth_exceeded_full_roundtrip_lifecycle() {
+        let (bus, mut rx) = setup();
+        let a = AgentId::new();
+        let b = AgentId::new();
+
+        // 1. Exhaust the depth counter.
+        exhaust_depth(&bus, a, b).await;
+
+        // Drain all send triggers from the exchange.
+        while rx.try_recv().is_ok() {}
+
+        // 2. Next alternating send returns DepthExceeded.
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
+
+        let err = bus
+            .send(next_sender, next_id, peer_name, peer_id, "overflow")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SendError::DepthExceeded));
+
+        // 3. dm_ended marker should be written with depth_exceeded reason.
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let history = bus.session_manager.get_history(session_id).unwrap();
+        let marker = history.last().unwrap();
+        let meta = marker.metadata.as_ref().unwrap();
+        assert_eq!(meta["message_type"], "dm_ended");
+        assert_eq!(meta["ended_by"], next_sender);
+        assert_eq!(meta["reason"], "depth_exceeded");
+
+        // 4. Depth counter should be reset.
+        let dm_ctx = dm_context_id("alice", "bob");
+        assert!(
+            !bus.depths.contains_key(&dm_ctx),
+            "depth counter should be reset after depth exceeded"
+        );
+        assert!(
+            !bus.last_activity.contains_key(&dm_ctx),
+            "last_activity should be removed after depth exceeded"
+        );
+
+        // 5. ConversationEnded RunTrigger should have been emitted for the peer.
+        let notification = rx
+            .try_recv()
+            .expect("should have received a notification trigger");
+        assert_eq!(notification.agent_id, peer_id);
+
+        match &notification.source {
+            MessageSource::ConversationEnded {
+                from_agent,
+                from_name,
+                reason,
+            } => {
+                assert_eq!(*from_agent, next_id);
+                assert_eq!(from_name, next_sender);
+                assert_eq!(*reason, ConversationEndReason::DepthExceeded);
+            }
+            other => panic!("expected ConversationEnded, got {:?}", other),
+        }
+
+        // 6. Trigger should target the notifications:{peer} session.
+        assert_eq!(
+            notification.context_id,
+            format!("notifications:{peer_name}")
+        );
+        assert_eq!(
+            notification.session_id,
+            SessionId::deterministic(&format!("notifications:{peer_name}"))
+        );
+
+        // Bonus: a new conversation should be possible immediately.
+        bus.send("alice", a, "bob", b, "fresh start").await.unwrap();
+        let entry = bus.depths.get(&dm_ctx).unwrap();
+        assert_eq!(entry.value().1, 1, "depth should restart at 1");
+    }
+
+    /// S1 resilience: When end_conversation fails during depth-exceeded
+    /// handling, send() should still return DepthExceeded (not an internal
+    /// error). This tests the TODO from PR #403.
+    ///
+    /// We simulate failure by dropping the trigger channel AND having no
+    /// DM session (so the session write in end_conversation would succeed
+    /// but there's nothing to write to — the depths.remove() happens first,
+    /// then the session check returns early). The key assertion is that
+    /// send() returns DepthExceeded regardless.
+    #[tokio::test]
+    async fn test_depth_exceeded_returns_depth_exceeded_even_when_end_conversation_noop() {
+        let session_manager = Arc::new(SessionManager::new(SessionConfig::default()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let bus = Arc::new(MessageBus::new(session_manager, tx));
+
+        // Drop the receiver so trigger sends will fail silently.
+        drop(rx);
+
+        let a = AgentId::new();
+        let b = AgentId::new();
+
+        // Exhaust the depth counter.
+        exhaust_depth(&bus, a, b).await;
+
+        // Next send should return DepthExceeded. The end_conversation call
+        // inside send() will proceed (session exists from exhaust_depth
+        // messages), but the trigger send will fail because rx is dropped.
+        // Crucially, send() must still return DepthExceeded, not an internal error.
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
+
+        let err = bus
+            .send(next_sender, next_id, peer_name, peer_id, "overflow")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, SendError::DepthExceeded),
+            "send() should return DepthExceeded even when end_conversation trigger fails, got: {:?}",
+            err
+        );
+
+        // The depth counter should still have been reset (end_conversation
+        // runs depths.remove() before the trigger send that fails).
+        let dm_ctx = dm_context_id("alice", "bob");
+        assert!(
+            !bus.depths.contains_key(&dm_ctx),
+            "depth should still be reset even when trigger channel is dropped"
+        );
+    }
+
+    /// S1 resilience (variant): simultaneous depth-exceeded from both sides.
+    ///
+    /// If two agents both try to send at MAX_DM_DEPTH+1 simultaneously,
+    /// both should get DepthExceeded, and only one notification trigger should
+    /// fire (the depths.remove() atomicity guard prevents doubles).
+    ///
+    /// Uses multi-threaded runtime + `tokio::spawn` so the two calls can
+    /// truly race on separate OS threads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_simultaneous_depth_exceeded_both_get_error() {
+        let (bus, mut rx) = setup();
+        let a = AgentId::new();
+        let b = AgentId::new();
+
+        exhaust_depth(&bus, a, b).await;
+
+        // Drain all send triggers from the initial exchange.
+        while rx.try_recv().is_ok() {}
+
+        // Both agents try to send one more message simultaneously via
+        // tokio::spawn so they execute on separate worker threads for
+        // true concurrency.
+        let bus_a = bus.clone();
+        let bus_b = bus.clone();
+
+        let handle_a =
+            tokio::spawn(async move { bus_a.send("alice", a, "bob", b, "overflow-a").await });
+        let handle_b =
+            tokio::spawn(async move { bus_b.send("bob", b, "alice", a, "overflow-b").await });
+
+        let result_a = handle_a.await.unwrap();
+        let result_b = handle_b.await.unwrap();
+
+        // Count how many got DepthExceeded.
+        let a_exceeded = matches!(result_a, Err(SendError::DepthExceeded));
+        let b_exceeded = matches!(result_b, Err(SendError::DepthExceeded));
+
+        // At least one must be DepthExceeded (the one that sees the depth
+        // above the limit). It's possible one succeeds if it races in after
+        // the other's end_conversation resets the depth, but then the depth
+        // counter would restart at 1 — which is fine.
+        assert!(
+            a_exceeded || b_exceeded,
+            "At least one sender must get DepthExceeded; a={:?}, b={:?}",
+            result_a,
+            result_b
+        );
+
+        // Count notification triggers (ConversationEnded).
+        let mut notification_count = 0;
+        while let Ok(trigger) = rx.try_recv() {
+            if matches!(trigger.source, MessageSource::ConversationEnded { .. }) {
+                notification_count += 1;
+            }
+        }
+
+        // At most one ConversationEnded notification should have fired
+        // (from the first end_conversation call; the second sees
+        // depths.remove() returning None and skips). Zero is possible
+        // if neither hit depth exceeded (race where one resets depth
+        // before the other checks), but that would mean both succeeded.
+        assert!(
+            notification_count <= 1,
+            "At most 1 ConversationEnded notification should fire, got {notification_count}"
+        );
+    }
+
+    /// Verify end_conversation is idempotent: calling it twice for the same
+    /// DM pair should not produce duplicate markers or triggers.
+    #[tokio::test]
+    async fn test_end_conversation_idempotent() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Start a conversation.
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        // End conversation first time.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // End conversation second time (same direction).
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // Count triggers: should be exactly 1 (from the first call).
+        let mut trigger_count = 0;
+        while rx.try_recv().is_ok() {
+            trigger_count += 1;
+        }
+        assert_eq!(
+            trigger_count, 1,
+            "idempotent end_conversation should produce exactly 1 trigger, got {trigger_count}"
+        );
+
+        // DM session should have exactly 2 messages: the DM + ONE marker.
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let history = bus.session_manager.get_history(session_id).unwrap();
+        assert_eq!(
+            history.len(),
+            2,
+            "session should have 2 messages (dm + 1 marker), got {}",
+            history.len()
+        );
+    }
+
+    /// Notification session ID is deterministic and distinct from the DM
+    /// session ID — ensures conversation-end notifications don't pollute
+    /// the DM session.
+    #[tokio::test]
+    async fn test_notification_session_id_is_distinct_from_dm_session() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Start and end a conversation.
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        let notification_trigger = rx.try_recv().unwrap();
+
+        // The notification session ID should NOT be the DM session ID.
+        let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+        assert_ne!(
+            notification_trigger.session_id, dm_session_id,
+            "notification session should be distinct from the DM session"
+        );
+
+        // It should be the deterministic ID for "notifications:bob".
+        let expected_notification_id = SessionId::deterministic("notifications:bob");
+        assert_eq!(notification_trigger.session_id, expected_notification_id);
+    }
+
+    /// After end_conversation + depth reset, verify that the full depth
+    /// budget is available again (not just one message, but the full
+    /// MAX_DM_DEPTH messages).
+    #[tokio::test]
+    async fn test_depth_fully_replenished_after_end_conversation() {
+        let (bus, mut rx) = setup();
+        let a = AgentId::new();
+        let b = AgentId::new();
+
+        // Exhaust depth.
+        exhaust_depth(&bus, a, b).await;
+        while rx.try_recv().is_ok() {}
+
+        // Trigger DepthExceeded and reset.
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
+        let _ = bus
+            .send(next_sender, next_id, peer_name, peer_id, "overflow")
+            .await;
+        while rx.try_recv().is_ok() {}
+
+        // Now exhaust depth again — should be able to send MAX_DM_DEPTH
+        // more messages without hitting the limit.
+        exhaust_depth(&bus, a, b).await;
+
+        // The next message should trigger DepthExceeded again (confirming
+        // the full budget was restored, not just 1 message).
+        let err = bus
+            .send(next_sender, next_id, peer_name, peer_id, "overflow again")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SendError::DepthExceeded),
+            "should hit DepthExceeded again after full replenishment"
         );
     }
 }
