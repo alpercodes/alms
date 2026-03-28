@@ -285,7 +285,9 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
         return None;
     }
 
-    let source = derive_source_label(&params.context_id, &params.agent_name)?;
+    // Still call derive_source_label to filter out subagent sessions (returns
+    // None for excluded session types, triggering early return via `?`).
+    let _source = derive_source_label(&params.context_id, &params.agent_name)?;
 
     // Build the new entry line.
     let snippet = truncate_to_char_boundary(&params.run_input, HEURISTIC_INPUT_BYTES);
@@ -294,7 +296,7 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
     } else {
         ""
     };
-    let entry = format!("{}: \"{snippet}{ellipsis}\"", source.source_label);
+    let entry = format!("\"{snippet}{ellipsis}\"");
 
     // Append to existing summary (if any).
     let combined = match &params.existing_summary {
@@ -627,7 +629,7 @@ mod tests {
     fn test_heuristic_basic_format() {
         let params = heuristic_params("How do I configure CORS?", "web-chat-123", None);
         let result = generate_heuristic(&params).unwrap();
-        assert_eq!(result, "User chat: \"How do I configure CORS?\"");
+        assert_eq!(result, "\"How do I configure CORS?\"");
     }
 
     #[test]
@@ -637,7 +639,7 @@ mod tests {
         let result = generate_heuristic(&params).unwrap();
         assert!(result.ends_with("...\""));
         // The snippet inside quotes should be ~120 chars
-        let inner = &result["User chat: \"".len()..result.len() - 4]; // strip trailing ...\"
+        let inner = &result["\"".len()..result.len() - 4]; // strip trailing ...\"
         assert_eq!(inner.len(), 120);
     }
 
@@ -649,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_heuristic_appends_to_existing() {
-        let existing = "User chat: \"First question about CORS\"";
+        let existing = "\"First question about CORS\"";
         let params = heuristic_params("Second question about auth", "web-chat-123", Some(existing));
         let result = generate_heuristic(&params).unwrap();
         assert!(result.contains("First question about CORS"));
@@ -664,7 +666,7 @@ mod tests {
         let mut existing_lines: Vec<String> = Vec::new();
         for i in 0..10 {
             existing_lines.push(format!(
-                "User chat: \"Question number {i} about something fairly long to fill space\""
+                "\"Question number {i} about something fairly long to fill space\""
             ));
         }
         let existing = existing_lines.join("\n");
@@ -704,8 +706,8 @@ mod tests {
         let params = heuristic_params_with_name("Hello", "dm:alice:bob", None, "alice");
         let result = generate_heuristic(&params).unwrap();
         assert!(
-            result.starts_with("DM with bob:"),
-            "DM session should produce a summary with peer label, got: {result}"
+            result.starts_with('"'),
+            "DM session summary should not include source_label prefix, got: {result}"
         );
     }
 
@@ -719,14 +721,20 @@ mod tests {
     fn test_heuristic_telegram_label() {
         let params = heuristic_params("Hello from telegram", "telegram_bot_12345", None);
         let result = generate_heuristic(&params).unwrap();
-        assert!(result.starts_with("Telegram chat: "));
+        assert!(
+            result.starts_with('"'),
+            "Telegram summary should not include source_label prefix, got: {result}"
+        );
     }
 
     #[test]
     fn test_heuristic_job_label() {
         let params = heuristic_params("Generate daily report", "job_daily-report", None);
         let result = generate_heuristic(&params).unwrap();
-        assert!(result.starts_with("Scheduled job: daily-report: "));
+        assert!(
+            result.starts_with('"'),
+            "Job summary should not include source_label prefix, got: {result}"
+        );
     }
 
     // -- trim_oldest_lines --------------------------------------------------
@@ -819,7 +827,10 @@ mod tests {
         };
         let result = generate_session_summary(&llm, &params).await.unwrap();
         assert!(result.contains("How do I set up CORS?"));
-        assert!(result.starts_with("User chat:"));
+        assert!(
+            result.starts_with('"'),
+            "Heuristic summary should not include source_label prefix, got: {result}"
+        );
     }
 
     #[tokio::test]
@@ -923,8 +934,8 @@ mod tests {
         assert!(result.is_some(), "DM sessions should now produce summaries");
         let text = result.unwrap();
         assert!(
-            text.starts_with("DM with bob:"),
-            "DM summary should use peer label, got: {text}"
+            text.starts_with('"'),
+            "DM summary should not include source_label prefix, got: {text}"
         );
     }
 
