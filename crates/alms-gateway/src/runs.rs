@@ -927,7 +927,7 @@ async fn execute_run(state: AppState, params: RunParams) {
                             peer = %peer_name,
                             "DM run ended with ignore_message — signalling conversation end"
                         );
-                        if let Err(e) = state
+                        match state
                             .message_bus
                             .end_conversation(
                                 name,
@@ -938,9 +938,30 @@ async fn execute_run(state: AppState, params: RunParams) {
                             )
                             .await
                         {
-                            warn!(
-                                "Failed to signal conversation end for {name} -> {peer_name}: {e}"
-                            );
+                            Ok(()) => {
+                                // Emit dm_conversation_ended SSE event on the
+                                // DM session stream so the web UI can show a
+                                // "conversation ended" indicator. Phase 6 of #384.
+                                state
+                                    .run_manager
+                                    .send_session_event(
+                                        session_id,
+                                        run_id,
+                                        SseEventData::dm_conversation_ended(
+                                            session_id,
+                                            name,
+                                            &peer_name,
+                                            "ignored",
+                                            &context_id,
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to signal conversation end for {name} -> {peer_name}: {e}"
+                                );
+                            }
                         }
                     } else {
                         warn!(
