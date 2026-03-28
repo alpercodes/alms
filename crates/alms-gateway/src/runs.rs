@@ -1473,7 +1473,7 @@ fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> S
 /// This is used by `run_trigger_loop` when it receives a
 /// `MessageSource::ConversationEnded` trigger.  The notification tells the
 /// peer agent that the DM conversation has ended, includes the reason, and
-/// suggests using `read_session` to review what was discussed.
+/// suggests using `read_messages` to review what was discussed.
 fn format_dm_ended_notification(from_name: &str, reason: ConversationEndReason) -> String {
     let reason_text = match reason {
         ConversationEndReason::Ignored => {
@@ -1490,10 +1490,10 @@ fn format_dm_ended_notification(from_name: &str, reason: ConversationEndReason) 
     format!(
         "[DM conversation ended] {reason_text}\n\
          \n\
-         You can use read_session(\"dm:{a}:...\") or list_my_sessions() to review \
-         the conversation history. Decide what to do next: report results, update \
-         your goals/memories, or take other action.",
-        a = from_name,
+         You can use read_messages(from: \"{from}\") to review the conversation \
+         history. Decide what to do next: report results, update your \
+         goals/memories, or take other action.",
+        from = from_name,
     )
 }
 
@@ -2272,8 +2272,8 @@ mod tests {
             "Ignored reason should explain the agent chose not to reply"
         );
         assert!(
-            msg.contains("read_session") || msg.contains("list_my_sessions"),
-            "notification should hint at tools for reviewing the conversation"
+            msg.contains("read_messages"),
+            "notification should hint at read_messages for reviewing the conversation"
         );
     }
 
@@ -2293,8 +2293,8 @@ mod tests {
             "DepthExceeded reason should mention the depth limit"
         );
         assert!(
-            msg.contains("read_session") || msg.contains("list_my_sessions"),
-            "notification should hint at tools for reviewing the conversation"
+            msg.contains("read_messages"),
+            "notification should hint at read_messages for reviewing the conversation"
         );
     }
 
