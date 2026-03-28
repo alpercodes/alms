@@ -51,12 +51,18 @@ impl ReadSessionTool {
         }
 
         // Case 2: shared DM session (agent_id is nil UUID sentinel).
-        // Access is granted if the agent's name appears in the context_id.
+        // Access is granted if the agent's name exactly matches one of the
+        // colon-delimited segments in the context_id (pattern: "dm:{name1}:{name2}").
+        // We compare exact segments to prevent substring false-positives
+        // (e.g. agent "al" must NOT match "dm:alice:bob").
         let nil_sentinel = AgentId(uuid::Uuid::nil());
         if session.agent_id == nil_sentinel {
             if let Some(ref name) = self.agent_name {
-                // DM context_ids follow the pattern "dm:{name1}:{name2}"
-                if session.context_id.contains(name) {
+                let segments: Vec<&str> = session.context_id.split(':').collect();
+                if segments.len() >= 3
+                    && segments[0] == "dm"
+                    && (segments[1] == name || segments[2] == name)
+                {
                     return Ok(());
                 }
             }
@@ -193,24 +199,51 @@ impl Tool for ReadSessionTool {
 
         let total = messages.len();
         let start = total.saturating_sub(last_n);
+
+        let is_dm = session.context_id.starts_with("dm:");
+
         let recent: Vec<Value> = messages[start..]
             .iter()
             .map(|m| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "role": format!("{:?}", m.role).to_lowercase(),
                     "content": content_to_string(&m.content),
-                })
+                });
+                // For DM sessions, include sender attribution from metadata
+                // so the output is readable (all DM messages have role "user").
+                if is_dm {
+                    let from_agent = m
+                        .metadata
+                        .as_ref()
+                        .and_then(|meta| meta.get("from_agent"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    entry["from"] = Value::String(from_agent.to_string());
+                }
+                entry
             })
             .collect();
 
-        Ok(serde_json::json!({
+        let mut result = serde_json::json!({
             "session_id": session_id_str,
             "context_id": session.context_id,
             "message_count": total,
             "showing": recent.len(),
             "messages": recent,
             "summary": summary.as_deref().unwrap_or(""),
-        }))
+        });
+
+        // Add a hint for DM sessions directing agents to read_messages
+        // for proper perspective mapping ("you" vs peer name).
+        if is_dm {
+            result["note"] = Value::String(
+                "This is a DM session. For perspective-aware sender labels, \
+                 use the read_messages tool instead."
+                    .to_string(),
+            );
+        }
+
+        Ok(result)
     }
 
     fn is_builtin(&self) -> bool {
@@ -492,6 +525,102 @@ mod tests {
             .unwrap();
 
         assert!(result["error"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_dm_substring_prefix_does_not_grant_access() {
+        // Regression: agent named "al" should NOT access dm:alice:bob
+        // because "al" is a substring of "alice" but not an exact segment match.
+        let mgr = make_session_manager();
+        let agent_id = AgentId::new();
+        let tool = ReadSessionTool::new(mgr.clone(), agent_id, Some("al".to_string()));
+
+        let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+        let session = mgr.get_or_create_shared(dm_session_id, "dm:alice:bob");
+        mgr.append_message(session.id, make_msg(Role::User, "Secret"))
+            .unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+            .await
+            .unwrap();
+
+        // Access must be denied -- "al" is not an exact segment in "dm:alice:bob"
+        assert!(
+            result["error"].as_str().is_some(),
+            "Agent 'al' should not access dm:alice:bob via substring match"
+        );
+        assert!(result["error"].as_str().unwrap().contains("shared session"));
+    }
+
+    #[tokio::test]
+    async fn test_dm_session_includes_sender_attribution() {
+        // S2: DM sessions should include "from" field with sender name
+        // and a "note" suggesting read_messages for perspective mapping.
+        let mgr = make_session_manager();
+        let agent_id = AgentId::new();
+        let tool = ReadSessionTool::new(mgr.clone(), agent_id, Some("alice".to_string()));
+
+        let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+        let session = mgr.get_or_create_shared(dm_session_id, "dm:alice:bob");
+
+        // Add DM messages with from_agent metadata
+        let msg1 = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: alms_session::Content::Text("Hey Bob!".into()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({"from_agent": "alice"})),
+        };
+        let msg2 = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: alms_session::Content::Text("Hi Alice!".into()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({"from_agent": "bob"})),
+        };
+        mgr.append_message(session.id, msg1).unwrap();
+        mgr.append_message(session.id, msg2).unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+            .await
+            .unwrap();
+
+        // Verify sender attribution is included
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["from"], "alice");
+        assert_eq!(msgs[1]["from"], "bob");
+
+        // Verify the DM note is present
+        assert!(
+            result["note"].as_str().is_some(),
+            "DM sessions should include a note about read_messages"
+        );
+        assert!(result["note"].as_str().unwrap().contains("read_messages"));
+    }
+
+    #[tokio::test]
+    async fn test_non_dm_session_has_no_from_or_note() {
+        // Non-DM sessions should NOT include "from" field or "note"
+        let mgr = make_session_manager();
+        let agent_id = AgentId::new();
+        let tool = ReadSessionTool::new(mgr.clone(), agent_id, Some("alice".to_string()));
+
+        let session = mgr.get_or_create(agent_id, "web-chat");
+        mgr.append_message(session.id, make_msg(Role::User, "Hello"))
+            .unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "session_id": session.id.0.to_string() }))
+            .await
+            .unwrap();
+
+        let msgs = result["messages"].as_array().unwrap();
+        // Non-DM messages should not have "from" field
+        assert!(msgs[0].get("from").is_none());
+        // Non-DM sessions should not have a note
+        assert!(result.get("note").is_none());
     }
 
     #[tokio::test]
