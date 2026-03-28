@@ -12,6 +12,7 @@ use alms_core::{
     Run, RunId, RunInput, RunStatus, RunStatusResponse, SessionId,
 };
 use alms_runtime::RuntimeEvent;
+use alms_runtime::message_sender::{ConversationEndReason, MessageSender as _};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -432,6 +433,29 @@ fn resolve_posture_for_run(
     }
 }
 
+/// Extract the peer agent name from a `dm:{name1}:{name2}` context ID.
+///
+/// The DM context ID format is `dm:{first}:{second}` where the names are
+/// alphabetically sorted (see [`alms_core::dm_context_id`]). The peer is
+/// whichever name is NOT the current agent.
+///
+/// Returns `None` if the context ID does not match the expected format or
+/// neither name matches `agent_name`.
+///
+/// Note: `split_once(':')` is safe because agent names are restricted to
+/// `[a-z0-9-]` by `validate_agent_name` — colons cannot appear in names.
+fn extract_peer_from_dm_context(context_id: &str, agent_name: &str) -> Option<String> {
+    let rest = context_id.strip_prefix("dm:")?;
+    let (first, second) = rest.split_once(':')?;
+    if first == agent_name {
+        Some(second.to_string())
+    } else if second == agent_name {
+        Some(first.to_string())
+    } else {
+        None
+    }
+}
+
 /// Execute a run in background, forwarding runtime events to SSE.
 #[instrument(level = "info", skip(state, params), fields(run_id = %params.run_id.0, session_id = %params.session_id.0))]
 async fn execute_run(state: AppState, params: RunParams) {
@@ -801,6 +825,10 @@ async fn execute_run(state: AppState, params: RunParams) {
         Ok(output) => {
             persist_tool_calls(&output.tool_calls);
 
+            // Save emptiness flag before output.response is consumed by
+            // mark_run_as_completed. Used below for ignore_message detection.
+            let response_is_empty = output.response.is_empty();
+
             // Detect max-iterations sentinel and emit a warning event so the
             // frontend can style it distinctly (yellow) instead of as a normal
             // agent message.
@@ -866,6 +894,66 @@ async fn execute_run(state: AppState, params: RunParams) {
                         .await;
                     run_mgr.untrack_in_flight();
                 });
+            }
+
+            // ── ignore_message detection for DM conversations (#387) ──
+            //
+            // When a peer-message run (DM) completes with an empty response,
+            // it means the agent called `ignore_message`. Signal the end of the
+            // conversation to the MessageBus so the peer gets notified and the
+            // depth counter resets. See Phase 3 of #384.
+            //
+            // Note: an empty response from degenerate LLM behavior (e.g. null
+            // content with no tool calls) is intentionally treated the same as
+            // `ignore_message` — both result in the conversation being ended.
+            // This is the correct semantic: a DM peer-message that produces no
+            // output has nothing to deliver, so ending the conversation is the
+            // only sensible action.
+            if is_peer_message && response_is_empty && context_id.starts_with("dm:") {
+                if let Some(ref name) = agent_name
+                    && let Some(peer_name) = extract_peer_from_dm_context(&context_id, name)
+                {
+                    // Resolve the peer's AgentId from the agent registry.
+                    let peer_agent_id = state
+                        .session_manager
+                        .store()
+                        .and_then(|store| store.load_agent_by_name(&peer_name).ok())
+                        .flatten()
+                        .map(|record| record.id);
+
+                    if let Some(peer_id) = peer_agent_id {
+                        info!(
+                            agent = %name,
+                            peer = %peer_name,
+                            "DM run ended with ignore_message — signalling conversation end"
+                        );
+                        if let Err(e) = state
+                            .message_bus
+                            .end_conversation(
+                                name,
+                                agent_id,
+                                &peer_name,
+                                peer_id,
+                                ConversationEndReason::Ignored,
+                            )
+                            .await
+                        {
+                            warn!(
+                                "Failed to signal conversation end for {name} -> {peer_name}: {e}"
+                            );
+                        }
+                    } else {
+                        warn!(
+                            peer = %peer_name,
+                            "Cannot signal conversation end — peer agent not found in registry"
+                        );
+                    }
+                } else {
+                    debug!(
+                        "DM ignore_message detected but could not extract peer from context_id '{}'",
+                        context_id
+                    );
+                }
             }
 
             info!("Run {} completed successfully", run_id.0);
@@ -1998,5 +2086,121 @@ mod tests {
         }
 
         assert_eq!(llm.provider(), "anthropic");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_peer_from_dm_context tests (#387)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_peer_agent_name_is_first() {
+        // Context: dm:alice:bob, agent is alice -> peer is bob
+        let peer = extract_peer_from_dm_context("dm:alice:bob", "alice");
+        assert_eq!(peer.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn test_extract_peer_agent_name_is_second() {
+        // Context: dm:alice:bob, agent is bob -> peer is alice
+        let peer = extract_peer_from_dm_context("dm:alice:bob", "bob");
+        assert_eq!(peer.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn test_extract_peer_agent_name_not_found() {
+        // Agent name not in the context_id at all
+        let peer = extract_peer_from_dm_context("dm:alice:bob", "charlie");
+        assert!(peer.is_none());
+    }
+
+    #[test]
+    fn test_extract_peer_non_dm_context() {
+        // Not a DM context ID
+        let peer = extract_peer_from_dm_context("notifications:alice", "alice");
+        assert!(peer.is_none());
+    }
+
+    #[test]
+    fn test_extract_peer_malformed_context() {
+        // Missing second name
+        let peer = extract_peer_from_dm_context("dm:alice", "alice");
+        assert!(peer.is_none());
+    }
+
+    #[test]
+    fn test_extract_peer_empty_context() {
+        let peer = extract_peer_from_dm_context("", "alice");
+        assert!(peer.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // ignore_message detection integration tests (#387)
+    //
+    // These test the detection conditions that determine whether
+    // end_conversation should be called. Since execute_run requires
+    // a full AppState, we test the condition logic directly.
+    // -----------------------------------------------------------------------
+
+    /// Helper: evaluates the three-way condition for ignore_message detection.
+    fn should_signal_ignore(
+        is_peer_message: bool,
+        response_is_empty: bool,
+        context_id: &str,
+    ) -> bool {
+        is_peer_message && response_is_empty && context_id.starts_with("dm:")
+    }
+
+    #[test]
+    fn test_ignore_in_dm_context_triggers_end_conversation() {
+        // All three conditions met: peer message + empty response + DM context
+        assert!(
+            should_signal_ignore(true, true, "dm:alice:bob"),
+            "ignore_message in DM context should trigger end_conversation"
+        );
+    }
+
+    #[test]
+    fn test_ignore_in_non_dm_context_does_not_trigger() {
+        // Peer message + empty response, but NOT a DM context
+        assert!(
+            !should_signal_ignore(true, true, "session:abc123"),
+            "ignore_message outside DM context should NOT trigger end_conversation"
+        );
+    }
+
+    #[test]
+    fn test_non_empty_response_in_dm_does_not_trigger() {
+        // Peer message + DM context, but response is NOT empty
+        assert!(
+            !should_signal_ignore(true, false, "dm:alice:bob"),
+            "non-empty response in DM context should NOT trigger end_conversation"
+        );
+    }
+
+    #[test]
+    fn test_non_peer_message_in_dm_does_not_trigger() {
+        // Empty response + DM context, but NOT a peer message
+        assert!(
+            !should_signal_ignore(false, true, "dm:alice:bob"),
+            "non-peer-message run should NOT trigger end_conversation"
+        );
+    }
+
+    #[test]
+    fn test_notification_context_does_not_trigger() {
+        // Notification sessions have context_id = "notifications:agent_name"
+        // which does NOT start with "dm:", so no false positive.
+        assert!(
+            !should_signal_ignore(false, true, "notifications:bob"),
+            "notification session should NOT trigger end_conversation"
+        );
+    }
+
+    #[test]
+    fn test_job_context_does_not_trigger() {
+        assert!(
+            !should_signal_ignore(false, true, "job_some-uuid"),
+            "job session should NOT trigger end_conversation"
+        );
     }
 }
