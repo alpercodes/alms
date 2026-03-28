@@ -17,7 +17,9 @@
 //! allowing fresh conversation bursts after a quiet period.
 
 use alms_core::{AgentId, SessionId, dm_context_id};
-use alms_runtime::message_sender::{DeliveryReceipt, MessageSender, SendError};
+use alms_runtime::message_sender::{
+    ConversationEndReason, DeliveryReceipt, MessageSender, SendError,
+};
 use alms_session::SessionManager;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -31,7 +33,10 @@ use tracing::{info, instrument, warn};
 const MAX_DM_DEPTH: u32 = 20;
 
 /// Seconds of inactivity after which the depth counter resets for a DM pair.
-const DEPTH_EXPIRY_SECS: u64 = 60;
+///
+/// Raised from 60s to 1800s (30 minutes) because complex agent runs can
+/// easily exceed one minute. See discussion on #362 / decision D5 in #384.
+const DEPTH_EXPIRY_SECS: u64 = 1800;
 
 // ---------------------------------------------------------------------------
 // RunTrigger -- sent to the gateway to create runs
@@ -60,6 +65,15 @@ pub enum MessageSource {
     },
     /// Subagent completion notification (bridged from the existing channel).
     SubagentCompletion,
+    /// A DM conversation was ended (ignore_message or depth exceeded).
+    ///
+    /// The peer receives a one-shot notification run so it can act on the
+    /// conversation outcome. See #384 for the full lifecycle design.
+    ConversationEnded {
+        from_agent: AgentId,
+        from_name: String,
+        reason: ConversationEndReason,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +242,87 @@ impl MessageSender for MessageBus {
         );
 
         Ok(DeliveryReceipt { session_id })
+    }
+
+    /// End a DM conversation: write a metadata marker, reset depth, and
+    /// emit a `RunTrigger` with `ConversationEnded` source for the peer.
+    #[instrument(
+        level = "info",
+        skip(self),
+        fields(
+            sender = %sender_name,
+            peer = %peer_name,
+            reason = %reason,
+        )
+    )]
+    async fn end_conversation(
+        &self,
+        sender_name: &str,
+        sender_agent_id: AgentId,
+        peer_name: &str,
+        peer_agent_id: AgentId,
+        reason: ConversationEndReason,
+    ) -> Result<(), SendError> {
+        let dm_context = dm_context_id(sender_name, peer_name);
+        let session_id = SessionId::deterministic_dm(sender_name, peer_name);
+
+        // Ensure the shared DM session exists (it should, since a
+        // conversation must have started before it can end).
+        let _session = self
+            .session_manager
+            .get_or_create_shared(session_id, &dm_context);
+
+        // --- Write dm_ended metadata marker to the shared DM session ---
+        let marker = alms_session::Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: alms_session::Role::User,
+            content: alms_session::Content::Text(String::new()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "message_type": "dm_ended",
+                "ended_by": sender_name,
+                "reason": reason.to_string(),
+            })),
+        };
+        self.session_manager
+            .append_message(session_id, marker)
+            .map_err(|e| SendError::Internal(e.to_string()))?;
+
+        // --- Reset depth counter for this DM pair (decision D6) ---
+        self.depths.remove(&dm_context);
+        self.last_activity.remove(&dm_context);
+
+        // --- Emit RunTrigger for the peer agent ---
+        let notification_context = format!("notifications:{peer_name}");
+        let notification_session_id = SessionId::deterministic(&notification_context);
+
+        let input = format!("[DM conversation ended] Agent {sender_name} ended the conversation.");
+
+        let trigger = RunTrigger {
+            agent_id: peer_agent_id,
+            session_id: notification_session_id,
+            input,
+            source: MessageSource::ConversationEnded {
+                from_agent: sender_agent_id,
+                from_name: sender_name.to_string(),
+                reason,
+            },
+            context_id: notification_context,
+        };
+
+        if let Err(e) = self.run_trigger_tx.send(trigger) {
+            warn!(
+                error = %e,
+                "Failed to send RunTrigger for conversation end notification (receiver dropped)"
+            );
+        }
+
+        info!(
+            session_id = %session_id.0,
+            "DM conversation ended, depth counter reset"
+        );
+
+        Ok(())
     }
 }
 
@@ -579,5 +674,213 @@ mod tests {
         // alice-charlie should still be present (active)
         assert!(bus.depths.contains_key(&ac_ctx));
         assert!(bus.last_activity.contains_key(&ac_ctx));
+    }
+
+    // -----------------------------------------------------------------------
+    // end_conversation tests (#386)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_end_conversation_writes_marker_to_dm_session() {
+        let (bus, mut _rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Start a conversation so the DM session exists.
+        bus.send("alice", alice_id, "bob", bob_id, "Hello Bob!")
+            .await
+            .unwrap();
+
+        // Drain the send trigger.
+        let _ = _rx.try_recv();
+
+        // End the conversation from alice's side.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // The DM session should now contain 2 messages: the original DM + the marker.
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let history = bus.session_manager.get_history(session_id).unwrap();
+        assert_eq!(
+            history.len(),
+            2,
+            "DM session should have 2 messages (dm + dm_ended marker)"
+        );
+
+        // Verify the marker message metadata.
+        let marker = &history[1];
+        let meta = marker
+            .metadata
+            .as_ref()
+            .expect("marker should have metadata");
+        assert_eq!(meta["message_type"], "dm_ended");
+        assert_eq!(meta["ended_by"], "alice");
+        assert_eq!(meta["reason"], "ignored");
+
+        // Marker content should be empty.
+        match &marker.content {
+            alms_session::Content::Text(t) => {
+                assert!(t.is_empty(), "marker content should be empty")
+            }
+            other => panic!("expected Text content, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_end_conversation_resets_depth_counter() {
+        let (bus, _rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Build up some depth with alternating messages.
+        bus.send("alice", alice_id, "bob", bob_id, "ping")
+            .await
+            .unwrap();
+        bus.send("bob", bob_id, "alice", alice_id, "pong")
+            .await
+            .unwrap();
+        bus.send("alice", alice_id, "bob", bob_id, "ping2")
+            .await
+            .unwrap();
+
+        let dm_ctx = dm_context_id("alice", "bob");
+        assert!(
+            bus.depths.contains_key(&dm_ctx),
+            "depth counter should exist after messages"
+        );
+
+        // End the conversation.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // Depth counter and last_activity should both be removed.
+        assert!(
+            !bus.depths.contains_key(&dm_ctx),
+            "depth counter should be reset after end_conversation"
+        );
+        assert!(
+            !bus.last_activity.contains_key(&dm_ctx),
+            "last_activity should be removed after end_conversation"
+        );
+
+        // A new conversation should be possible immediately (fresh depth).
+        bus.send("alice", alice_id, "bob", bob_id, "fresh start")
+            .await
+            .unwrap();
+        let entry = bus.depths.get(&dm_ctx).unwrap();
+        assert_eq!(entry.value().1, 1, "depth should restart at 1");
+    }
+
+    #[tokio::test]
+    async fn test_end_conversation_emits_run_trigger_with_conversation_ended() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Start a conversation.
+        bus.send("alice", alice_id, "bob", bob_id, "Hello Bob!")
+            .await
+            .unwrap();
+
+        // Drain the send trigger.
+        let _ = rx.try_recv().unwrap();
+
+        // End the conversation.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // A RunTrigger should have been emitted for the peer (bob).
+        let trigger = rx.try_recv().expect("should have received a RunTrigger");
+
+        // Verify trigger fields.
+        assert_eq!(trigger.agent_id, bob_id);
+        assert_eq!(
+            trigger.context_id, "notifications:bob",
+            "notification should target the notifications session"
+        );
+        assert_eq!(
+            trigger.session_id,
+            SessionId::deterministic("notifications:bob"),
+            "session ID should be deterministic from the notification context"
+        );
+        assert_eq!(
+            trigger.input,
+            "[DM conversation ended] Agent alice ended the conversation."
+        );
+
+        // Verify source variant.
+        match &trigger.source {
+            MessageSource::ConversationEnded {
+                from_agent,
+                from_name,
+                reason,
+            } => {
+                assert_eq!(*from_agent, alice_id);
+                assert_eq!(from_name, "alice");
+                assert_eq!(*reason, ConversationEndReason::Ignored);
+            }
+            other => panic!("expected ConversationEnded, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_end_conversation_depth_exceeded_reason() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Start a conversation.
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        // End with DepthExceeded reason.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::DepthExceeded,
+        )
+        .await
+        .unwrap();
+
+        // Verify marker has depth_exceeded reason.
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let history = bus.session_manager.get_history(session_id).unwrap();
+        let marker = history.last().unwrap();
+        let meta = marker.metadata.as_ref().unwrap();
+        assert_eq!(meta["reason"], "depth_exceeded");
+
+        // Verify trigger source has the correct reason.
+        let trigger = rx.try_recv().unwrap();
+        match &trigger.source {
+            MessageSource::ConversationEnded { reason, .. } => {
+                assert_eq!(*reason, ConversationEndReason::DepthExceeded);
+            }
+            other => panic!("expected ConversationEnded, got {:?}", other),
+        }
     }
 }

@@ -4,7 +4,7 @@
 //! can reference it without depending on `alms-coordinator`. The `MessageBus`
 //! in `alms-coordinator` implements this trait.
 
-use alms_core::SessionId;
+use alms_core::{AgentId, SessionId};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +13,28 @@ use serde::{Deserialize, Serialize};
 pub struct DeliveryReceipt {
     /// The shared DM session where the message was persisted.
     pub session_id: SessionId,
+}
+
+/// Reason a DM conversation was ended.
+///
+/// Used by `end_conversation` to communicate why the conversation was
+/// terminated. The `MessageBus` writes this reason into the DM session
+/// metadata marker and includes it in the `RunTrigger` for peer notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConversationEndReason {
+    /// The agent called `ignore_message` (chose not to reply).
+    Ignored,
+    /// The DM depth limit (`MAX_DM_DEPTH`) was reached.
+    DepthExceeded,
+}
+
+impl std::fmt::Display for ConversationEndReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ignored => write!(f, "ignored"),
+            Self::DepthExceeded => write!(f, "depth_exceeded"),
+        }
+    }
 }
 
 /// Error type for message delivery failures.
@@ -50,4 +72,18 @@ pub trait MessageSender: Send + Sync + std::fmt::Debug {
         recipient_agent_id: alms_core::AgentId,
         message: &str,
     ) -> Result<DeliveryReceipt, SendError>;
+
+    /// Signal the end of a DM conversation between two agents.
+    ///
+    /// This writes a `dm_ended` metadata marker to the shared DM session,
+    /// resets the depth counter for the pair, and emits a `RunTrigger` so
+    /// the peer agent receives a notification run.
+    async fn end_conversation(
+        &self,
+        sender_name: &str,
+        sender_agent_id: AgentId,
+        peer_name: &str,
+        peer_agent_id: AgentId,
+        reason: ConversationEndReason,
+    ) -> Result<(), SendError>;
 }

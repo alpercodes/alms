@@ -85,6 +85,15 @@ impl SessionId {
         Self(Uuid::new_v4())
     }
 
+    /// Derive a deterministic SessionId from an arbitrary context string.
+    ///
+    /// Same input always produces the same SessionId (UUID v5). Use this
+    /// for notification sessions, named sessions, or any case where a
+    /// stable identity is needed from a string key.
+    pub fn deterministic(context: &str) -> Self {
+        Self(Uuid::new_v5(&ALMS_NAMESPACE, context.as_bytes()))
+    }
+
     /// Derive a deterministic SessionId for a DM conversation between two agents.
     ///
     /// Names are sorted alphabetically so both sides resolve to the same
