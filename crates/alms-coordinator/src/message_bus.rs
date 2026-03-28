@@ -404,6 +404,19 @@ mod tests {
         (bus, rx)
     }
 
+    /// After `exhaust_depth`, returns the identity of the agent whose next
+    /// send will overflow: `(sender_name, sender_id, peer_name, peer_id)`.
+    ///
+    /// `MAX_DM_DEPTH` alternating messages start with alice (even indices),
+    /// so the next sender depends on whether the total count is even or odd.
+    fn overflow_sender(a: AgentId, b: AgentId) -> (&'static str, AgentId, &'static str, AgentId) {
+        if MAX_DM_DEPTH.is_multiple_of(2) {
+            ("alice", a, "bob", b)
+        } else {
+            ("bob", b, "alice", a)
+        }
+    }
+
     /// Send MAX_DM_DEPTH alternating messages between alice and bob to exhaust
     /// the depth counter. After calling this, the next alternating send will
     /// trigger `SendError::DepthExceeded`.
@@ -505,22 +518,9 @@ mod tests {
         exhaust_depth(&bus, a, b).await;
 
         // Next alternating message should be rejected (depth > MAX_DM_DEPTH)
+        let (sender, sender_id, peer, peer_id) = overflow_sender(a, b);
         let err = bus
-            .send(
-                if MAX_DM_DEPTH.is_multiple_of(2) {
-                    "alice"
-                } else {
-                    "bob"
-                },
-                if MAX_DM_DEPTH.is_multiple_of(2) { a } else { b },
-                if MAX_DM_DEPTH.is_multiple_of(2) {
-                    "bob"
-                } else {
-                    "alice"
-                },
-                if MAX_DM_DEPTH.is_multiple_of(2) { b } else { a },
-                "one more",
-            )
+            .send(sender, sender_id, peer, peer_id, "one more")
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -576,22 +576,9 @@ mod tests {
         exhaust_depth(&bus, a, b).await;
 
         // Next message should be rejected (depth exceeded)
+        let (sender, sender_id, peer, peer_id) = overflow_sender(a, b);
         let err = bus
-            .send(
-                if MAX_DM_DEPTH.is_multiple_of(2) {
-                    "alice"
-                } else {
-                    "bob"
-                },
-                if MAX_DM_DEPTH.is_multiple_of(2) { a } else { b },
-                if MAX_DM_DEPTH.is_multiple_of(2) {
-                    "bob"
-                } else {
-                    "alice"
-                },
-                if MAX_DM_DEPTH.is_multiple_of(2) { b } else { a },
-                "overflow",
-            )
+            .send(sender, sender_id, peer, peer_id, "overflow")
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -1008,7 +995,10 @@ mod tests {
     /// S4: Simultaneous end_conversation from both agents should produce
     /// exactly one notification trigger (not two). This tests the C1 fix:
     /// depths.remove() as the atomicity guard.
-    #[tokio::test]
+    ///
+    /// Uses multi-threaded runtime + `tokio::spawn` so the two calls can
+    /// truly race on separate OS threads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_simultaneous_end_conversation_only_one_trigger() {
         let (bus, mut rx) = setup();
         let alice_id = AgentId::new();
@@ -1021,30 +1011,37 @@ mod tests {
         // Drain the send trigger.
         let _ = rx.try_recv().unwrap();
 
-        // Both agents call end_conversation simultaneously.
+        // Both agents call end_conversation simultaneously via tokio::spawn
+        // so they execute on separate worker threads for true concurrency.
         let bus_a = bus.clone();
         let bus_b = bus.clone();
 
-        let (result_a, result_b) = tokio::join!(
-            bus_a.end_conversation(
-                "alice",
-                alice_id,
-                "bob",
-                bob_id,
-                ConversationEndReason::Ignored,
-            ),
-            bus_b.end_conversation(
-                "bob",
-                bob_id,
-                "alice",
-                alice_id,
-                ConversationEndReason::Ignored,
-            ),
-        );
+        let handle_a = tokio::spawn(async move {
+            bus_a
+                .end_conversation(
+                    "alice",
+                    alice_id,
+                    "bob",
+                    bob_id,
+                    ConversationEndReason::Ignored,
+                )
+                .await
+        });
+        let handle_b = tokio::spawn(async move {
+            bus_b
+                .end_conversation(
+                    "bob",
+                    bob_id,
+                    "alice",
+                    alice_id,
+                    ConversationEndReason::Ignored,
+                )
+                .await
+        });
 
         // Both calls should succeed (no errors).
-        result_a.unwrap();
-        result_b.unwrap();
+        handle_a.await.unwrap().unwrap();
+        handle_b.await.unwrap().unwrap();
 
         // Count triggers: exactly one should have been emitted.
         // (The loser of the depths.remove() race returns early without
@@ -1080,16 +1077,7 @@ mod tests {
         exhaust_depth(&bus, a, b).await;
 
         // The next message should trigger DepthExceeded.
-        let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
-            "alice"
-        } else {
-            "bob"
-        };
-        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
-            (a, "bob", b)
-        } else {
-            (b, "alice", a)
-        };
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
             .send(next_sender, next_id, peer_name, peer_id, "overflow")
@@ -1124,16 +1112,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         // Trigger DepthExceeded.
-        let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
-            "alice"
-        } else {
-            "bob"
-        };
-        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
-            (a, "bob", b)
-        } else {
-            (b, "alice", a)
-        };
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
             .send(next_sender, next_id, peer_name, peer_id, "overflow")
@@ -1183,16 +1162,7 @@ mod tests {
         );
 
         // Trigger DepthExceeded.
-        let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
-            "alice"
-        } else {
-            "bob"
-        };
-        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
-            (a, "bob", b)
-        } else {
-            (b, "alice", a)
-        };
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let _ = bus
             .send(next_sender, next_id, peer_name, peer_id, "overflow")
@@ -1479,16 +1449,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         // 2. Next alternating send returns DepthExceeded.
-        let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
-            "alice"
-        } else {
-            "bob"
-        };
-        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
-            (a, "bob", b)
-        } else {
-            (b, "alice", a)
-        };
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
             .send(next_sender, next_id, peer_name, peer_id, "overflow")
@@ -1579,16 +1540,7 @@ mod tests {
         // inside send() will proceed (session exists from exhaust_depth
         // messages), but the trigger send will fail because rx is dropped.
         // Crucially, send() must still return DepthExceeded, not an internal error.
-        let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
-            "alice"
-        } else {
-            "bob"
-        };
-        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
-            (a, "bob", b)
-        } else {
-            (b, "alice", a)
-        };
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
             .send(next_sender, next_id, peer_name, peer_id, "overflow")
@@ -1615,7 +1567,10 @@ mod tests {
     /// If two agents both try to send at MAX_DM_DEPTH+1 simultaneously,
     /// both should get DepthExceeded, and only one notification trigger should
     /// fire (the depths.remove() atomicity guard prevents doubles).
-    #[tokio::test]
+    ///
+    /// Uses multi-threaded runtime + `tokio::spawn` so the two calls can
+    /// truly race on separate OS threads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_simultaneous_depth_exceeded_both_get_error() {
         let (bus, mut rx) = setup();
         let a = AgentId::new();
@@ -1626,15 +1581,19 @@ mod tests {
         // Drain all send triggers from the initial exchange.
         while rx.try_recv().is_ok() {}
 
-        // Both agents try to send one more message simultaneously.
-        // At least one (and possibly both) should get DepthExceeded.
+        // Both agents try to send one more message simultaneously via
+        // tokio::spawn so they execute on separate worker threads for
+        // true concurrency.
         let bus_a = bus.clone();
         let bus_b = bus.clone();
 
-        let (result_a, result_b) = tokio::join!(
-            bus_a.send("alice", a, "bob", b, "overflow-a"),
-            bus_b.send("bob", b, "alice", a, "overflow-b"),
-        );
+        let handle_a =
+            tokio::spawn(async move { bus_a.send("alice", a, "bob", b, "overflow-a").await });
+        let handle_b =
+            tokio::spawn(async move { bus_b.send("bob", b, "alice", a, "overflow-b").await });
+
+        let result_a = handle_a.await.unwrap();
+        let result_b = handle_b.await.unwrap();
 
         // Count how many got DepthExceeded.
         let a_exceeded = matches!(result_a, Err(SendError::DepthExceeded));
@@ -1780,16 +1739,7 @@ mod tests {
         while rx.try_recv().is_ok() {}
 
         // Trigger DepthExceeded and reset.
-        let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
-            "alice"
-        } else {
-            "bob"
-        };
-        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
-            (a, "bob", b)
-        } else {
-            (b, "alice", a)
-        };
+        let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
         let _ = bus
             .send(next_sender, next_id, peer_name, peer_id, "overflow")
             .await;
