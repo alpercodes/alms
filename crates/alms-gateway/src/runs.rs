@@ -441,6 +441,9 @@ fn resolve_posture_for_run(
 ///
 /// Returns `None` if the context ID does not match the expected format or
 /// neither name matches `agent_name`.
+///
+/// Note: `split_once(':')` is safe because agent names are restricted to
+/// `[a-z0-9-]` by `validate_agent_name` — colons cannot appear in names.
 fn extract_peer_from_dm_context(context_id: &str, agent_name: &str) -> Option<String> {
     let rest = context_id.strip_prefix("dm:")?;
     let (first, second) = rest.split_once(':')?;
@@ -899,6 +902,13 @@ async fn execute_run(state: AppState, params: RunParams) {
             // it means the agent called `ignore_message`. Signal the end of the
             // conversation to the MessageBus so the peer gets notified and the
             // depth counter resets. See Phase 3 of #384.
+            //
+            // Note: an empty response from degenerate LLM behavior (e.g. null
+            // content with no tool calls) is intentionally treated the same as
+            // `ignore_message` — both result in the conversation being ended.
+            // This is the correct semantic: a DM peer-message that produces no
+            // output has nothing to deliver, so ending the conversation is the
+            // only sensible action.
             if is_peer_message && response_is_empty && context_id.starts_with("dm:") {
                 if let Some(ref name) = agent_name
                     && let Some(peer_name) = extract_peer_from_dm_context(&context_id, name)
