@@ -119,16 +119,26 @@ impl Tool for ListMySessionsTool {
         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity.0));
 
         // Filter out internal sessions and optionally the current session.
-        let filtered: Vec<_> = sessions
+        // Collect all visible sessions first, then slice for limit -- avoids
+        // iterating the filter chain twice (once for `take(limit)`, once for `total`).
+        let all_visible: Vec<_> = sessions
             .iter()
             .filter(|s| !is_internal_session(&s.context_id))
             .filter(|s| include_current || s.id != self.current_session_id)
-            .take(limit)
             .collect();
+        let total = all_visible.len();
+        let filtered = &all_visible[..total.min(limit)];
 
         // Build the result, enriching each session with message count and summary.
+        //
+        // NOTE: N+1 query pattern -- for each session we issue two SQLite queries
+        // (message_count + load_session_summary). Acceptable for MVP since the
+        // queries are simple indexed lookups and limit defaults to 10. If this
+        // becomes a hot path, batch methods should be added to SqliteStore:
+        //   - message_counts_for_sessions(ids) -> HashMap<SessionId, usize>
+        //   - load_session_summaries_batch(agent_id, ids) -> HashMap<SessionId, SessionSummary>
         let mut session_list = Vec::with_capacity(filtered.len());
-        for session in &filtered {
+        for session in filtered {
             // Derive context type and source label.
             let ctx_type = context_type_from_id(&session.context_id);
             let source_label = derive_source_label(&session.context_id, &self.agent_name)
@@ -163,12 +173,6 @@ impl Tool for ListMySessionsTool {
                 "summary": summary,
             }));
         }
-
-        let total = sessions
-            .iter()
-            .filter(|s| !is_internal_session(&s.context_id))
-            .filter(|s| include_current || s.id != self.current_session_id)
-            .count();
 
         Ok(serde_json::json!({
             "sessions": session_list,
