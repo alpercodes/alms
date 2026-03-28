@@ -642,7 +642,7 @@ Returns current server defaults for UI pre-population.
   "posture": "guarded",
   "context_strategy": "truncate",
   "stream_chunk_timeout_secs": 60,
-  "enabled_tools": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "read_messages"],
+  "enabled_tools": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"],
   "agent_id": "<uuid>",
   "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null, "needs_bootstrap": false}],
   "workspace_dir": "./data/workspace",
@@ -673,7 +673,7 @@ Returns current server defaults for UI pre-population.
     "shell_policy": "sandboxed",
     "timeout_secs": 30,
     "max_output_bytes": null,
-    "enabled": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "read_messages"]
+    "enabled": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"]
   }
 }
 ```
@@ -740,4 +740,4 @@ Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
 ---
 
-*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response and new tools (`list_my_sessions`, `read_session`, `read_messages`).*
+*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response and new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`).*
