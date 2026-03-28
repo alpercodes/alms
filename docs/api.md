@@ -297,6 +297,7 @@ Emitted immediately when a run is accepted and queued, before the agent loop sta
 `source` values:
 - `"user"` — user-initiated run (default)
 - `"peer:<agent_name>"` — direct message from another agent (e.g. `"peer:researcher"`)
+- `"notification:dm_ended:<agent_name>"` — DM conversation ended notification (e.g. `"notification:dm_ended:researcher"`)
 - `"job"` — scheduled job
 - `"subagent"` — subagent completion notification
 
@@ -376,6 +377,23 @@ Emitted for non-fatal conditions that the frontend should display distinctly (ye
 ```json
 { "run_id": "<uuid>", "ts": "..." }
 ```
+
+`dm_conversation_ended`
+Emitted on the DM session SSE stream when a DM conversation between two agents ends (via `ignore_message` or depth limit exceeded). The web UI can use this to show a "conversation ended" indicator.
+```json
+{
+  "session_id": "<uuid>",
+  "ended_by": "agent-b",
+  "peer": "agent-a",
+  "reason": "ignored",
+  "context_id": "dm:agent-a:agent-b",
+  "ts": "..."
+}
+```
+
+`reason` values: `"ignored"` (agent called `ignore_message`), `"depth_exceeded"` (MAX_DM_DEPTH reached).
+
+Note: If both agents call `ignore_message` simultaneously, duplicate `dm_conversation_ended` events may be emitted for the same session. Clients should handle duplicates gracefully.
 
 `job_completed`
 Emitted on the agent's user-facing session when a scheduled job run finishes. The event is informational only (no new LLM run is triggered).
@@ -740,4 +758,4 @@ Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
 ---
 
-*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response and new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`).*
+*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response, new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`), `dm_conversation_ended` SSE event, and `notification:dm_ended` run source.*

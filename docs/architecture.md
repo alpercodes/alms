@@ -48,9 +48,16 @@ Any agent running inside ALMS can call the `invoke_agent` tool to spawn a subage
 - Each subagent has its own tool registry, context window, and system prompt
 - Subagent runs a full `agent_loop` (multi-iteration tool use, up to `max_iterations`)
 
-### Layer 2 — Peer-to-Peer Direct Messaging (Phase 1 implemented)
+### Layer 2 — Peer-to-Peer Direct Messaging (Phase 1 + DM lifecycle implemented)
 
 Agents can send messages to any other agent by name via the `send_message` tool. Messages are delivered through a shared `MessageBus` in the Coordinator and stored in DM sessions (deterministic UUID v5 identity based on the sorted agent-name pair). The recipient's `ContextBuilder` uses perspective mapping (`build_with_perspective`) to correctly attribute messages as "self" vs "other" based on the `from_agent` metadata. This enables bidirectional collaboration without requiring a parent-child relationship.
+
+**DM conversation lifecycle (#384):** DM conversations have an explicit start/exchange/end lifecycle:
+- **Start**: First `send_message` creates the shared DM session and begins depth tracking.
+- **Exchange**: Each reply increments a depth counter per DM pair (max: `MAX_DM_DEPTH` = 20). The inactivity timeout is 30 minutes (`DEPTH_EXPIRY_SECS` = 1800).
+- **End**: Triggered by `ignore_message` (agent declines to reply) or depth limit exceeded. `MessageBus::end_conversation()` writes a `dm_ended` marker to the DM session, resets the depth counter, and emits a `ConversationEnded` `RunTrigger` to the peer.
+- **Peer notification**: The peer receives a one-shot notification run on a dedicated `notifications:{agent_name}` session (not the DM session). This run does NOT include the DM addendum. The agent can then report results, update goals/memories, or take other action.
+- **SSE event**: A `dm_conversation_ended` event is emitted on the DM session stream for web UI rendering.
 
 ---
 
@@ -244,6 +251,7 @@ Token cost is a first-class constraint:
 - Agent registry with named persistent agents, per-agent config overrides
 - Token-by-token SSE streaming, sliding-summary context compression
 - Peer-to-peer direct messaging via `send_message` tool + MessageBus + DM sessions with perspective mapping (Layer 2 Phase 1)
+- DM conversation lifecycle: `ignore_message` and depth-exceeded trigger `end_conversation` with `dm_ended` session markers, depth counter reset, `ConversationEnded` peer notification via `notifications:{agent}` sessions, and `dm_conversation_ended` SSE events (#384 Phases 1-7)
 - Cross-session episodic memory via run summaries (`session_summaries` table, heuristic + LLM modes, context injection with 15% budget cap)
 
 ### Pending 🎯

@@ -4,7 +4,7 @@ Design document for agent-to-agent communication in ALMS.
 
 **Authors**: Heph + Atlas
 **Date**: 2026-03-22
-**Status**: Phase 1 implemented
+**Status**: Phase 1 implemented; DM conversation lifecycle (Phases 1-7 of #384) implemented
 **Relates to**: `docs/product-vision-core.md` (Layer 2), `docs/communication-architecture.md` (product vision), `docs/architecture.md` (Option 2 -- Peer Mesh)
 
 ---
@@ -277,6 +277,14 @@ Agents can decline to respond to an invocation (per `communication-architecture.
 ```
 
 When called, the run ends early. The ignore is logged but no response is broadcast. The system prompt instructs agents on when this is appropriate.
+
+**DM conversation lifecycle:** When `ignore_message` is called during a DM run (i.e. the context_id starts with `dm:`), the gateway detects the empty response and signals the end of the conversation via `MessageBus::end_conversation()`. This:
+1. Writes a `dm_ended` metadata marker to the shared DM session (with `ended_by` and `reason` fields).
+2. Resets the depth counter for the DM pair to zero, allowing a fresh conversation immediately.
+3. Emits a `RunTrigger` with `MessageSource::ConversationEnded` targeting the peer agent on a dedicated `notifications:{agent_name}` session.
+4. Emits a `dm_conversation_ended` SSE event on the DM session stream for web UI rendering.
+
+The peer receives a one-shot notification run with input `[DM conversation ended] Agent {name} ended the conversation.` The notification run does NOT include the DM addendum (no "use send_message to reply" prompt), because the conversation is over. The peer can then decide to report results, update goals/memories, or take other action. See #384 for the full design.
 
 `send_message` and `ignore_message` are mutually exclusive within a single tool-call batch. If both appear in the same LLM response, neither executes -- both receive error results, and the agent gets another iteration to choose one. Other non-conflicting tools in the same batch still execute normally. (See #364.)
 
@@ -726,6 +734,66 @@ The user needs to observe agent-to-agent conversations. This is handled by:
 
 No new endpoints are needed for observation -- the existing session/run/SSE infrastructure handles it.
 
+### 9.5 DM Conversation Lifecycle (Implemented -- #384 Phases 1-7)
+
+DM conversations between agents now have an explicit lifecycle with completion signaling and peer notification. The lifecycle is:
+
+```
+Agent A sends message to Agent B  (send_message tool)
+  |
+  v
+MessageBus: write to shared DM session, emit RunTrigger
+  |
+  v
+Agent B runs, processes message, may reply (send_message back) or end (ignore_message)
+  |
+  |--- Agent B replies: depth incremented, RunTrigger sent to A, conversation continues
+  |
+  |--- Agent B calls ignore_message (or LLM returns empty response):
+  |      |
+  |      v
+  |    Gateway detects empty response + is_peer_message + dm: context
+  |      |
+  |      v
+  |    MessageBus::end_conversation():
+  |      1. Remove depth counter (atomicity guard -- prevents double notification)
+  |      2. Remove last_activity entry
+  |      3. Write dm_ended metadata marker to shared DM session
+  |      4. Emit RunTrigger with ConversationEnded source to peer's
+  |         notifications:{agent_name} session
+  |      |
+  |      v
+  |    Gateway emits dm_conversation_ended SSE event on the DM session stream
+  |      |
+  |      v
+  |    Peer (Agent A) receives notification run:
+  |      - Input: "[DM conversation ended] Agent B ended the conversation."
+  |      - Session: notifications:{agent_a_name} (dedicated, accumulates all notifications)
+  |      - No DM addendum injected (is_peer = false)
+  |      - Agent can report results, update goals/memories, etc.
+  |
+  |--- Depth limit exceeded (MAX_DM_DEPTH = 20):
+         |
+         v
+       MessageBus::send() calls end_conversation(reason: DepthExceeded)
+         Same lifecycle as ignore_message: marker write, depth reset, peer notification
+         Returns SendError::DepthExceeded to the sender
+```
+
+**Key implementation details:**
+
+- **`DEPTH_EXPIRY_SECS`**: 1800 seconds (30 minutes). Complex agent runs can easily exceed one minute; the original 60s was too short. After this period of inactivity, the depth counter resets automatically. (Decision D5 of #384.)
+
+- **`end_conversation` on MessageBus** (`crates/alms-coordinator/src/message_bus.rs`): Uses `depths.remove()` as an atomicity guard. If two agents call `end_conversation` simultaneously for the same DM pair, only the one whose `remove()` returns `Some` proceeds with the marker write and trigger emission. The other returns `Ok(())` early, preventing double notifications.
+
+- **`ConversationEndReason` enum** (`crates/alms-runtime/src/message_sender.rs`): `Ignored` (agent called `ignore_message`) or `DepthExceeded` (MAX_DM_DEPTH hit). Included in the `dm_ended` marker metadata and the `ConversationEnded` `RunTrigger`.
+
+- **Notification sessions**: Context ID pattern `notifications:{agent_name}`, one per agent. These are persistent sessions that accumulate all DM-end notifications. They do NOT start with `dm:`, so the existing DM detection code naturally skips DM-specific behavior (no DM addendum, no perspective mapping). Notification sessions are excluded from user-facing context (e.g. the `user.md` workspace file).
+
+- **`dm_conversation_ended` SSE event** (`crates/alms-gateway/src/sse.rs`): Emitted on the DM session stream. Payload: `{session_id, ended_by, peer, reason, context_id, ts}`. The frontend should be prepared to handle duplicates (simultaneous ignore from both agents may emit two events).
+
+- **`dm_recipient.md` prompt**: The DM addendum tells agents that calling `ignore_message` will notify the peer. This is injected only for peer DM runs (`is_peer = true`), never for notification runs.
+
 ---
 
 ## 10. Database Schema Changes
@@ -914,7 +982,7 @@ Agents could flood each other with messages, creating infinite loops:
 
 **Mitigations:**
 1. **Per-session rate limit**: Max N runs per minute per session (configurable, default: 10)
-2. **Max message depth**: Track how many times a message has been "forwarded" (A->B->A->B...). After depth N (default: 20), delivery is refused with an error. The depth counter resets automatically after 60 seconds of inactivity in the DM pair, allowing fresh conversation bursts after a quiet period.
+2. **Max message depth**: Track how many times a message has been "forwarded" (A->B->A->B...). After depth N (default: 20), delivery is refused with an error. The depth counter resets automatically after 1800 seconds (30 minutes) of inactivity in the DM pair, allowing fresh conversation bursts after a quiet period. (Raised from the original 60s in #385 / decision D5 of #384, since complex agent runs easily exceed one minute.)
 3. **Token budget per DM pair per hour**: Configurable limit on total tokens spent on a DM conversation
 
 ### 14.4 User Override
@@ -947,7 +1015,7 @@ Each phase delivers independent value and is a PR-sized chunk.
 
 **Loop prevention (must ship with Phase 1):**
 - Message depth tracking: the MessageBus internally tracks a `depth` counter per DM conversation chain, incremented each time a message bounces between the same pair (A->B = 1, B->A = 2, A->B = 3...). Delivery is refused at `depth > MAX_DM_DEPTH` (default: 20). This counter is managed entirely by the MessageBus -- it is **not** exposed as a parameter on `send_message` and agents are unaware of it.
-- Depth expiry: if no messages are exchanged in a DM pair for 60 seconds, the depth counter resets automatically, allowing fresh conversation bursts after a quiet period. This replaces the previous per-DM cooldown approach, which blocked legitimate replies.
+- Depth expiry: if no messages are exchanged in a DM pair for 1800 seconds (30 minutes), the depth counter resets automatically, allowing fresh conversation bursts after a quiet period. This replaces the previous per-DM cooldown approach, which blocked legitimate replies. (Originally 60s; raised in #385 per decision D5 of #384.)
 - These are simple counters/timers in the MessageBus, not separate infrastructure.
 
 **Tests:**
@@ -1149,11 +1217,12 @@ Key design principles:
 - **Hybrid messaging**: structured data for routine info, natural language for reasoning (cost control)
 - **Shared sessions with perspective mapping**: one session per conversation, ContextBuilder maps roles based on who is reading (requires minor ContextBuilder + SessionManager changes)
 - **RunTrigger generalization**: the existing completion notification pattern becomes a universal message delivery mechanism
-- **Ignore signal**: agents can decline invocations to avoid wasted LLM calls
+- **Ignore signal**: agents can decline invocations to avoid wasted LLM calls; in DM context, `ignore_message` triggers conversation end with peer notification (Section 9.5)
+- **Explicit DM lifecycle**: conversations have a clear start (first `send_message`), exchange (depth-tracked replies), and end (`ignore_message` or depth limit) with peer notification via dedicated `notifications:{agent}` sessions, `dm_ended` session markers, and `dm_conversation_ended` SSE events
 - **Conservative extension**: reuses existing session/run/SSE infrastructure, keeps each phase independently deployable
 
 ---
 
-*Design Date: 2026-03-22*
+*Design Date: 2026-03-22 (updated 2026-03-28)*
 *Authors: Heph + Atlas*
-*Status: Proposed -- pending review*
+*Status: Phase 1 (DM messaging) implemented; DM conversation lifecycle (#384 Phases 1-7) implemented. Groups, daemon agents, meetings pending.*
