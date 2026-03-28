@@ -53,11 +53,24 @@ pub struct SourceLabel {
 
 /// Derive a human-readable source label from a `context_id`.
 ///
+/// `agent_name` is the name of the current agent — used to determine the peer
+/// in DM sessions (format: `dm:{name1}:{name2}`, alphabetically sorted).
+///
 /// Returns `None` for session types that should be excluded from summary
-/// generation (DM and subagent sessions).
-pub fn derive_source_label(context_id: &str) -> Option<SourceLabel> {
-    // DM sessions -- excluded
-    if context_id.starts_with("dm:") {
+/// generation (subagent and episodic sessions).  DM sessions are included
+/// with a label like "DM with {peer_name}".
+pub fn derive_source_label(context_id: &str, agent_name: &str) -> Option<SourceLabel> {
+    // DM sessions: "dm:{name1}:{name2}" (alphabetically sorted).
+    // Determine the peer by finding the name that isn't ours.
+    if let Some(rest) = context_id.strip_prefix("dm:") {
+        if let Some((a, b)) = rest.split_once(':') {
+            let peer = if a == agent_name { b } else { a };
+            return Some(SourceLabel {
+                source_type: "dm".into(),
+                source_label: format!("DM with {peer}"),
+            });
+        }
+        // Malformed dm: context_id — exclude to be safe.
         return None;
     }
 
@@ -113,6 +126,8 @@ pub struct SummaryParams {
     pub existing_summary: Option<String>,
     /// Model to use for LLM mode.  Falls back to the LLM client's default.
     pub summary_model: Option<String>,
+    /// Agent name — used to derive the peer in DM sessions.
+    pub agent_name: String,
 }
 
 /// Generate or update a session summary.
@@ -156,6 +171,8 @@ pub struct PersistSummaryRequest {
     pub run_output: String,
     pub context_id: String,
     pub summary_model: Option<String>,
+    /// Agent name — used to derive the peer in DM sessions.
+    pub agent_name: String,
 }
 
 /// Fire-and-forget summary generation + persistence.
@@ -186,7 +203,7 @@ pub async fn generate_and_persist_summary(
     req: PersistSummaryRequest,
 ) {
     // Check if the session type should be summarised.
-    let source = match derive_source_label(&req.context_id) {
+    let source = match derive_source_label(&req.context_id, &req.agent_name) {
         Some(s) => s,
         None => {
             debug!(
@@ -220,6 +237,7 @@ pub async fn generate_and_persist_summary(
         context_id: req.context_id.clone(),
         existing_summary,
         summary_model: req.summary_model,
+        agent_name: req.agent_name,
     };
 
     let summary_text = match generate_session_summary(llm, &params).await {
@@ -234,13 +252,14 @@ pub async fn generate_and_persist_summary(
         "Session summary generated"
     );
 
-    // Upsert to database.
+    // Upsert to database (with source label for injection formatting).
     if let Some(store) = session_manager.store() {
         if let Err(e) = store.upsert_session_summary(
             params.agent_id,
             params.session_id,
             &summary_text,
             Some(params.run_id),
+            Some(&source.source_label),
         ) {
             error!("Failed to persist session summary: {e}");
         }
@@ -266,7 +285,9 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
         return None;
     }
 
-    let source = derive_source_label(&params.context_id)?;
+    // Still call derive_source_label to filter out subagent sessions (returns
+    // None for excluded session types, triggering early return via `?`).
+    let _source = derive_source_label(&params.context_id, &params.agent_name)?;
 
     // Build the new entry line.
     let snippet = truncate_to_char_boundary(&params.run_input, HEURISTIC_INPUT_BYTES);
@@ -275,7 +296,7 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
     } else {
         ""
     };
-    let entry = format!("{}: \"{snippet}{ellipsis}\"", source.source_label);
+    let entry = format!("\"{snippet}{ellipsis}\"");
 
     // Append to existing summary (if any).
     let combined = match &params.existing_summary {
@@ -405,6 +426,99 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
 }
 
 // ---------------------------------------------------------------------------
+// Context injection formatting
+// ---------------------------------------------------------------------------
+
+use crate::context::estimate_tokens;
+use alms_session::SessionSummary;
+
+/// Format a list of [`SessionSummary`] records into the episodic injection
+/// string, respecting a token budget.
+///
+/// Summaries are expected to arrive in `updated_at DESC` order (most recent
+/// first).  This function preserves that order so the most recently active
+/// session appears closest to the current conversation in the context window,
+/// giving it the strongest LLM recency bias.
+///
+/// When the formatted summaries would exceed `budget_tokens`, the oldest
+/// summaries (at the end of the list) are dropped first.  If even the header
+/// alone exceeds the budget, `None` is returned.
+///
+/// Returns `None` when `summaries` is empty or all summaries are empty strings.
+///
+/// **Defense-in-depth filtering:** Entries whose `source_label` is `None` are
+/// silently skipped.  Under normal operation subagent sessions never get a
+/// summary row, but this guard prevents manually-inserted or corrupt rows from
+/// leaking into the episodic context.
+///
+/// **Budget contract:** The caller is responsible for ensuring `budget_tokens`
+/// is already clamped to the configured percentage cap (15% of
+/// `max_input_tokens` by default, enforced in
+/// [`ContextConfig::normalize_episodic`]).  This function does not re-enforce
+/// the cap — it trusts the budget it receives.
+pub fn format_episodic_for_injection(
+    summaries: &[SessionSummary],
+    budget_tokens: usize,
+) -> Option<String> {
+    if summaries.is_empty() || budget_tokens == 0 {
+        return None;
+    }
+
+    let header = "[Your conversation history across sessions — most recent first]\n";
+    let header_tokens = estimate_tokens(header);
+    if header_tokens >= budget_tokens {
+        return None;
+    }
+
+    let mut remaining = budget_tokens - header_tokens;
+    let mut entries: Vec<String> = Vec::new();
+
+    for summary in summaries {
+        if summary.summary.is_empty() {
+            continue;
+        }
+
+        // S2: Defense-in-depth -- skip entries without a source_label.
+        // Under normal operation subagent sessions never get a summary row,
+        // but if one is manually inserted (or exists from before source_label
+        // was added), filtering here prevents it from appearing in the context.
+        let label = match &summary.source_label {
+            Some(l) if !l.is_empty() => l.as_str(),
+            _ => continue,
+        };
+
+        // Format: **<source_label> (last active: <date>)**\n<summary>
+        let updated = summary.updated_at.0.format("%Y-%m-%d %H:%M UTC");
+        let entry = format!(
+            "\n**{label} (last active: {updated})**\n{}",
+            summary.summary
+        );
+
+        let entry_tokens = estimate_tokens(&entry);
+        if entry_tokens > remaining {
+            // Budget exhausted -- stop adding entries.
+            break;
+        }
+        remaining -= entry_tokens;
+        entries.push(entry);
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+
+    // Pre-allocate: budget_tokens * 3 approximates the char capacity since
+    // estimate_tokens uses chars/3.
+    let mut result = String::with_capacity(budget_tokens * 3);
+    result.push_str(header);
+    for entry in &entries {
+        result.push_str(entry);
+    }
+
+    Some(result)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -417,21 +531,21 @@ mod tests {
 
     #[test]
     fn test_source_label_web_chat() {
-        let label = derive_source_label("web-chat-2026-03-25").unwrap();
+        let label = derive_source_label("web-chat-2026-03-25", "myagent").unwrap();
         assert_eq!(label.source_type, "web");
         assert_eq!(label.source_label, "User chat");
     }
 
     #[test]
     fn test_source_label_telegram() {
-        let label = derive_source_label("telegram_mybot_123456").unwrap();
+        let label = derive_source_label("telegram_mybot_123456", "myagent").unwrap();
         assert_eq!(label.source_type, "telegram");
         assert_eq!(label.source_label, "Telegram chat");
     }
 
     #[test]
     fn test_source_label_job() {
-        let label = derive_source_label("job_abc123").unwrap();
+        let label = derive_source_label("job_abc123", "myagent").unwrap();
         assert_eq!(label.source_type, "job");
         assert_eq!(label.source_label, "Scheduled job: abc123");
     }
@@ -439,7 +553,7 @@ mod tests {
     #[test]
     fn test_source_label_job_long_id() {
         let long_id = "a".repeat(50);
-        let label = derive_source_label(&format!("job_{long_id}")).unwrap();
+        let label = derive_source_label(&format!("job_{long_id}"), "myagent").unwrap();
         assert_eq!(label.source_type, "job");
         // Should be truncated to 37 chars + "..."
         assert!(label.source_label.ends_with("..."));
@@ -447,23 +561,40 @@ mod tests {
     }
 
     #[test]
-    fn test_source_label_dm_excluded() {
-        assert!(derive_source_label("dm:alice:bob").is_none());
+    fn test_source_label_dm_alice_perspective() {
+        // alice sees "DM with bob"
+        let label = derive_source_label("dm:alice:bob", "alice").unwrap();
+        assert_eq!(label.source_type, "dm");
+        assert_eq!(label.source_label, "DM with bob");
+    }
+
+    #[test]
+    fn test_source_label_dm_bob_perspective() {
+        // bob sees "DM with alice"
+        let label = derive_source_label("dm:alice:bob", "bob").unwrap();
+        assert_eq!(label.source_type, "dm");
+        assert_eq!(label.source_label, "DM with alice");
+    }
+
+    #[test]
+    fn test_source_label_dm_malformed_excluded() {
+        // Malformed DM context_id (no second colon) should be excluded.
+        assert!(derive_source_label("dm:alice", "alice").is_none());
     }
 
     #[test]
     fn test_source_label_subagent_excluded() {
-        assert!(derive_source_label("subagent_task_123").is_none());
+        assert!(derive_source_label("subagent_task_123", "myagent").is_none());
     }
 
     #[test]
     fn test_source_label_episodic_excluded() {
-        assert!(derive_source_label("episodic:myagent").is_none());
+        assert!(derive_source_label("episodic:myagent", "myagent").is_none());
     }
 
     #[test]
     fn test_source_label_unknown_defaults_to_web() {
-        let label = derive_source_label("some-random-context").unwrap();
+        let label = derive_source_label("some-random-context", "myagent").unwrap();
         assert_eq!(label.source_type, "web");
         assert_eq!(label.source_label, "User chat");
     }
@@ -471,6 +602,15 @@ mod tests {
     // -- heuristic mode -----------------------------------------------------
 
     fn heuristic_params(input: &str, context_id: &str, existing: Option<&str>) -> SummaryParams {
+        heuristic_params_with_name(input, context_id, existing, "myagent")
+    }
+
+    fn heuristic_params_with_name(
+        input: &str,
+        context_id: &str,
+        existing: Option<&str>,
+        agent_name: &str,
+    ) -> SummaryParams {
         SummaryParams {
             mode: RunSummaryMode::Heuristic,
             agent_id: AgentId::new(),
@@ -481,6 +621,7 @@ mod tests {
             context_id: context_id.to_string(),
             existing_summary: existing.map(|s| s.to_string()),
             summary_model: None,
+            agent_name: agent_name.to_string(),
         }
     }
 
@@ -488,7 +629,7 @@ mod tests {
     fn test_heuristic_basic_format() {
         let params = heuristic_params("How do I configure CORS?", "web-chat-123", None);
         let result = generate_heuristic(&params).unwrap();
-        assert_eq!(result, "User chat: \"How do I configure CORS?\"");
+        assert_eq!(result, "\"How do I configure CORS?\"");
     }
 
     #[test]
@@ -498,7 +639,7 @@ mod tests {
         let result = generate_heuristic(&params).unwrap();
         assert!(result.ends_with("...\""));
         // The snippet inside quotes should be ~120 chars
-        let inner = &result["User chat: \"".len()..result.len() - 4]; // strip trailing ...\"
+        let inner = &result["\"".len()..result.len() - 4]; // strip trailing ...\"
         assert_eq!(inner.len(), 120);
     }
 
@@ -510,7 +651,7 @@ mod tests {
 
     #[test]
     fn test_heuristic_appends_to_existing() {
-        let existing = "User chat: \"First question about CORS\"";
+        let existing = "\"First question about CORS\"";
         let params = heuristic_params("Second question about auth", "web-chat-123", Some(existing));
         let result = generate_heuristic(&params).unwrap();
         assert!(result.contains("First question about CORS"));
@@ -525,7 +666,7 @@ mod tests {
         let mut existing_lines: Vec<String> = Vec::new();
         for i in 0..10 {
             existing_lines.push(format!(
-                "User chat: \"Question number {i} about something fairly long to fill space\""
+                "\"Question number {i} about something fairly long to fill space\""
             ));
         }
         let existing = existing_lines.join("\n");
@@ -561,9 +702,13 @@ mod tests {
     }
 
     #[test]
-    fn test_heuristic_dm_session_skipped() {
-        let params = heuristic_params("Hello", "dm:alice:bob", None);
-        assert!(generate_heuristic(&params).is_none());
+    fn test_heuristic_dm_session_included() {
+        let params = heuristic_params_with_name("Hello", "dm:alice:bob", None, "alice");
+        let result = generate_heuristic(&params).unwrap();
+        assert!(
+            result.starts_with('"'),
+            "DM session summary should not include source_label prefix, got: {result}"
+        );
     }
 
     #[test]
@@ -576,14 +721,20 @@ mod tests {
     fn test_heuristic_telegram_label() {
         let params = heuristic_params("Hello from telegram", "telegram_bot_12345", None);
         let result = generate_heuristic(&params).unwrap();
-        assert!(result.starts_with("Telegram chat: "));
+        assert!(
+            result.starts_with('"'),
+            "Telegram summary should not include source_label prefix, got: {result}"
+        );
     }
 
     #[test]
     fn test_heuristic_job_label() {
         let params = heuristic_params("Generate daily report", "job_daily-report", None);
         let result = generate_heuristic(&params).unwrap();
-        assert!(result.starts_with("Scheduled job: daily-report: "));
+        assert!(
+            result.starts_with('"'),
+            "Job summary should not include source_label prefix, got: {result}"
+        );
     }
 
     // -- trim_oldest_lines --------------------------------------------------
@@ -650,6 +801,7 @@ mod tests {
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
+            agent_name: "myagent".into(),
         };
         assert!(generate_session_summary(&llm, &params).await.is_none());
     }
@@ -671,10 +823,14 @@ mod tests {
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
+            agent_name: "myagent".into(),
         };
         let result = generate_session_summary(&llm, &params).await.unwrap();
         assert!(result.contains("How do I set up CORS?"));
-        assert!(result.starts_with("User chat:"));
+        assert!(
+            result.starts_with('"'),
+            "Heuristic summary should not include source_label prefix, got: {result}"
+        );
     }
 
     #[tokio::test]
@@ -694,6 +850,7 @@ mod tests {
             context_id: "web-chat-1".into(),
             existing_summary: None,
             summary_model: None,
+            agent_name: "myagent".into(),
         };
         // Mock LLM returns a canned response -- we just verify it doesn't panic
         // and returns Some.
@@ -718,6 +875,7 @@ mod tests {
             context_id: "web-chat-1".into(),
             existing_summary: Some("Debugged CORS issue in gateway.rs.".into()),
             summary_model: None,
+            agent_name: "myagent".into(),
         };
         // Should not panic, should return Some
         let result = generate_session_summary(&llm, &params).await;
@@ -731,7 +889,9 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        for ctx in &["dm:alice:bob", "subagent_task_1", "episodic:myagent"] {
+        // DM sessions are now included (not excluded), only subagent and episodic
+        // sessions should return None.
+        for ctx in &["subagent_task_1", "episodic:myagent"] {
             let params = SummaryParams {
                 mode: RunSummaryMode::Heuristic,
                 agent_id: AgentId::new(),
@@ -742,11 +902,352 @@ mod tests {
                 context_id: ctx.to_string(),
                 existing_summary: None,
                 summary_model: None,
+                agent_name: "myagent".into(),
             };
             assert!(
                 generate_session_summary(&llm, &params).await.is_none(),
                 "Expected None for context_id={ctx}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_summary_dm_session_produces_summary() {
+        let llm = LlmClient::new(crate::llm_types::LlmConfig {
+            mock: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let params = SummaryParams {
+            mode: RunSummaryMode::Heuristic,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "hello from DM".into(),
+            run_output: "hi back".into(),
+            context_id: "dm:alice:bob".into(),
+            existing_summary: None,
+            summary_model: None,
+            agent_name: "alice".into(),
+        };
+        let result = generate_session_summary(&llm, &params).await;
+        assert!(result.is_some(), "DM sessions should now produce summaries");
+        let text = result.unwrap();
+        assert!(
+            text.starts_with('"'),
+            "DM summary should not include source_label prefix, got: {text}"
+        );
+    }
+
+    // -- format_episodic_for_injection ----------------------------------------
+
+    use alms_core::Timestamp;
+    use alms_session::SessionSummary;
+
+    fn make_summary(summary: &str, minutes_ago: i64) -> SessionSummary {
+        make_summary_with_label(summary, minutes_ago, Some("User chat"))
+    }
+
+    fn make_summary_with_label(
+        summary: &str,
+        minutes_ago: i64,
+        label: Option<&str>,
+    ) -> SessionSummary {
+        let ts = chrono::Utc::now() - chrono::Duration::minutes(minutes_ago);
+        SessionSummary {
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            summary: summary.to_string(),
+            last_run_id: None,
+            updated_at: Timestamp(ts),
+            source_label: label.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn test_format_episodic_empty_input() {
+        assert!(format_episodic_for_injection(&[], 1000).is_none());
+    }
+
+    #[test]
+    fn test_format_episodic_zero_budget() {
+        let summaries = vec![make_summary("Hello world", 5)];
+        assert!(format_episodic_for_injection(&summaries, 0).is_none());
+    }
+
+    #[test]
+    fn test_format_episodic_single_summary() {
+        let summaries = vec![make_summary("Debugged CORS issue in gateway.rs.", 10)];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        assert!(result.starts_with("[Your conversation history across sessions"));
+        assert!(result.contains("Debugged CORS issue"));
+        assert!(result.contains("**User chat (last active:"));
+    }
+
+    #[test]
+    fn test_format_episodic_multiple_summaries_preserves_order() {
+        let summaries = vec![
+            make_summary("Most recent session activity.", 5),
+            make_summary("Older session activity.", 60),
+        ];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        // Most recent should appear before older in the string
+        let pos_recent = result.find("Most recent").unwrap();
+        let pos_older = result.find("Older session").unwrap();
+        assert!(
+            pos_recent < pos_older,
+            "Most recent summary should appear first in the output"
+        );
+    }
+
+    #[test]
+    fn test_format_episodic_budget_trims_oldest() {
+        // Create summaries where fitting all of them would exceed a small budget.
+        let summaries = vec![
+            make_summary("Summary A with some text.", 5),
+            make_summary("Summary B with some text.", 10),
+            make_summary("Summary C with some text.", 15),
+        ];
+        // Each summary entry is roughly: "\n**Session (last active: ...)**\n<text>"
+        // which is about 70-80 chars => ~25 tokens.  Header is ~20 tokens.
+        // Budget of 70 should fit header + 1-2 entries but not all 3.
+        let result = format_episodic_for_injection(&summaries, 70).unwrap();
+        assert!(result.contains("Summary A"), "Newest must be included");
+        // Oldest (C) should be dropped
+        assert!(
+            !result.contains("Summary C"),
+            "Oldest summary should be dropped when budget is tight"
+        );
+    }
+
+    #[test]
+    fn test_format_episodic_skips_empty_summaries() {
+        let summaries = vec![
+            make_summary("", 5),
+            make_summary("Real summary here.", 10),
+            make_summary("", 15),
+        ];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        assert!(result.contains("Real summary here."));
+        // Only the header and one entry -- no blank entries
+        let session_count = result.matches("**User chat").count();
+        assert_eq!(session_count, 1, "Only non-empty summaries should appear");
+    }
+
+    #[test]
+    fn test_format_episodic_all_empty_returns_none() {
+        let summaries = vec![make_summary("", 5), make_summary("", 10)];
+        assert!(format_episodic_for_injection(&summaries, 5000).is_none());
+    }
+
+    // -- S1: source label in headers ------------------------------------------
+
+    #[test]
+    fn test_format_episodic_uses_source_label_in_header() {
+        let summaries = vec![
+            make_summary_with_label("Web session.", 5, Some("User chat")),
+            make_summary_with_label("Telegram session.", 10, Some("Telegram chat")),
+        ];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        assert!(
+            result.contains("**User chat (last active:"),
+            "Should use 'User chat' label"
+        );
+        assert!(
+            result.contains("**Telegram chat (last active:"),
+            "Should use 'Telegram chat' label"
+        );
+    }
+
+    // -- S2: defense-in-depth: entries without source_label are skipped --------
+
+    #[test]
+    fn test_format_episodic_skips_no_source_label() {
+        let summaries = vec![
+            make_summary_with_label("Labelled entry.", 5, Some("User chat")),
+            make_summary_with_label("No label entry.", 10, None),
+            make_summary_with_label("Empty label entry.", 15, Some("")),
+        ];
+        let result = format_episodic_for_injection(&summaries, 5000).unwrap();
+        assert!(result.contains("Labelled entry."));
+        assert!(
+            !result.contains("No label entry."),
+            "Entries without source_label should be filtered out"
+        );
+        assert!(
+            !result.contains("Empty label entry."),
+            "Entries with empty source_label should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_format_episodic_all_missing_labels_returns_none() {
+        let summaries = vec![
+            make_summary_with_label("Entry A.", 5, None),
+            make_summary_with_label("Entry B.", 10, None),
+        ];
+        assert!(
+            format_episodic_for_injection(&summaries, 5000).is_none(),
+            "All entries without labels should result in None"
+        );
+    }
+
+    // -- S4: integration test (DB -> format -> inject) -------------------------
+
+    /// Integration test: insert summaries into a real (in-memory) SQLite store,
+    /// load them, format them, and verify the episodic content that would be
+    /// injected into the context window.
+    #[test]
+    fn test_integration_db_to_formatted_injection() {
+        use alms_session::Session;
+        use alms_session::sqlite::SqliteStore;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent_id = AgentId::new();
+
+        // Create three sessions from different channels.
+        let s_web = Session::new(agent_id, "web-chat-1");
+        let s_tg = Session::new(agent_id, "telegram_bot_123");
+        let s_current = Session::new(agent_id, "web-chat-2");
+        store.save_session(&s_web).unwrap();
+        store.save_session(&s_tg).unwrap();
+        store.save_session(&s_current).unwrap();
+
+        // Insert summaries with source labels (as the generation code would).
+        store
+            .upsert_session_summary(
+                agent_id,
+                s_web.id,
+                "Debugged CORS issue in gateway config.",
+                None,
+                Some("User chat"),
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store
+            .upsert_session_summary(
+                agent_id,
+                s_tg.id,
+                "Discussed deployment on VPS.",
+                None,
+                Some("Telegram chat"),
+            )
+            .unwrap();
+
+        // Load summaries excluding the current session.
+        let summaries = store
+            .load_session_summaries(agent_id, 50, Some(&s_current.id))
+            .unwrap();
+        assert_eq!(
+            summaries.len(),
+            2,
+            "Should load 2 summaries (current excluded)"
+        );
+
+        // Format for injection.
+        let formatted =
+            format_episodic_for_injection(&summaries, 5000).expect("Should produce formatted text");
+
+        // Verify structure.
+        assert!(
+            formatted.starts_with("[Your conversation history across sessions"),
+            "Should start with the header"
+        );
+        assert!(
+            formatted.contains("**Telegram chat (last active:"),
+            "Telegram summary should have correct source label"
+        );
+        assert!(
+            formatted.contains("**User chat (last active:"),
+            "Web summary should have correct source label"
+        );
+        assert!(
+            formatted.contains("Debugged CORS issue"),
+            "Web summary content should be present"
+        );
+        assert!(
+            formatted.contains("Discussed deployment"),
+            "Telegram summary content should be present"
+        );
+
+        // Verify ordering: most recent (Telegram, inserted second) should appear first.
+        let tg_pos = formatted.find("Discussed deployment").unwrap();
+        let web_pos = formatted.find("Debugged CORS").unwrap();
+        assert!(
+            tg_pos < web_pos,
+            "Most recent summary (Telegram) should appear before older one (web)"
+        );
+
+        // Verify that DM sessions WITH a proper source label ARE included.
+        let s_dm = Session::new(agent_id, "dm:alice:bob");
+        store.save_session(&s_dm).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        store
+            .upsert_session_summary(
+                agent_id,
+                s_dm.id,
+                "Discussed project architecture with bob.",
+                None,
+                Some("DM with bob"),
+            )
+            .unwrap();
+
+        let summaries2 = store
+            .load_session_summaries(agent_id, 50, Some(&s_current.id))
+            .unwrap();
+        assert_eq!(
+            summaries2.len(),
+            3,
+            "Should load 3 summaries (web + tg + dm)"
+        );
+
+        let formatted2 = format_episodic_for_injection(&summaries2, 5000)
+            .expect("Should produce text including DM entry");
+        assert!(
+            formatted2.contains("Discussed project architecture with bob"),
+            "DM entry with source_label should be included"
+        );
+        assert!(
+            formatted2.contains("**DM with bob (last active:"),
+            "DM entry should have correct source label header"
+        );
+        // Three labelled entries should produce headers.
+        let header_count = formatted2.matches("(last active:").count();
+        assert_eq!(
+            header_count, 3,
+            "All three labelled entries should produce headers"
+        );
+
+        // Defense-in-depth: entries WITHOUT source_label are still filtered out.
+        // Simulate a corrupt or manually-inserted row with no label.
+        let s_orphan = Session::new(agent_id, "orphan-session");
+        store.save_session(&s_orphan).unwrap();
+        store
+            .upsert_session_summary(
+                agent_id,
+                s_orphan.id,
+                "Orphan content that should not appear.",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let summaries3 = store
+            .load_session_summaries(agent_id, 50, Some(&s_current.id))
+            .unwrap();
+        assert_eq!(summaries3.len(), 4);
+
+        let formatted3 = format_episodic_for_injection(&summaries3, 5000)
+            .expect("Should still produce text from labelled entries");
+        assert!(
+            !formatted3.contains("Orphan content that should not appear"),
+            "Entry without source_label must be filtered out"
+        );
+        // Only three labelled entries should produce headers.
+        let header_count3 = formatted3.matches("(last active:").count();
+        assert_eq!(
+            header_count3, 3,
+            "Only labelled entries should produce headers"
+        );
     }
 }

@@ -403,6 +403,9 @@ impl SessionManager {
 
     /// Insert or update the episodic summary for a `(agent_id, session_id)` pair.
     ///
+    /// `source_label` is a human-readable label derived from the session's
+    /// `context_id` (e.g. "User chat", "Telegram chat").
+    ///
     /// No-op (with a warning) when no SQLite store is configured.
     pub fn upsert_session_summary(
         &self,
@@ -410,9 +413,16 @@ impl SessionManager {
         session_id: SessionId,
         summary_text: &str,
         run_id: Option<RunId>,
+        source_label: Option<&str>,
     ) -> AlmsResult<()> {
         if let Some(store) = &self.store {
-            store.upsert_session_summary(agent_id, session_id, summary_text, run_id)?;
+            store.upsert_session_summary(
+                agent_id,
+                session_id,
+                summary_text,
+                run_id,
+                source_label,
+            )?;
         } else {
             warn!("upsert_session_summary called without SQLite store -- skipping");
         }
@@ -557,8 +567,14 @@ mod tests {
         let session = mgr.get_or_create(agent_id, "ctx-summary");
 
         let run_id = alms_core::RunId::new();
-        mgr.upsert_session_summary(agent_id, session.id, "Debugged CORS headers.", Some(run_id))
-            .unwrap();
+        mgr.upsert_session_summary(
+            agent_id,
+            session.id,
+            "Debugged CORS headers.",
+            Some(run_id),
+            Some("User chat"),
+        )
+        .unwrap();
 
         // Single lookup
         let loaded = mgr
@@ -589,7 +605,7 @@ mod tests {
         let session_id = SessionId::new();
 
         // upsert is a no-op
-        mgr.upsert_session_summary(agent_id, session_id, "test", None)
+        mgr.upsert_session_summary(agent_id, session_id, "test", None, None)
             .unwrap();
 
         // load returns empty / None
