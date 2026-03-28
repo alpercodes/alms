@@ -238,6 +238,7 @@ impl SseEventData {
     /// - `"peer:<agent_name>"` — DM from another agent
     /// - `"job"` — scheduled job
     /// - `"subagent"` — subagent completion notification
+    /// - `"notification:dm_ended:<agent_name>"` — DM conversation ended notification
     ///
     /// `queued_behind` indicates how many runs are ahead of this one in the
     /// agent's queue. 0 means the run will start immediately.
