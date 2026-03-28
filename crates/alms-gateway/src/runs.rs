@@ -1468,6 +1468,35 @@ fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> S
     )
 }
 
+/// Format a human-readable notification message for a DM conversation ending.
+///
+/// This is used by `run_trigger_loop` when it receives a
+/// `MessageSource::ConversationEnded` trigger.  The notification tells the
+/// peer agent that the DM conversation has ended, includes the reason, and
+/// suggests using `read_session` to review what was discussed.
+fn format_dm_ended_notification(from_name: &str, reason: ConversationEndReason) -> String {
+    let reason_text = match reason {
+        ConversationEndReason::Ignored => {
+            format!("Agent \"{from_name}\" ended the conversation (chose not to reply).")
+        }
+        ConversationEndReason::DepthExceeded => {
+            format!(
+                "The conversation with agent \"{from_name}\" was terminated \
+                 because the maximum message depth was reached."
+            )
+        }
+    };
+
+    format!(
+        "[DM conversation ended] {reason_text}\n\
+         \n\
+         You can use read_session(\"dm:{a}:...\") or list_my_sessions() to review \
+         the conversation history. Decide what to do next: report results, update \
+         your goals/memories, or take other action.",
+        a = from_name,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // RunTrigger loop (peer messaging)
 // ---------------------------------------------------------------------------
@@ -1476,6 +1505,16 @@ fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> S
 ///
 /// Each trigger creates a run on the target agent's session, reusing the
 /// same `execute_run` path as user-initiated and notification runs.
+///
+/// For `Agent` triggers (peer DMs), the message has already been persisted
+/// to the shared DM session by the `MessageBus`; we pass `is_peer = true`
+/// so `execute_run` uses `run_on_session` (no double-write).
+///
+/// For `ConversationEnded` triggers, the notification text has NOT been
+/// persisted — the MessageBus only wrote a `dm_ended` marker to the DM
+/// session, not to the notification session.  We format a richer
+/// notification here and pass `is_peer = false` so `execute_run` uses
+/// `runtime.run()`, which persists the input to the notification session.
 pub(crate) async fn run_trigger_loop(
     mut rx: mpsc::UnboundedReceiver<alms_coordinator::message_bus::RunTrigger>,
     state: AppState,
@@ -1487,18 +1526,31 @@ pub(crate) async fn run_trigger_loop(
         let agent_id = trigger.agent_id;
         let context_id = trigger.context_id;
 
-        let source_label = match &trigger.source {
-            MessageSource::Agent { from_name, .. } => format!("peer:{from_name}"),
-            MessageSource::SubagentCompletion => "subagent".to_string(),
-            MessageSource::ConversationEnded { from_name, .. } => {
-                format!("notification:dm_ended:{from_name}")
-            }
+        // Build a source label for SSE `run_created` events and determine
+        // whether this is a peer DM run (which needs the DM addendum) or
+        // a notification run (which must NOT get the DM addendum).
+        let (source_label, is_peer, input) = match &trigger.source {
+            MessageSource::Agent { from_name, .. } => (
+                format!("peer:{from_name}"),
+                true,
+                // Peer DM: input already persisted by MessageBus — pass it
+                // through so the Run record has a copy.
+                trigger.input,
+            ),
+            MessageSource::SubagentCompletion => ("subagent".to_string(), false, trigger.input),
+            MessageSource::ConversationEnded {
+                from_name, reason, ..
+            } => (
+                format!("notification:dm_ended:{from_name}"),
+                // NOT a peer message — the notification run should not get
+                // the DM addendum injected (it tells the agent to use
+                // send_message/ignore_message, which is wrong here).
+                false,
+                // Format a richer notification that includes the reason and
+                // a follow-up hint, overriding the basic text from the bus.
+                format_dm_ended_notification(from_name, *reason),
+            ),
         };
-
-        // ConversationEnded is NOT a peer message -- the notification run
-        // should not get the DM addendum injected (it tells the agent to
-        // use send_message/ignore_message, which is wrong for a notification).
-        let is_peer = matches!(trigger.source, MessageSource::Agent { .. });
 
         info!(
             session_id = %session_id.0,
@@ -1507,15 +1559,11 @@ pub(crate) async fn run_trigger_loop(
             "RunTrigger -> creating run"
         );
 
-        // The message has already been persisted to the session by the
-        // MessageBus. We still pass `input` to execute_run so the
-        // agent loop knows what prompted this run (it reads from session
-        // history, but the run record needs the input).
         enqueue_triggered_run(
             &state,
             agent_id,
             session_id,
-            trigger.input,
+            input,
             context_id,
             source_label,
             is_peer,
@@ -2201,6 +2249,61 @@ mod tests {
         assert!(
             !should_signal_ignore(false, true, "job_some-uuid"),
             "job session should NOT trigger end_conversation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_dm_ended_notification tests (#388)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dm_ended_notification_ignored_reason() {
+        let msg = format_dm_ended_notification("alice", ConversationEndReason::Ignored);
+        assert!(
+            msg.starts_with("[DM conversation ended]"),
+            "notification should start with the DM ended prefix"
+        );
+        assert!(
+            msg.contains("alice"),
+            "notification should mention the agent who ended the conversation"
+        );
+        assert!(
+            msg.contains("chose not to reply"),
+            "Ignored reason should explain the agent chose not to reply"
+        );
+        assert!(
+            msg.contains("read_session") || msg.contains("list_my_sessions"),
+            "notification should hint at tools for reviewing the conversation"
+        );
+    }
+
+    #[test]
+    fn test_dm_ended_notification_depth_exceeded_reason() {
+        let msg = format_dm_ended_notification("bob", ConversationEndReason::DepthExceeded);
+        assert!(
+            msg.starts_with("[DM conversation ended]"),
+            "notification should start with the DM ended prefix"
+        );
+        assert!(
+            msg.contains("bob"),
+            "notification should mention the peer agent"
+        );
+        assert!(
+            msg.contains("maximum message depth"),
+            "DepthExceeded reason should mention the depth limit"
+        );
+        assert!(
+            msg.contains("read_session") || msg.contains("list_my_sessions"),
+            "notification should hint at tools for reviewing the conversation"
+        );
+    }
+
+    #[test]
+    fn test_dm_ended_notification_is_not_empty() {
+        let msg = format_dm_ended_notification("x", ConversationEndReason::Ignored);
+        assert!(
+            msg.len() > 50,
+            "notification should be a substantive message, not a stub"
         );
     }
 }
