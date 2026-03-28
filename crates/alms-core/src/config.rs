@@ -462,7 +462,7 @@ impl ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
-    /// Provider: "openai" (default), "openrouter", or "anthropic"
+    /// Provider: "openrouter" (default), "openai", or "anthropic"
     pub provider: String,
     pub base_url: String,
     pub model: String,
