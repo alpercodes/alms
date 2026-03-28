@@ -284,7 +284,23 @@ When called, the run ends early. The ignore is logged but no response is broadca
 3. Emits a `RunTrigger` with `MessageSource::ConversationEnded` targeting the peer agent on a dedicated `notifications:{agent_name}` session.
 4. Emits a `dm_conversation_ended` SSE event on the DM session stream for web UI rendering.
 
-The peer receives a one-shot notification run with input `[DM conversation ended] Agent {name} ended the conversation.` The notification run does NOT include the DM addendum (no "use send_message to reply" prompt), because the conversation is over. The peer can then decide to report results, update goals/memories, or take other action. See #384 for the full design.
+The peer receives a one-shot notification run. The raw `RunTrigger.input` from `end_conversation()` is a simple marker, but `run_trigger_loop` in `runs.rs` enriches it via `format_dm_ended_notification()`, which produces a richer message including the reason and a `read_messages` hint. For example, when the reason is `Ignored`:
+
+```
+[DM conversation ended] Agent "bob" ended the conversation (chose not to reply).
+
+You can use read_messages(from: "bob") to review the conversation history. Decide what to do next: report results, update your goals/memories, or take other action.
+```
+
+When the reason is `DepthExceeded`:
+
+```
+[DM conversation ended] The conversation with agent "bob" was terminated because the maximum message depth was reached.
+
+You can use read_messages(from: "bob") to review the conversation history. Decide what to do next: report results, update your goals/memories, or take other action.
+```
+
+The notification run does NOT include the DM addendum (no "use send_message to reply" prompt), because the conversation is over. The peer can then decide to report results, update goals/memories, or take other action. See #384 for the full design.
 
 `send_message` and `ignore_message` are mutually exclusive within a single tool-call batch. If both appear in the same LLM response, neither executes -- both receive error results, and the agent gets another iteration to choose one. Other non-conflicting tools in the same batch still execute normally. (See #364.)
 
@@ -767,7 +783,10 @@ Agent B runs, processes message, may reply (send_message back) or end (ignore_me
   |      |
   |      v
   |    Peer (Agent A) receives notification run:
-  |      - Input: "[DM conversation ended] Agent B ended the conversation."
+  |      - Input: enriched by format_dm_ended_notification() in runs.rs, e.g.:
+  |          [DM conversation ended] Agent "B" ended the conversation (chose not to reply).
+  |          You can use read_messages(from: "B") to review the conversation history.
+  |          Decide what to do next: report results, update your goals/memories, or take other action.
   |      - Session: notifications:{agent_a_name} (dedicated, accumulates all notifications)
   |      - No DM addendum injected (is_peer = false)
   |      - Agent can report results, update goals/memories, etc.
