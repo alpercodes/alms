@@ -324,6 +324,12 @@ impl AgentRuntime {
         self
     }
 
+    /// Register the `read_session` tool for on-demand session recall.
+    pub fn with_read_session(self, tool: crate::read_session_tool::ReadSessionTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
     /// Register the `send_message` tool for peer-to-peer agent messaging.
     pub fn with_send_message(self, tool: crate::send_message_tool::SendMessageTool) -> Self {
         self.tools.register(std::sync::Arc::new(tool));

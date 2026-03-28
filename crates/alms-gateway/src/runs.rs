@@ -697,6 +697,16 @@ async fn execute_run(state: AppState, params: RunParams) {
             .with_read_subagent_session(read_session_tool);
     }
 
+    // Register read_session tool (on-demand session recall for the agent's own sessions).
+    {
+        let read_own_session_tool = alms_runtime::ReadSessionTool::new(
+            state.session_manager.clone(),
+            agent_id,
+            agent_name.clone(),
+        );
+        runtime = runtime.with_read_session(read_own_session_tool);
+    }
+
     // Register peer messaging tools (Layer 2) when agent name is known.
     if let Some(ref name) = agent_name {
         let sender: std::sync::Arc<dyn alms_runtime::MessageSender> = state.message_bus.clone();
