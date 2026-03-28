@@ -15,6 +15,7 @@ files (`personality.md`, `goals.md`, `memories.md`, `user.md`).
 | `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context()` in `crates/alms-runtime/src/agent.rs` |
 | `subagent.md` | Default system prompt for ephemeral (unnamed) subagents spawned via `invoke_agent`. | `DEFAULT_SUBAGENT_PROMPT` constant in `crates/alms-coordinator/src/lib.rs` |
 | `summarizer.md` | System prompt for the sliding-summary LLM call that compresses old conversation history into a rolling summary. | `maybe_summarize()` in `crates/alms-runtime/src/agent.rs` |
+| `session_summarizer.md` | System prompt for the episodic memory LLM call that generates cross-session summaries after each run. Focus on *what was accomplished*, not how. 1-3 sentences, past tense. | `generate_llm()` in `crates/alms-runtime/src/episodic.rs` |
 
 ## When Each Prompt Is Used
 
@@ -80,6 +81,22 @@ with the summarizer prompt to compress old messages into a rolling summary.
 
 **Code path**: `maybe_summarize()` in `agent.rs` -- builds a separate LLM request
 with the summarizer system prompt and a user message containing the transcript.
+
+### `session_summarizer.md` -- Episodic Memory Summaries
+
+When `run_summary_mode` is set to `"llm"`, the gateway spawns a fire-and-forget task
+after each successful run to generate a cross-session episodic summary. This task
+builds a lightweight LLM request with the session summarizer prompt, the run input
+(truncated to ~2000 chars), the agent's output (truncated to ~2000 chars), and the
+existing summary (if any). The LLM produces a concise 1-3 sentence summary focused
+on what was accomplished, not internal steps.
+
+**Code path**: `generate_llm()` in `episodic.rs` -> `include_str!("../prompts/session_summarizer.md")`
+
+**Key constraints**:
+- Max 150 output tokens
+- Uses `summary_model` if configured, otherwise falls back to the agent's default model
+- Errors are logged and swallowed -- summary failure must never fail the run
 
 ## Prompt Assembly Order
 

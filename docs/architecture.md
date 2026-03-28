@@ -100,11 +100,51 @@ Assemble minimal context (task-specific system prompt + capabilities) →
 LLM call → ... → emit result → stop
 ```
 
+**Context assembly order** (for all agents):
+```
+[System prompt] → [Episodic summaries*] → [Rolling summary*] → [Recent messages] → [Current input]
+```
+\* Episodic summaries injected when `run_summary_mode != off` and past session summaries exist. Rolling summary injected when strategy is `sliding-summary` and enough messages have been compressed.
+
+**Episodic memory** (cross-session awareness):
+
+After each successful run, the gateway may generate a per-session summary and store it in the `session_summaries` SQLite table. On subsequent runs, these summaries are loaded (excluding the current session), formatted with source labels and timestamps, and injected as a system message between the main system prompt and the session history. This gives agents awareness of what they were doing in other conversations without re-reading full transcripts.
+
+Summary generation modes (controlled by `run_summary_mode`):
+- `off` (default) — no summaries, no episodic injection
+- `heuristic` — deterministic one-liner from first ~120 chars of input (zero LLM cost)
+- `llm` — rich 1-3 sentence summary via a lightweight LLM call using `session_summarizer.md` prompt
+
+The episodic token budget (`run_summary_budget`, default: 2000) is hard-capped at 15% of `max_input_tokens` and subtracted from the total context budget so episodic content never starves the current conversation.
+
+```
+[Run completes successfully]
+        │
+        ▼
+[generate_and_persist_summary()] (fire-and-forget tokio::spawn)
+        │
+        ├── derive_source_label(context_id) → skip subagent/episodic sessions
+        ├── load existing summary from session_summaries table
+        ├── generate new/updated summary (heuristic or LLM)
+        └── upsert to session_summaries (agent_id, session_id, summary, source_label)
+        
+[Next run starts]
+        │
+        ▼
+[load_episodic_summaries()] → load summaries (exclude current session)
+        │
+        ▼
+[format_episodic_for_injection()] → token-budgeted formatted text
+        │
+        ▼
+[build_with_perspective()] → injected as system message after main system prompt
+```
+
 ### Tool Sandbox (`alms-sandbox`)
 
 Isolated tool execution used by every agent regardless of hierarchy level.
 
-**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list`, `workspace_write`, `invoke_agent`, `get_task_result`, `read_subagent_session`, `send_message`
+**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list`, `workspace_write`, `invoke_agent`, `get_task_result`, `read_subagent_session`, `send_message`, `list_agents`, `read_messages`, `ignore_message`, `list_my_sessions`, `read_session`
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 
@@ -182,6 +222,7 @@ Token cost is a first-class constraint:
 - **Context compression** — `ContextBuilder` with `truncate` (default) and `sliding-summary` strategies
 - **Usage tracking** — `prompt_tokens` + `completion_tokens` accumulated per run, including subagent usage rolled up to parent
 - **Cost observability** — `run_finished` SSE event and `GET /runs/{id}` expose per-run token counts
+- **Episodic budget cap** — Cross-session summaries are hard-capped at 15% of `max_input_tokens` so episodic context never starves the current conversation
 - **Tiered routing** — Subagents can be routed to cheaper models for simpler tasks (planned)
 
 ---
@@ -191,7 +232,7 @@ Token cost is a first-class constraint:
 ### Completed ✅
 - Core types, session manager, agent runtime, WASM sandbox
 - HTTP gateway with SSE streaming, approval workflow, audit log
-- Built-in tools: echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, get_task_result, read_subagent_session, send_message
+- Built-in tools: echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, get_task_result, read_subagent_session, send_message, list_agents, read_messages, ignore_message, list_my_sessions, read_session
 - Cron/scheduler, SQLite persistence, web UI with agent selector
 - Coordinator with real AgentRuntime loops, foreground + background subagents
 - `invoke_agent` tool with `name` param for persistent subagent sessions (UUID v5 deterministic identity)
@@ -203,6 +244,7 @@ Token cost is a first-class constraint:
 - Agent registry with named persistent agents, per-agent config overrides
 - Token-by-token SSE streaming, sliding-summary context compression
 - Peer-to-peer direct messaging via `send_message` tool + MessageBus + DM sessions with perspective mapping (Layer 2 Phase 1)
+- Cross-session episodic memory via run summaries (`session_summaries` table, heuristic + LLM modes, context injection with 15% budget cap)
 
 ### Pending 🎯
 - Autonomous subagent loops — see `docs/autonomous-subagents-design.md`
@@ -237,5 +279,5 @@ alms-cli → alms-gateway → alms-runtime  → alms-core
 
 ---
 
-*Architecture Date: 2026-03-22*
+*Architecture Date: 2026-03-28*
 *Topology: Hierarchy (invoke_agent) + Peer DM (send_message via MessageBus)*
