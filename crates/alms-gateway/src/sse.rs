@@ -810,4 +810,24 @@ mod tests {
         assert_eq!(event.data["context_id"], "dm:alice:bob");
         assert!(event.data["ts"].is_string(), "ts should be a string");
     }
+
+    #[test]
+    fn test_dm_conversation_ended_event_depth_exceeded() {
+        let session_id = alms_core::SessionId::new();
+        let event = SseEventData::dm_conversation_ended(
+            session_id,
+            "bob",
+            "alice",
+            "depth_exceeded",
+            "dm:alice:bob",
+        );
+
+        assert_eq!(event.event_type, "dm_conversation_ended");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["ended_by"], "bob");
+        assert_eq!(event.data["peer"], "alice");
+        assert_eq!(event.data["reason"], "depth_exceeded");
+        assert_eq!(event.data["context_id"], "dm:alice:bob");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+    }
 }
