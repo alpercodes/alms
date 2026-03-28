@@ -7,6 +7,7 @@ use crate::get_task_result_tool::GetTaskResultTool;
 use crate::invoke_agent_tool::InvokeAgentTool;
 use crate::llm_client::LlmClient;
 use crate::llm_types::*;
+use crate::read_session_tool::ReadSessionTool;
 use crate::read_subagent_session_tool::ReadSubagentSessionTool;
 use crate::tools::ToolRegistry;
 use crate::workspace::AgentWorkspace;
@@ -320,6 +321,12 @@ impl AgentRuntime {
 
     /// Register the `read_subagent_session` tool for on-demand subagent context retrieval.
     pub fn with_read_subagent_session(self, tool: ReadSubagentSessionTool) -> Self {
+        self.tools.register(std::sync::Arc::new(tool));
+        self
+    }
+
+    /// Register the `read_session` tool for on-demand session recall.
+    pub fn with_read_session(self, tool: ReadSessionTool) -> Self {
         self.tools.register(std::sync::Arc::new(tool));
         self
     }
