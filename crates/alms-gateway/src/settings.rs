@@ -37,6 +37,11 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
             "get_task_result",
             "read_subagent_session",
             "read_session",
+            "send_message",
+            "list_agents",
+            "read_messages",
+            "ignore_message",
+            "list_my_sessions",
         ]
         .iter()
         .map(|s| s.to_string()),
