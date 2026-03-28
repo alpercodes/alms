@@ -298,6 +298,30 @@ impl SseEventData {
             },
         )
     }
+
+    /// Session-level: a DM conversation between two agents has ended.
+    ///
+    /// Emitted on the DM session SSE stream so the web UI can show a
+    /// "conversation ended" indicator. See Phase 6 of #384.
+    pub fn dm_conversation_ended(
+        session_id: alms_core::SessionId,
+        ended_by: &str,
+        peer: &str,
+        reason: &str,
+        context_id: &str,
+    ) -> Self {
+        Self::new(
+            "dm_conversation_ended",
+            DmConversationEndedData {
+                session_id: session_id.0.to_string(),
+                ended_by: ended_by.to_string(),
+                peer: peer.to_string(),
+                reason: reason.to_string(),
+                context_id: context_id.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
 }
 
 /// SSE event stream wrapper
@@ -546,6 +570,16 @@ struct JobCompletedData {
     ts: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize)]
+struct DmConversationEndedData {
+    session_id: String,
+    ended_by: String,
+    peer: String,
+    reason: String,
+    context_id: String,
+    ts: DateTime<Utc>,
+}
+
 /// Classify an error message into an error code for the frontend.
 ///
 /// The code is used by the UI to pick appropriate styling:
@@ -755,5 +789,45 @@ mod tests {
 
         let generic_event = SseEventData::run_error(run_id, "unknown failure");
         assert_eq!(generic_event.data["error"]["code"], "INTERNAL");
+    }
+
+    #[test]
+    fn test_dm_conversation_ended_event() {
+        let session_id = alms_core::SessionId::new();
+        let event = SseEventData::dm_conversation_ended(
+            session_id,
+            "alice",
+            "bob",
+            "ignored",
+            "dm:alice:bob",
+        );
+
+        assert_eq!(event.event_type, "dm_conversation_ended");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["ended_by"], "alice");
+        assert_eq!(event.data["peer"], "bob");
+        assert_eq!(event.data["reason"], "ignored");
+        assert_eq!(event.data["context_id"], "dm:alice:bob");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+    }
+
+    #[test]
+    fn test_dm_conversation_ended_event_depth_exceeded() {
+        let session_id = alms_core::SessionId::new();
+        let event = SseEventData::dm_conversation_ended(
+            session_id,
+            "bob",
+            "alice",
+            "depth_exceeded",
+            "dm:alice:bob",
+        );
+
+        assert_eq!(event.event_type, "dm_conversation_ended");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["ended_by"], "bob");
+        assert_eq!(event.data["peer"], "alice");
+        assert_eq!(event.data["reason"], "depth_exceeded");
+        assert_eq!(event.data["context_id"], "dm:alice:bob");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
     }
 }

@@ -927,20 +927,53 @@ async fn execute_run(state: AppState, params: RunParams) {
                             peer = %peer_name,
                             "DM run ended with ignore_message — signalling conversation end"
                         );
-                        if let Err(e) = state
+                        let end_reason = ConversationEndReason::Ignored;
+                        match state
                             .message_bus
-                            .end_conversation(
-                                name,
-                                agent_id,
-                                &peer_name,
-                                peer_id,
-                                ConversationEndReason::Ignored,
-                            )
+                            .end_conversation(name, agent_id, &peer_name, peer_id, end_reason)
                             .await
                         {
-                            warn!(
-                                "Failed to signal conversation end for {name} -> {peer_name}: {e}"
-                            );
+                            Ok(()) => {
+                                // Emit dm_conversation_ended SSE event on the
+                                // DM session stream so the web UI can show a
+                                // "conversation ended" indicator. Phase 6 of #384.
+                                //
+                                // NOTE: This code path only fires for the
+                                // ignore_message reason.  The depth-exceeded
+                                // reason is handled inside MessageBus::send()
+                                // (Phase 7, PR #403) which calls
+                                // end_conversation deep in the coordinator
+                                // layer — that path does NOT emit this SSE
+                                // event.  A follow-up PR will add SSE
+                                // emission for depth-exceeded.
+                                //
+                                // NOTE: If both agents ignore simultaneously,
+                                // end_conversation returns Ok(()) for both
+                                // callers (the second sees "already ended by
+                                // peer" and returns Ok).  This means duplicate
+                                // dm_conversation_ended SSE events may be
+                                // emitted for the same session.  The frontend
+                                // should be prepared to handle duplicates.
+                                state
+                                    .run_manager
+                                    .send_session_event(
+                                        session_id,
+                                        run_id,
+                                        SseEventData::dm_conversation_ended(
+                                            session_id,
+                                            name,
+                                            &peer_name,
+                                            &end_reason.to_string(),
+                                            &context_id,
+                                        ),
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to signal conversation end for {name} -> {peer_name}: {e}"
+                                );
+                            }
                         }
                     } else {
                         warn!(
