@@ -1402,8 +1402,14 @@ pub(crate) async fn run_trigger_loop(
         let source_label = match &trigger.source {
             MessageSource::Agent { from_name, .. } => format!("peer:{from_name}"),
             MessageSource::SubagentCompletion => "subagent".to_string(),
+            MessageSource::ConversationEnded { from_name, .. } => {
+                format!("notification:dm_ended:{from_name}")
+            }
         };
 
+        // ConversationEnded is NOT a peer message -- the notification run
+        // should not get the DM addendum injected (it tells the agent to
+        // use send_message/ignore_message, which is wrong for a notification).
         let is_peer = matches!(trigger.source, MessageSource::Agent { .. });
 
         info!(

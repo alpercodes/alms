@@ -168,6 +168,17 @@ mod tests {
         ) -> Result<crate::message_sender::DeliveryReceipt, SendError> {
             Err(SendError::Internal("noop".into()))
         }
+
+        async fn end_conversation(
+            &self,
+            _: &str,
+            _: AgentId,
+            _: &str,
+            _: AgentId,
+            _: crate::message_sender::ConversationEndReason,
+        ) -> Result<(), SendError> {
+            Err(SendError::Internal("noop".into()))
+        }
     }
 
     fn make_tool() -> SendMessageTool {
