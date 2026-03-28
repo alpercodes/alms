@@ -768,8 +768,8 @@ impl AgentRuntime {
 
     /// Returns true if the given context_id represents a user-facing session
     /// (web chat, Telegram, etc.) where `user.md` should be included in the
-    /// system prompt.  Non-user-facing contexts (DM, subagent, job) return
-    /// false.
+    /// system prompt.  Non-user-facing contexts (DM, subagent, job,
+    /// notification) return false.
     ///
     /// NOTE: This function is **default-open** — unknown context_id prefixes
     /// are treated as user-facing.  When adding a new non-user-facing context
@@ -778,7 +778,8 @@ impl AgentRuntime {
         // These prefixes indicate non-user-facing sessions.
         !(context_id.starts_with("dm:")
             || context_id.starts_with("subagent_")
-            || context_id.starts_with("job_"))
+            || context_id.starts_with("job_")
+            || context_id.starts_with("notifications:"))
     }
 
     /// Build context window for LLM using ContextBuilder.
@@ -2719,13 +2720,17 @@ mod tests {
         assert!(AgentRuntime::is_user_facing_context("web-chat-123"));
         assert!(AgentRuntime::is_user_facing_context("telegram_agent_456"));
 
-        // Non-user-facing: DM, subagent, job
+        // Non-user-facing: DM, subagent, job, notification
         assert!(!AgentRuntime::is_user_facing_context("dm:alice:bob"));
         assert!(!AgentRuntime::is_user_facing_context("subagent_task123"));
         assert!(!AgentRuntime::is_user_facing_context(
             "subagent_task123_reviewer"
         ));
         assert!(!AgentRuntime::is_user_facing_context("job_abc"));
+        assert!(!AgentRuntime::is_user_facing_context("notifications:alice"));
+        assert!(!AgentRuntime::is_user_facing_context(
+            "notifications:my-agent"
+        ));
 
         // Edge cases: empty string and unknown prefix default to user-facing
         assert!(AgentRuntime::is_user_facing_context(""));
@@ -2735,6 +2740,9 @@ mod tests {
         assert!(AgentRuntime::is_user_facing_context("dmx:something"));
         assert!(AgentRuntime::is_user_facing_context("subagentx_something"));
         assert!(AgentRuntime::is_user_facing_context("jobs_something"));
+        assert!(AgentRuntime::is_user_facing_context(
+            "notification_something"
+        ));
     }
 
     #[test]
