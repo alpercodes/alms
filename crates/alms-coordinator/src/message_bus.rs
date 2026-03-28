@@ -246,6 +246,15 @@ impl MessageSender for MessageBus {
 
     /// End a DM conversation: write a metadata marker, reset depth, and
     /// emit a `RunTrigger` with `ConversationEnded` source for the peer.
+    ///
+    /// Concurrency safety: `depths.remove()` is used as the atomicity point.
+    /// If two agents call `end_conversation` simultaneously for the same pair,
+    /// only the one whose `depths.remove()` returns `Some` proceeds with the
+    /// marker write and trigger emission. The other observes `None` and
+    /// returns early, preventing double notifications. The depth removal also
+    /// happens BEFORE the marker write so that a concurrent `send()` cannot
+    /// slip a message in after the marker (it would start a fresh depth=1
+    /// conversation instead).
     #[instrument(
         level = "info",
         skip(self),
@@ -263,14 +272,47 @@ impl MessageSender for MessageBus {
         peer_agent_id: AgentId,
         reason: ConversationEndReason,
     ) -> Result<(), SendError> {
+        // --- S3: Self-message guard (mirrors send()) ---
+        if sender_agent_id == peer_agent_id {
+            return Err(SendError::SelfMessage);
+        }
+
         let dm_context = dm_context_id(sender_name, peer_name);
         let session_id = SessionId::deterministic_dm(sender_name, peer_name);
 
-        // Ensure the shared DM session exists (it should, since a
-        // conversation must have started before it can end).
-        let _session = self
-            .session_manager
-            .get_or_create_shared(session_id, &dm_context);
+        // --- C1+C2: Reset depth FIRST, use remove() as atomicity guard ---
+        //
+        // depths.remove() returns Some if the entry existed (we are the first
+        // caller to end this conversation) or None if it was already removed
+        // (a concurrent end_conversation already handled it). This prevents
+        // double marker writes and double notification triggers.
+        //
+        // By removing depth BEFORE writing the marker, a concurrent send()
+        // that races in will start a fresh depth=1 conversation rather than
+        // appending after the dm_ended marker.
+        let was_active = self.depths.remove(&dm_context).is_some();
+        self.last_activity.remove(&dm_context);
+
+        if !was_active {
+            info!(
+                session_id = %session_id.0,
+                "end_conversation skipped -- already ended by peer"
+            );
+            return Ok(());
+        }
+
+        // --- S2: Validate that the DM session exists ---
+        //
+        // A conversation must have started (via send()) before it can end.
+        // If the session doesn't exist, the caller has a bug -- return early
+        // rather than silently creating an empty session.
+        if self.session_manager.get(session_id).is_err() {
+            warn!(
+                session_id = %session_id.0,
+                "end_conversation called but DM session does not exist -- no-op"
+            );
+            return Ok(());
+        }
 
         // --- Write dm_ended metadata marker to the shared DM session ---
         let marker = alms_session::Message {
@@ -287,10 +329,6 @@ impl MessageSender for MessageBus {
         self.session_manager
             .append_message(session_id, marker)
             .map_err(|e| SendError::Internal(e.to_string()))?;
-
-        // --- Reset depth counter for this DM pair (decision D6) ---
-        self.depths.remove(&dm_context);
-        self.last_activity.remove(&dm_context);
 
         // --- Emit RunTrigger for the peer agent ---
         let notification_context = format!("notifications:{peer_name}");
@@ -882,5 +920,164 @@ mod tests {
             }
             other => panic!("expected ConversationEnded, got {:?}", other),
         }
+    }
+
+    /// S3: end_conversation should reject sender == peer (self-message guard).
+    #[tokio::test]
+    async fn test_end_conversation_self_message_rejected() {
+        let (bus, _rx) = setup();
+        let agent_id = AgentId::new();
+
+        // Ending a conversation with yourself should fail.
+        let err = bus
+            .end_conversation(
+                "alice",
+                agent_id,
+                "alice",
+                agent_id,
+                ConversationEndReason::Ignored,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, SendError::SelfMessage));
+    }
+
+    /// S2: end_conversation should no-op when the DM session doesn't exist
+    /// (no conversation was ever started).
+    #[tokio::test]
+    async fn test_end_conversation_nonexistent_session_is_noop() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Pre-insert a depth entry so depths.remove() succeeds (simulates
+        // a state where depth tracking exists but the session was never
+        // properly created -- shouldn't happen in practice, but tests the
+        // defensive check).
+        let dm_ctx = dm_context_id("alice", "bob");
+        bus.depths.insert(dm_ctx.clone(), ("alice".to_string(), 1));
+
+        // end_conversation should succeed (no error) but not emit a trigger.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // No trigger should have been emitted (session didn't exist).
+        assert!(
+            rx.try_recv().is_err(),
+            "no RunTrigger should be emitted when DM session doesn't exist"
+        );
+
+        // Depth entry should still have been removed.
+        assert!(!bus.depths.contains_key(&dm_ctx));
+    }
+
+    /// S4: Simultaneous end_conversation from both agents should produce
+    /// exactly one notification trigger (not two). This tests the C1 fix:
+    /// depths.remove() as the atomicity guard.
+    #[tokio::test]
+    async fn test_simultaneous_end_conversation_only_one_trigger() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Start a conversation so the DM session and depth exist.
+        bus.send("alice", alice_id, "bob", bob_id, "Hello Bob!")
+            .await
+            .unwrap();
+        // Drain the send trigger.
+        let _ = rx.try_recv().unwrap();
+
+        // Both agents call end_conversation simultaneously.
+        let bus_a = bus.clone();
+        let bus_b = bus.clone();
+
+        let (result_a, result_b) = tokio::join!(
+            bus_a.end_conversation(
+                "alice",
+                alice_id,
+                "bob",
+                bob_id,
+                ConversationEndReason::Ignored,
+            ),
+            bus_b.end_conversation(
+                "bob",
+                bob_id,
+                "alice",
+                alice_id,
+                ConversationEndReason::Ignored,
+            ),
+        );
+
+        // Both calls should succeed (no errors).
+        result_a.unwrap();
+        result_b.unwrap();
+
+        // Count triggers: exactly one should have been emitted.
+        // (The loser of the depths.remove() race returns early without
+        // writing a marker or emitting a trigger.)
+        let mut trigger_count = 0;
+        while rx.try_recv().is_ok() {
+            trigger_count += 1;
+        }
+
+        assert_eq!(
+            trigger_count, 1,
+            "simultaneous end_conversation should produce exactly 1 trigger, got {trigger_count}"
+        );
+
+        // Depth and last_activity should both be cleaned up.
+        let dm_ctx = dm_context_id("alice", "bob");
+        assert!(!bus.depths.contains_key(&dm_ctx));
+        assert!(!bus.last_activity.contains_key(&dm_ctx));
+    }
+
+    /// C2: After end_conversation, a concurrent send() should start a fresh
+    /// conversation (depth=1) rather than appending after the dm_ended marker.
+    #[tokio::test]
+    async fn test_send_after_end_starts_fresh_conversation() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Start and end a conversation.
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv();
+
+        // The depth counter should be gone.
+        let dm_ctx = dm_context_id("alice", "bob");
+        assert!(!bus.depths.contains_key(&dm_ctx));
+
+        // A new send() should succeed and start at depth=1.
+        bus.send("alice", alice_id, "bob", bob_id, "New conversation!")
+            .await
+            .unwrap();
+
+        let entry = bus.depths.get(&dm_ctx).unwrap();
+        assert_eq!(
+            entry.value().1,
+            1,
+            "depth should be 1 for a fresh conversation after end"
+        );
     }
 }

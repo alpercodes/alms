@@ -90,6 +90,9 @@ impl SessionId {
     /// Same input always produces the same SessionId (UUID v5). Use this
     /// for notification sessions, named sessions, or any case where a
     /// stable identity is needed from a string key.
+    ///
+    /// [`deterministic_dm`](Self::deterministic_dm) is a convenience wrapper
+    /// that sorts agent names and delegates here with a `"dm:{a}:{b}"` key.
     pub fn deterministic(context: &str) -> Self {
         Self(Uuid::new_v5(&ALMS_NAMESPACE, context.as_bytes()))
     }
@@ -98,10 +101,11 @@ impl SessionId {
     ///
     /// Names are sorted alphabetically so both sides resolve to the same
     /// SessionId regardless of who initiated the conversation (UUID v5).
+    ///
+    /// This is a convenience wrapper around [`deterministic`](Self::deterministic)
+    /// with the key `"dm:{sorted_a}:{sorted_b}"` -- see [`dm_context_id`].
     pub fn deterministic_dm(a: &str, b: &str) -> Self {
-        let (first, second) = if a < b { (a, b) } else { (b, a) };
-        let input = format!("dm:{}:{}", first, second);
-        Self(Uuid::new_v5(&ALMS_NAMESPACE, input.as_bytes()))
+        Self::deterministic(&dm_context_id(a, b))
     }
 }
 
