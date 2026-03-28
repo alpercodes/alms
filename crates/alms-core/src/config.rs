@@ -481,7 +481,7 @@ pub struct LlmConfig {
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
-            provider: "openai".into(),
+            provider: "openrouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             model: "moonshotai/kimi-k2.5".into(),
             api_key: None,
