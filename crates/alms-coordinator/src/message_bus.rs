@@ -189,6 +189,10 @@ impl MessageSender for MessageBus {
             // session, reset the depth counter, and notify the peer.
             // This ensures depth-exceeded conversations get the same lifecycle
             // events as ignore_message-ended conversations (#391).
+            //
+            // TODO(Phase 9, #393): Add resilience testing for end_conversation
+            // failures here — e.g. what happens when the session write fails
+            // or the RunTrigger channel is closed. Currently we log and proceed.
             if let Err(e) = self
                 .end_conversation(
                     sender_name,
@@ -400,6 +404,23 @@ mod tests {
         (bus, rx)
     }
 
+    /// Send MAX_DM_DEPTH alternating messages between alice and bob to exhaust
+    /// the depth counter. After calling this, the next alternating send will
+    /// trigger `SendError::DepthExceeded`.
+    async fn exhaust_depth(bus: &MessageBus, alice_id: AgentId, bob_id: AgentId) {
+        for i in 0..MAX_DM_DEPTH {
+            if i % 2 == 0 {
+                bus.send("alice", alice_id, "bob", bob_id, "ping")
+                    .await
+                    .unwrap();
+            } else {
+                bus.send("bob", bob_id, "alice", alice_id, "pong")
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_send_creates_shared_session() {
         let (bus, mut rx) = setup();
@@ -481,15 +502,7 @@ mod tests {
         let a = AgentId::new();
         let b = AgentId::new();
 
-        // Send MAX_DM_DEPTH alternating messages (depth reaches MAX_DM_DEPTH).
-        // Each sender change increments depth: alice(1), bob(2), alice(3), ...
-        for i in 0..MAX_DM_DEPTH {
-            if i % 2 == 0 {
-                bus.send("alice", a, "bob", b, "ping").await.unwrap();
-            } else {
-                bus.send("bob", b, "alice", a, "pong").await.unwrap();
-            }
-        }
+        exhaust_depth(&bus, a, b).await;
 
         // Next alternating message should be rejected (depth > MAX_DM_DEPTH)
         let err = bus
@@ -560,14 +573,7 @@ mod tests {
         let a = AgentId::new();
         let b = AgentId::new();
 
-        // Exhaust depth: send MAX_DM_DEPTH alternating messages
-        for i in 0..MAX_DM_DEPTH {
-            if i % 2 == 0 {
-                bus.send("alice", a, "bob", b, "ping").await.unwrap();
-            } else {
-                bus.send("bob", b, "alice", a, "pong").await.unwrap();
-            }
-        }
+        exhaust_depth(&bus, a, b).await;
 
         // Next message should be rejected (depth exceeded)
         let err = bus
@@ -1071,14 +1077,7 @@ mod tests {
         let a = AgentId::new();
         let b = AgentId::new();
 
-        // Exhaust depth with alternating messages.
-        for i in 0..MAX_DM_DEPTH {
-            if i % 2 == 0 {
-                bus.send("alice", a, "bob", b, "ping").await.unwrap();
-            } else {
-                bus.send("bob", b, "alice", a, "pong").await.unwrap();
-            }
-        }
+        exhaust_depth(&bus, a, b).await;
 
         // The next message should trigger DepthExceeded.
         let next_sender = if MAX_DM_DEPTH.is_multiple_of(2) {
@@ -1086,14 +1085,14 @@ mod tests {
         } else {
             "bob"
         };
-        let (next_id, peer_name, _peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
+        let (next_id, peer_name, peer_id) = if MAX_DM_DEPTH.is_multiple_of(2) {
             (a, "bob", b)
         } else {
             (b, "alice", a)
         };
 
         let err = bus
-            .send(next_sender, next_id, peer_name, _peer_id, "overflow")
+            .send(next_sender, next_id, peer_name, peer_id, "overflow")
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -1119,14 +1118,7 @@ mod tests {
         let a = AgentId::new();
         let b = AgentId::new();
 
-        // Exhaust depth.
-        for i in 0..MAX_DM_DEPTH {
-            if i % 2 == 0 {
-                bus.send("alice", a, "bob", b, "ping").await.unwrap();
-            } else {
-                bus.send("bob", b, "alice", a, "pong").await.unwrap();
-            }
-        }
+        exhaust_depth(&bus, a, b).await;
 
         // Drain all send triggers.
         while rx.try_recv().is_ok() {}
@@ -1182,14 +1174,7 @@ mod tests {
         let a = AgentId::new();
         let b = AgentId::new();
 
-        // Exhaust depth.
-        for i in 0..MAX_DM_DEPTH {
-            if i % 2 == 0 {
-                bus.send("alice", a, "bob", b, "ping").await.unwrap();
-            } else {
-                bus.send("bob", b, "alice", a, "pong").await.unwrap();
-            }
-        }
+        exhaust_depth(&bus, a, b).await;
 
         let dm_ctx = dm_context_id("alice", "bob");
         assert!(
