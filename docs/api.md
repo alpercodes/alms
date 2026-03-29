@@ -621,7 +621,7 @@ Path parameter accepts either a UUID or a name slug. UUID is tried first.
 
 Valid `posture` values: `"guarded"` (default — requires approval for risky tools), `"full_control"` (no approvals), `"autonomous"` (no approvals, no human-in-the-loop expected — for background agents, scheduled jobs, and subagents).
 
-> **Note:** When an agent receives a direct message from another agent (peer-to-peer DM via `send_message`), Guarded posture is automatically overridden to Autonomous for that run, since there is no human in the loop to approve tool calls. Without this override the run would hang indefinitely waiting for approval that can never arrive.
+> **Note:** When a run is system-triggered (peer-to-peer DMs via `send_message`, notification runs, subagent completions, and scheduled jobs), Guarded posture is automatically overridden to Autonomous for that run via the `is_system_triggered` flag, since there is no human in the loop to approve tool calls. Without this override the run would hang indefinitely waiting for approval that can never arrive. User-initiated runs (via the HTTP API) are never affected — Guarded posture is preserved as configured.
 
 To clear an override, pass an empty string: `"model": ""`.
 
