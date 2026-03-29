@@ -282,7 +282,7 @@ When called, the run ends early. The ignore is logged but no response is broadca
 1. Writes a `dm_ended` metadata marker to the shared DM session (with `ended_by` and `reason` fields).
 2. Resets the depth counter for the DM pair to zero, allowing a fresh conversation immediately.
 3. Emits a `RunTrigger` with `MessageSource::ConversationEnded` targeting the peer agent on a dedicated `notifications:{agent_name}` session.
-4. Emits a `dm_conversation_ended` SSE event on the DM session stream for web UI rendering.
+4. Emits a `dm_conversation_ended` SSE event on the DM session stream for web UI rendering. For `ignore_message`, this is emitted in `execute_run` after `end_conversation` returns. For depth-exceeded, it is emitted in `run_trigger_loop` when processing the `ConversationEnded` trigger (#419).
 
 The peer receives a one-shot notification run. The raw `RunTrigger.input` from `end_conversation()` is a simple marker, but `run_trigger_loop` in `runs.rs` enriches it via `format_dm_ended_notification()`, which produces a richer message including the reason and a `read_messages` hint. For example, when the reason is `Ignored`:
 
@@ -796,6 +796,8 @@ Agent B runs, processes message, may reply (send_message back) or end (ignore_me
          v
        MessageBus::send() calls end_conversation(reason: DepthExceeded)
          Same lifecycle as ignore_message: marker write, depth reset, peer notification
+         dm_conversation_ended SSE emitted from run_trigger_loop when processing
+         the ConversationEnded trigger (#419)
          Returns SendError::DepthExceeded to the sender
 ```
 
