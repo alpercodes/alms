@@ -1855,9 +1855,8 @@ fn sanitize_error_for_session(err: &AlmsError) -> String {
 const SEND_MESSAGE_TOOL: &str = "send_message";
 const IGNORE_MESSAGE_TOOL: &str = "ignore_message";
 
-/// Error message returned to the LLM when both DM tools appear in one batch.
-const DM_CONFLICT_MSG: &str = "send_message and ignore_message are mutually exclusive \
-     — you can only use one per turn. Choose one.";
+/// Re-export the shared constant for in-crate use.
+const DM_CONFLICT_MSG: &str = alms_core::DM_CONFLICT_MSG;
 
 /// Result of checking a tool-call batch for DM tool conflicts.
 #[derive(Debug)]

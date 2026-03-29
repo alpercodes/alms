@@ -19,13 +19,22 @@ pub use registry::{
 };
 pub use run::{
     CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
-    TokenUsage, ToolCallRecord, ToolCallRole,
+    TokenUsage, ToolCallRecord, ToolCallRole, ran_ignore_message_successfully,
 };
 
 /// Sentinel string returned by the agent loop when the max-iterations limit is
 /// hit.  Defined once so that the runtime (`agent.rs`) and the gateway
 /// (`runs.rs`) stay in sync.
 pub const MAX_ITERATIONS_SENTINEL: &str = "[Max iterations reached]";
+
+/// Error message returned to the LLM when both `send_message` and
+/// `ignore_message` appear in the same tool-call batch (DM conflict).
+///
+/// Defined in `alms-core` so that both `alms-runtime` (conflict detection in
+/// the agent loop) and `alms-gateway` (ignore-message detection in `execute_run`)
+/// can reference the same sentinel string.
+pub const DM_CONFLICT_MSG: &str = "send_message and ignore_message are mutually exclusive \
+     — you can only use one per turn. Choose one.";
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
