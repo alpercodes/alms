@@ -1394,6 +1394,22 @@ impl AgentRuntime {
                     return (tool_call_records, Ok((String::new(), total_usage)));
                 }
 
+                // In a DM-triggered run, terminate the loop after the agent
+                // has successfully called `send_message`.  The reply has been
+                // delivered; re-entering the loop would let the LLM call
+                // `send_message` again, producing duplicate messages and a
+                // cascade of RunTrigger events (#407 Bug 1).
+                if should_terminate_after_dm_send(&tool_calls, is_dm, dm_check.conflict) {
+                    info!("DM run: send_message delivered — ending loop (one reply per DM run)");
+                    // Return the last text content (if any) alongside the
+                    // accumulated usage.  In most DM runs the LLM returns
+                    // tool calls only (no text), so `content` is typically
+                    // None/empty here; the actual message is delivered via
+                    // the `send_message` tool execution.
+                    let text = content.unwrap_or_default();
+                    return (tool_call_records, Ok((text, total_usage)));
+                }
+
                 // Append tool_loop instructions to the system prompt for
                 // subsequent iterations. The agent's identity (initial prompt +
                 // workspace prefix) is preserved; tool_loop adds continuation
@@ -1884,6 +1900,23 @@ pub(crate) fn should_terminate_on_ignore(tool_calls: &[ToolCall], dm_conflict: b
         && tool_calls
             .iter()
             .any(|tc| tc.function.name == IGNORE_MESSAGE_TOOL)
+}
+
+/// Returns `true` when `send_message` was called without a conflict in a
+/// DM-triggered run, meaning the agent has delivered its reply and the loop
+/// should terminate.  Without this check the loop re-enters, the LLM calls
+/// `send_message` again, and the result is duplicate messages and a cascade
+/// of `RunTrigger` events (#407 Bug 1).
+pub(crate) fn should_terminate_after_dm_send(
+    tool_calls: &[ToolCall],
+    is_dm: bool,
+    dm_conflict: bool,
+) -> bool {
+    is_dm
+        && !dm_conflict
+        && tool_calls
+            .iter()
+            .any(|tc| tc.function.name == SEND_MESSAGE_TOOL)
 }
 
 /// Maximum number of times the agent loop will retry when a DM-triggered
@@ -3038,6 +3071,97 @@ mod tests {
         assert!(!check.conflict);
         assert!(check.conflicting_tools.is_empty());
         assert!(!should_terminate_on_ignore(&tool_calls, check.conflict));
+    }
+
+    // ---- should_terminate_after_dm_send tests (#407 Bug 1) ----
+
+    /// In a DM run, `send_message` alone should terminate the loop.
+    #[test]
+    fn test_dm_send_terminates_in_dm_context() {
+        use crate::llm_types::{FunctionCall, ToolCall};
+
+        let tool_calls = vec![ToolCall {
+            id: "tc_send".to_string(),
+            function: FunctionCall {
+                name: "send_message".to_string(),
+                arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
+            },
+        }];
+
+        assert!(
+            should_terminate_after_dm_send(&tool_calls, true, false),
+            "send_message in a DM run (no conflict) should terminate the loop"
+        );
+    }
+
+    /// Outside a DM run, `send_message` should NOT terminate the loop
+    /// (the agent may be using it from a web-chat context to message
+    /// another agent, and may have more work to do).
+    #[test]
+    fn test_dm_send_does_not_terminate_outside_dm() {
+        use crate::llm_types::{FunctionCall, ToolCall};
+
+        let tool_calls = vec![ToolCall {
+            id: "tc_send".to_string(),
+            function: FunctionCall {
+                name: "send_message".to_string(),
+                arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
+            },
+        }];
+
+        assert!(
+            !should_terminate_after_dm_send(&tool_calls, false, false),
+            "send_message outside a DM run should NOT terminate the loop"
+        );
+    }
+
+    /// When there is a conflict (both send_message and ignore_message),
+    /// do NOT terminate — let the agent retry on the next iteration.
+    #[test]
+    fn test_dm_send_does_not_terminate_on_conflict() {
+        use crate::llm_types::{FunctionCall, ToolCall};
+
+        let tool_calls = vec![
+            ToolCall {
+                id: "tc_send".to_string(),
+                function: FunctionCall {
+                    name: "send_message".to_string(),
+                    arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "tc_ignore".to_string(),
+                function: FunctionCall {
+                    name: "ignore_message".to_string(),
+                    arguments: r#"{"reason":"done"}"#.to_string(),
+                },
+            },
+        ];
+
+        assert!(
+            !should_terminate_after_dm_send(&tool_calls, true, true),
+            "send_message with conflict should NOT terminate the loop"
+        );
+    }
+
+    /// When no DM tool is present, should_terminate_after_dm_send
+    /// returns false even in a DM context.
+    #[test]
+    fn test_dm_send_no_dm_tools() {
+        use crate::llm_types::{FunctionCall, ToolCall};
+
+        let tool_calls = vec![ToolCall {
+            id: "tc_echo".to_string(),
+            function: FunctionCall {
+                name: "echo".to_string(),
+                arguments: r#"{"message":"hello"}"#.to_string(),
+            },
+        }];
+
+        assert!(
+            !should_terminate_after_dm_send(&tool_calls, true, false),
+            "No send_message call means no DM-send termination"
+        );
     }
 
     // ---- dm_tool_was_called tests (#361) ----
