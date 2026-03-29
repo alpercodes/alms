@@ -255,13 +255,16 @@ impl From<Run> for RunStatusResponse {
 /// A call is only counted as successful if:
 /// 1. An `Assistant`-role record exists with `tool_name == "ignore_message"`, AND
 /// 2. A corresponding `Tool`-role result record (matched by `tool_id`) exists
-///    whose result does NOT contain the DM conflict error message.
+///    whose result is NOT an error (does not start with `"Error:"`).
 ///
-/// This prevents a false positive when both `send_message` and `ignore_message`
-/// appear in a conflict batch (PR #365) -- both are blocked and receive error
-/// results, but the function must return `false` so the agent can retry.
+/// This prevents false positives when:
+/// - Both `send_message` and `ignore_message` appear in a conflict batch
+///   (PR #365) -- both are blocked and receive error results.
+/// - `ignore_message` is called from a non-DM session (PR #415) -- the tool
+///   returns an `InvalidParameters` error.
+/// - Any other tool execution failure occurs.
 ///
-/// Shared between `alms-runtime` (`dm_tool_was_called`) and `alms-gateway`
+/// Shared between `alms-runtime` (agent loop termination) and `alms-gateway`
 /// (`execute_run` ignore-message detection).
 pub fn ran_ignore_message_successfully(records: &[ToolCallRecord]) -> bool {
     records.iter().any(|r| {
@@ -274,7 +277,7 @@ pub fn ran_ignore_message_successfully(records: &[ToolCallRecord]) -> bool {
                         && !result
                             .result
                             .as_deref()
-                            .is_some_and(|res| res.contains(crate::DM_CONFLICT_MSG))
+                            .is_some_and(|res| res.starts_with("Error:"))
                 })
             })
     })
@@ -460,5 +463,47 @@ mod tests {
     fn test_ran_ignore_empty_records() {
         let records: Vec<ToolCallRecord> = vec![];
         assert!(!ran_ignore_message_successfully(&records));
+    }
+
+    /// When `ignore_message` is called from a non-DM session, the tool
+    /// returns an `InvalidParameters` error. The formatted result starts
+    /// with `"Error:"` and must NOT be treated as a successful call.
+    #[test]
+    fn test_ran_ignore_non_dm_error_not_successful() {
+        let records = vec![
+            make_record(ToolCallRole::Assistant, "ignore_message", "tc_ign", None),
+            make_record(
+                ToolCallRole::Tool,
+                "ignore_message",
+                "tc_ign",
+                Some(
+                    "Error: Invalid parameters: ignore_message can only be used in DM sessions. \
+                     You are currently in a non-DM session.",
+                ),
+            ),
+        ];
+        assert!(
+            !ran_ignore_message_successfully(&records),
+            "ignore_message that returned an error should not count as successful"
+        );
+    }
+
+    /// Any `"Error:"` prefix in the tool result should prevent the call
+    /// from being treated as successful, regardless of the error content.
+    #[test]
+    fn test_ran_ignore_generic_error_not_successful() {
+        let records = vec![
+            make_record(ToolCallRole::Assistant, "ignore_message", "tc_ign", None),
+            make_record(
+                ToolCallRole::Tool,
+                "ignore_message",
+                "tc_ign",
+                Some("Error: some unexpected failure"),
+            ),
+        ];
+        assert!(
+            !ran_ignore_message_successfully(&records),
+            "any tool error should prevent ignore_message from being treated as successful"
+        );
     }
 }
