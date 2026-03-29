@@ -744,7 +744,6 @@ async fn execute_run(state: AppState, params: RunParams) {
             alms_runtime::ListAgentsTool::new(state.session_manager.clone(), name.clone());
         let read_tool =
             alms_runtime::ReadMessagesTool::new(state.session_manager.clone(), name.clone());
-        let ignore_tool = alms_runtime::IgnoreMessageTool::new();
         let list_sessions_tool = alms_runtime::ListMySessionsTool::new(
             state.session_manager.clone(),
             agent_id,
@@ -755,8 +754,16 @@ async fn execute_run(state: AppState, params: RunParams) {
             .with_send_message(send_tool)
             .with_list_agents(list_tool)
             .with_read_messages(read_tool)
-            .with_ignore_message(ignore_tool)
             .with_list_my_sessions(list_sessions_tool);
+
+        // Only register `ignore_message` in DM sessions — the tool is
+        // meaningless outside DM context and would confuse the LLM into
+        // calling it in web-chat or job runs.  The runtime guard in
+        // IgnoreMessageTool::execute() remains as defense-in-depth.
+        if context_id.starts_with("dm:") {
+            let ignore_tool = alms_runtime::IgnoreMessageTool::new(context_id.clone());
+            runtime = runtime.with_ignore_message(ignore_tool);
+        }
     }
 
     // Spawn forwarder: converts RuntimeEvents → SseEventData (and stores approvals).

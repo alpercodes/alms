@@ -1,14 +1,13 @@
 //! ignore_message tool -- lets an agent decline to respond.
 //!
 //! When called, this tool signals that the current run should end early
-//! without producing a response. Useful for DM conversations where an
-//! agent has nothing meaningful to add (avoids burning through max-depth),
-//! and for future group chats with `@everyone` where not every agent needs
-//! to respond.
+//! without producing a response. Only valid in DM sessions -- calling it
+//! from a non-DM context returns an error so the agent knows it cannot
+//! use this tool there.
 
-use alms_sandbox::{Tool, error::SandboxResult};
+use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Built-in tool that lets an agent decline to respond to a message.
 ///
@@ -16,18 +15,18 @@ use tracing::info;
 /// The agent loop in `agent.rs` checks for this marker after processing
 /// tool results and, when detected, breaks without appending an assistant
 /// response to the session.
+///
+/// If called outside a DM session, the tool returns an error explaining
+/// that `ignore_message` can only be used in DM sessions.
 #[derive(Debug)]
-pub struct IgnoreMessageTool;
-
-impl Default for IgnoreMessageTool {
-    fn default() -> Self {
-        Self
-    }
+pub struct IgnoreMessageTool {
+    /// The context ID of the current session, used to verify this is a DM.
+    context_id: String,
 }
 
 impl IgnoreMessageTool {
-    pub fn new() -> Self {
-        Self
+    pub fn new(context_id: String) -> Self {
+        Self { context_id }
     }
 }
 
@@ -38,9 +37,9 @@ impl Tool for IgnoreMessageTool {
     }
 
     fn description(&self) -> &str {
-        "Decline to respond to this message. Use when you have nothing \
-         meaningful to add to the conversation. The run ends early -- no \
-         response is sent or broadcast."
+        "Decline to respond to this message. Only usable in DM sessions. \
+         Use when you have nothing meaningful to add to the conversation. \
+         The run ends early -- no response is sent or broadcast."
     }
 
     fn parameters(&self) -> Value {
@@ -56,6 +55,19 @@ impl Tool for IgnoreMessageTool {
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
+        // Guard: only allow in DM sessions.
+        if !self.context_id.starts_with("dm:") {
+            warn!(
+                context_id = %self.context_id,
+                "ignore_message called from non-DM session — rejecting"
+            );
+            return Err(SandboxError::InvalidParameters(
+                "ignore_message can only be used in DM sessions. \
+                 You are currently in a non-DM session."
+                    .to_string(),
+            ));
+        }
+
         let reason = params
             .get("reason")
             .and_then(|v| v.as_str())
@@ -78,13 +90,19 @@ impl Tool for IgnoreMessageTool {
 mod tests {
     use super::*;
 
-    fn make_tool() -> IgnoreMessageTool {
-        IgnoreMessageTool::new()
+    /// Helper: create a tool wired to a DM context (the happy path).
+    fn make_dm_tool() -> IgnoreMessageTool {
+        IgnoreMessageTool::new("dm:alice:bob".to_string())
+    }
+
+    /// Helper: create a tool wired to a non-DM context.
+    fn make_non_dm_tool() -> IgnoreMessageTool {
+        IgnoreMessageTool::new("web-chat-session".to_string())
     }
 
     #[tokio::test]
-    async fn test_returns_ignored_marker() {
-        let tool = make_tool();
+    async fn test_returns_ignored_marker_in_dm() {
+        let tool = make_dm_tool();
         let result = tool
             .execute(serde_json::json!({ "reason": "nothing to add" }))
             .await
@@ -95,15 +113,43 @@ mod tests {
 
     #[tokio::test]
     async fn test_default_reason_when_omitted() {
-        let tool = make_tool();
+        let tool = make_dm_tool();
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert_eq!(result["ignored"], true);
         assert_eq!(result["reason"], "no reason given");
     }
 
+    #[tokio::test]
+    async fn test_rejects_non_dm_context() {
+        let tool = make_non_dm_tool();
+        let result = tool
+            .execute(serde_json::json!({ "reason": "whatever" }))
+            .await;
+        assert!(result.is_err(), "Should fail in non-DM context");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("only be used in DM sessions"),
+            "Error should mention DM sessions, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rejects_job_context() {
+        let tool = IgnoreMessageTool::new("job_abc123".to_string());
+        let result = tool.execute(serde_json::json!({})).await;
+        assert!(result.is_err(), "Should fail in job context");
+    }
+
+    #[tokio::test]
+    async fn test_rejects_subagent_context() {
+        let tool = IgnoreMessageTool::new("subagent_task123".to_string());
+        let result = tool.execute(serde_json::json!({})).await;
+        assert!(result.is_err(), "Should fail in subagent context");
+    }
+
     #[test]
     fn test_schema_has_reason_property() {
-        let tool = make_tool();
+        let tool = make_dm_tool();
         let schema = tool.parameters();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["reason"].is_object());
@@ -113,13 +159,13 @@ mod tests {
 
     #[test]
     fn test_tool_name() {
-        let tool = make_tool();
+        let tool = make_dm_tool();
         assert_eq!(tool.name(), "ignore_message");
     }
 
     #[test]
     fn test_is_builtin() {
-        let tool = make_tool();
+        let tool = make_dm_tool();
         assert!(tool.is_builtin());
     }
 }

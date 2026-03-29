@@ -1386,10 +1386,12 @@ impl AgentRuntime {
                     tool_seq += 1;
                 }
 
-                // Check if any tool call is an ignore_message marker.
-                // When detected (and it was NOT blocked by a conflict),
-                // end the run early without producing a response.
-                if should_terminate_on_ignore(&tool_calls, dm_check.conflict) {
+                // Check if `ignore_message` was called AND succeeded.
+                // We inspect the actual tool-call records (which include
+                // execution results), not just the LLM's requested calls.
+                // This prevents early termination when ignore_message fails
+                // (e.g. called from a non-DM session, or blocked by conflict).
+                if alms_core::ran_ignore_message_successfully(&tool_call_records) {
                     info!("Agent declined to respond via ignore_message — ending run early");
                     return (tool_call_records, Ok((String::new(), total_usage)));
                 }
@@ -1892,15 +1894,6 @@ pub(crate) fn detect_dm_conflict(tool_calls: &[ToolCall]) -> DmConflictCheck {
     }
 }
 
-/// Returns `true` when the `ignore_message` tool was called without a
-/// conflict, meaning the run should terminate early.
-pub(crate) fn should_terminate_on_ignore(tool_calls: &[ToolCall], dm_conflict: bool) -> bool {
-    !dm_conflict
-        && tool_calls
-            .iter()
-            .any(|tc| tc.function.name == IGNORE_MESSAGE_TOOL)
-}
-
 /// Returns `true` when `send_message` was called without a conflict in a
 /// DM-triggered run, meaning the agent has delivered its reply and the loop
 /// should terminate.  Without this check the loop re-enters, the LLM calls
@@ -1937,12 +1930,12 @@ const DM_TEXT_ONLY_RETRY_MSG: &str = "ERROR: Your text-only response was NOT del
 /// A DM tool is only counted as "called" if:
 /// 1. An `Assistant`-role record exists for `send_message` or `ignore_message`, AND
 /// 2. A corresponding `Tool`-role result record (matched by `tool_id`) exists
-///    whose result does NOT contain the DM conflict error message.
+///    whose result is NOT an error (does not start with `"Error:"`).
 ///
-/// This prevents a false positive when both tools appear in a conflict
-/// batch (PR #365) — both are blocked and receive error results, but
-/// the function must return `false` so the text-only retry (PR #369)
-/// can trigger on the next iteration.
+/// This prevents false positives when:
+/// - Both tools appear in a conflict batch (PR #365) — both are blocked
+///   and receive error results, so the text-only retry can trigger.
+/// - `ignore_message` returns an error in a non-DM context (defense-in-depth).
 pub(crate) fn dm_tool_was_called(records: &[alms_core::ToolCallRecord]) -> bool {
     records.iter().any(|r| {
         r.role == alms_core::ToolCallRole::Assistant
@@ -1951,14 +1944,14 @@ pub(crate) fn dm_tool_was_called(records: &[alms_core::ToolCallRecord]) -> bool 
                 .is_some_and(|n| n == SEND_MESSAGE_TOOL || n == IGNORE_MESSAGE_TOOL)
             && r.tool_id.as_ref().is_some_and(|call_id| {
                 // Find the matching Tool-role result record and verify it
-                // was not a conflict-blocked error.
+                // was not an error.
                 records.iter().any(|result| {
                     result.role == alms_core::ToolCallRole::Tool
                         && result.tool_id.as_deref() == Some(call_id.as_str())
                         && !result
                             .result
                             .as_deref()
-                            .is_some_and(|res| res.contains(DM_CONFLICT_MSG))
+                            .is_some_and(|res| res.starts_with("Error:"))
                 })
             })
     })
@@ -2887,9 +2880,9 @@ mod tests {
 
     // ---- send_message / ignore_message conflict detection tests (#364) ----
     //
-    // These tests exercise the extracted `detect_dm_conflict` and
-    // `should_terminate_on_ignore` helpers directly, verifying the real
-    // code path rather than replicating the detection booleans inline.
+    // These tests exercise `detect_dm_conflict` for request-level conflict
+    // detection, and `alms_core::ran_ignore_message_successfully` for
+    // result-level termination decisions (verifying the real code path).
 
     /// When both `send_message` and `ignore_message` appear in the same
     /// tool-call batch, both should be blocked with error results.
@@ -2931,18 +2924,12 @@ mod tests {
                 tc.function.name
             );
         }
-
-        // Early-termination must be suppressed when there is a conflict.
-        assert!(
-            !should_terminate_on_ignore(&tool_calls, check.conflict),
-            "Run must NOT terminate early when both tools conflict"
-        );
     }
 
-    /// When `ignore_message` is called alone (no `send_message`), the run
-    /// should still terminate early as before.
+    /// When `ignore_message` is called alone (no `send_message`), there
+    /// should be no conflict.
     #[test]
-    fn test_ignore_message_alone_terminates() {
+    fn test_ignore_message_alone_no_conflict() {
         use crate::llm_types::{FunctionCall, ToolCall};
 
         let tool_calls = vec![ToolCall {
@@ -2962,11 +2949,6 @@ mod tests {
         assert!(
             check.conflicting_tools.is_empty(),
             "No tools should be flagged as conflicting"
-        );
-
-        assert!(
-            should_terminate_on_ignore(&tool_calls, check.conflict),
-            "ignore_message alone should terminate the run early"
         );
     }
 
@@ -3028,7 +3010,7 @@ mod tests {
     }
 
     /// When `send_message` is called alone (no `ignore_message`), there
-    /// should be no conflict and no early termination.
+    /// should be no conflict.
     #[test]
     fn test_send_message_alone_no_conflict() {
         use crate::llm_types::{FunctionCall, ToolCall};
@@ -3047,10 +3029,6 @@ mod tests {
             "No conflict when only send_message is present"
         );
         assert!(check.conflicting_tools.is_empty());
-        assert!(
-            !should_terminate_on_ignore(&tool_calls, check.conflict),
-            "send_message alone should not trigger early termination"
-        );
     }
 
     /// When neither DM tool is present, there should be no conflict.
@@ -3069,7 +3047,6 @@ mod tests {
         let check = detect_dm_conflict(&tool_calls);
         assert!(!check.conflict);
         assert!(check.conflicting_tools.is_empty());
-        assert!(!should_terminate_on_ignore(&tool_calls, check.conflict));
     }
 
     // ---- should_terminate_after_dm_send tests (#407 Bug 1) ----
