@@ -305,6 +305,20 @@ export function openSessionStream(sessionId, opts) {
         }];
     });
 
+    // -- dm_conversation_ended --
+    on('dm_conversation_ended', (e) => {
+        const data = JSON.parse(e.data);
+        const peer = data.peer || 'unknown';
+        const reasonLabels = {
+            'ignored': 'no further replies',
+            'depth_exceeded': 'message limit reached',
+        };
+        const reason = reasonLabels[data.reason] || data.reason || 'conversation ended';
+        chatMessages.value = [...chatMessages.value, {
+            id: nextMsgId(), type: 'dm_ended', peer, reason,
+        }];
+    });
+
     // -- approval_resolved --
     on('approval_resolved', (e) => {
         const data = JSON.parse(e.data);

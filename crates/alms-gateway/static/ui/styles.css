@@ -572,6 +572,34 @@ header h1 {
   word-break: break-word;
 }
 
+/* ── DM conversation ended banner ── */
+.dm-ended-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  justify-content: center;
+  padding: var(--space-2) var(--space-4);
+  margin: var(--space-2) 0;
+  font-size: var(--text-xs);
+  color: var(--text-disabled);
+  position: relative;
+}
+.dm-ended-banner::before,
+.dm-ended-banner::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+.dm-ended-label {
+  font-weight: 600;
+  white-space: nowrap;
+}
+.dm-ended-reason {
+  white-space: nowrap;
+  font-style: italic;
+}
+
 /* ── Tool events ── */
 .tool-row {
   align-self: flex-start;

@@ -1,7 +1,7 @@
 import { signal } from '../deps.js';
 
 // Chat messages for the active session.
-// Entries: { id: string, type: 'user'|'agent'|'tool'|'approval'|'error'|'warning'|'system'|'thinking'|'tokens', ... }
+// Entries: { id: string, type: 'user'|'agent'|'tool'|'approval'|'error'|'warning'|'system'|'dm_ended'|'thinking'|'tokens', ... }
 export const chatMessages = signal([]);
 
 // Monotonically increasing counter for stable message IDs.

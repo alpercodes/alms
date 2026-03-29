@@ -53,3 +53,12 @@ export function SystemMessage({ text }) {
         </div>
     `;
 }
+
+export function DmEndedMessage({ peer, reason }) {
+    return html`
+        <div class="dm-ended-banner">
+            <span class="dm-ended-label">DM conversation with ${peer} ended</span>
+            <span class="dm-ended-reason">${reason}</span>
+        </div>
+    `;
+}
