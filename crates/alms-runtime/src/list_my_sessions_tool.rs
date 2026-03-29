@@ -60,6 +60,8 @@ fn context_type_from_id(context_id: &str) -> &'static str {
         "subagent"
     } else if context_id.starts_with("episodic:") {
         "episodic"
+    } else if context_id.starts_with("notifications:") {
+        "notification"
     } else {
         "web"
     }
@@ -68,7 +70,9 @@ fn context_type_from_id(context_id: &str) -> &'static str {
 /// Returns `true` for internal session types that should be hidden from
 /// the agent's session listing.
 fn is_internal_session(context_id: &str) -> bool {
-    context_id.starts_with("subagent_") || context_id.starts_with("episodic:")
+    context_id.starts_with("subagent_")
+        || context_id.starts_with("episodic:")
+        || context_id.starts_with("notifications:")
 }
 
 #[async_trait::async_trait]
@@ -237,6 +241,11 @@ mod tests {
         assert_eq!(context_type_from_id("episodic:main"), "episodic");
     }
 
+    #[test]
+    fn test_context_type_notification() {
+        assert_eq!(context_type_from_id("notifications:bob"), "notification");
+    }
+
     // -- is_internal_session --
 
     #[test]
@@ -248,6 +257,12 @@ mod tests {
     #[test]
     fn test_episodic_sessions_are_internal() {
         assert!(is_internal_session("episodic:main"));
+    }
+
+    #[test]
+    fn test_notification_sessions_are_internal() {
+        assert!(is_internal_session("notifications:bob"));
+        assert!(is_internal_session("notifications:"));
     }
 
     #[test]
@@ -272,6 +287,22 @@ mod tests {
         let result = tool.execute(serde_json::json!({})).await.unwrap();
 
         // Should only have web-chat (current excluded by default, subagent excluded always)
+        assert_eq!(result["showing"], 1);
+        assert_eq!(result["sessions"][0]["context_id"], "web-chat");
+    }
+
+    #[tokio::test]
+    async fn test_excludes_notification_sessions() {
+        let mgr = Arc::new(make_manager());
+        let agent_id = AgentId::new();
+        let current = mgr.get_or_create(agent_id, "current-ctx");
+        mgr.get_or_create(agent_id, "web-chat");
+        mgr.get_or_create(agent_id, "notifications:bob");
+
+        let tool = make_tool(mgr, agent_id, current.id);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        // Should only have web-chat (current excluded by default, notification excluded always)
         assert_eq!(result["showing"], 1);
         assert_eq!(result["sessions"][0]["context_id"], "web-chat");
     }

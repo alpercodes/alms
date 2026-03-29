@@ -84,6 +84,14 @@ pub fn derive_source_label(context_id: &str, agent_name: &str) -> Option<SourceL
         return None;
     }
 
+    // Notification sessions: "notifications:{agent_name}"
+    if let Some(rest) = context_id.strip_prefix("notifications:") {
+        return Some(SourceLabel {
+            source_type: "notification".into(),
+            source_label: format!("DM-end notification from {rest}"),
+        });
+    }
+
     // Telegram sessions: "telegram_{agent}_{chatid}"
     if context_id.starts_with("telegram_") {
         return Some(SourceLabel {
@@ -590,6 +598,13 @@ mod tests {
     #[test]
     fn test_source_label_episodic_excluded() {
         assert!(derive_source_label("episodic:myagent", "myagent").is_none());
+    }
+
+    #[test]
+    fn test_source_label_notification() {
+        let label = derive_source_label("notifications:bob", "myagent").unwrap();
+        assert_eq!(label.source_type, "notification");
+        assert_eq!(label.source_label, "DM-end notification from bob");
     }
 
     #[test]
