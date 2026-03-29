@@ -249,3 +249,216 @@ impl From<Run> for RunStatusResponse {
         }
     }
 }
+
+/// Check whether `ignore_message` was **successfully** called during a run.
+///
+/// A call is only counted as successful if:
+/// 1. An `Assistant`-role record exists with `tool_name == "ignore_message"`, AND
+/// 2. A corresponding `Tool`-role result record (matched by `tool_id`) exists
+///    whose result does NOT contain the DM conflict error message.
+///
+/// This prevents a false positive when both `send_message` and `ignore_message`
+/// appear in a conflict batch (PR #365) -- both are blocked and receive error
+/// results, but the function must return `false` so the agent can retry.
+///
+/// Shared between `alms-runtime` (`dm_tool_was_called`) and `alms-gateway`
+/// (`execute_run` ignore-message detection).
+pub fn ran_ignore_message_successfully(records: &[ToolCallRecord]) -> bool {
+    records.iter().any(|r| {
+        r.role == ToolCallRole::Assistant
+            && r.tool_name.as_deref() == Some("ignore_message")
+            && r.tool_id.as_ref().is_some_and(|call_id| {
+                records.iter().any(|result| {
+                    result.role == ToolCallRole::Tool
+                        && result.tool_id.as_deref() == Some(call_id.as_str())
+                        && !result
+                            .result
+                            .as_deref()
+                            .is_some_and(|res| res.contains(crate::DM_CONFLICT_MSG))
+                })
+            })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn make_record(
+        role: ToolCallRole,
+        tool_name: &str,
+        tool_id: &str,
+        result: Option<&str>,
+    ) -> ToolCallRecord {
+        ToolCallRecord {
+            seq: 0,
+            role,
+            tool_name: Some(tool_name.to_string()),
+            tool_id: Some(tool_id.to_string()),
+            params: None,
+            result: result.map(String::from),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_ran_ignore_successfully_clean_call() {
+        let records = vec![
+            make_record(ToolCallRole::Assistant, "ignore_message", "call_1", None),
+            make_record(
+                ToolCallRole::Tool,
+                "ignore_message",
+                "call_1",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
+        assert!(ran_ignore_message_successfully(&records));
+    }
+
+    #[test]
+    fn test_ran_ignore_conflict_blocked() {
+        let conflict_error = format!("Error: {}", crate::DM_CONFLICT_MSG);
+        let records = vec![
+            make_record(ToolCallRole::Assistant, "send_message", "tc_send", None),
+            make_record(ToolCallRole::Assistant, "ignore_message", "tc_ignore", None),
+            make_record(
+                ToolCallRole::Tool,
+                "send_message",
+                "tc_send",
+                Some(&conflict_error),
+            ),
+            make_record(
+                ToolCallRole::Tool,
+                "ignore_message",
+                "tc_ignore",
+                Some(&conflict_error),
+            ),
+        ];
+        assert!(
+            !ran_ignore_message_successfully(&records),
+            "conflict-blocked ignore_message should not count as successful"
+        );
+    }
+
+    #[test]
+    fn test_ran_ignore_conflict_then_clean_ignore() {
+        // First batch: conflict -- both tools blocked
+        let conflict_error = format!("Error: {}", crate::DM_CONFLICT_MSG);
+        let records = vec![
+            make_record(ToolCallRole::Assistant, "send_message", "tc_send_1", None),
+            make_record(
+                ToolCallRole::Assistant,
+                "ignore_message",
+                "tc_ignore_1",
+                None,
+            ),
+            make_record(
+                ToolCallRole::Tool,
+                "send_message",
+                "tc_send_1",
+                Some(&conflict_error),
+            ),
+            make_record(
+                ToolCallRole::Tool,
+                "ignore_message",
+                "tc_ignore_1",
+                Some(&conflict_error),
+            ),
+            // Second batch: agent retried with just ignore_message -- success
+            make_record(
+                ToolCallRole::Assistant,
+                "ignore_message",
+                "tc_ignore_2",
+                None,
+            ),
+            make_record(
+                ToolCallRole::Tool,
+                "ignore_message",
+                "tc_ignore_2",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
+        assert!(
+            ran_ignore_message_successfully(&records),
+            "after conflict resolution, a successful ignore_message should be detected"
+        );
+    }
+
+    #[test]
+    fn test_ran_ignore_conflict_then_send_message() {
+        // First batch: conflict -- both tools blocked
+        let conflict_error = format!("Error: {}", crate::DM_CONFLICT_MSG);
+        let records = vec![
+            make_record(ToolCallRole::Assistant, "send_message", "tc_send_1", None),
+            make_record(
+                ToolCallRole::Assistant,
+                "ignore_message",
+                "tc_ignore_1",
+                None,
+            ),
+            make_record(
+                ToolCallRole::Tool,
+                "send_message",
+                "tc_send_1",
+                Some(&conflict_error),
+            ),
+            make_record(
+                ToolCallRole::Tool,
+                "ignore_message",
+                "tc_ignore_1",
+                Some(&conflict_error),
+            ),
+            // Second batch: agent retried with just send_message -- success
+            make_record(ToolCallRole::Assistant, "send_message", "tc_send_2", None),
+            make_record(
+                ToolCallRole::Tool,
+                "send_message",
+                "tc_send_2",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
+        assert!(
+            !ran_ignore_message_successfully(&records),
+            "conflict-batch followed by send_message should NOT detect ignore_message"
+        );
+    }
+
+    #[test]
+    fn test_ran_ignore_no_tool_result() {
+        // Assistant record exists but no corresponding Tool result
+        let records = vec![make_record(
+            ToolCallRole::Assistant,
+            "ignore_message",
+            "call_1",
+            None,
+        )];
+        assert!(
+            !ran_ignore_message_successfully(&records),
+            "Assistant record without Tool result should not count"
+        );
+    }
+
+    #[test]
+    fn test_ran_ignore_only_send_message() {
+        let records = vec![
+            make_record(ToolCallRole::Assistant, "send_message", "call_1", None),
+            make_record(
+                ToolCallRole::Tool,
+                "send_message",
+                "call_1",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
+        assert!(
+            !ran_ignore_message_successfully(&records),
+            "send_message should not be detected as ignore_message"
+        );
+    }
+
+    #[test]
+    fn test_ran_ignore_empty_records() {
+        let records: Vec<ToolCallRecord> = vec![];
+        assert!(!ran_ignore_message_successfully(&records));
+    }
+}

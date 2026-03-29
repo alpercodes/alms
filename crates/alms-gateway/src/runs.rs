@@ -903,10 +903,7 @@ async fn execute_run(state: AppState, params: RunParams) {
             // also breaks with an empty response after `send_message`.  We now
             // inspect the actual tool-call records to distinguish `ignore_message`
             // from `send_message`.
-            let ran_ignore_message = output.tool_calls.iter().any(|r| {
-                r.role == alms_core::ToolCallRole::Assistant
-                    && r.tool_name.as_deref() == Some("ignore_message")
-            });
+            let ran_ignore_message = alms_core::ran_ignore_message_successfully(&output.tool_calls);
             if is_peer_message && ran_ignore_message && context_id.starts_with("dm:") {
                 if let Some(ref name) = agent_name
                     && let Some(peer_name) = extract_peer_from_dm_context(&context_id, name)
@@ -2220,18 +2217,21 @@ mod tests {
     // a full AppState, we test the condition logic directly.
     // -----------------------------------------------------------------------
 
-    /// Build a minimal `ToolCallRecord` with the given role and tool name.
+    /// Build a minimal `ToolCallRecord` with the given role, tool name,
+    /// tool_id, and optional result.
     fn make_tool_record(
         role: alms_core::ToolCallRole,
         tool_name: &str,
+        tool_id: &str,
+        result: Option<&str>,
     ) -> alms_core::ToolCallRecord {
         alms_core::ToolCallRecord {
             seq: 0,
             role,
             tool_name: Some(tool_name.to_string()),
-            tool_id: Some("call_1".to_string()),
+            tool_id: Some(tool_id.to_string()),
             params: None,
-            result: None,
+            result: result.map(String::from),
             timestamp: Utc::now(),
         }
     }
@@ -2240,24 +2240,35 @@ mod tests {
     ///
     /// Mirrors the production logic in `execute_run()`: the condition is
     /// `is_peer_message && ran_ignore_message && context_id.starts_with("dm:")`.
+    ///
+    /// Uses `alms_core::ran_ignore_message_successfully` which requires a
+    /// matching non-conflict `Tool`-role result for each `Assistant`-role
+    /// `ignore_message` record.
     fn should_signal_ignore(
         is_peer_message: bool,
         tool_calls: &[alms_core::ToolCallRecord],
         context_id: &str,
     ) -> bool {
-        let ran_ignore_message = tool_calls.iter().any(|r| {
-            r.role == alms_core::ToolCallRole::Assistant
-                && r.tool_name.as_deref() == Some("ignore_message")
-        });
+        let ran_ignore_message = alms_core::ran_ignore_message_successfully(tool_calls);
         is_peer_message && ran_ignore_message && context_id.starts_with("dm:")
     }
 
     #[test]
     fn test_ignore_in_dm_context_triggers_end_conversation() {
-        let records = vec![make_tool_record(
-            alms_core::ToolCallRole::Assistant,
-            "ignore_message",
-        )];
+        let records = vec![
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "ignore_message",
+                "call_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "ignore_message",
+                "call_1",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
         assert!(
             should_signal_ignore(true, &records, "dm:alice:bob"),
             "ignore_message in DM context should trigger end_conversation"
@@ -2266,10 +2277,20 @@ mod tests {
 
     #[test]
     fn test_ignore_in_non_dm_context_does_not_trigger() {
-        let records = vec![make_tool_record(
-            alms_core::ToolCallRole::Assistant,
-            "ignore_message",
-        )];
+        let records = vec![
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "ignore_message",
+                "call_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "ignore_message",
+                "call_1",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
         assert!(
             !should_signal_ignore(true, &records, "session:abc123"),
             "ignore_message outside DM context should NOT trigger end_conversation"
@@ -2279,12 +2300,22 @@ mod tests {
     #[test]
     fn test_send_message_in_dm_does_not_trigger() {
         // A DM run that ends with send_message should NOT trigger
-        // end_conversation — this was the false-positive bug introduced
+        // end_conversation -- this was the false-positive bug introduced
         // by the Bug 1 fix in PR #412.
-        let records = vec![make_tool_record(
-            alms_core::ToolCallRole::Assistant,
-            "send_message",
-        )];
+        let records = vec![
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "send_message",
+                "call_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "send_message",
+                "call_1",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
         assert!(
             !should_signal_ignore(true, &records, "dm:alice:bob"),
             "send_message in DM context should NOT trigger end_conversation"
@@ -2294,7 +2325,7 @@ mod tests {
     #[test]
     fn test_no_tool_calls_in_dm_does_not_trigger() {
         // Empty tool_calls (degenerate LLM response) should NOT trigger
-        // end_conversation — there was no explicit ignore_message call.
+        // end_conversation -- there was no explicit ignore_message call.
         let records: Vec<alms_core::ToolCallRecord> = vec![];
         assert!(
             !should_signal_ignore(true, &records, "dm:alice:bob"),
@@ -2304,10 +2335,20 @@ mod tests {
 
     #[test]
     fn test_non_peer_message_in_dm_does_not_trigger() {
-        let records = vec![make_tool_record(
-            alms_core::ToolCallRole::Assistant,
-            "ignore_message",
-        )];
+        let records = vec![
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "ignore_message",
+                "call_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "ignore_message",
+                "call_1",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
         assert!(
             !should_signal_ignore(false, &records, "dm:alice:bob"),
             "non-peer-message run should NOT trigger end_conversation"
@@ -2318,10 +2359,20 @@ mod tests {
     fn test_notification_context_does_not_trigger() {
         // Notification sessions have context_id = "notifications:agent_name"
         // which does NOT start with "dm:", so no false positive.
-        let records = vec![make_tool_record(
-            alms_core::ToolCallRole::Assistant,
-            "ignore_message",
-        )];
+        let records = vec![
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "ignore_message",
+                "call_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "ignore_message",
+                "call_1",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
         assert!(
             !should_signal_ignore(false, &records, "notifications:bob"),
             "notification session should NOT trigger end_conversation"
@@ -2330,10 +2381,20 @@ mod tests {
 
     #[test]
     fn test_job_context_does_not_trigger() {
-        let records = vec![make_tool_record(
-            alms_core::ToolCallRole::Assistant,
-            "ignore_message",
-        )];
+        let records = vec![
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "ignore_message",
+                "call_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "ignore_message",
+                "call_1",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
         assert!(
             !should_signal_ignore(false, &records, "job_some-uuid"),
             "job session should NOT trigger end_conversation"
@@ -2343,14 +2404,138 @@ mod tests {
     #[test]
     fn test_tool_role_result_does_not_trigger() {
         // A Tool-role record (tool result) with name "ignore_message" should
-        // NOT be counted — only Assistant-role records (the actual call).
+        // NOT be counted -- only Assistant-role records (the actual call)
+        // paired with a successful Tool-role result.
         let records = vec![make_tool_record(
             alms_core::ToolCallRole::Tool,
             "ignore_message",
+            "call_1",
+            Some(r#"{"ok":true}"#),
         )];
         assert!(
             !should_signal_ignore(true, &records, "dm:alice:bob"),
             "Tool-role ignore_message record should NOT trigger end_conversation"
+        );
+    }
+
+    #[test]
+    fn test_conflict_batch_does_not_trigger_end_conversation() {
+        // Both send_message and ignore_message were called in the same batch.
+        // Both are blocked with DM conflict errors.
+        // Agent retries with just send_message and succeeds.
+        // The old blocked ignore_message should NOT trigger end_conversation.
+        let conflict_error = format!("Error: {}", alms_core::DM_CONFLICT_MSG);
+        let records = vec![
+            // First batch: conflict -- both tools blocked
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "send_message",
+                "tc_send_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "ignore_message",
+                "tc_ignore_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "send_message",
+                "tc_send_1",
+                Some(&conflict_error),
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "ignore_message",
+                "tc_ignore_1",
+                Some(&conflict_error),
+            ),
+            // Second batch: agent retried with just send_message -- success
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "send_message",
+                "tc_send_2",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "send_message",
+                "tc_send_2",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
+        assert!(
+            !should_signal_ignore(true, &records, "dm:alice:bob"),
+            "conflict-batch followed by clean send_message should NOT trigger end_conversation"
+        );
+    }
+
+    #[test]
+    fn test_conflict_batch_then_clean_ignore_triggers() {
+        // Both tools called in conflict batch (both blocked), then agent
+        // retries with just ignore_message and succeeds.
+        // The clean ignore_message SHOULD trigger end_conversation.
+        let conflict_error = format!("Error: {}", alms_core::DM_CONFLICT_MSG);
+        let records = vec![
+            // First batch: conflict -- both tools blocked
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "send_message",
+                "tc_send_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "ignore_message",
+                "tc_ignore_1",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "send_message",
+                "tc_send_1",
+                Some(&conflict_error),
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "ignore_message",
+                "tc_ignore_1",
+                Some(&conflict_error),
+            ),
+            // Second batch: agent retried with just ignore_message -- success
+            make_tool_record(
+                alms_core::ToolCallRole::Assistant,
+                "ignore_message",
+                "tc_ignore_2",
+                None,
+            ),
+            make_tool_record(
+                alms_core::ToolCallRole::Tool,
+                "ignore_message",
+                "tc_ignore_2",
+                Some(r#"{"ok":true}"#),
+            ),
+        ];
+        assert!(
+            should_signal_ignore(true, &records, "dm:alice:bob"),
+            "conflict-batch followed by clean ignore_message SHOULD trigger end_conversation"
+        );
+    }
+
+    #[test]
+    fn test_ignore_without_tool_result_does_not_trigger() {
+        // Assistant-role ignore_message record exists but no corresponding
+        // Tool-role result -- should not trigger.
+        let records = vec![make_tool_record(
+            alms_core::ToolCallRole::Assistant,
+            "ignore_message",
+            "call_1",
+            None,
+        )];
+        assert!(
+            !should_signal_ignore(true, &records, "dm:alice:bob"),
+            "ignore_message without matching Tool result should NOT trigger end_conversation"
         );
     }
 
