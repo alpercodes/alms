@@ -1256,6 +1256,38 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
     Ok(())
 }
 
+/// Prefixes that identify internal (non-user-facing) sessions.
+///
+/// Sessions whose `context_id` starts with any of these prefixes are excluded
+/// when searching for the user's web-chat session.  This list is the single
+/// source of truth for [`find_user_facing_session`], [`notify_job_completion`],
+/// and [`notify_dm_ended_to_webchat`].
+const INTERNAL_SESSION_PREFIXES: &[&str] =
+    &["job_", "subagent_", "dm:", "notifications:", "episodic:"];
+
+/// Returns `true` if the given `context_id` belongs to an internal session
+/// that should not be targeted by user-facing notifications.
+fn is_internal_context_id(context_id: &str) -> bool {
+    INTERNAL_SESSION_PREFIXES
+        .iter()
+        .any(|prefix| context_id.starts_with(prefix))
+}
+
+/// Find the most recent user-facing session for the given agent.
+///
+/// Returns `None` if the agent has no non-internal sessions.  Sessions are
+/// returned in last-activity order by `list_all`, so the first match is the
+/// most recently active one.
+fn find_user_facing_session(
+    session_manager: &alms_session::SessionManager,
+    agent_id: alms_core::AgentId,
+) -> Option<alms_session::Session> {
+    session_manager
+        .list_all()
+        .into_iter()
+        .find(|s| s.agent_id == agent_id && !is_internal_context_id(&s.context_id))
+}
+
 /// Send a job-completion notification to the agent's most recent user-facing
 /// session. This makes job runs visible in the chat without creating a full
 /// notification run (which would trigger another LLM call).
@@ -1291,16 +1323,7 @@ async fn notify_job_completion(
     };
 
     // Find the agent's most recent user-facing session (exclude internal sessions).
-    let all_sessions = state.session_manager.list_all();
-    let user_session = all_sessions.iter().find(|s| {
-        s.agent_id == agent_id
-            && !s.context_id.starts_with("job_")
-            && !s.context_id.starts_with("subagent_")
-            && !s.context_id.starts_with("dm:")
-            && !s.context_id.starts_with("notifications:")
-    });
-
-    let Some(target) = user_session else {
+    let Some(target) = find_user_facing_session(&state.session_manager, agent_id) else {
         debug!(
             "No user-facing session for agent {} — skipping job notification",
             agent_id
@@ -1376,16 +1399,7 @@ async fn notify_dm_ended_to_webchat(
     context_id: &str,
 ) {
     // Find the agent's most recent user-facing session (exclude internal sessions).
-    let all_sessions = state.session_manager.list_all();
-    let user_session = all_sessions.iter().find(|s| {
-        s.agent_id == agent_id
-            && !s.context_id.starts_with("job_")
-            && !s.context_id.starts_with("subagent_")
-            && !s.context_id.starts_with("dm:")
-            && !s.context_id.starts_with("notifications:")
-    });
-
-    let Some(target) = user_session else {
+    let Some(target) = find_user_facing_session(&state.session_manager, agent_id) else {
         debug!(
             "No user-facing session for agent {} — skipping DM ended web-chat notification",
             agent_id
@@ -1764,18 +1778,19 @@ pub(crate) async fn run_trigger_loop(
                 // which is invisible to the user watching the web-chat.
                 // Forward a dm_conversation_ended event to the user-facing
                 // session so they see something immediately.
-                let dm_context = alms_core::dm_context_id(
-                    from_name,
-                    context_id.strip_prefix("notifications:").unwrap_or(""),
-                );
-                notify_dm_ended_to_webchat(
-                    &state,
-                    agent_id,
-                    from_name,
-                    &reason.to_string(),
-                    &dm_context,
-                )
-                .await;
+                if let Some(peer_name) = context_id.strip_prefix("notifications:") {
+                    let dm_context = alms_core::dm_context_id(from_name, peer_name);
+                    notify_dm_ended_to_webchat(
+                        &state,
+                        agent_id,
+                        from_name,
+                        &reason.to_string(),
+                        &dm_context,
+                    )
+                    .await;
+                } else {
+                    warn!("ConversationEnded trigger has unexpected context_id: {context_id}");
+                }
 
                 (
                     format!("notification:dm_ended:{from_name}"),
@@ -2801,6 +2816,84 @@ mod tests {
         assert!(
             msg.len() > 50,
             "notification should be a substantive message, not a stub"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // find_user_facing_session / is_internal_context_id tests (#428)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_internal_prefixes_detected() {
+        for prefix in &["job_", "subagent_", "dm:", "notifications:", "episodic:"] {
+            let context_id = format!("{prefix}something");
+            assert!(
+                is_internal_context_id(&context_id),
+                "context_id '{context_id}' should be classified as internal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_user_facing_context_ids() {
+        // Plain context IDs (web chat, telegram, etc.) are user-facing.
+        for ctx in &["web", "default", "telegram:123", "my-custom-context"] {
+            assert!(
+                !is_internal_context_id(ctx),
+                "context_id '{ctx}' should NOT be classified as internal"
+            );
+        }
+    }
+
+    #[test]
+    fn test_find_user_facing_session_excludes_internal() {
+        let mgr = alms_session::SessionManager::new(alms_session::SessionConfig::default());
+        let agent_id = AgentId::new();
+
+        // Create several internal sessions
+        mgr.get_or_create(agent_id, "dm:alice:bob");
+        mgr.get_or_create(agent_id, "subagent_task_1");
+        mgr.get_or_create(agent_id, "job_abc");
+        mgr.get_or_create(agent_id, "notifications:alice");
+        mgr.get_or_create(agent_id, "episodic:main");
+
+        // No user-facing session yet
+        assert!(
+            find_user_facing_session(&mgr, agent_id).is_none(),
+            "should return None when only internal sessions exist"
+        );
+
+        // Create a user-facing session
+        let user_session = mgr.get_or_create(agent_id, "web");
+
+        let found = find_user_facing_session(&mgr, agent_id);
+        assert!(found.is_some(), "should find the user-facing session");
+        assert_eq!(found.unwrap().id, user_session.id);
+    }
+
+    #[test]
+    fn test_find_user_facing_session_ignores_other_agents() {
+        let mgr = alms_session::SessionManager::new(alms_session::SessionConfig::default());
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+
+        // Create a user-facing session for agent B only
+        mgr.get_or_create(agent_b, "web");
+
+        assert!(
+            find_user_facing_session(&mgr, agent_a).is_none(),
+            "should not return sessions belonging to a different agent"
+        );
+    }
+
+    #[test]
+    fn test_find_user_facing_session_no_sessions() {
+        let mgr = alms_session::SessionManager::new(alms_session::SessionConfig::default());
+        let agent_id = AgentId::new();
+
+        assert!(
+            find_user_facing_session(&mgr, agent_id).is_none(),
+            "should return None when no sessions exist at all"
         );
     }
 }

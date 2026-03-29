@@ -27,12 +27,18 @@ export function mapHistoryMessages(msgs) {
     const entries = [];
     for (const m of msgs) {
         if (m.type === 'text' || !m.type) {
-            // Legacy messages without type field, or explicit text
+            // Synthetic system markers (job notifications, DM-ended markers)
+            // are returned with role "system" and metadata.synthetic=true.
+            // Render them as notification entries so the UI can style them
+            // differently from agent/user messages.
+            const isSynthetic = m.role === 'system'
+                && m.metadata && m.metadata.synthetic;
             entries.push({
                 id: nextMsgId(),
-                type: m.role === 'user' ? 'user' : 'agent',
+                type: isSynthetic ? 'notification' : (m.role === 'user' ? 'user' : 'agent'),
                 role: m.role,
                 text: m.content || '',
+                metadata: m.metadata || null,
                 sealed: true,
             });
         } else if (m.type === 'tool_call') {
