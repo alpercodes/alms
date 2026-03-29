@@ -744,7 +744,7 @@ async fn execute_run(state: AppState, params: RunParams) {
             alms_runtime::ListAgentsTool::new(state.session_manager.clone(), name.clone());
         let read_tool =
             alms_runtime::ReadMessagesTool::new(state.session_manager.clone(), name.clone());
-        let ignore_tool = alms_runtime::IgnoreMessageTool::new();
+        let ignore_tool = alms_runtime::IgnoreMessageTool::new(context_id.clone());
         let list_sessions_tool = alms_runtime::ListMySessionsTool::new(
             state.session_manager.clone(),
             agent_id,
