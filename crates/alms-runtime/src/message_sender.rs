@@ -64,6 +64,11 @@ pub trait MessageSender: Send + Sync + std::fmt::Debug {
     /// The message is written to the shared DM session and a run trigger
     /// is emitted for the recipient. Depth tracking is handled internally
     /// by the implementation -- agents are unaware of these mechanisms.
+    ///
+    /// `sender_session_id` is the session the sender is currently running in
+    /// (e.g. `web-chat-12345`). It is stored as the "source session" for
+    /// the sender in this DM pair so that notification runs can be routed
+    /// back to that session instead of an invisible `notifications:` session.
     async fn send(
         &self,
         sender_name: &str,
@@ -71,6 +76,7 @@ pub trait MessageSender: Send + Sync + std::fmt::Debug {
         recipient_name: &str,
         recipient_agent_id: alms_core::AgentId,
         message: &str,
+        sender_session_id: Option<alms_core::SessionId>,
     ) -> Result<DeliveryReceipt, SendError>;
 
     /// Signal the end of a DM conversation between two agents.

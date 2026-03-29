@@ -4,7 +4,7 @@
 //! The recipient processes the message asynchronously via a triggered run.
 
 use crate::message_sender::{MessageSender, SendError};
-use alms_core::AgentId;
+use alms_core::{AgentId, SessionId};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
 use serde_json::Value;
@@ -23,6 +23,11 @@ pub struct SendMessageTool {
     sender_name: String,
     /// Session manager for agent name resolution.
     session_manager: Arc<SessionManager>,
+    /// The session the sender is currently running in.
+    ///
+    /// Passed to `MessageSender::send()` so the MessageBus can track it
+    /// as the "source session" for notification routing.
+    sender_session_id: SessionId,
 }
 
 impl SendMessageTool {
@@ -31,12 +36,14 @@ impl SendMessageTool {
         sender_agent_id: AgentId,
         sender_name: String,
         session_manager: Arc<SessionManager>,
+        sender_session_id: SessionId,
     ) -> Self {
         Self {
             sender,
             sender_agent_id,
             sender_name,
             session_manager,
+            sender_session_id,
         }
     }
 }
@@ -117,6 +124,7 @@ impl Tool for SendMessageTool {
                 to,
                 recipient.id,
                 message,
+                Some(self.sender_session_id),
             )
             .await
         {
@@ -165,6 +173,7 @@ mod tests {
             _: &str,
             _: AgentId,
             _: &str,
+            _: Option<SessionId>,
         ) -> Result<crate::message_sender::DeliveryReceipt, SendError> {
             Err(SendError::Internal("noop".into()))
         }
@@ -184,7 +193,13 @@ mod tests {
     fn make_tool() -> SendMessageTool {
         let mgr = Arc::new(SessionManager::new(alms_session::SessionConfig::default()));
         let sender: Arc<dyn MessageSender> = Arc::new(NoopSender);
-        SendMessageTool::new(sender, AgentId::new(), "test-sender".into(), mgr)
+        SendMessageTool::new(
+            sender,
+            AgentId::new(),
+            "test-sender".into(),
+            mgr,
+            SessionId::new(),
+        )
     }
 
     #[tokio::test]
