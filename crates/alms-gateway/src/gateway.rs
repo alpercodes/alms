@@ -5,7 +5,7 @@
 use crate::session_queue::SessionQueue;
 use alms_channel::telegram::TelegramChannel;
 use alms_channel::{Channel, ChannelConfig};
-use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult, SessionId, validate_agent_name};
+use alms_core::{AgentId, AgentRecord, AlmsConfig, AlmsResult, validate_agent_name};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient};
 use alms_session::{SessionConfig, SessionManager, SqliteStore};
 use parking_lot::RwLock;
@@ -410,7 +410,7 @@ impl Gateway {
     /// Run the main message processing loop (standalone, no shutdown signal).
     pub async fn run(&mut self) -> AlmsResult<()> {
         let token = CancellationToken::new();
-        let queue = Arc::new(SessionQueue::<SessionId>::new(token.clone()));
+        let queue = Arc::new(SessionQueue::new(token.clone()));
         let result = self.run_until_shutdown(token.clone(), queue).await;
         token.cancel();
         result
@@ -418,8 +418,8 @@ impl Gateway {
 
     /// Run the message processing loop until the shutdown token is cancelled.
     ///
-    /// All runs for the same session are serialized via `session_queue` (FIFO).
-    /// Different sessions process concurrently.
+    /// All runs for the same agent are serialized via `agent_queue` (FIFO).
+    /// Different agents process concurrently.
     ///
     /// Per-agent Telegram bots each have their own polling loop. Messages from
     /// all bots are merged into a single channel tagged with the owning agent,
@@ -427,7 +427,7 @@ impl Gateway {
     pub async fn run_until_shutdown(
         &mut self,
         token: CancellationToken,
-        session_queue: Arc<SessionQueue<SessionId>>,
+        agent_queue: Arc<SessionQueue<AgentId>>,
     ) -> AlmsResult<()> {
         info!("Starting message processing loop (shutdown-aware)");
 
@@ -547,17 +547,8 @@ impl Gateway {
                     let runtime = Arc::new(runtime);
                     let sm = Arc::clone(&self.session_manager);
                     let name_for_ctx = effective_name;
-                    // Resolve the session ID before enqueueing so we can
-                    // key the queue by SessionId (not AgentId).
-                    let tg_context_id = format!(
-                        "telegram_{}_{}",
-                        name_for_ctx, msg.chat_id.0
-                    );
-                    let tg_session = self
-                        .session_manager
-                        .get_or_create(agent_id, &tg_context_id);
-                    session_queue.enqueue(
-                        tg_session.id,
+                    agent_queue.enqueue(
+                        agent_id,
                         Box::pin(async move {
                             process_telegram_message(
                                 runtime,

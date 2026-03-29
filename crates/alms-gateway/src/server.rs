@@ -491,10 +491,9 @@ pub struct AppState {
     pub coordinator: Arc<Coordinator>,
     /// Token cancelled during graceful shutdown.
     pub shutdown_token: CancellationToken,
-    /// Per-session work queue -- serializes all runs for a given session.
-    /// A stuck run (e.g. notification waiting for approval) only blocks its
-    /// own session, not the agent's other sessions (e.g. web-chat).
-    pub session_queue: Arc<SessionQueue<SessionId>>,
+    /// Per-agent work queue -- serializes all runs for a given agent (Section 7
+    /// of the Layer 2 design: no parallel agent instances).
+    pub agent_queue: Arc<SessionQueue<AgentId>>,
     /// Snapshot of LLM config — read once at startup so handlers avoid locking the gateway.
     pub llm_config: alms_runtime::LlmConfig,
     /// Snapshot of agent config — read once at startup so handlers avoid locking the gateway.
@@ -625,7 +624,7 @@ impl AppState {
             scheduler,
             coordinator,
             shutdown_token: shutdown_token.clone(),
-            session_queue: Arc::new(SessionQueue::new(shutdown_token)),
+            agent_queue: Arc::new(SessionQueue::new(shutdown_token)),
             llm_config,
             agent_config,
             default_agent_id,
@@ -1020,11 +1019,11 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     // without requiring us to lock the gateway mutex from outside.
     let background_gateway = state.gateway.clone();
     let gateway_token = shutdown_token.clone();
-    let gateway_session_queue = state.session_queue.clone();
+    let gateway_agent_queue = state.agent_queue.clone();
     let gateway_handle = tokio::spawn(async move {
         let mut gateway = background_gateway.lock().await;
         if let Err(e) = gateway
-            .run_until_shutdown(gateway_token, gateway_session_queue)
+            .run_until_shutdown(gateway_token, gateway_agent_queue)
             .await
         {
             tracing::error!("Gateway message loop exited: {}", e);
