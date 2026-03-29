@@ -977,12 +977,9 @@ async fn execute_run(state: AppState, params: RunParams) {
                                 //
                                 // NOTE: This code path only fires for the
                                 // ignore_message reason.  The depth-exceeded
-                                // reason is handled inside MessageBus::send()
-                                // (Phase 7, PR #403) which calls
-                                // end_conversation deep in the coordinator
-                                // layer — that path does NOT emit this SSE
-                                // event.  A follow-up PR will add SSE
-                                // emission for depth-exceeded.
+                                // reason emits this event from
+                                // `run_trigger_loop` when processing the
+                                // `ConversationEnded` trigger (#419).
                                 //
                                 // NOTE: If both agents ignore simultaneously,
                                 // end_conversation returns Ok(()) for both
@@ -1614,16 +1611,62 @@ pub(crate) async fn run_trigger_loop(
             MessageSource::SubagentCompletion => ("subagent".to_string(), false, trigger.input),
             MessageSource::ConversationEnded {
                 from_name, reason, ..
-            } => (
-                format!("notification:dm_ended:{from_name}"),
-                // NOT a peer message — the notification run should not get
-                // the DM addendum injected (it tells the agent to use
-                // send_message/ignore_message, which is wrong here).
-                false,
-                // Format a richer notification that includes the reason and
-                // a follow-up hint, overriding the basic text from the bus.
-                format_dm_ended_notification(from_name, *reason),
-            ),
+            } => {
+                // ── Emit dm_conversation_ended SSE for depth-exceeded (#419) ──
+                //
+                // The ignore_message path emits this event in execute_run
+                // (line ~967). The depth-exceeded path calls
+                // end_conversation deep inside MessageBus::send(), which
+                // has no access to SSE infrastructure. We emit the event
+                // here instead, since the ConversationEnded trigger
+                // carries all the information we need.
+                //
+                // The `context_id` at this point is
+                // `notifications:{peer_name}` — we extract the peer name
+                // to reconstruct the DM session ID and context.
+                if *reason == ConversationEndReason::DepthExceeded
+                    && let Some(peer_name) = context_id.strip_prefix("notifications:")
+                {
+                    let dm_context = alms_core::dm_context_id(from_name, peer_name);
+                    let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
+
+                    info!(
+                        from = %from_name,
+                        peer = %peer_name,
+                        dm_session = %dm_session_id.0,
+                        "Emitting dm_conversation_ended SSE for depth-exceeded"
+                    );
+
+                    // Use a dummy RunId — there is no single run that
+                    // "owns" this event; it is a session-level signal.
+                    let dummy_run_id = RunId::new();
+                    state
+                        .run_manager
+                        .send_session_event(
+                            dm_session_id,
+                            dummy_run_id,
+                            SseEventData::dm_conversation_ended(
+                                dm_session_id,
+                                from_name,
+                                peer_name,
+                                &reason.to_string(),
+                                &dm_context,
+                            ),
+                        )
+                        .await;
+                }
+
+                (
+                    format!("notification:dm_ended:{from_name}"),
+                    // NOT a peer message — the notification run should not get
+                    // the DM addendum injected (it tells the agent to use
+                    // send_message/ignore_message, which is wrong here).
+                    false,
+                    // Format a richer notification that includes the reason and
+                    // a follow-up hint, overriding the basic text from the bus.
+                    format_dm_ended_notification(from_name, *reason),
+                )
+            }
         };
 
         info!(
