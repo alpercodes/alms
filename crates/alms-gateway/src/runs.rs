@@ -1002,6 +1002,19 @@ async fn execute_run(state: AppState, params: RunParams) {
                                         ),
                                     )
                                     .await;
+
+                                // Forward to the initiating agent's web-chat
+                                // session so the user watching that session
+                                // sees the notification (the DM session event
+                                // above is invisible to the web-chat).
+                                notify_dm_ended_to_webchat(
+                                    &state,
+                                    agent_id,
+                                    &peer_name,
+                                    &end_reason.to_string(),
+                                    &context_id,
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 warn!(
@@ -1277,13 +1290,14 @@ async fn notify_job_completion(
         None => ("error", "run record not found".to_string()),
     };
 
-    // Find the agent's most recent user-facing session (exclude job_* and subagent_*).
+    // Find the agent's most recent user-facing session (exclude internal sessions).
     let all_sessions = state.session_manager.list_all();
     let user_session = all_sessions.iter().find(|s| {
         s.agent_id == agent_id
             && !s.context_id.starts_with("job_")
             && !s.context_id.starts_with("subagent_")
             && !s.context_id.starts_with("dm:")
+            && !s.context_id.starts_with("notifications:")
     });
 
     let Some(target) = user_session else {
@@ -1339,6 +1353,94 @@ async fn notify_job_completion(
 
     info!(
         "Job notification sent to session {} (status={status})",
+        target_session_id.0
+    );
+}
+
+/// Forward a `dm_conversation_ended` event to the agent's user-facing
+/// web-chat session so the human watching that session sees a notification.
+///
+/// Without this, the `dm_conversation_ended` SSE event only lands on the DM
+/// session's SSE stream (which the user is typically not watching) and the
+/// notification run executes on a `notifications:` session (also invisible
+/// to the web-chat).
+///
+/// This mirrors `notify_job_completion`: find the most recent user-facing
+/// session, emit an SSE event, and persist a marker message so it survives
+/// page reloads.
+async fn notify_dm_ended_to_webchat(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    peer_name: &str,
+    reason: &str,
+    context_id: &str,
+) {
+    // Find the agent's most recent user-facing session (exclude internal sessions).
+    let all_sessions = state.session_manager.list_all();
+    let user_session = all_sessions.iter().find(|s| {
+        s.agent_id == agent_id
+            && !s.context_id.starts_with("job_")
+            && !s.context_id.starts_with("subagent_")
+            && !s.context_id.starts_with("dm:")
+            && !s.context_id.starts_with("notifications:")
+    });
+
+    let Some(target) = user_session else {
+        debug!(
+            "No user-facing session for agent {} — skipping DM ended web-chat notification",
+            agent_id
+        );
+        return;
+    };
+    let target_session_id = target.id;
+
+    // Emit SSE event on the web-chat session so connected UI clients see it.
+    let dummy_run_id = RunId::new();
+    state
+        .run_manager
+        .send_session_event(
+            target_session_id,
+            dummy_run_id,
+            SseEventData::dm_conversation_ended(
+                target_session_id,
+                "system",
+                peer_name,
+                reason,
+                context_id,
+            ),
+        )
+        .await;
+
+    // Persist a marker message so it appears on reload.
+    let reason_text = match reason {
+        "ignored" => "no further replies".to_string(),
+        "depth_exceeded" => "message limit reached".to_string(),
+        other => other.to_string(),
+    };
+    let marker = alms_session::Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: alms_session::Role::System,
+        content: alms_session::Content::Text(format!(
+            "[DM conversation ended] Conversation with {peer_name} ended ({reason_text})."
+        )),
+        timestamp: alms_core::Timestamp::now(),
+        metadata: Some(serde_json::json!({
+            "synthetic": true,
+            "type": "dm_ended_notification",
+            "peer": peer_name,
+            "reason": reason,
+            "context_id": context_id,
+        })),
+    };
+    if let Err(e) = state
+        .session_manager
+        .append_message(target_session_id, marker)
+    {
+        warn!("Failed to persist DM ended marker to web-chat session: {e}");
+    }
+
+    info!(
+        "DM ended notification forwarded to web-chat session {} (peer={peer_name}, reason={reason})",
         target_session_id.0
     );
 }
@@ -1655,6 +1757,25 @@ pub(crate) async fn run_trigger_loop(
                         )
                         .await;
                 }
+
+                // ── Forward notification to the agent's web-chat session ──
+                //
+                // The notification run will execute on `notifications:{name}`
+                // which is invisible to the user watching the web-chat.
+                // Forward a dm_conversation_ended event to the user-facing
+                // session so they see something immediately.
+                let dm_context = alms_core::dm_context_id(
+                    from_name,
+                    context_id.strip_prefix("notifications:").unwrap_or(""),
+                );
+                notify_dm_ended_to_webchat(
+                    &state,
+                    agent_id,
+                    from_name,
+                    &reason.to_string(),
+                    &dm_context,
+                )
+                .await;
 
                 (
                     format!("notification:dm_ended:{from_name}"),
