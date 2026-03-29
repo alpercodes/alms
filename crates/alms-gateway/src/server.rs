@@ -813,18 +813,36 @@ async fn get_session_messages(
                         Role::Assistant => "assistant",
                         Role::Tool => "tool",
                         Role::System => {
-                            // System messages are internal — skip them from API output
-                            skipped += 1;
-                            return None;
+                            // Pass through synthetic markers (job notifications,
+                            // DM-ended markers, etc.) so they survive page reloads.
+                            // Non-synthetic system messages (e.g. context-builder
+                            // injections) are internal and should not be exposed.
+                            let is_synthetic = m
+                                .metadata
+                                .as_ref()
+                                .and_then(|md| md.get("synthetic"))
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            if !is_synthetic {
+                                skipped += 1;
+                                return None;
+                            }
+                            "system"
                         }
                     };
                     let json = match &m.content {
-                        Content::Text(t) => serde_json::json!({
-                            "role": role_str,
-                            "type": "text",
-                            "content": t,
-                            "timestamp": m.timestamp,
-                        }),
+                        Content::Text(t) => {
+                            let mut obj = serde_json::json!({
+                                "role": role_str,
+                                "type": "text",
+                                "content": t,
+                                "timestamp": m.timestamp,
+                            });
+                            if let Some(ref md) = m.metadata {
+                                obj["metadata"] = md.clone();
+                            }
+                            obj
+                        }
                         Content::ToolCall { name, params } => serde_json::json!({
                             "role": role_str,
                             "type": "tool_call",

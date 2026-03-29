@@ -75,6 +75,17 @@ function ChatView() {
                     if (m.type === 'dm_ended') {
                         return html`<${DmEndedMessage} key=${m.id} peer=${m.peer} reason=${m.reason} />`;
                     }
+                    if (m.type === 'notification') {
+                        // Synthetic system markers restored from session history.
+                        // Route to the correct visual component based on metadata.type.
+                        const md = m.metadata || {};
+                        if (md.type === 'dm_ended_notification') {
+                            const reasonLabels = { 'ignored': 'no further replies', 'depth_exceeded': 'message limit reached' };
+                            return html`<${DmEndedMessage} key=${m.id} peer=${md.peer || 'unknown'} reason=${reasonLabels[md.reason] || md.reason || 'conversation ended'} />`;
+                        }
+                        // job_notification and other synthetic markers: render as system message
+                        return html`<${SystemMessage} key=${m.id} text=${m.text} />`;
+                    }
                     if (m.type === 'tokens') {
                         return html`<${TokenBadge} key=${m.id} usage=${m.usage} />`;
                     }
