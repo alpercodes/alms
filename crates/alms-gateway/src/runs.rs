@@ -1398,11 +1398,18 @@ async fn notify_dm_ended_to_webchat(
     reason: &str,
     context_id: &str,
 ) {
+    info!(
+        agent_id = %agent_id,
+        peer = %peer_name,
+        reason = %reason,
+        "notify_dm_ended_to_webchat called — looking for user-facing session"
+    );
+
     // Find the agent's most recent user-facing session (exclude internal sessions).
     let Some(target) = find_user_facing_session(&state.session_manager, agent_id) else {
-        debug!(
-            "No user-facing session for agent {} — skipping DM ended web-chat notification",
-            agent_id
+        info!(
+            agent_id = %agent_id,
+            "No user-facing session for agent — skipping DM ended web-chat notification"
         );
         return;
     };
