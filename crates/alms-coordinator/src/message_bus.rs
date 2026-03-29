@@ -247,9 +247,22 @@ impl MessageSender for MessageBus {
         // subsequent messages sent from within the DM session itself should
         // not overwrite the original source. We use `or_insert` to preserve
         // the first entry.
+        //
+        // IMPORTANT: Skip recording when the sender_session_id IS the DM
+        // session itself. This happens when an agent is triggered by a DM
+        // (runs on the DM session) and calls send_message to reply -- its
+        // session_id is the DM session, which is not user-facing. Recording
+        // it would defeat the `notifications:` fallback. See PR #433 review.
         if let Some(sid) = sender_session_id {
-            let key = (dm_context.clone(), sender_name.to_string());
-            self.source_sessions.entry(key).or_insert(sid);
+            let dm_session_id = SessionId::deterministic_dm(sender_name, recipient_name);
+            if sid != dm_session_id {
+                let key = (dm_context.clone(), sender_name.to_string());
+                // or_insert preserves the first entry. This matters when an
+                // agent's initial send_message is from a web-chat session, but
+                // follow-up messages come from DM-triggered runs. We want to
+                // keep the web-chat.
+                self.source_sessions.entry(key).or_insert(sid);
+            }
         }
 
         // --- Shared DM session ---
@@ -1086,6 +1099,104 @@ mod tests {
                     *source_session_id,
                     Some(alice_session),
                     "source_session_id should be Alice's web-chat session"
+                );
+            }
+            other => panic!("expected ConversationEnded, got {:?}", other),
+        }
+    }
+
+    /// When a DM-triggered agent replies via `send_message`, the sender's
+    /// session ID is the DM session itself. This should NOT be recorded as
+    /// a source session, because it would defeat the `notifications:` fallback.
+    ///
+    /// Scenario: Alice sends from web-chat. Bob is triggered by the DM, so
+    /// Bob's run executes on the DM session. Bob calls `send_message("alice",
+    /// "reply")` with `sender_session_id = Some(dm_session_id)`. The DM session
+    /// should be filtered out, so Bob has no source session. When Alice ends
+    /// the conversation, Bob's notification falls back to `notifications:bob`.
+    #[tokio::test]
+    async fn test_dm_session_not_recorded_as_source_session() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Alice sends from her web-chat session.
+        let alice_session = SessionId::new();
+        bus.session_manager
+            .get_or_create_shared(alice_session, "web-chat-alice");
+        bus.send(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            "Hello Bob!",
+            Some(alice_session),
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv(); // drain send trigger
+
+        // Bob replies from within the DM session (DM-triggered agent).
+        // In production, SendMessageTool passes the current session_id,
+        // which for a DM-triggered run IS the DM session.
+        let dm_session_id = SessionId::deterministic_dm("bob", "alice");
+        bus.send(
+            "bob",
+            bob_id,
+            "alice",
+            alice_id,
+            "Hi Alice!",
+            Some(dm_session_id),
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv(); // drain send trigger
+
+        // Verify that the DM session was NOT stored as Bob's source session.
+        let bob_key = (dm_context_id("bob", "alice"), "bob".to_string());
+        assert!(
+            !bus.source_sessions.contains_key(&bob_key),
+            "DM session should not be recorded as Bob's source session"
+        );
+
+        // Alice's web-chat source session should still be recorded.
+        let alice_key = (dm_context_id("alice", "bob"), "alice".to_string());
+        assert!(
+            bus.source_sessions.contains_key(&alice_key),
+            "Alice's web-chat should still be recorded as her source session"
+        );
+
+        // Now Alice ends the conversation.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // Bob's notification should fall back to notifications:bob
+        // (not the DM session).
+        let trigger = rx.try_recv().expect("should have received notification");
+        assert_eq!(trigger.agent_id, bob_id);
+        assert_eq!(
+            trigger.context_id, "notifications:bob",
+            "notification should fall back to notifications:bob, not the DM session"
+        );
+        assert_eq!(
+            trigger.session_id,
+            SessionId::deterministic("notifications:bob"),
+        );
+
+        match &trigger.source {
+            MessageSource::ConversationEnded {
+                source_session_id, ..
+            } => {
+                assert!(
+                    source_session_id.is_none(),
+                    "source_session_id should be None (DM session was filtered out)"
                 );
             }
             other => panic!("expected ConversationEnded, got {:?}", other),
