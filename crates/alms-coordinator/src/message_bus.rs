@@ -1320,6 +1320,151 @@ mod tests {
         assert_eq!(trigger.context_id, "notifications:bob");
     }
 
+    /// When both agents have source sessions (each was invoked from a
+    /// separate web-chat), the notification for each peer should route to
+    /// the correct source session.
+    ///
+    /// Scenario: chamunchuk sends from web-chat-A, blumbum sends from
+    /// web-chat-B (a user is talking to blumbum separately). When the
+    /// conversation ends, chamunchuk's notification goes to web-chat-A and
+    /// blumbum's notification goes to web-chat-B.
+    #[tokio::test]
+    async fn test_both_agents_have_source_sessions() {
+        let (bus, mut rx) = setup();
+        let chamunchuk_id = AgentId::new();
+        let blumbum_id = AgentId::new();
+
+        // Create the two source sessions in the session manager.
+        let webchat_a = SessionId::new();
+        bus.session_manager
+            .get_or_create_shared(webchat_a, "web-chat-A");
+        let webchat_b = SessionId::new();
+        bus.session_manager
+            .get_or_create_shared(webchat_b, "web-chat-B");
+
+        // Chamunchuk sends from web-chat-A.
+        bus.send(
+            "chamunchuk",
+            chamunchuk_id,
+            "blumbum",
+            blumbum_id,
+            "Hey blumbum!",
+            Some(webchat_a),
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv(); // drain send trigger
+
+        // Blumbum replies from web-chat-B (a user is talking to blumbum
+        // separately, so blumbum's tool call passes web-chat-B as source).
+        bus.send(
+            "blumbum",
+            blumbum_id,
+            "chamunchuk",
+            chamunchuk_id,
+            "Hi chamunchuk!",
+            Some(webchat_b),
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv(); // drain send trigger
+
+        // Chamunchuk ends the conversation.
+        bus.end_conversation(
+            "chamunchuk",
+            chamunchuk_id,
+            "blumbum",
+            blumbum_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // Blumbum's notification should route to web-chat-B.
+        let trigger = rx.try_recv().expect("should have received notification");
+        assert_eq!(trigger.agent_id, blumbum_id);
+        assert_eq!(
+            trigger.session_id, webchat_b,
+            "blumbum's notification should go to web-chat-B"
+        );
+        assert_eq!(trigger.context_id, "web-chat-B");
+
+        match &trigger.source {
+            MessageSource::ConversationEnded {
+                source_session_id, ..
+            } => {
+                assert_eq!(
+                    *source_session_id,
+                    Some(webchat_b),
+                    "source_session_id should be blumbum's web-chat-B"
+                );
+            }
+            other => panic!("expected ConversationEnded, got {:?}", other),
+        }
+
+        // Now test the reverse: start a new conversation and have blumbum
+        // end it, so chamunchuk's notification goes to web-chat-A.
+        //
+        // The source sessions were cleaned up by end_conversation, so we
+        // need to establish them again.
+        bus.send(
+            "chamunchuk",
+            chamunchuk_id,
+            "blumbum",
+            blumbum_id,
+            "Round 2!",
+            Some(webchat_a),
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv();
+
+        bus.send(
+            "blumbum",
+            blumbum_id,
+            "chamunchuk",
+            chamunchuk_id,
+            "Round 2 reply!",
+            Some(webchat_b),
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv();
+
+        // This time, blumbum ends the conversation.
+        bus.end_conversation(
+            "blumbum",
+            blumbum_id,
+            "chamunchuk",
+            chamunchuk_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // Chamunchuk's notification should route to web-chat-A.
+        let trigger = rx.try_recv().expect("should have received notification");
+        assert_eq!(trigger.agent_id, chamunchuk_id);
+        assert_eq!(
+            trigger.session_id, webchat_a,
+            "chamunchuk's notification should go to web-chat-A"
+        );
+        assert_eq!(trigger.context_id, "web-chat-A");
+
+        match &trigger.source {
+            MessageSource::ConversationEnded {
+                source_session_id, ..
+            } => {
+                assert_eq!(
+                    *source_session_id,
+                    Some(webchat_a),
+                    "source_session_id should be chamunchuk's web-chat-A"
+                );
+            }
+            other => panic!("expected ConversationEnded, got {:?}", other),
+        }
+    }
+
     /// S3: end_conversation should reject sender == peer (self-message guard).
     #[tokio::test]
     async fn test_end_conversation_self_message_rejected() {

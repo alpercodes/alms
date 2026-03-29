@@ -1749,34 +1749,43 @@ pub(crate) async fn run_trigger_loop(
                 // has no access to SSE infrastructure. We emit the event
                 // here instead, since the ConversationEnded trigger
                 // carries all the information we need.
-                if *reason == ConversationEndReason::DepthExceeded
-                    && let Some(ref peer_name) = peer_name_resolved
-                {
-                    let dm_context = alms_core::dm_context_id(from_name, peer_name);
-                    let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
+                if *reason == ConversationEndReason::DepthExceeded {
+                    if let Some(ref peer_name) = peer_name_resolved {
+                        let dm_context = alms_core::dm_context_id(from_name, peer_name);
+                        let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
 
-                    info!(
-                        from = %from_name,
-                        peer = %peer_name,
-                        dm_session = %dm_session_id.0,
-                        "Emitting dm_conversation_ended SSE for depth-exceeded"
-                    );
+                        info!(
+                            from = %from_name,
+                            peer = %peer_name,
+                            dm_session = %dm_session_id.0,
+                            "Emitting dm_conversation_ended SSE for depth-exceeded"
+                        );
 
-                    let dummy_run_id = RunId::new();
-                    state
-                        .run_manager
-                        .send_session_event(
-                            dm_session_id,
-                            dummy_run_id,
-                            SseEventData::dm_conversation_ended(
+                        // Use a dummy RunId because the notification run has
+                        // not been created yet at this point.
+                        let dummy_run_id = RunId::new();
+                        state
+                            .run_manager
+                            .send_session_event(
                                 dm_session_id,
-                                from_name,
-                                peer_name,
-                                &reason.to_string(),
-                                &dm_context,
-                            ),
-                        )
-                        .await;
+                                dummy_run_id,
+                                SseEventData::dm_conversation_ended(
+                                    dm_session_id,
+                                    from_name,
+                                    peer_name,
+                                    &reason.to_string(),
+                                    &dm_context,
+                                ),
+                            )
+                            .await;
+                    } else {
+                        warn!(
+                            agent_id = %agent_id.0,
+                            from = %from_name,
+                            "Skipping dm_conversation_ended SSE for depth-exceeded: \
+                             agent not found in registry, cannot resolve peer name"
+                        );
+                    }
                 }
 
                 // ── Forward notification to the agent's web-chat session ──
