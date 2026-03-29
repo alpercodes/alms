@@ -874,22 +874,30 @@ async fn execute_run(state: AppState, params: RunParams) {
             // For DM runs the agent's actual outbound reply is sent via the
             // `send_message` tool and persisted to the shared DM session —
             // `output.response` is typically empty or a brief LLM
-            // acknowledgment.  Read the last assistant message from the DM
+            // acknowledgment.  Read the last outbound message from the DM
             // session to capture the real content for episodic summaries
             // (#421).
+            //
+            // All DM messages are stored as `Role::User` with `from_agent`
+            // metadata — perspective mapping to `Role::Assistant` only
+            // happens at context assembly time.  So we match on
+            // `from_agent` + `message_type == "dm"` instead of role.
             let run_output_for_summary = run_input_for_summary.as_ref().map(|_| {
                 if context_id.starts_with("dm:")
+                    && let Some(ref name) = agent_name
                     && let Ok(history) = state.session_manager.get_history(session_id)
-                    && let Some(last_assistant) = history.iter().rev().find(|m| {
-                        m.role == alms_session::Role::Assistant
-                            && matches!(m.content, alms_session::Content::Text(_))
+                    && let Some(last_own) = history.iter().rev().find(|m| {
+                        m.metadata.as_ref().is_some_and(|meta| {
+                            meta.get("from_agent").and_then(|v| v.as_str()) == Some(name)
+                                && meta.get("message_type").and_then(|v| v.as_str()) == Some("dm")
+                        }) && matches!(m.content, alms_session::Content::Text(_))
                     })
-                    && let alms_session::Content::Text(ref text) = last_assistant.content
+                    && let alms_session::Content::Text(ref text) = last_own.content
                     && !text.is_empty()
                 {
                     return text.clone();
                 }
-                // Non-DM runs or fallback when no assistant message was found.
+                // Non-DM runs or fallback when no outbound message was found.
                 output.response.clone()
             });
 
