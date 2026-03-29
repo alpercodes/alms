@@ -84,6 +84,11 @@ pub fn derive_source_label(context_id: &str, agent_name: &str) -> Option<SourceL
         return None;
     }
 
+    // Notification sessions: "notifications:{agent_name}" -- excluded (internal)
+    if context_id.starts_with("notifications:") {
+        return None;
+    }
+
     // Telegram sessions: "telegram_{agent}_{chatid}"
     if context_id.starts_with("telegram_") {
         return Some(SourceLabel {
@@ -590,6 +595,11 @@ mod tests {
     #[test]
     fn test_source_label_episodic_excluded() {
         assert!(derive_source_label("episodic:myagent", "myagent").is_none());
+    }
+
+    #[test]
+    fn test_source_label_notification() {
+        assert!(derive_source_label("notifications:bob", "myagent").is_none());
     }
 
     #[test]
