@@ -266,7 +266,7 @@ Default posture recommendations:
 - No `sudo` — not yet enforced (command denylist not implemented; use OS-level restrictions)
 - Network allowlist empty by default — not yet implemented
 - Cronjob creation requires approval — implemented via Guarded posture
-  - **Exception:** When an agent receives a peer-to-peer direct message (`send_message`), Guarded posture is automatically overridden to Autonomous for that run because there is no human in the loop to approve tool calls (the run would hang indefinitely otherwise). This means a DM-triggered run on a Guarded agent can execute tools — including cronjob creation — without approval. The override is safe because `is_peer_message` is set internally by the MessageBus (not controllable via the HTTP API), but operators should be aware of this trade-off when configuring agent postures.
+  - **Exception:** When a run is system-triggered — peer-to-peer DMs (via `send_message`), notification runs (e.g., `ConversationEnded`), subagent completions, and scheduled jobs — Guarded posture is automatically overridden to Autonomous via the `is_system_triggered` flag, because there is no human in the loop to approve tool calls (the run would hang indefinitely otherwise). This means a system-triggered run on a Guarded agent can execute tools — including cronjob creation — without approval. The override is safe because `is_system_triggered` is set internally by the gateway's `enqueue_triggered_run` helper and `fire_job_run` function (not controllable via the HTTP `create_run` API), but operators should be aware of this trade-off when configuring agent postures.
 
 ---
 
