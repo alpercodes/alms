@@ -747,6 +747,7 @@ async fn execute_run(state: AppState, params: RunParams) {
             agent_id,
             name.clone(),
             state.session_manager.clone(),
+            session_id,
         );
         let list_tool =
             alms_runtime::ListAgentsTool::new(state.session_manager.clone(), name.clone());
@@ -1726,8 +1727,20 @@ pub(crate) async fn run_trigger_loop(
             ),
             MessageSource::SubagentCompletion => ("subagent".to_string(), false, trigger.input),
             MessageSource::ConversationEnded {
-                from_name, reason, ..
+                from_name,
+                reason,
+                source_session_id,
+                ..
             } => {
+                // Resolve the peer (notification recipient) name for SSE
+                // events and DM context reconstruction.
+                let peer_name_resolved = state
+                    .session_manager
+                    .store()
+                    .and_then(|store| store.load_agent_by_id(agent_id).ok())
+                    .flatten()
+                    .map(|r| r.name);
+
                 // ── Emit dm_conversation_ended SSE for depth-exceeded (#419) ──
                 //
                 // The ignore_message path emits this event in execute_run
@@ -1736,12 +1749,8 @@ pub(crate) async fn run_trigger_loop(
                 // has no access to SSE infrastructure. We emit the event
                 // here instead, since the ConversationEnded trigger
                 // carries all the information we need.
-                //
-                // The `context_id` at this point is
-                // `notifications:{peer_name}` — we extract the peer name
-                // to reconstruct the DM session ID and context.
                 if *reason == ConversationEndReason::DepthExceeded
-                    && let Some(peer_name) = context_id.strip_prefix("notifications:")
+                    && let Some(ref peer_name) = peer_name_resolved
                 {
                     let dm_context = alms_core::dm_context_id(from_name, peer_name);
                     let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
@@ -1753,8 +1762,6 @@ pub(crate) async fn run_trigger_loop(
                         "Emitting dm_conversation_ended SSE for depth-exceeded"
                     );
 
-                    // Use a dummy RunId — there is no single run that
-                    // "owns" this event; it is a session-level signal.
                     let dummy_run_id = RunId::new();
                     state
                         .run_manager
@@ -1774,11 +1781,14 @@ pub(crate) async fn run_trigger_loop(
 
                 // ── Forward notification to the agent's web-chat session ──
                 //
-                // The notification run will execute on `notifications:{name}`
-                // which is invisible to the user watching the web-chat.
-                // Forward a dm_conversation_ended event to the user-facing
-                // session so they see something immediately.
-                if let Some(peer_name) = context_id.strip_prefix("notifications:") {
+                // When the notification run is routed to the source session
+                // (the session where `send_message` was originally called),
+                // the user is already watching that session -- no separate
+                // forwarding needed. Only forward to web-chat when the
+                // notification falls back to `notifications:` (invisible).
+                if source_session_id.is_none()
+                    && let Some(ref peer_name) = peer_name_resolved
+                {
                     let dm_context = alms_core::dm_context_id(from_name, peer_name);
                     notify_dm_ended_to_webchat(
                         &state,
@@ -1788,8 +1798,6 @@ pub(crate) async fn run_trigger_loop(
                         &dm_context,
                     )
                     .await;
-                } else {
-                    warn!("ConversationEnded trigger has unexpected context_id: {context_id}");
                 }
 
                 (

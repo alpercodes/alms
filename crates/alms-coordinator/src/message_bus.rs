@@ -73,6 +73,12 @@ pub enum MessageSource {
         from_agent: AgentId,
         from_name: String,
         reason: ConversationEndReason,
+        /// The session the peer was in when they first called `send_message`
+        /// for this DM pair (e.g. `web-chat-12345`). If present, the
+        /// notification run is routed to this session so the user sees the
+        /// agent's reaction. If `None`, the notification falls back to the
+        /// `notifications:{agent}` session.
+        source_session_id: Option<SessionId>,
     },
 }
 
@@ -94,6 +100,16 @@ pub struct MessageBus {
     depths: DashMap<String, (String, u32)>,
     /// Per-DM-pair last activity timestamp for depth expiry.
     last_activity: DashMap<String, Instant>,
+    /// Per-DM-pair per-agent source session tracking.
+    ///
+    /// Key: `(dm_context, agent_name)` -- e.g. `("dm:alice:bob", "alice")`.
+    /// Value: the SessionId the agent was in when they first called
+    /// `send_message` for this DM pair (e.g. their web-chat session).
+    ///
+    /// Used by `end_conversation` to route the notification run to the
+    /// peer's source session instead of an invisible `notifications:` session.
+    /// Entries are cleaned up alongside depth expiry.
+    source_sessions: DashMap<(String, String), SessionId>,
 }
 
 impl MessageBus {
@@ -107,7 +123,16 @@ impl MessageBus {
             run_trigger_tx,
             depths: DashMap::new(),
             last_activity: DashMap::new(),
+            source_sessions: DashMap::new(),
         }
+    }
+
+    /// Remove all source-session entries for a given DM context.
+    ///
+    /// Called during depth expiry and conversation end to clean up
+    /// the `source_sessions` map.
+    fn remove_source_sessions_for_dm(&self, dm_context: &str) {
+        self.source_sessions.retain(|(ctx, _), _| ctx != dm_context);
     }
 }
 
@@ -134,6 +159,7 @@ impl MessageSender for MessageBus {
         recipient_name: &str,
         recipient_agent_id: AgentId,
         message: &str,
+        sender_session_id: Option<SessionId>,
     ) -> Result<DeliveryReceipt, SendError> {
         // --- Validation ---
 
@@ -150,14 +176,16 @@ impl MessageSender for MessageBus {
             && last.elapsed().as_secs() >= DEPTH_EXPIRY_SECS
         {
             self.depths.remove(&dm_context);
+            self.remove_source_sessions_for_dm(&dm_context);
         }
 
-        // Opportunistic cleanup: remove expired entries from both DashMaps
+        // Opportunistic cleanup: remove expired entries from all DashMaps
         // to prevent unbounded growth from accumulated DM pairs. We only
         // retain entries that have been active within the expiry window.
         self.last_activity.retain(|key, last| {
             if last.elapsed().as_secs() >= DEPTH_EXPIRY_SECS {
                 self.depths.remove(key);
+                self.remove_source_sessions_for_dm(key);
                 false
             } else {
                 true
@@ -210,6 +238,18 @@ impl MessageSender for MessageBus {
             }
 
             return Err(SendError::DepthExceeded);
+        }
+
+        // --- Track source session for notification routing ---
+        //
+        // Store the sender's current session as their "source session" for
+        // this DM pair. Only record it on the FIRST send_message call --
+        // subsequent messages sent from within the DM session itself should
+        // not overwrite the original source. We use `or_insert` to preserve
+        // the first entry.
+        if let Some(sid) = sender_session_id {
+            let key = (dm_context.clone(), sender_name.to_string());
+            self.source_sessions.entry(key).or_insert(sid);
         }
 
         // --- Shared DM session ---
@@ -354,22 +394,59 @@ impl MessageSender for MessageBus {
             .append_message(session_id, marker)
             .map_err(|e| SendError::Internal(e.to_string()))?;
 
+        // --- Look up peer's source session for notification routing ---
+        //
+        // If the peer originally called `send_message` from a user-facing
+        // session (e.g. web-chat-12345), the notification run should go to
+        // that session so the user sees the agent's reaction. If there is
+        // no source session (the peer was invoked directly by a DM trigger),
+        // fall back to the `notifications:{peer_name}` session.
+        let peer_source_key = (dm_context.clone(), peer_name.to_string());
+        let peer_source_session = self
+            .source_sessions
+            .get(&peer_source_key)
+            .map(|entry| *entry.value());
+
+        let (target_session_id, target_context_id) = if let Some(source_sid) = peer_source_session {
+            // Route notification to the peer's source session.
+            // Reconstruct the context_id from the session -- use the session's
+            // context_id if available, otherwise fall back to notifications.
+            let ctx = self
+                .session_manager
+                .get(source_sid)
+                .ok()
+                .map(|s| s.context_id.clone())
+                .unwrap_or_else(|| format!("notifications:{peer_name}"));
+            info!(
+                peer = %peer_name,
+                source_session = %source_sid.0,
+                "Routing notification to peer's source session"
+            );
+            (source_sid, ctx)
+        } else {
+            let ctx = format!("notifications:{peer_name}");
+            let sid = SessionId::deterministic(&ctx);
+            (sid, ctx)
+        };
+
+        // --- Clean up source sessions for this DM pair ---
+        self.remove_source_sessions_for_dm(&dm_context);
+
         // --- Emit RunTrigger for the peer agent ---
-        let notification_context = format!("notifications:{peer_name}");
-        let notification_session_id = SessionId::deterministic(&notification_context);
 
         let input = format!("[DM conversation ended] Agent {sender_name} ended the conversation.");
 
         let trigger = RunTrigger {
             agent_id: peer_agent_id,
-            session_id: notification_session_id,
+            session_id: target_session_id,
             input,
             source: MessageSource::ConversationEnded {
                 from_agent: sender_agent_id,
                 from_name: sender_name.to_string(),
                 reason,
+                source_session_id: peer_source_session,
             },
-            context_id: notification_context,
+            context_id: target_context_id,
         };
 
         if let Err(e) = self.run_trigger_tx.send(trigger) {
@@ -423,11 +500,11 @@ mod tests {
     async fn exhaust_depth(bus: &MessageBus, alice_id: AgentId, bob_id: AgentId) {
         for i in 0..MAX_DM_DEPTH {
             if i % 2 == 0 {
-                bus.send("alice", alice_id, "bob", bob_id, "ping")
+                bus.send("alice", alice_id, "bob", bob_id, "ping", None)
                     .await
                     .unwrap();
             } else {
-                bus.send("bob", bob_id, "alice", alice_id, "pong")
+                bus.send("bob", bob_id, "alice", alice_id, "pong", None)
                     .await
                     .unwrap();
             }
@@ -441,7 +518,7 @@ mod tests {
         let recipient_id = AgentId::new();
 
         let receipt = bus
-            .send("alice", sender_id, "bob", recipient_id, "Hello Bob!")
+            .send("alice", sender_id, "bob", recipient_id, "Hello Bob!", None)
             .await
             .unwrap();
 
@@ -472,13 +549,13 @@ mod tests {
 
         // Alice sends to Bob
         let r1 = bus
-            .send("alice", alice_id, "bob", bob_id, "Hello Bob!")
+            .send("alice", alice_id, "bob", bob_id, "Hello Bob!", None)
             .await
             .unwrap();
 
         // Bob sends to Alice (same shared session, reversed order)
         let r2 = bus
-            .send("bob", bob_id, "alice", alice_id, "Hi Alice!")
+            .send("bob", bob_id, "alice", alice_id, "Hi Alice!", None)
             .await
             .unwrap();
 
@@ -502,7 +579,7 @@ mod tests {
         let agent_id = AgentId::new();
 
         let err = bus
-            .send("alice", agent_id, "alice", agent_id, "echo")
+            .send("alice", agent_id, "alice", agent_id, "echo", None)
             .await
             .unwrap_err();
 
@@ -520,7 +597,7 @@ mod tests {
         // Next alternating message should be rejected (depth > MAX_DM_DEPTH)
         let (sender, sender_id, peer, peer_id) = overflow_sender(a, b);
         let err = bus
-            .send(sender, sender_id, peer, peer_id, "one more")
+            .send(sender, sender_id, peer, peer_id, "one more", None)
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -533,10 +610,10 @@ mod tests {
         let b = AgentId::new();
 
         // A -> B succeeds
-        bus.send("alice", a, "bob", b, "msg1").await.unwrap();
+        bus.send("alice", a, "bob", b, "msg1", None).await.unwrap();
 
         // B -> A should succeed immediately (no cooldown blocking replies)
-        bus.send("bob", b, "alice", a, "reply").await.unwrap();
+        bus.send("bob", b, "alice", a, "reply", None).await.unwrap();
     }
 
     #[tokio::test]
@@ -547,10 +624,12 @@ mod tests {
         let c = AgentId::new();
 
         // A -> B succeeds
-        bus.send("alice", a, "bob", b, "msg1").await.unwrap();
+        bus.send("alice", a, "bob", b, "msg1", None).await.unwrap();
 
         // A -> C should also succeed (different pair)
-        bus.send("alice", a, "charlie", c, "msg2").await.unwrap();
+        bus.send("alice", a, "charlie", c, "msg2", None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -559,7 +638,7 @@ mod tests {
         let a = AgentId::new();
         let b = AgentId::new();
 
-        let receipt = bus.send("alice", a, "bob", b, "Hello").await.unwrap();
+        let receipt = bus.send("alice", a, "bob", b, "Hello", None).await.unwrap();
 
         let history = bus.session_manager.get_history(receipt.session_id).unwrap();
         let meta = history[0].metadata.as_ref().unwrap();
@@ -578,7 +657,7 @@ mod tests {
         // Next message should be rejected (depth exceeded)
         let (sender, sender_id, peer, peer_id) = overflow_sender(a, b);
         let err = bus
-            .send(sender, sender_id, peer, peer_id, "overflow")
+            .send(sender, sender_id, peer, peer_id, "overflow", None)
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -591,7 +670,10 @@ mod tests {
         );
 
         // After activity expires, depth should be reset -- sending should succeed.
-        let receipt = bus.send("alice", a, "bob", b, "fresh start").await.unwrap();
+        let receipt = bus
+            .send("alice", a, "bob", b, "fresh start", None)
+            .await
+            .unwrap();
         assert_eq!(
             receipt.session_id,
             SessionId::deterministic_dm("alice", "bob")
@@ -616,7 +698,14 @@ mod tests {
 
         // Step 1: Alice sends a message to Bob via the MessageBus.
         let receipt = bus
-            .send("alice", alice_id, "bob", bob_id, "Hello Bob, how are you?")
+            .send(
+                "alice",
+                alice_id,
+                "bob",
+                bob_id,
+                "Hello Bob, how are you?",
+                None,
+            )
             .await
             .unwrap();
 
@@ -658,7 +747,7 @@ mod tests {
 
         // Step 6: A second message from Bob should use the SAME session.
         let receipt2 = bus
-            .send("bob", bob_id, "alice", alice_id, "I'm fine, thanks!")
+            .send("bob", bob_id, "alice", alice_id, "I'm fine, thanks!", None)
             .await
             .unwrap();
         assert_eq!(receipt2.session_id, expected_session_id);
@@ -687,8 +776,10 @@ mod tests {
         let c = AgentId::new();
 
         // Create two DM pairs: alice-bob and alice-charlie
-        bus.send("alice", a, "bob", b, "hi bob").await.unwrap();
-        bus.send("alice", a, "charlie", c, "hi charlie")
+        bus.send("alice", a, "bob", b, "hi bob", None)
+            .await
+            .unwrap();
+        bus.send("alice", a, "charlie", c, "hi charlie", None)
             .await
             .unwrap();
 
@@ -708,7 +799,7 @@ mod tests {
         );
 
         // Sending any message triggers opportunistic cleanup of expired pairs
-        bus.send("alice", a, "charlie", c, "still here")
+        bus.send("alice", a, "charlie", c, "still here", None)
             .await
             .unwrap();
 
@@ -738,7 +829,7 @@ mod tests {
         let bob_id = AgentId::new();
 
         // Start a conversation so the DM session exists.
-        bus.send("alice", alice_id, "bob", bob_id, "Hello Bob!")
+        bus.send("alice", alice_id, "bob", bob_id, "Hello Bob!", None)
             .await
             .unwrap();
 
@@ -791,13 +882,13 @@ mod tests {
         let bob_id = AgentId::new();
 
         // Build up some depth with alternating messages.
-        bus.send("alice", alice_id, "bob", bob_id, "ping")
+        bus.send("alice", alice_id, "bob", bob_id, "ping", None)
             .await
             .unwrap();
-        bus.send("bob", bob_id, "alice", alice_id, "pong")
+        bus.send("bob", bob_id, "alice", alice_id, "pong", None)
             .await
             .unwrap();
-        bus.send("alice", alice_id, "bob", bob_id, "ping2")
+        bus.send("alice", alice_id, "bob", bob_id, "ping2", None)
             .await
             .unwrap();
 
@@ -829,7 +920,7 @@ mod tests {
         );
 
         // A new conversation should be possible immediately (fresh depth).
-        bus.send("alice", alice_id, "bob", bob_id, "fresh start")
+        bus.send("alice", alice_id, "bob", bob_id, "fresh start", None)
             .await
             .unwrap();
         let entry = bus.depths.get(&dm_ctx).unwrap();
@@ -843,7 +934,7 @@ mod tests {
         let bob_id = AgentId::new();
 
         // Start a conversation.
-        bus.send("alice", alice_id, "bob", bob_id, "Hello Bob!")
+        bus.send("alice", alice_id, "bob", bob_id, "Hello Bob!", None)
             .await
             .unwrap();
 
@@ -886,6 +977,7 @@ mod tests {
                 from_agent,
                 from_name,
                 reason,
+                ..
             } => {
                 assert_eq!(*from_agent, alice_id);
                 assert_eq!(from_name, "alice");
@@ -902,7 +994,7 @@ mod tests {
         let bob_id = AgentId::new();
 
         // Start a conversation.
-        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!", None)
             .await
             .unwrap();
         let _ = rx.try_recv();
@@ -933,6 +1025,188 @@ mod tests {
             }
             other => panic!("expected ConversationEnded, got {:?}", other),
         }
+    }
+
+    /// When send_message is called with a source session, the notification
+    /// run should be routed to that source session instead of `notifications:`.
+    #[tokio::test]
+    async fn test_source_session_routes_notification_to_source() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Alice sends from her web-chat session.
+        let alice_session = SessionId::new();
+        // Create the session in the manager so get() works during end_conversation.
+        bus.session_manager
+            .get_or_create_shared(alice_session, "web-chat-alice");
+        bus.send(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            "Hello Bob!",
+            Some(alice_session),
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv(); // drain send trigger
+
+        // Bob replies from the DM session (no source session -- triggered by DM).
+        bus.send("bob", bob_id, "alice", alice_id, "Hi Alice!", None)
+            .await
+            .unwrap();
+        let _ = rx.try_recv(); // drain send trigger
+
+        // Bob ends the conversation.
+        bus.end_conversation(
+            "bob",
+            bob_id,
+            "alice",
+            alice_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // The notification should go to Alice's source session (web-chat).
+        let trigger = rx.try_recv().expect("should have received notification");
+        assert_eq!(trigger.agent_id, alice_id);
+        assert_eq!(
+            trigger.session_id, alice_session,
+            "notification should go to Alice's source session, not notifications:"
+        );
+        assert_eq!(trigger.context_id, "web-chat-alice");
+
+        match &trigger.source {
+            MessageSource::ConversationEnded {
+                source_session_id, ..
+            } => {
+                assert_eq!(
+                    *source_session_id,
+                    Some(alice_session),
+                    "source_session_id should be Alice's web-chat session"
+                );
+            }
+            other => panic!("expected ConversationEnded, got {:?}", other),
+        }
+    }
+
+    /// When no source session is provided, notification falls back to
+    /// the `notifications:` session (existing behavior).
+    #[tokio::test]
+    async fn test_no_source_session_falls_back_to_notifications() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        // Both agents send without a source session (e.g. both triggered by DMs).
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!", None)
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        bus.send("bob", bob_id, "alice", alice_id, "Hi!", None)
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        // Alice ends the conversation.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // The notification should fall back to notifications:bob.
+        let trigger = rx.try_recv().expect("should have received notification");
+        assert_eq!(trigger.agent_id, bob_id);
+        assert_eq!(trigger.context_id, "notifications:bob");
+        assert_eq!(
+            trigger.session_id,
+            SessionId::deterministic("notifications:bob"),
+        );
+
+        match &trigger.source {
+            MessageSource::ConversationEnded {
+                source_session_id, ..
+            } => {
+                assert!(
+                    source_session_id.is_none(),
+                    "source_session_id should be None when no source session was provided"
+                );
+            }
+            other => panic!("expected ConversationEnded, got {:?}", other),
+        }
+    }
+
+    /// Source sessions are cleaned up when the conversation ends, so a
+    /// new conversation gets fresh source tracking.
+    #[tokio::test]
+    async fn test_source_sessions_cleaned_up_after_end_conversation() {
+        let (bus, mut rx) = setup();
+        let alice_id = AgentId::new();
+        let bob_id = AgentId::new();
+
+        let alice_session = SessionId::new();
+        bus.session_manager
+            .get_or_create_shared(alice_session, "web-chat-alice");
+
+        // First conversation: Alice sends from web-chat.
+        bus.send(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            "First conv",
+            Some(alice_session),
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv();
+
+        // End conversation.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv(); // drain notification trigger
+
+        // Source session map should be empty now.
+        assert!(
+            bus.source_sessions.is_empty(),
+            "source_sessions should be cleaned up after end_conversation"
+        );
+
+        // Second conversation: Alice sends WITHOUT a source session.
+        bus.send("alice", alice_id, "bob", bob_id, "Second conv", None)
+            .await
+            .unwrap();
+        let _ = rx.try_recv();
+
+        // End conversation again.
+        bus.end_conversation(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            ConversationEndReason::Ignored,
+        )
+        .await
+        .unwrap();
+
+        // This time, notification should go to notifications:bob (no source).
+        let trigger = rx.try_recv().expect("should have received notification");
+        assert_eq!(trigger.context_id, "notifications:bob");
     }
 
     /// S3: end_conversation should reject sender == peer (self-message guard).
@@ -1005,7 +1279,7 @@ mod tests {
         let bob_id = AgentId::new();
 
         // Start a conversation so the DM session and depth exist.
-        bus.send("alice", alice_id, "bob", bob_id, "Hello Bob!")
+        bus.send("alice", alice_id, "bob", bob_id, "Hello Bob!", None)
             .await
             .unwrap();
         // Drain the send trigger.
@@ -1080,7 +1354,7 @@ mod tests {
         let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
-            .send(next_sender, next_id, peer_name, peer_id, "overflow")
+            .send(next_sender, next_id, peer_name, peer_id, "overflow", None)
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -1115,7 +1389,7 @@ mod tests {
         let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
-            .send(next_sender, next_id, peer_name, peer_id, "overflow")
+            .send(next_sender, next_id, peer_name, peer_id, "overflow", None)
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -1136,6 +1410,7 @@ mod tests {
                 from_agent,
                 from_name,
                 reason,
+                ..
             } => {
                 assert_eq!(*from_agent, next_id);
                 assert_eq!(from_name, next_sender);
@@ -1165,7 +1440,7 @@ mod tests {
         let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let _ = bus
-            .send(next_sender, next_id, peer_name, peer_id, "overflow")
+            .send(next_sender, next_id, peer_name, peer_id, "overflow", None)
             .await;
 
         // Depth counter should have been reset.
@@ -1179,9 +1454,16 @@ mod tests {
         );
 
         // A fresh conversation should work immediately.
-        bus.send("alice", a, "bob", b, "fresh start after depth exceeded")
-            .await
-            .unwrap();
+        bus.send(
+            "alice",
+            a,
+            "bob",
+            b,
+            "fresh start after depth exceeded",
+            None,
+        )
+        .await
+        .unwrap();
 
         let entry = bus.depths.get(&dm_ctx).unwrap();
         assert_eq!(
@@ -1200,7 +1482,7 @@ mod tests {
         let bob_id = AgentId::new();
 
         // Start and end a conversation.
-        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!", None)
             .await
             .unwrap();
         let _ = rx.try_recv();
@@ -1221,7 +1503,7 @@ mod tests {
         assert!(!bus.depths.contains_key(&dm_ctx));
 
         // A new send() should succeed and start at depth=1.
-        bus.send("alice", alice_id, "bob", bob_id, "New conversation!")
+        bus.send("alice", alice_id, "bob", bob_id, "New conversation!", None)
             .await
             .unwrap();
 
@@ -1250,7 +1532,7 @@ mod tests {
         let bob_id = AgentId::new();
 
         // Start a conversation so the session and depth exist.
-        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!", None)
             .await
             .unwrap();
 
@@ -1308,7 +1590,9 @@ mod tests {
 
         // send() should still succeed — the message is persisted to the
         // session even though the RunTrigger can't be delivered.
-        let receipt = bus.send("alice", alice_id, "bob", bob_id, "Hello!").await;
+        let receipt = bus
+            .send("alice", alice_id, "bob", bob_id, "Hello!", None)
+            .await;
 
         assert!(
             receipt.is_ok(),
@@ -1341,16 +1625,30 @@ mod tests {
         let bob_id = AgentId::new();
 
         // 1. Alice starts the conversation.
-        bus.send("alice", alice_id, "bob", bob_id, "Hey Bob, can you help?")
-            .await
-            .unwrap();
+        bus.send(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            "Hey Bob, can you help?",
+            None,
+        )
+        .await
+        .unwrap();
         let trigger1 = rx.try_recv().unwrap();
         assert_eq!(trigger1.agent_id, bob_id);
 
         // 2. Bob replies.
-        bus.send("bob", bob_id, "alice", alice_id, "Sure, what do you need?")
-            .await
-            .unwrap();
+        bus.send(
+            "bob",
+            bob_id,
+            "alice",
+            alice_id,
+            "Sure, what do you need?",
+            None,
+        )
+        .await
+        .unwrap();
         let trigger2 = rx.try_recv().unwrap();
         assert_eq!(trigger2.agent_id, alice_id);
 
@@ -1399,6 +1697,7 @@ mod tests {
                 from_agent,
                 from_name,
                 reason,
+                ..
             } => {
                 assert_eq!(*from_agent, alice_id);
                 assert_eq!(from_name, "alice");
@@ -1415,9 +1714,16 @@ mod tests {
         );
 
         // Bonus: a new conversation should be possible immediately.
-        bus.send("alice", alice_id, "bob", bob_id, "Fresh conversation!")
-            .await
-            .unwrap();
+        bus.send(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            "Fresh conversation!",
+            None,
+        )
+        .await
+        .unwrap();
         let entry = bus.depths.get(&dm_ctx).unwrap();
         assert_eq!(
             entry.value().1,
@@ -1452,7 +1758,7 @@ mod tests {
         let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
-            .send(next_sender, next_id, peer_name, peer_id, "overflow")
+            .send(next_sender, next_id, peer_name, peer_id, "overflow", None)
             .await
             .unwrap_err();
         assert!(matches!(err, SendError::DepthExceeded));
@@ -1488,6 +1794,7 @@ mod tests {
                 from_agent,
                 from_name,
                 reason,
+                ..
             } => {
                 assert_eq!(*from_agent, next_id);
                 assert_eq!(from_name, next_sender);
@@ -1507,7 +1814,9 @@ mod tests {
         );
 
         // Bonus: a new conversation should be possible immediately.
-        bus.send("alice", a, "bob", b, "fresh start").await.unwrap();
+        bus.send("alice", a, "bob", b, "fresh start", None)
+            .await
+            .unwrap();
         let entry = bus.depths.get(&dm_ctx).unwrap();
         assert_eq!(entry.value().1, 1, "depth should restart at 1");
     }
@@ -1543,7 +1852,7 @@ mod tests {
         let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
 
         let err = bus
-            .send(next_sender, next_id, peer_name, peer_id, "overflow")
+            .send(next_sender, next_id, peer_name, peer_id, "overflow", None)
             .await
             .unwrap_err();
 
@@ -1588,9 +1897,9 @@ mod tests {
         let bus_b = bus.clone();
 
         let handle_a =
-            tokio::spawn(async move { bus_a.send("alice", a, "bob", b, "overflow-a").await });
+            tokio::spawn(async move { bus_a.send("alice", a, "bob", b, "overflow-a", None).await });
         let handle_b =
-            tokio::spawn(async move { bus_b.send("bob", b, "alice", a, "overflow-b").await });
+            tokio::spawn(async move { bus_b.send("bob", b, "alice", a, "overflow-b", None).await });
 
         let result_a = handle_a.await.unwrap();
         let result_b = handle_b.await.unwrap();
@@ -1638,7 +1947,7 @@ mod tests {
         let bob_id = AgentId::new();
 
         // Start a conversation.
-        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!", None)
             .await
             .unwrap();
         let _ = rx.try_recv();
@@ -1696,7 +2005,7 @@ mod tests {
         let bob_id = AgentId::new();
 
         // Start and end a conversation.
-        bus.send("alice", alice_id, "bob", bob_id, "Hello!")
+        bus.send("alice", alice_id, "bob", bob_id, "Hello!", None)
             .await
             .unwrap();
         let _ = rx.try_recv();
@@ -1741,7 +2050,7 @@ mod tests {
         // Trigger DepthExceeded and reset.
         let (next_sender, next_id, peer_name, peer_id) = overflow_sender(a, b);
         let _ = bus
-            .send(next_sender, next_id, peer_name, peer_id, "overflow")
+            .send(next_sender, next_id, peer_name, peer_id, "overflow", None)
             .await;
         while rx.try_recv().is_ok() {}
 
@@ -1752,7 +2061,14 @@ mod tests {
         // The next message should trigger DepthExceeded again (confirming
         // the full budget was restored, not just 1 message).
         let err = bus
-            .send(next_sender, next_id, peer_name, peer_id, "overflow again")
+            .send(
+                next_sender,
+                next_id,
+                peer_name,
+                peer_id,
+                "overflow again",
+                None,
+            )
             .await
             .unwrap_err();
         assert!(
