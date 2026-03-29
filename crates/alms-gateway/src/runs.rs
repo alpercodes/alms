@@ -73,6 +73,12 @@ struct RunParams {
     /// by the MessageBus. The agent loop uses `run_on_session` to look up the
     /// shared session by `SessionId` directly and skips re-persisting the input.
     is_peer_message: bool,
+    /// When true, the run was created by the system (not a user-initiated HTTP
+    /// request). All runs from `enqueue_triggered_run` are system-triggered:
+    /// peer DM messages, notification runs, subagent completions. These runs
+    /// have no human watching, so Guarded posture would hang forever waiting
+    /// for approval -- the posture is overridden to Autonomous.
+    is_system_triggered: bool,
 }
 
 /// Result of resolving per-agent config from the agent registry.
@@ -400,6 +406,7 @@ pub async fn create_run(
                     context_id,
                     cancel_token,
                     is_peer_message: false,
+                    is_system_triggered: false,
                 },
             )
             .await;
@@ -418,15 +425,15 @@ pub async fn create_run(
 
 /// Resolve the effective posture for a run.
 ///
-/// Peer-message-triggered runs (DMs from other agents) have no human in the
-/// loop, so Guarded posture would hang forever waiting for approval. This
-/// function overrides Guarded to Autonomous for those runs while leaving all
-/// other postures unchanged.
+/// System-triggered runs (peer DMs, notification runs, subagent completions)
+/// have no human in the loop, so Guarded posture would hang forever waiting
+/// for approval. This function overrides Guarded to Autonomous for those
+/// runs while leaving all other postures unchanged.
 fn resolve_posture_for_run(
     posture: alms_runtime::Posture,
-    is_peer_message: bool,
+    is_system_triggered: bool,
 ) -> alms_runtime::Posture {
-    if is_peer_message && posture == alms_runtime::Posture::Guarded {
+    if is_system_triggered && posture == alms_runtime::Posture::Guarded {
         alms_runtime::Posture::Autonomous
     } else {
         posture
@@ -468,6 +475,7 @@ async fn execute_run(state: AppState, params: RunParams) {
         context_id,
         cancel_token,
         is_peer_message,
+        is_system_triggered,
     } = params;
     // Track this run for graceful shutdown drain.
     state.run_manager.track_in_flight();
@@ -538,13 +546,13 @@ async fn execute_run(state: AppState, params: RunParams) {
         llm = llm.with_model(model.clone());
     }
 
-    // Peer-message-triggered runs (DMs from other agents) have no human in
-    // the loop, so Guarded posture would hang forever waiting for approval.
-    // Force Autonomous posture for these runs.
-    let resolved = resolve_posture_for_run(agent_config.posture, is_peer_message);
+    // System-triggered runs (peer DMs, notifications, subagent completions)
+    // have no human in the loop, so Guarded posture would hang forever
+    // waiting for approval.  Force Autonomous posture for these runs.
+    let resolved = resolve_posture_for_run(agent_config.posture, is_system_triggered);
     if resolved != agent_config.posture {
         info!(
-            "Run {} is peer-message-triggered — overriding {:?} posture to {:?}",
+            "Run {} is system-triggered — overriding {:?} posture to {:?}",
             run_id.0, agent_config.posture, resolved
         );
     }
@@ -1160,6 +1168,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
             context_id,
             cancel_token,
             is_peer_message: false,
+            is_system_triggered: true,
         },
     )
     .await;
@@ -1461,6 +1470,9 @@ async fn enqueue_triggered_run(
                     context_id,
                     cancel_token,
                     is_peer_message,
+                    // All runs via enqueue_triggered_run are system-triggered
+                    // (no human watching), so Guarded posture is overridden.
+                    is_system_triggered: true,
                 },
             )
             .await;
@@ -2090,42 +2102,42 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_message_overrides_guarded_to_autonomous() {
+    fn test_system_triggered_overrides_guarded_to_autonomous() {
         let result = resolve_posture_for_run(Posture::Guarded, true);
         assert_eq!(
             result,
             Posture::Autonomous,
-            "Guarded posture should be overridden to Autonomous for peer-message runs"
+            "Guarded posture should be overridden to Autonomous for system-triggered runs"
         );
     }
 
     #[test]
-    fn test_peer_message_does_not_override_full_control() {
+    fn test_system_triggered_does_not_override_full_control() {
         let result = resolve_posture_for_run(Posture::FullControl, true);
         assert_eq!(
             result,
             Posture::FullControl,
-            "FullControl posture should NOT be overridden for peer-message runs"
+            "FullControl posture should NOT be overridden for system-triggered runs"
         );
     }
 
     #[test]
-    fn test_peer_message_does_not_override_autonomous() {
+    fn test_system_triggered_does_not_override_autonomous() {
         let result = resolve_posture_for_run(Posture::Autonomous, true);
         assert_eq!(
             result,
             Posture::Autonomous,
-            "Autonomous posture should remain unchanged for peer-message runs"
+            "Autonomous posture should remain unchanged for system-triggered runs"
         );
     }
 
     #[test]
-    fn test_non_peer_message_keeps_guarded() {
+    fn test_user_initiated_keeps_guarded() {
         let result = resolve_posture_for_run(Posture::Guarded, false);
         assert_eq!(
             result,
             Posture::Guarded,
-            "Guarded posture should be preserved for non-peer-message runs"
+            "Guarded posture should be preserved for user-initiated runs"
         );
     }
 
