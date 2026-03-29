@@ -870,9 +870,28 @@ async fn execute_run(state: AppState, params: RunParams) {
                 .await;
 
             // Clone the response before mark_run_as_completed consumes it.
-            let run_output_for_summary = run_input_for_summary
-                .as_ref()
-                .map(|_| output.response.clone());
+            //
+            // For DM runs the agent's actual outbound reply is sent via the
+            // `send_message` tool and persisted to the shared DM session —
+            // `output.response` is typically empty or a brief LLM
+            // acknowledgment.  Read the last assistant message from the DM
+            // session to capture the real content for episodic summaries
+            // (#421).
+            let run_output_for_summary = run_input_for_summary.as_ref().map(|_| {
+                if context_id.starts_with("dm:")
+                    && let Ok(history) = state.session_manager.get_history(session_id)
+                    && let Some(last_assistant) = history.iter().rev().find(|m| {
+                        m.role == alms_session::Role::Assistant
+                            && matches!(m.content, alms_session::Content::Text(_))
+                    })
+                    && let alms_session::Content::Text(ref text) = last_assistant.content
+                    && !text.is_empty()
+                {
+                    return text.clone();
+                }
+                // Non-DM runs or fallback when no assistant message was found.
+                output.response.clone()
+            });
 
             state
                 .run_manager
