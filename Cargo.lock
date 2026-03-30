@@ -121,6 +121,7 @@ dependencies = [
  "alms-core",
  "alms-runtime",
  "alms-session",
+ "alms-tools",
  "async-trait",
  "chrono",
  "crossbeam",
@@ -166,6 +167,7 @@ dependencies = [
  "alms-core",
  "alms-runtime",
  "alms-session",
+ "alms-tools",
  "axum",
  "chrono",
  "cron",
@@ -248,6 +250,25 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-test",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "alms-tools"
+version = "0.1.1"
+dependencies = [
+ "alms-core",
+ "alms-sandbox",
+ "alms-session",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tokio-util",
  "tracing",
  "uuid",
 ]

@@ -1,4 +1,4 @@
-use crate::context::{ContextBuilder, content_to_string};
+use crate::context::ContextBuilder;
 use crate::events::PHASE_SUMMARIZING;
 use crate::llm_types::*;
 use alms_core::AlmsResult;
@@ -259,7 +259,7 @@ impl AgentRuntime {
                     SessionRole::System => "System",
                     SessionRole::Tool => "Tool",
                 };
-                format!("{}: {}", role_label, content_to_string(&m.content))
+                format!("{}: {}", role_label, m.content.to_display_string())
             })
             .collect::<Vec<_>>()
             .join("\n");

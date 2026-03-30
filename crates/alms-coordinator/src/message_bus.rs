@@ -17,10 +17,10 @@
 //! allowing fresh conversation bursts after a quiet period.
 
 use alms_core::{AgentId, SessionId, dm_context_id};
-use alms_runtime::message_sender::{
+use alms_session::SessionManager;
+use alms_tools::message_sender::{
     ConversationEndReason, DeliveryReceipt, MessageSender, SendError,
 };
-use alms_session::SessionManager;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};

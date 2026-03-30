@@ -4,26 +4,19 @@
 //! - LLM client and API communication
 //! - Tool registry and execution
 //! - Agent loop orchestration
+//!
+//! Tool implementations (except `workspace_write`) have been extracted to the
+//! `alms-tools` crate. The `SubagentDispatcher`, `MessageSender`, and
+//! `EventForwarder` traits also live in `alms-tools`.
 
 pub mod agent;
 pub(crate) mod anthropic;
 pub mod context;
 pub mod episodic;
 pub mod events;
-pub mod get_task_result_tool;
-pub mod ignore_message_tool;
-pub mod invoke_agent_tool;
-pub mod list_agents_tool;
-pub mod list_my_sessions_tool;
 pub mod llm_client;
 pub mod llm_types;
-pub mod message_sender;
-pub mod read_messages_tool;
-pub mod read_session_tool;
-pub mod read_subagent_session_tool;
 pub mod scheduler;
-pub mod send_message_tool;
-pub mod subagent;
 pub mod tools;
 pub mod workspace;
 pub mod workspace_tool;
@@ -31,20 +24,9 @@ pub mod workspace_tool;
 pub use agent::{AgentConfig, AgentRuntime, Posture, RunOutput, SystemPrompts};
 pub use context::ContextBuilder;
 pub use events::{RuntimeEvent, RuntimeEventSender};
-pub use get_task_result_tool::GetTaskResultTool;
-pub use ignore_message_tool::IgnoreMessageTool;
-pub use invoke_agent_tool::InvokeAgentTool;
-pub use list_agents_tool::ListAgentsTool;
-pub use list_my_sessions_tool::ListMySessionsTool;
 pub use llm_client::LlmClient;
 pub use llm_types::*;
-pub use message_sender::MessageSender;
-pub use read_messages_tool::ReadMessagesTool;
-pub use read_session_tool::ReadSessionTool;
-pub use read_subagent_session_tool::ReadSubagentSessionTool;
 pub use scheduler::{JobRun, Scheduler};
-pub use send_message_tool::SendMessageTool;
-pub use subagent::SubagentDispatcher;
 pub use tools::ToolRegistry;
 pub use workspace::{AgentWorkspace, WorkspaceFile};
 

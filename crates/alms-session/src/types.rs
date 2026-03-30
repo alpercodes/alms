@@ -129,6 +129,42 @@ pub enum Content {
     },
 }
 
+impl Content {
+    /// Convert this content value to a plain-text display string.
+    ///
+    /// Used for human-readable rendering of session messages (e.g. in tool
+    /// outputs, summary generation, and context fallback paths).
+    ///
+    /// **Note:** `ToolResult` output is truncated to 2000 bytes with a
+    /// `[truncated, N bytes total]` suffix.  If a caller needs the full
+    /// output it should match on `Content::ToolResult` directly.
+    pub fn to_display_string(&self) -> String {
+        match self {
+            Content::Text(text) => text.clone(),
+            Content::ToolCall { name, params } => {
+                format!("Tool call: {}({})", name, params)
+            }
+            Content::ToolResult { tool_id, result } => {
+                let result_str = result.to_string();
+                // Truncate long tool outputs in context
+                if result_str.len() > 2000 {
+                    format!(
+                        "Tool result {}: {}... [truncated, {} bytes total]",
+                        tool_id,
+                        &result_str[..2000],
+                        result_str.len()
+                    )
+                } else {
+                    format!("Tool result {}: {}", tool_id, result_str)
+                }
+            }
+            Content::Image { url, .. } => {
+                format!("[Image: {}]", url)
+            }
+        }
+    }
+}
+
 /// Session configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -215,5 +251,56 @@ mod tests {
             }
             other => panic!("expected Image, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn to_display_string_text() {
+        let c = Content::Text("hello world".to_string());
+        assert_eq!(c.to_display_string(), "hello world");
+    }
+
+    #[test]
+    fn to_display_string_tool_call() {
+        let c = Content::ToolCall {
+            name: "echo".into(),
+            params: serde_json::json!({"msg": "hi"}),
+        };
+        let s = c.to_display_string();
+        assert!(s.starts_with("Tool call: echo("));
+    }
+
+    #[test]
+    fn to_display_string_tool_result_short() {
+        let c = Content::ToolResult {
+            tool_id: "t1".into(),
+            result: serde_json::json!("ok"),
+        };
+        let s = c.to_display_string();
+        assert!(s.contains("Tool result t1:"));
+        assert!(!s.contains("[truncated"));
+    }
+
+    #[test]
+    fn to_display_string_tool_result_truncated() {
+        let long = "x".repeat(5000);
+        let c = Content::ToolResult {
+            tool_id: "t2".into(),
+            result: serde_json::Value::String(long),
+        };
+        let s = c.to_display_string();
+        assert!(s.contains("[truncated"));
+        assert!(s.len() < 3000);
+    }
+
+    #[test]
+    fn to_display_string_image() {
+        let c = Content::Image {
+            url: "https://example.com/img.png".into(),
+            alt: Some("photo".into()),
+        };
+        assert_eq!(
+            c.to_display_string(),
+            "[Image: https://example.com/img.png]"
+        );
     }
 }

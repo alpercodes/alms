@@ -309,11 +309,11 @@ impl ContextBuilder {
                 };
                 LlmMessage::tool_result(tool_id.clone(), content)
             }
-            (Role::System, _) => LlmMessage::system(content_to_string(&msg.content)),
-            (Role::User, _) => LlmMessage::user(content_to_string(&msg.content)),
-            (Role::Assistant, _) => LlmMessage::assistant(content_to_string(&msg.content)),
+            (Role::System, _) => LlmMessage::system(msg.content.to_display_string()),
+            (Role::User, _) => LlmMessage::user(msg.content.to_display_string()),
+            (Role::Assistant, _) => LlmMessage::assistant(msg.content.to_display_string()),
             (Role::Tool, _) => {
-                LlmMessage::tool_result(msg.id.clone(), content_to_string(&msg.content))
+                LlmMessage::tool_result(msg.id.clone(), msg.content.to_display_string())
             }
         }
     }
@@ -397,38 +397,8 @@ fn estimate_llm_message_tokens(msg: &LlmMessage) -> usize {
     content_tokens + tool_call_tokens
 }
 
-/// Convert session Content to a plain-text string.
-///
-/// Used by `read_subagent_session_tool` for formatting subagent messages and as a
-/// fallback in `session_msg_to_llm` for unexpected role/content combinations (e.g.
-/// `Content::Image`). The `ToolCall`/`ToolResult` branches here are NOT used by
-/// `session_msg_to_llm` — those are handled by dedicated match arms that produce
-/// structured LLM messages instead.
-pub(crate) fn content_to_string(content: &Content) -> String {
-    match content {
-        Content::Text(text) => text.clone(),
-        Content::ToolCall { name, params } => {
-            format!("Tool call: {}({})", name, params)
-        }
-        Content::ToolResult { tool_id, result } => {
-            let result_str = result.to_string();
-            // Truncate long tool outputs in context
-            if result_str.len() > 2000 {
-                format!(
-                    "Tool result {}: {}... [truncated, {} bytes total]",
-                    tool_id,
-                    &result_str[..2000],
-                    result_str.len()
-                )
-            } else {
-                format!("Tool result {}: {}", tool_id, result_str)
-            }
-        }
-        Content::Image { url, .. } => {
-            format!("[Image: {}]", url)
-        }
-    }
-}
+// content_to_string has been removed.  Use Content::to_display_string()
+// (defined in alms_session::types) instead.
 
 #[cfg(test)]
 mod tests {
@@ -681,7 +651,7 @@ mod tests {
             tool_id: "test".into(),
             result: serde_json::Value::String(long_result),
         };
-        let result = content_to_string(&content);
+        let result = content.to_display_string();
         assert!(result.contains("[truncated"));
         assert!(result.len() < 3000);
     }

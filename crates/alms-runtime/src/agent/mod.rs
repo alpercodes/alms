@@ -11,12 +11,8 @@ mod tests;
 pub use types::{AgentConfig, Posture, RunOutput, SystemPrompts};
 
 use crate::events::{PHASE_BUILDING_CONTEXT, RuntimeEventSender};
-use crate::get_task_result_tool::GetTaskResultTool;
-use crate::invoke_agent_tool::InvokeAgentTool;
 use crate::llm_client::LlmClient;
 use crate::llm_types::*;
-use crate::read_session_tool::ReadSessionTool;
-use crate::read_subagent_session_tool::ReadSubagentSessionTool;
 use crate::tools::ToolRegistry;
 use crate::workspace::AgentWorkspace;
 use crate::workspace_tool::WorkspaceWriteTool;
@@ -194,63 +190,6 @@ impl AgentRuntime {
     /// Attach a runtime event sender so the gateway can observe tool events.
     pub fn with_event_sender(mut self, sender: RuntimeEventSender) -> Self {
         self.event_sender = Some(sender);
-        self
-    }
-
-    /// Register the `invoke_agent` tool so the agent can spawn subagents.
-    pub fn with_invoke_agent(self, tool: InvokeAgentTool) -> Self {
-        self.tools.register(std::sync::Arc::new(tool));
-        self
-    }
-
-    /// Register the `get_task_result` tool for polling background subagents.
-    pub fn with_get_task_result(self, tool: GetTaskResultTool) -> Self {
-        self.tools.register(std::sync::Arc::new(tool));
-        self
-    }
-
-    /// Register the `read_subagent_session` tool for on-demand subagent context retrieval.
-    pub fn with_read_subagent_session(self, tool: ReadSubagentSessionTool) -> Self {
-        self.tools.register(std::sync::Arc::new(tool));
-        self
-    }
-
-    /// Register the `read_session` tool for on-demand session recall.
-    pub fn with_read_session(self, tool: ReadSessionTool) -> Self {
-        self.tools.register(std::sync::Arc::new(tool));
-        self
-    }
-
-    /// Register the `send_message` tool for peer-to-peer agent messaging.
-    pub fn with_send_message(self, tool: crate::send_message_tool::SendMessageTool) -> Self {
-        self.tools.register(std::sync::Arc::new(tool));
-        self
-    }
-
-    /// Register the `list_agents` tool for agent discovery.
-    pub fn with_list_agents(self, tool: crate::list_agents_tool::ListAgentsTool) -> Self {
-        self.tools.register(std::sync::Arc::new(tool));
-        self
-    }
-
-    /// Register the `list_my_sessions` tool for session self-awareness.
-    pub fn with_list_my_sessions(
-        self,
-        tool: crate::list_my_sessions_tool::ListMySessionsTool,
-    ) -> Self {
-        self.tools.register(std::sync::Arc::new(tool));
-        self
-    }
-
-    /// Register the `read_messages` tool for reading DM conversation history.
-    pub fn with_read_messages(self, tool: crate::read_messages_tool::ReadMessagesTool) -> Self {
-        self.tools.register(std::sync::Arc::new(tool));
-        self
-    }
-
-    /// Register the `ignore_message` tool so agents can decline to respond.
-    pub fn with_ignore_message(self, tool: crate::ignore_message_tool::IgnoreMessageTool) -> Self {
-        self.tools.register(std::sync::Arc::new(tool));
         self
     }
 

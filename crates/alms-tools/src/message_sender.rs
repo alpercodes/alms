@@ -1,6 +1,6 @@
 //! Trait for sending peer messages between agents.
 //!
-//! This trait is defined in `alms-runtime` so the tools (SendMessageTool, etc.)
+//! This trait is defined in `alms-tools` so the tools (SendMessageTool, etc.)
 //! can reference it without depending on `alms-coordinator`. The `MessageBus`
 //! in `alms-coordinator` implements this trait.
 
