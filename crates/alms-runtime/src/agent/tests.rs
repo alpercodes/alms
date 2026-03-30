@@ -826,6 +826,55 @@ fn test_is_user_facing_context() {
     ));
 }
 
+// ── tool_result_ok tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_tool_result_ok_no_exit_code() {
+    // Most tools return plain JSON without exit_code — treated as success.
+    let val = serde_json::json!({"output": "hello"});
+    assert!(helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_exit_code_zero() {
+    let val = serde_json::json!({"exit_code": 0, "stdout": "ok"});
+    assert!(helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_exit_code_nonzero() {
+    let val = serde_json::json!({"exit_code": 1, "stderr": "fail"});
+    assert!(!helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_exit_code_negative() {
+    // Killed by signal (e.g. -9) should also be failure.
+    let val = serde_json::json!({"exit_code": -9});
+    assert!(!helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_exit_code_non_integer() {
+    // exit_code that is not an integer (e.g. string) is treated as success
+    // because `as_i64()` returns None for non-integer JSON values.
+    let val = serde_json::json!({"exit_code": "not_a_number"});
+    assert!(helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_string_value() {
+    // Plain string result (e.g. echo tool) is always success.
+    let val = serde_json::json!("just a string");
+    assert!(helpers::tool_result_ok(&val));
+}
+
+#[test]
+fn test_tool_result_ok_null_value() {
+    let val = serde_json::Value::Null;
+    assert!(helpers::tool_result_ok(&val));
+}
+
 #[test]
 fn test_dm_addendum_contains_peer_name() {
     let addendum = AgentRuntime::dm_addendum("alice");

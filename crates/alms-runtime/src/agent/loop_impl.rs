@@ -448,7 +448,7 @@ impl AgentRuntime {
                                     non_conflicting_count,
                                 );
                                 Err(AlmsError::Runtime(
-                                    "BUG: exec_iter exhausted — conflicting_tools filter \
+                                    "BUG: exec_iter exhausted -- conflicting_tools filter \
                                      diverged from exec_indices"
                                         .into(),
                                 ))
@@ -579,6 +579,13 @@ impl AgentRuntime {
     ///
     /// Accumulates the full response (content + tool calls + usage) from the
     /// streaming chunks and returns them in the same shape as `complete()`.
+    ///
+    /// **Timeout**: Per-chunk timeout is enforced inside the LLM client's
+    /// `complete_stream` implementation (see `LlmClient::complete_stream` in
+    /// `llm_client.rs`), controlled by `LlmConfig::stream_chunk_timeout_secs`
+    /// (default 60s). If the provider stalls mid-stream, the chunk-level
+    /// timeout fires and propagates an error up through this method. User-
+    /// initiated cancellation is handled separately in `call_llm_with_cancellation`.
     pub(crate) async fn stream_llm_call(
         &self,
         request: CompletionRequest,
@@ -640,11 +647,13 @@ impl AgentRuntime {
         }
 
         // Build final tool_calls from accumulated deltas.
-        // Filter out ghost entries (empty id) that can appear if the
-        // accumulator was grown by index but no actual data arrived.
+        // Filter out ghost entries that can appear if the accumulator was
+        // grown by index but no actual data arrived. Check both id and name:
+        // a non-empty id with an empty name would produce a ToolCall that
+        // fails at the tools.contains(name) check in execute_tool_call.
         let tool_calls: Vec<ToolCall> = tool_call_acc
             .into_iter()
-            .filter(|(id, _, _)| !id.is_empty())
+            .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
             .map(|(id, name, arguments)| ToolCall {
                 id,
                 function: FunctionCall { name, arguments },
@@ -693,6 +702,10 @@ impl AgentRuntime {
             "Executing tool"
         );
 
+        // Wall-clock start time. In Guarded mode, `elapsed` will include
+        // however long the user took to approve the tool call. If pure
+        // execution-only timing is ever needed, reset `start` after the
+        // approval check below.
         let start = std::time::Instant::now();
 
         // Parse arguments
@@ -843,13 +856,15 @@ impl AgentRuntime {
                     duration_ms = %elapsed.as_millis(),
                     "Tool execution failed"
                 );
+                // Use `Error` (not `Deny`) to distinguish runtime failures
+                // from policy denials in audit log queries.
                 let _ = session_manager.append_audit(
                     session_id,
                     AuditEvent {
                         session_id,
                         run_id: self.run_id,
                         tool: name.to_string(),
-                        decision: AuditDecision::Deny,
+                        decision: AuditDecision::Error,
                         params: args,
                         result: None,
                         error: Some(e.to_string()),

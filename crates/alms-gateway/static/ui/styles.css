@@ -1332,6 +1332,7 @@ header h1 {
 .audit-tool { font-weight: 600; color: var(--text-primary); }
 .audit-allow { color: var(--success); }
 .audit-deny  { color: var(--error); }
+.audit-error { color: var(--warning); }
 .audit-time  { color: var(--text-disabled); font-family: var(--font-mono); }
 .audit-params {
   color: var(--text-muted);
