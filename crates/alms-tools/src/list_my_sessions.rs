@@ -5,7 +5,7 @@
 //! session_id, context_type, context_id, message count, last activity, and
 //! the episodic summary if one exists.
 
-use crate::episodic::derive_source_label;
+use alms_core::source_label::derive_source_label;
 use alms_core::{AgentId, SessionId};
 use alms_sandbox::{Tool, error::SandboxResult};
 use alms_session::SessionManager;

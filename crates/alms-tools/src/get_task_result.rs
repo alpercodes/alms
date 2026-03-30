@@ -82,7 +82,7 @@ impl Tool for GetTaskResultTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::RuntimeEventSender;
+    use crate::event_forwarder::EventForwarder;
     use alms_core::{AlmsResult, RunId, SessionId};
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
@@ -97,7 +97,7 @@ mod tests {
             _task: String,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
-            _parent_event_tx: Option<RuntimeEventSender>,
+            _parent_event_fwd: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<String> {

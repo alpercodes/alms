@@ -6,7 +6,6 @@
 //! subagent's session. The tool derives the subagent's deterministic session
 //! ID (same UUID v5 logic as invoke_agent) and reads from SessionManager.
 
-use crate::context::content_to_string;
 use alms_core::{AgentId, SessionId};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
@@ -131,7 +130,7 @@ impl Tool for ReadSubagentSessionTool {
             .map(|m| {
                 serde_json::json!({
                     "role": format!("{:?}", m.role).to_lowercase(),
-                    "content": content_to_string(&m.content)
+                    "content": m.content.to_display_string()
                 })
             })
             .collect();

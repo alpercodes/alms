@@ -1,10 +1,10 @@
 pub mod message_bus;
 
 use alms_core::{AgentId, AlmsResult, RunId, SessionId};
-use alms_runtime::events::RuntimeEventSender;
-use alms_runtime::subagent::{PollResult, SubagentDispatcher};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient, RunOutput};
 use alms_session::SessionManager;
+use alms_tools::event_forwarder::EventForwarder;
+use alms_tools::subagent::{PollResult, SubagentDispatcher};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -236,7 +236,7 @@ impl Coordinator {
     pub async fn spawn_subagent(
         &self,
         request: SubagentRequest,
-        parent_event_tx: Option<RuntimeEventSender>,
+        parent_event_tx: Option<Arc<dyn EventForwarder>>,
         is_background: bool,
         parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<TaskId> {
@@ -383,7 +383,7 @@ impl SubagentDispatcher for Coordinator {
         task: String,
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
-        parent_event_tx: Option<RuntimeEventSender>,
+        parent_event_tx: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
         parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<String> {
@@ -440,7 +440,7 @@ impl SubagentDispatcher for Coordinator {
         task: String,
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
-        parent_event_tx: Option<RuntimeEventSender>,
+        parent_event_tx: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
         parent_cancel_token: Option<CancellationToken>,
     ) -> alms_core::AlmsResult<Uuid> {
@@ -533,7 +533,7 @@ async fn run_subagent(
     result_tx: oneshot::Sender<TaskResult>,
     session_manager: Arc<SessionManager>,
     llm: LlmClient,
-    parent_event_tx: Option<RuntimeEventSender>,
+    parent_event_tx: Option<Arc<dyn EventForwarder>>,
     base_agent_config: AgentConfig,
     workspace_dir: Option<std::path::PathBuf>,
     data_dir: Option<std::path::PathBuf>,
@@ -809,7 +809,7 @@ async fn run_agent_loop(
     request: &SubagentRequest,
     session_manager: &Arc<SessionManager>,
     llm: &LlmClient,
-    parent_event_tx: Option<RuntimeEventSender>,
+    parent_event_tx: Option<Arc<dyn EventForwarder>>,
     base_agent_config: &AgentConfig,
     workspace_dir: Option<&std::path::Path>,
     data_dir: Option<&std::path::Path>,
@@ -956,7 +956,7 @@ async fn run_agent_loop(
     // Forward subagent tool events into the parent run's event stream,
     // tagging each event with the subagent's identity so the UI can
     // distinguish subagent activity from parent activity.
-    if let Some(parent_tx) = parent_event_tx {
+    if let Some(parent_fwd) = parent_event_tx {
         let label = request
             .subagent_name
             .clone()
@@ -964,31 +964,54 @@ async fn run_agent_loop(
         tokio::spawn(async move {
             use alms_runtime::RuntimeEvent;
             let mut rx = sub_rx;
-            while let Some(mut event) = rx.recv().await {
-                match &mut event {
-                    RuntimeEvent::ToolStart { source_agent, .. }
-                    | RuntimeEvent::ToolEnd { source_agent, .. }
-                    | RuntimeEvent::TokenDelta { source_agent, .. }
-                    | RuntimeEvent::ApprovalRequired { source_agent, .. } => {
-                        *source_agent = Some(label.clone());
+            while let Some(event) = rx.recv().await {
+                let agent_label = Some(label.clone());
+                match event {
+                    RuntimeEvent::ToolStart {
+                        invocation_id,
+                        tool,
+                        params,
+                        ..
+                    } => {
+                        parent_fwd.forward_tool_start(invocation_id, tool, params, agent_label);
                     }
-                    // Suppress subagent status events — they would overwrite
+                    RuntimeEvent::ToolEnd {
+                        invocation_id,
+                        ok,
+                        result,
+                        ..
+                    } => {
+                        parent_fwd.forward_tool_end(invocation_id, ok, result, agent_label);
+                    }
+                    RuntimeEvent::TokenDelta { delta, .. } => {
+                        parent_fwd.forward_token_delta(delta, agent_label);
+                    }
+                    // Suppress subagent status events -- they would overwrite
                     // the parent's thinking indicator with the subagent's phase,
                     // which is confusing. The user doesn't need to know that a
                     // subagent is "building context" or "calling LLM".
                     RuntimeEvent::Status { .. } => continue,
+                    // ApprovalRequired cannot be forwarded through EventForwarder
+                    // (it requires a oneshot channel). Subagent approvals are
+                    // not supported; the subagent will hang until timeout.
+                    RuntimeEvent::ApprovalRequired { tool, .. } => {
+                        warn!(
+                            tool = %tool,
+                            "Subagent requested approval -- not supported, will hang until timeout"
+                        );
+                        continue;
+                    }
                     // Forward warnings from subagents, tagged with the
                     // subagent label so the operator can tell them apart
                     // from parent warnings.
-                    RuntimeEvent::Warning { source_agent, .. } => {
-                        *source_agent = Some(label.clone());
+                    RuntimeEvent::Warning { code, message, .. } => {
+                        parent_fwd.forward_warning(code, message, agent_label);
                     }
                 }
-                let _ = parent_tx.send(event);
             }
         });
     } else {
-        // Nobody is consuming — drop the receiver so sends silently fail
+        // Nobody is consuming -- drop the receiver so sends silently fail
         drop(sub_rx);
     }
 

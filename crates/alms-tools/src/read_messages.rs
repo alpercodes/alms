@@ -4,7 +4,6 @@
 //! The session is looked up by its deterministic SessionId (derived from the
 //! sorted name pair) rather than by `(agent_id, context_id)`.
 
-use crate::context::content_to_string;
 use alms_core::SessionId;
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
@@ -110,7 +109,7 @@ impl Tool for ReadMessagesTool {
 
                 serde_json::json!({
                     "from": display_sender,
-                    "content": content_to_string(&m.content),
+                    "content": m.content.to_display_string(),
                 })
             })
             .collect();

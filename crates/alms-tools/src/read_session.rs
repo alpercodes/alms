@@ -9,7 +9,6 @@
 //! (where `agent_id` is the nil UUID sentinel), access is granted if the
 //! agent's name appears in the session's `context_id`.
 
-use crate::context::content_to_string;
 use alms_core::{AgentId, SessionId};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
 use alms_session::SessionManager;
@@ -207,7 +206,7 @@ impl Tool for ReadSessionTool {
             .map(|m| {
                 let mut entry = serde_json::json!({
                     "role": format!("{:?}", m.role).to_lowercase(),
-                    "content": content_to_string(&m.content),
+                    "content": m.content.to_display_string(),
                 });
                 // For DM sessions, include sender attribution from metadata
                 // so the output is readable (all DM messages have role "user").

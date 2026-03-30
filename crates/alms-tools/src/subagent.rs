@@ -1,20 +1,21 @@
-//! SubagentDispatcher trait — lets tools spawn subagents without a direct
+//! SubagentDispatcher trait -- lets tools spawn subagents without a direct
 //! dependency on alms-coordinator.
 //!
-//! Defined here (in alms-runtime) so that InvokeAgentTool can hold an
+//! Defined here (in alms-tools) so that InvokeAgentTool can hold an
 //! `Arc<dyn SubagentDispatcher>` without creating a cycle between
-//! alms-runtime and alms-coordinator.
+//! alms-tools and alms-coordinator.
 
-use crate::events::RuntimeEventSender;
+use crate::event_forwarder::EventForwarder;
 use alms_core::{AlmsError, AlmsResult, RunId, SessionId};
 use async_trait::async_trait;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Outcome of polling a background subagent task.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PollResult {
-    /// Task is still running — call `get_task_result` again later.
+    /// Task is still running -- call `get_task_result` again later.
     Running,
     /// Task completed successfully with this response text.
     Completed(String),
@@ -33,15 +34,15 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     /// agent registry via `alms agent create`. Their config (model, posture)
     /// and workspace files are loaded from the registry.
     ///
-    /// `parent_event_tx` is the parent run's runtime event sender. When
-    /// provided, the subagent's tool events are forwarded into the parent
-    /// run's SSE stream so the UI can show subagent activity inline.
+    /// `parent_event_fwd` is a type-erased event forwarder. When provided,
+    /// the subagent's tool events are forwarded into the parent run's SSE
+    /// stream so the UI can show subagent activity inline.
     async fn dispatch(
         &self,
         task: String,
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
-        parent_event_tx: Option<RuntimeEventSender>,
+        parent_event_fwd: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
         parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<String>;
@@ -50,13 +51,13 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     ///
     /// The caller can poll for the result using `poll_task(task_id)`. The
     /// subagent runs concurrently with the parent's loop. Subagent tool events
-    /// are still forwarded into `parent_event_tx` when provided.
+    /// are still forwarded into `parent_event_fwd` when provided.
     async fn dispatch_background(
         &self,
         _task: String,
         _parent_session_id: SessionId,
         _parent_run_id: Option<RunId>,
-        _parent_event_tx: Option<RuntimeEventSender>,
+        _parent_event_fwd: Option<Arc<dyn EventForwarder>>,
         _subagent_name: Option<String>,
         _parent_cancel_token: Option<CancellationToken>,
     ) -> AlmsResult<Uuid> {

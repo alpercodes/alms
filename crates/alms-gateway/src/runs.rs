@@ -12,7 +12,7 @@ use alms_core::{
     Run, RunId, RunInput, RunStatus, RunStatusResponse, SessionId,
 };
 use alms_runtime::RuntimeEvent;
-use alms_runtime::message_sender::{ConversationEndReason, MessageSender as _};
+use alms_tools::message_sender::{ConversationEndReason, MessageSender as _};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -24,6 +24,78 @@ use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
+
+// ---------------------------------------------------------------------------
+// RuntimeEventForwarder -- bridges alms-tools EventForwarder to RuntimeEvent
+// ---------------------------------------------------------------------------
+
+/// Concrete [`EventForwarder`](alms_tools::EventForwarder) that wraps a
+/// `RuntimeEventSender` and maps each method to the corresponding
+/// `RuntimeEvent` variant.
+///
+/// This is the bridge that lets tools in `alms-tools` emit events without
+/// depending on `alms-runtime`'s `RuntimeEvent` enum.
+#[derive(Debug, Clone)]
+struct RuntimeEventForwarder {
+    tx: alms_runtime::RuntimeEventSender,
+}
+
+impl RuntimeEventForwarder {
+    fn new(tx: alms_runtime::RuntimeEventSender) -> Self {
+        Self { tx }
+    }
+}
+
+impl alms_tools::EventForwarder for RuntimeEventForwarder {
+    fn forward_tool_start(
+        &self,
+        invocation_id: uuid::Uuid,
+        tool: String,
+        params: serde_json::Value,
+        source_agent: Option<String>,
+    ) {
+        let _ = self.tx.send(RuntimeEvent::ToolStart {
+            invocation_id,
+            tool,
+            params,
+            source_agent,
+        });
+    }
+
+    fn forward_tool_end(
+        &self,
+        invocation_id: uuid::Uuid,
+        ok: bool,
+        result: serde_json::Value,
+        source_agent: Option<String>,
+    ) {
+        let _ = self.tx.send(RuntimeEvent::ToolEnd {
+            invocation_id,
+            ok,
+            result,
+            source_agent,
+        });
+    }
+
+    fn forward_token_delta(&self, delta: String, source_agent: Option<String>) {
+        let _ = self.tx.send(RuntimeEvent::TokenDelta {
+            delta,
+            source_agent,
+        });
+    }
+
+    fn forward_status(&self, phase: String, detail: Option<String>) {
+        let _ = self.tx.send(RuntimeEvent::Status { phase, detail });
+    }
+
+    fn forward_warning(&self, code: String, message: String, source_agent: Option<String>) {
+        let _ = self.tx.send(RuntimeEvent::Warning {
+            code,
+            message,
+            source_agent,
+        });
+    }
+}
 
 /// Valid LLM provider identifiers accepted in per-run overrides.
 ///
@@ -562,7 +634,8 @@ async fn execute_run(state: AppState, params: RunParams) {
     // Clone before moving into `with_event_sender` so invoke_agent can forward
     // subagent events into the same stream.
     let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
-    let invoke_agent_tx = runtime_tx.clone();
+    let invoke_agent_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
+        std::sync::Arc::new(RuntimeEventForwarder::new(runtime_tx.clone()));
 
     // Override system prompt with bootstrap prompt for first-time agents.
     // Must come after per-agent overrides so bootstrap takes precedence.
@@ -654,10 +727,10 @@ async fn execute_run(state: AppState, params: RunParams) {
     // The cancel_token is passed to InvokeAgentTool so that cancelling the
     // parent run propagates to all subagents spawned during this run.
     {
-        let dispatcher: std::sync::Arc<dyn alms_runtime::SubagentDispatcher> =
+        let dispatcher: std::sync::Arc<dyn alms_tools::SubagentDispatcher> =
             state.coordinator.clone();
-        let get_task_tool = alms_runtime::GetTaskResultTool::new(dispatcher.clone());
-        // Separate channel for background subagent events → session stream.
+        let get_task_tool = alms_tools::GetTaskResultTool::new(dispatcher.clone());
+        // Separate channel for background subagent events -> session stream.
         // This is independent of the parent's runtime_tx, so it doesn't
         // block the parent run from finishing.
         // Note: bg_run_id uses the parent's run_id. These events may arrive
@@ -713,36 +786,41 @@ async fn execute_run(state: AppState, params: RunParams) {
             }
         });
 
-        let invoke_tool = alms_runtime::InvokeAgentTool::new(
+        let bg_event_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
+            std::sync::Arc::new(RuntimeEventForwarder::new(bg_event_tx));
+        let invoke_tool = alms_tools::InvokeAgentTool::new(
             dispatcher,
             session_id,
             Some(run_id),
-            Some(invoke_agent_tx),
+            Some(invoke_agent_fwd.clone()),
         )
         .with_cancel_token(cancel_token)
-        .with_background_event_tx(bg_event_tx);
+        .with_background_event_fwd(bg_event_fwd);
         let read_session_tool =
-            alms_runtime::ReadSubagentSessionTool::new(state.session_manager.clone(), session_id);
-        runtime = runtime
-            .with_invoke_agent(invoke_tool)
-            .with_get_task_result(get_task_tool)
-            .with_read_subagent_session(read_session_tool);
+            alms_tools::ReadSubagentSessionTool::new(state.session_manager.clone(), session_id);
+        runtime.tools().register(std::sync::Arc::new(invoke_tool));
+        runtime.tools().register(std::sync::Arc::new(get_task_tool));
+        runtime
+            .tools()
+            .register(std::sync::Arc::new(read_session_tool));
     }
 
     // Register read_session tool (on-demand session recall for the agent's own sessions).
     {
-        let read_own_session_tool = alms_runtime::ReadSessionTool::new(
+        let read_own_session_tool = alms_tools::ReadSessionTool::new(
             state.session_manager.clone(),
             agent_id,
             agent_name.clone(),
         );
-        runtime = runtime.with_read_session(read_own_session_tool);
+        runtime
+            .tools()
+            .register(std::sync::Arc::new(read_own_session_tool));
     }
 
     // Register peer messaging tools (Layer 2) when agent name is known.
     if let Some(ref name) = agent_name {
-        let sender: std::sync::Arc<dyn alms_runtime::MessageSender> = state.message_bus.clone();
-        let send_tool = alms_runtime::SendMessageTool::new(
+        let sender: std::sync::Arc<dyn alms_tools::MessageSender> = state.message_bus.clone();
+        let send_tool = alms_tools::SendMessageTool::new(
             sender,
             agent_id,
             name.clone(),
@@ -750,28 +828,29 @@ async fn execute_run(state: AppState, params: RunParams) {
             session_id,
         );
         let list_tool =
-            alms_runtime::ListAgentsTool::new(state.session_manager.clone(), name.clone());
+            alms_tools::ListAgentsTool::new(state.session_manager.clone(), name.clone());
         let read_tool =
-            alms_runtime::ReadMessagesTool::new(state.session_manager.clone(), name.clone());
-        let list_sessions_tool = alms_runtime::ListMySessionsTool::new(
+            alms_tools::ReadMessagesTool::new(state.session_manager.clone(), name.clone());
+        let list_sessions_tool = alms_tools::ListMySessionsTool::new(
             state.session_manager.clone(),
             agent_id,
             session_id,
             name.clone(),
         );
-        runtime = runtime
-            .with_send_message(send_tool)
-            .with_list_agents(list_tool)
-            .with_read_messages(read_tool)
-            .with_list_my_sessions(list_sessions_tool);
+        runtime.tools().register(std::sync::Arc::new(send_tool));
+        runtime.tools().register(std::sync::Arc::new(list_tool));
+        runtime.tools().register(std::sync::Arc::new(read_tool));
+        runtime
+            .tools()
+            .register(std::sync::Arc::new(list_sessions_tool));
 
-        // Only register `ignore_message` in DM sessions — the tool is
+        // Only register `ignore_message` in DM sessions -- the tool is
         // meaningless outside DM context and would confuse the LLM into
         // calling it in web-chat or job runs.  The runtime guard in
         // IgnoreMessageTool::execute() remains as defense-in-depth.
         if context_id.starts_with("dm:") {
-            let ignore_tool = alms_runtime::IgnoreMessageTool::new(context_id.clone());
-            runtime = runtime.with_ignore_message(ignore_tool);
+            let ignore_tool = alms_tools::IgnoreMessageTool::new(context_id.clone());
+            runtime.tools().register(std::sync::Arc::new(ignore_tool));
         }
     }
 
@@ -793,8 +872,7 @@ async fn execute_run(state: AppState, params: RunParams) {
     // DM sessions are included — the agent_name is needed to derive the peer.
     let agent_name_for_summary = agent_name.clone().unwrap_or_default();
     let should_summarize = run_summary_mode != alms_core::config::RunSummaryMode::Off
-        && alms_runtime::episodic::derive_source_label(&context_id, &agent_name_for_summary)
-            .is_some();
+        && alms_core::derive_source_label(&context_id, &agent_name_for_summary).is_some();
 
     let run_input_for_summary = if should_summarize {
         Some(input.clone())

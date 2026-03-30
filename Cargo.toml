@@ -8,6 +8,7 @@ members = [
     "crates/alms-cli",
     "crates/alms-core",
     "crates/alms-coordinator",
+    "crates/alms-tools",
 ]
 resolver = "2"
 

@@ -1,6 +1,6 @@
 //! invoke_agent tool — lets a running agent spawn a subagent via the Coordinator.
 
-use crate::events::RuntimeEventSender;
+use crate::event_forwarder::EventForwarder;
 use crate::subagent::SubagentDispatcher;
 use alms_core::{RunId, SessionId};
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
@@ -19,14 +19,14 @@ pub struct InvokeAgentTool {
     parent_run_id: Option<RunId>,
     /// Clone of the parent run's event sender so subagent tool events
     /// are forwarded into the parent's SSE stream.
-    parent_event_tx: Option<RuntimeEventSender>,
+    parent_event_tx: Option<Arc<dyn EventForwarder>>,
     /// Parent run's cancellation token — threaded into subagent dispatch so
     /// cancelling the parent also cancels active subagents.
     parent_cancel_token: Option<CancellationToken>,
     /// Separate event sender for background subagents. Goes to session
     /// subscribers directly (not through the parent's runtime channel)
     /// so it doesn't block the parent run from finishing.
-    background_event_tx: Option<RuntimeEventSender>,
+    background_event_tx: Option<Arc<dyn EventForwarder>>,
 }
 
 impl InvokeAgentTool {
@@ -34,7 +34,7 @@ impl InvokeAgentTool {
         dispatcher: Arc<dyn SubagentDispatcher>,
         parent_session_id: SessionId,
         parent_run_id: Option<RunId>,
-        parent_event_tx: Option<RuntimeEventSender>,
+        parent_event_tx: Option<Arc<dyn EventForwarder>>,
     ) -> Self {
         Self {
             dispatcher,
@@ -46,10 +46,10 @@ impl InvokeAgentTool {
         }
     }
 
-    /// Attach a separate event sender for background subagent dispatch.
+    /// Attach a separate event forwarder for background subagent dispatch.
     /// Events from background subagents flow to session subscribers directly.
-    pub fn with_background_event_tx(mut self, tx: RuntimeEventSender) -> Self {
-        self.background_event_tx = Some(tx);
+    pub fn with_background_event_fwd(mut self, fwd: Arc<dyn EventForwarder>) -> Self {
+        self.background_event_tx = Some(fwd);
         self
     }
 
@@ -186,7 +186,7 @@ mod tests {
             _task: String,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
-            _parent_event_tx: Option<RuntimeEventSender>,
+            _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<String> {
@@ -231,7 +231,7 @@ mod tests {
                 _task: String,
                 _parent_session_id: SessionId,
                 _parent_run_id: Option<RunId>,
-                _parent_event_tx: Option<RuntimeEventSender>,
+                _parent_event_tx: Option<Arc<dyn EventForwarder>>,
                 _subagent_name: Option<String>,
                 _parent_cancel_token: Option<CancellationToken>,
             ) -> AlmsResult<String> {
@@ -267,7 +267,7 @@ mod tests {
             _task: String,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
-            _parent_event_tx: Option<RuntimeEventSender>,
+            _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<String> {
@@ -279,7 +279,7 @@ mod tests {
             _task: String,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
-            _parent_event_tx: Option<RuntimeEventSender>,
+            _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<Uuid> {
@@ -349,7 +349,7 @@ mod tests {
             _task: String,
             _parent_session_id: SessionId,
             _parent_run_id: Option<RunId>,
-            _parent_event_tx: Option<RuntimeEventSender>,
+            _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
         ) -> AlmsResult<String> {

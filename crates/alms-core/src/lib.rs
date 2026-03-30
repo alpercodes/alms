@@ -6,6 +6,7 @@ pub mod job;
 pub mod registry;
 pub mod run;
 pub mod secrets;
+pub mod source_label;
 
 pub use channel::{Channel, ChannelConfig, ChannelMessage, IncomingMessage, OutgoingMessage};
 
@@ -21,6 +22,7 @@ pub use run::{
     CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
     TokenUsage, ToolCallRecord, ToolCallRole, ran_ignore_message_successfully,
 };
+pub use source_label::{SourceLabel, derive_source_label, truncate_to_char_boundary};
 
 /// Sentinel string returned by the agent loop when the max-iterations limit is
 /// hit.  Defined once so that the runtime (`agent.rs`) and the gateway
