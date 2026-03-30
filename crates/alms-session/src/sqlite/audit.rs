@@ -16,6 +16,7 @@ impl SqliteStore {
         let decision = match event.decision {
             AuditDecision::Allow => "allow",
             AuditDecision::Deny => "deny",
+            AuditDecision::Error => "error",
         };
         self.conn
             .lock()
@@ -117,10 +118,10 @@ impl SqliteStore {
                             return None;
                         }
                     };
-                    let decision = if decision_str == "allow" {
-                        AuditDecision::Allow
-                    } else {
-                        AuditDecision::Deny
+                    let decision = match decision_str.as_str() {
+                        "allow" => AuditDecision::Allow,
+                        "error" => AuditDecision::Error,
+                        _ => AuditDecision::Deny,
                     };
                     Some(AuditEvent {
                         session_id: SessionId(session_uuid),
@@ -181,5 +182,30 @@ mod tests {
         assert_eq!(audit[0].run_id, Some(run_id));
         assert!(matches!(audit[0].decision, AuditDecision::Deny));
         assert_eq!(audit[0].error.as_deref(), Some("denied"));
+    }
+
+    #[test]
+    fn test_audit_error_roundtrip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        store.save_session(&session).unwrap();
+
+        let event = AuditEvent {
+            session_id: session.id,
+            run_id: None,
+            tool: "shell_exec".to_string(),
+            decision: AuditDecision::Error,
+            params: serde_json::json!({"command": "ls"}),
+            result: None,
+            error: Some("process timed out".to_string()),
+            timestamp: alms_core::Timestamp::now(),
+        };
+        store.save_audit(&event).unwrap();
+
+        let audit = store.load_audit(session.id).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].tool, "shell_exec");
+        assert!(matches!(audit[0].decision, AuditDecision::Error));
+        assert_eq!(audit[0].error.as_deref(), Some("process timed out"));
     }
 }

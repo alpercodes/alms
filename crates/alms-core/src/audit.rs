@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 pub enum AuditDecision {
     Allow,
     Deny,
+    /// A runtime failure during tool execution (as opposed to a policy denial).
+    /// Distinguishes "we chose not to run this" (`Deny`) from "we ran it and it
+    /// failed" (`Error`).
+    Error,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
