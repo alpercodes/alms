@@ -14,6 +14,7 @@ use super::dm::{
     DM_CONFLICT_MSG, DM_TEXT_ONLY_MAX_RETRIES, DM_TEXT_ONLY_RETRY_MSG, detect_dm_conflict,
     dm_tool_was_called, should_terminate_after_dm_send,
 };
+use super::helpers::tool_result_ok;
 use super::types::Posture;
 
 impl AgentRuntime {
@@ -74,57 +75,22 @@ impl AgentRuntime {
                 "Agent loop iteration"
             );
 
+            // NOTE: `messages.clone()` is required here because
+            // `CompletionRequest` takes ownership of the `Vec<LlmMessage>`,
+            // but we continue to mutate `messages` after the LLM call
+            // (appending tool results for the next iteration). The clone
+            // cost scales with conversation length; if this becomes a
+            // bottleneck, the LLM client could be changed to accept a
+            // reference, but that would require upstream API changes.
             let request = CompletionRequest::new(self.llm.default_model())
                 .with_messages(messages.clone())
                 .with_tools(self.tools.to_definitions())
                 .with_max_tokens(self.config.max_tokens);
 
-            // Checkpoint B: LLM call with cancellation support.
-            // Stream the LLM call, emitting token_delta events as chunks arrive.
-            // Falls back to buffered mode if streaming fails.
-            self.emit_status(PHASE_CALLING_LLM, None);
-            let streaming_future = self.stream_llm_call(request.clone());
-            let stream_result = if let Some(ref token) = self.cancel_token {
-                tokio::select! {
-                    result = streaming_future => result,
-                    _ = token.cancelled() => return (tool_call_records, Err(AlmsError::Cancelled)),
-                }
-            } else {
-                streaming_future.await
-            };
-            let (content, tool_calls, usage) = match stream_result {
+            let (content, tool_calls, usage) = match self.call_llm_with_cancellation(request).await
+            {
                 Ok(result) => result,
-                Err(e) => {
-                    warn!("Streaming failed, falling back to buffered: {}", e);
-                    let buffered_future = self.llm.complete(request);
-                    let response = if let Some(ref token) = self.cancel_token {
-                        tokio::select! {
-                            result = buffered_future => match result {
-                                Ok(r) => r,
-                                Err(e) => return (tool_call_records, Err(e)),
-                            },
-                            _ = token.cancelled() => return (tool_call_records, Err(AlmsError::Cancelled)),
-                        }
-                    } else {
-                        match buffered_future.await {
-                            Ok(r) => r,
-                            Err(e) => return (tool_call_records, Err(e)),
-                        }
-                    };
-                    let usage = response.usage.clone();
-                    let choice = match response.choices.into_iter().next() {
-                        Some(c) => c,
-                        None => {
-                            return (
-                                tool_call_records,
-                                Err(AlmsError::Runtime(
-                                    "LLM returned empty choices array".to_string(),
-                                )),
-                            );
-                        }
-                    };
-                    (choice.message.content, choice.message.tool_calls, usage)
-                }
+                Err(e) => return (tool_call_records, Err(e)),
             };
 
             // Accumulate token usage from this LLM call
@@ -141,47 +107,21 @@ impl AgentRuntime {
                     tool_call_id: None,
                 });
 
-                // Persist assistant text content (if any) before tool calls.
-                // For DM sessions, skip session persistence — tool calls stay
-                // in-memory for the current run's multi-turn loop only.
+                // Persist assistant text and tool call entries to session
+                // history. Intentionally fire-and-forget: session persistence
+                // failures are logged as warnings but do not abort the run.
+                // This is a deliberate design choice -- the LLM loop should
+                // be resilient to transient SQLite errors, and the in-memory
+                // `messages` vec is the authoritative state for the current
+                // run. If persistence is critical for your deployment, monitor
+                // these warnings and consider promoting them to errors.
                 if !is_dm {
-                    if let Some(ref text) = content
-                        && !text.is_empty()
-                        && let Err(e) = session_manager.append_message(
-                            session_id,
-                            SessionMessage {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                role: SessionRole::Assistant,
-                                content: SessionContent::Text(text.clone()),
-                                timestamp: alms_core::Timestamp::now(),
-                                metadata: None,
-                            },
-                        )
-                    {
-                        warn!("Failed to persist assistant text to session: {}", e);
-                    }
-
-                    // Persist tool calls to session history
-                    for tc in &tool_calls {
-                        if let Err(e) = session_manager.append_message(
-                            session_id,
-                            SessionMessage {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                role: SessionRole::Assistant,
-                                content: SessionContent::ToolCall {
-                                    name: tc.function.name.clone(),
-                                    params: serde_json::from_str(&tc.function.arguments)
-                                        .unwrap_or_else(|_| {
-                                            serde_json::Value::String(tc.function.arguments.clone())
-                                        }),
-                                },
-                                timestamp: alms_core::Timestamp::now(),
-                                metadata: Some(serde_json::json!({ "tool_call_id": tc.id })),
-                            },
-                        ) {
-                            warn!("Failed to persist tool call to session: {}", e);
-                        }
-                    }
+                    self.persist_assistant_tool_calls(
+                        session_manager,
+                        session_id,
+                        content.as_deref(),
+                        &tool_calls,
+                    );
                 }
 
                 // Collect tool call records for per-run storage (all sessions).
@@ -200,14 +140,14 @@ impl AgentRuntime {
 
                 // Pre-execution conflict detection: send_message and
                 // ignore_message are mutually exclusive. If both appear in
-                // the same tool-call batch, execute neither — return error
+                // the same tool-call batch, execute neither -- return error
                 // results for both so the LLM can retry with just one.
                 // Other non-conflicting tools in the batch still execute
                 // normally. (Fixes #364)
                 let dm_check = detect_dm_conflict(&tool_calls);
                 if dm_check.conflict {
                     warn!(
-                        "Agent called both send_message and ignore_message in same batch — \
+                        "Agent called both send_message and ignore_message in same batch -- \
                          rejecting both; the agent will retry with one"
                     );
                 }
@@ -225,138 +165,32 @@ impl AgentRuntime {
                     self.emit_status(PHASE_EXECUTING_TOOLS, Some(&detail));
                 }
 
-                // Checkpoint C: tool execution with cancellation support.
-                //
-                // Full-control / Autonomous posture: run all tool calls concurrently
-                // so background invoke_agent calls don't block each other and
-                // independent tools finish in parallel.
-                //
-                // Guarded posture: run tool calls sequentially so the user sees one
-                // approval prompt at a time rather than all at once.
-                //
-                // When dm_check.conflict is true, send_message and
-                // ignore_message are skipped (replaced with error results);
-                // other tools in the batch still execute.
-                let conflicting_tools = dm_check.conflicting_tools;
-
-                let results = match self.config.posture {
-                    Posture::Guarded => {
-                        // Note: cancellation during active tool execution (post-approval)
-                        // is not detected until the tool completes, which is acceptable
-                        // since guarded tools block on approval (which IS cancellation-aware).
-                        let mut results = Vec::with_capacity(tool_calls.len());
-                        for tc in &tool_calls {
-                            if conflicting_tools.contains(&tc.function.name.as_str()) {
-                                results.push(Err(AlmsError::ToolExecution(
-                                    DM_CONFLICT_MSG.to_string(),
-                                )));
-                                continue;
-                            }
-                            if let Some(ref token) = self.cancel_token
-                                && token.is_cancelled()
-                            {
-                                return (tool_call_records, Err(AlmsError::Cancelled));
-                            }
-                            results.push(
-                                self.execute_tool_call(tc, session_manager, session_id)
-                                    .await,
-                            );
-                        }
-                        results
-                    }
-                    Posture::FullControl | Posture::Autonomous => {
-                        // Indices of non-conflicting tools to execute.
-                        let exec_indices: Vec<usize> = tool_calls
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, tc)| {
-                                !conflicting_tools.contains(&tc.function.name.as_str())
-                            })
-                            .map(|(i, _)| i)
-                            .collect();
-
-                        // Execute non-conflicting tools concurrently.
-                        let exec_results = if exec_indices.is_empty() {
-                            Vec::new()
-                        } else {
-                            let exec_futures = exec_indices.iter().map(|&i| {
-                                self.execute_tool_call(&tool_calls[i], session_manager, session_id)
-                            });
-                            if let Some(ref token) = self.cancel_token {
-                                tokio::select! {
-                                    r = futures::future::join_all(exec_futures) => r,
-                                    _ = token.cancelled() => return (tool_call_records, Err(AlmsError::Cancelled)),
-                                }
-                            } else {
-                                futures::future::join_all(exec_futures).await
-                            }
-                        };
-
-                        // Assemble final results: conflict errors for
-                        // conflicting tools, execution results for the rest.
-                        let mut exec_iter = exec_results.into_iter();
-                        tool_calls
-                            .iter()
-                            .map(|tc| {
-                                if conflicting_tools.contains(&tc.function.name.as_str()) {
-                                    Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string()))
-                                } else {
-                                    exec_iter.next().unwrap_or_else(|| {
-                                        Err(AlmsError::Runtime("missing tool result".into()))
-                                    })
-                                }
-                            })
-                            .collect()
-                    }
+                // Execute tools with posture-aware concurrency and cancellation.
+                let results = match self
+                    .run_tool_calls(
+                        &tool_calls,
+                        dm_check.conflicting_tools,
+                        session_manager,
+                        session_id,
+                    )
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(e) => return (tool_call_records, Err(e)),
                 };
 
-                for (tool_call, result) in tool_calls.iter().zip(results) {
-                    let (content, ok) = match result {
-                        Ok(value) => {
-                            // shell_exec returns Ok even for non-zero exit codes;
-                            // check exit_code so persisted metadata matches SSE events.
-                            let ok = value
-                                .get("exit_code")
-                                .and_then(|v| v.as_i64())
-                                .is_none_or(|code| code == 0);
-                            (value.to_string(), ok)
-                        }
-                        Err(e) => (format!("Error: {}", e), false),
-                    };
-                    messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
-
-                    // Persist tool result to session history (skip for DM sessions).
-                    if !is_dm
-                        && let Err(e) = session_manager.append_message(
-                            session_id,
-                            SessionMessage {
-                                id: uuid::Uuid::new_v4().to_string(),
-                                role: SessionRole::Tool,
-                                content: SessionContent::ToolResult {
-                                    tool_id: tool_call.id.clone(),
-                                    result: serde_json::from_str(&content)
-                                        .unwrap_or(serde_json::Value::String(content.clone())),
-                                },
-                                timestamp: alms_core::Timestamp::now(),
-                                metadata: Some(serde_json::json!({ "ok": ok })),
-                            },
-                        )
-                    {
-                        warn!("Failed to persist tool result to session: {}", e);
-                    }
-
-                    // Collect tool result record for per-run storage (all sessions).
-                    tool_call_records.push(alms_core::ToolCallRecord {
-                        seq: tool_seq,
-                        role: alms_core::ToolCallRole::Tool,
-                        tool_name: Some(tool_call.function.name.clone()),
-                        tool_id: Some(tool_call.id.clone()),
-                        params: None,
-                        result: Some(content.clone()),
-                        timestamp: chrono::Utc::now(),
-                    });
-                    tool_seq += 1;
-                }
+                // Process results: push tool result messages into the
+                // conversation, persist to session, and collect records.
+                self.process_tool_results(
+                    &tool_calls,
+                    results,
+                    &mut messages,
+                    &mut tool_call_records,
+                    &mut tool_seq,
+                    session_manager,
+                    session_id,
+                    is_dm,
+                );
 
                 // Check if `ignore_message` was called AND succeeded.
                 // We inspect the actual tool-call records (which include
@@ -364,7 +198,7 @@ impl AgentRuntime {
                 // This prevents early termination when ignore_message fails
                 // (e.g. called from a non-DM session, or blocked by conflict).
                 if alms_core::ran_ignore_message_successfully(&tool_call_records) {
-                    info!("Agent declined to respond via ignore_message — ending run early");
+                    info!("Agent declined to respond via ignore_message -- ending run early");
                     return (tool_call_records, Ok((String::new(), total_usage)));
                 }
 
@@ -374,12 +208,7 @@ impl AgentRuntime {
                 // `send_message` again, producing duplicate messages and a
                 // cascade of RunTrigger events (#407 Bug 1).
                 if should_terminate_after_dm_send(&tool_calls, is_dm, dm_check.conflict) {
-                    info!("DM run: send_message delivered — ending loop (one reply per DM run)");
-                    // Return the last text content (if any) alongside the
-                    // accumulated usage.  In most DM runs the LLM returns
-                    // tool calls only (no text), so `content` is typically
-                    // None/empty here; the actual message is delivered via
-                    // the `send_message` tool execution.
+                    info!("DM run: send_message delivered -- ending loop (one reply per DM run)");
                     let text = content.unwrap_or_default();
                     return (tool_call_records, Ok((text, total_usage)));
                 }
@@ -390,7 +219,7 @@ impl AgentRuntime {
                 // guidance on top.
                 //
                 // For DM sessions, re-inject the DM recipient addendum so the
-                // agent remembers to use `send_message` on every iteration —
+                // agent remembers to use `send_message` on every iteration --
                 // not just the first one (fixes #346).
                 self.rebuild_system_prompt_for_tool_loop(&mut messages, include_user, dm_peer);
 
@@ -402,7 +231,7 @@ impl AgentRuntime {
             // When a DM-triggered run ends with a text-only response and
             // neither `send_message` nor `ignore_message` was called during
             // the entire run, the agent's response will be silently dropped
-            // (by design — DM responses must go through `send_message`).
+            // (by design -- DM responses must go through `send_message`).
             //
             // Instead of accepting this silently, re-invoke the LLM with an
             // error message so it gets one more chance to use the correct
@@ -416,7 +245,7 @@ impl AgentRuntime {
                 warn!(
                     agent_id = %self.agent_id.0,
                     retry = dm_text_only_retries,
-                    "DM run ended with text-only response — retrying with error prompt"
+                    "DM run ended with text-only response -- retrying with error prompt"
                 );
 
                 // Emit a warning event so the operator/UI is aware.
@@ -424,7 +253,7 @@ impl AgentRuntime {
                     let _ = tx.send(crate::events::RuntimeEvent::Warning {
                         code: "DM_TEXT_ONLY_RETRY".to_string(),
                         message: "Agent responded with text only in a DM session. \
-                                  Text responses are not delivered — retrying with \
+                                  Text responses are not delivered -- retrying with \
                                   instructions to use send_message or ignore_message."
                             .to_string(),
                         source_agent: None,
@@ -464,7 +293,7 @@ impl AgentRuntime {
                 warn!(
                     agent_id = %self.agent_id.0,
                     retries = dm_text_only_retries,
-                    "DM text-only retry exhausted — response will be dropped"
+                    "DM text-only retry exhausted -- response will be dropped"
                 );
                 if let Some(ref tx) = self.event_sender {
                     let _ = tx.send(crate::events::RuntimeEvent::Warning {
@@ -481,6 +310,268 @@ impl AgentRuntime {
                 tool_call_records,
                 Ok((content.unwrap_or_default(), total_usage)),
             );
+        }
+    }
+
+    /// Call the LLM (streaming with buffered fallback), respecting cancellation.
+    ///
+    /// Emits `PHASE_CALLING_LLM` status, attempts streaming first, falls back
+    /// to buffered mode on streaming failure. Returns the same triple as
+    /// `stream_llm_call`: (content, tool_calls, usage).
+    async fn call_llm_with_cancellation(
+        &self,
+        request: CompletionRequest,
+    ) -> AlmsResult<(Option<String>, Option<Vec<ToolCall>>, Option<Usage>)> {
+        self.emit_status(PHASE_CALLING_LLM, None);
+
+        // Try streaming first.
+        let stream_result = if let Some(ref token) = self.cancel_token {
+            tokio::select! {
+                result = self.stream_llm_call(request.clone()) => result,
+                _ = token.cancelled() => return Err(AlmsError::Cancelled),
+            }
+        } else {
+            self.stream_llm_call(request.clone()).await
+        };
+
+        match stream_result {
+            Ok(result) => Ok(result),
+            Err(e) => {
+                warn!("Streaming failed, falling back to buffered: {}", e);
+                let response = if let Some(ref token) = self.cancel_token {
+                    tokio::select! {
+                        result = self.llm.complete(request) => result?,
+                        _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                    }
+                } else {
+                    self.llm.complete(request).await?
+                };
+                let usage = response.usage.clone();
+                let choice = response.choices.into_iter().next().ok_or_else(|| {
+                    AlmsError::Runtime("LLM returned empty choices array".to_string())
+                })?;
+                Ok((choice.message.content, choice.message.tool_calls, usage))
+            }
+        }
+    }
+
+    /// Execute tool calls with posture-aware concurrency and cancellation.
+    ///
+    /// - **Guarded**: runs tools sequentially so the user sees one approval
+    ///   prompt at a time. Cancellation is checked between each tool.
+    /// - **FullControl / Autonomous**: runs non-conflicting tools concurrently
+    ///   via `join_all`. Cancellation races against the entire batch.
+    ///
+    /// Conflicting tools (from DM conflict detection) receive error results
+    /// instead of executing.
+    ///
+    /// Returns `Err(AlmsError::Cancelled)` if the run is cancelled during
+    /// execution; otherwise returns the result vector in tool_calls order.
+    async fn run_tool_calls(
+        &self,
+        tool_calls: &[ToolCall],
+        conflicting_tools: &[&str],
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+    ) -> AlmsResult<Vec<AlmsResult<serde_json::Value>>> {
+        match self.config.posture {
+            Posture::Guarded => {
+                // Sequential execution: cancellation checked between each tool.
+                // Note: cancellation during active tool execution (post-approval)
+                // is not detected until the tool completes, which is acceptable
+                // since guarded tools block on approval (which IS cancellation-aware).
+                let mut results = Vec::with_capacity(tool_calls.len());
+                for tc in tool_calls {
+                    if conflicting_tools.contains(&tc.function.name.as_str()) {
+                        results.push(Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string())));
+                        continue;
+                    }
+                    if let Some(ref token) = self.cancel_token
+                        && token.is_cancelled()
+                    {
+                        return Err(AlmsError::Cancelled);
+                    }
+                    results.push(
+                        self.execute_tool_call(tc, session_manager, session_id)
+                            .await,
+                    );
+                }
+                Ok(results)
+            }
+            Posture::FullControl | Posture::Autonomous => {
+                // Indices of non-conflicting tools to execute.
+                let exec_indices: Vec<usize> = tool_calls
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, tc)| !conflicting_tools.contains(&tc.function.name.as_str()))
+                    .map(|(i, _)| i)
+                    .collect();
+
+                // Execute non-conflicting tools concurrently.
+                let exec_results = if exec_indices.is_empty() {
+                    Vec::new()
+                } else {
+                    let exec_futures = exec_indices.iter().map(|&i| {
+                        self.execute_tool_call(&tool_calls[i], session_manager, session_id)
+                    });
+                    if let Some(ref token) = self.cancel_token {
+                        tokio::select! {
+                            r = futures::future::join_all(exec_futures) => r,
+                            _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                        }
+                    } else {
+                        futures::future::join_all(exec_futures).await
+                    }
+                };
+
+                // Assemble final results: conflict errors for conflicting
+                // tools, execution results for the rest. The exec_iter
+                // produces exactly `exec_indices.len()` items (one per
+                // non-conflicting tool), which is consumed in order.
+                let mut exec_iter = exec_results.into_iter();
+                let non_conflicting_count = exec_indices.len();
+                let results: Vec<_> = tool_calls
+                    .iter()
+                    .map(|tc| {
+                        if conflicting_tools.contains(&tc.function.name.as_str()) {
+                            Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string()))
+                        } else {
+                            exec_iter.next().unwrap_or_else(|| {
+                                // This branch is structurally unreachable: exec_results
+                                // has exactly one entry per non-conflicting tool, and we
+                                // consume them in the same order. If this fires, the
+                                // conflict-filter / exec logic has diverged.
+                                debug_assert!(
+                                    false,
+                                    "exec_iter exhausted prematurely: expected {} results \
+                                     for non-conflicting tools but ran out",
+                                    non_conflicting_count,
+                                );
+                                Err(AlmsError::Runtime(
+                                    "BUG: exec_iter exhausted — conflicting_tools filter \
+                                     diverged from exec_indices"
+                                        .into(),
+                                ))
+                            })
+                        }
+                    })
+                    .collect();
+                Ok(results)
+            }
+        }
+    }
+
+    /// Persist assistant text content and tool call entries to session history.
+    ///
+    /// This is intentionally fire-and-forget: persistence failures are logged
+    /// as warnings but do not abort the run. The in-memory `messages` vec is
+    /// the authoritative state for the current run; session persistence is a
+    /// best-effort durability layer so that conversation history survives
+    /// across runs. If this becomes a reliability concern, these warnings
+    /// should be monitored and potentially escalated.
+    fn persist_assistant_tool_calls(
+        &self,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        content: Option<&str>,
+        tool_calls: &[ToolCall],
+    ) {
+        // Persist assistant text content (if any) before tool calls.
+        if let Some(text) = content
+            && !text.is_empty()
+            && let Err(e) = session_manager.append_message(
+                session_id,
+                SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: SessionRole::Assistant,
+                    content: SessionContent::Text(text.to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: None,
+                },
+            )
+        {
+            warn!("Failed to persist assistant text to session: {}", e);
+        }
+
+        // Persist tool calls to session history.
+        for tc in tool_calls {
+            if let Err(e) = session_manager.append_message(
+                session_id,
+                SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role: SessionRole::Assistant,
+                    content: SessionContent::ToolCall {
+                        name: tc.function.name.clone(),
+                        params: serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| {
+                            serde_json::Value::String(tc.function.arguments.clone())
+                        }),
+                    },
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata: Some(serde_json::json!({ "tool_call_id": tc.id })),
+                },
+            ) {
+                warn!("Failed to persist tool call to session: {}", e);
+            }
+        }
+    }
+
+    /// Process tool execution results: push tool result messages into the
+    /// conversation, persist to session (non-DM), and collect per-run records.
+    #[allow(clippy::too_many_arguments)] // Private helper; the parameters are clear and grouping them into a struct would add indirection without real benefit.
+    fn process_tool_results(
+        &self,
+        tool_calls: &[ToolCall],
+        results: Vec<AlmsResult<serde_json::Value>>,
+        messages: &mut Vec<LlmMessage>,
+        tool_call_records: &mut Vec<alms_core::ToolCallRecord>,
+        tool_seq: &mut u32,
+        session_manager: &SessionManager,
+        session_id: alms_core::SessionId,
+        is_dm: bool,
+    ) {
+        for (tool_call, result) in tool_calls.iter().zip(results) {
+            let (content, ok) = match result {
+                Ok(value) => {
+                    let ok = tool_result_ok(&value);
+                    (value.to_string(), ok)
+                }
+                Err(e) => (format!("Error: {}", e), false),
+            };
+            messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
+
+            // Persist tool result to session history (skip for DM sessions).
+            // Intentionally fire-and-forget -- see persist_assistant_tool_calls
+            // for the rationale.
+            if !is_dm
+                && let Err(e) = session_manager.append_message(
+                    session_id,
+                    SessionMessage {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        role: SessionRole::Tool,
+                        content: SessionContent::ToolResult {
+                            tool_id: tool_call.id.clone(),
+                            result: serde_json::from_str(&content)
+                                .unwrap_or(serde_json::Value::String(content.clone())),
+                        },
+                        timestamp: alms_core::Timestamp::now(),
+                        metadata: Some(serde_json::json!({ "ok": ok })),
+                    },
+                )
+            {
+                warn!("Failed to persist tool result to session: {}", e);
+            }
+
+            // Collect tool result record for per-run storage (all sessions).
+            tool_call_records.push(alms_core::ToolCallRecord {
+                seq: *tool_seq,
+                role: alms_core::ToolCallRole::Tool,
+                tool_name: Some(tool_call.function.name.clone()),
+                tool_id: Some(tool_call.id.clone()),
+                params: None,
+                result: Some(content.clone()),
+                timestamp: chrono::Utc::now(),
+            });
+            *tool_seq += 1;
         }
     }
 
@@ -731,12 +822,7 @@ impl AgentRuntime {
                         timestamp: alms_core::Timestamp::now(),
                     },
                 );
-                // shell_exec returns Ok even for non-zero exit codes;
-                // surface the exit code so the UI shows failure (red X).
-                let ok = value
-                    .get("exit_code")
-                    .and_then(|v| v.as_i64())
-                    .is_none_or(|code| code == 0);
+                let ok = tool_result_ok(value);
 
                 if let Some(ref sender) = self.event_sender {
                     let _ = sender.send(RuntimeEvent::ToolEnd {
