@@ -19,16 +19,10 @@
 use crate::llm_client::LlmClient;
 use crate::llm_types::{CompletionRequest, LlmMessage};
 use alms_core::config::RunSummaryMode;
-use alms_core::source_label::truncate_to_char_boundary;
+use alms_core::source_label::{derive_source_label, truncate_to_char_boundary};
 use alms_core::{AgentId, RunId, SessionId};
 use alms_session::SessionManager;
 use tracing::{debug, error, info, instrument, warn};
-
-// Re-export from alms-core so existing callers that import from
-// `alms_runtime::episodic` continue to compile during migration.
-// TODO: remove these re-exports once all callers have been updated.
-#[doc(hidden)]
-pub use alms_core::source_label::{SourceLabel, derive_source_label};
 
 /// Maximum byte length for the heuristic input snippet.
 ///

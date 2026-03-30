@@ -151,7 +151,7 @@ The episodic token budget (`run_summary_budget`, default: 2000) is hard-capped a
 
 Isolated tool execution used by every agent regardless of hierarchy level.
 
-**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list`, `workspace_write`, `invoke_agent`, `get_task_result`, `read_subagent_session`, `send_message`, `list_agents`, `read_messages`, `ignore_message`, `list_my_sessions`, `read_session`
+**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list` (in alms-sandbox), `workspace_write` (in alms-runtime), `invoke_agent`, `get_task_result`, `read_subagent_session`, `send_message`, `list_agents`, `read_messages`, `ignore_message`, `list_my_sessions`, `read_session` (in alms-tools)
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 
@@ -266,6 +266,14 @@ crates/
   alms-core/          # Shared types, errors, unified config
   alms-coordinator/   # Subagent lifecycle management (hierarchy root)
   alms-runtime/       # Agent loop (shared by all levels of hierarchy)
+                      #   agent/ — AgentRuntime, loop, context building, DM helpers
+                      #   context.rs — ContextBuilder (token-budgeted context window)
+                      #   workspace.rs — AgentWorkspace (personality/goals/memories/user files)
+                      #   workspace_tool.rs — WorkspaceWriteTool (stays here, depends on AgentWorkspace)
+  alms-tools/         # Tool implementations extracted from alms-runtime
+                      #   9 agent tools (send_message, invoke_agent, read_session, etc.)
+                      #   SubagentDispatcher, MessageSender traits
+                      #   EventForwarder trait for type-erased runtime event forwarding
   alms-session/       # Session state, SQLite persistence
   alms-sandbox/       # Tool execution, WASM sandbox, builtin tools
   alms-channel/       # User-facing adapters (Telegram, web)
@@ -273,19 +281,27 @@ crates/
   alms-cli/           # CLI entrypoint
 ```
 
-### Dependency graph (no cycles)
+### Dependency graph (no cycles, 9 crates)
 
 ```
-alms-cli → alms-gateway → alms-runtime  → alms-core
-                        → alms-channel  → alms-core
-                        → alms-session  → alms-core
-           alms-runtime → alms-sandbox  → alms-core
+alms-cli → alms-gateway → alms-runtime      → alms-core
+                        → alms-tools        → alms-core
+                                            → alms-session
+                                            → alms-sandbox
+                        → alms-coordinator  → alms-core
+                                            → alms-session
+                                            → alms-runtime
+                                            → alms-tools
+                        → alms-channel      → alms-core
+                        → alms-session      → alms-core
+           alms-runtime → alms-sandbox      → alms-core
                         → alms-session
-     alms-coordinator   → alms-core
-                        → alms-session
+         → alms-session
 ```
+
+The `EventForwarder` trait in `alms-tools` enables type-erased event forwarding from subagent runs back to the gateway's SSE stream, without introducing a dependency from alms-tools to alms-runtime.
 
 ---
 
-*Architecture Date: 2026-03-28*
+*Architecture Date: 2026-03-30*
 *Topology: Hierarchy (invoke_agent) + Peer DM (send_message via MessageBus)*

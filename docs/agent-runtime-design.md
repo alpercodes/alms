@@ -84,7 +84,7 @@ OpenClaw tells the agent to "summarize your session" — this fails because:
 - It's non-deterministic (different quality each time)
 - The user sees degraded responses and doesn't know why
 
-ALMS currently hardcodes `take(50)` messages in `agent.rs:158`. No compression, no awareness of token budget.
+ALMS originally hardcoded `take(50)` messages in the agent loop. No compression, no awareness of token budget. (This has since been replaced by the `ContextBuilder` in `context.rs`.)
 
 ### Design
 
@@ -146,7 +146,7 @@ ALMS currently hardcodes `take(50)` messages in `agent.rs:158`. No compression, 
    - `compression_ratio`: `full_history_tokens / context_tokens_sent`
 
 **Where it plugs in:**
-- Replace `build_messages` in `agent.rs` with `ContextBuilder::build(session, config, input)`
+- Context assembly lives in `agent/context.rs` (uses `ContextBuilder::build()`)
 - ContextBuilder is configured from `[context]` in `alms.toml`
 - Summary updates happen after each run completes (background task, not blocking)
 
@@ -342,4 +342,4 @@ ContextBuilder (per run)
 
 ---
 
-*Design by Atlas (2026-02-14). Episodic memory section added 2026-03-28. Implements requirements from `docs/agent-ux-requirements.md`.*
+*Design by Atlas (2026-02-14). Episodic memory section added 2026-03-28. Updated 2026-03-30: tool implementations extracted to `alms-tools` crate, agent.rs split into `agent/` module directory. Implements requirements from `docs/agent-ux-requirements.md`.*

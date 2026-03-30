@@ -27,10 +27,20 @@ crates/
                      #   config.rs — unified AlmsConfig (layered: defaults → TOML → env vars)
                      #   registry.rs — AgentRecord, CreateAgentRequest, validate_agent_name
   alms-gateway/      # Axum HTTP server, SSE streaming, run lifecycle, event log
-  alms-runtime/      # Agent loop, LLM client (OpenAI-compat), tool execution, audit
+  alms-runtime/      # Agent loop, LLM client, tool registry, context builder, workspace
+                     #   agent/mod.rs — AgentRuntime struct, public API, run orchestration
+                     #   agent/loop_impl.rs — agent_loop(), stream_llm_call(), execute_tool_call()
+                     #   agent/context.rs — build_context(), episodic summaries, summarization
+                     #   agent/dm.rs — DM-specific helpers, conflict detection
+                     #   agent/types.rs — Posture, AgentConfig, SystemPrompts, RunOutput
                      #   context.rs — ContextBuilder (token-budgeted context window)
                      #   workspace.rs — AgentWorkspace (personality/goals/memories/user files)
                      #   episodic.rs — Cross-session episodic memory (summary generation + formatting)
+                     #   workspace_tool.rs — WorkspaceWriteTool (exception: stays in runtime)
+  alms-tools/        # Tool implementations extracted from alms-runtime
+                     #   9 agent tools (send_message, invoke_agent, read_session, etc.)
+                     #   SubagentDispatcher, MessageSender traits
+                     #   EventForwarder trait for type-erased runtime event forwarding
   alms-coordinator/  # Multi-agent orchestration — pure hierarchy, real AgentRuntime loops
   alms-session/      # Session store, JSON snapshot persistence (atomic + rotation + checksums)
                      #   sqlite/session_summaries.rs — per-session episodic summary persistence
@@ -45,18 +55,22 @@ _quarantine/         # Archived/superseded docs
 research/            # Competitive analysis and tech-stack decisions
 ```
 
-### Dependency graph (no cycles)
+### Dependency graph (no cycles, 9 crates)
 
 ```
-alms-cli → alms-gateway → alms-runtime    → alms-core
-         → alms-session → alms-core
-                        → alms-coordinator → alms-core
-                                           → alms-session
-                                           → alms-runtime
-                        → alms-channel    → alms-core
-                        → alms-session    → alms-core
-           alms-runtime → alms-sandbox    → alms-core
+alms-cli → alms-gateway → alms-runtime      → alms-core
+                        → alms-tools        → alms-core
+                                            → alms-session
+                                            → alms-sandbox
+                        → alms-coordinator  → alms-core
+                                            → alms-session
+                                            → alms-runtime
+                                            → alms-tools
+                        → alms-channel      → alms-core
+                        → alms-session      → alms-core
+           alms-runtime → alms-sandbox      → alms-core
                         → alms-session
+         → alms-session
 ```
 
 ## Code Conventions
@@ -97,7 +111,7 @@ The agent runtime (`alms-runtime`) has three key subsystems:
    - `needs_bootstrap()` detects first-time agents (no `personality.md`)
    - `alms agent create` initializes empty workspace files; `init_workspace_files()` in `alms-core` is idempotent
 
-3. **ToolRegistry** (`tools.rs`): Tools expose JSON Schema parameters via `fn parameters() -> Value`. Definitions serialize to OpenAI format: `{"type": "function", "function": {"name", "description", "parameters"}}`.
+3. **ToolRegistry** (`tools.rs` in alms-runtime, tool implementations in `alms-tools`): Tools expose JSON Schema parameters via `fn parameters() -> Value`. Definitions serialize to OpenAI format: `{"type": "function", "function": {"name", "description", "parameters"}}`. The registry wrapper lives in alms-runtime; the `Tool` trait is defined in alms-sandbox (`src/lib.rs`). The 9 agent-to-agent tool implementations (send_message, invoke_agent, read_session, etc.) and supporting traits (`SubagentDispatcher`, `MessageSender`, `EventForwarder`) live in the `alms-tools` crate. Exception: `workspace_write` stays in alms-runtime because it depends on `AgentWorkspace`.
 
 4. **Episodic Memory** (`episodic.rs`): Cross-session awareness via run summaries. After each successful run, a per-session summary is generated (mode: `off`|`heuristic`|`llm`, controlled by `run_summary_mode`). Summaries are stored in the `session_summaries` SQLite table and injected into the context window of subsequent runs as a system message between the main system prompt and session history. Context assembly order: `[system_prompt, (episodic summaries?), (rolling summary if sliding-summary), recent_messages, current_input]`. The episodic token budget (`run_summary_budget`, default 2000) is hard-capped at 15% of `max_input_tokens` and is subtracted from the total budget so it does not starve the current conversation. Agents can also recall their own sessions on demand via `list_my_sessions` and `read_session` tools.
 

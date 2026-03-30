@@ -9,12 +9,12 @@ files (`personality.md`, `goals.md`, `memories.md`, `user.md`).
 
 | File | Purpose | Used By |
 |------|---------|---------|
-| `initial.md` | Base system prompt for all top-level agents. Sets the agent's default behavior and mentions the `alms --help` CLI discovery hint. | `AgentConfig::default()` in `crates/alms-runtime/src/agent.rs` |
-| `tool_loop.md` | Continuation prompt appended to the system message after tool results. Tells the LLM to analyze results and decide whether to use more tools or respond. | `SystemPrompts::default()` in `crates/alms-runtime/src/agent.rs` |
+| `initial.md` | Base system prompt for all top-level agents. Sets the agent's default behavior and mentions the `alms --help` CLI discovery hint. | `AgentConfig::default()` in `crates/alms-runtime/src/agent/types.rs` |
+| `tool_loop.md` | Continuation prompt appended to the system message after tool results. Tells the LLM to analyze results and decide whether to use more tools or respond. | `SystemPrompts::default()` in `crates/alms-runtime/src/agent/types.rs` |
 | `bootstrap.md` | First-time agent onboarding prompt. Replaces the initial prompt when `personality.md` does not exist. Guides the agent through an interview to populate workspace files. | `AgentWorkspace::bootstrap_prompt()` in `crates/alms-runtime/src/workspace.rs` |
-| `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context()` in `crates/alms-runtime/src/agent.rs` |
+| `dm_recipient.md` | Template appended to the system prompt when the agent receives a direct message. Contains a `{peer}` placeholder replaced at runtime with the sender's name. | `build_context()` in `crates/alms-runtime/src/agent/context.rs` |
 | `subagent.md` | Default system prompt for ephemeral (unnamed) subagents spawned via `invoke_agent`. | `DEFAULT_SUBAGENT_PROMPT` constant in `crates/alms-coordinator/src/lib.rs` |
-| `summarizer.md` | System prompt for the sliding-summary LLM call that compresses old conversation history into a rolling summary. | `maybe_summarize()` in `crates/alms-runtime/src/agent.rs` |
+| `summarizer.md` | System prompt for the sliding-summary LLM call that compresses old conversation history into a rolling summary. | `maybe_summarize()` in `crates/alms-runtime/src/agent/context.rs` |
 | `session_summarizer.md` | System prompt for the episodic memory LLM call that generates cross-session summaries after each run. Focus on *what was accomplished*, not how. 1-3 sentences, past tense. | `generate_llm()` in `crates/alms-runtime/src/episodic.rs` |
 
 ## When Each Prompt Is Used
@@ -47,7 +47,7 @@ message is updated before the next LLM call. The tool loop prompt is appended to
 initial prompt (not replacing it), so the agent retains its identity while getting
 continuation guidance.
 
-**Code path**: `agent_loop()` in `agent.rs` -- after processing tool results, the
+**Code path**: `agent_loop()` in `agent/loop_impl.rs` -- after processing tool results, the
 system message at `messages[0]` is rebuilt as:
 ```
 assemble_system_prompt(initial_prompt + "\n\n" + tool_loop_prompt)
@@ -59,9 +59,9 @@ When the context ID starts with `"dm:"`, the `build_context()` method extracts t
 peer agent's name and appends the DM addendum to the system prompt. The `{peer}`
 placeholder in the template is replaced with the actual peer name.
 
-**Code path**: `build_context()` in `agent.rs` -- after assembling the base system
+**Code path**: `build_context()` in `agent/context.rs` -- after assembling the base system
 prompt with workspace prefix, if the context is a DM session. Additionally,
-`agent_loop()` re-injects the addendum via the `dm_addendum()` helper on every
+`agent_loop()` in `agent/loop_impl.rs` re-injects the addendum via the `dm_addendum()` helper on every
 tool-loop system prompt rebuild, so the agent retains DM awareness across
 tool-call iterations (see #346).
 
@@ -79,7 +79,7 @@ When the context strategy is `"sliding-summary"` and enough new messages have
 accumulated past the summary interval, the `maybe_summarize()` method calls the LLM
 with the summarizer prompt to compress old messages into a rolling summary.
 
-**Code path**: `maybe_summarize()` in `agent.rs` -- builds a separate LLM request
+**Code path**: `maybe_summarize()` in `agent/context.rs` -- builds a separate LLM request
 with the summarizer system prompt and a user message containing the transcript.
 
 ### `session_summarizer.md` -- Episodic Memory Summaries
