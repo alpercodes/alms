@@ -127,6 +127,7 @@ CREATE TABLE IF NOT EXISTS runs (
     prompt_tokens     INTEGER,
     completion_tokens INTEGER,
     job_id            TEXT,
+    parent_run_id     TEXT,
     created_at        TEXT NOT NULL
 );
 
@@ -235,6 +236,8 @@ impl SqliteStore {
         );
         // Auto-migrate: add source_label column to session_summaries (existing DBs).
         let _ = conn.execute_batch("ALTER TABLE session_summaries ADD COLUMN source_label TEXT;");
+        // Auto-migrate: add parent_run_id column to runs for subagent run visibility.
+        let _ = conn.execute_batch("ALTER TABLE runs ADD COLUMN parent_run_id TEXT;");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -454,7 +457,8 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let prompt_tokens: Option<i64> = row.get(9)?;
     let completion_tokens: Option<i64> = row.get(10)?;
     let job_id_str: Option<String> = row.get(11)?;
-    let created_at_str: String = row.get(12)?;
+    let parent_run_id_str: Option<String> = row.get(12)?;
+    let created_at_str: String = row.get(13)?;
 
     let run_id_uuid = uuid::Uuid::parse_str(&run_id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -467,7 +471,7 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     })?;
     let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(12, rusqlite::types::Type::Text, Box::new(e))
+            rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(e))
         })?
         .with_timezone(&chrono::Utc);
     let started_at = started_at_str
@@ -498,6 +502,9 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let job_id = job_id_str
         .and_then(|s| uuid::Uuid::parse_str(&s).ok())
         .map(alms_core::job::JobId);
+    let parent_run_id = parent_run_id_str
+        .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+        .map(RunId);
 
     Ok(Run {
         run_id: RunId(run_id_uuid),
@@ -512,5 +519,6 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         started_at,
         ended_at,
         job_id,
+        parent_run_id,
     })
 }

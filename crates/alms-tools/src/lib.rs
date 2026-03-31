@@ -12,7 +12,6 @@
 //! Tools are registered on an `AgentRuntime` by the gateway (`alms-gateway`).
 
 pub mod event_forwarder;
-pub mod get_task_result;
 pub mod ignore_message;
 pub mod invoke_agent;
 pub mod list_agents;
@@ -25,7 +24,6 @@ pub mod send_message;
 pub mod subagent;
 
 // Re-export tool structs for ergonomic imports.
-pub use get_task_result::GetTaskResultTool;
 pub use ignore_message::IgnoreMessageTool;
 pub use invoke_agent::InvokeAgentTool;
 pub use list_agents::ListAgentsTool;
@@ -38,4 +36,4 @@ pub use send_message::SendMessageTool;
 // Re-export traits and supporting types.
 pub use event_forwarder::EventForwarder;
 pub use message_sender::{ConversationEndReason, DeliveryReceipt, MessageSender, SendError};
-pub use subagent::{PollResult, SubagentDispatcher};
+pub use subagent::SubagentDispatcher;

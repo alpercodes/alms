@@ -72,9 +72,7 @@ Manages the lifecycle of subagent tasks spawned by a parent agent.
 - Spawn a subagent `AgentRuntime` for each request
 - Return the subagent's final response to the caller as a `TaskResult`
 - Cancel subagents when the parent run is cancelled
-- Expose active tasks via `GET /tasks` and `GET /tasks/{id}`
-
-**Current state:** Fully implemented. `invoke_agent` and `get_task_result` tools wired to real `AgentRuntime` loops. Supports foreground (blocking) and background (non-blocking with poll) modes. Named subagents with persistent sessions via UUID v5 deterministic identity.
+**Current state:** Fully implemented. `invoke_agent` tool wired to real `AgentRuntime` loops. Supports foreground (blocking) and background (non-blocking with auto-notification) modes. Named subagents with persistent sessions via UUID v5 deterministic identity. Subagent runs are registered as proper runs visible in `GET /runs`.
 
 ```
 [Parent AgentRuntime]
@@ -151,7 +149,7 @@ The episodic token budget (`run_summary_budget`, default: 2000) is hard-capped a
 
 Isolated tool execution used by every agent regardless of hierarchy level.
 
-**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list` (in alms-sandbox), `workspace_write` (in alms-runtime), `invoke_agent`, `get_task_result`, `read_subagent_session`, `send_message`, `list_agents`, `read_messages`, `ignore_message`, `list_my_sessions`, `read_session` (in alms-tools)
+**Built-in tools:** `echo`, `math`, `http_get`, `shell_exec`, `fs_read`, `fs_write`, `fs_list` (in alms-sandbox), `workspace_write` (in alms-runtime), `invoke_agent`, `read_subagent_session`, `send_message`, `list_agents`, `read_messages`, `ignore_message`, `list_my_sessions`, `read_session` (in alms-tools)
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 
@@ -239,7 +237,7 @@ Token cost is a first-class constraint:
 ### Completed ✅
 - Core types, session manager, agent runtime, WASM sandbox
 - HTTP gateway with SSE streaming, approval workflow, audit log
-- Built-in tools: echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, get_task_result, read_subagent_session, send_message, list_agents, read_messages, ignore_message, list_my_sessions, read_session
+- Built-in tools: echo, math, http_get, shell_exec, fs_read, fs_write, fs_list, workspace_write, invoke_agent, read_subagent_session, send_message, list_agents, read_messages, ignore_message, list_my_sessions, read_session
 - Cron/scheduler, SQLite persistence, web UI with agent selector
 - Coordinator with real AgentRuntime loops, foreground + background subagents
 - `invoke_agent` tool with `name` param for persistent subagent sessions (UUID v5 deterministic identity)

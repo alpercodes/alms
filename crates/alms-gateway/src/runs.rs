@@ -722,14 +722,13 @@ async fn execute_run(state: AppState, params: RunParams) {
         runtime = runtime.with_workspace(workspace);
     }
 
-    // Register invoke_agent + get_task_result tools.
+    // Register invoke_agent tool.
     // Subagent events are forwarded into this run's SSE stream.
     // The cancel_token is passed to InvokeAgentTool so that cancelling the
     // parent run propagates to all subagents spawned during this run.
     {
         let dispatcher: std::sync::Arc<dyn alms_tools::SubagentDispatcher> =
             state.coordinator.clone();
-        let get_task_tool = alms_tools::GetTaskResultTool::new(dispatcher.clone());
         // Separate channel for background subagent events -> session stream.
         // This is independent of the parent's runtime_tx, so it doesn't
         // block the parent run from finishing.
@@ -799,7 +798,6 @@ async fn execute_run(state: AppState, params: RunParams) {
         let read_session_tool =
             alms_tools::ReadSubagentSessionTool::new(state.session_manager.clone(), session_id);
         runtime.tools().register(std::sync::Arc::new(invoke_tool));
-        runtime.tools().register(std::sync::Arc::new(get_task_tool));
         runtime
             .tools()
             .register(std::sync::Arc::new(read_session_tool));
@@ -1724,10 +1722,7 @@ fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> S
         ),
         None => (
             format!("(task {})", c.task_id.0),
-            format!(
-                "Use get_task_result(\"{}\") to retrieve the full result.",
-                c.task_id.0
-            ),
+            "The subagent result summary is included above.".to_string(),
         ),
     };
 

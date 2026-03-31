@@ -22,8 +22,9 @@ impl SqliteStore {
             .execute(
                 "INSERT OR REPLACE INTO runs \
                  (run_id, session_id, agent_id, input, response, error, status, \
-                  started_at, ended_at, prompt_tokens, completion_tokens, job_id, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
+                  parent_run_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     run.run_id.0.to_string(),
                     run.session_id.0.to_string(),
@@ -37,6 +38,7 @@ impl SqliteStore {
                     prompt_tokens,
                     completion_tokens,
                     run.job_id.map(|j| j.0.to_string()),
+                    run.parent_run_id.map(|r| r.0.to_string()),
                     run.created_at.to_rfc3339(),
                 ],
             )
@@ -49,7 +51,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT run_id, session_id, agent_id, input, response, error, status, \
-                    started_at, ended_at, prompt_tokens, completion_tokens, job_id, created_at \
+                    started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
+                    parent_run_id, created_at \
              FROM runs WHERE run_id = ?1",
             params![run_id.0.to_string()],
             parse_run_row,
@@ -71,7 +74,8 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT run_id, session_id, agent_id, input, response, error, status, \
-                        started_at, ended_at, prompt_tokens, completion_tokens, job_id, created_at \
+                        started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
+                        parent_run_id, created_at \
                  FROM runs WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_runs_by_session: {e}")))?;
@@ -109,7 +113,8 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT run_id, session_id, agent_id, input, response, error, status, \
-                        started_at, ended_at, prompt_tokens, completion_tokens, job_id, created_at \
+                        started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
+                        parent_run_id, created_at \
                  FROM runs WHERE created_at >= ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_all_runs: {e}")))?;
@@ -370,6 +375,37 @@ mod tests {
         let loaded = store.load_run(run.run_id).unwrap().unwrap();
         assert_eq!(loaded.job_id, Some(job_id));
         assert_eq!(loaded.input, "job prompt");
+    }
+
+    #[test]
+    fn test_run_with_parent_run_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let parent_run_id = RunId::new();
+        let run = Run::for_subagent(
+            session.id,
+            session.agent_id,
+            "subagent task".to_string(),
+            parent_run_id,
+        );
+
+        store.save_run(&run).unwrap();
+
+        let loaded = store.load_run(run.run_id).unwrap().unwrap();
+        assert_eq!(loaded.parent_run_id, Some(parent_run_id));
+        assert_eq!(loaded.input, "subagent task");
+    }
+
+    #[test]
+    fn test_run_without_parent_run_id() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let run = new_run(session.id, session.agent_id);
+
+        store.save_run(&run).unwrap();
+
+        let loaded = store.load_run(run.run_id).unwrap().unwrap();
+        assert_eq!(loaded.parent_run_id, None);
     }
 
     #[test]

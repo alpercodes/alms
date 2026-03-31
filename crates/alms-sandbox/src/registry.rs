@@ -244,7 +244,6 @@ impl ToolRegistry {
         // enabled_filter.
         const KNOWN_DYNAMIC_TOOLS: &[&str] = &[
             "invoke_agent",
-            "get_task_result",
             "read_subagent_session",
             "send_message",
             "workspace_write",

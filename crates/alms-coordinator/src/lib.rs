@@ -1,10 +1,10 @@
 pub mod message_bus;
 
-use alms_core::{AgentId, AlmsResult, RunId, SessionId};
+use alms_core::{AgentId, AlmsResult, Run, RunId, RunRegistrar, SessionId};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient, RunOutput};
 use alms_session::SessionManager;
 use alms_tools::event_forwarder::EventForwarder;
-use alms_tools::subagent::{PollResult, SubagentDispatcher};
+use alms_tools::subagent::SubagentDispatcher;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use std::time::Duration;
 
 /// How long (in seconds) a subagent is allowed to run before it times out,
 /// and also how long its result is kept in memory after completion so that
-/// background callers can poll via `get_task_result`.
+/// the completion notification system can process it.
 const SUBAGENT_TTL_SECS: u64 = 300;
 
 /// Max characters in a completion notification summary.
@@ -107,7 +107,7 @@ pub struct SubagentHandle {
     /// Receiver for the final TaskResult — taken by `dispatch()` to await completion.
     pub result_rx: Option<oneshot::Receiver<TaskResult>>,
     /// Stored result for background tasks — set by `run_subagent` on completion
-    /// so `poll_task` can retrieve it without consuming the oneshot receiver.
+    /// so the completion notification system can access the result.
     pub completed_result: Option<TaskResult>,
 }
 
@@ -146,6 +146,9 @@ pub struct Coordinator {
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
     /// Secrets store for API key resolution (per-agent provider overrides).
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
+    /// Optional run registrar — when set, subagent runs are registered as
+    /// proper runs so they appear in GET /runs, the UI sidebar, and the CLI.
+    run_registrar: Option<Arc<dyn RunRegistrar>>,
 }
 
 impl Coordinator {
@@ -162,6 +165,7 @@ impl Coordinator {
             subagent_prompts: Arc::new(DashMap::new()),
             completion_tx: None,
             secrets: None,
+            run_registrar: None,
         }
     }
 
@@ -184,6 +188,7 @@ impl Coordinator {
             subagent_prompts: Arc::new(DashMap::new()),
             completion_tx: None,
             secrets: None,
+            run_registrar: None,
         }
     }
 
@@ -207,6 +212,13 @@ impl Coordinator {
         secrets: Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>,
     ) -> Self {
         self.secrets = Some(secrets);
+        self
+    }
+
+    /// Set a run registrar so subagent runs are registered as proper runs
+    /// visible in GET /runs, the UI sidebar, and the CLI.
+    pub fn with_run_registrar(mut self, registrar: Arc<dyn RunRegistrar>) -> Self {
+        self.run_registrar = Some(registrar);
         self
     }
 
@@ -302,6 +314,7 @@ impl Coordinator {
         let subagent_prompts = self.subagent_prompts.clone();
         let completion_tx = self.completion_tx.clone();
         let secrets = self.secrets.clone();
+        let run_registrar = self.run_registrar.clone();
 
         let span = tracing::info_span!(
             "subagent::execute",
@@ -327,6 +340,7 @@ impl Coordinator {
                     completion_tx,
                     parent_cancel_token,
                     secrets,
+                    run_registrar,
                 )
                 .await;
             }
@@ -455,8 +469,9 @@ impl SubagentDispatcher for Coordinator {
             .spawn_subagent(request, parent_event_tx, true, parent_cancel_token)
             .await?;
 
-        // Drop the oneshot receiver — background callers poll via completed_result,
-        // not the channel. This frees the allocation; run_subagent's result_tx.send()
+        // Drop the oneshot receiver — the completion notification system reads
+        // the result from `completed_result` on the SubagentHandle, not from
+        // this channel. This frees the allocation; run_subagent's result_tx.send()
         // will silently fail (already uses `let _ = ...`), which is intentional.
         drop(self.take_result_rx(task_id));
 
@@ -465,38 +480,6 @@ impl SubagentDispatcher for Coordinator {
             "Background subagent spawned (non-blocking)"
         );
         Ok(task_id.0)
-    }
-
-    #[instrument(level = "debug", skip(self), fields(task_id = %task_id))]
-    async fn poll_task(&self, task_id: Uuid) -> alms_core::AlmsResult<PollResult> {
-        let tid = TaskId(task_id);
-        match self.get_status(tid) {
-            None => Err(alms_core::AlmsError::Runtime(format!(
-                "Task {task_id} not found (may have expired after {SUBAGENT_TTL_SECS}s)"
-            ))),
-            Some(TaskStatus::Pending | TaskStatus::Running) => Ok(PollResult::Running),
-            Some(done_status) => match self.get_completed_result(tid) {
-                None => Err(alms_core::AlmsError::Runtime(
-                    "Task finished but result unavailable".to_string(),
-                )),
-                Some(result) => Ok(match done_status {
-                    TaskStatus::Completed => PollResult::Completed(
-                        result.result["response"]
-                            .as_str()
-                            .unwrap_or("[no response]")
-                            .to_string(),
-                    ),
-                    TaskStatus::Failed => PollResult::Failed(
-                        result.result["error"]
-                            .as_str()
-                            .unwrap_or("subagent failed")
-                            .to_string(),
-                    ),
-                    TaskStatus::Cancelled => PollResult::Cancelled,
-                    _ => PollResult::Failed("unexpected terminal state".to_string()),
-                }),
-            },
-        }
     }
 }
 
@@ -541,6 +524,7 @@ async fn run_subagent(
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
     parent_cancel_token: Option<CancellationToken>,
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
+    run_registrar: Option<Arc<dyn RunRegistrar>>,
 ) {
     // RAII guard: removes the name from active_named on drop (including panics).
     let _named_guard = NamedSubagentGuard {
@@ -580,7 +564,32 @@ async fn run_subagent(
         }
     });
 
-    let (new_status, result_value, tokens_used) = tokio::select! {
+    // Derive the subagent's identity early so we can register the run
+    // *before* the tokio::select!.  This ensures the run record is always
+    // updated — even when timeout or cancellation wins the select and the
+    // run_agent_loop future is dropped.
+    let (sub_agent_id, sub_context_id) = derive_subagent_identity(task_id, &request);
+
+    // Register the subagent run with the RunRegistrar (if available) so it
+    // appears in GET /runs, the UI sidebar, and CLI `alms run list`.
+    let subagent_run = if let Some(ref registrar) = run_registrar {
+        let session = session_manager.get_or_create(sub_agent_id, &sub_context_id);
+        let mut run = if let Some(parent_rid) = request.parent_run_id {
+            Run::for_subagent(session.id, sub_agent_id, request.task.clone(), parent_rid)
+        } else {
+            Run::new(session.id, sub_agent_id, request.task.clone())
+        };
+        run.mark_running();
+        registrar.register_run(run.clone());
+        Some(run)
+    } else {
+        None
+    };
+
+    // The select returns the task status, a JSON result value (for the
+    // TaskResult / completion notification), and optionally the full
+    // RunOutput so we can record accurate token usage in the run record.
+    let (new_status, result_value, tokens_used, run_output) = tokio::select! {
         _ = tokio::time::sleep(request.timeout) => {
             warn!(
                 target: "subagent::timeout",
@@ -588,7 +597,7 @@ async fn run_subagent(
                 timeout_secs = %request.timeout.as_secs(),
                 "Subagent timed out"
             );
-            (TaskStatus::Failed, serde_json::json!({"error": "Timeout"}), None)
+            (TaskStatus::Failed, serde_json::json!({"error": "Timeout"}), None, None)
         }
         _ = child_cancel_token.cancelled() => {
             info!(
@@ -596,9 +605,9 @@ async fn run_subagent(
                 task_id = %task_id.0,
                 "Subagent cancelled"
             );
-            (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None)
+            (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None)
         }
-        output = run_agent_loop(task_id, &request, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref()) => {
+        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref()) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -613,6 +622,7 @@ async fn run_subagent(
                         TaskStatus::Completed,
                         serde_json::json!({"response": run_output.response}),
                         Some(tokens),
+                        Some(run_output),
                     )
                 }
                 Err(e) => {
@@ -626,6 +636,7 @@ async fn run_subagent(
                         TaskStatus::Failed,
                         serde_json::json!({"error": e.to_string()}),
                         None,
+                        None,
                     )
                 }
             }
@@ -636,6 +647,37 @@ async fn run_subagent(
     // on the oneshot). This is a no-op if the token was already cancelled.
     child_cancel_token.cancel();
     bridge_handle.abort();
+
+    // Update the run record with the outcome.  This executes regardless of
+    // which tokio::select! branch fired (normal completion, timeout, or
+    // cancellation), preventing orphaned "Running" records.
+    if let (Some(registrar), Some(mut run)) = (&run_registrar, subagent_run) {
+        match new_status {
+            TaskStatus::Completed => {
+                if let Some(ref output) = run_output {
+                    run.mark_completed(
+                        output.response.clone(),
+                        alms_core::TokenUsage {
+                            prompt_tokens: output.usage.prompt_tokens,
+                            completion_tokens: output.usage.completion_tokens,
+                        },
+                    );
+                }
+            }
+            TaskStatus::Failed => {
+                let error = result_value["error"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string();
+                run.mark_failed(error);
+            }
+            TaskStatus::Cancelled => {
+                run.mark_cancelled();
+            }
+            _ => {}
+        }
+        registrar.update_run(run);
+    }
 
     let task_result = TaskResult {
         task_id,
@@ -790,6 +832,20 @@ fn agent_config_for_subagent(
     (config, model, provider)
 }
 
+/// Derive the subagent's identity (agent_id, context_id) without building
+/// the full config.  Called by `run_subagent` *before* `tokio::select!` so
+/// that the run can be registered early and updated after timeout/cancel.
+fn derive_subagent_identity(task_id: TaskId, request: &SubagentRequest) -> (AgentId, String) {
+    if let Some(ref name) = request.subagent_name {
+        let parent_as_agent = AgentId(request.parent_session.0);
+        let stable_id = AgentId::deterministic(parent_as_agent, name);
+        let stable_ctx = format!("subagent_{}_{}", request.parent_session.0, name);
+        (stable_id, stable_ctx)
+    } else {
+        (AgentId::new(), format!("subagent_{}", task_id.0))
+    }
+}
+
 /// Run the actual agent loop for a subagent.
 ///
 /// Creates a fresh `AgentRuntime`, forwards its events to the parent's
@@ -803,10 +859,15 @@ fn agent_config_for_subagent(
 /// **Ephemeral subagents** (`subagent_name` is None): fresh agent ID,
 /// fresh session, default config, disposable workspace at
 /// `{workspace_dir}/.ephemeral/{task_id}/` for fs sandbox scoping.
+///
+/// Run registration/update is handled by the caller (`run_subagent`) to
+/// ensure the run record is always updated, even on timeout or cancellation.
 #[allow(clippy::too_many_arguments)]
 async fn run_agent_loop(
     task_id: TaskId,
     request: &SubagentRequest,
+    agent_id: AgentId,
+    context_id: &str,
     session_manager: &Arc<SessionManager>,
     llm: &LlmClient,
     parent_event_tx: Option<Arc<dyn EventForwarder>>,
@@ -817,72 +878,63 @@ async fn run_agent_loop(
     cancel_token: CancellationToken,
     secrets: Option<&Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
 ) -> AlmsResult<RunOutput> {
-    // Derive identity and config based on whether the subagent is named
-    let (agent_id, context_id, config, model_override, provider_override, attach_workspace) =
-        if let Some(ref name) = request.subagent_name {
-            // Named: deterministic identity, look up agent registry for config
-            let parent_as_agent = AgentId(request.parent_session.0);
-            let stable_id = AgentId::deterministic(parent_as_agent, name);
-            let stable_ctx = format!("subagent_{}_{}", request.parent_session.0, name);
-
-            // Look up agent record in registry for model/posture
-            let record_config = session_manager
-                .store()
-                .and_then(|store| store.load_agent_by_name(name).ok())
-                .flatten()
-                .map(|record| {
-                    debug!("Loaded agent record for named subagent '{name}'");
-                    SubagentRecordConfig {
-                        model: record.model,
-                        posture: record.posture,
-                        provider: record.provider,
-                    }
-                })
-                .or_else(|| {
-                    warn!(
-                        "Named subagent '{name}' not found in agent registry — using defaults. \
-                         Create it with: alms agent create --name {name}"
-                    );
-                    None
-                });
-
-            let (config, model, provider) =
-                agent_config_for_subagent(record_config, base_agent_config);
-
-            // Detect system_prompt drift: warn when the prompt changes between
-            // invocations of the same named subagent within the same parent session.
-            //
-            // Safety: concurrent invocations of the same named subagent are
-            // rejected by the active_named guard in spawn_subagent(), so this
-            // get-then-insert is not racy for a given stable_ctx.
-            if let Some(prev_prompt) = subagent_prompts.get(&stable_ctx)
-                && *prev_prompt != config.system_prompt
-            {
+    // Derive config based on whether the subagent is named (identity already resolved
+    // by the caller via `derive_subagent_identity`).
+    let (config, model_override, provider_override, attach_workspace) = if let Some(ref name) =
+        request.subagent_name
+    {
+        // Named: look up agent registry for config
+        let record_config = session_manager
+            .store()
+            .and_then(|store| store.load_agent_by_name(name).ok())
+            .flatten()
+            .map(|record| {
+                debug!("Loaded agent record for named subagent '{name}'");
+                SubagentRecordConfig {
+                    model: record.model,
+                    posture: record.posture,
+                    provider: record.provider,
+                }
+            })
+            .or_else(|| {
                 warn!(
-                    subagent_name = %name,
-                    context_id = %stable_ctx,
-                    "Named subagent '{name}' system_prompt has changed since the last \
-                     invocation. The existing session history was built under the \
-                     previous prompt — this may cause inconsistent behavior."
+                    "Named subagent '{name}' not found in agent registry — using defaults. \
+                         Create it with: alms agent create --name {name}"
                 );
-            }
-            subagent_prompts.insert(stable_ctx.clone(), config.system_prompt.clone());
+                None
+            });
 
-            (stable_id, stable_ctx, config, model, provider, true)
-        } else {
-            // Ephemeral: fresh each invocation.
-            // Still attach a workspace scoped to a temporary directory so that
-            // fs_read/fs_write/fs_list are narrowed (preventing project-root access).
-            let (config, _, _) = agent_config_for_subagent(None, base_agent_config);
-            (
-                AgentId::new(),
-                format!("subagent_{}", task_id.0),
-                config,
-                None,
-                None,
-                true, // attach an ephemeral workspace to restrict fs_* sandbox
-            )
-        };
+        let (config, model, provider) = agent_config_for_subagent(record_config, base_agent_config);
+
+        // Detect system_prompt drift: warn when the prompt changes between
+        // invocations of the same named subagent within the same parent session.
+        //
+        // Safety: concurrent invocations of the same named subagent are
+        // rejected by the active_named guard in spawn_subagent(), so this
+        // get-then-insert is not racy for a given stable_ctx.
+        if let Some(prev_prompt) = subagent_prompts.get(context_id)
+            && *prev_prompt != config.system_prompt
+        {
+            warn!(
+                subagent_name = %name,
+                context_id = %context_id,
+                "Named subagent '{name}' system_prompt has changed since the last \
+                 invocation. The existing session history was built under the \
+                 previous prompt — this may cause inconsistent behavior."
+            );
+        }
+        subagent_prompts.insert(context_id.to_owned(), config.system_prompt.clone());
+
+        (config, model, provider, true)
+    } else {
+        // Ephemeral: fresh each invocation.
+        // Still attach a workspace scoped to a temporary directory so that
+        // fs_read/fs_write/fs_list are narrowed (preventing project-root access).
+        let (config, _, _) = agent_config_for_subagent(None, base_agent_config);
+        (
+            config, None, None, true, // attach an ephemeral workspace to restrict fs_* sandbox
+        )
+    };
 
     // Create a per-subagent event channel
     let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
@@ -1016,7 +1068,7 @@ async fn run_agent_loop(
     }
 
     runtime
-        .run(session_manager, &context_id, &request.task)
+        .run(session_manager, context_id, &request.task)
         .await
 }
 
@@ -1065,10 +1117,10 @@ mod tests {
         );
     }
 
-    // -- (b) dispatch_background + poll_task lifecycle --------------------------
+    // -- (b) dispatch_background spawns successfully ----------------------------
 
     #[tokio::test]
-    async fn test_dispatch_background_lifecycle() {
+    async fn test_dispatch_background_spawns() {
         let coord = test_coordinator();
         let task_uuid = coord
             .dispatch_background(
@@ -1082,28 +1134,26 @@ mod tests {
             .await
             .expect("dispatch_background should succeed");
 
-        // The mock LLM completes almost instantly, but the task may still be
-        // running when we first poll.  Retry briefly.
-        let mut result = None;
+        // The returned UUID should be non-nil (a real task was created).
+        assert_ne!(task_uuid, uuid::Uuid::nil());
+
+        // Wait briefly for the mock LLM to complete — the task should
+        // eventually reach a terminal state in the DashMap.
+        let tid = TaskId(task_uuid);
+        let mut found_terminal = false;
         for _ in 0..50 {
-            match coord.poll_task(task_uuid).await {
-                Ok(PollResult::Running) => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Ok(other) => {
-                    result = Some(other);
+            match coord.get_status(tid) {
+                Some(TaskStatus::Completed) | Some(TaskStatus::Failed) => {
+                    found_terminal = true;
                     break;
                 }
-                Err(e) => panic!("poll_task error: {e}"),
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
             }
         }
-
-        match result {
-            Some(PollResult::Completed(text)) => {
-                assert!(text.contains("mock"), "Expected mock response, got: {text}");
-            }
-            other => panic!("Expected Completed, got: {other:?}"),
-        }
+        assert!(
+            found_terminal,
+            "Background subagent should reach terminal state"
+        );
     }
 
     // -- (d) cancel_subagent removes handle from DashMap -----------------------
@@ -1170,15 +1220,6 @@ mod tests {
             "Expected Failed or Completed, got: {:?}",
             task_result.status
         );
-    }
-
-    // -- (f) poll_task on unknown task_id → Err ---------------------------------
-
-    #[tokio::test]
-    async fn test_poll_unknown_task_returns_error() {
-        let coord = test_coordinator();
-        let result = coord.poll_task(Uuid::new_v4()).await;
-        assert!(result.is_err(), "polling unknown task should return Err");
     }
 
     // -- (g) list_active shows spawned subagents --------------------------------

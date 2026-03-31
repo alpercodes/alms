@@ -93,8 +93,8 @@ impl Tool for InvokeAgentTool {
                 "background": {
                     "type": "boolean",
                     "description": "When true, spawn the subagent in the background and return \
-                                    immediately with a task_id. Poll for the result with \
-                                    get_task_result(task_id). Default: false."
+                                    immediately. You will be automatically notified when the \
+                                    subagent completes. Default: false."
                 }
             },
             "required": ["task"]

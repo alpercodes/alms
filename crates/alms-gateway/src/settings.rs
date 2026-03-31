@@ -34,7 +34,6 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     tools.extend(
         [
             "invoke_agent",
-            "get_task_result",
             "read_subagent_session",
             "read_session",
             "send_message",

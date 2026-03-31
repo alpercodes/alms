@@ -118,6 +118,9 @@ pub struct Run {
     pub ended_at: Option<DateTime<Utc>>,
     /// Set when this run was triggered by a scheduled job.
     pub job_id: Option<JobId>,
+    /// Set when this run is a subagent execution spawned by another run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<RunId>,
 }
 
 impl Run {
@@ -135,6 +138,7 @@ impl Run {
             started_at: None,
             ended_at: None,
             job_id: None,
+            parent_run_id: None,
         }
     }
 
@@ -142,6 +146,19 @@ impl Run {
     pub fn for_job(session_id: SessionId, agent_id: AgentId, input: String, job_id: JobId) -> Self {
         Self {
             job_id: Some(job_id),
+            ..Self::new(session_id, agent_id, input)
+        }
+    }
+
+    /// Create a run for a subagent spawned by another run.
+    pub fn for_subagent(
+        session_id: SessionId,
+        agent_id: AgentId,
+        input: String,
+        parent_run_id: RunId,
+    ) -> Self {
+        Self {
+            parent_run_id: Some(parent_run_id),
             ..Self::new(session_id, agent_id, input)
         }
     }
@@ -224,6 +241,9 @@ pub struct RunStatusResponse {
     pub ts: DateTime<Utc>,
     /// Set when this run was triggered by a scheduled job.
     pub job_id: Option<JobId>,
+    /// Set when this run is a subagent execution spawned by another run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<RunId>,
     /// Number of tool call records stored for this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_count: Option<u32>,
@@ -245,9 +265,22 @@ impl From<Run> for RunStatusResponse {
                 .ended_at
                 .unwrap_or_else(|| run.started_at.unwrap_or(run.created_at)),
             job_id: run.job_id,
+            parent_run_id: run.parent_run_id,
             tool_call_count: None,
         }
     }
+}
+
+/// Trait for registering and updating runs from outside the gateway.
+///
+/// The Coordinator uses this to make subagent runs visible in the RunManager
+/// without depending on `alms-gateway`. The gateway implements this trait
+/// on its `RunManager`.
+pub trait RunRegistrar: Send + Sync + std::fmt::Debug {
+    /// Register a new run (insert into the run store and persist to SQLite).
+    fn register_run(&self, run: Run);
+    /// Update an existing run (e.g. mark as completed/failed).
+    fn update_run(&self, run: Run);
 }
 
 /// Check whether `ignore_message` was **successfully** called during a run.

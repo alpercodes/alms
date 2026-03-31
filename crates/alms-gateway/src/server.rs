@@ -18,7 +18,6 @@ use crate::runs::{
 use crate::session_queue::SessionQueue;
 use crate::settings::get_settings;
 use crate::sse::SseEventData;
-use crate::tasks::{get_task, list_tasks};
 use crate::workspace::{get_workspace, update_workspace_file};
 use alms_coordinator::Coordinator;
 use alms_core::{AgentId, AlmsResult, JobStatus, Run, RunId, SessionId};
@@ -471,6 +470,16 @@ impl Default for RunManager {
     }
 }
 
+impl alms_core::RunRegistrar for RunManager {
+    fn register_run(&self, run: Run) {
+        self.insert_run(run);
+    }
+
+    fn update_run(&self, run: Run) {
+        RunManager::update_run(self, run);
+    }
+}
+
 /// Shared application state for HTTP server
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -553,13 +562,25 @@ impl AppState {
             }
             None => Arc::new(JobStore::new()),
         };
+        // Build RunManager with optional SQLite persistence, then hydrate
+        // completed runs from the database so GET /runs returns history.
+        // Created before the Coordinator so we can share it as a RunRegistrar.
+        let run_manager = if let Some(store) = session_manager.store() {
+            let rm = RunManager::new().with_store(Arc::clone(store));
+            rm.hydrate_from_store();
+            rm
+        } else {
+            RunManager::new()
+        };
+
         let mut coord = Coordinator::with_agent_config(
             agent_id,
             session_manager.clone(),
             llm.clone(),
             agent_config.clone(),
         )
-        .with_completion_channel(completion_tx);
+        .with_completion_channel(completion_tx)
+        .with_run_registrar(Arc::new(run_manager.clone()));
         if let Some(ref ws_dir) = workspace_dir {
             coord = coord.with_workspace_dir(ws_dir.clone());
         }
@@ -602,16 +623,6 @@ impl AppState {
                 }
             }
         }
-
-        // Build RunManager with optional SQLite persistence, then hydrate
-        // completed runs from the database so GET /runs returns history.
-        let run_manager = if let Some(store) = session_manager.store() {
-            let rm = RunManager::new().with_store(Arc::clone(store));
-            rm.hydrate_from_store();
-            rm
-        } else {
-            RunManager::new()
-        };
 
         Ok(Self {
             session_manager,
@@ -700,9 +711,6 @@ fn protected_router() -> Router<AppState> {
         // Jobs (scheduled agent runs)
         .route("/jobs", post(create_job).get(list_jobs))
         .route("/jobs/{job_id}", get(get_job).delete(cancel_job))
-        // Coordinator tasks (active subagents)
-        .route("/tasks", get(list_tasks))
-        .route("/tasks/{task_id}", get(get_task))
         // API key management
         .route(
             "/auth/keys",

@@ -249,6 +249,7 @@ Why not `POST /agent/run`?
   "usage": { "prompt_tokens": 150, "completion_tokens": 42 },
   "ts": "2026-02-11T07:52:05Z",
   "job_id": null,
+  "parent_run_id": null,
   "tool_call_count": 6
 }
 ```
@@ -257,6 +258,7 @@ Notes:
 - `response` and `error` use `skip_serializing_if = "Option::is_none"` — they are absent (not `null`) for in-flight runs, present only once the run reaches a terminal state.
 - `response` maps to the agent's text output (`Run.output`); renamed at the API boundary for clarity.
 - `usage` is `null` for failed/cancelled runs.
+- `parent_run_id` is present (as a UUID string) for subagent runs; absent for top-level runs (uses `skip_serializing_if = "Option::is_none"`).
 - `tool_call_count` (optional integer) — number of tool call records stored for this run. Present when SQLite persistence is enabled. Use `GET /runs/{run_id}/tool-calls` to retrieve the full records.
 
 ### 5.3 Stream a run (SSE-first)
@@ -660,7 +662,7 @@ Returns current server defaults for UI pre-population.
   "posture": "guarded",
   "context_strategy": "truncate",
   "stream_chunk_timeout_secs": 60,
-  "enabled_tools": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"],
+  "enabled_tools": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"],
   "agent_id": "<uuid>",
   "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null, "needs_bootstrap": false}],
   "workspace_dir": "./data/workspace",
@@ -691,7 +693,7 @@ Returns current server defaults for UI pre-population.
     "shell_policy": "sandboxed",
     "timeout_secs": 30,
     "max_output_bytes": null,
-    "enabled": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "get_task_result", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"]
+    "enabled": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"]
   }
 }
 ```
@@ -735,21 +737,7 @@ Updates a single workspace file. `{file}` is one of: `personality.md`, `goals.md
 
 ---
 
-## 12) Tasks (subagent status)
-
-### 12.1 List tasks
-`GET /tasks`
-
-Returns active and recent subagent tasks managed by the coordinator.
-
-### 12.2 Get task
-`GET /tasks/{task_id}`
-
-Returns status and result of a specific subagent task.
-
----
-
-## 13) Auth
+## 12) Auth
 
 Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 

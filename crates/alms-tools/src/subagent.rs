@@ -12,19 +12,6 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-/// Outcome of polling a background subagent task.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PollResult {
-    /// Task is still running -- call `get_task_result` again later.
-    Running,
-    /// Task completed successfully with this response text.
-    Completed(String),
-    /// Task failed with this error message.
-    Failed(String),
-    /// Task was cancelled before it could complete.
-    Cancelled,
-}
-
 /// Implemented by `Coordinator` to allow tools to spawn subagents.
 #[async_trait]
 pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
@@ -49,9 +36,10 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
 
     /// Fire a subagent in the background and return its task ID immediately.
     ///
-    /// The caller can poll for the result using `poll_task(task_id)`. The
-    /// subagent runs concurrently with the parent's loop. Subagent tool events
-    /// are still forwarded into `parent_event_fwd` when provided.
+    /// The subagent runs concurrently with the parent's loop. Results are
+    /// delivered automatically via the completion notification system.
+    /// Subagent tool events are still forwarded into `parent_event_fwd`
+    /// when provided.
     async fn dispatch_background(
         &self,
         _task: String,
@@ -63,16 +51,6 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     ) -> AlmsResult<Uuid> {
         Err(AlmsError::Runtime(
             "dispatch_background not supported by this dispatcher".to_string(),
-        ))
-    }
-
-    /// Poll a background task spawned via `dispatch_background`.
-    ///
-    /// Returns `PollResult::Running` while the task is in progress.
-    /// Returns an error if the task ID is unknown or has already expired.
-    async fn poll_task(&self, _task_id: Uuid) -> AlmsResult<PollResult> {
-        Err(AlmsError::Runtime(
-            "poll_task not supported by this dispatcher".to_string(),
         ))
     }
 }
