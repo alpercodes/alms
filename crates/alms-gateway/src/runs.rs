@@ -742,7 +742,7 @@ async fn execute_run(state: AppState, params: RunParams) {
         tokio::spawn(async move {
             let mut rx = bg_event_rx;
             while let Some(event) = rx.recv().await {
-                let sse = match &event {
+                let sse = match event {
                     alms_runtime::RuntimeEvent::ToolStart {
                         invocation_id,
                         tool,
@@ -750,10 +750,10 @@ async fn execute_run(state: AppState, params: RunParams) {
                         source_agent,
                     } => SseEventData::tool_start(
                         bg_run_id,
-                        crate::sse::ToolInvocationId(*invocation_id),
-                        tool,
-                        params.clone(),
-                        source_agent.clone(),
+                        crate::sse::ToolInvocationId(invocation_id),
+                        &tool,
+                        params,
+                        source_agent,
                     ),
                     alms_runtime::RuntimeEvent::ToolEnd {
                         invocation_id,
@@ -762,18 +762,20 @@ async fn execute_run(state: AppState, params: RunParams) {
                         source_agent,
                     } => SseEventData::tool_end(
                         bg_run_id,
-                        crate::sse::ToolInvocationId(*invocation_id),
-                        *ok,
-                        result.clone(),
-                        source_agent.clone(),
+                        crate::sse::ToolInvocationId(invocation_id),
+                        ok,
+                        result,
+                        source_agent,
                     ),
-                    alms_runtime::RuntimeEvent::ApprovalRequired { tool, .. } => {
+                    alms_runtime::RuntimeEvent::ApprovalRequired {
+                        tool, decision_tx, ..
+                    } => {
                         warn!(
-                            "Background subagent requested approval for '{}' — \
-                             approvals are not supported for background subagents. \
-                             The subagent will hang until timeout.",
-                            tool
+                            tool = %tool,
+                            "Background subagent requested approval -- \
+                             not supported, auto-denying"
                         );
+                        let _ = decision_tx.send(false);
                         continue;
                     }
                     _ => continue,

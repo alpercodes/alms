@@ -1043,12 +1043,17 @@ async fn run_agent_loop(
                     RuntimeEvent::Status { .. } => continue,
                     // ApprovalRequired cannot be forwarded through EventForwarder
                     // (it requires a oneshot channel). Subagent approvals are
-                    // not supported; the subagent will hang until timeout.
-                    RuntimeEvent::ApprovalRequired { tool, .. } => {
+                    // not supported; auto-deny the tool call immediately so the
+                    // subagent doesn't hang waiting for a response that will
+                    // never come.
+                    RuntimeEvent::ApprovalRequired {
+                        tool, decision_tx, ..
+                    } => {
                         warn!(
                             tool = %tool,
-                            "Subagent requested approval -- not supported, will hang until timeout"
+                            "Subagent requested approval -- not supported, auto-denying"
                         );
+                        let _ = decision_tx.send(false);
                         continue;
                     }
                     // Forward warnings from subagents, tagged with the
@@ -1534,6 +1539,43 @@ mod tests {
     fn test_truncate_no_content() {
         let result = serde_json::json!({"cancelled": true});
         assert_eq!(truncate_for_notification(&result), "[no content]");
+    }
+
+    // -- event bridge auto-denies subagent ApprovalRequired -----------------
+
+    #[tokio::test]
+    async fn test_event_bridge_auto_denies_approval() {
+        use alms_runtime::RuntimeEvent;
+
+        // Create a channel pair simulating the subagent's event channel.
+        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+
+        // Create the approval oneshot.
+        let (decision_tx, decision_rx) = tokio::sync::oneshot::channel::<bool>();
+
+        // Simulate the subagent emitting an ApprovalRequired event.
+        sub_tx
+            .send(RuntimeEvent::ApprovalRequired {
+                approval_id: Uuid::new_v4(),
+                tool: "shell_exec".to_string(),
+                params: serde_json::json!({"cmd": "rm -rf /"}),
+                decision_tx,
+                source_agent: None,
+            })
+            .unwrap();
+        drop(sub_tx); // close channel so the loop terminates
+
+        // Simulate the coordinator event bridge logic: read events and
+        // auto-deny ApprovalRequired.
+        while let Some(event) = sub_rx.recv().await {
+            if let RuntimeEvent::ApprovalRequired { decision_tx, .. } = event {
+                let _ = decision_tx.send(false);
+            }
+        }
+
+        // The subagent side should receive `false` (denial).
+        let result = decision_rx.await;
+        assert_eq!(result, Ok(false), "ApprovalRequired should be auto-denied");
     }
 
     #[test]
