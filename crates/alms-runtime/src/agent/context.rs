@@ -250,20 +250,56 @@ impl AgentRuntime {
         };
         sum_messages.push(LlmMessage::user(user_prefix));
 
+        // For DM sessions, use from_agent metadata to label messages with agent
+        // names instead of raw roles (which are all Role::User in DM sessions).
+        // When from_agent matches this agent's name, label as "You ({name})" so
+        // the summarizer preserves self-attribution in the summary.
+        let self_name = self.agent_name.as_deref();
+        let mut has_agent_labels = false;
+
         let transcript: String = to_compress
             .iter()
             .map(|m| {
-                let role_label = match m.role {
-                    SessionRole::User => "User",
-                    SessionRole::Assistant => "Assistant",
-                    SessionRole::System => "System",
-                    SessionRole::Tool => "Tool",
+                let from = m
+                    .metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get("from_agent"))
+                    .and_then(|v| v.as_str());
+
+                let role_label: std::borrow::Cow<'_, str> = match from {
+                    Some(sender) if self_name == Some(sender) => {
+                        has_agent_labels = true;
+                        format!("You ({})", sender).into()
+                    }
+                    Some(sender) => {
+                        has_agent_labels = true;
+                        sender.to_string().into()
+                    }
+                    None => match m.role {
+                        SessionRole::User => "User".into(),
+                        SessionRole::Assistant => "Assistant".into(),
+                        SessionRole::System => "System".into(),
+                        SessionRole::Tool => "Tool".into(),
+                    },
                 };
                 format!("{}: {}", role_label, m.content.to_display_string())
             })
             .collect::<Vec<_>>()
             .join("\n");
-        sum_messages.push(LlmMessage::user(transcript));
+
+        // When agent labels are present (DM session), prepend an instruction
+        // to the transcript so the summarizer preserves attribution.
+        if has_agent_labels {
+            sum_messages.push(LlmMessage::user(format!(
+                "This is a conversation between agents. \
+                 Preserve who said what — use agent names \
+                 (e.g., 'Alice requested X, Bob agreed to Y'). \
+                 Lines starting with 'You (name):' are from the perspective agent.\n\n{}",
+                transcript
+            )));
+        } else {
+            sum_messages.push(LlmMessage::user(transcript));
+        }
 
         let model = self
             .config
