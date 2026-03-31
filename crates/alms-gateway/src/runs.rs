@@ -535,6 +535,20 @@ fn extract_peer_from_dm_context(context_id: &str, agent_name: &str) -> Option<St
     }
 }
 
+/// RAII guard that calls [`RunManager::untrack_in_flight`] on drop.
+///
+/// This ensures the in-flight counter is always decremented even when the
+/// run task panics, preventing `wait_drain` from blocking indefinitely.
+struct InFlightGuard {
+    run_manager: crate::server::RunManager,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.run_manager.untrack_in_flight();
+    }
+}
+
 /// Execute a run in background, forwarding runtime events to SSE.
 #[instrument(level = "info", skip(state, params), fields(run_id = %params.run_id.0, session_id = %params.session_id.0))]
 async fn execute_run(state: AppState, params: RunParams) {
@@ -549,8 +563,12 @@ async fn execute_run(state: AppState, params: RunParams) {
         is_peer_message,
         is_system_triggered,
     } = params;
-    // Track this run for graceful shutdown drain.
+    // Track this run for graceful shutdown drain.  The guard ensures the
+    // counter is decremented even if this function panics.
     state.run_manager.track_in_flight();
+    let _in_flight_guard = InFlightGuard {
+        run_manager: state.run_manager.clone(),
+    };
 
     // Early exit if already cancelled (queued-then-cancelled before execution started).
     if cancel_token.is_cancelled() {
@@ -561,7 +579,6 @@ async fn execute_run(state: AppState, params: RunParams) {
         state.run_manager.mark_run_as_cancelled(run_id);
         state.run_manager.remove_cancel_token(run_id);
         state.run_manager.remove_senders(run_id);
-        state.run_manager.untrack_in_flight();
         info!("Run {} was cancelled before starting", run_id.0);
         return;
     }
@@ -690,7 +707,6 @@ async fn execute_run(state: AppState, params: RunParams) {
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
-            state.run_manager.untrack_in_flight();
             return;
         }
     }
@@ -1007,9 +1023,11 @@ async fn execute_run(state: AppState, params: RunParams) {
                 };
                 run_mgr.track_in_flight();
                 tokio::spawn(async move {
+                    let _guard = InFlightGuard {
+                        run_manager: run_mgr,
+                    };
                     alms_runtime::episodic::generate_and_persist_summary(&sm, &llm_clone, req)
                         .await;
-                    run_mgr.untrack_in_flight();
                 });
             }
 
@@ -1198,8 +1216,7 @@ async fn execute_run(state: AppState, params: RunParams) {
     state.run_manager.remove_cancel_token(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
-    // Signal drain waiters that this run is done.
-    state.run_manager.untrack_in_flight();
+    // `_in_flight_guard` dropped here — signals drain waiters that this run is done.
 }
 
 // ---------------------------------------------------------------------------

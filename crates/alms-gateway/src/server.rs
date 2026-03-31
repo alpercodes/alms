@@ -138,7 +138,12 @@ impl RunManager {
 
     /// Wait until all in-flight runs complete, or timeout expires.
     /// Returns `true` if drained, `false` on timeout.
+    ///
+    /// Uses an absolute deadline so the timeout is not reset when
+    /// intermediate notifications arrive (e.g. individual runs completing
+    /// while others are still in progress).
     pub async fn wait_drain(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
         loop {
             // Register the notification future BEFORE checking the counter
             // to avoid lost wakeups.
@@ -148,7 +153,7 @@ impl RunManager {
             }
             tokio::select! {
                 _ = notified => {}
-                _ = tokio::time::sleep(timeout) => return false,
+                _ = tokio::time::sleep_until(deadline) => return false,
             }
         }
     }
@@ -1244,6 +1249,37 @@ mod tests {
         let rm = RunManager::new();
         rm.track_in_flight();
         // Never untrack — should time out.
+        assert!(!rm.wait_drain(std::time::Duration::from_millis(50)).await);
+    }
+
+    /// Verify that intermediate notifications (in_flight going 1->0->1) do
+    /// not reset the absolute deadline in `wait_drain`.
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_timeout_is_absolute_not_per_notification() {
+        let rm = RunManager::new();
+        rm.track_in_flight(); // run A
+
+        let rm2 = rm.clone();
+        tokio::spawn(async move {
+            // After 20ms: run A finishes (1->0, notifies), run B starts (0->1)
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            rm2.untrack_in_flight();
+            rm2.track_in_flight();
+
+            // After another 20ms: same pattern
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            rm2.untrack_in_flight();
+            rm2.track_in_flight();
+
+            // After another 20ms: same — now 60ms total, past the 50ms deadline
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            rm2.untrack_in_flight();
+            rm2.track_in_flight();
+            // Never untrack the last one
+        });
+
+        // 50ms total timeout — should fire even though notifications arrived
+        // at 20ms and 40ms (which would have reset the timer before the fix).
         assert!(!rm.wait_drain(std::time::Duration::from_millis(50)).await);
     }
 
