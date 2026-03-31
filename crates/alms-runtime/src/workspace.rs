@@ -9,7 +9,7 @@
 //! These are read at the start of each run and injected into the system prompt.
 //! The agent can update goals.md, memories.md, and user.md via the workspace_write tool.
 
-use alms_core::{AlmsError, AlmsResult};
+use alms_core::{AlmsError, AlmsResult, truncate_to_char_boundary};
 use std::path::PathBuf;
 use tracing::{debug, info};
 
@@ -180,7 +180,7 @@ impl AgentWorkspace {
             let memories = if memories.len() > 4000 {
                 format!(
                     "{}...\n[memories truncated, {} chars total]",
-                    &memories[..4000],
+                    truncate_to_char_boundary(&memories, 4000),
                     memories.len()
                 )
             } else {

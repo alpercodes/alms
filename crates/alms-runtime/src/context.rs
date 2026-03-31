@@ -5,6 +5,7 @@
 
 use crate::llm_types::{FunctionCall, LlmMessage, ToolCall};
 use alms_core::config::ContextConfig;
+use alms_core::truncate_to_char_boundary;
 use alms_session::{Content, Message, Role};
 use tracing::{debug, warn};
 
@@ -301,7 +302,7 @@ impl ContextBuilder {
                 let content = if result_str.len() > 2000 {
                     format!(
                         "{}... [truncated, {} bytes total]",
-                        &result_str[..2000],
+                        truncate_to_char_boundary(&result_str, 2000),
                         result_str.len()
                     )
                 } else {

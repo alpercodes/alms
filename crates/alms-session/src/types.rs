@@ -1,4 +1,4 @@
-use alms_core::{AgentId, RunId, SessionId, Timestamp};
+use alms_core::{AgentId, RunId, SessionId, Timestamp, truncate_to_char_boundary};
 
 /// Per-session episodic summary for cross-session memory.
 ///
@@ -151,7 +151,7 @@ impl Content {
                     format!(
                         "Tool result {}: {}... [truncated, {} bytes total]",
                         tool_id,
-                        &result_str[..2000],
+                        truncate_to_char_boundary(&result_str, 2000),
                         result_str.len()
                     )
                 } else {
@@ -290,6 +290,40 @@ mod tests {
         let s = c.to_display_string();
         assert!(s.contains("[truncated"));
         assert!(s.len() < 3000);
+    }
+
+    #[test]
+    fn to_display_string_tool_result_truncated_multibyte() {
+        // Build a string where byte offset 2000 falls inside a multi-byte char.
+        // Each emoji is 4 bytes. 499 emojis = 1996 bytes, then "ab" = 1998,
+        // then one more emoji starts at byte 1998 and spans 1998..2002.
+        // Byte offset 2000 would be mid-char and panic without the fix.
+        let mut long = "\u{1F600}".repeat(499); // 1996 bytes
+        long.push_str("ab"); // 1998 bytes
+        long.push_str(&"\u{1F600}".repeat(300)); // 1998 + 1200 = 3198 bytes
+        let c = Content::ToolResult {
+            tool_id: "t3".into(),
+            result: serde_json::Value::String(long),
+        };
+        // Must not panic:
+        let s = c.to_display_string();
+        assert!(s.contains("[truncated"));
+        // The display string must be valid UTF-8 (it is, since it's a String).
+        // Verify that it's reasonably truncated.
+        assert!(s.len() < 4000);
+    }
+
+    #[test]
+    fn to_display_string_tool_result_truncated_cjk() {
+        // CJK characters are 3 bytes each. 667 chars = 2001 bytes, so byte
+        // offset 2000 lands in the middle of the last character.
+        let long: String = std::iter::repeat('\u{4E16}').take(1000).collect(); // 3000 bytes
+        let c = Content::ToolResult {
+            tool_id: "t4".into(),
+            result: serde_json::Value::String(long),
+        };
+        let s = c.to_display_string();
+        assert!(s.contains("[truncated"));
     }
 
     #[test]
