@@ -1736,13 +1736,25 @@ fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> S
     )
 }
 
+/// Maximum character length for the formatted conversation transcript
+/// included in DM-ended notifications. Very long conversations are
+/// truncated from the beginning (keeping the most recent messages) so the
+/// agent sees the tail of the discussion.
+const DM_HISTORY_MAX_CHARS: usize = 4000;
+
 /// Format a human-readable notification message for a DM conversation ending.
 ///
 /// This is used by `run_trigger_loop` when it receives a
 /// `MessageSource::ConversationEnded` trigger.  The notification tells the
 /// peer agent that the DM conversation has ended, includes the reason, and
-/// suggests using `read_messages` to review what was discussed.
-fn format_dm_ended_notification(from_name: &str, reason: ConversationEndReason) -> String {
+/// — when `conversation_history` is provided — embeds the full DM
+/// transcript so the agent can act immediately without calling
+/// `read_messages`.
+fn format_dm_ended_notification(
+    from_name: &str,
+    reason: ConversationEndReason,
+    conversation_history: Option<&str>,
+) -> String {
     let reason_text = match reason {
         ConversationEndReason::Ignored => {
             format!("Agent \"{from_name}\" ended the conversation (chose not to reply).")
@@ -1755,13 +1767,126 @@ fn format_dm_ended_notification(from_name: &str, reason: ConversationEndReason) 
         }
     };
 
+    match conversation_history {
+        Some(history) if !history.is_empty() => {
+            format!(
+                "[DM conversation ended] {reason_text}\n\
+                 \n\
+                 Below is the full conversation history:\n\
+                 \n\
+                 {history}\n\
+                 \n\
+                 Decide what to do next: report results, update your \
+                 goals/memories, or take other action.",
+            )
+        }
+        _ => {
+            // Fallback: no history available (session already cleaned up,
+            // or error reading it). Point the agent at read_messages.
+            format!(
+                "[DM conversation ended] {reason_text}\n\
+                 \n\
+                 You can use read_messages(from: \"{from}\") to review the conversation \
+                 history. Decide what to do next: report results, update your \
+                 goals/memories, or take other action.",
+                from = from_name,
+            )
+        }
+    }
+}
+
+/// Format a DM session's messages into a human-readable conversation
+/// transcript suitable for embedding in a notification.
+///
+/// Only text messages are included (tool calls, tool results, images, and
+/// system markers like `dm_ended` are skipped). Each message is formatted
+/// as:
+///
+/// ```text
+/// [HH:MM] agent_name: message text
+/// ```
+///
+/// The output is truncated to [`DM_HISTORY_MAX_CHARS`] characters. When
+/// truncation is needed, the oldest messages are dropped and a leading
+/// note indicates how many messages were omitted.
+fn format_dm_conversation_history(messages: &[alms_session::Message]) -> String {
+    // Collect renderable lines (only text messages with content).
+    let mut lines: Vec<String> = Vec::new();
+
+    for msg in messages {
+        // Skip non-text content (tool calls, tool results, images).
+        let text = match &msg.content {
+            alms_session::Content::Text(t) => t.as_str(),
+            _ => continue,
+        };
+
+        // Skip empty text (e.g. dm_ended markers with empty body).
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        // Skip system metadata markers (dm_ended, synthetic notifications).
+        if let Some(ref meta) = msg.metadata {
+            let msg_type = meta
+                .get("message_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if msg_type == "dm_ended" {
+                continue;
+            }
+            if meta.get("synthetic").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
+        }
+
+        // Extract sender name from metadata, or fall back to role.
+        let sender = msg
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("from_agent"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(match msg.role {
+                alms_session::Role::User => "user",
+                alms_session::Role::Assistant => "assistant",
+                alms_session::Role::System => "system",
+                alms_session::Role::Tool => "tool",
+            });
+
+        let ts = msg.timestamp.0.format("%H:%M");
+        lines.push(format!("[{ts}] {sender}: {text}"));
+    }
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // Build the full transcript and truncate from the front if needed.
+    let full = lines.join("\n");
+    if full.len() <= DM_HISTORY_MAX_CHARS {
+        return full;
+    }
+
+    // Walk from the end to find how many lines fit within the budget,
+    // leaving room for the "[N earlier messages omitted]" prefix.
+    let omitted_prefix_budget = 60; // generous estimate
+    let budget = DM_HISTORY_MAX_CHARS.saturating_sub(omitted_prefix_budget);
+    let mut included_start = lines.len();
+    let mut accumulated = 0usize;
+    for (i, line) in lines.iter().enumerate().rev() {
+        // +1 for the newline separator
+        let cost = line.len() + if i < lines.len() - 1 { 1 } else { 0 };
+        if accumulated + cost > budget {
+            break;
+        }
+        accumulated += cost;
+        included_start = i;
+    }
+
+    let omitted = included_start;
+    let truncated_lines = &lines[included_start..];
     format!(
-        "[DM conversation ended] {reason_text}\n\
-         \n\
-         You can use read_messages(from: \"{from}\") to review the conversation \
-         history. Decide what to do next: report results, update your \
-         goals/memories, or take other action.",
-        from = from_name,
+        "[{omitted} earlier message(s) omitted]\n{}",
+        truncated_lines.join("\n")
     )
 }
 
@@ -1889,15 +2014,49 @@ pub(crate) async fn run_trigger_loop(
                     .await;
                 }
 
+                // ── Fetch DM conversation history (#429) ──
+                //
+                // Resolve the DM session and format its message history so
+                // the notification includes the full transcript. This saves
+                // the agent an LLM round-trip that would otherwise be spent
+                // calling read_messages.
+                let conversation_history = peer_name_resolved.as_ref().and_then(|peer_name| {
+                    let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
+                    match state.session_manager.get_history(dm_session_id) {
+                        Ok(messages) => {
+                            let formatted = format_dm_conversation_history(&messages);
+                            if formatted.is_empty() {
+                                None
+                            } else {
+                                Some(formatted)
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                dm_session = %dm_session_id.0,
+                                error = %e,
+                                "Failed to fetch DM history for notification — \
+                                 falling back to read_messages hint"
+                            );
+                            None
+                        }
+                    }
+                });
+
                 (
                     format!("notification:dm_ended:{from_name}"),
                     // NOT a peer message — the notification run should not get
                     // the DM addendum injected (it tells the agent to use
                     // send_message/ignore_message, which is wrong here).
                     false,
-                    // Format a richer notification that includes the reason and
-                    // a follow-up hint, overriding the basic text from the bus.
-                    format_dm_ended_notification(from_name, *reason),
+                    // Format a richer notification that includes the reason,
+                    // the DM conversation transcript (when available), and a
+                    // follow-up hint.
+                    format_dm_ended_notification(
+                        from_name,
+                        *reason,
+                        conversation_history.as_deref(),
+                    ),
                 )
             }
         };
@@ -2862,12 +3021,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // format_dm_ended_notification tests (#388)
+    // format_dm_ended_notification tests (#388, #429)
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_dm_ended_notification_ignored_reason() {
-        let msg = format_dm_ended_notification("alice", ConversationEndReason::Ignored);
+    fn test_dm_ended_notification_ignored_no_history() {
+        let msg = format_dm_ended_notification("alice", ConversationEndReason::Ignored, None);
         assert!(
             msg.starts_with("[DM conversation ended]"),
             "notification should start with the DM ended prefix"
@@ -2882,13 +3041,13 @@ mod tests {
         );
         assert!(
             msg.contains("read_messages"),
-            "notification should hint at read_messages for reviewing the conversation"
+            "fallback (no history) should hint at read_messages"
         );
     }
 
     #[test]
-    fn test_dm_ended_notification_depth_exceeded_reason() {
-        let msg = format_dm_ended_notification("bob", ConversationEndReason::DepthExceeded);
+    fn test_dm_ended_notification_depth_exceeded_no_history() {
+        let msg = format_dm_ended_notification("bob", ConversationEndReason::DepthExceeded, None);
         assert!(
             msg.starts_with("[DM conversation ended]"),
             "notification should start with the DM ended prefix"
@@ -2903,16 +3062,184 @@ mod tests {
         );
         assert!(
             msg.contains("read_messages"),
-            "notification should hint at read_messages for reviewing the conversation"
+            "fallback (no history) should hint at read_messages"
         );
     }
 
     #[test]
     fn test_dm_ended_notification_is_not_empty() {
-        let msg = format_dm_ended_notification("x", ConversationEndReason::Ignored);
+        let msg = format_dm_ended_notification("x", ConversationEndReason::Ignored, None);
         assert!(
             msg.len() > 50,
             "notification should be a substantive message, not a stub"
+        );
+    }
+
+    #[test]
+    fn test_dm_ended_notification_with_history() {
+        let history = "[10:00] alice: Hello Bob\n[10:01] bob: Hi Alice, what's up?";
+        let msg =
+            format_dm_ended_notification("alice", ConversationEndReason::Ignored, Some(history));
+        assert!(
+            msg.starts_with("[DM conversation ended]"),
+            "notification should start with the DM ended prefix"
+        );
+        assert!(
+            msg.contains("Hello Bob"),
+            "notification should include conversation content"
+        );
+        assert!(
+            msg.contains("Hi Alice"),
+            "notification should include both sides of the conversation"
+        );
+        assert!(
+            msg.contains("full conversation history"),
+            "notification with history should mention it contains the transcript"
+        );
+        assert!(
+            !msg.contains("read_messages"),
+            "notification with history should NOT suggest read_messages"
+        );
+    }
+
+    #[test]
+    fn test_dm_ended_notification_empty_history_falls_back() {
+        let msg = format_dm_ended_notification("alice", ConversationEndReason::Ignored, Some(""));
+        assert!(
+            msg.contains("read_messages"),
+            "empty history string should fall back to read_messages hint"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_dm_conversation_history tests (#429)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_dm_history_basic() {
+        use alms_session::{Content, Message, Role};
+
+        let messages = vec![
+            Message {
+                id: "1".into(),
+                role: Role::User,
+                content: Content::Text("Hello from alice".into()),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"from_agent": "alice"})),
+            },
+            Message {
+                id: "2".into(),
+                role: Role::User,
+                content: Content::Text("Hi alice, I got your message".into()),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"from_agent": "bob"})),
+            },
+        ];
+
+        let result = format_dm_conversation_history(&messages);
+        assert!(
+            result.contains("alice: Hello from alice"),
+            "should include alice's message with sender label"
+        );
+        assert!(
+            result.contains("bob: Hi alice"),
+            "should include bob's message with sender label"
+        );
+    }
+
+    #[test]
+    fn test_format_dm_history_skips_empty_and_markers() {
+        use alms_session::{Content, Message, Role};
+
+        let messages = vec![
+            Message {
+                id: "1".into(),
+                role: Role::User,
+                content: Content::Text("Real message".into()),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"from_agent": "alice"})),
+            },
+            // Empty text (dm_ended marker body)
+            Message {
+                id: "2".into(),
+                role: Role::User,
+                content: Content::Text(String::new()),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"message_type": "dm_ended"})),
+            },
+            // Tool call
+            Message {
+                id: "3".into(),
+                role: Role::Tool,
+                content: Content::ToolResult {
+                    tool_id: "t1".into(),
+                    result: serde_json::json!({"ok": true}),
+                },
+                timestamp: alms_core::Timestamp::now(),
+                metadata: None,
+            },
+            // Synthetic notification
+            Message {
+                id: "4".into(),
+                role: Role::System,
+                content: Content::Text("synthetic marker".into()),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"synthetic": true})),
+            },
+        ];
+
+        let result = format_dm_conversation_history(&messages);
+        assert!(
+            result.contains("Real message"),
+            "should include the real message"
+        );
+        assert!(!result.contains("dm_ended"), "should skip dm_ended markers");
+        assert!(!result.contains("Tool result"), "should skip tool results");
+        assert!(
+            !result.contains("synthetic marker"),
+            "should skip synthetic markers"
+        );
+    }
+
+    #[test]
+    fn test_format_dm_history_empty_session() {
+        let result = format_dm_conversation_history(&[]);
+        assert!(
+            result.is_empty(),
+            "empty session should produce empty string"
+        );
+    }
+
+    #[test]
+    fn test_format_dm_history_truncation() {
+        use alms_session::{Content, Message, Role};
+
+        // Create enough messages to exceed DM_HISTORY_MAX_CHARS
+        let messages: Vec<Message> = (0..200)
+            .map(|i| Message {
+                id: format!("msg_{i}"),
+                role: Role::User,
+                content: Content::Text(format!("Message number {i} with some padding text to make it longer and ensure truncation kicks in properly")),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"from_agent": "alice"})),
+            })
+            .collect();
+
+        let result = format_dm_conversation_history(&messages);
+        assert!(
+            result.len() <= DM_HISTORY_MAX_CHARS,
+            "truncated output should be within budget (got {} chars, max {})",
+            result.len(),
+            DM_HISTORY_MAX_CHARS,
+        );
+        assert!(
+            result.contains("earlier message(s) omitted"),
+            "truncated output should indicate messages were omitted"
+        );
+        // The last message should always be present (most recent)
+        assert!(
+            result.contains("Message number 199"),
+            "truncated output should include the most recent message"
         );
     }
 
