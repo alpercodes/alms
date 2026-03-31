@@ -1,4 +1,5 @@
 use crate::{SandboxError, Tool, error::SandboxResult};
+use alms_core::truncate_to_char_boundary;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -168,19 +169,16 @@ fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
 /// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
 /// Appends a truncation note when the string is shortened.
 fn safe_truncate(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_owned();
+    let truncated = truncate_to_char_boundary(s, max_bytes);
+    if truncated.len() == s.len() {
+        s.to_owned()
+    } else {
+        format!(
+            "{}…[truncated, {} bytes omitted]",
+            truncated,
+            s.len() - truncated.len()
+        )
     }
-    // Walk back from max_bytes until we land on a char boundary.
-    let boundary = (0..=max_bytes)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    format!(
-        "{}…[truncated, {} bytes omitted]",
-        &s[..boundary],
-        s.len() - boundary
-    )
 }
 
 /// Returns a list of environment variable names that are critical for process

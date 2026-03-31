@@ -2,7 +2,9 @@
 
 mod types;
 use alms_core::channel::{ChatId, MessageId, UserId};
-use alms_core::{AlmsResult, Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
+use alms_core::{
+    AlmsResult, Channel, ChannelConfig, IncomingMessage, OutgoingMessage, truncate_to_char_boundary,
+};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use reqwest::Client;
@@ -403,7 +405,7 @@ fn split_message(text: &str, max_len: usize) -> Vec<&str> {
         }
 
         // Search window: the first `max_len` bytes (must land on a char boundary).
-        let window = &remaining[..floor_char_boundary(remaining, max_len)];
+        let window = truncate_to_char_boundary(remaining, max_len);
 
         // Try paragraph break.
         let split_at = window
@@ -412,7 +414,7 @@ fn split_message(text: &str, max_len: usize) -> Vec<&str> {
             // Try line break.
             .or_else(|| window.rfind('\n').map(|pos| pos + 1))
             // Hard split at char boundary.
-            .unwrap_or_else(|| floor_char_boundary(remaining, max_len));
+            .unwrap_or_else(|| truncate_to_char_boundary(remaining, max_len).len());
 
         let (chunk, rest) = remaining.split_at(split_at);
         if !chunk.is_empty() {
@@ -422,18 +424,6 @@ fn split_message(text: &str, max_len: usize) -> Vec<&str> {
     }
 
     chunks
-}
-
-/// Find the largest byte index ≤ `max` that falls on a UTF-8 char boundary.
-fn floor_char_boundary(s: &str, max: usize) -> usize {
-    if max >= s.len() {
-        return s.len();
-    }
-    let mut idx = max;
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
 }
 
 impl Default for TelegramChannel {

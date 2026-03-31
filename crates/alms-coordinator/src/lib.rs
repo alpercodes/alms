@@ -1,6 +1,8 @@
 pub mod message_bus;
 
-use alms_core::{AgentId, AlmsResult, Run, RunId, RunRegistrar, SessionId};
+use alms_core::{
+    AgentId, AlmsResult, Run, RunId, RunRegistrar, SessionId, truncate_to_char_boundary,
+};
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient, RunOutput};
 use alms_session::SessionManager;
 use alms_tools::event_forwarder::EventForwarder;
@@ -775,15 +777,11 @@ fn truncate_for_notification(result: &serde_json::Value) -> String {
         .or_else(|| result["error"].as_str())
         .unwrap_or("[no content]");
 
-    if text.len() <= NOTIFICATION_SUMMARY_MAX_CHARS {
+    let truncated = truncate_to_char_boundary(text, NOTIFICATION_SUMMARY_MAX_CHARS);
+    if truncated.len() == text.len() {
         text.to_string()
     } else {
-        // Truncate at a char boundary
-        let mut end = NOTIFICATION_SUMMARY_MAX_CHARS;
-        while !text.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        format!("{}…[truncated]", &text[..end])
+        format!("{}…[truncated]", truncated)
     }
 }
 
