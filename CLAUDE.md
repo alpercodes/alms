@@ -86,15 +86,23 @@ alms-cli → alms-gateway → alms-runtime      → alms-core
 
 ## Claude Code Agent Team
 
-Three agents work in parallel using git worktree isolation (`.claude/agents/`):
+Internal agents (under Atlas's control, use git worktree isolation):
 
 | Agent | Role | Worktree | Co-Authored-By | Can Edit Code |
 |-------|------|----------|----------------|---------------|
 | **Atlas** | Main developer | Main repo | `Atlas <noreply@anthropic.com>` | Yes |
+| **Heph** (`heph-dev`) | Feature dev | Isolated | `Heph <noreply@anthropic.com>` | Yes |
 | **Tim** (`alms-dev-guardian`) | Code reviewer | Isolated | `Tim <noreply@anthropic.com>` | No (read-only) |
 | **Larry** (`larry-bug-fix`) | Bug fixer | Isolated | `Larry <noreply@anthropic.com>` | Yes |
 
-- All agents use `isolation: "worktree"` so they never interfere with each other
+External agents (not under Atlas's control):
+
+| Agent | Role |
+|-------|------|
+| **Argus** | External — independent agent |
+| **Tesla** | External — independent agent |
+
+- All internal agents use `isolation: "worktree"` so they never interfere with each other
 - Tim posts reviews as GitHub PR comments with `## Review by Tim (automated)` header
 - Larry creates branches, fixes bugs, pushes, creates PRs, and comments on GitHub issues
 - Atlas coordinates, plans, implements features, and posts Tim's reviews when Bash is blocked in worktrees
@@ -106,6 +114,8 @@ Three agents work in parallel using git worktree isolation (`.claude/agents/`):
 - Run `make ci` before pushing
 
 ### VPS & Remotes
+
+> **Note**: VPS deployment is not in scope right now. Will be picked up later.
 
 - **VPS**: `root@<vps-host>` (Ubuntu 24.04, 4GB RAM)
 - **Canonical repo on VPS**: `</srv/alms` (has `main` checked out)
