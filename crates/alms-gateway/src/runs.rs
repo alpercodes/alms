@@ -896,6 +896,12 @@ async fn execute_run(state: AppState, params: RunParams) {
         None
     };
 
+    // Capture a timestamp *before* the run starts so we can scope the DM
+    // outbound-message lookup to only messages written during this run.
+    // Without this, an `ignore_message` run would pick up a stale outbound
+    // message from a prior run (#434, Bug 1).
+    let run_start_ts = alms_core::Timestamp::now();
+
     let result = if is_peer_message {
         // Peer-triggered run: the input message is already in the shared
         // session (written by MessageBus with from_agent metadata).
@@ -982,10 +988,17 @@ async fn execute_run(state: AppState, params: RunParams) {
                     && let Some(ref name) = agent_name
                     && let Ok(history) = state.session_manager.get_history(session_id)
                     && let Some(last_own) = history.iter().rev().find(|m| {
-                        m.metadata.as_ref().is_some_and(|meta| {
-                            meta.get("from_agent").and_then(|v| v.as_str()) == Some(name)
-                                && meta.get("message_type").and_then(|v| v.as_str()) == Some("dm")
-                        }) && matches!(m.content, alms_session::Content::Text(_))
+                        // Scope to messages written *during this run* to avoid
+                        // picking up stale outbound messages from prior runs
+                        // (e.g. when ignore_message was called in the current
+                        // run — #434 Bug 1).
+                        m.timestamp.0 >= run_start_ts.0
+                            && m.metadata.as_ref().is_some_and(|meta| {
+                                meta.get("from_agent").and_then(|v| v.as_str()) == Some(name)
+                                    && meta.get("message_type").and_then(|v| v.as_str())
+                                        == Some("dm")
+                            })
+                            && matches!(m.content, alms_session::Content::Text(_))
                     })
                     && let alms_session::Content::Text(ref text) = last_own.content
                     && !text.is_empty()

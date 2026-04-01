@@ -7,10 +7,11 @@
 //!
 //! Two modes are supported:
 //!
-//! - **Heuristic**: deterministic, no LLM call.  Produces a source-labelled
-//!   one-liner from the first ~120 characters of the run input.  When an
-//!   existing summary exists, the new entry is appended and old entries are
-//!   trimmed to keep total length under ~500 characters.
+//! - **Heuristic**: deterministic, no LLM call.  Produces a one-liner from
+//!   the first ~120 bytes of the run input and ~80 bytes of the run output
+//!   (when available).  When an existing summary exists, the new entry is
+//!   appended and old entries are trimmed to keep total length under ~500
+//!   characters.
 //!
 //! - **LLM**: makes a lightweight completion call with the run input, the
 //!   agent's final response, and the existing summary (if any).  The LLM
@@ -30,6 +31,11 @@ use tracing::{debug, error, info, instrument, warn};
 /// equivalent; multi-byte UTF-8 sequences may result in fewer characters.
 /// `truncate_to_char_boundary` ensures we never split mid-codepoint.
 const HEURISTIC_INPUT_BYTES: usize = 120;
+
+/// Maximum byte length for the heuristic *output* snippet appended after the
+/// input.  Kept shorter than the input budget so a single entry line stays
+/// compact.  Only included when `run_output` is non-empty.
+const HEURISTIC_OUTPUT_BYTES: usize = 80;
 
 /// Maximum total byte length for accumulated heuristic summaries.
 /// Oldest entries are trimmed when the total exceeds this.
@@ -204,8 +210,9 @@ pub async fn generate_and_persist_summary(
 
 /// Produce a deterministic summary from the source label and run input.
 ///
-/// Format: `"{source_label}: \"{first ~120 chars of input}...\""` (or without
-/// the ellipsis when the input fits entirely).
+/// Format: `"<input snippet>" -> "<output snippet>"` when `run_output` is
+/// available, otherwise `"<input snippet>"` alone.  Snippets are truncated
+/// to [`HEURISTIC_INPUT_BYTES`] and [`HEURISTIC_OUTPUT_BYTES`] respectively.
 ///
 /// When an existing summary exists, the new entry is appended on a new line.
 /// The total is trimmed line-by-line (oldest first) to stay under
@@ -220,13 +227,25 @@ fn generate_heuristic(params: &SummaryParams) -> Option<String> {
     let _source = derive_source_label(&params.context_id, &params.agent_name)?;
 
     // Build the new entry line.
-    let snippet = truncate_to_char_boundary(&params.run_input, HEURISTIC_INPUT_BYTES);
-    let ellipsis = if params.run_input.len() > snippet.len() {
+    let in_snippet = truncate_to_char_boundary(&params.run_input, HEURISTIC_INPUT_BYTES);
+    let in_ellipsis = if params.run_input.len() > in_snippet.len() {
         "..."
     } else {
         ""
     };
-    let entry = format!("\"{snippet}{ellipsis}\"");
+
+    // Include the agent's response when available (#434, Bug 2).
+    let entry = if !params.run_output.is_empty() {
+        let out_snippet = truncate_to_char_boundary(&params.run_output, HEURISTIC_OUTPUT_BYTES);
+        let out_ellipsis = if params.run_output.len() > out_snippet.len() {
+            "..."
+        } else {
+            ""
+        };
+        format!("\"{in_snippet}{in_ellipsis}\" -> \"{out_snippet}{out_ellipsis}\"")
+    } else {
+        format!("\"{in_snippet}{in_ellipsis}\"")
+    };
 
     // Append to existing summary (if any).
     let combined = match &params.existing_summary {
@@ -478,6 +497,16 @@ mod tests {
     fn test_heuristic_basic_format() {
         let params = heuristic_params("How do I configure CORS?", "web-chat-123", None);
         let result = generate_heuristic(&params).unwrap();
+        // run_output is "Some output" so the entry includes `-> "Some output"`
+        assert_eq!(result, "\"How do I configure CORS?\" -> \"Some output\"");
+    }
+
+    #[test]
+    fn test_heuristic_no_output() {
+        // When run_output is empty, only the input is shown.
+        let mut params = heuristic_params("How do I configure CORS?", "web-chat-123", None);
+        params.run_output = String::new();
+        let result = generate_heuristic(&params).unwrap();
         assert_eq!(result, "\"How do I configure CORS?\"");
     }
 
@@ -486,10 +515,12 @@ mod tests {
         let long_input = "a".repeat(200);
         let params = heuristic_params(&long_input, "web-chat-123", None);
         let result = generate_heuristic(&params).unwrap();
-        assert!(result.ends_with("...\""));
-        // The snippet inside quotes should be ~120 chars
-        let inner = &result["\"".len()..result.len() - 4]; // strip trailing ...\"
-        assert_eq!(inner.len(), 120);
+        // The result now includes `-> "Some output"` after the input snippet.
+        assert!(result.contains("...\""), "input should be truncated");
+        assert!(
+            result.contains("-> \"Some output\""),
+            "output should be present"
+        );
     }
 
     #[test]
@@ -583,6 +614,43 @@ mod tests {
         assert!(
             result.starts_with('"'),
             "Job summary should not include source_label prefix, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_dm_includes_run_output() {
+        // Bug 2 regression: DM summaries must include the agent's reply.
+        let mut params =
+            heuristic_params_with_name("Hey, can you help?", "dm:alice:bob", None, "alice");
+        params.run_output = "Sure, what do you need?".to_string();
+        let result = generate_heuristic(&params).unwrap();
+        assert!(
+            result.contains("Hey, can you help?"),
+            "Should contain input: {result}"
+        );
+        assert!(
+            result.contains("Sure, what do you need?"),
+            "Should contain output: {result}"
+        );
+        assert!(
+            result.contains("->"),
+            "Should contain arrow separator: {result}"
+        );
+    }
+
+    #[test]
+    fn test_heuristic_truncates_long_output() {
+        let long_output = "b".repeat(200);
+        let mut params = heuristic_params("short input", "web-chat-123", None);
+        params.run_output = long_output;
+        let result = generate_heuristic(&params).unwrap();
+        assert!(
+            result.contains("-> \""),
+            "Should contain output section: {result}"
+        );
+        assert!(
+            result.ends_with("...\""),
+            "Long output should be truncated: {result}"
         );
     }
 

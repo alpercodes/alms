@@ -252,7 +252,7 @@ After each successful run, the gateway spawns a fire-and-forget `tokio::spawn` t
 **Summary modes** (controlled by `context.run_summary_mode` in `alms.toml` or `ALMS_RUN_SUMMARY_MODE` env var):
 
 - **`off`** (default) — No summaries generated. No episodic injection.
-- **`heuristic`** — Deterministic, no LLM call. Produces a one-liner from the first ~120 chars of run input. Successive runs in the same session append entries; oldest lines are trimmed when total exceeds ~500 chars.
+- **`heuristic`** — Deterministic, no LLM call. Produces a one-liner from the first ~120 bytes of run input and ~80 bytes of the agent's response (when available). Successive runs in the same session append entries; oldest lines are trimmed when total exceeds ~500 chars.
 - **`llm`** — Lightweight LLM call using `session_summarizer.md` prompt. Receives run input (~2000 chars), agent output (~2000 chars), and existing summary. Produces a concise 1-3 sentence evolving summary. Max 150 output tokens.
 
 **How episodic context is injected:**
@@ -300,7 +300,7 @@ CREATE INDEX idx_session_summaries_agent
 
 - **Race condition on concurrent runs:** Two concurrent runs for the same session can both load the same base summary, generate independently, and the last writer wins. Acceptable for MVP since concurrent runs on the same session are rare.
 - **No summary eviction:** Summaries accumulate indefinitely. A future cleanup job should prune summaries for sessions that have been idle beyond a threshold.
-- **Heuristic mode is input-only:** It captures what the user asked, not what the agent did. LLM mode produces more useful summaries but costs tokens.
+- **Heuristic mode uses truncated snippets:** It captures truncated input (~120 bytes) and output (~80 bytes) rather than full context. LLM mode produces richer summaries at the cost of tokens.
 
 ---
 

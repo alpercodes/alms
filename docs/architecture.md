@@ -117,7 +117,7 @@ After each successful run, the gateway may generate a per-session summary and st
 
 Summary generation modes (controlled by `run_summary_mode`):
 - `off` (default) — no summaries, no episodic injection
-- `heuristic` — deterministic one-liner from first ~120 chars of input (zero LLM cost)
+- `heuristic` — deterministic one-liner from truncated input + output (zero LLM cost)
 - `llm` — rich 1-3 sentence summary via a lightweight LLM call using `session_summarizer.md` prompt
 
 The episodic token budget (`run_summary_budget`, default: 2000) is hard-capped at 15% of `max_input_tokens` and subtracted from the total context budget so episodic content never starves the current conversation.
