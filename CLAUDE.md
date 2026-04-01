@@ -51,8 +51,8 @@ docs/                # Design docs — api.md, architecture.md, security-model.m
                      #   agent-runtime-design.md — detailed design for config/context/workspace
                      #   agent-ux-requirements.md — Alper's UX requirements
                      #   system-prompts.md — prompt file inventory and assembly order
-_quarantine/         # Archived/superseded docs
-research/            # Competitive analysis and tech-stack decisions
+                     #   _archive/ — archived/superseded docs
+                     #   research/ — competitive analysis and tech-stack decisions
 ```
 
 ### Dependency graph (no cycles, 9 crates)
@@ -84,42 +84,6 @@ alms-cli → alms-gateway → alms-runtime      → alms-core
 - **IDs**: Newtype wrappers (`AgentId`, `SessionId`, `RunId`, etc.) — never raw strings
 - **Tests**: `#[cfg(test)] mod tests` in each file. Golden tests for SSE in `alms-gateway/tests/`
 
-## Configuration System
-
-Unified config in `alms-core/src/config.rs` (`AlmsConfig`):
-- **Layered precedence**: compiled defaults → `alms.toml` config file → env var overrides
-- **Secrets** (API keys, tokens): loaded exclusively from `data/secrets.json` (via `alms auth set` or web UI). Env var fallback has been removed for security (agents can read env vars via `shell_exec`). Never stored in `alms.toml` (`#[serde(skip)]`). Set keys with: `alms auth set openrouter sk-...`, `alms auth set anthropic sk-ant-...`, `alms auth set telegram 123456:ABC-DEF`
-- See `alms.toml.example` for all options with documentation
-- Key env vars: `ALMS_LLM_PROVIDER` (`openrouter`|`openai`|`anthropic`), `ALMS_LLM_MOCK=1`, `DEFAULT_MODEL`, `LLM_BASE_URL`, `ALMS_AGENT_ID`, `ALMS_SANDBOX_ROOT`, `ALMS_SHELL_POLICY`, `ALMS_DATA_DIR` (default: `./data`), `ALMS_WORKSPACE_DIR` (default: `{data_dir}/workspace`), `ALMS_LOG_DIR` (default: `{data_dir}/logs`), `ALMS_LOG_FILE_LEVEL` (default: `debug`), `ALMS_LOG_ROTATION` (`daily`|`hourly`|`never`), `ALMS_LOG_FILE_ENABLED` (`true`|`false`, default: `true`), `ALMS_RUN_SUMMARY_MODE` (`off`|`heuristic`|`llm`, default: `off`), `ALMS_RUN_SUMMARY_BUDGET` (default: `2000`, hard-capped at 15% of `max_input_tokens`)
-- Sensitive env vars (still env-var-based by design -- cannot be stored in the file they protect): `ALMS_AUTH_TOKEN` (bearer auth), `ALMS_MASTER_KEY` (encrypts `data/secrets.json` at rest with AES-256-GCM)
-- **Deprecated env vars**: `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN` are detected at startup and a warning is logged, but their values are NOT used. Migrate with `alms auth set <provider> <key>`
-- `GatewayConfig::from_env()` uses `AlmsConfig::load()` internally — single source of truth
-- **Agent ID persistence**: the default agent UUID is stored in `./data/agent_id` (plain-text sidecar file). Precedence: `ALMS_AGENT_ID` env var > sidecar file > generate new. To reconnect existing data after a migration: `echo "<uuid>" > ./data/agent_id`
-
-## Agent Runtime Architecture
-
-The agent runtime (`alms-runtime`) has three key subsystems:
-
-1. **ContextBuilder** (`context.rs`): Assembles token-budgeted context windows for LLM calls. Strategies: `truncate` (default), `full`, `sliding-summary` (rolling LLM summary of old messages + recent window verbatim). Config via `ContextConfig`.
-
-2. **AgentWorkspace** (`workspace.rs`): Per-agent persistent identity files:
-   - `personality.md` — the *agent's* tone, style, role, constraints (agent + user editable; agent writes during bootstrap)
-   - `goals.md` — the agent's current objectives (agent + user editable)
-   - `memories.md` — what the agent has learned: domain facts, past decisions, accumulated knowledge (agent + user editable)
-   - `user.md` — who the *user* is: name, working style, preferences, background (agent + user editable; filled during bootstrap interview)
-   - Prepended to system prompt when workspace is attached to runtime
-   - `needs_bootstrap()` detects first-time agents (no `personality.md`)
-   - `alms agent create` initializes empty workspace files; `init_workspace_files()` in `alms-core` is idempotent
-
-3. **ToolRegistry** (`tools.rs` in alms-runtime, tool implementations in `alms-tools`): Tools expose JSON Schema parameters via `fn parameters() -> Value`. Definitions serialize to OpenAI format: `{"type": "function", "function": {"name", "description", "parameters"}}`. The registry wrapper lives in alms-runtime; the `Tool` trait is defined in alms-sandbox (`src/lib.rs`). The 9 agent-to-agent tool implementations (send_message, invoke_agent, read_session, etc.) and supporting traits (`SubagentDispatcher`, `MessageSender`, `EventForwarder`) live in the `alms-tools` crate. Exception: `workspace_write` stays in alms-runtime because it depends on `AgentWorkspace`.
-
-4. **Episodic Memory** (`episodic.rs`): Cross-session awareness via run summaries. After each successful run, a per-session summary is generated (mode: `off`|`heuristic`|`llm`, controlled by `run_summary_mode`). Summaries are stored in the `session_summaries` SQLite table and injected into the context window of subsequent runs as a system message between the main system prompt and session history. Context assembly order: `[system_prompt, (episodic summaries?), (rolling summary if sliding-summary), recent_messages, current_input]`. The episodic token budget (`run_summary_budget`, default 2000) is hard-capped at 15% of `max_input_tokens` and is subtracted from the total budget so it does not starve the current conversation. Agents can also recall their own sessions on demand via `list_my_sessions` and `read_session` tools.
-
-## LLM Types
-
-- `LlmMessage.content` is `Option<String>` (null when LLM returns tool calls only)
-- Two `LlmConfig` types exist: `alms_core::config::LlmConfig` (canonical) and `alms_runtime::llm_types::LlmConfig` (legacy, with `From` bridge). Prefer the core one for new code.
-
 ## Claude Code Agent Team
 
 Three agents work in parallel using git worktree isolation (`.claude/agents/`):
@@ -148,28 +112,6 @@ Three agents work in parallel using git worktree isolation (`.claude/agents/`):
 - **Git remote `atlas`**: points to the VPS canonical repo
 - **Pushing to VPS**: The VPS repo has `main` checked out, so direct pushes are refused by default. To push: temporarily set `receive.denyCurrentBranch=updateInstead` on VPS, push, then reset to `refuse`.
 - **Agent workspace repos**: `</srv/workspace-atlas/alms`, `</srv/workspace-mustafa/alms`
-
-## Key Design Decisions
-
-- **SSE over WebSockets** for streaming (simpler, proxy-friendly, reconnect via Last-Event-ID)
-- **SQLite persistence** via `SqliteStore` — sessions + audit events persisted to `./data/alms.db` by default
-- **WASM sandbox** for tool isolation; native builtins bypass WASM for now
-- **Single-process daemon** — no microservice split planned for MVP
-- **Mock LLM** available via `ALMS_LLM_MOCK=1` env var for testing without API keys
-- **Simple config** — avoid the OpenClaw pattern of confusing nested settings; flat, predictable keys
-- **Multi-agent: hierarchy + peer messaging** — vertical delegation via `invoke_agent` tool (any agent can spawn subagents; results flow up from children to parents). Peer-to-peer direct messaging via `send_message` tool (Layer 2 — agents can send messages to any other agent by name through a shared MessageBus; delivered into the recipient's next context window via DM sessions with perspective mapping). Named subagents (`name` param) must be pre-registered via `alms agent create` (which creates workspace dir + empty identity files and outputs the workspace path); config (model, posture) loaded from agent registry, workspace attached at `{workspace_dir}/{name}/`. Persistent sessions via UUID v5 deterministic identity — conversation history preserved across invocations. `read_subagent_session` tool for on-demand context retrieval from subagent sessions. Default system prompt tells agents they can run `alms --help` via shell_exec to discover CLI commands, enabling autonomous subagent creation.
-
-## Known Issues
-
-- `fs_*` tools are sandboxed via `canonicalize()` + prefix check against `tools.sandbox_root` (default: cwd)
-  - When a workspace is attached (via `with_workspace()`), `fs_read`/`fs_write`/`fs_list` are re-sandboxed to the agent's workspace directory, which is more restrictive than `tools.sandbox_root`
-  - Ephemeral subagents (without a named workspace) get a disposable workspace at `{workspace_dir}/.ephemeral/{task_id}/` to prevent project-root access; these are cleaned up automatically after the subagent completes
-  - `shell_exec` cwd is restricted in sandboxed mode, but the executed command itself can still access files outside the sandbox — for true shell isolation, use a restricted OS user or Landlock (future task)
-- `data/secrets.json` is protected by a filename denylist in `fs_read`, `fs_write`, `fs_list`, and `shell_exec` (argv + substring check)
-  - Denylist uses case-insensitive comparison to prevent bypass on Windows
-  - `fs_list` filters denied filenames from directory listings to prevent information disclosure
-  - This is best-effort — indirect access via shell variable expansion or encoding is still possible. For production deployments, set `ALMS_MASTER_KEY` to enable AES-256-GCM encryption of secrets at rest
-- Run cancellation does not propagate to active subagents — cancelling a parent run drops the `join_all` future but subagent tasks in the Coordinator continue running to completion (or timeout). This means subagent LLM calls keep burning tokens after the user cancels. Fix requires threading the parent's `CancellationToken` into `spawn_subagent`.
 
 ## Current State (as of 2026-03-28)
 
