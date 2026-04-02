@@ -32,11 +32,16 @@ async function selectSession(sessionId) {
     // Persist the selection for this agent
     saveActiveSession(activeAgentId.value, sessionId);
 
-    // Load runs for new session
+    // Load runs for new session and restore activeRunId if a run is in-progress.
     try {
         const data = await listRuns(sessionId);
         if (gen !== selectGeneration) return; // stale — discard
-        runs.value = data.runs || [];
+        const loaded = data.runs || [];
+        runs.value = loaded;
+        const active = loaded.find(r => r.status === 'queued' || r.status === 'running');
+        if (active) {
+            activeRunId.value = active.run_id;
+        }
     } catch {
         if (gen !== selectGeneration) return;
         runs.value = [];
@@ -54,6 +59,12 @@ async function selectSession(sessionId) {
     } catch (err) {
         if (gen !== selectGeneration) return;
         chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }];
+    }
+
+    // If a run is in-progress, append a thinking indicator so the user sees
+    // the cancel button and "Thinking..." state after switching sessions.
+    if (activeRunId.value && !chatMessages.value.some(m => m.type === 'thinking')) {
+        chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
     }
 
     if (gen !== selectGeneration) return; // final guard before opening stream

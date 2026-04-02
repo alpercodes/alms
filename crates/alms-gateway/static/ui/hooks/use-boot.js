@@ -88,6 +88,13 @@ async function loadAgentSessions(agentId) {
                 loadRunHistory(selected.id),
             ]);
             if (gen !== switchGeneration) return; // stale — discard
+            // If a run is in-progress, append a thinking indicator so the
+            // user sees the cancel button and "Thinking..." state.  This
+            // runs after both loadHistory and loadRunHistory have settled,
+            // avoiding the race where loadHistory overwrites the indicator.
+            if (activeRunId.value && !chatMessages.value.some(m => m.type === 'thinking')) {
+                chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
+            }
             // Open persistent session stream — skip replay of events
             // already reflected in the loaded message history.
             openSessionStream(selected.id, { lastEventId });
@@ -130,11 +137,24 @@ async function loadHistory(sessionId) {
 
 /**
  * Load run history for a session.
+ *
+ * If any run is still queued or running, restores `activeRunId` so the
+ * caller (loadAgentSessions) can append a thinking indicator after both
+ * history and runs have loaded.  This covers page refresh and session
+ * switch scenarios where the SSE `run_created` event has already been
+ * sent and won't be replayed.
  */
 async function loadRunHistory(sessionId) {
     try {
         const data = await listRuns(sessionId);
-        runs.value = data.runs || [];
+        const loaded = data.runs || [];
+        runs.value = loaded;
+
+        // Restore activeRunId from any in-progress run.
+        const active = loaded.find(r => r.status === 'queued' || r.status === 'running');
+        if (active) {
+            activeRunId.value = active.run_id;
+        }
     } catch {
         runs.value = [];
     }
