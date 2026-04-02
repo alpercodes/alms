@@ -2381,7 +2381,14 @@ pub struct SessionEventsQuery {
     /// Client-supplied last event ID — used when the browser's EventSource
     /// cannot send the `Last-Event-Id` header (i.e. the initial connection).
     /// Takes precedence over the header when both are present.
-    pub last_event_id: Option<u64>,
+    ///
+    /// Accepted as `String` (not `u64`) because ephemeral SSE events
+    /// (token_delta, status) use random UUIDs as their `id` field.  If the
+    /// last event the browser saw was ephemeral, the client may send a UUID
+    /// here.  Using `String` prevents Axum from rejecting the request with
+    /// a 422 deserialization error, which would break SSE reconnection and
+    /// leave the run appearing stuck (see #465 follow-up).
+    pub last_event_id: Option<String>,
 }
 
 /// GET /sessions/{session_id}/events — persistent session-level SSE stream.
@@ -2408,12 +2415,20 @@ pub async fn stream_session_events(
 
     // Query parameter takes precedence over header (the header is only sent
     // by the browser on automatic reconnects, not on the initial connection).
-    let last_event_id = query.last_event_id.or_else(|| {
-        headers
-            .get("last-event-id")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-    });
+    //
+    // Both sources may contain non-numeric values (UUIDs from ephemeral
+    // events), so we parse with `.ok()` to silently ignore unparseable
+    // values and fall back to replaying all events (from_id=0).
+    let last_event_id = query
+        .last_event_id
+        .as_deref()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| {
+            headers
+                .get("last-event-id")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+        });
     let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
 
     let (tx, rx) = event_channel();
