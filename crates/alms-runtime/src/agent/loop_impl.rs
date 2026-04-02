@@ -605,20 +605,24 @@ impl AgentRuntime {
             // input_tokens in `message_start` and output_tokens in
             // `message_delta` as separate events, so we merge by taking
             // the max of each field rather than overwriting the struct.
+            //
+            // NOTE: Anthropic sends each token count exactly once (not
+            // incrementally), so max() is equivalent to "take the non-zero
+            // value". If the protocol ever switches to incremental
+            // reporting, this would need to become additive.
             if let Some(chunk_usage) = chunk.usage {
                 usage = Some(match usage {
-                    Some(prev) => Usage {
-                        prompt_tokens: prev.prompt_tokens.max(chunk_usage.prompt_tokens),
-                        completion_tokens: prev
-                            .completion_tokens
-                            .max(chunk_usage.completion_tokens),
-                        total_tokens: 0, // recomputed below
-                    },
+                    Some(prev) => {
+                        let p = prev.prompt_tokens.max(chunk_usage.prompt_tokens);
+                        let c = prev.completion_tokens.max(chunk_usage.completion_tokens);
+                        Usage {
+                            prompt_tokens: p,
+                            completion_tokens: c,
+                            total_tokens: p + c,
+                        }
+                    }
                     None => chunk_usage,
                 });
-                if let Some(ref mut u) = usage {
-                    u.total_tokens = u.prompt_tokens + u.completion_tokens;
-                }
             }
 
             let Some(choice) = chunk.choices.into_iter().next() else {
