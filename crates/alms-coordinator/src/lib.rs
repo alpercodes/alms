@@ -71,7 +71,6 @@ pub struct TaskResult {
     pub task_id: TaskId,
     pub status: TaskStatus,
     pub result: serde_json::Value,
-    pub execution_time_ms: u64,
     pub tokens_used: Option<usize>,
 }
 
@@ -87,7 +86,6 @@ pub struct SubagentCompletion {
     pub status: TaskStatus,
     /// Truncated summary of the result (for context efficiency).
     pub summary: String,
-    pub execution_time_ms: u64,
     /// Parent session to notify.
     pub parent_session_id: SessionId,
     /// Parent agent ID (for run creation).
@@ -357,38 +355,6 @@ impl Coordinator {
     /// Returns `None` if the task does not exist or the receiver was already taken.
     pub fn take_result_rx(&self, task_id: TaskId) -> Option<oneshot::Receiver<TaskResult>> {
         self.subagents.get_mut(&task_id)?.result_rx.take()
-    }
-
-    /// Get the completed result for a finished background task.
-    ///
-    /// Returns `None` if the task is still running, not found, or is a
-    /// foreground task whose result was consumed by `dispatch()`.
-    pub fn get_completed_result(&self, task_id: TaskId) -> Option<TaskResult> {
-        self.subagents.get(&task_id)?.completed_result.clone()
-    }
-
-    /// Cancel a running subagent
-    pub fn cancel_subagent(&self, task_id: TaskId) -> AlmsResult<()> {
-        if let Some((_, handle)) = self.subagents.remove(&task_id) {
-            let _ = handle.cancel_tx.send(());
-            info!("Cancelled subagent {:?}", task_id);
-            Ok(())
-        } else {
-            Err(alms_core::AlmsError::AgentNotFound(task_id.0.to_string()))
-        }
-    }
-
-    /// Get status of a subagent
-    pub fn get_status(&self, task_id: TaskId) -> Option<TaskStatus> {
-        self.subagents.get(&task_id).map(|h| h.status)
-    }
-
-    /// List all active subagents
-    pub fn list_active(&self) -> Vec<(TaskId, TaskStatus)> {
-        self.subagents
-            .iter()
-            .map(|e| (*e.key(), e.value().status))
-            .collect()
     }
 }
 
@@ -685,7 +651,6 @@ async fn run_subagent(
         task_id,
         status: new_status,
         result: result_value,
-        execution_time_ms: start.elapsed().as_millis() as u64,
         tokens_used,
     };
 
@@ -714,7 +679,6 @@ async fn run_subagent(
             subagent_name: request.subagent_name.clone(),
             status: new_status,
             summary,
-            execution_time_ms: task_result.execution_time_ms,
             parent_session_id,
             parent_agent_id,
         };
@@ -1073,6 +1037,38 @@ async fn run_agent_loop(
     runtime
         .run(session_manager, context_id, &request.task)
         .await
+}
+
+#[cfg(test)]
+impl Coordinator {
+    /// Get the completed result for a finished background task (test-only).
+    pub fn get_completed_result(&self, task_id: TaskId) -> Option<TaskResult> {
+        self.subagents.get(&task_id)?.completed_result.clone()
+    }
+
+    /// Cancel a running subagent (test-only).
+    pub fn cancel_subagent(&self, task_id: TaskId) -> AlmsResult<()> {
+        if let Some((_, handle)) = self.subagents.remove(&task_id) {
+            let _ = handle.cancel_tx.send(());
+            info!("Cancelled subagent {:?}", task_id);
+            Ok(())
+        } else {
+            Err(alms_core::AlmsError::AgentNotFound(task_id.0.to_string()))
+        }
+    }
+
+    /// Get status of a subagent (test-only).
+    pub fn get_status(&self, task_id: TaskId) -> Option<TaskStatus> {
+        self.subagents.get(&task_id).map(|h| h.status)
+    }
+
+    /// List all active subagents (test-only).
+    pub fn list_active(&self) -> Vec<(TaskId, TaskStatus)> {
+        self.subagents
+            .iter()
+            .map(|e| (*e.key(), e.value().status))
+            .collect()
+    }
 }
 
 #[cfg(test)]

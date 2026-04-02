@@ -22,7 +22,7 @@ pub use run::{
     CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunRegistrar, RunStatus,
     RunStatusResponse, TokenUsage, ToolCallRecord, ToolCallRole, ran_ignore_message_successfully,
 };
-pub use source_label::{SourceLabel, derive_source_label, truncate_to_char_boundary};
+pub use source_label::{derive_source_label, truncate_to_char_boundary};
 
 /// Sentinel string returned by the agent loop when the max-iterations limit is
 /// hit.  Defined once so that the runtime (`agent.rs`) and the gateway

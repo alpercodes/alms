@@ -1,15 +1,11 @@
 pub mod job_store;
 pub mod sqlite;
-pub mod store;
 pub mod types;
 
 pub use alms_core::AuditEvent;
 pub use job_store::JobStore;
 pub use sqlite::SqliteStore;
-pub use store::{MemoryStore, SessionStore};
-pub use types::{
-    Content, ContextSummary, Message, Role, Session, SessionConfig, SessionStatus, SessionSummary,
-};
+pub use types::{Content, ContextSummary, Message, Role, Session, SessionConfig, SessionSummary};
 
 use alms_core::{AgentId, AlmsResult, RunId, SessionId};
 use dashmap::DashMap;
@@ -317,36 +313,6 @@ impl SessionManager {
         sessions
     }
 
-    /// Archive idle sessions
-    pub fn archive_idle(&self) -> usize {
-        let mut count = 0;
-        let timeout = std::time::Duration::from_secs(self.config.idle_timeout_secs);
-
-        for mut entry in self.sessions.iter_mut() {
-            let session = entry.value_mut();
-            let idle = alms_core::Timestamp::now().0 - session.last_activity.0;
-
-            if idle > chrono::Duration::from_std(timeout).unwrap_or_default()
-                && session.status == types::SessionStatus::Active
-            {
-                session.status = types::SessionStatus::Idle;
-                // Write-through updated status to SQLite
-                if let Some(store) = &self.store
-                    && let Err(e) = store.save_session(session)
-                {
-                    warn!(
-                        "Failed to persist idle status for session {:?}: {}",
-                        session.id, e
-                    );
-                }
-                count += 1;
-                info!("Archived idle session: {:?}", session.id);
-            }
-        }
-
-        count
-    }
-
     /// Delete a session
     pub fn delete(&self, agent_id: AgentId, context_id: impl AsRef<str>) -> AlmsResult<()> {
         let key = (agent_id, context_id.as_ref().to_string());
@@ -499,9 +465,42 @@ impl SessionManager {
 }
 
 #[cfg(test)]
+impl SessionManager {
+    /// Archive idle sessions (test-only — not wired to any production code path).
+    pub fn archive_idle(&self) -> usize {
+        let mut count = 0;
+        let timeout = std::time::Duration::from_secs(self.config.idle_timeout_secs);
+
+        for mut entry in self.sessions.iter_mut() {
+            let session = entry.value_mut();
+            let idle = alms_core::Timestamp::now().0 - session.last_activity.0;
+
+            if idle > chrono::Duration::from_std(timeout).unwrap_or_default()
+                && session.status == types::SessionStatus::Active
+            {
+                session.status = types::SessionStatus::Idle;
+                // Write-through updated status to SQLite
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save_session(session)
+                {
+                    warn!(
+                        "Failed to persist idle status for session {:?}: {}",
+                        session.id, e
+                    );
+                }
+                count += 1;
+                info!("Archived idle session: {:?}", session.id);
+            }
+        }
+
+        count
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Content, Message, Role};
+    use crate::types::{Content, Message, Role, SessionStatus};
 
     fn make_manager() -> SessionManager {
         let store = SqliteStore::open_in_memory().unwrap();

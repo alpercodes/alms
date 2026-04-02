@@ -1,5 +1,7 @@
 use crate::sandbox::SandboxConfig;
-use crate::{NativeTool, SandboxError, Tool, ToolDef, WasmTool, error::SandboxResult};
+#[cfg(test)]
+use crate::{NativeTool, ToolDef, WasmTool};
+use crate::{SandboxError, Tool, error::SandboxResult};
 use dashmap::DashMap;
 use serde_json::Value;
 use std::sync::Arc;
@@ -10,7 +12,9 @@ use tracing::{debug, error, info, warn};
 pub struct ToolRegistry {
     /// Registered tools: name -> tool
     tools: Arc<DashMap<String, Arc<dyn Tool>>>,
-    /// Default sandbox config for WASM tools
+    /// Default sandbox config for WASM tools (currently only used in test builds;
+    /// will be used in production when WASM tool loading is wired).
+    #[allow(dead_code)]
     default_config: SandboxConfig,
     /// When non-empty, only tools whose name appears in this list can be
     /// registered. This filter applies to **all** `register()` calls —
@@ -26,15 +30,6 @@ impl ToolRegistry {
         Self {
             tools: Arc::new(DashMap::new()),
             default_config: SandboxConfig::default(),
-            enabled_filter: Arc::new(Vec::new()),
-        }
-    }
-
-    /// Create a new registry with custom default config
-    pub fn with_config(config: SandboxConfig) -> Self {
-        Self {
-            tools: Arc::new(DashMap::new()),
-            default_config: config,
             enabled_filter: Arc::new(Vec::new()),
         }
     }
@@ -69,31 +64,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Register a native tool
-    pub fn register_native<F>(&self, name: impl Into<String>, handler: F) -> SandboxResult<()>
-    where
-        F: Fn(Value) -> SandboxResult<Value> + Send + Sync + 'static,
-    {
-        let tool = NativeTool::new(name, handler);
-        self.register(Arc::new(tool))
-    }
-
-    /// Register a WASM tool from definition
-    pub fn register_wasm(&self, def: ToolDef) -> SandboxResult<()> {
-        let tool = WasmTool::new(def, self.default_config.clone())?;
-        self.register(Arc::new(tool))
-    }
-
-    /// Register a WASM tool with custom config
-    pub fn register_wasm_with_config(
-        &self,
-        def: ToolDef,
-        config: SandboxConfig,
-    ) -> SandboxResult<()> {
-        let tool = WasmTool::new(def, config)?;
-        self.register(Arc::new(tool))
-    }
-
     /// Lookup a tool by name
     pub fn lookup(&self, name: &str) -> SandboxResult<Arc<dyn Tool>> {
         self.tools
@@ -107,63 +77,9 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
-    /// Unregister a tool
-    pub fn unregister(&self, name: &str) -> SandboxResult<()> {
-        if self.tools.remove(name).is_some() {
-            info!("Unregistered tool: {}", name);
-            Ok(())
-        } else {
-            Err(SandboxError::ToolNotFound(name.to_string()))
-        }
-    }
-
     /// List all registered tool names
     pub fn list(&self) -> Vec<String> {
         self.tools.iter().map(|e| e.key().clone()).collect()
-    }
-
-    /// List built-in tools
-    pub fn list_builtin(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .filter(|e| e.value().is_builtin())
-            .map(|e| e.key().clone())
-            .collect()
-    }
-
-    /// List WASM tools
-    pub fn list_wasm(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .filter(|e| e.value().is_wasm())
-            .map(|e| e.key().clone())
-            .collect()
-    }
-
-    /// Get the number of registered tools
-    pub fn len(&self) -> usize {
-        self.tools.len()
-    }
-
-    /// Check if registry is empty
-    pub fn is_empty(&self) -> bool {
-        self.tools.is_empty()
-    }
-
-    /// Clear all tools
-    pub fn clear(&self) {
-        self.tools.clear();
-        info!("Cleared all tools from registry");
-    }
-
-    /// Get the default sandbox config
-    pub fn default_config(&self) -> &SandboxConfig {
-        &self.default_config
-    }
-
-    /// Set the default sandbox config
-    pub fn set_default_config(&mut self, config: SandboxConfig) {
-        self.default_config = config;
     }
 
     /// Create a registry with all built-in tools registered (unrestricted).
@@ -275,6 +191,97 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+impl ToolRegistry {
+    /// Create a new registry with custom default config (test-only).
+    pub fn with_config(config: SandboxConfig) -> Self {
+        Self {
+            tools: Arc::new(DashMap::new()),
+            default_config: config,
+            enabled_filter: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Register a native tool (test-only).
+    pub fn register_native<F>(&self, name: impl Into<String>, handler: F) -> SandboxResult<()>
+    where
+        F: Fn(Value) -> SandboxResult<Value> + Send + Sync + 'static,
+    {
+        let tool = NativeTool::new(name, handler);
+        self.register(Arc::new(tool))
+    }
+
+    /// Register a WASM tool from definition (test-only).
+    pub fn register_wasm(&self, def: ToolDef) -> SandboxResult<()> {
+        let tool = WasmTool::new(def, self.default_config.clone())?;
+        self.register(Arc::new(tool))
+    }
+
+    /// Register a WASM tool with custom config (test-only).
+    pub fn register_wasm_with_config(
+        &self,
+        def: ToolDef,
+        config: SandboxConfig,
+    ) -> SandboxResult<()> {
+        let tool = WasmTool::new(def, config)?;
+        self.register(Arc::new(tool))
+    }
+
+    /// Unregister a tool (test-only).
+    pub fn unregister(&self, name: &str) -> SandboxResult<()> {
+        if self.tools.remove(name).is_some() {
+            info!("Unregistered tool: {}", name);
+            Ok(())
+        } else {
+            Err(SandboxError::ToolNotFound(name.to_string()))
+        }
+    }
+
+    /// List built-in tools (test-only).
+    pub fn list_builtin(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|e| e.value().is_builtin())
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// List WASM tools (test-only).
+    pub fn list_wasm(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|e| e.value().is_wasm())
+            .map(|e| e.key().clone())
+            .collect()
+    }
+
+    /// Get the number of registered tools (test-only).
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Check if registry is empty (test-only).
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+
+    /// Clear all tools (test-only).
+    pub fn clear(&self) {
+        self.tools.clear();
+        info!("Cleared all tools from registry");
+    }
+
+    /// Get the default sandbox config (test-only).
+    pub fn default_config(&self) -> &SandboxConfig {
+        &self.default_config
+    }
+
+    /// Set the default sandbox config (test-only).
+    pub fn set_default_config(&mut self, config: SandboxConfig) {
+        self.default_config = config;
     }
 }
 
