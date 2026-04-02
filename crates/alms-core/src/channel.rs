@@ -121,18 +121,6 @@ impl OutgoingMessage {
             options: None,
         }
     }
-
-    pub fn reply_to(mut self, message_id: MessageId) -> Self {
-        self.reply_to = Some(message_id);
-        self
-    }
-}
-
-/// A message that can be either incoming or outgoing
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ChannelMessage {
-    Incoming(IncomingMessage),
-    Outgoing(OutgoingMessage),
 }
 
 /// Configuration for a channel adapter
@@ -192,9 +180,6 @@ pub trait Channel: Send + Sync {
     /// Stop the channel
     async fn stop(&self) -> AlmsResult<()>;
 }
-
-/// A boxed channel for dynamic dispatch
-pub type BoxedChannel = Box<dyn Channel>;
 
 #[cfg(test)]
 mod tests {

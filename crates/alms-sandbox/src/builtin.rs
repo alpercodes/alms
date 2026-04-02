@@ -5,9 +5,6 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use tracing::warn;
 
-/// Built-in tool trait marker
-pub trait BuiltinTool: Tool {}
-
 /// Filenames that must never be accessed by agent tools.
 ///
 /// These are checked against the final component of resolved paths in fs_read,
@@ -248,8 +245,6 @@ impl Tool for EchoTool {
     }
 }
 
-impl BuiltinTool for EchoTool {}
-
 /// Math tool - performs mathematical operations
 #[derive(Debug, Clone, Default)]
 pub struct MathTool;
@@ -417,8 +412,6 @@ impl Tool for MathTool {
     }
 }
 
-impl BuiltinTool for MathTool {}
-
 /// HTTP GET tool - performs HTTP GET requests
 #[derive(Debug, Clone)]
 pub struct HttpGetTool {
@@ -434,11 +427,6 @@ impl HttpGetTool {
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client }
-    }
-
-    /// Create with a custom client
-    pub fn with_client(client: reqwest::Client) -> Self {
         Self { client }
     }
 }
@@ -537,8 +525,6 @@ impl Tool for HttpGetTool {
         Ok(result)
     }
 }
-
-impl BuiltinTool for HttpGetTool {}
 
 // ---------------------------------------------------------------------------
 // Shell execution tool
@@ -810,8 +796,6 @@ impl Tool for ShellExecTool {
     }
 }
 
-impl BuiltinTool for ShellExecTool {}
-
 // ---------------------------------------------------------------------------
 // Filesystem tools
 // ---------------------------------------------------------------------------
@@ -901,8 +885,6 @@ impl Tool for FsReadTool {
         Ok(serde_json::json!({ "content": result }))
     }
 }
-
-impl BuiltinTool for FsReadTool {}
 
 /// Write (or append to) a file on the filesystem.
 #[derive(Debug, Clone, Default)]
@@ -1035,8 +1017,6 @@ impl Tool for FsWriteTool {
     }
 }
 
-impl BuiltinTool for FsWriteTool {}
-
 /// List directory contents.
 #[derive(Debug, Clone, Default)]
 pub struct FsListTool {
@@ -1133,8 +1113,6 @@ impl Tool for FsListTool {
         Ok(serde_json::json!({ "path": path, "entries": entries }))
     }
 }
-
-impl BuiltinTool for FsListTool {}
 
 #[cfg(test)]
 mod tests {

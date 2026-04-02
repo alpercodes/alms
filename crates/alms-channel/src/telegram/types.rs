@@ -121,8 +121,12 @@ impl SendMessageRequest {
     }
 }
 
-/// Response from sending a message
+/// Response from sending a message.
+///
+/// Fields beyond `message_id` are required for Serde deserialization of the
+/// Telegram API response but are not read by application code.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 pub struct SentMessage {
     pub message_id: i64,
     pub chat: Chat,

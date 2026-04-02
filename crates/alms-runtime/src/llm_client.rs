@@ -66,11 +66,6 @@ impl LlmClient {
         })
     }
 
-    /// Create from environment variables
-    pub fn from_env() -> AlmsResult<Self> {
-        Self::new(LlmConfig::from_env())
-    }
-
     /// Create a completion request builder, adapting format per provider.
     fn build_request(&self, request: &CompletionRequest) -> AlmsResult<RequestBuilder> {
         match self.provider {
@@ -338,25 +333,6 @@ impl LlmClient {
             }
         }
         SseParseResult::Skip
-    }
-
-    /// Quick completion with default model
-    pub async fn quick_complete(&self, messages: Vec<LlmMessage>) -> AlmsResult<String> {
-        let request = CompletionRequest::new(&self.config.default_model).with_messages(messages);
-
-        let response = self.complete(request).await?;
-
-        let choice =
-            response.choices.into_iter().next().ok_or_else(|| {
-                AlmsError::Runtime("LLM returned empty choices array".to_string())
-            })?;
-
-        choice.message.content.ok_or_else(|| {
-            AlmsError::Runtime(
-                "LLM returned null content (tool-call-only response in non-tool context)"
-                    .to_string(),
-            )
-        })
     }
 
     fn mock_response(&self, request: &CompletionRequest) -> CompletionResponse {

@@ -164,11 +164,6 @@ impl CompletionRequest {
         self.max_tokens = Some(tokens);
         self
     }
-
-    pub fn with_streaming(mut self) -> Self {
-        self.stream = Some(true);
-        self
-    }
 }
 
 /// LLM completion response

@@ -205,19 +205,6 @@ impl TelegramChannel {
         self.get("getMe").await
     }
 
-    /// Send a raw message via the API.
-    ///
-    /// **Warning**: bypasses `split_message` — caller must ensure `text` fits
-    /// within [`TELEGRAM_MAX_MESSAGE_LEN`] or handle splitting themselves.
-    pub async fn send_raw_message(
-        &self,
-        chat_id: i64,
-        text: impl Into<String>,
-    ) -> AlmsResult<SentMessage> {
-        let request = SendMessageRequest::new(chat_id, text);
-        self.post("sendMessage", &request).await
-    }
-
     /// Get updates via polling
     async fn get_updates(&self, offset: Option<i64>) -> AlmsResult<Vec<Update>> {
         let mut request = GetUpdatesRequest::new();

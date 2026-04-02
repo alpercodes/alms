@@ -8,8 +8,7 @@ pub mod registry;
 pub mod sandbox;
 
 pub use builtin::{
-    BuiltinTool, EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
-    ShellExecTool,
+    EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool, ShellExecTool,
 };
 pub use error::{SandboxError, SandboxResult};
 pub use registry::ToolRegistry;
@@ -68,16 +67,6 @@ impl ToolDef {
         }
     }
 
-    /// Create a new tool definition (for built-in tools)
-    pub fn new_builtin(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            description: String::new(),
-            wasm_bytes: None,
-            entry_point: "execute".to_string(),
-        }
-    }
-
     /// Set the description
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
         self.description = desc.into();
@@ -115,11 +104,6 @@ impl WasmTool {
             entry_point: def.entry_point,
             config,
         })
-    }
-
-    /// Get the WASM bytes
-    pub fn wasm_bytes(&self) -> &[u8] {
-        &self.wasm_bytes
     }
 }
 

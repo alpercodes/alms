@@ -8,7 +8,7 @@ pub mod run;
 pub mod secrets;
 pub mod source_label;
 
-pub use channel::{Channel, ChannelConfig, ChannelMessage, IncomingMessage, OutgoingMessage};
+pub use channel::{Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
 
 pub use audit::{AuditDecision, AuditEvent};
 pub use config::AlmsConfig;

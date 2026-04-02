@@ -257,12 +257,6 @@ impl AgentRuntime {
         }
     }
 
-    /// Create with default config
-    pub fn with_defaults(agent_id: AgentId) -> AlmsResult<Self> {
-        let llm = LlmClient::from_env()?;
-        Self::new(agent_id, AgentConfig::default(), llm)
-    }
-
     /// Run the agent on a single input
     #[instrument(
         level = "info",
