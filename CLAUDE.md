@@ -42,7 +42,7 @@ crates/
                      #   SubagentDispatcher, MessageSender traits
                      #   EventForwarder trait for type-erased runtime event forwarding
   alms-coordinator/  # Multi-agent orchestration — pure hierarchy, real AgentRuntime loops
-  alms-session/      # Session store, JSON snapshot persistence (atomic + rotation + checksums)
+  alms-session/      # Session management, SQLite persistence, episodic summary storage
                      #   sqlite/session_summaries.rs — per-session episodic summary persistence
   alms-sandbox/      # WASM tool sandbox, builtin tools (echo, math, http_get), registry
   alms-channel/      # Channel adapters (Telegram polling implemented)
