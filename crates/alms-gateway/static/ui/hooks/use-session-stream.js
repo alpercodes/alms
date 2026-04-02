@@ -122,9 +122,20 @@ export function openSessionStream(sessionId, opts) {
     sessionRetryCount = 0;
     lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
 
-    /** Wrap an event handler to track the highest seen SSE event ID. */
+    /**
+     * Wrap an event handler to track the highest seen SSE event ID.
+     *
+     * Only numeric IDs (from the session event log) are tracked.
+     * Ephemeral events (token_delta, status) use random UUID IDs that
+     * cannot be parsed back to a u64 on the server.  If we stored a UUID
+     * here and then reconnected with `?last_event_id=<uuid>`, the backend
+     * would reject the request (query param expects u64), breaking SSE
+     * reconnection and leaving the run appearing stuck.
+     */
     const on = (type, handler) => es.addEventListener(type, (e) => {
-        if (e.lastEventId) lastSeenEventId = e.lastEventId;
+        if (e.lastEventId && /^\d+$/.test(e.lastEventId)) {
+            lastSeenEventId = e.lastEventId;
+        }
         handler(e);
     });
 
