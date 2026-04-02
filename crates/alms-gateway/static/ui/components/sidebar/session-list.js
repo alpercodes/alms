@@ -53,7 +53,7 @@ async function selectSession(sessionId) {
         if (data.last_event_id != null) lastEventId = data.last_event_id;
     } catch (err) {
         if (gen !== selectGeneration) return;
-        chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.message || 'unknown error'}` }];
+        chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }];
     }
 
     if (gen !== selectGeneration) return; // final guard before opening stream

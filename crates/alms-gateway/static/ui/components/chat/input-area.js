@@ -32,7 +32,7 @@ export async function startRun(text) {
     } catch (err) {
         chatMessages.value = chatMessages.value
             .filter(m => m.type !== 'thinking')
-            .concat([{ id: nextMsgId(), type: 'error', text: `Failed to start run: ${err.message || err.status || 'unknown error'}` }]);
+            .concat([{ id: nextMsgId(), type: 'error', text: `Failed to start run: ${err.error?.message || err.message || err.status || 'unknown error'}` }]);
         console.error('[startRun] failed:', err);
     }
 }
