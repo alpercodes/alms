@@ -123,7 +123,7 @@ async function loadHistory(sessionId) {
         return data.last_event_id ?? null;
     } catch (err) {
         console.error('[loadHistory] failed:', err);
-        chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.message || 'unknown error'}` }];
+        chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }];
         return null;
     }
 }

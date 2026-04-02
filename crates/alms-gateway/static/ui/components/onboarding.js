@@ -32,7 +32,7 @@ export function OnboardingView() {
                 console.warn('[onboarding] POST /agents returned no id for agent:', val, resp);
             }
         } catch (err) {
-            error.value = err.message || 'Failed to create agent';
+            error.value = err.error?.message || err.message || 'Failed to create agent';
         } finally {
             loading.value = false;
         }
