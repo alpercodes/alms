@@ -305,7 +305,8 @@ async fn test_guarded_posture_sequential_approvals() {
         mock: true,
         ..LlmConfig::default()
     };
-    let tools = crate::ToolRegistry::with_builtins_sandboxed(None, true, &["echo".to_string()]);
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["echo".to_string()]);
     let session_config = SessionConfig::default();
     let session_manager = SessionManager::new(session_config);
     let agent_id = AgentId::new();

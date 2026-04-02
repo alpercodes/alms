@@ -113,7 +113,7 @@ impl SendMessageRequest {
         self
     }
 
-    // TODO: use when sending Markdown/HTML-formatted messages
+    // TODO(dead-code): test-only method — consider gating behind #[cfg(test)]
     #[allow(dead_code)]
     pub fn parse_mode(mut self, mode: impl Into<String>) -> Self {
         self.parse_mode = Some(mode.into());

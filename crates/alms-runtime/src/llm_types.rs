@@ -296,6 +296,7 @@ impl From<alms_core::config::LlmConfig> for LlmConfig {
 }
 
 impl LlmConfig {
+    // TODO(dead-code): test-only helper (~30 lines) — consider gating behind #[cfg(test)]
     pub fn from_env() -> Self {
         let mut config = Self::default();
 

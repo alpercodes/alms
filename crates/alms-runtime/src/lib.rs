@@ -21,13 +21,11 @@ pub mod tools;
 pub mod workspace;
 pub mod workspace_tool;
 
-pub use agent::{AgentConfig, AgentRuntime, Posture, RunOutput, SystemPrompts};
-pub use context::ContextBuilder;
+pub use agent::{AgentConfig, AgentRuntime, Posture, RunOutput};
 pub use events::{RuntimeEvent, RuntimeEventSender};
 pub use llm_client::LlmClient;
 pub use llm_types::*;
-pub use scheduler::{JobRun, Scheduler};
-pub use tools::ToolRegistry;
+pub use scheduler::Scheduler;
 pub use workspace::{AgentWorkspace, WorkspaceFile};
 
 // Re-export core types for convenience
