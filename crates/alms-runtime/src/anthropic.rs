@@ -79,6 +79,9 @@ pub(crate) struct AnthropicResponse {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct AnthropicUsage {
+    /// Input (prompt) tokens. Defaults to 0 for streaming `message_delta`
+    /// events which only carry `output_tokens`.
+    #[serde(default)]
     pub input_tokens: u32,
     pub output_tokens: u32,
 }
@@ -696,5 +699,38 @@ mod tests {
     fn test_parse_anthropic_sse_message_stop() {
         let result = parse_anthropic_sse("message_stop", "{}");
         assert!(matches!(result, SseParseResult::Done));
+    }
+
+    /// Anthropic `message_delta` events include only `output_tokens` in the
+    /// usage field (no `input_tokens`). Verify that `AnthropicUsage`
+    /// deserializes correctly with `input_tokens` defaulting to 0.
+    #[test]
+    fn test_message_delta_usage_missing_input_tokens() {
+        let data = r#"{"type":"message_delta","delta":{"type":"message_delta","stop_reason":"end_turn"},"usage":{"output_tokens":42}}"#;
+        let result = parse_anthropic_sse("message_delta", data);
+        match result {
+            SseParseResult::Chunk(chunk) => {
+                let usage = chunk.usage.expect("usage should be present");
+                assert_eq!(usage.completion_tokens, 42);
+                // input_tokens defaults to 0 when absent from the JSON
+                assert_eq!(usage.prompt_tokens, 0);
+            }
+            other => panic!("Expected Chunk, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// Verify that `message_start` usage (with both fields) deserializes correctly.
+    #[test]
+    fn test_message_start_usage_has_both_fields() {
+        let data = r#"{"type":"message_start","message":{"id":"msg_1","content":[],"model":"claude","stop_reason":null,"usage":{"input_tokens":150,"output_tokens":0}}}"#;
+        let result = parse_anthropic_sse("message_start", data);
+        match result {
+            SseParseResult::Chunk(chunk) => {
+                let usage = chunk.usage.expect("usage should be present");
+                assert_eq!(usage.prompt_tokens, 150);
+                assert_eq!(usage.completion_tokens, 0);
+            }
+            other => panic!("Expected Chunk, got {:?}", std::mem::discriminant(&other)),
+        }
     }
 }

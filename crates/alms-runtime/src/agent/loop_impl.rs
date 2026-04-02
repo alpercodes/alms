@@ -601,9 +601,28 @@ impl AgentRuntime {
         while let Some(result) = stream.next().await {
             let chunk = result?;
 
-            // Capture usage from final chunk
-            if chunk.usage.is_some() {
-                usage = chunk.usage;
+            // Accumulate usage across chunks. Anthropic streaming sends
+            // input_tokens in `message_start` and output_tokens in
+            // `message_delta` as separate events, so we merge by taking
+            // the max of each field rather than overwriting the struct.
+            //
+            // NOTE: Anthropic sends each token count exactly once (not
+            // incrementally), so max() is equivalent to "take the non-zero
+            // value". If the protocol ever switches to incremental
+            // reporting, this would need to become additive.
+            if let Some(chunk_usage) = chunk.usage {
+                usage = Some(match usage {
+                    Some(prev) => {
+                        let p = prev.prompt_tokens.max(chunk_usage.prompt_tokens);
+                        let c = prev.completion_tokens.max(chunk_usage.completion_tokens);
+                        Usage {
+                            prompt_tokens: p,
+                            completion_tokens: c,
+                            total_tokens: p + c,
+                        }
+                    }
+                    None => chunk_usage,
+                });
             }
 
             let Some(choice) = chunk.choices.into_iter().next() else {
