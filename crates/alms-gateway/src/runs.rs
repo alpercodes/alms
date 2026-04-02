@@ -1738,6 +1738,11 @@ async fn enqueue_triggered_run(
     run_id
 }
 
+/// Template for subagent completion notifications, loaded at compile time from
+/// `crates/alms-runtime/prompts/subagent_completed.md`.
+const SUBAGENT_COMPLETED_TEMPLATE: &str =
+    include_str!("../../alms-runtime/prompts/subagent_completed.md");
+
 /// Format a human-readable notification message for the parent agent.
 fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> String {
     let status = match c.status {
@@ -1758,14 +1763,11 @@ fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> S
         ),
     };
 
-    format!(
-        "[Subagent notification] Background subagent {label} has {status}.\n\
-         \n\
-         Summary: {summary}\n\
-         \n\
-         {follow_up}",
-        summary = c.summary,
-    )
+    SUBAGENT_COMPLETED_TEMPLATE
+        .replace("{label}", &label)
+        .replace("{status}", status)
+        .replace("{summary}", &c.summary)
+        .replace("{follow_up}", &follow_up)
 }
 
 /// Maximum character length for the formatted conversation transcript
@@ -1773,6 +1775,16 @@ fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> S
 /// truncated from the beginning (keeping the most recent messages) so the
 /// agent sees the tail of the discussion.
 const DM_HISTORY_MAX_CHARS: usize = 4000;
+
+/// Template for DM-ended notification with conversation history, loaded at
+/// compile time from `crates/alms-runtime/prompts/dm_ended_with_history.md`.
+const DM_ENDED_WITH_HISTORY_TEMPLATE: &str =
+    include_str!("../../alms-runtime/prompts/dm_ended_with_history.md");
+
+/// Template for DM-ended notification without history (fallback), loaded at
+/// compile time from `crates/alms-runtime/prompts/dm_ended_no_history.md`.
+const DM_ENDED_NO_HISTORY_TEMPLATE: &str =
+    include_str!("../../alms-runtime/prompts/dm_ended_no_history.md");
 
 /// Format a human-readable notification message for a DM conversation ending.
 ///
@@ -1800,29 +1812,15 @@ fn format_dm_ended_notification(
     };
 
     match conversation_history {
-        Some(history) if !history.is_empty() => {
-            format!(
-                "[DM conversation ended] {reason_text}\n\
-                 \n\
-                 Below is the full conversation history:\n\
-                 \n\
-                 {history}\n\
-                 \n\
-                 Decide what to do next: report results, update your \
-                 goals/memories, or take other action.",
-            )
-        }
+        Some(history) if !history.is_empty() => DM_ENDED_WITH_HISTORY_TEMPLATE
+            .replace("{reason}", &reason_text)
+            .replace("{history}", history),
         _ => {
             // Fallback: no history available (session already cleaned up,
             // or error reading it). Point the agent at read_messages.
-            format!(
-                "[DM conversation ended] {reason_text}\n\
-                 \n\
-                 You can use read_messages(from: \"{from}\") to review the conversation \
-                 history. Decide what to do next: report results, update your \
-                 goals/memories, or take other action.",
-                from = from_name,
-            )
+            DM_ENDED_NO_HISTORY_TEMPLATE
+                .replace("{reason}", &reason_text)
+                .replace("{from}", from_name)
         }
     }
 }

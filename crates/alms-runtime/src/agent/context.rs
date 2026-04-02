@@ -290,13 +290,10 @@ impl AgentRuntime {
         // When agent labels are present (DM session), prepend an instruction
         // to the transcript so the summarizer preserves attribution.
         if has_agent_labels {
-            sum_messages.push(LlmMessage::user(format!(
-                "This is a conversation between agents. \
-                 Preserve who said what — use agent names \
-                 (e.g., 'Alice requested X, Bob agreed to Y'). \
-                 Lines starting with 'You (name):' are from the perspective agent.\n\n{}",
-                transcript
-            )));
+            let dm_summarizer_template = include_str!("../../prompts/dm_summarizer.md").trim();
+            sum_messages.push(LlmMessage::user(
+                dm_summarizer_template.replace("{transcript}", &transcript),
+            ));
         } else {
             sum_messages.push(LlmMessage::user(transcript));
         }

@@ -317,7 +317,7 @@ mod tests {
     fn to_display_string_tool_result_truncated_cjk() {
         // CJK characters are 3 bytes each. 667 chars = 2001 bytes, so byte
         // offset 2000 lands in the middle of the last character.
-        let long: String = std::iter::repeat('\u{4E16}').take(1000).collect(); // 3000 bytes
+        let long: String = "世".repeat(1000); // 3000 bytes
         let c = Content::ToolResult {
             tool_id: "t4".into(),
             result: serde_json::Value::String(long),

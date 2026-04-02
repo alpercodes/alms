@@ -69,10 +69,10 @@ pub(crate) const DM_TEXT_ONLY_MAX_RETRIES: u32 = 1;
 /// Error message injected into the conversation when the agent responds
 /// with text only in a DM session instead of using `send_message` or
 /// `ignore_message`.
-pub(crate) const DM_TEXT_ONLY_RETRY_MSG: &str = "ERROR: Your text-only response was NOT delivered to the other agent. \
-     In a direct message conversation you MUST use either the `send_message` tool \
-     to reply or the `ignore_message` tool to explicitly decline. \
-     Plain text responses are discarded. Please try again using the correct tool.";
+///
+/// Loaded at compile time from `crates/alms-runtime/prompts/dm_text_only_retry.md`.
+pub(crate) const DM_TEXT_ONLY_RETRY_MSG: &str =
+    include_str!("../../prompts/dm_text_only_retry.md").trim_ascii();
 
 /// Check whether `send_message` or `ignore_message` was **successfully**
 /// called at any point during the run by inspecting the accumulated tool

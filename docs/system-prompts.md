@@ -16,6 +16,11 @@ files (`personality.md`, `goals.md`, `memories.md`, `user.md`).
 | `subagent.md` | Default system prompt for ephemeral (unnamed) subagents spawned via `invoke_agent`. | `DEFAULT_SUBAGENT_PROMPT` constant in `crates/alms-coordinator/src/lib.rs` |
 | `summarizer.md` | System prompt for the sliding-summary LLM call that compresses old conversation history into a rolling summary. | `maybe_summarize()` in `crates/alms-runtime/src/agent/context.rs` |
 | `session_summarizer.md` | System prompt for the episodic memory LLM call that generates cross-session summaries after each run. Focus on *what was accomplished*, not how. 1-3 sentences, past tense. | `generate_llm()` in `crates/alms-runtime/src/episodic.rs` |
+| `dm_summarizer.md` | DM-specific instruction prepended to the summarizer transcript. Tells the LLM to preserve per-agent attribution. Contains a `{transcript}` placeholder. | `maybe_summarize()` in `crates/alms-runtime/src/agent/context.rs` |
+| `dm_text_only_retry.md` | Error message injected when an agent uses a text-only response in a DM session instead of `send_message`/`ignore_message`. | `dm_text_only_retry()` in `crates/alms-runtime/src/agent/dm.rs` |
+| `dm_ended_with_history.md` | DM conversation ended notification template with embedded transcript. Contains `{reason}` and `{history}` placeholders. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs.rs` |
+| `dm_ended_no_history.md` | Fallback DM conversation ended notification when history is unavailable. Contains `{reason}` and `{from}` placeholders. Points agent to `read_messages`. | `format_dm_ended_notification()` in `crates/alms-gateway/src/runs.rs` |
+| `subagent_completed.md` | Background subagent completion notification template. Contains `{label}`, `{status}`, `{summary}`, and `{follow_up}` placeholders. | `format_completion_notification()` in `crates/alms-gateway/src/runs.rs` |
 
 ## When Each Prompt Is Used
 

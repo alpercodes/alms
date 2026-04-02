@@ -1,0 +1,1 @@
+ERROR: Your text-only response was NOT delivered to the other agent. In a direct message conversation you MUST use either the `send_message` tool to reply or the `ignore_message` tool to explicitly decline. Plain text responses are discarded. Please try again using the correct tool.
