@@ -130,11 +130,29 @@ async function loadHistory(sessionId) {
 
 /**
  * Load run history for a session.
+ *
+ * If any run is still queued or running, restores `activeRunId` and appends
+ * a thinking indicator to chatMessages so the UI shows the cancel button
+ * and "Thinking..." state.  This covers page refresh and session switch
+ * scenarios where the SSE `run_created` event has already been sent and
+ * won't be replayed (its event ID is below the `last_event_id` watermark).
  */
 async function loadRunHistory(sessionId) {
     try {
         const data = await listRuns(sessionId);
-        runs.value = data.runs || [];
+        const loaded = data.runs || [];
+        runs.value = loaded;
+
+        // Restore activeRunId from any in-progress run.
+        const active = loaded.find(r => r.status === 'queued' || r.status === 'running');
+        if (active) {
+            activeRunId.value = active.run_id;
+            // Append a thinking indicator if one is not already present.
+            const msgs = chatMessages.value;
+            if (!msgs.some(m => m.type === 'thinking')) {
+                chatMessages.value = [...msgs, { id: nextMsgId(), type: 'thinking' }];
+            }
+        }
     } catch {
         runs.value = [];
     }
