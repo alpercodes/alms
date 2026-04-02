@@ -1503,3 +1503,64 @@ fn test_dm_tool_was_called_conflict_then_success() {
         "After conflict resolution, a successful send_message should be detected"
     );
 }
+
+/// Verify that streaming usage is accumulated (merged) across chunks rather
+/// than overwritten.  Anthropic sends `input_tokens` in `message_start` and
+/// `output_tokens` in `message_delta` as separate events; the accumulator
+/// must combine them.
+#[test]
+fn test_streaming_usage_accumulation() {
+    // Simulate two chunks: first has prompt_tokens, second has completion_tokens
+    let first = Usage {
+        prompt_tokens: 150,
+        completion_tokens: 0,
+        total_tokens: 150,
+    };
+    let second = Usage {
+        prompt_tokens: 0,
+        completion_tokens: 75,
+        total_tokens: 75,
+    };
+
+    // Replicate the accumulation logic from stream_llm_call
+    let mut usage: Option<Usage> = None;
+
+    // Process first chunk
+    let chunk_usage = first;
+    usage = Some(match usage {
+        Some(prev) => Usage {
+            prompt_tokens: prev.prompt_tokens.max(chunk_usage.prompt_tokens),
+            completion_tokens: prev.completion_tokens.max(chunk_usage.completion_tokens),
+            total_tokens: 0,
+        },
+        None => chunk_usage,
+    });
+    if let Some(ref mut u) = usage {
+        u.total_tokens = u.prompt_tokens + u.completion_tokens;
+    }
+
+    // Process second chunk
+    let chunk_usage = second;
+    usage = Some(match usage {
+        Some(prev) => Usage {
+            prompt_tokens: prev.prompt_tokens.max(chunk_usage.prompt_tokens),
+            completion_tokens: prev.completion_tokens.max(chunk_usage.completion_tokens),
+            total_tokens: 0,
+        },
+        None => chunk_usage,
+    });
+    if let Some(ref mut u) = usage {
+        u.total_tokens = u.prompt_tokens + u.completion_tokens;
+    }
+
+    let u = usage.expect("usage should be set");
+    assert_eq!(
+        u.prompt_tokens, 150,
+        "prompt_tokens should come from first chunk"
+    );
+    assert_eq!(
+        u.completion_tokens, 75,
+        "completion_tokens should come from second chunk"
+    );
+    assert_eq!(u.total_tokens, 225, "total should be sum of both");
+}
