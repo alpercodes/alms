@@ -139,6 +139,7 @@ impl Scheduler {
         self.notify.notify_one();
     }
 
+    // TODO(dead-code): test-only — can't cleanly gate because JobRun/history are woven into production struct
     /// Return a snapshot of all completed job runs in chronological order.
     pub async fn completed_runs(&self) -> Vec<JobRun> {
         self.history.lock().await.clone()

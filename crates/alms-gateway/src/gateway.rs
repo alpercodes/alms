@@ -69,6 +69,7 @@ impl GatewayConfig {
         Self::default()
     }
 
+    // TODO(dead-code): test-only builder — consider gating behind #[cfg(test)]
     pub fn with_telegram_token(mut self, token: impl Into<String>) -> Self {
         self.telegram_token = Some(token.into());
         self

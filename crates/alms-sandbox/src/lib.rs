@@ -47,6 +47,7 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
     }
 }
 
+// TODO(dead-code): zero current external consumers — real WASM infra, keep until wired
 /// Tool definition for registration
 #[derive(Debug, Clone)]
 pub struct ToolDef {
