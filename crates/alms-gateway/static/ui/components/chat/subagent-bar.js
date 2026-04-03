@@ -6,7 +6,9 @@ const PREVIEW_LEN = 100;
 function toolSummary(tool) {
     if (!tool.params) return '';
     switch (tool.tool) {
+        case 'shell':
         case 'shell_exec':
+            if (tool.params.command) return tool.params.command;
             return tool.params.argv ? tool.params.argv.join(' ') : '';
         case 'fs_read': return tool.params.path || '';
         case 'fs_write': return tool.params.path || '';

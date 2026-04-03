@@ -179,7 +179,7 @@ Returns the full chat history for a session, including tool calls and results.
   "messages": [
     { "role": "user",      "type": "text",        "content": "run ls", "timestamp": "..." },
     { "role": "assistant", "type": "text",        "content": "Sure, let me run that.", "timestamp": "..." },
-    { "role": "assistant", "type": "tool_call",   "tool": "shell_exec", "params": {"argv":["ls"]}, "timestamp": "...", "metadata": {"tool_call_id": "call_123"} },
+    { "role": "assistant", "type": "tool_call",   "tool": "shell", "params": {"command":"ls"}, "timestamp": "...", "metadata": {"tool_call_id": "call_123"} },
     { "role": "tool",      "type": "tool_result", "tool_id": "call_123", "result": "file1.txt\nfile2.txt", "ok": true, "timestamp": "..." },
     { "role": "assistant", "type": "text",        "content": "Here are the files.", "timestamp": "..." }
   ],
@@ -328,7 +328,7 @@ Transient phase indicator emitted at key moments during the agent loop so the UI
 {
   "run_id": "<uuid>",
   "tool_invocation_id": "<uuid>",
-  "tool": "shell_exec",
+  "tool": "shell",
   "params": {}
 }
 ```
@@ -350,7 +350,7 @@ Transient phase indicator emitted at key moments during the agent loop so the UI
   "approval_id": "<uuid>",
   "capability": "shell.exec",
   "request": {
-    "tool": "shell_exec",
+    "tool": "shell",
     "params": {}
   }
 }
@@ -431,7 +431,7 @@ Returns the full list of tool call and result records for a run, ordered by sequ
     {
       "seq": 0,
       "role": "assistant",
-      "tool_name": "shell_exec",
+      "tool_name": "shell",
       "tool_id": "call_abc123",
       "params": "{\"command\":\"ls\"}",
       "timestamp": "2026-03-22T10:00:00Z"
@@ -439,7 +439,7 @@ Returns the full list of tool call and result records for a run, ordered by sequ
     {
       "seq": 1,
       "role": "tool",
-      "tool_name": "shell_exec",
+      "tool_name": "shell",
       "tool_id": "call_abc123",
       "result": "\"file1.txt\\nfile2.txt\"",
       "timestamp": "2026-03-22T10:00:01Z"

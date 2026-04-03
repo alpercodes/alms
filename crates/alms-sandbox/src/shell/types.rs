@@ -32,7 +32,7 @@ pub const DEFAULT_TIMEOUT_MS: u64 = DEFAULT_TIMEOUT_SECS * 1000;
 /// Parsed input for the shell tool.
 ///
 /// Supports two invocation styles:
-/// - `command` (primary): a shell command string executed via `bash -c` / `cmd /c`
+/// - `command` (primary): a shell command string executed via `bash -c` on all platforms
 /// - `argv` (legacy): an argv array executed directly (no shell)
 #[derive(Debug, Clone)]
 pub struct ShellInput {

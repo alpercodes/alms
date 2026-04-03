@@ -1,14 +1,8 @@
+use crate::shell::security::DENIED_FILENAMES;
 use crate::{SandboxError, Tool, error::SandboxResult};
 use alms_core::truncate_to_char_boundary;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
-
-/// Filenames that must never be accessed by agent tools.
-///
-/// These are checked against the final component of resolved paths in fs_read,
-/// fs_write, and against command strings/argv in the shell tool to prevent
-/// agents from reading secrets or other sensitive files.
-const DENIED_FILENAMES: &[&str] = &["secrets.json"];
 
 /// Check whether a resolved path references a denied filename.
 ///

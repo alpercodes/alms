@@ -112,8 +112,9 @@ impl ShellTool {
                 "default_cwd is outside sandbox_root"
             );
         }
-        // Replace the state with one rooted at the new cwd.
-        // Background tasks from the old state are preserved since ShellState uses Arc.
+        // Replace the state with a fresh instance rooted at the new cwd.
+        // Note: this creates a new ShellState, so any in-flight background
+        // tasks from the previous state will no longer be queryable.
         self.state = ShellState::new(cwd);
         self
     }
@@ -275,7 +276,7 @@ impl Tool for ShellTool {
                 },
                 "check_task": {
                     "type": "string",
-                    "description": "Check the result of a background task by its task_id."
+                    "description": "Check the result of a background task by its task_id. Mutually exclusive with 'command' and 'argv' — when present, all other parameters are ignored."
                 }
             }
         })
@@ -594,19 +595,34 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn test_shell_tool_sandboxed_cwd_rejected() {
+    async fn test_shell_tool_sandboxed_cwd_stays_inside() {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
-        let tool = ShellTool::sandboxed(root);
+        let tool = ShellTool::sandboxed(root.clone());
+
+        // The command changes to /etc in a subshell, but the persistent cwd
+        // should NOT be updated to /etc because it is outside the sandbox root.
         let result = tool
             .execute(serde_json::json!({"command": "cd /etc && ls"}))
             .await;
-        // The command itself might succeed (cd happens in subshell) but the
-        // cwd validation should prevent executing if the state's cwd is outside sandbox.
-        // Since we start inside the sandbox, this specific test validates that
-        // the command runs but the persistent cwd stays in the sandbox.
-        // Let's test explicit cwd outside sandbox via argv mode instead.
-        assert!(result.is_ok() || result.is_err());
+        // The command itself should succeed (it runs in a subshell)
+        assert!(result.is_ok(), "command should execute successfully");
+
+        // Verify the persistent cwd is still inside the sandbox root
+        let cwd_result = tool
+            .execute(serde_json::json!({"command": "pwd"}))
+            .await
+            .unwrap();
+        let stdout = cwd_result["stdout"].as_str().unwrap();
+        let cwd_path = std::path::Path::new(stdout.trim());
+        assert!(
+            std::fs::canonicalize(cwd_path)
+                .unwrap_or_default()
+                .starts_with(&root),
+            "persistent cwd '{}' should remain inside sandbox root '{}'",
+            stdout.trim(),
+            root.display()
+        );
     }
 
     #[tokio::test]

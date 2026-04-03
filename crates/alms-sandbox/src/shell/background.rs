@@ -11,6 +11,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
+/// Maximum number of completed background task results to retain.
+/// When exceeded, the oldest entries are evicted to prevent memory leaks.
+const MAX_COMPLETED_TASKS: usize = 100;
+
 /// Submit a command for background execution.
 ///
 /// Returns the task ID immediately. The command runs in a tokio spawned task
@@ -68,6 +72,11 @@ pub(crate) async fn submit_background_task(
         };
 
         let mut tasks = state_clone.background_tasks.lock().await;
+        // Evict oldest entries when the map exceeds the limit to prevent
+        // unbounded memory growth from long-running agents.
+        if tasks.len() >= MAX_COMPLETED_TASKS {
+            evict_oldest(&mut tasks);
+        }
         tasks.insert(task_id_clone, task_result);
     });
 
@@ -98,6 +107,26 @@ pub(crate) async fn list_background_tasks(state: &ShellState) -> Vec<(String, bo
             (id.clone(), completed)
         })
         .collect()
+}
+
+/// Evict the oldest completed task from the map.
+///
+/// Task IDs are formatted as `bg_N` where N is a monotonically increasing
+/// counter, so the lexicographically smallest ID is the oldest. We parse
+/// the numeric suffix for correct ordering.
+fn evict_oldest(tasks: &mut HashMap<String, BackgroundTaskResult>) {
+    if let Some(oldest_key) = tasks
+        .keys()
+        .min_by_key(|k| {
+            k.strip_prefix("bg_")
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(u64::MAX)
+        })
+        .cloned()
+    {
+        debug!(task_id = %oldest_key, "Evicting oldest background task result");
+        tasks.remove(&oldest_key);
+    }
 }
 
 #[cfg(test)]
@@ -140,5 +169,35 @@ mod tests {
         let state = ShellState::new(PathBuf::from("."));
         let result = check_background_task(&state, "bg_999").await;
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_evict_oldest_removes_lowest_id() {
+        let mut tasks = HashMap::new();
+        for i in [5, 2, 8, 1, 3] {
+            tasks.insert(
+                format!("bg_{i}"),
+                BackgroundTaskResult {
+                    task_id: format!("bg_{i}"),
+                    command: "test".to_string(),
+                    output: None,
+                    error: Some("done".to_string()),
+                },
+            );
+        }
+        assert_eq!(tasks.len(), 5);
+        evict_oldest(&mut tasks);
+        assert_eq!(tasks.len(), 4);
+        assert!(
+            !tasks.contains_key("bg_1"),
+            "bg_1 should have been evicted as the oldest"
+        );
+    }
+
+    #[test]
+    fn test_evict_oldest_empty_map_is_noop() {
+        let mut tasks: HashMap<String, BackgroundTaskResult> = HashMap::new();
+        evict_oldest(&mut tasks);
+        assert!(tasks.is_empty());
     }
 }

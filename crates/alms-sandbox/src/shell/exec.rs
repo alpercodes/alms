@@ -103,8 +103,25 @@ pub(crate) async fn execute_command(
 
     // Extract cwd from pwd marker if we used command mode
     if is_command_mode && let Some(new_cwd) = extract_cwd_from_output(&raw_stdout) {
-        let mut cwd_lock = state.cwd.lock().await;
-        *cwd_lock = PathBuf::from(new_cwd);
+        let new_path = PathBuf::from(new_cwd);
+        // Validate the new cwd against sandbox root before storing.
+        // If the command changed directory outside the sandbox (e.g. `cd /etc`),
+        // keep the old cwd to prevent sandbox escape on subsequent calls.
+        if !unrestricted && let Some(root) = sandbox_root {
+            if validate_cwd(&new_path, root).is_ok() {
+                let mut cwd_lock = state.cwd.lock().await;
+                *cwd_lock = new_path;
+            } else {
+                warn!(
+                    new_cwd = %new_path.display(),
+                    sandbox_root = %root.display(),
+                    "Post-command cwd is outside sandbox root; keeping previous cwd"
+                );
+            }
+        } else {
+            let mut cwd_lock = state.cwd.lock().await;
+            *cwd_lock = new_path;
+        }
     }
 
     // Strip the pwd marker from stdout before returning
@@ -151,8 +168,10 @@ fn resolve_command(input: &ShellInput) -> SandboxResult<(String, bool)> {
 
 /// Build the tokio Command for execution.
 ///
-/// In command mode, wraps with `bash -c` (Unix) or `cmd /c` (Windows)
-/// and appends a `pwd` marker to detect cwd changes.
+/// In command mode, wraps with `bash -c` on all platforms. On Windows,
+/// this requires Git Bash or WSL to be available on PATH. We use bash
+/// (not `cmd /c`) on Windows because the pwd marker, exit code capture,
+/// and shell syntax assume POSIX semantics.
 /// In argv mode, spawns the program directly.
 fn build_command(
     effective_command: &str,
@@ -173,6 +192,8 @@ fn build_command(
         }
         #[cfg(windows)]
         {
+            // Use bash (Git Bash / WSL) on Windows too — the pwd marker,
+            // exit code capture, and shell syntax all assume POSIX semantics.
             cmd = tokio::process::Command::new("bash");
             cmd.arg("-c");
             cmd.arg(&wrapped);
@@ -204,51 +225,50 @@ fn wrap_command_with_pwd_marker(command: &str) -> String {
     format!("{command}; __alms_ec=$?; echo; echo '{PWD_MARKER}'; pwd; exit $__alms_ec")
 }
 
-/// Extract the cwd from command output by looking for the PWD marker.
+/// Extract the cwd from command output by looking for the **last** PWD marker.
+///
+/// We match the last occurrence because command output could contain the
+/// literal marker string. The real marker is always appended last by
+/// `wrap_command_with_pwd_marker`.
 ///
 /// Returns `Some(path_str)` if found, `None` if the marker is not present.
 fn extract_cwd_from_output(stdout: &str) -> Option<&str> {
-    // Find the marker line and take the next line as the cwd
-    let mut found_marker = false;
-    for line in stdout.lines() {
-        if found_marker {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed);
-            }
-        }
-        if line.trim() == PWD_MARKER {
-            found_marker = true;
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Search backwards for the last marker line
+    let marker_idx = lines.iter().rposition(|line| line.trim() == PWD_MARKER)?;
+    // The cwd is the next non-empty line after the marker
+    for line in &lines[marker_idx + 1..] {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed);
         }
     }
     None
 }
 
-/// Strip the pwd marker and the cwd line from stdout before returning to the caller.
+/// Strip the **last** pwd marker and the cwd line from stdout before returning
+/// to the caller.
+///
+/// Only the last marker is stripped because earlier occurrences of the marker
+/// string in command output are part of the user's data and should be preserved.
 fn strip_pwd_marker(stdout: &str) -> String {
-    let mut lines: Vec<&str> = Vec::new();
-    let mut skip_remaining = false;
+    let lines: Vec<&str> = stdout.lines().collect();
+    // Find the last marker line
+    let Some(marker_idx) = lines.iter().rposition(|line| line.trim() == PWD_MARKER) else {
+        return lines.join("\n");
+    };
 
-    for line in stdout.lines() {
-        if line.trim() == PWD_MARKER {
-            // Remove the trailing empty line before the marker if present
-            if let Some(last) = lines.last()
-                && last.trim().is_empty()
-            {
-                lines.pop();
-            }
-            skip_remaining = true;
-            continue;
-        }
-        if skip_remaining {
-            // Skip the pwd output line after the marker
-            skip_remaining = false;
-            continue;
-        }
-        lines.push(line);
+    // Take all lines before the marker
+    let mut result: Vec<&str> = lines[..marker_idx].to_vec();
+
+    // Remove trailing empty line before the marker if present
+    if let Some(last) = result.last()
+        && last.trim().is_empty()
+    {
+        result.pop();
     }
 
-    lines.join("\n")
+    result.join("\n")
 }
 
 /// Validate that a cwd is within the sandbox root.
@@ -333,6 +353,34 @@ mod tests {
         let cleaned = strip_pwd_marker(output);
         // lines() strips trailing newline, join re-joins without it
         assert_eq!(cleaned, "line1\nline2");
+    }
+
+    #[test]
+    fn test_extract_cwd_matches_last_marker() {
+        // If command output contains the marker string, we must match the LAST one
+        let output = format!(
+            "echo {PWD_MARKER}\n/fake/path\nreal output\n\n{PWD_MARKER}\n/home/user/real\n"
+        );
+        assert_eq!(extract_cwd_from_output(&output), Some("/home/user/real"));
+    }
+
+    #[test]
+    fn test_strip_pwd_marker_matches_last_marker() {
+        // Only the last marker should be stripped; earlier occurrences are user data
+        let output = format!(
+            "echo {PWD_MARKER}\n/fake/path\nreal output\n\n{PWD_MARKER}\n/home/user/real\n"
+        );
+        let cleaned = strip_pwd_marker(&output);
+        assert!(
+            cleaned.contains(PWD_MARKER),
+            "first marker should be preserved as user data"
+        );
+        assert!(cleaned.contains("/fake/path"));
+        assert!(cleaned.contains("real output"));
+        assert!(
+            !cleaned.contains("/home/user/real"),
+            "real cwd line should be stripped"
+        );
     }
 
     #[test]

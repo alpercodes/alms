@@ -1,6 +1,7 @@
 use alms_core::{AlmsError, AlmsResult};
 use alms_sandbox::{SandboxError, ToolRegistry as SandboxRegistry};
 use serde_json::Value;
+use std::collections::HashSet;
 use tracing::{debug, warn};
 
 /// Runtime tool registry wraps the sandbox registry
@@ -72,13 +73,22 @@ impl ToolRegistry {
         self.registry.contains(name)
     }
 
-    /// Get tool definitions for LLM with real parameter schemas
+    /// Get tool definitions for LLM with real parameter schemas.
+    ///
+    /// Deduplicates by `tool.name()` so that aliases (e.g. "shell_exec" ->
+    /// "shell") do not produce duplicate function definitions — OpenAI and
+    /// other providers reject payloads with duplicate function names.
     pub fn to_definitions(&self) -> Vec<crate::llm_types::ToolDefinition> {
+        let mut seen = HashSet::new();
         self.registry
             .list()
             .into_iter()
             .filter_map(|name| {
                 let tool = self.registry.lookup(&name).ok()?;
+                let canonical_name = tool.name().to_string();
+                if !seen.insert(canonical_name) {
+                    return None;
+                }
                 Some(
                     crate::llm_types::ToolDefinition::new(tool.name(), tool.description())
                         .with_parameters(tool.parameters()),
