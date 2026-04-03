@@ -1,8 +1,10 @@
 import { html } from '../../deps.js';
+import { activeAgent } from '../../state/agents.js';
 
 export function Message({ type, role, text, sealed }) {
     const cls = type === 'user' ? 'user' : 'agent';
-    const label = type === 'user' ? '>' : '$';
+    const agentName = activeAgent.value?.name;
+    const label = type === 'user' ? '>' : (agentName ? `${agentName} $` : '$');
     const streaming = type === 'agent' && sealed === false;
     return html`
         <div class="msg ${cls}">

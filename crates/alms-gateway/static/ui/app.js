@@ -11,7 +11,7 @@ import { chatMessages } from './state/chat.js';
 import { PanelContainer } from './components/panel/index.js';
 import { SettingsModal } from './components/settings-modal.js';
 import { OnboardingView } from './components/onboarding.js';
-import { agents } from './state/agents.js';
+import { agents, activeAgent } from './state/agents.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
 import { scrollToBottom } from './utils/format.js';
 
@@ -49,7 +49,8 @@ function ChatView() {
                     }
                     if (m.type === 'image') {
                         const cls = m.role === 'user' ? 'user' : 'agent';
-                        const label = m.role === 'user' ? '>' : '$';
+                        const agentName = activeAgent.value?.name;
+                        const label = m.role === 'user' ? '>' : (agentName ? `${agentName} $` : '$');
                         return html`
                             <div key=${m.id} class="msg ${cls}">
                                 <div class="msg-label">${label}</div>
@@ -113,9 +114,10 @@ function ChatView() {
                                 ? 'Running ' + m.phaseDetail
                                 : 'Running tools';
                         }
+                        const thinkingName = activeAgent.value?.name || 'Agent';
                         return html`
                             <div key=${m.id} class="msg agent">
-                                <div class="msg-label">Agent</div>
+                                <div class="msg-label">${thinkingName} $</div>
                                 <div class="msg-body thinking-indicator">${label}</div>
                             </div>
                         `;
