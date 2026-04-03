@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::info;
 
 /// Run manager for tracking runs and their event streams
@@ -572,11 +573,32 @@ impl AppState {
         let agent_id = gateway.agent_id();
         let default_agent_id = gateway.agent_id_handle();
         let llm_config = gateway.llm_config().clone();
-        let agent_config = gateway.agent_config().clone();
+        let mut agent_config_val = gateway.agent_config().clone();
         let auth_token_value = gateway.auth_token().map(String::from);
-        let session_config = gateway.session_config().clone();
+        let mut session_config = gateway.session_config().clone();
         let logging_config = gateway.logging_config().clone();
-        let tools_config = gateway.tools_config().clone();
+        let mut tools_config = gateway.tools_config().clone();
+
+        // Apply persisted settings from a previous PATCH /settings so that
+        // configuration changes survive gateway restarts.
+        if let Some(persisted) = crate::settings::load_persisted_settings(&data_dir) {
+            if let Some(ctx) = persisted.context {
+                agent_config_val.context_config = ctx;
+            }
+            if let Some(sess) = persisted.session {
+                session_config = sess;
+            }
+            if let Some(t) = persisted.tools {
+                // Also sync the two copies kept in agent_config.
+                agent_config_val.sandbox_root = t.sandbox_root.clone();
+                agent_config_val.shell_policy = t.shell_policy.clone();
+                tools_config = t;
+            }
+        }
+
+        // Create the shared agent config Arc *once* — both the Coordinator and
+        // AppState reference the same lock so PATCH /settings updates propagate.
+        let agent_config = Arc::new(parking_lot::RwLock::new(agent_config_val));
         let db_path_str = gateway.db_path().map(String::from);
         let job_store = match db_path_str.as_deref() {
             Some(path) => {
@@ -600,7 +622,7 @@ impl AppState {
             agent_id,
             session_manager.clone(),
             llm.clone(),
-            agent_config.clone(),
+            Arc::clone(&agent_config),
         )
         .with_completion_channel(completion_tx)
         .with_run_registrar(Arc::new(run_manager.clone()));
@@ -660,7 +682,7 @@ impl AppState {
             shutdown_token: shutdown_token.clone(),
             agent_queue: Arc::new(SessionQueue::new(shutdown_token)),
             llm_config,
-            agent_config: Arc::new(parking_lot::RwLock::new(agent_config)),
+            agent_config,
             default_agent_id,
             llm,
             auth_token_value,
@@ -678,13 +700,20 @@ pub use crate::sse::{RunEventStream, event_channel};
 
 /// Routes that do NOT require authentication
 fn public_router() -> Router<AppState> {
+    // Static files get Cache-Control: no-store so browsers always fetch fresh
+    // JS/CSS after a deployment, matching the HTML endpoint at `/`.
+    let static_files = ServeDir::new("crates/alms-gateway/static/ui")
+        .fallback(ServeFile::new("crates/alms-gateway/static/ui/index.html"));
+    let static_with_cache = tower::ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        ))
+        .service(static_files);
+
     Router::new()
         .route("/health", get(health_check))
-        .nest_service(
-            "/ui",
-            ServeDir::new("crates/alms-gateway/static/ui")
-                .fallback(ServeFile::new("crates/alms-gateway/static/ui/index.html")),
-        )
+        .nest_service("/ui", static_with_cache)
 }
 
 /// Routes that require authentication (all except /health)

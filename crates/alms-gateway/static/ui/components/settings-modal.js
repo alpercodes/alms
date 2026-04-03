@@ -633,6 +633,9 @@ export function SettingsModal({ open, onClose }) {
                 </div>
 
                 <!-- Server settings save feedback -->
+                <span class="settings-hint" style="text-align:center; display:block; margin-top:4px;">
+                    Server settings are persisted to disk and survive restarts.
+                </span>
                 ${serverError.value && html`
                     <div class="settings-error">${serverError.value}</div>
                 `}

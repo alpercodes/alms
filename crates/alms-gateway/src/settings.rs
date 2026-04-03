@@ -1,9 +1,13 @@
 //! Settings endpoints — exposes server-side defaults for UI pre-population
 //! and accepts partial config updates via PATCH.
+//!
+//! Server-level settings (context, session, tools) are persisted to
+//! `{data_dir}/settings.json` so they survive restarts.
 
 use crate::server::AppState;
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tracing::info;
 
 /// GET /settings — returns current server defaults for UI pre-population.
@@ -324,6 +328,9 @@ pub async fn patch_settings(
         );
     }
 
+    // Persist current settings to disk so they survive restarts.
+    persist_settings(&state);
+
     if errors.is_empty() {
         (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
     } else {
@@ -334,5 +341,83 @@ pub async fn patch_settings(
                 "errors": errors,
             })),
         )
+    }
+}
+
+// ── Persistence helpers ───────────────────────────────────────────────
+
+/// On-disk representation of the mutable server-level settings.
+///
+/// Written to `{data_dir}/settings.json` after every PATCH /settings and
+/// loaded on startup to restore the previous configuration.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct PersistedSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<alms_core::config::ContextConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<alms_session::SessionConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<alms_core::config::ToolsConfig>,
+}
+
+/// Return the canonical path for the persisted settings file.
+pub fn settings_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("settings.json")
+}
+
+/// Write the current mutable settings to `{data_dir}/settings.json`.
+fn persist_settings(state: &AppState) {
+    let persisted = PersistedSettings {
+        context: Some(state.agent_config.read().context_config.clone()),
+        session: Some(state.session_config.read().clone()),
+        tools: Some(state.tools_config.read().clone()),
+    };
+    let path = settings_path(&state.data_dir);
+    match serde_json::to_string_pretty(&persisted) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to persist settings to disk"
+                );
+            } else {
+                tracing::debug!(path = %path.display(), "Persisted settings to disk");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to serialize settings for persistence");
+        }
+    }
+}
+
+/// Load persisted settings from disk. Returns `None` if the file does not
+/// exist or cannot be parsed (a warning is logged in the latter case).
+pub fn load_persisted_settings(data_dir: &Path) -> Option<PersistedSettings> {
+    let path = settings_path(data_dir);
+    match std::fs::read_to_string(&path) {
+        Ok(json) => match serde_json::from_str::<PersistedSettings>(&json) {
+            Ok(s) => {
+                info!(path = %path.display(), "Loaded persisted settings from disk");
+                Some(s)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to parse persisted settings — using defaults"
+                );
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to read persisted settings — using defaults"
+            );
+            None
+        }
     }
 }
