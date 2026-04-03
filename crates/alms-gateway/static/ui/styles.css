@@ -501,6 +501,102 @@ header h1 {
   color: var(--text-primary);
 }
 
+/* ── Markdown-rendered agent messages ── */
+.msg-body.markdown-body {
+  white-space: normal;
+}
+.msg-body.markdown-body > *:first-child { margin-top: 0; }
+.msg-body.markdown-body > *:last-child { margin-bottom: 0; }
+
+.msg-body.markdown-body p {
+  margin: 0 0 var(--space-2) 0;
+}
+.msg-body.markdown-body p:last-child { margin-bottom: 0; }
+
+.msg-body.markdown-body strong { font-weight: 700; }
+.msg-body.markdown-body em { font-style: italic; }
+
+.msg-body.markdown-body code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--surface-3);
+  padding: 1px 5px;
+  border-radius: var(--radius-xs);
+}
+
+.msg-body.markdown-body pre {
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+  margin: var(--space-2) 0;
+  overflow-x: auto;
+}
+.msg-body.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.msg-body.markdown-body ul,
+.msg-body.markdown-body ol {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-6);
+}
+.msg-body.markdown-body li {
+  margin-bottom: var(--space-1);
+}
+
+.msg-body.markdown-body blockquote {
+  border-left: 3px solid var(--border-strong);
+  margin: var(--space-2) 0;
+  padding: var(--space-1) var(--space-4);
+  color: var(--text-secondary);
+}
+
+.msg-body.markdown-body h1,
+.msg-body.markdown-body h2,
+.msg-body.markdown-body h3,
+.msg-body.markdown-body h4,
+.msg-body.markdown-body h5,
+.msg-body.markdown-body h6 {
+  margin: var(--space-3) 0 var(--space-2) 0;
+  font-weight: 700;
+  line-height: 1.3;
+}
+.msg-body.markdown-body h1 { font-size: var(--text-lg); }
+.msg-body.markdown-body h2 { font-size: var(--text-base); }
+.msg-body.markdown-body h3 { font-size: var(--text-sm); }
+
+.msg-body.markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+  margin: var(--space-3) 0;
+}
+
+.msg-body.markdown-body a {
+  color: var(--accent-text);
+  text-decoration: underline;
+}
+
+.msg-body.markdown-body table {
+  border-collapse: collapse;
+  margin: var(--space-2) 0;
+  font-size: var(--text-xs);
+}
+.msg-body.markdown-body th,
+.msg-body.markdown-body td {
+  border: 1px solid var(--border-default);
+  padding: var(--space-1) var(--space-2);
+}
+.msg-body.markdown-body th {
+  background: var(--surface-3);
+  font-weight: 700;
+}
+
 .msg-tokens {
   font-size: var(--text-2xs);
   color: var(--text-disabled);

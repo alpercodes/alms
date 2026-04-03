@@ -1,4 +1,4 @@
-import { html } from '../../deps.js';
+import { html, renderMarkdown } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
 
 export function Message({ type, role, text, sealed }) {
@@ -6,6 +6,21 @@ export function Message({ type, role, text, sealed }) {
     const agentName = activeAgent.value?.name;
     const label = type === 'user' ? '>' : (agentName ? `${agentName} $` : '$');
     const streaming = type === 'agent' && sealed === false;
+
+    // Render Markdown for sealed (finished) agent messages only.
+    // While streaming, use plain text with pre-wrap to avoid running
+    // marked.parse() + DOMPurify.sanitize() on every animation frame.
+    if (type === 'agent' && sealed) {
+        const rendered = renderMarkdown(text || '');
+        return html`
+            <div class="msg ${cls}">
+                <div class="msg-label">${label}</div>
+                <div class="msg-body markdown-body"
+                     dangerouslySetInnerHTML=${{ __html: rendered }} />
+            </div>
+        `;
+    }
+
     return html`
         <div class="msg ${cls}">
             <div class="msg-label">${label}</div>
