@@ -1130,6 +1130,7 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     }
 
     // Phase 1: Signal received. Axum stopped accepting new connections.
+    let shutdown_start = std::time::Instant::now();
     info!("HTTP server stopped accepting connections, draining...");
 
     // Phase 2: Scheduler loop already exiting (token cancelled).
@@ -1188,7 +1189,10 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     }
     info!("SQLite WAL flushed");
 
-    info!("ALMS Gateway shut down cleanly");
+    info!(
+        "Shutdown complete in {:.1}s",
+        shutdown_start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
