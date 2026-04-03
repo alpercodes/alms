@@ -1367,24 +1367,23 @@ mod tests {
 
         // Null byte mid-path — should either error or stay inside sandbox
         let result = check_sandbox_path("safe\0/../../../etc/passwd", &root);
-        match &result {
-            Ok(resolved) => assert!(
+        if let Ok(resolved) = &result {
+            assert!(
                 resolved.starts_with(&root),
                 "null-byte path resolved outside sandbox: {}",
                 resolved.display()
-            ),
-            Err(_) => {} // Error is also acceptable — the path is not usable
+            );
         }
+        // Error is also acceptable — the path is not usable
 
         // Null byte in a simple filename — same contract
         let result2 = check_sandbox_path("file\0.txt", &root);
-        match &result2 {
-            Ok(resolved) => assert!(
+        if let Ok(resolved) = &result2 {
+            assert!(
                 resolved.starts_with(&root),
                 "null-byte filename resolved outside sandbox: {}",
                 resolved.display()
-            ),
-            Err(_) => {}
+            );
         }
     }
 }
