@@ -7,12 +7,27 @@ use axum::response::sse::{Event, Sse};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::error;
 use uuid::Uuid;
+
+/// Monotonic counter for ephemeral SSE event IDs.
+///
+/// Events without a persisted `event_id` (e.g. `token_delta`, `status`) are
+/// assigned IDs like `ephemeral-1`, `ephemeral-2`, etc.  These are clearly
+/// non-numeric so the browser's native `EventSource` auto-reconnect will never
+/// send them as a valid `Last-Event-Id` that the backend would try to parse as
+/// `u64`.
+static EPHEMERAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_ephemeral_id() -> String {
+    let n = EPHEMERAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("ephemeral-{n}")
+}
 
 /// Unique identifier for a tool invocation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -346,7 +361,7 @@ impl RunEventStream {
                 .id(data
                     .event_id
                     .map(|id| id.to_string())
-                    .unwrap_or_else(|| Uuid::new_v4().to_string()))
+                    .unwrap_or_else(next_ephemeral_id))
                 .json_data(&data.data)
                 .unwrap_or_else(|e| {
                     error!(
@@ -376,7 +391,7 @@ impl RunEventStream {
                 .id(data
                     .event_id
                     .map(|id| id.to_string())
-                    .unwrap_or_else(|| Uuid::new_v4().to_string()))
+                    .unwrap_or_else(next_ephemeral_id))
                 .json_data(&data.data)
                 .unwrap_or_else(|e| {
                     error!(
@@ -399,7 +414,7 @@ impl RunEventStream {
                     .id(data
                         .event_id
                         .map(|id| id.to_string())
-                        .unwrap_or_else(|| Uuid::new_v4().to_string()))
+                        .unwrap_or_else(next_ephemeral_id))
                     .json_data(&data.data)
                     .unwrap_or_else(|e| {
                         error!(
