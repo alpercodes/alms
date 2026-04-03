@@ -27,11 +27,7 @@ pub(crate) async fn submit_background_task(
     default_env: HashMap<String, String>,
 ) -> SandboxResult<String> {
     let task_id = state.next_id().await;
-    let command_display = input
-        .command
-        .clone()
-        .or_else(|| input.argv.as_ref().map(|a| a.join(" ")))
-        .unwrap_or_else(|| "<unknown>".to_string());
+    let command_display = input.command.clone();
 
     info!(task_id = %task_id, command = %command_display, "Submitting background task");
 
@@ -139,8 +135,7 @@ mod tests {
     async fn test_submit_and_check_background_task() {
         let state = ShellState::new(PathBuf::from("."));
         let input = ShellInput {
-            command: Some("echo hello".to_string()),
-            argv: None,
+            command: "echo hello".to_string(),
             description: None,
             timeout_ms: 5000,
             run_in_background: true,

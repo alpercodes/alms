@@ -1145,7 +1145,7 @@ mod tests {
         // Uses the ShellTool via the crate-level type alias
         let tool = crate::ShellTool::new();
         let result = tool
-            .execute(serde_json::json!({"argv": ["cat", "data/secrets.json"]}))
+            .execute(serde_json::json!({"command": "cat data/secrets.json"}))
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("denied"));
@@ -1156,7 +1156,7 @@ mod tests {
     async fn test_shell_allowed_normal_files() {
         let tool = crate::ShellTool::new();
         let result = tool
-            .execute(serde_json::json!({"argv": ["echo", "data.json"]}))
+            .execute(serde_json::json!({"command": "echo data.json"}))
             .await;
         assert!(result.is_ok());
     }

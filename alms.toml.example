@@ -89,11 +89,12 @@ max_output_bytes = 65536
 # Override with: ALMS_SANDBOX_ROOT=/custom/path
 sandbox_root = "."
 # Shell execution policy: "sandboxed" (default) or "unrestricted".
-# "sandboxed" — shell_exec cwd is restricted to sandbox_root.
-# "unrestricted" — no cwd restriction (power-user / full root access).
-# Note: sandboxed mode restricts cwd but cannot prevent the command itself
-# from accessing files outside the sandbox. For true shell isolation, use
-# a restricted OS user or Landlock (see docs/security-model.md §4.4).
+# "sandboxed" — shell cwd is restricted to sandbox_root. On Linux 5.13+,
+#   Landlock filesystem restrictions are also applied so the child process
+#   can only access files within sandbox_root (plus read-only system paths).
+#   On Windows/macOS, sandboxed mode restricts cwd only — the command itself
+#   can still access files outside the sandbox at the OS level.
+# "unrestricted" — no cwd or filesystem restriction (power-user / full access).
 # Override with: ALMS_SHELL_POLICY=unrestricted
 shell_policy = "sandboxed"
 

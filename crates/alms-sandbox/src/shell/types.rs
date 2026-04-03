@@ -31,16 +31,13 @@ pub const DEFAULT_TIMEOUT_MS: u64 = DEFAULT_TIMEOUT_SECS * 1000;
 
 /// Parsed input for the shell tool.
 ///
-/// Supports two invocation styles:
-/// - `command` (primary): a shell command string executed via `bash -c` on all platforms
-/// - `argv` (legacy): an argv array executed directly (no shell)
+/// The command is a shell string executed via `bash -c` on all platforms.
+/// The legacy `argv` mode has been removed for security reasons (it bypassed
+/// the destructive command denylist and offered no sandboxing benefits).
 #[derive(Debug, Clone)]
 pub struct ShellInput {
-    /// The command to execute (primary interface).
-    pub command: Option<String>,
-
-    /// Legacy argv-style invocation (fallback when `command` is absent).
-    pub argv: Option<Vec<String>>,
+    /// The command to execute via `bash -c`.
+    pub command: String,
 
     /// Optional description of what the command does (for audit logging).
     pub description: Option<String>,

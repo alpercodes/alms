@@ -8,8 +8,6 @@
 //! Adds:
 //! - Pattern-based command denylist (dangerous destructive commands)
 
-use std::path::Path;
-
 /// Filenames that must never be accessed by agent tools.
 ///
 /// Single source of truth — imported by `builtin.rs` for fs_read/fs_write
@@ -62,32 +60,6 @@ pub(crate) fn command_references_denied_file(command: &str) -> Option<&'static s
         .iter()
         .find(|denied| lower.contains(*denied))
         .copied()
-}
-
-/// Check whether any element in a shell argv references a denied filename.
-///
-/// Preserved from the original `ShellExecTool` for backward compatibility
-/// with the argv-based invocation path.
-pub(crate) fn argv_references_denied_file(argv: &[&str]) -> Option<&'static str> {
-    for arg in argv {
-        // Check as a path component (handles `data/secrets.json`, `/abs/path/secrets.json`)
-        let p = Path::new(arg);
-        if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
-            for denied in DENIED_FILENAMES {
-                if denied.eq_ignore_ascii_case(name) {
-                    return Some(denied);
-                }
-            }
-        }
-        // Also check as a substring of the full argument to catch `sh -c "cat secrets.json"`
-        // where the denied filename is embedded inside a quoted command string.
-        for denied in DENIED_FILENAMES {
-            if arg.to_ascii_lowercase().contains(denied) {
-                return Some(denied);
-            }
-        }
-    }
-    None
 }
 
 /// Check whether a command matches any denied destructive pattern.
@@ -148,44 +120,6 @@ mod tests {
         );
         assert_eq!(command_references_denied_file("ls -la"), None);
         assert_eq!(command_references_denied_file("cat data.json"), None);
-    }
-
-    #[test]
-    fn test_argv_references_denied_file() {
-        assert_eq!(
-            argv_references_denied_file(&["cat", "data/secrets.json"]),
-            Some("secrets.json")
-        );
-        assert_eq!(
-            argv_references_denied_file(&["cat", "/abs/path/secrets.json"]),
-            Some("secrets.json")
-        );
-        assert_eq!(argv_references_denied_file(&["ls", "-la"]), None);
-        assert_eq!(argv_references_denied_file(&["cat", "data.json"]), None);
-    }
-
-    #[test]
-    fn test_argv_references_denied_file_case_insensitive() {
-        assert_eq!(
-            argv_references_denied_file(&["cat", "data/SECRETS.JSON"]),
-            Some("secrets.json")
-        );
-        assert_eq!(
-            argv_references_denied_file(&["cat", "Secrets.Json"]),
-            Some("secrets.json")
-        );
-    }
-
-    #[test]
-    fn test_argv_references_denied_via_sh_c() {
-        assert_eq!(
-            argv_references_denied_file(&["sh", "-c", "cat secrets.json"]),
-            Some("secrets.json")
-        );
-        assert_eq!(
-            argv_references_denied_file(&["sh", "-c", "cat data/Secrets.JSON"]),
-            Some("secrets.json")
-        );
     }
 
     #[test]
