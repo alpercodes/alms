@@ -654,7 +654,7 @@ Returns current server defaults for UI pre-population.
 **Response 200**
 ```json
 {
-  "version": "0.1.1",
+  "version": "0.1.2",
   "provider": "openai",
   "model": "openai/gpt-4o",
   "base_url": "https://openrouter.ai/api/v1",
@@ -699,6 +699,50 @@ Returns current server defaults for UI pre-population.
 ```
 
 Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved for backward compatibility alongside the new nested objects (`context`, `session`, `logging`, `tools`). The nested objects contain the same data in a structured form. New consumers should prefer the nested objects.
+
+### 10.2 Update server settings
+`PATCH /settings`
+
+Partially update server-level configuration at runtime. Only `context`, `session`, and `tools` sections are mutable. Changes take effect on the next run; in-flight runs are unaffected. Logging requires a restart and is not accepted here.
+
+**Request body** (all fields optional):
+```json
+{
+  "context": {
+    "strategy": "sliding-summary",
+    "max_input_tokens": 128000,
+    "recent_window": 20,
+    "summary_interval": 30,
+    "summary_model": "gpt-4o-mini"
+  },
+  "session": {
+    "max_messages": 10000,
+    "max_context_tokens": 256000,
+    "idle_timeout_secs": 86400,
+    "auto_archive": true,
+    "archive_ttl_secs": 2592000
+  },
+  "tools": {
+    "shell_policy": "sandboxed",
+    "sandbox_root": ".",
+    "timeout_secs": 30,
+    "max_output_bytes": 65536
+  }
+}
+```
+
+**Response 200** (all fields applied successfully):
+```json
+{ "status": "ok" }
+```
+
+**Response 422** (some fields had validation errors):
+```json
+{
+  "status": "partial",
+  "errors": ["context.strategy must be one of [\"sliding-summary\", \"full\", \"truncate\"], got 'invalid'"]
+}
+```
 
 ---
 

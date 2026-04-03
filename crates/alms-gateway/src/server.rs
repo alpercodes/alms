@@ -16,7 +16,7 @@ use crate::runs::{
     list_runs, run_trigger_loop, scheduler_fire_loop, stream_run_events,
 };
 use crate::session_queue::SessionQueue;
-use crate::settings::get_settings;
+use crate::settings::{get_settings, patch_settings};
 use crate::sse::SseEventData;
 use crate::workspace::{get_workspace, update_workspace_file};
 use alms_coordinator::Coordinator;
@@ -528,8 +528,8 @@ pub struct AppState {
     pub agent_queue: Arc<SessionQueue<AgentId>>,
     /// Snapshot of LLM config — read once at startup so handlers avoid locking the gateway.
     pub llm_config: alms_runtime::LlmConfig,
-    /// Snapshot of agent config — read once at startup so handlers avoid locking the gateway.
-    pub agent_config: alms_runtime::AgentConfig,
+    /// Agent config — mutable via PATCH /settings (context section).
+    pub agent_config: Arc<parking_lot::RwLock<alms_runtime::AgentConfig>>,
     /// Default agent ID — shared with Gateway, updated live on set-default.
     pub default_agent_id: Arc<parking_lot::RwLock<AgentId>>,
     /// LLM client clone — read once at startup so run execution avoids locking the gateway.
@@ -540,12 +540,12 @@ pub struct AppState {
     pub secrets: Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>,
     /// Agent-to-agent message bus for peer messaging (Layer 2).
     pub message_bus: Arc<alms_coordinator::message_bus::MessageBus>,
-    /// Session config snapshot — exposed via GET /settings for UI display.
-    pub session_config: alms_session::SessionConfig,
-    /// Logging config snapshot — exposed via GET /settings for UI display.
+    /// Session config — mutable via PATCH /settings.
+    pub session_config: Arc<parking_lot::RwLock<alms_session::SessionConfig>>,
+    /// Logging config snapshot — exposed via GET /settings for UI display (read-only, requires restart).
     pub logging_config: alms_core::config::LoggingConfig,
-    /// Tools config snapshot (timeout, max_output_bytes) — for UI display.
-    pub tools_config: alms_core::config::ToolsConfig,
+    /// Tools config — mutable via PATCH /settings.
+    pub tools_config: Arc<parking_lot::RwLock<alms_core::config::ToolsConfig>>,
 }
 
 impl AppState {
@@ -660,15 +660,15 @@ impl AppState {
             shutdown_token: shutdown_token.clone(),
             agent_queue: Arc::new(SessionQueue::new(shutdown_token)),
             llm_config,
-            agent_config,
+            agent_config: Arc::new(parking_lot::RwLock::new(agent_config)),
             default_agent_id,
             llm,
             auth_token_value,
             secrets,
             message_bus,
-            session_config,
+            session_config: Arc::new(parking_lot::RwLock::new(session_config)),
             logging_config,
-            tools_config,
+            tools_config: Arc::new(parking_lot::RwLock::new(tools_config)),
         })
     }
 }
@@ -729,8 +729,8 @@ fn protected_router() -> Router<AppState> {
             "/agents/{id_or_name}/workspace/{file}",
             axum::routing::put(update_workspace_file),
         )
-        // Settings (server defaults for UI pre-population)
-        .route("/settings", get(get_settings))
+        // Settings (server defaults for UI pre-population + partial update)
+        .route("/settings", get(get_settings).patch(patch_settings))
         // Jobs (scheduled agent runs)
         .route("/jobs", post(create_job).get(list_jobs))
         .route("/jobs/{job_id}", get(get_job).delete(cancel_job))

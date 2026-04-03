@@ -1,5 +1,6 @@
 import { html, useSignal, useEffect, computed } from '../deps.js';
-import { serverDefaults, localSettings, saveSettings } from '../state/settings.js';
+import { serverDefaults, localSettings, saveSettings, refreshServerDefaults } from '../state/settings.js';
+import { patchSettings } from '../api/settings.js';
 import { listKeys, setKey, removeKey } from '../api/auth.js';
 
 const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
@@ -68,6 +69,19 @@ function InfoRow({ label, value, desc }) {
             <div class="settings-info-row-header">
                 <span class="settings-info-row-label">${label}</span>
                 <span class="settings-info-row-value">${value}</span>
+            </div>
+            ${desc && html`<span class="settings-hint">${desc}</span>`}
+        </div>
+    `;
+}
+
+/** Editable row: label + input + optional description. */
+function EditRow({ label, desc, children }) {
+    return html`
+        <div class="settings-info-row">
+            <div class="settings-info-row-header" style="flex-wrap:wrap;gap:6px;">
+                <span class="settings-info-row-label">${label}</span>
+                ${children}
             </div>
             ${desc && html`<span class="settings-hint">${desc}</span>`}
         </div>
@@ -194,15 +208,66 @@ export function SettingsModal({ open, onClose }) {
     const posture = useSignal('');
     const saved = useSignal(false);
 
+    // Server-level editable signals — Context
+    const ctxStrategy = useSignal('');
+    const ctxMaxInput = useSignal('');
+    const ctxRecentWindow = useSignal('');
+    const ctxSummaryInterval = useSignal('');
+    const ctxSummaryModel = useSignal('');
+
+    // Server-level editable signals — Session
+    const sessMaxMessages = useSignal('');
+    const sessMaxCtxTokens = useSignal('');
+    const sessIdleTimeout = useSignal('');
+    const sessAutoArchive = useSignal(true);
+    const sessArchiveTtl = useSignal('');
+
+    // Server-level editable signals — Tools
+    const toolsShellPolicy = useSignal('');
+    const toolsSandboxRoot = useSignal('');
+    const toolsTimeout = useSignal('');
+    const toolsMaxOutput = useSignal('');
+
+    // Feedback for server settings save
+    const serverSaving = useSignal(false);
+    const serverSaved = useSignal(false);
+    const serverError = useSignal('');
+
     useEffect(() => {
         if (open) {
+            const d = serverDefaults.value;
+            const ctx = d.context || {};
+            const sess = d.session || {};
+            const tools = d.tools || {};
+
             provider.value = localSettings.value.provider || '';
             model.value = localSettings.value.model || '';
             maxTokens.value = localSettings.value.max_tokens != null
                 ? String(localSettings.value.max_tokens)
                 : '';
             posture.value = localSettings.value.posture || '';
+
+            // Populate server-level fields
+            ctxStrategy.value = ctx.strategy || 'truncate';
+            ctxMaxInput.value = ctx.max_input_tokens != null ? String(ctx.max_input_tokens) : '';
+            ctxRecentWindow.value = ctx.recent_window != null ? String(ctx.recent_window) : '';
+            ctxSummaryInterval.value = ctx.summary_interval != null ? String(ctx.summary_interval) : '';
+            ctxSummaryModel.value = ctx.summary_model || '';
+
+            sessMaxMessages.value = sess.max_messages != null ? String(sess.max_messages) : '';
+            sessMaxCtxTokens.value = sess.max_context_tokens != null ? String(sess.max_context_tokens) : '';
+            sessIdleTimeout.value = sess.idle_timeout_secs != null ? String(sess.idle_timeout_secs) : '';
+            sessAutoArchive.value = sess.auto_archive != null ? sess.auto_archive : true;
+            sessArchiveTtl.value = sess.archive_ttl_secs != null ? String(sess.archive_ttl_secs) : '';
+
+            toolsShellPolicy.value = tools.shell_policy || 'sandboxed';
+            toolsSandboxRoot.value = tools.sandbox_root || '.';
+            toolsTimeout.value = tools.timeout_secs != null ? String(tools.timeout_secs) : '';
+            toolsMaxOutput.value = tools.max_output_bytes != null ? String(tools.max_output_bytes) : '';
+
             saved.value = false;
+            serverSaved.value = false;
+            serverError.value = '';
         }
     }, [open]);
 
@@ -234,6 +299,99 @@ export function SettingsModal({ open, onClose }) {
         posture.value = '';
         saved.value = true;
         setTimeout(() => onClose(), 600);
+    };
+
+    /** Save server-level settings via PATCH /settings. */
+    const onSaveServer = async () => {
+        serverSaving.value = true;
+        serverError.value = '';
+        serverSaved.value = false;
+
+        const body = {};
+
+        // Build context patch — only include fields that changed from server defaults
+        const ctxPatch = {};
+        if (ctxStrategy.value && ctxStrategy.value !== (ctx.strategy || '')) {
+            ctxPatch.strategy = ctxStrategy.value;
+        }
+        const newMaxInput = parseInt(ctxMaxInput.value, 10);
+        if (!isNaN(newMaxInput) && newMaxInput !== ctx.max_input_tokens) {
+            ctxPatch.max_input_tokens = newMaxInput;
+        }
+        const newRecent = parseInt(ctxRecentWindow.value, 10);
+        if (!isNaN(newRecent) && newRecent !== ctx.recent_window) {
+            ctxPatch.recent_window = newRecent;
+        }
+        const newSummaryInt = parseInt(ctxSummaryInterval.value, 10);
+        if (!isNaN(newSummaryInt) && newSummaryInt !== ctx.summary_interval) {
+            ctxPatch.summary_interval = newSummaryInt;
+        }
+        if (ctxSummaryModel.value !== (ctx.summary_model || '')) {
+            ctxPatch.summary_model = ctxSummaryModel.value;
+        }
+        if (Object.keys(ctxPatch).length > 0) body.context = ctxPatch;
+
+        // Build session patch
+        const sessPatch = {};
+        const newMaxMsg = parseInt(sessMaxMessages.value, 10);
+        if (!isNaN(newMaxMsg) && newMaxMsg !== sess.max_messages) {
+            sessPatch.max_messages = newMaxMsg;
+        }
+        const newMaxCtx = parseInt(sessMaxCtxTokens.value, 10);
+        if (!isNaN(newMaxCtx) && newMaxCtx !== sess.max_context_tokens) {
+            sessPatch.max_context_tokens = newMaxCtx;
+        }
+        const newIdle = parseInt(sessIdleTimeout.value, 10);
+        if (!isNaN(newIdle) && newIdle !== sess.idle_timeout_secs) {
+            sessPatch.idle_timeout_secs = newIdle;
+        }
+        if (sessAutoArchive.value !== sess.auto_archive) {
+            sessPatch.auto_archive = sessAutoArchive.value;
+        }
+        const newTtl = parseInt(sessArchiveTtl.value, 10);
+        if (!isNaN(newTtl) && newTtl !== sess.archive_ttl_secs) {
+            sessPatch.archive_ttl_secs = newTtl;
+        }
+        if (Object.keys(sessPatch).length > 0) body.session = sessPatch;
+
+        // Build tools patch
+        const toolsPatch = {};
+        if (toolsShellPolicy.value && toolsShellPolicy.value !== (tools.shell_policy || '')) {
+            toolsPatch.shell_policy = toolsShellPolicy.value;
+        }
+        if (toolsSandboxRoot.value !== (tools.sandbox_root || '')) {
+            toolsPatch.sandbox_root = toolsSandboxRoot.value;
+        }
+        const newTimeout = parseInt(toolsTimeout.value, 10);
+        if (!isNaN(newTimeout) && newTimeout !== tools.timeout_secs) {
+            toolsPatch.timeout_secs = newTimeout;
+        }
+        const newMaxOut = parseInt(toolsMaxOutput.value, 10);
+        if (!isNaN(newMaxOut) && newMaxOut !== tools.max_output_bytes) {
+            toolsPatch.max_output_bytes = newMaxOut;
+        }
+        if (Object.keys(toolsPatch).length > 0) body.tools = toolsPatch;
+
+        if (Object.keys(body).length === 0) {
+            // Nothing changed
+            serverSaved.value = true;
+            serverSaving.value = false;
+            return;
+        }
+
+        try {
+            const resp = await patchSettings(body);
+            if (resp.errors && resp.errors.length > 0) {
+                serverError.value = resp.errors.join('; ');
+            }
+            serverSaved.value = true;
+            // Refresh server defaults so UI reflects the new values
+            await refreshServerDefaults();
+        } catch (err) {
+            serverError.value = err.error?.message || err.message || 'Failed to save server settings';
+        } finally {
+            serverSaving.value = false;
+        }
     };
 
     const onOverlayClick = (e) => {
@@ -328,53 +486,121 @@ export function SettingsModal({ open, onClose }) {
 
                 <div class="settings-divider"></div>
 
-                <!-- Context (server-level, read-only) -->
+                <!-- Context (server-level, editable) -->
                 <${Section} key="ctx" title="Context" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        Controls how conversation history is assembled for each LLM request. Edit in alms.toml under [context].
+                        Controls how conversation history is assembled for each LLM request. Changes apply to the next run.
                     </span>
-                    <${InfoRow} label="Strategy" value=${ctx.strategy || 'truncate'}
-                        desc="truncate = drop oldest messages. full = send all. sliding-summary = summarize old + keep recent verbatim." />
-                    <${InfoRow} label="Max input tokens" value=${fmt(ctx.max_input_tokens)}
-                        desc="Token budget per LLM request (should match your model's context window)." />
-                    <${InfoRow} label="Recent window" value=${ctx.recent_window ?? '--'}
-                        desc="For sliding-summary: number of recent messages kept verbatim." />
-                    <${InfoRow} label="Summary interval" value=${ctx.summary_interval ?? '--'}
-                        desc="Messages between summary regenerations (sliding-summary only)." />
-                    <${InfoRow} label="Summary model" value=${ctx.summary_model || 'same as default'}
-                        desc="Optional cheaper model for generating summaries." />
+                    <${EditRow} label="Strategy"
+                        desc="truncate = drop oldest messages. full = send all. sliding-summary = summarize old + keep recent verbatim.">
+                        <select class="settings-select settings-input-sm"
+                                value=${ctxStrategy.value}
+                                onChange=${e => { ctxStrategy.value = e.target.value; }}>
+                            <option value="truncate">truncate</option>
+                            <option value="full">full</option>
+                            <option value="sliding-summary">sliding-summary</option>
+                        </select>
+                    <//>
+                    <${EditRow} label="Max input tokens"
+                        desc="Token budget per LLM request (should match your model's context window).">
+                        <input class="settings-input settings-input-sm" type="number" min="1" step="1000"
+                               value=${ctxMaxInput.value}
+                               onInput=${e => { ctxMaxInput.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Recent window"
+                        desc="For sliding-summary: number of recent messages kept verbatim.">
+                        <input class="settings-input settings-input-sm" type="number" min="1"
+                               value=${ctxRecentWindow.value}
+                               onInput=${e => { ctxRecentWindow.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Summary interval"
+                        desc="Messages between summary regenerations (sliding-summary only).">
+                        <input class="settings-input settings-input-sm" type="number" min="0"
+                               value=${ctxSummaryInterval.value}
+                               onInput=${e => { ctxSummaryInterval.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Summary model"
+                        desc="Optional cheaper model for generating summaries. Leave empty for default.">
+                        <input class="settings-input settings-input-sm" type="text"
+                               placeholder="same as default"
+                               list="model-suggestions"
+                               value=${ctxSummaryModel.value}
+                               onInput=${e => { ctxSummaryModel.value = e.target.value; }} />
+                    <//>
                 <//>
 
-                <!-- Session (server-level, read-only) -->
+                <!-- Session (server-level, editable) -->
                 <${Section} key="sess" title="Session" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        Controls session storage and retention. Edit in alms.toml under [session].
+                        Controls session storage and retention. Changes apply to the next run.
                     </span>
-                    <${InfoRow} label="Max messages" value=${fmt(sess.max_messages)}
-                        desc="Maximum messages stored per session." />
-                    <${InfoRow} label="Max context tokens" value=${fmt(sess.max_context_tokens)}
-                        desc="Maximum tokens retained in session history (storage limit, must be >= context max_input_tokens)." />
-                    <${InfoRow} label="Idle timeout" value=${fmtDuration(sess.idle_timeout_secs)}
-                        desc="Time before a session is considered idle." />
-                    <${InfoRow} label="Auto archive" value=${sess.auto_archive != null ? (sess.auto_archive ? 'yes' : 'no') : '--'}
-                        desc="Automatically archive idle sessions." />
-                    <${InfoRow} label="Archive TTL" value=${fmtDuration(sess.archive_ttl_secs)}
-                        desc="Delete archived sessions after this duration." />
+                    <${EditRow} label="Max messages"
+                        desc="Maximum messages stored per session.">
+                        <input class="settings-input settings-input-sm" type="number" min="1"
+                               value=${sessMaxMessages.value}
+                               onInput=${e => { sessMaxMessages.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Max context tokens"
+                        desc="Maximum tokens retained in session history (must be >= context max_input_tokens).">
+                        <input class="settings-input settings-input-sm" type="number" min="1" step="1000"
+                               value=${sessMaxCtxTokens.value}
+                               onInput=${e => { sessMaxCtxTokens.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Idle timeout (seconds)"
+                        desc="Time before a session is considered idle.">
+                        <input class="settings-input settings-input-sm" type="number" min="0"
+                               value=${sessIdleTimeout.value}
+                               onInput=${e => { sessIdleTimeout.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Auto archive"
+                        desc="Automatically archive idle sessions.">
+                        <label class="settings-toggle">
+                            <input type="checkbox"
+                                   checked=${sessAutoArchive.value}
+                                   onChange=${e => { sessAutoArchive.value = e.target.checked; }} />
+                            <span>${sessAutoArchive.value ? 'enabled' : 'disabled'}</span>
+                        </label>
+                    <//>
+                    <${EditRow} label="Archive TTL (seconds)"
+                        desc="Delete archived sessions after this duration.">
+                        <input class="settings-input settings-input-sm" type="number" min="0"
+                               value=${sessArchiveTtl.value}
+                               onInput=${e => { sessArchiveTtl.value = e.target.value; }} />
+                    <//>
                 <//>
 
-                <!-- Tools (server-level, read-only) -->
+                <!-- Tools (server-level, editable) -->
                 <${Section} key="tools" title="Tools" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        Tool execution settings. Edit in alms.toml under [tools].
+                        Tool execution settings. Changes apply to the next run.
                     </span>
-                    <${InfoRow} label="Shell policy" value=${tools.shell_policy || 'sandboxed'}
-                        desc="sandboxed = restrict shell cwd to sandbox root. unrestricted = no cwd restriction." />
-                    <${InfoRow} label="Sandbox root" value=${tools.sandbox_root || '.'}
-                        desc="Filesystem sandbox root for fs_* tools. Empty = unrestricted." />
-                    <${InfoRow} label="Tool timeout" value=${fmtDuration(tools.timeout_secs)}
-                        desc="Maximum execution time per tool call." />
-                    <${InfoRow} label="Max output" value=${tools.max_output_bytes != null ? `${fmt(tools.max_output_bytes)} bytes` : '--'}
-                        desc="Maximum bytes returned from a single tool call." />
+                    <${EditRow} label="Shell policy"
+                        desc="sandboxed = restrict shell cwd to sandbox root. unrestricted = no cwd restriction.">
+                        <select class="settings-select settings-input-sm"
+                                value=${toolsShellPolicy.value}
+                                onChange=${e => { toolsShellPolicy.value = e.target.value; }}>
+                            <option value="sandboxed">sandboxed</option>
+                            <option value="unrestricted">unrestricted</option>
+                        </select>
+                    <//>
+                    <${EditRow} label="Sandbox root"
+                        desc="Filesystem sandbox root for fs_* tools. Empty = unrestricted.">
+                        <input class="settings-input settings-input-sm" type="text"
+                               value=${toolsSandboxRoot.value}
+                               onInput=${e => { toolsSandboxRoot.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Tool timeout (seconds)"
+                        desc="Maximum execution time per tool call.">
+                        <input class="settings-input settings-input-sm" type="number" min="1"
+                               value=${toolsTimeout.value}
+                               onInput=${e => { toolsTimeout.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Max output (bytes)"
+                        desc="Maximum bytes returned from a single tool call.">
+                        <input class="settings-input settings-input-sm" type="number" min="1"
+                               value=${toolsMaxOutput.value}
+                               onInput=${e => { toolsMaxOutput.value = e.target.value; }} />
+                    <//>
                     <${InfoRow} label="Enabled tools" value=${`${enabledTools.length} tools`}
                         desc=${enabledTools.join(', ')} />
                 <//>
@@ -382,7 +608,7 @@ export function SettingsModal({ open, onClose }) {
                 <!-- Logging (server-level, read-only) -->
                 <${Section} key="log" title="Logging" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        File-based logging settings. Edit in alms.toml under [logging]. Requires restart.
+                        File-based logging settings. Requires restart to change.
                     </span>
                     <${InfoRow} label="File logging" value=${log.file_enabled != null ? (log.file_enabled ? 'enabled' : 'disabled') : '--'}
                         desc="Whether persistent file logging is active." />
@@ -406,11 +632,21 @@ export function SettingsModal({ open, onClose }) {
                     </div>
                 </div>
 
+                <!-- Server settings save feedback -->
+                ${serverError.value && html`
+                    <div class="settings-error">${serverError.value}</div>
+                `}
+
                 <div class="settings-footer">
-                    <button class="settings-cancel" onClick=${onReset}>Reset</button>
+                    <button class="settings-save" onClick=${onSaveServer}
+                            disabled=${serverSaving.value}>
+                        ${serverSaving.value ? 'Saving...' : (serverSaved.value ? 'Server saved!' : 'Apply server settings')}
+                    </button>
+                    <span class="settings-footer-spacer"></span>
+                    <button class="settings-cancel" onClick=${onReset}>Reset overrides</button>
                     <button class="settings-cancel" onClick=${onClose}>Cancel</button>
                     <button class="settings-save" onClick=${onSave}>
-                        ${saved.value ? 'Saved!' : 'Apply'}
+                        ${saved.value ? 'Saved!' : 'Apply overrides'}
                     </button>
                 </div>
             </div>

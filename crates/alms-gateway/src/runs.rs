@@ -604,10 +604,11 @@ async fn execute_run(state: AppState, params: RunParams) {
 
     // Resolve per-agent config (model, posture) from the agent registry,
     // then layer per-run overrides on top.
+    let base_agent_config = state.agent_config.read().clone();
     let resolved = resolve_agent_config(
         agent_id,
         &state.session_manager,
-        &state.agent_config,
+        &base_agent_config,
         &state.llm,
         Some(&state.secrets.read()),
     );
