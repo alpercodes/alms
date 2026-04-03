@@ -16,7 +16,7 @@ use crate::runs::{
     list_runs, run_trigger_loop, scheduler_fire_loop, stream_run_events,
 };
 use crate::session_queue::SessionQueue;
-use crate::settings::get_settings;
+use crate::settings::{get_settings, patch_settings};
 use crate::sse::SseEventData;
 use crate::workspace::{get_workspace, update_workspace_file};
 use alms_coordinator::Coordinator;
@@ -39,6 +39,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tracing::info;
 
 /// Run manager for tracking runs and their event streams
@@ -528,8 +529,8 @@ pub struct AppState {
     pub agent_queue: Arc<SessionQueue<AgentId>>,
     /// Snapshot of LLM config — read once at startup so handlers avoid locking the gateway.
     pub llm_config: alms_runtime::LlmConfig,
-    /// Snapshot of agent config — read once at startup so handlers avoid locking the gateway.
-    pub agent_config: alms_runtime::AgentConfig,
+    /// Agent config — mutable via PATCH /settings (context section).
+    pub agent_config: Arc<parking_lot::RwLock<alms_runtime::AgentConfig>>,
     /// Default agent ID — shared with Gateway, updated live on set-default.
     pub default_agent_id: Arc<parking_lot::RwLock<AgentId>>,
     /// LLM client clone — read once at startup so run execution avoids locking the gateway.
@@ -540,12 +541,12 @@ pub struct AppState {
     pub secrets: Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>,
     /// Agent-to-agent message bus for peer messaging (Layer 2).
     pub message_bus: Arc<alms_coordinator::message_bus::MessageBus>,
-    /// Session config snapshot — exposed via GET /settings for UI display.
-    pub session_config: alms_session::SessionConfig,
-    /// Logging config snapshot — exposed via GET /settings for UI display.
+    /// Session config — mutable via PATCH /settings.
+    pub session_config: Arc<parking_lot::RwLock<alms_session::SessionConfig>>,
+    /// Logging config snapshot — exposed via GET /settings for UI display (read-only, requires restart).
     pub logging_config: alms_core::config::LoggingConfig,
-    /// Tools config snapshot (timeout, max_output_bytes) — for UI display.
-    pub tools_config: alms_core::config::ToolsConfig,
+    /// Tools config — mutable via PATCH /settings.
+    pub tools_config: Arc<parking_lot::RwLock<alms_core::config::ToolsConfig>>,
 }
 
 impl AppState {
@@ -572,11 +573,32 @@ impl AppState {
         let agent_id = gateway.agent_id();
         let default_agent_id = gateway.agent_id_handle();
         let llm_config = gateway.llm_config().clone();
-        let agent_config = gateway.agent_config().clone();
+        let mut agent_config_val = gateway.agent_config().clone();
         let auth_token_value = gateway.auth_token().map(String::from);
-        let session_config = gateway.session_config().clone();
+        let mut session_config = gateway.session_config().clone();
         let logging_config = gateway.logging_config().clone();
-        let tools_config = gateway.tools_config().clone();
+        let mut tools_config = gateway.tools_config().clone();
+
+        // Apply persisted settings from a previous PATCH /settings so that
+        // configuration changes survive gateway restarts.
+        if let Some(persisted) = crate::settings::load_persisted_settings(&data_dir) {
+            if let Some(ctx) = persisted.context {
+                agent_config_val.context_config = ctx;
+            }
+            if let Some(sess) = persisted.session {
+                session_config = sess;
+            }
+            if let Some(t) = persisted.tools {
+                // Also sync the two copies kept in agent_config.
+                agent_config_val.sandbox_root = t.sandbox_root.clone();
+                agent_config_val.shell_policy = t.shell_policy.clone();
+                tools_config = t;
+            }
+        }
+
+        // Create the shared agent config Arc *once* — both the Coordinator and
+        // AppState reference the same lock so PATCH /settings updates propagate.
+        let agent_config = Arc::new(parking_lot::RwLock::new(agent_config_val));
         let db_path_str = gateway.db_path().map(String::from);
         let job_store = match db_path_str.as_deref() {
             Some(path) => {
@@ -600,7 +622,7 @@ impl AppState {
             agent_id,
             session_manager.clone(),
             llm.clone(),
-            agent_config.clone(),
+            Arc::clone(&agent_config),
         )
         .with_completion_channel(completion_tx)
         .with_run_registrar(Arc::new(run_manager.clone()));
@@ -666,9 +688,9 @@ impl AppState {
             auth_token_value,
             secrets,
             message_bus,
-            session_config,
+            session_config: Arc::new(parking_lot::RwLock::new(session_config)),
             logging_config,
-            tools_config,
+            tools_config: Arc::new(parking_lot::RwLock::new(tools_config)),
         })
     }
 }
@@ -678,13 +700,20 @@ pub use crate::sse::{RunEventStream, event_channel};
 
 /// Routes that do NOT require authentication
 fn public_router() -> Router<AppState> {
+    // Static files get Cache-Control: no-store so browsers always fetch fresh
+    // JS/CSS after a deployment, matching the HTML endpoint at `/`.
+    let static_files = ServeDir::new("crates/alms-gateway/static/ui")
+        .fallback(ServeFile::new("crates/alms-gateway/static/ui/index.html"));
+    let static_with_cache = tower::ServiceBuilder::new()
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        ))
+        .service(static_files);
+
     Router::new()
         .route("/health", get(health_check))
-        .nest_service(
-            "/ui",
-            ServeDir::new("crates/alms-gateway/static/ui")
-                .fallback(ServeFile::new("crates/alms-gateway/static/ui/index.html")),
-        )
+        .nest_service("/ui", static_with_cache)
 }
 
 /// Routes that require authentication (all except /health)
@@ -729,8 +758,8 @@ fn protected_router() -> Router<AppState> {
             "/agents/{id_or_name}/workspace/{file}",
             axum::routing::put(update_workspace_file),
         )
-        // Settings (server defaults for UI pre-population)
-        .route("/settings", get(get_settings))
+        // Settings (server defaults for UI pre-population + partial update)
+        .route("/settings", get(get_settings).patch(patch_settings))
         // Jobs (scheduled agent runs)
         .route("/jobs", post(create_job).get(list_jobs))
         .route("/jobs/{job_id}", get(get_job).delete(cancel_job))

@@ -29,4 +29,5 @@ export async function apiFetch(path, opts = {}) {
 export const get = (path) => apiFetch(path);
 export const post = (path, body) => apiFetch(path, { method: 'POST', body });
 export const put = (path, body) => apiFetch(path, { method: 'PUT', body });
+export const patch = (path, body) => apiFetch(path, { method: 'PATCH', body });
 export const del = (path) => apiFetch(path, { method: 'DELETE' });

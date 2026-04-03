@@ -1,4 +1,5 @@
 import { signal } from '../deps.js';
+import { fetchSettings } from '../api/settings.js';
 
 // Server-reported defaults from GET /settings
 export const serverDefaults = signal({});
@@ -20,4 +21,14 @@ export function saveSettings(updates) {
     const merged = { ...localSettings.value, ...updates };
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(merged));
     localSettings.value = merged;
+}
+
+/** Re-fetch server defaults after a PATCH /settings update. */
+export async function refreshServerDefaults() {
+    try {
+        const data = await fetchSettings();
+        serverDefaults.value = data;
+    } catch (err) {
+        console.error('[settings] refresh failed:', err);
+    }
 }

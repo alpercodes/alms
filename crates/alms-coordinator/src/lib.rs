@@ -131,8 +131,10 @@ pub struct Coordinator {
     session_manager: Arc<SessionManager>,
     /// LLM client — cloned for each subagent runtime
     llm: LlmClient,
-    /// Base agent config — subagents inherit sandbox settings from this
-    base_agent_config: AgentConfig,
+    /// Base agent config — subagents inherit sandbox settings from this.
+    /// Shared with the gateway's AppState so PATCH /settings updates are
+    /// visible to subsequently-spawned subagents.
+    base_agent_config: Arc<parking_lot::RwLock<AgentConfig>>,
     /// Workspace base directory — named subagents get workspaces under this dir
     workspace_dir: Option<std::path::PathBuf>,
     /// Absolute path to the gateway's data directory. Propagated to subagent
@@ -159,7 +161,7 @@ impl Coordinator {
             active_named: Arc::new(dashmap::DashSet::new()),
             session_manager,
             llm,
-            base_agent_config: AgentConfig::default(),
+            base_agent_config: Arc::new(parking_lot::RwLock::new(AgentConfig::default())),
             workspace_dir: None,
             data_dir: None,
             subagent_prompts: Arc::new(DashMap::new()),
@@ -170,11 +172,15 @@ impl Coordinator {
     }
 
     /// Create a coordinator that inherits sandbox settings from the given config.
+    ///
+    /// The `Arc<RwLock<AgentConfig>>` is shared with the gateway's `AppState`
+    /// so that PATCH /settings updates are visible to subsequently-spawned
+    /// subagents without restarting the server.
     pub fn with_agent_config(
         main_agent: AgentId,
         session_manager: Arc<SessionManager>,
         llm: LlmClient,
-        base_agent_config: AgentConfig,
+        base_agent_config: Arc<parking_lot::RwLock<AgentConfig>>,
     ) -> Self {
         Self {
             main_agent,
@@ -308,7 +314,9 @@ impl Coordinator {
         let active_named = self.active_named.clone();
         let session_manager = self.session_manager.clone();
         let llm = self.llm.clone();
-        let base_agent_config = self.base_agent_config.clone();
+        // Snapshot the current config under the lock so that PATCH /settings
+        // updates are reflected in subsequently-spawned subagents.
+        let base_agent_config = self.base_agent_config.read().clone();
         let workspace_dir = self.workspace_dir.clone();
         let data_dir = self.data_dir.clone();
         let subagent_prompts = self.subagent_prompts.clone();
