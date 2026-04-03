@@ -1210,6 +1210,39 @@ header h1 {
   word-break: break-all;
 }
 
+/* Per-run overrides header */
+.settings-overrides-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Effective value hint below each editable field */
+.settings-effective {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  font-family: var(--font-mono);
+}
+
+/* Override count badge on the settings gear button */
+.settings-btn { position: relative; }
+.settings-override-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+  pointer-events: none;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
    Agent Management Panel
    ══════════════════════════════════════════════════════════════════════ */

@@ -5,6 +5,7 @@ import { localSettings, serverDefaults } from '../state/settings.js';
 import { theme, toggleTheme } from '../state/theme.js';
 import { switchAgent } from '../hooks/use-boot.js';
 import { IconGear, IconSun, IconMoon } from '../utils/icons.js';
+import { activeOverrideCount } from './settings-modal.js';
 
 const TABS = ['agents', 'workspace', 'jobs', 'audit'];
 
@@ -78,9 +79,12 @@ export function Header({ onOpenSettings, status }) {
                 ${theme.value === 'dark' ? html`<${IconSun} />` : html`<${IconMoon} />`}
             </button>
 
-            <button class="header-icon-btn" title="Settings" aria-label="Settings"
+            <button class="header-icon-btn settings-btn" title="Settings" aria-label="Settings"
                     onClick=${onOpenSettings}>
                 <${IconGear} />
+                ${activeOverrideCount.value > 0 && html`
+                    <span class="settings-override-badge">${activeOverrideCount.value}</span>
+                `}
             </button>
         </header>
     `;

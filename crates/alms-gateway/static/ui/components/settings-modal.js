@@ -1,8 +1,31 @@
-import { html, useSignal, useEffect } from '../deps.js';
+import { html, useSignal, useEffect, computed } from '../deps.js';
 import { serverDefaults, localSettings, saveSettings } from '../state/settings.js';
 import { listKeys, setKey, removeKey } from '../api/auth.js';
 
 const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
+
+/** Common models for datalist suggestions, grouped by provider. */
+const MODEL_SUGGESTIONS = [
+    // OpenAI
+    'gpt-4o',
+    'gpt-4o-mini',
+    'gpt-4.1',
+    'gpt-4.1-mini',
+    'gpt-4.1-nano',
+    'o3',
+    'o3-mini',
+    'o4-mini',
+    // Anthropic
+    'claude-sonnet-4-20250514',
+    'claude-opus-4-20250514',
+    'claude-3-7-sonnet-20250219',
+    'claude-3-5-haiku-20241022',
+    // OpenRouter (popular picks)
+    'google/gemini-2.5-pro-preview',
+    'google/gemini-2.5-flash-preview',
+    'deepseek/deepseek-r1',
+    'deepseek/deepseek-chat-v3-0324',
+];
 
 /** Format large numbers with commas for readability. */
 function fmt(n) {
@@ -150,6 +173,20 @@ function ApiKeysSection() {
     `;
 }
 
+/**
+ * Count how many per-run overrides are currently active.
+ * Exported so the header can show an indicator badge.
+ */
+export const activeOverrideCount = computed(() => {
+    const s = localSettings.value;
+    let count = 0;
+    if (s.provider) count++;
+    if (s.model) count++;
+    if (s.max_tokens != null) count++;
+    if (s.posture) count++;
+    return count;
+});
+
 export function SettingsModal({ open, onClose }) {
     const provider = useSignal('');
     const model = useSignal('');
@@ -205,20 +242,33 @@ export function SettingsModal({ open, onClose }) {
 
     const enabledTools = tools.enabled || defaults.enabled_tools || [];
 
+    // Effective values: what the next run will actually use.
+    const effProvider = provider.value || defaults.provider || 'openai';
+    const effModel = model.value.trim() || defaults.model || 'unknown';
+    const effMaxTokens = maxTokens.value ? parseInt(maxTokens.value, 10) : (defaults.max_tokens || 100000);
+    const effPosture = posture.value || defaults.posture || 'guarded';
+
     return html`
         <div class="settings-overlay open" onClick=${onOverlayClick}>
             <div class="settings-modal">
                 <h2>Settings</h2>
 
-                <!-- ── Security: API Keys ── -->
+                <!-- Security: API Keys -->
                 <${ApiKeysSection} />
 
                 <div class="settings-divider"></div>
 
-                <!-- ── LLM: Per-run overrides (editable) ── -->
+                <!-- Per-run overrides (editable) -->
+                <div class="settings-overrides-header">
+                    <span class="settings-label">Per-run overrides</span>
+                    <span class="settings-hint">
+                        Applied to every new run. Leave empty to use server defaults.
+                    </span>
+                </div>
+
                 <div class="settings-grid">
                     <div class="settings-row">
-                        <label class="settings-label">Provider override</label>
+                        <label class="settings-label">Provider</label>
                         <select class="settings-select"
                                 value=${provider.value}
                                 onChange=${e => { provider.value = e.target.value; }}>
@@ -227,16 +277,23 @@ export function SettingsModal({ open, onClose }) {
                             <option value="anthropic">Anthropic</option>
                             <option value="openrouter">OpenRouter</option>
                         </select>
+                        <span class="settings-effective">
+                            Effective: ${effProvider}
+                        </span>
                     </div>
 
                     <div class="settings-row">
-                        <label class="settings-label">Model override</label>
+                        <label class="settings-label">Model</label>
                         <input class="settings-input" type="text"
+                               list="model-suggestions"
                                placeholder=${defaults.model || 'server default'}
                                value=${model.value}
                                onInput=${e => { model.value = e.target.value; }} />
-                        <span class="settings-hint">
-                            Leave empty to use server default (${defaults.model || 'unknown'}).
+                        <datalist id="model-suggestions">
+                            ${MODEL_SUGGESTIONS.map(m => html`<option value=${m} />`)}
+                        </datalist>
+                        <span class="settings-effective">
+                            Effective: ${effModel}
                         </span>
                     </div>
                 </div>
@@ -244,10 +301,13 @@ export function SettingsModal({ open, onClose }) {
                 <div class="settings-grid">
                     <div class="settings-row">
                         <label class="settings-label">Max tokens</label>
-                        <input class="settings-input" type="number" min="1"
+                        <input class="settings-input" type="number" min="1" step="1000"
                                placeholder=${defaults.max_tokens || 100000}
                                value=${maxTokens.value}
                                onInput=${e => { maxTokens.value = e.target.value; }} />
+                        <span class="settings-effective">
+                            Effective: ${fmt(effMaxTokens)}
+                        </span>
                     </div>
 
                     <div class="settings-row">
@@ -260,12 +320,15 @@ export function SettingsModal({ open, onClose }) {
                             <option value="guarded">guarded</option>
                             <option value="autonomous">autonomous</option>
                         </select>
+                        <span class="settings-effective">
+                            Effective: ${effPosture}
+                        </span>
                     </div>
                 </div>
 
                 <div class="settings-divider"></div>
 
-                <!-- ── Context (server-level, read-only) ── -->
+                <!-- Context (server-level, read-only) -->
                 <${Section} key="ctx" title="Context" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
                         Controls how conversation history is assembled for each LLM request. Edit in alms.toml under [context].
@@ -282,7 +345,7 @@ export function SettingsModal({ open, onClose }) {
                         desc="Optional cheaper model for generating summaries." />
                 <//>
 
-                <!-- ── Session (server-level, read-only) ── -->
+                <!-- Session (server-level, read-only) -->
                 <${Section} key="sess" title="Session" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
                         Controls session storage and retention. Edit in alms.toml under [session].
@@ -299,7 +362,7 @@ export function SettingsModal({ open, onClose }) {
                         desc="Delete archived sessions after this duration." />
                 <//>
 
-                <!-- ── Tools (server-level, read-only) ── -->
+                <!-- Tools (server-level, read-only) -->
                 <${Section} key="tools" title="Tools" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
                         Tool execution settings. Edit in alms.toml under [tools].
@@ -316,7 +379,7 @@ export function SettingsModal({ open, onClose }) {
                         desc=${enabledTools.join(', ')} />
                 <//>
 
-                <!-- ── Logging (server-level, read-only) ── -->
+                <!-- Logging (server-level, read-only) -->
                 <${Section} key="log" title="Logging" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
                         File-based logging settings. Edit in alms.toml under [logging]. Requires restart.
@@ -333,7 +396,7 @@ export function SettingsModal({ open, onClose }) {
 
                 <div class="settings-divider"></div>
 
-                <!-- ── Server info (compact) ── -->
+                <!-- Server info (compact) -->
                 <div class="settings-row">
                     <label class="settings-label">Server info</label>
                     <div class="settings-info">
