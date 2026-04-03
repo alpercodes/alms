@@ -279,18 +279,6 @@ export function SettingsModal({ open, onClose }) {
     const log = defaults.logging || {};
     const tools = defaults.tools || {};
 
-    const onSave = () => {
-        const updates = {};
-        updates.provider = provider.value || null;
-        updates.model = model.value.trim() || null;
-        const mt = parseInt(maxTokens.value, 10);
-        updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
-        updates.posture = posture.value || null;
-        saveSettings(updates);
-        saved.value = true;
-        setTimeout(() => onClose(), 600);
-    };
-
     const onReset = () => {
         saveSettings({ provider: null, model: null, max_tokens: null, posture: null });
         provider.value = '';
@@ -301,15 +289,25 @@ export function SettingsModal({ open, onClose }) {
         setTimeout(() => onClose(), 600);
     };
 
-    /** Save server-level settings via PATCH /settings. */
-    const onSaveServer = async () => {
+    /** Single Apply handler: saves per-run overrides to localStorage AND patches server settings. */
+    const onApply = async () => {
         serverSaving.value = true;
         serverError.value = '';
         serverSaved.value = false;
+        saved.value = false;
 
+        // 1. Always save per-run overrides to localStorage (this never fails)
+        const updates = {};
+        updates.provider = provider.value || null;
+        updates.model = model.value.trim() || null;
+        const mt = parseInt(maxTokens.value, 10);
+        updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
+        updates.posture = posture.value || null;
+        saveSettings(updates);
+
+        // 2. Build server settings patch — only include fields that changed from server defaults
         const body = {};
 
-        // Build context patch — only include fields that changed from server defaults
         const ctxPatch = {};
         if (ctxStrategy.value && ctxStrategy.value !== (ctx.strategy || '')) {
             ctxPatch.strategy = ctxStrategy.value;
@@ -331,7 +329,6 @@ export function SettingsModal({ open, onClose }) {
         }
         if (Object.keys(ctxPatch).length > 0) body.context = ctxPatch;
 
-        // Build session patch
         const sessPatch = {};
         const newMaxMsg = parseInt(sessMaxMessages.value, 10);
         if (!isNaN(newMaxMsg) && newMaxMsg !== sess.max_messages) {
@@ -354,7 +351,6 @@ export function SettingsModal({ open, onClose }) {
         }
         if (Object.keys(sessPatch).length > 0) body.session = sessPatch;
 
-        // Build tools patch
         const toolsPatch = {};
         if (toolsShellPolicy.value && toolsShellPolicy.value !== (tools.shell_policy || '')) {
             toolsPatch.shell_policy = toolsShellPolicy.value;
@@ -372,25 +368,26 @@ export function SettingsModal({ open, onClose }) {
         }
         if (Object.keys(toolsPatch).length > 0) body.tools = toolsPatch;
 
-        if (Object.keys(body).length === 0) {
-            // Nothing changed
-            serverSaved.value = true;
-            serverSaving.value = false;
-            return;
+        // 3. If there are server-level changes, PATCH them
+        if (Object.keys(body).length > 0) {
+            try {
+                const resp = await patchSettings(body);
+                if (resp.errors && resp.errors.length > 0) {
+                    serverError.value = resp.errors.join('; ');
+                }
+                await refreshServerDefaults();
+            } catch (err) {
+                serverError.value = err.error?.message || err.message || 'Failed to save server settings';
+            }
         }
 
-        try {
-            const resp = await patchSettings(body);
-            if (resp.errors && resp.errors.length > 0) {
-                serverError.value = resp.errors.join('; ');
-            }
-            serverSaved.value = true;
-            // Refresh server defaults so UI reflects the new values
-            await refreshServerDefaults();
-        } catch (err) {
-            serverError.value = err.error?.message || err.message || 'Failed to save server settings';
-        } finally {
-            serverSaving.value = false;
+        // 4. Show success feedback — per-run overrides are always saved even if server patch failed
+        saved.value = true;
+        serverSaving.value = false;
+
+        // Close after brief feedback, unless there was a server error
+        if (!serverError.value) {
+            setTimeout(() => onClose(), 600);
         }
     };
 
@@ -632,24 +629,18 @@ export function SettingsModal({ open, onClose }) {
                     </div>
                 </div>
 
-                <!-- Server settings save feedback -->
-                <span class="settings-hint" style="text-align:center; display:block; margin-top:4px;">
-                    Server settings are persisted to disk and survive restarts.
-                </span>
                 ${serverError.value && html`
-                    <div class="settings-error">${serverError.value}</div>
+                    <div class="settings-error">
+                        Per-run overrides saved. Server settings failed: ${serverError.value}
+                    </div>
                 `}
 
                 <div class="settings-footer">
-                    <button class="settings-save" onClick=${onSaveServer}
-                            disabled=${serverSaving.value}>
-                        ${serverSaving.value ? 'Saving...' : (serverSaved.value ? 'Server saved!' : 'Apply server settings')}
-                    </button>
-                    <span class="settings-footer-spacer"></span>
-                    <button class="settings-cancel" onClick=${onReset}>Reset overrides</button>
+                    <button class="settings-cancel" onClick=${onReset}>Reset</button>
                     <button class="settings-cancel" onClick=${onClose}>Cancel</button>
-                    <button class="settings-save" onClick=${onSave}>
-                        ${saved.value ? 'Saved!' : 'Apply overrides'}
+                    <button class="settings-save" onClick=${onApply}
+                            disabled=${serverSaving.value}>
+                        ${serverSaving.value ? 'Saving...' : (saved.value ? 'Saved!' : 'Apply')}
                     </button>
                 </div>
             </div>
