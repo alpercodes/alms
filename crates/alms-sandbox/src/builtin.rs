@@ -1326,4 +1326,65 @@ mod tests {
         );
         assert!(result_new.unwrap().starts_with(&root));
     }
+
+    // ── Windows mixed-separator test (S1 from Tim's review) ────────────────
+
+    #[cfg(windows)]
+    #[test]
+    fn test_canonicalize_mixed_separators_windows() {
+        // On Windows, backslash-mixed paths like `foo\..\..\secret` are a
+        // classic sandbox bypass vector.  `Path::components()` normalizes
+        // separators, so the function should be safe — this test locks down
+        // that assumption.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        // Pure backslash traversal
+        assert!(
+            check_sandbox_path("foo\\..\\..\\..\\secret", &root).is_err(),
+            "backslash traversal should be rejected"
+        );
+        // Mixed forward- and back-slash traversal
+        assert!(
+            check_sandbox_path("foo/..\\..\\secret", &root).is_err(),
+            "mixed-separator traversal should be rejected"
+        );
+    }
+
+    // ── Null byte injection test (S2 from Tim's review) ────────────────────
+
+    #[test]
+    fn test_canonicalize_null_byte_injection() {
+        // Some OS APIs truncate at `\0`, which could let an attacker turn
+        // `"safe\0/../../../etc/passwd"` into just `"safe"`.  Rust's
+        // `std::fs::canonicalize` and `path.exists()` reject embedded nulls
+        // on all platforms, so `canonicalize_best_effort` falls through to
+        // the component-by-component walk where the NUL stays in the
+        // `Normal` component.  Regardless of the exact error, the path must
+        // never resolve to something *outside* the sandbox.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        // Null byte mid-path — should either error or stay inside sandbox
+        let result = check_sandbox_path("safe\0/../../../etc/passwd", &root);
+        match &result {
+            Ok(resolved) => assert!(
+                resolved.starts_with(&root),
+                "null-byte path resolved outside sandbox: {}",
+                resolved.display()
+            ),
+            Err(_) => {} // Error is also acceptable — the path is not usable
+        }
+
+        // Null byte in a simple filename — same contract
+        let result2 = check_sandbox_path("file\0.txt", &root);
+        match &result2 {
+            Ok(resolved) => assert!(
+                resolved.starts_with(&root),
+                "null-byte filename resolved outside sandbox: {}",
+                resolved.display()
+            ),
+            Err(_) => {}
+        }
+    }
 }
