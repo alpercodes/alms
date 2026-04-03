@@ -6,13 +6,16 @@ pub mod builtin;
 pub mod error;
 pub mod registry;
 pub mod sandbox;
+pub mod shell;
 
-pub use builtin::{
-    EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool, ShellExecTool,
-};
+pub use builtin::{EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool};
 pub use error::{SandboxError, SandboxResult};
 pub use registry::ToolRegistry;
 pub use sandbox::{Sandbox, SandboxConfig};
+pub use shell::ShellTool;
+
+/// Type alias for backward compatibility. Use [`ShellTool`] instead.
+pub type ShellExecTool = ShellTool;
 
 /// Tool trait - implemented by both WASM and native tools
 #[async_trait::async_trait]

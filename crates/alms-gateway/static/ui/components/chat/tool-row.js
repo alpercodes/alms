@@ -4,9 +4,11 @@ import { html, useSignal } from '../../deps.js';
 function toolSummary(tool, params) {
     if (!params) return '';
     switch (tool) {
+        case 'shell':
         case 'shell_exec':
+            if (params.command) return params.command;
             if (params.argv) return params.argv.join(' ');
-            return params.command || '';
+            return '';
         case 'fs_read':
             return params.path || '';
         case 'fs_write': {

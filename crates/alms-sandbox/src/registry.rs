@@ -64,6 +64,39 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Register a tool under a specific name (alias).
+    ///
+    /// Unlike `register()`, this allows inserting a tool under a different
+    /// name than `tool.name()`. Used for backward-compatible aliases
+    /// (e.g. registering `ShellTool` under the legacy `"shell_exec"` name).
+    ///
+    /// The enabled filter checks the provided `alias` name, not `tool.name()`.
+    pub fn register_as(&self, alias: &str, tool: Arc<dyn Tool>) -> SandboxResult<()> {
+        if !self.enabled_filter.is_empty()
+            && !self.enabled_filter.iter().any(|e| e == alias)
+            // Also accept the tool's canonical name in the filter
+            && !self
+                .enabled_filter
+                .iter()
+                .any(|e| e == tool.name())
+        {
+            debug!(
+                "Skipping alias registration of tool '{}' as '{}' — not in enabled_filter",
+                tool.name(),
+                alias
+            );
+            return Ok(());
+        }
+
+        if self.tools.contains_key(alias) {
+            warn!("Tool alias '{}' already registered, replacing", alias);
+        }
+
+        debug!("Registering tool alias: '{}' -> '{}'", alias, tool.name());
+        self.tools.insert(alias.to_string(), tool);
+        Ok(())
+    }
+
     /// Lookup a tool by name
     pub fn lookup(&self, name: &str) -> SandboxResult<Arc<dyn Tool>> {
         self.tools
@@ -112,6 +145,9 @@ impl ToolRegistry {
     ///
     /// When `enabled` is non-empty, only tools whose name appears in the list
     /// are registered. When empty, all builtins are registered.
+    ///
+    /// The shell tool is registered under `"shell"` (primary) and `"shell_exec"`
+    /// (backward-compatible alias). The enabled filter accepts either name.
     pub fn register_builtin_tools_sandboxed(
         &self,
         sandbox_root: Option<std::path::PathBuf>,
@@ -119,11 +155,15 @@ impl ToolRegistry {
         enabled: &[String],
     ) {
         use crate::builtin::{
-            EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool, ShellExecTool,
+            EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
         };
+        use crate::shell::{SHELL_TOOL_ALIAS, SHELL_TOOL_NAME, ShellTool};
 
         // Build all tools, then filter by the enabled list.
-        let shell_tool = ShellExecTool::with_policy(sandbox_root.clone(), shell_unrestricted);
+        let shell_tool: Arc<dyn Tool> = Arc::new(ShellTool::with_policy(
+            sandbox_root.clone(),
+            shell_unrestricted,
+        ));
         let (fs_read, fs_write, fs_list) = match sandbox_root {
             Some(ref root) => (
                 FsReadTool::sandboxed(root.clone()),
@@ -137,7 +177,7 @@ impl ToolRegistry {
             Arc::new(EchoTool::new()),
             Arc::new(MathTool::new()),
             Arc::new(HttpGetTool::new()),
-            Arc::new(shell_tool),
+            Arc::clone(&shell_tool),
             Arc::new(fs_read),
             Arc::new(fs_write),
             Arc::new(fs_list),
@@ -151,6 +191,22 @@ impl ToolRegistry {
             if let Err(e) = self.register(tool) {
                 error!("Failed to register builtin tool: {}", e);
             }
+        }
+
+        // Register the shell tool under the legacy alias "shell_exec" for
+        // backward compatibility. The enabled_filter accepts either "shell"
+        // or "shell_exec" for the alias registration.
+        let shell_alias_allowed = self.enabled_filter.is_empty()
+            || self
+                .enabled_filter
+                .iter()
+                .any(|e| e == SHELL_TOOL_NAME || e == SHELL_TOOL_ALIAS);
+        if shell_alias_allowed {
+            self.tools.insert(SHELL_TOOL_ALIAS.to_string(), shell_tool);
+            debug!(
+                "Registered shell tool alias '{}' -> '{}'",
+                SHELL_TOOL_ALIAS, SHELL_TOOL_NAME
+            );
         }
 
         // Warn about enabled entries that don't match any builtin tool name,
@@ -170,6 +226,7 @@ impl ToolRegistry {
         for name in enabled {
             if !builtin_names.iter().any(|b| b == name)
                 && !KNOWN_DYNAMIC_TOOLS.iter().any(|d| d == name)
+                && name != SHELL_TOOL_ALIAS
             {
                 warn!(
                     "tools.enabled contains unknown tool '{}' — not a builtin or known dynamic tool; typo?",
@@ -368,7 +425,8 @@ mod tests {
         assert!(registry.contains("echo"));
         assert!(registry.contains("math"));
         assert!(!registry.contains("http_get"));
-        assert!(!registry.contains("shell_exec"));
+        assert!(!registry.contains("shell")); // primary name blocked
+        assert!(!registry.contains("shell_exec")); // alias also blocked
         assert!(!registry.contains("fs_read"));
         assert!(!registry.contains("fs_write"));
         assert!(!registry.contains("fs_list"));
@@ -381,11 +439,13 @@ mod tests {
         assert!(registry.contains("echo"));
         assert!(registry.contains("math"));
         assert!(registry.contains("http_get"));
-        assert!(registry.contains("shell_exec"));
+        assert!(registry.contains("shell")); // primary name
+        assert!(registry.contains("shell_exec")); // backward-compat alias
         assert!(registry.contains("fs_read"));
         assert!(registry.contains("fs_write"));
         assert!(registry.contains("fs_list"));
-        assert_eq!(registry.len(), 7);
+        // 7 builtins + 1 alias (shell_exec -> shell) = 8 entries
+        assert_eq!(registry.len(), 8);
     }
 
     #[test]
@@ -422,6 +482,6 @@ mod tests {
             .register_native("invoke_agent", |_| Ok(Value::Null))
             .unwrap();
         assert!(registry.contains("invoke_agent"));
-        assert_eq!(registry.len(), 8); // 7 builtins + 1 dynamic
+        assert_eq!(registry.len(), 9); // 7 builtins + 1 alias + 1 dynamic
     }
 }

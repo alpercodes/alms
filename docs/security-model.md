@@ -142,17 +142,32 @@ Mitigations:
 ### 4.1 Do not expose raw bash as a default
 Expose a `shell_exec` tool that is policy-gated.
 
-### 4.2 Minimal contract for `shell_exec`
+### 4.2 Minimal contract for `shell` (renamed from `shell_exec`)
+
+The shell tool's primary interface is now command strings executed via `bash -c`.
+The legacy `argv` mode is preserved as a fallback for backward compatibility.
+
 Request fields:
-- `argv`: array of strings (no shell interpolation), e.g. `["git","status"]`
-- `cwd`: workspace-relative path (validated against sandbox_root in sandboxed mode)
-- `timeout_secs`
+- `command` (primary): shell command string, executed via `bash -c` (both Unix and Windows via Git Bash / WSL)
+- `argv` (legacy fallback): array of strings (no shell interpolation), e.g. `["git","status"]`
+- `description`: brief description of what the command does (for audit logging)
+- `timeout_ms`: timeout in milliseconds (default 120000, max 600000)
+- `run_in_background`: when `true`, returns a task_id immediately; use `check_task` to poll results
+- `check_task`: check the result of a background task by its task_id
 - `env`: extra key-value pairs (daemon env is cleared via `env_clear()` — secrets never leak)
+
+The working directory persists across calls. After each command, the tool
+appends a `pwd` marker to detect cwd changes; the new cwd is stored in
+the shell state for the next invocation.
+
+A best-effort command denylist blocks obviously destructive patterns
+(`rm -rf /`, `mkfs.`, fork bombs, etc.). This is substring-based and
+fundamentally bypassable; it is defense-in-depth, not a security boundary.
 
 Response fields:
 - `exit_code`
-- `stdout` (truncated to 8KB)
-- `stderr` (truncated to 8KB)
+- `stdout` (truncated to 30KB with head+tail line preservation)
+- `stderr` (truncated to 30KB with head+tail line preservation)
 
 ### 4.3 Filesystem sandboxing (implemented)
 
@@ -172,7 +187,7 @@ Response fields:
 
 ### 4.4 Isolation roadmap
 
-**Current (MVP):** `Command` + argv array (no shell injection) + `env_clear()` + `sandbox_root` path prefix enforcement for fs tools + cwd restriction for shell.
+**Current (MVP):** `bash -c` command strings (primary) + legacy argv fallback + `env_clear()` + best-effort command denylist + `sandbox_root` path prefix enforcement for fs tools + persistent cwd restriction for shell (validated against sandbox root on each invocation).
 
 **Next — OS-level isolation:**
 - **Landlock** (Linux 5.13+): kernel LSM that lets an unprivileged process restrict its own filesystem access before exec. The `landlock` crate makes this ~30 lines of Rust. Would make `shell_exec` truly sandboxed on Linux. No root required. Cross-platform story: Linux-only; Windows/macOS need alternative approaches.
@@ -259,10 +274,11 @@ Suggested table/event fields:
 
 Default posture recommendations:
 - Workspace-only file access — **implemented**: `sandbox_root = "."` confines fs tools to cwd
-- Shell commands use argv array, not raw shell — **implemented**: `shell_exec` uses `Command::new()` with args, no shell interpolation
+- Shell primary interface is `bash -c` command strings; legacy `argv` mode preserved as fallback — **implemented**: `shell` tool wraps commands with `bash -c`, argv mode uses direct `Command::new()` with args
+- Shell command denylist (best-effort) — **implemented**: substring-based denylist blocks `rm -rf /`, `mkfs.`, fork bombs, etc.; bypassable, defense-in-depth only
 - Shell env cleared — **implemented**: `env_clear()` prevents secret leakage to child processes
-- Shell cwd restricted — **implemented**: `shell_policy = "sandboxed"` restricts cwd to sandbox_root
-- Strict output truncation — **implemented**: 8KB stdout/stderr cap, 32KB fs_read cap, UTF-8 safe truncation
+- Shell cwd restricted — **implemented**: `shell_policy = "sandboxed"` restricts cwd to sandbox_root; persistent cwd validated against sandbox on each invocation
+- Strict output truncation — **implemented**: 30KB stdout/stderr cap with head+tail line preservation, 32KB fs_read cap, UTF-8 safe truncation
 - No `sudo` — not yet enforced (command denylist not implemented; use OS-level restrictions)
 - Network allowlist empty by default — not yet implemented
 - Cronjob creation requires approval — implemented via Guarded posture
@@ -275,7 +291,7 @@ Default posture recommendations:
 P0 (before public use):
 - [ ] Single capability model, used everywhere
 - [ ] Tool registry enforces capability checks
-- [x] Shell tool uses argv (no `bash -lc` by default) — `shell_exec` uses `Command::new()` + args
+- [x] Shell tool — primary interface is `bash -c` command strings; legacy `argv` mode preserved; best-effort command denylist
 - [x] Audit log for tool runs + job runs — SQLite-backed audit events
 - [ ] Job principal + capability scoping
 - [x] Output truncation + sanitization — safe UTF-8 truncation on all tool outputs
