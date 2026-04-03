@@ -10,10 +10,18 @@ import DOMPurify from 'dompurify';
 
 const html = htm.bind(h);
 
-// Configure marked: disable mangle/headerIds to keep output clean
+// Configure marked for GFM with line breaks
 marked.setOptions({
     breaks: true,
     gfm: true,
+});
+
+// Open rendered links in a new tab instead of navigating the dashboard away
+DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+    if (node.tagName === 'A') {
+        node.setAttribute('target', '_blank');
+        node.setAttribute('rel', 'noopener noreferrer');
+    }
 });
 
 /**
