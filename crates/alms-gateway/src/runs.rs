@@ -648,12 +648,11 @@ async fn execute_run(state: AppState, params: RunParams) {
     agent_config.posture = resolved;
 
     // Create a runtime event channel so we can forward tool events to SSE.
-    // Clone before moving into `with_event_sender` so invoke_agent can forward
-    // subagent events into the same stream.
-    //
-    // IMPORTANT: `invoke_agent_fwd` holds a clone of `runtime_tx`.  It MUST
-    // be explicitly dropped before awaiting the forwarder task, otherwise the
-    // channel never closes and `forwarder_handle.await` hangs forever.
+    // A second sender (`invoke_agent_tx`) is created for the InvokeAgentTool
+    // so subagent events are forwarded into the same SSE stream.  It is moved
+    // directly into the tool (not cloned) so no orphaned sender lingers in
+    // this scope -- when the runtime drops its sender and the tool drops its
+    // sender, the channel closes and the forwarder task completes.
     let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
     let invoke_agent_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
         std::sync::Arc::new(RuntimeEventForwarder::new(runtime_tx.clone()));
@@ -813,7 +812,7 @@ async fn execute_run(state: AppState, params: RunParams) {
             dispatcher,
             session_id,
             Some(run_id),
-            Some(invoke_agent_fwd.clone()),
+            Some(invoke_agent_fwd),
         )
         .with_cancel_token(cancel_token)
         .with_background_event_fwd(bg_event_fwd);
@@ -920,18 +919,12 @@ async fn execute_run(state: AppState, params: RunParams) {
             .await
     };
 
-    // Drop `runtime` AND `invoke_agent_fwd` to close ALL clones of
-    // `runtime_tx`, signalling EOF to the forwarder.  Without the explicit
-    // `invoke_agent_fwd` drop the forwarder would hang forever: the Arc
-    // wraps a `runtime_tx.clone()` that keeps the channel open even after
-    // the runtime (which owns the original sender) is dropped.
-    //
-    // This was a regression introduced by the alms-tools extraction (#439)
-    // which changed `invoke_agent_tx` (moved into InvokeAgentTool) to an
-    // `Arc<dyn EventForwarder>` that is cloned instead of moved, leaving
-    // a live sender in the local scope.
+    // Drop `runtime` to close the last sender on `runtime_tx`.
+    // The `invoke_agent_fwd` Arc was moved (not cloned) into `InvokeAgentTool`,
+    // which lives inside the runtime's tool registry, so dropping the runtime
+    // also drops the forwarder's sender.  Once all senders are gone the channel
+    // closes and `forwarder_handle` completes.
     drop(runtime);
-    drop(invoke_agent_fwd);
     forwarder_handle.await.ok();
 
     // Helper: persist tool call records (used by all outcome branches).
