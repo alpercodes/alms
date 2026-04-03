@@ -230,7 +230,6 @@ export function SettingsModal({ open, onClose }) {
 
     // Feedback for server settings save
     const serverSaving = useSignal(false);
-    const serverSaved = useSignal(false);
     const serverError = useSignal('');
 
     useEffect(() => {
@@ -266,7 +265,7 @@ export function SettingsModal({ open, onClose }) {
             toolsMaxOutput.value = tools.max_output_bytes != null ? String(tools.max_output_bytes) : '';
 
             saved.value = false;
-            serverSaved.value = false;
+
             serverError.value = '';
         }
     }, [open]);
@@ -293,7 +292,6 @@ export function SettingsModal({ open, onClose }) {
     const onApply = async () => {
         serverSaving.value = true;
         serverError.value = '';
-        serverSaved.value = false;
         saved.value = false;
 
         // 1. Always save per-run overrides to localStorage (this never fails)
@@ -371,13 +369,12 @@ export function SettingsModal({ open, onClose }) {
         // 3. If there are server-level changes, PATCH them
         if (Object.keys(body).length > 0) {
             try {
-                const resp = await patchSettings(body);
-                if (resp.errors && resp.errors.length > 0) {
-                    serverError.value = resp.errors.join('; ');
-                }
+                await patchSettings(body);
                 await refreshServerDefaults();
             } catch (err) {
-                serverError.value = err.error?.message || err.message || 'Failed to save server settings';
+                // 422 responses have { errors: ["...", "..."] } spread onto the thrown object
+                const msgs = Array.isArray(err.errors) ? err.errors.join('; ') : null;
+                serverError.value = msgs || err.message || 'Failed to save server settings';
             }
         }
 

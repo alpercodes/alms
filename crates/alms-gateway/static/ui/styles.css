@@ -1286,11 +1286,6 @@ select.settings-input-sm {
   border: 1px solid var(--error);
 }
 
-/* Spacer to separate server-save button from per-run buttons */
-.settings-footer-spacer {
-  flex: 1;
-}
-
 /* Disabled state for save buttons */
 .settings-save:disabled {
   opacity: 0.6;
