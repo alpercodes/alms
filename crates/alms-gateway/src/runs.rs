@@ -648,8 +648,11 @@ async fn execute_run(state: AppState, params: RunParams) {
     agent_config.posture = resolved;
 
     // Create a runtime event channel so we can forward tool events to SSE.
-    // Clone before moving into `with_event_sender` so invoke_agent can forward
-    // subagent events into the same stream.
+    // A second sender (`invoke_agent_tx`) is created for the InvokeAgentTool
+    // so subagent events are forwarded into the same SSE stream.  It is moved
+    // directly into the tool (not cloned) so no orphaned sender lingers in
+    // this scope -- when the runtime drops its sender and the tool drops its
+    // sender, the channel closes and the forwarder task completes.
     let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
     let invoke_agent_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
         std::sync::Arc::new(RuntimeEventForwarder::new(runtime_tx.clone()));
@@ -809,7 +812,7 @@ async fn execute_run(state: AppState, params: RunParams) {
             dispatcher,
             session_id,
             Some(run_id),
-            Some(invoke_agent_fwd.clone()),
+            Some(invoke_agent_fwd),
         )
         .with_cancel_token(cancel_token)
         .with_background_event_fwd(bg_event_fwd);
@@ -916,9 +919,11 @@ async fn execute_run(state: AppState, params: RunParams) {
             .await
     };
 
-    // Drop `runtime` explicitly to close `runtime_tx` and signal EOF to the
-    // forwarder. Then await the forwarder so all buffered tool events are
-    // forwarded before we send run_finished / run_error.
+    // Drop `runtime` to close the last sender on `runtime_tx`.
+    // The `invoke_agent_fwd` Arc was moved (not cloned) into `InvokeAgentTool`,
+    // which lives inside the runtime's tool registry, so dropping the runtime
+    // also drops the forwarder's sender.  Once all senders are gone the channel
+    // closes and `forwarder_handle` completes.
     drop(runtime);
     forwarder_handle.await.ok();
 
