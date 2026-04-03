@@ -166,6 +166,36 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    // --- Bearer header on SSE endpoints (regression guard) ---
+
+    #[tokio::test]
+    async fn test_bearer_header_accepted_on_run_events_sse() {
+        let resp = app(Some("secret"))
+            .oneshot(
+                HttpRequest::get("/runs/some-run-id/events")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_bearer_header_accepted_on_session_events_sse() {
+        let resp = app(Some("secret"))
+            .oneshot(
+                HttpRequest::get("/sessions/some-session-id/events")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     // --- Query-string token: rejected on non-SSE routes ---
 
     #[tokio::test]
