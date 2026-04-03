@@ -1,29 +1,14 @@
 use crate::{SandboxError, Tool, error::SandboxResult};
 use alms_core::truncate_to_char_boundary;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use tracing::warn;
 
 /// Filenames that must never be accessed by agent tools.
 ///
 /// These are checked against the final component of resolved paths in fs_read,
-/// fs_write, and against argv elements in shell_exec to prevent agents from
-/// reading secrets or other sensitive files.
+/// fs_write, and against command strings/argv in the shell tool to prevent
+/// agents from reading secrets or other sensitive files.
 const DENIED_FILENAMES: &[&str] = &["secrets.json"];
-
-/// Environment variable names that must never be injected into shell_exec
-/// child processes. Belt-and-suspenders protection: `env_clear()` already
-/// strips the parent environment, but this ensures these names are also
-/// filtered from the tool-call `env` parameter and `default_env`.
-const SECRET_ENV_VARS: &[&str] = &[
-    "OPENROUTER_API_KEY",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "TELEGRAM_BOT_TOKEN",
-    "ALMS_MASTER_KEY",
-    "ALMS_AUTH_TOKEN",
-];
 
 /// Check whether a resolved path references a denied filename.
 ///
@@ -39,35 +24,7 @@ fn is_denied_path(path: &Path) -> bool {
         })
 }
 
-/// Check whether any element in a shell argv references a denied filename.
-///
-/// This is a best-effort check: it catches obvious patterns like
-/// `cat data/secrets.json` or `cat /abs/path/secrets.json` and also catches
-/// `sh -c "cat secrets.json"` by scanning each arg as a substring. It cannot
-/// prevent all indirect access (e.g. `cat $(echo secrets.json)`, base64
-/// encoding, variable expansion). For true shell isolation, use a restricted
-/// OS user or Landlock.
-fn argv_references_denied_file(argv: &[&str]) -> Option<&'static str> {
-    for arg in argv {
-        // Check as a path component (handles `data/secrets.json`, `/abs/path/secrets.json`)
-        let p = Path::new(arg);
-        if let Some(name) = p.file_name().and_then(|f| f.to_str()) {
-            for denied in DENIED_FILENAMES {
-                if denied.eq_ignore_ascii_case(name) {
-                    return Some(denied);
-                }
-            }
-        }
-        // Also check as a substring of the full argument to catch `sh -c "cat secrets.json"`
-        // where the denied filename is embedded inside a quoted command string.
-        for denied in DENIED_FILENAMES {
-            if arg.to_ascii_lowercase().contains(denied) {
-                return Some(denied);
-            }
-        }
-    }
-    None
-}
+// NOTE: `argv_references_denied_file` moved to `crate::shell::security`.
 
 /// Resolve a path and verify it falls within the sandbox root.
 ///
@@ -175,25 +132,6 @@ fn safe_truncate(s: &str, max_bytes: usize) -> String {
             truncated,
             s.len() - truncated.len()
         )
-    }
-}
-
-/// Returns a list of environment variable names that are critical for process
-/// spawning on the current platform.
-///
-/// These variables are safe to inherit (they don't contain secrets) and are
-/// re-injected after `env_clear()` so that child processes can run correctly.
-/// On Windows, the absence of `SystemRoot`, `PATH`, `PATHEXT`, and `COMSPEC`
-/// causes most executables to fail. On Unix, `PATH` is needed for command
-/// resolution.
-fn platform_critical_env_vars() -> &'static [&'static str] {
-    #[cfg(windows)]
-    {
-        &["SystemRoot", "PATH", "PATHEXT", "COMSPEC"]
-    }
-    #[cfg(not(windows))]
-    {
-        &["PATH"]
     }
 }
 
@@ -527,274 +465,10 @@ impl Tool for HttpGetTool {
 }
 
 // ---------------------------------------------------------------------------
-// Shell execution tool
+// Shell execution tool — see `crate::shell::ShellTool` (redesigned in #469).
+// The old `ShellExecTool` struct has been removed. A type alias
+// `ShellExecTool = ShellTool` is provided in `lib.rs` for backward compat.
 // ---------------------------------------------------------------------------
-
-/// Shell exec tool — runs an external program via argv (no shell injection).
-///
-/// Parameters:
-///   argv     : [string, ...]   — program + args, e.g. ["ls", "-la"]
-///   cwd      : string?         — working directory (default: current dir)
-///   env      : {string: string}? — extra environment variables
-///   timeout_secs : number?    — max wait time in seconds (default: 30, max: 120)
-#[derive(Debug, Clone)]
-pub struct ShellExecTool {
-    /// When Some, cwd is validated against this root in sandboxed mode.
-    sandbox_root: Option<PathBuf>,
-    /// When true, no cwd restriction is applied (power-user mode).
-    unrestricted: bool,
-    /// Default working directory when no explicit `cwd` param is provided.
-    /// Used to set the agent's workspace as the "home directory".
-    /// Takes precedence over `sandbox_root` as default cwd.
-    ///
-    /// NOTE: On Windows this may carry a `\\?\` extended-length prefix from
-    /// `canonicalize()`. This is safe because the value is only ever passed to
-    /// `Command::current_dir()` (which accepts `AsRef<Path>` and delegates to
-    /// the OS) or compared via `Path::starts_with()`. No string concatenation
-    /// or `format!`-based path building is done with this field.
-    /// Audited 2026-03-24 for PR #338.
-    default_cwd: Option<PathBuf>,
-    /// Default environment variables injected into spawned processes.
-    /// Applied after `env_clear()` — the tool call's `env` parameter
-    /// overrides these on conflict.
-    default_env: HashMap<String, String>,
-}
-
-impl Default for ShellExecTool {
-    fn default() -> Self {
-        Self {
-            sandbox_root: None,
-            unrestricted: true,
-            default_cwd: None,
-            default_env: HashMap::new(),
-        }
-    }
-}
-
-impl ShellExecTool {
-    /// Create an unrestricted shell_exec tool.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Create a sandboxed shell_exec tool. The cwd is restricted to `root`.
-    pub fn sandboxed(root: PathBuf) -> Self {
-        Self {
-            sandbox_root: Some(root),
-            unrestricted: false,
-            default_cwd: None,
-            default_env: HashMap::new(),
-        }
-    }
-
-    /// Create with explicit policy.
-    pub fn with_policy(sandbox_root: Option<PathBuf>, unrestricted: bool) -> Self {
-        Self {
-            sandbox_root,
-            unrestricted,
-            default_cwd: None,
-            default_env: HashMap::new(),
-        }
-    }
-
-    /// Set the default working directory for commands without an explicit `cwd` param.
-    pub fn with_default_cwd(mut self, cwd: PathBuf) -> Self {
-        if let Some(ref root) = self.sandbox_root
-            && !cwd.starts_with(root)
-        {
-            warn!(
-                default_cwd = %cwd.display(),
-                sandbox_root = %root.display(),
-                "default_cwd is outside sandbox_root — commands without explicit cwd will run outside the sandbox boundary"
-            );
-        }
-        self.default_cwd = Some(cwd);
-        self
-    }
-
-    /// Set default environment variables for spawned processes.
-    ///
-    /// These are injected after `env_clear()` so they don't leak the daemon's
-    /// secrets. The tool call's `env` parameter overrides defaults on conflict.
-    pub fn with_default_env(mut self, env: HashMap<String, String>) -> Self {
-        self.default_env = env;
-        self
-    }
-}
-
-#[async_trait::async_trait]
-impl Tool for ShellExecTool {
-    fn name(&self) -> &str {
-        "shell_exec"
-    }
-
-    fn description(&self) -> &str {
-        "Run an external program via argv array (no shell — safe from injection). \
-        Returns stdout, stderr, and exit_code. Use for file system operations, \
-        running scripts, checking system state, etc."
-    }
-
-    fn is_builtin(&self) -> bool {
-        true
-    }
-
-    fn parameters(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "argv": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Program and arguments, e.g. [\"ls\", \"-la\", \"/tmp\"]",
-                    "minItems": 1
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory for the process. Defaults to the agent workspace when available, otherwise the project root."
-                },
-                "env": {
-                    "type": "object",
-                    "description": "Extra environment variables as key-value pairs.",
-                    "additionalProperties": { "type": "string" }
-                },
-                "timeout_secs": {
-                    "type": "number",
-                    "description": "Max execution time in seconds (default 30, max 120)."
-                }
-            },
-            "required": ["argv"]
-        })
-    }
-
-    async fn execute(&self, params: Value) -> SandboxResult<Value> {
-        let argv = params
-            .get("argv")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| {
-                SandboxError::InvalidParameters("'argv' must be an array".to_string())
-            })?;
-
-        if argv.is_empty() {
-            return Err(SandboxError::InvalidParameters(
-                "'argv' must not be empty".to_string(),
-            ));
-        }
-
-        let program = argv[0].as_str().ok_or_else(|| {
-            SandboxError::InvalidParameters("argv[0] must be a string".to_string())
-        })?;
-
-        let args = argv[1..]
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                v.as_str().ok_or_else(|| {
-                    SandboxError::InvalidParameters(format!("argv[{}] must be a string", i + 1))
-                })
-            })
-            .collect::<SandboxResult<Vec<&str>>>()?;
-
-        // Deny-list check: block commands that reference sensitive files in argv.
-        // This is best-effort — it catches `cat data/secrets.json` but not
-        // indirect access. For true isolation, use ALMS_MASTER_KEY encryption.
-        let full_argv: Vec<&str> = std::iter::once(program)
-            .chain(args.iter().copied())
-            .collect();
-        if let Some(denied) = argv_references_denied_file(&full_argv) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Command references denied file '{denied}'"
-            )));
-        }
-
-        let timeout_secs = params
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(30)
-            .min(120);
-
-        let mut cmd = tokio::process::Command::new(program);
-        cmd.args(&args);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
-
-        if let Some(cwd) = params.get("cwd").and_then(|v| v.as_str()) {
-            if !self.unrestricted
-                && let Some(ref root) = self.sandbox_root
-            {
-                check_sandbox_path_async(cwd, root).await?;
-            }
-            cmd.current_dir(cwd);
-        } else if let Some(ref default) = self.default_cwd {
-            // Agent workspace "home directory" — use as default cwd
-            cmd.current_dir(default);
-        } else if !self.unrestricted
-            && let Some(ref root) = self.sandbox_root
-        {
-            // Fallback: sandbox root as cwd
-            cmd.current_dir(root);
-        }
-
-        // Clear the daemon's environment (which may hold sensitive config like ALMS_AUTH_TOKEN and ALMS_MASTER_KEY)
-        // then re-inject platform-critical vars that don't contain secrets,
-        // then inject gateway-provided defaults (ALMS_DATA_DIR, etc.),
-        // then apply tool-call env params which override defaults on conflict.
-        cmd.env_clear();
-
-        // Re-inject platform-critical env vars needed for process spawning.
-        // On Windows, clearing SystemRoot/PATH/PATHEXT/COMSPEC breaks most
-        // executables. On Unix, PATH is needed for command resolution.
-        // These are injected first so default_env / tool-call env can override.
-        for key in platform_critical_env_vars() {
-            if let Ok(val) = std::env::var(key) {
-                cmd.env(key, val);
-            }
-        }
-
-        for (k, v) in &self.default_env {
-            if SECRET_ENV_VARS.iter().any(|s| s.eq_ignore_ascii_case(k)) {
-                warn!(env_var = %k, "Blocked secret env var from default_env injection");
-                continue;
-            }
-            cmd.env(k, v);
-        }
-        if let Some(env_obj) = params.get("env").and_then(|v| v.as_object()) {
-            for (k, v) in env_obj {
-                if SECRET_ENV_VARS.iter().any(|s| s.eq_ignore_ascii_case(k)) {
-                    warn!(env_var = %k, "Blocked secret env var from tool-call env injection");
-                    continue;
-                }
-                if let Some(val) = v.as_str() {
-                    cmd.env(k, val);
-                }
-            }
-        }
-
-        let child = cmd
-            .spawn()
-            .map_err(|e| SandboxError::Io(format!("Failed to spawn '{}': {}", program, e)))?;
-
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            child.wait_with_output(),
-        )
-        .await
-        .map_err(|_| SandboxError::Io(format!("Process timed out after {}s", timeout_secs)))?
-        .map_err(|e| SandboxError::Io(format!("Process error: {}", e)))?;
-
-        const MAX_OUTPUT: usize = 8000;
-        let stdout = String::from_utf8_lossy(&result.stdout);
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        let stdout_str = safe_truncate(&stdout, MAX_OUTPUT);
-        let stderr_str = safe_truncate(&stderr, MAX_OUTPUT);
-
-        Ok(serde_json::json!({
-            "exit_code": result.status.code().unwrap_or(-1),
-            "stdout": stdout_str,
-            "stderr": stderr_str,
-        }))
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Filesystem tools
@@ -1196,7 +870,7 @@ mod tests {
         assert!(!EchoTool::new().description().is_empty());
         assert!(!MathTool::new().description().is_empty());
         assert!(!HttpGetTool::new().description().is_empty());
-        assert!(!ShellExecTool::new().description().is_empty());
+        // ShellTool description tested in crate::shell::tests
         assert!(!FsReadTool::new().description().is_empty());
         assert!(!FsWriteTool::new().description().is_empty());
         assert!(!FsListTool::new().description().is_empty());
@@ -1285,286 +959,7 @@ mod tests {
         assert!(check_sandbox_path("escape/passwd", &root).is_err());
     }
 
-    // ── ShellExecTool ─────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_shell_exec_missing_argv() {
-        let result = ShellExecTool::new().execute(serde_json::json!({})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_shell_exec_empty_argv() {
-        let result = ShellExecTool::new()
-            .execute(serde_json::json!({"argv": []}))
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_shell_exec_non_string_arg() {
-        let result = ShellExecTool::new()
-            .execute(serde_json::json!({"argv": ["echo", 42]}))
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_echo() {
-        let result = ShellExecTool::new()
-            .execute(serde_json::json!({"argv": ["echo", "hello"]}))
-            .await
-            .unwrap();
-        assert_eq!(result["exit_code"], 0);
-        assert!(result["stdout"].as_str().unwrap().contains("hello"));
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_env_cleared() {
-        // The daemon env has OPENROUTER_API_KEY etc. After env_clear(), "env" output
-        // should not contain any inherited vars — only platform-critical vars
-        // (PATH) plus any default_env injections.
-        let result = ShellExecTool::new()
-            .execute(serde_json::json!({"argv": ["env"]}))
-            .await
-            .unwrap();
-        let stdout = result["stdout"].as_str().unwrap();
-        // With env_clear(), no OPENROUTER_API_KEY should leak.
-        assert!(
-            !stdout.contains("OPENROUTER_API_KEY"),
-            "API keys must not leak into spawned processes"
-        );
-        // PATH should be re-injected for command resolution.
-        assert!(
-            stdout.contains("PATH="),
-            "PATH should be re-injected after env_clear(): {stdout}"
-        );
-    }
-
-    #[test]
-    fn test_platform_critical_env_vars_not_empty() {
-        let vars = platform_critical_env_vars();
-        assert!(
-            !vars.is_empty(),
-            "platform_critical_env_vars must not be empty"
-        );
-        assert!(
-            vars.contains(&"PATH"),
-            "PATH must be in platform-critical vars on all platforms"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn test_platform_critical_env_vars_windows() {
-        let vars = platform_critical_env_vars();
-        for expected in &["SystemRoot", "PATH", "PATHEXT", "COMSPEC"] {
-            assert!(
-                vars.contains(expected),
-                "{expected} must be in platform-critical vars on Windows"
-            );
-        }
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_sandboxed_cwd_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        let tool = ShellExecTool::sandboxed(root);
-        let result = tool
-            .execute(serde_json::json!({"argv": ["ls"], "cwd": "/etc"}))
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("outside sandbox"));
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_sandboxed_default_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        // Create a marker file so we can verify cwd
-        std::fs::write(root.join("marker.txt"), "found").unwrap();
-        let tool = ShellExecTool::sandboxed(root);
-        let result = tool
-            .execute(serde_json::json!({"argv": ["cat", "marker.txt"]}))
-            .await
-            .unwrap();
-        assert_eq!(result["exit_code"], 0);
-        assert!(result["stdout"].as_str().unwrap().contains("found"));
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_default_cwd() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws_dir = dir.path().join("workspace");
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::write(ws_dir.join("marker.txt"), "home").unwrap();
-
-        let tool = ShellExecTool::new().with_default_cwd(ws_dir);
-        let result = tool
-            .execute(serde_json::json!({"argv": ["cat", "marker.txt"]}))
-            .await
-            .unwrap();
-        assert_eq!(result["exit_code"], 0);
-        assert!(result["stdout"].as_str().unwrap().contains("home"));
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_explicit_cwd_overrides_default() {
-        let dir = tempfile::tempdir().unwrap();
-        let ws_dir = dir.path().join("workspace");
-        let other_dir = dir.path().join("other");
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::create_dir_all(&other_dir).unwrap();
-        std::fs::write(other_dir.join("marker.txt"), "explicit").unwrap();
-
-        let other_dir = std::fs::canonicalize(&other_dir).unwrap();
-        let tool = ShellExecTool::new().with_default_cwd(ws_dir);
-        let result = tool
-            .execute(serde_json::json!({
-                "argv": ["cat", "marker.txt"],
-                "cwd": other_dir.to_str().unwrap()
-            }))
-            .await
-            .unwrap();
-        assert_eq!(result["exit_code"], 0);
-        assert!(result["stdout"].as_str().unwrap().contains("explicit"));
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_default_cwd_with_sandbox() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        let ws_dir = root.join("workspace");
-        std::fs::create_dir_all(&ws_dir).unwrap();
-        std::fs::write(ws_dir.join("marker.txt"), "sandboxed-home").unwrap();
-
-        let tool = ShellExecTool::sandboxed(root.clone()).with_default_cwd(ws_dir);
-
-        // Default cwd should be workspace dir
-        let result = tool
-            .execute(serde_json::json!({"argv": ["cat", "marker.txt"]}))
-            .await
-            .unwrap();
-        assert_eq!(result["exit_code"], 0);
-        assert!(
-            result["stdout"]
-                .as_str()
-                .unwrap()
-                .contains("sandboxed-home")
-        );
-
-        // Explicit cwd outside sandbox should be rejected
-        let result = tool
-            .execute(serde_json::json!({"argv": ["ls"], "cwd": "/etc"}))
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_default_env() {
-        let mut env = HashMap::new();
-        env.insert(
-            "ALMS_DATA_DIR".to_string(),
-            "/tmp/alms-test-data".to_string(),
-        );
-        env.insert("ALMS_WORKSPACE_DIR".to_string(), "/tmp/alms-ws".to_string());
-
-        let tool = ShellExecTool::new().with_default_env(env);
-        let result = tool
-            .execute(serde_json::json!({"argv": ["env"]}))
-            .await
-            .unwrap();
-        let stdout = result["stdout"].as_str().unwrap();
-        assert!(
-            stdout.contains("ALMS_DATA_DIR=/tmp/alms-test-data"),
-            "default_env should inject ALMS_DATA_DIR into spawned process"
-        );
-        assert!(
-            stdout.contains("ALMS_WORKSPACE_DIR=/tmp/alms-ws"),
-            "default_env should inject ALMS_WORKSPACE_DIR into spawned process"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_tool_call_env_overrides_default() {
-        let mut env = HashMap::new();
-        env.insert("ALMS_DATA_DIR".to_string(), "/default/path".to_string());
-
-        let tool = ShellExecTool::new().with_default_env(env);
-        let result = tool
-            .execute(serde_json::json!({
-                "argv": ["env"],
-                "env": {"ALMS_DATA_DIR": "/override/path"}
-            }))
-            .await
-            .unwrap();
-        let stdout = result["stdout"].as_str().unwrap();
-        assert!(
-            stdout.contains("ALMS_DATA_DIR=/override/path"),
-            "tool call env should override default_env: {stdout}"
-        );
-        assert!(
-            !stdout.contains("ALMS_DATA_DIR=/default/path"),
-            "default value should be overridden"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_blocks_secret_env_in_tool_call() {
-        // Tool-call env params must not inject secret env vars.
-        let tool = ShellExecTool::new();
-        let result = tool
-            .execute(serde_json::json!({
-                "argv": ["env"],
-                "env": {"OPENAI_API_KEY": "stolen-key", "SAFE_VAR": "ok"}
-            }))
-            .await
-            .unwrap();
-        let stdout = result["stdout"].as_str().unwrap();
-        assert!(
-            !stdout.contains("OPENAI_API_KEY"),
-            "Secret env vars must be blocked from tool-call injection"
-        );
-        assert!(
-            stdout.contains("SAFE_VAR=ok"),
-            "Non-secret env vars should pass through"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_exec_blocks_secret_env_in_default_env() {
-        // default_env must not inject secret env vars.
-        let mut env = HashMap::new();
-        env.insert("ANTHROPIC_API_KEY".to_string(), "stolen-key".to_string());
-        env.insert("NORMAL_VAR".to_string(), "ok".to_string());
-
-        let tool = ShellExecTool::new().with_default_env(env);
-        let result = tool
-            .execute(serde_json::json!({"argv": ["env"]}))
-            .await
-            .unwrap();
-        let stdout = result["stdout"].as_str().unwrap();
-        assert!(
-            !stdout.contains("ANTHROPIC_API_KEY"),
-            "Secret env vars must be blocked from default_env injection"
-        );
-        assert!(
-            stdout.contains("NORMAL_VAR=ok"),
-            "Non-secret env vars should pass through"
-        );
-    }
+    // ── ShellTool tests are in crate::shell::tests ────────────────────────────
 
     // ── FsReadTool ────────────────────────────────────────────────────────────
 
@@ -1719,19 +1114,7 @@ mod tests {
         assert!(!is_denied_path(Path::new("alms.db")));
     }
 
-    #[test]
-    fn test_argv_references_denied_file() {
-        assert_eq!(
-            argv_references_denied_file(&["cat", "data/secrets.json"]),
-            Some("secrets.json")
-        );
-        assert_eq!(
-            argv_references_denied_file(&["cat", "/abs/path/secrets.json"]),
-            Some("secrets.json")
-        );
-        assert_eq!(argv_references_denied_file(&["ls", "-la"]), None);
-        assert_eq!(argv_references_denied_file(&["cat", "data.json"]), None);
-    }
+    // argv_references_denied_file tests moved to crate::shell::security::tests
 
     #[tokio::test]
     async fn test_fs_read_denied_secrets_json() {
@@ -1764,8 +1147,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shell_exec_denied_secrets_json() {
-        let tool = ShellExecTool::new();
+    async fn test_shell_denied_secrets_json() {
+        // Uses the ShellTool via the crate-level type alias
+        let tool = crate::ShellTool::new();
         let result = tool
             .execute(serde_json::json!({"argv": ["cat", "data/secrets.json"]}))
             .await;
@@ -1775,8 +1159,8 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn test_shell_exec_allowed_normal_files() {
-        let tool = ShellExecTool::new();
+    async fn test_shell_allowed_normal_files() {
+        let tool = crate::ShellTool::new();
         let result = tool
             .execute(serde_json::json!({"argv": ["echo", "data.json"]}))
             .await;
@@ -1794,33 +1178,11 @@ mod tests {
         assert!(is_denied_path(Path::new("data/Secrets.Json")));
     }
 
-    #[test]
-    fn test_argv_references_denied_file_case_insensitive() {
-        assert_eq!(
-            argv_references_denied_file(&["cat", "data/SECRETS.JSON"]),
-            Some("secrets.json")
-        );
-        assert_eq!(
-            argv_references_denied_file(&["cat", "Secrets.Json"]),
-            Some("secrets.json")
-        );
-    }
+    // argv_references_denied_file_case_insensitive test moved to crate::shell::security::tests
 
     // ── sh -c denylist bypass test ──────────────────────────────────────────
 
-    #[test]
-    fn test_argv_references_denied_via_sh_c() {
-        // `sh -c "cat secrets.json"` passes the denied filename inside a quoted
-        // argument. The substring check should catch this.
-        assert_eq!(
-            argv_references_denied_file(&["sh", "-c", "cat secrets.json"]),
-            Some("secrets.json")
-        );
-        assert_eq!(
-            argv_references_denied_file(&["sh", "-c", "cat data/Secrets.JSON"]),
-            Some("secrets.json")
-        );
-    }
+    // argv_references_denied_via_sh_c test moved to crate::shell::security::tests
 
     // ── Denylist via path traversal ─────────────────────────────────────────
 

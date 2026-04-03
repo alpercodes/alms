@@ -26,6 +26,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "fs_write",
         "http_get",
         "math",
+        "shell",
         "shell_exec",
     ];
     let mut tools: Vec<String> = if enabled.is_empty() {

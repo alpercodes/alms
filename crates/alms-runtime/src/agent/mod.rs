@@ -40,11 +40,11 @@ pub struct AgentRuntime {
     /// Per-run cancellation token for cooperative cancellation.
     pub(crate) cancel_token: Option<CancellationToken>,
     /// Resolved sandbox root (canonicalized). Retained so `with_workspace()` can
-    /// re-register shell_exec with the workspace dir as default cwd.
+    /// re-register the shell tool with the workspace dir as default cwd.
     pub(crate) resolved_sandbox_root: Option<std::path::PathBuf>,
     /// Whether shell commands bypass sandbox cwd restriction.
     pub(crate) shell_unrestricted: bool,
-    /// Default env vars injected into shell_exec processes (e.g. ALMS_DATA_DIR).
+    /// Default env vars injected into shell processes (e.g. ALMS_DATA_DIR).
     /// Retained so `with_workspace()` can pass them to the re-registered shell tool.
     pub(crate) shell_default_env: std::collections::HashMap<String, String>,
     /// Agent name for perspective mapping in DM sessions.
@@ -103,7 +103,7 @@ impl AgentRuntime {
     ///
     /// Also registers the `workspace_write` tool so the agent can update
     /// its `goals.md` and `memories.md` during runs, and re-registers
-    /// `shell_exec` with the workspace directory as default cwd.
+    /// the shell tool with the workspace directory as default cwd.
     ///
     /// **Note**: `workspace_write` registration goes through `ToolRegistry::register()`,
     /// which checks the `enabled_filter`. If the operator has set `tools.enabled`
@@ -169,10 +169,12 @@ impl AgentRuntime {
                 )));
         }
 
-        // Re-register shell_exec with workspace dir as default cwd and
+        // Re-register shell tool with workspace dir as default cwd and
         // gateway-provided default env vars (ALMS_DATA_DIR, etc.).
-        if tool_enabled("shell_exec") {
-            let mut shell_tool = alms_sandbox::ShellExecTool::with_policy(
+        // The tool is registered under both "shell" (primary) and "shell_exec" (alias).
+        let shell_enabled = tool_enabled("shell") || tool_enabled("shell_exec");
+        if shell_enabled {
+            let mut shell_tool = alms_sandbox::ShellTool::with_policy(
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
@@ -180,7 +182,11 @@ impl AgentRuntime {
             if !self.shell_default_env.is_empty() {
                 shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
             }
-            self.tools.register(std::sync::Arc::new(shell_tool));
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            // Also register under legacy alias for backward compatibility
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
         }
 
         self.workspace = Some(workspace);
@@ -205,14 +211,14 @@ impl AgentRuntime {
         self
     }
 
-    /// Set default environment variables for `shell_exec` processes.
+    /// Set default environment variables for shell processes.
     ///
-    /// These are injected into every process spawned by `shell_exec` after
+    /// These are injected into every process spawned by the shell tool after
     /// `env_clear()`, so the spawned CLI commands can discover the gateway's
     /// data directory (`ALMS_DATA_DIR`) and workspace directory
     /// (`ALMS_WORKSPACE_DIR`) even when cwd is sandboxed elsewhere.
     ///
-    /// Re-registers the `shell_exec` tool immediately so that unnamed agents
+    /// Re-registers the shell tool immediately so that unnamed agents
     /// (which skip `with_workspace()`) still receive the environment variables.
     pub fn with_shell_default_env(
         mut self,
@@ -220,17 +226,21 @@ impl AgentRuntime {
     ) -> Self {
         self.shell_default_env = env;
 
-        // Re-register shell_exec with the new default env so unnamed agents
+        // Re-register shell tool with the new default env so unnamed agents
         // (which never call with_workspace()) still get ALMS_DATA_DIR injected.
         let enabled = &self.config.enabled_tools;
-        let shell_enabled = enabled.is_empty() || enabled.iter().any(|t| t == "shell_exec");
-        if shell_enabled && self.tools.contains("shell_exec") {
-            let shell_tool = alms_sandbox::ShellExecTool::with_policy(
+        let shell_enabled =
+            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
+        if shell_enabled && (self.tools.contains("shell") || self.tools.contains("shell_exec")) {
+            let shell_tool = alms_sandbox::ShellTool::with_policy(
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
             .with_default_env(self.shell_default_env.clone());
-            self.tools.register(std::sync::Arc::new(shell_tool));
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
         }
 
         self

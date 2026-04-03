@@ -55,6 +55,13 @@ impl ToolRegistry {
         }
     }
 
+    /// Register a tool under a specific alias name (for backward compatibility).
+    pub fn register_arc_as(&self, alias: &str, tool: std::sync::Arc<dyn alms_sandbox::Tool>) {
+        if let Err(e) = self.registry.register_as(alias, tool) {
+            warn!("Failed to register tool alias '{}': {}", alias, e);
+        }
+    }
+
     /// List all tool names
     pub fn list(&self) -> Vec<String> {
         self.registry.list()
