@@ -570,8 +570,12 @@ async fn execute_run(state: AppState, params: RunParams) {
         run_manager: state.run_manager.clone(),
     };
 
-    // Early exit if already cancelled (queued-then-cancelled before execution started).
-    if cancel_token.is_cancelled() {
+    // Early exit if already cancelled (queued-then-cancelled before execution
+    // started) or if the server is shutting down.  The shutdown_token check
+    // prevents the SessionQueue drain from starting NEW runs during graceful
+    // shutdown -- they would increment the in-flight counter and potentially
+    // outlive the drain timeout.
+    if cancel_token.is_cancelled() || state.shutdown_token.is_cancelled() {
         state
             .run_manager
             .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))

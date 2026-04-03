@@ -287,6 +287,24 @@ impl RunManager {
         self.cancel_tokens.remove(&run_id);
     }
 
+    /// Cancel every registered in-flight run.
+    ///
+    /// Called during graceful shutdown so that agent loops exit at their next
+    /// cancellation check-point instead of running to completion.
+    pub fn cancel_all_in_flight(&self) -> usize {
+        let mut count = 0;
+        for entry in self.cancel_tokens.iter() {
+            entry.value().cancel();
+            count += 1;
+        }
+        count
+    }
+
+    /// Return the current value of the in-flight counter.
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
     /// Cancel any in-progress runs spawned by a given job.
     ///
     /// Iterates in-memory runs, finds those with `job_id == Some(target)` that
@@ -1086,11 +1104,33 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     // This disables Nagle buffering, which is critical for SSE: without it,
     // small token_delta events sit in the TCP send buffer and never reach
     // the browser until the connection closes (observed on Windows).
-    axum::serve(NoDelayListener(listener), app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_token, state.run_manager.clone()))
-        .await?;
+    //
+    // Axum's graceful shutdown waits for ALL in-flight connections to close
+    // after the shutdown signal fires.  shutdown_signal already closes SSE
+    // senders, but a reconnecting EventSource or a slow request could keep
+    // a connection alive.  We cap Axum's connection drain with a secondary
+    // timeout that starts once the shutdown token is cancelled.
+    let shutdown_token_for_drain = state.shutdown_token.clone();
+    let serve_future = axum::serve(NoDelayListener(listener), app)
+        .with_graceful_shutdown(shutdown_signal(shutdown_token, state.run_manager.clone()));
+    tokio::select! {
+        result = serve_future => {
+            if let Err(e) = result {
+                return Err(alms_core::AlmsError::Runtime(format!("Serve error: {e}")));
+            }
+        }
+        // Once the shutdown token fires (inside shutdown_signal), give Axum
+        // 5 seconds to drain connections before we move on regardless.
+        _ = async {
+            shutdown_token_for_drain.cancelled().await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        } => {
+            tracing::warn!("Axum connection drain timed out after 5s — proceeding with shutdown");
+        }
+    }
 
     // Phase 1: Signal received. Axum stopped accepting new connections.
+    let shutdown_start = std::time::Instant::now();
     info!("HTTP server stopped accepting connections, draining...");
 
     // Phase 2: Scheduler loop already exiting (token cancelled).
@@ -1119,12 +1159,25 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     info!("Channel adapters stopped");
 
     // Phase 5: Wait for in-flight runs to complete (with timeout).
-    let drain_timeout = std::time::Duration::from_secs(30);
+    // All run cancel-tokens were already triggered in shutdown_signal, so
+    // most runs should exit within a few seconds.  We use a short 8-second
+    // timeout since the runs are being cooperatively cancelled.
+    let in_flight = state.run_manager.in_flight_count();
+    if in_flight > 0 {
+        info!(
+            "Waiting for {} in-flight run(s) to finish (timeout 8s)...",
+            in_flight
+        );
+    }
+    let drain_timeout = std::time::Duration::from_secs(8);
     let drained = state.run_manager.wait_drain(drain_timeout).await;
     if drained {
         info!("All in-flight runs completed");
     } else {
-        tracing::warn!("Shutdown timeout: some runs did not finish within 30s");
+        tracing::warn!(
+            "Shutdown drain timeout: {} run(s) still in-flight after 8s — exiting anyway",
+            state.run_manager.in_flight_count()
+        );
     }
 
     // Phase 6: Flush SQLite WAL.
@@ -1136,7 +1189,10 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     }
     info!("SQLite WAL flushed");
 
-    info!("ALMS Gateway shut down cleanly");
+    info!(
+        "Shutdown complete in {:.1}s",
+        shutdown_start.elapsed().as_secs_f64()
+    );
     Ok(())
 }
 
@@ -1171,6 +1227,14 @@ async fn shutdown_signal(token: CancellationToken, run_manager: RunManager) {
     // session-level streams) terminate. Without this, Axum's graceful shutdown
     // waits indefinitely for long-lived SSE connections to close.
     run_manager.close_all_senders();
+
+    // Cancel every in-flight run so agent loops exit at their next
+    // cancellation check-point.  Without this, runs continue until they
+    // finish naturally and the drain timeout is the only backstop.
+    let cancelled = run_manager.cancel_all_in_flight();
+    if cancelled > 0 {
+        info!("Cancelled {} in-flight run(s) for shutdown", cancelled);
+    }
 }
 
 /// Re-register all non-cancelled persisted jobs with the scheduler on startup.
@@ -1515,5 +1579,64 @@ mod tests {
         let cancelled = rm.cancel_runs_for_job(target_job);
         assert_eq!(cancelled, 0);
         assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_in_flight_cancels_all_tokens() {
+        let rm = RunManager::new();
+
+        let t1 = CancellationToken::new();
+        let t2 = CancellationToken::new();
+        let t3 = CancellationToken::new();
+        rm.register_cancel_token(RunId::new(), t1.clone());
+        rm.register_cancel_token(RunId::new(), t2.clone());
+        rm.register_cancel_token(RunId::new(), t3.clone());
+
+        let count = rm.cancel_all_in_flight();
+        assert_eq!(count, 3);
+        assert!(t1.is_cancelled());
+        assert!(t2.is_cancelled());
+        assert!(t3.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_in_flight_empty() {
+        let rm = RunManager::new();
+        assert_eq!(rm.cancel_all_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_count() {
+        let rm = RunManager::new();
+        assert_eq!(rm.in_flight_count(), 0);
+        rm.track_in_flight();
+        assert_eq!(rm.in_flight_count(), 1);
+        rm.track_in_flight();
+        assert_eq!(rm.in_flight_count(), 2);
+        rm.untrack_in_flight();
+        assert_eq!(rm.in_flight_count(), 1);
+    }
+
+    /// After cancelling all tokens, runs that check their cancel_token
+    /// should exit promptly, allowing wait_drain to complete quickly.
+    #[tokio::test]
+    async fn test_cancel_all_unblocks_drain() {
+        let rm = RunManager::new();
+        rm.track_in_flight();
+        let token = CancellationToken::new();
+        rm.register_cancel_token(RunId::new(), token.clone());
+
+        let rm2 = rm.clone();
+        tokio::spawn(async move {
+            // Simulate a run that checks its cancel token and exits.
+            token.cancelled().await;
+            rm2.untrack_in_flight();
+        });
+
+        // Cancel all tokens — the spawned "run" should exit and untrack.
+        rm.cancel_all_in_flight();
+
+        // Should drain almost immediately (well within 1s).
+        assert!(rm.wait_drain(std::time::Duration::from_secs(1)).await);
     }
 }
