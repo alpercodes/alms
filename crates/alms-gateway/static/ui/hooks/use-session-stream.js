@@ -51,13 +51,13 @@ const MAX_SESSION_RETRIES = 10;
 let deltaBuffer = '';
 let flushTimer = null;
 /**
- * Highest SSE event ID seen on the current stream -- used for manual reconnect.
+ * Highest numeric SSE event ID seen on the current stream -- used for
+ * manual reconnect via `?last_event_id=<n>`.
  *
- * Type note: this value may be a number (when seeded from the REST API's
- * `last_event_id` integer field) or a string (when updated from the SSE
- * spec's `e.lastEventId`).  Both are coerced to a string via `String()`
- * before being sent as the `?last_event_id` query parameter, so the mixed
- * representation is harmless in practice.
+ * Only numeric IDs (from persisted session events) are stored here.
+ * Ephemeral events use synthetic non-numeric IDs (e.g. "ephemeral-42")
+ * that are deliberately excluded so the browser never sends them as
+ * `Last-Event-Id` during native EventSource auto-reconnect.
  */
 let lastSeenEventId = null;
 
@@ -123,18 +123,39 @@ export function openSessionStream(sessionId, opts) {
     lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
 
     /**
-     * Wrap an event handler to track the highest seen SSE event ID.
+     * Set of SSE event IDs already processed on this stream.
      *
-     * Only numeric IDs (from the session event log) are tracked.
-     * Ephemeral events (token_delta, status) use random UUID IDs that
-     * cannot be parsed back to a u64 on the server.  If we stored a UUID
-     * here and then reconnected with `?last_event_id=<uuid>`, the backend
-     * would reject the request (query param expects u64), breaking SSE
-     * reconnection and leaving the run appearing stuck.
+     * When the browser's native EventSource auto-reconnect replays events
+     * (e.g. after a transient network blip), the handlers would otherwise
+     * run a second time, causing duplicate chat messages or visual flashes.
+     * Tracking seen IDs makes every handler idempotent against replays.
+     *
+     * Ephemeral IDs (prefixed "ephemeral-") are excluded from this set
+     * because they are never reused and would only waste memory.
+     */
+    const seenEventIds = new Set();
+
+    /**
+     * Wrap an event handler to track the highest seen SSE event ID and
+     * deduplicate replayed events.
+     *
+     * Only numeric IDs (from the session event log) are tracked for
+     * reconnect. Ephemeral events (token_delta, status) use synthetic
+     * non-UUID IDs (e.g. "ephemeral-42") that the backend will not
+     * accept as a replay cursor.
      */
     const on = (type, handler) => es.addEventListener(type, (e) => {
-        if (e.lastEventId && /^\d+$/.test(e.lastEventId)) {
-            lastSeenEventId = e.lastEventId;
+        const id = e.lastEventId;
+        // Track highest numeric ID for manual reconnect
+        if (id && /^\d+$/.test(id)) {
+            lastSeenEventId = id;
+        }
+        // Deduplicate: skip events we have already processed (but always
+        // allow ephemeral events through -- they are never replayed and
+        // their IDs are not stored in the set).
+        if (id && !id.startsWith('ephemeral-')) {
+            if (seenEventIds.has(id)) return;
+            seenEventIds.add(id);
         }
         handler(e);
     });

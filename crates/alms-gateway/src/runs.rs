@@ -2393,11 +2393,11 @@ pub struct SessionEventsQuery {
     /// Takes precedence over the header when both are present.
     ///
     /// Accepted as `String` (not `u64`) because ephemeral SSE events
-    /// (token_delta, status) use random UUIDs as their `id` field.  If the
-    /// last event the browser saw was ephemeral, the client may send a UUID
-    /// here.  Using `String` prevents Axum from rejecting the request with
-    /// a 422 deserialization error, which would break SSE reconnection and
-    /// leave the run appearing stuck (see #465 follow-up).
+    /// (token_delta, status) use `ephemeral-N` as their `id` field.  If the
+    /// last event the browser saw was ephemeral, the client may send an
+    /// `ephemeral-N` value here.  Using `String` prevents Axum from rejecting
+    /// the request with a 422 deserialization error, which would break SSE
+    /// reconnection and leave the run appearing stuck (see #465 follow-up).
     pub last_event_id: Option<String>,
 }
 
@@ -2426,9 +2426,9 @@ pub async fn stream_session_events(
     // Query parameter takes precedence over header (the header is only sent
     // by the browser on automatic reconnects, not on the initial connection).
     //
-    // Both sources may contain non-numeric values (UUIDs from ephemeral
-    // events), so we parse with `.ok()` to silently ignore unparseable
-    // values and fall back to replaying all events (from_id=0).
+    // Both sources may contain non-numeric values (`ephemeral-N` from
+    // ephemeral events), so we parse with `.ok()` to silently ignore
+    // unparseable values and fall back to replaying all events (from_id=0).
     let last_event_id = query
         .last_event_id
         .as_deref()
