@@ -108,10 +108,42 @@ impl Tool for ReadSubagentSessionTool {
             .map(|s| s.text);
 
         if summary_only {
+            if let Some(ref text) = summary {
+                return Ok(serde_json::json!({
+                    "subagent": name,
+                    "summary": text,
+                    "has_summary": true,
+                }));
+            }
+
+            // No summary available — fall back to the last N messages so the
+            // caller still gets useful context instead of an empty response.
+            const FALLBACK_COUNT: usize = 10;
+            let messages = self
+                .session_manager
+                .get_history(session.id)
+                .map_err(|e| SandboxError::Io(format!("Failed to read session history: {e}")))?;
+
+            let total = messages.len();
+            let start = total.saturating_sub(FALLBACK_COUNT);
+            let recent: Vec<Value> = messages[start..]
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "role": format!("{:?}", m.role).to_lowercase(),
+                        "content": m.content.to_display_string()
+                    })
+                })
+                .collect();
+
             return Ok(serde_json::json!({
                 "subagent": name,
-                "summary": summary.as_deref().unwrap_or(""),
-                "has_summary": summary.is_some(),
+                "summary": Value::Null,
+                "has_summary": false,
+                "fallback_messages": recent,
+                "fallback_message_count": total,
+                "fallback_showing": recent.len(),
+                "note": "No summary available. Showing the last messages as a fallback.",
             }));
         }
 
@@ -271,24 +303,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_summary_only_mode() {
+    async fn test_summary_only_with_real_summary() {
+        let (tool, mgr) = make_tool();
+        let parent_as_agent = AgentId(tool.parent_session_id.0);
+        let stable_id = AgentId::deterministic(parent_as_agent, "summarized-sub");
+        let stable_ctx = format!("subagent_{}_{}", tool.parent_session_id.0, "summarized-sub");
+        let session = mgr.get_or_create(stable_id, &stable_ctx);
+        mgr.append_message(session.id, make_msg(Role::User, "hello"))
+            .unwrap();
+
+        // Set a context summary
+        mgr.update_summary(
+            session.id,
+            alms_session::ContextSummary {
+                text: "Researched topic X thoroughly".to_string(),
+                messages_covered: 1,
+                updated_at: Some(alms_core::Timestamp::now()),
+            },
+        )
+        .unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "name": "summarized-sub", "summary_only": true }))
+            .await
+            .unwrap();
+        assert_eq!(result["has_summary"], true);
+        assert_eq!(result["summary"], "Researched topic X thoroughly");
+        // No fallback messages when a real summary exists
+        assert!(result.get("fallback_messages").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_summary_only_falls_back_to_messages() {
         let (tool, mgr) = make_tool();
         populate_subagent(
             &tool,
             &mgr,
             "researcher",
-            vec![make_msg(Role::User, "research topic X")],
+            vec![
+                make_msg(Role::User, "research topic X"),
+                make_msg(Role::Assistant, "Here are my findings on topic X"),
+            ],
         );
 
-        // No summary set — should return empty
+        // No summary set — should fall back to returning messages
         let result = tool
             .execute(serde_json::json!({ "name": "researcher", "summary_only": true }))
             .await
             .unwrap();
         assert_eq!(result["has_summary"], false);
-        assert_eq!(result["summary"], "");
-        // Messages should NOT be included in summary_only mode
-        assert!(result.get("messages").is_none());
+        assert!(result["summary"].is_null());
+        // Fallback messages should be included
+        let fallback = result["fallback_messages"].as_array().unwrap();
+        assert_eq!(fallback.len(), 2);
+        assert_eq!(fallback[0]["content"], "research topic X");
+        assert_eq!(fallback[1]["content"], "Here are my findings on topic X");
+        assert_eq!(result["fallback_message_count"], 2);
+        assert_eq!(result["fallback_showing"], 2);
+        assert!(result["note"].as_str().unwrap().contains("fallback"));
     }
 
     #[tokio::test]
