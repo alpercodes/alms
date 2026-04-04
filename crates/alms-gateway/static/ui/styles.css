@@ -27,6 +27,9 @@
   --info: #2563eb;
   --info-muted: rgba(37, 99, 235, 0.1);
 
+  --dm-accent: #7c3aed;
+  --dm-accent-muted: rgba(124, 58, 237, 0.12);
+
   --border-subtle: #e4e4e7;
   --border-default: #d4d4d8;
   --border-strong: #a1a1aa;
@@ -76,6 +79,10 @@
   --error-muted: rgba(248, 113, 113, 0.1);
   --info: #60a5fa;
   --info-muted: rgba(96, 165, 250, 0.1);
+
+  /* ── DM / peer messaging accent (purple) ── */
+  --dm-accent: #a78bfa;
+  --dm-accent-muted: rgba(167, 139, 250, 0.15);
 
   /* ── Borders ── */
   --border-subtle: #27272a;
@@ -732,10 +739,10 @@ header h1 {
 
 /* DM tool calls get a distinct accent */
 .tc-row.tc-dm {
-  border-left-color: #a78bfa;
+  border-left-color: var(--dm-accent);
 }
 .tc-row.tc-dm.tc-done {
-  border-left-color: #a78bfa;
+  border-left-color: var(--dm-accent);
 }
 
 /* ── Header row (always visible) ── */
@@ -768,8 +775,8 @@ header h1 {
   letter-spacing: 0.02em;
 }
 .tc-row.tc-dm .tc-icon {
-  color: #a78bfa;
-  background: rgba(167, 139, 250, 0.15);
+  color: var(--dm-accent);
+  background: var(--dm-accent-muted);
 }
 
 .tc-spinner {
@@ -1858,14 +1865,14 @@ select.settings-input-sm {
 
 /* ── Subagent UI indicators ── */
 .tool-row.subagent-header {
-  border-left-color: #a78bfa;
+  border-left-color: var(--dm-accent);
   font-weight: 500;
 }
 .tool-row.subagent-header.done {
   border-left-color: var(--success);
 }
 .subagent-badge {
-  color: #a78bfa;
+  color: var(--dm-accent);
   font-weight: 600;
   font-size: var(--text-xs);
 }
@@ -1876,7 +1883,7 @@ select.settings-input-sm {
   opacity: 0.75;
 }
 .subagent-tag {
-  color: #a78bfa;
+  color: var(--dm-accent);
   font-size: var(--text-2xs);
   margin-right: var(--space-1);
 }
@@ -1884,7 +1891,7 @@ select.settings-input-sm {
   display: inline-block;
   width: 8px;
   height: 8px;
-  border: 1.5px solid #a78bfa;
+  border: 1.5px solid var(--dm-accent);
   border-top-color: transparent;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;

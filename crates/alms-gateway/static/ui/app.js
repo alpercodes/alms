@@ -1,4 +1,4 @@
-import { h, html, render, signal, useEffect, useRef, useSignal } from './deps.js';
+import { h, html, render, signal, useEffect, useMemo, useRef, useSignal } from './deps.js';
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
@@ -60,7 +60,8 @@ function ChatView() {
         scrollToBottom(messagesRef.current);
     }, [chatMessages.value]);
 
-    
+    // Memoize grouping so it only re-runs when the message array changes
+    const grouped = useMemo(() => groupMessages(chatMessages.value), [chatMessages.value]);
 
     return html`
         <div id="chat">
@@ -70,7 +71,7 @@ function ChatView() {
                         No messages yet. Send a message to start.
                     </div>
                 `}
-                ${groupMessages(chatMessages.value).map((item) => {
+                ${grouped.map((item) => {
                     if (item._isToolGroup) {
                         return html`
                             <${ToolGroup} key=${item.key} count=${item.tools.length}>
