@@ -1247,4 +1247,143 @@ mod tests {
         assert!(names.contains(&"config.json"));
         assert!(names.contains(&"data.txt"));
     }
+
+    // ── canonicalize_best_effort edge cases (issue #57) ─────────────────────
+
+    #[test]
+    fn test_canonicalize_deep_mixed_traversal() {
+        // a/b/../../c/../../../secret should escape the sandbox root
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(check_sandbox_path("a/b/../../c/../../../secret", &root).is_err());
+    }
+
+    #[test]
+    fn test_canonicalize_dot_only_paths() {
+        // Dot-only paths should resolve to the sandbox root itself
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        let result_dot = check_sandbox_path(".", &root);
+        assert!(result_dot.is_ok(), "path '.' should stay inside sandbox");
+        assert_eq!(result_dot.unwrap(), root);
+
+        let result_dot_slash = check_sandbox_path("./", &root);
+        assert!(
+            result_dot_slash.is_ok(),
+            "path './' should stay inside sandbox"
+        );
+        assert_eq!(result_dot_slash.unwrap(), root);
+
+        let result_dot_chain = check_sandbox_path("././.", &root);
+        assert!(
+            result_dot_chain.is_ok(),
+            "path '././.' should stay inside sandbox"
+        );
+        assert_eq!(result_dot_chain.unwrap(), root);
+    }
+
+    #[test]
+    fn test_canonicalize_empty_string() {
+        // Empty string should resolve to the sandbox root (no components)
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        let result = check_sandbox_path("", &root);
+        assert!(result.is_ok(), "empty string should resolve inside sandbox");
+        assert_eq!(result.unwrap(), root);
+    }
+
+    #[test]
+    fn test_canonicalize_excessive_parent_pops() {
+        // More .. pops than path depth should escape sandbox
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(check_sandbox_path("../../../..", &root).is_err());
+        assert!(check_sandbox_path("../../../../../../etc/passwd", &root).is_err());
+    }
+
+    #[test]
+    fn test_canonicalize_trailing_slashes() {
+        // Trailing slashes should not affect sandbox containment
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("foo")).unwrap();
+        std::fs::create_dir(root.join("foo").join("bar")).unwrap();
+
+        let result = check_sandbox_path("foo/bar/", &root);
+        assert!(
+            result.is_ok(),
+            "trailing slash on existing dir should stay inside sandbox"
+        );
+        assert!(result.unwrap().starts_with(&root));
+
+        // Trailing slash on non-existent path should also stay inside
+        let result_new = check_sandbox_path("newdir/subdir/", &root);
+        assert!(
+            result_new.is_ok(),
+            "trailing slash on new path should stay inside sandbox"
+        );
+        assert!(result_new.unwrap().starts_with(&root));
+    }
+
+    // ── Windows mixed-separator test (S1 from Tim's review) ────────────────
+
+    #[cfg(windows)]
+    #[test]
+    fn test_canonicalize_mixed_separators_windows() {
+        // On Windows, backslash-mixed paths like `foo\..\..\secret` are a
+        // classic sandbox bypass vector.  `Path::components()` normalizes
+        // separators, so the function should be safe — this test locks down
+        // that assumption.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        // Pure backslash traversal
+        assert!(
+            check_sandbox_path("foo\\..\\..\\..\\secret", &root).is_err(),
+            "backslash traversal should be rejected"
+        );
+        // Mixed forward- and back-slash traversal
+        assert!(
+            check_sandbox_path("foo/..\\..\\secret", &root).is_err(),
+            "mixed-separator traversal should be rejected"
+        );
+    }
+
+    // ── Null byte injection test (S2 from Tim's review) ────────────────────
+
+    #[test]
+    fn test_canonicalize_null_byte_injection() {
+        // Some OS APIs truncate at `\0`, which could let an attacker turn
+        // `"safe\0/../../../etc/passwd"` into just `"safe"`.  Rust's
+        // `std::fs::canonicalize` and `path.exists()` reject embedded nulls
+        // on all platforms, so `canonicalize_best_effort` falls through to
+        // the component-by-component walk where the NUL stays in the
+        // `Normal` component.  Regardless of the exact error, the path must
+        // never resolve to something *outside* the sandbox.
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        // Null byte mid-path — should either error or stay inside sandbox
+        let result = check_sandbox_path("safe\0/../../../etc/passwd", &root);
+        if let Ok(resolved) = &result {
+            assert!(
+                resolved.starts_with(&root),
+                "null-byte path resolved outside sandbox: {}",
+                resolved.display()
+            );
+        }
+        // Error is also acceptable — the path is not usable
+
+        // Null byte in a simple filename — same contract
+        let result2 = check_sandbox_path("file\0.txt", &root);
+        if let Ok(resolved) = &result2 {
+            assert!(
+                resolved.starts_with(&root),
+                "null-byte filename resolved outside sandbox: {}",
+                resolved.display()
+            );
+        }
+    }
 }
