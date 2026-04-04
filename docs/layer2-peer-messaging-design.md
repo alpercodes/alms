@@ -195,10 +195,23 @@ A new component that lives in `alms-coordinator` (or a new `alms-bus` crate if n
 /// as needed and triggering runs on the receiving agent.
 pub struct MessageBus {
     session_manager: Arc<SessionManager>,
-    /// Channel to trigger runs on the gateway (reuses existing pattern).
+    /// Channel to trigger runs on the gateway.
     run_trigger_tx: mpsc::UnboundedSender<RunTrigger>,
-    /// Agent registry for name resolution.
-    agent_store: Arc<SqliteStore>,
+    /// Per-DM-pair depth tracker: "dm:a:b" -> (last_sender_name, depth).
+    /// Depth increments each time the sender changes within the same pair.
+    depths: DashMap<String, (String, u32)>,
+    /// Per-DM-pair last activity timestamp for depth expiry.
+    last_activity: DashMap<String, Instant>,
+    /// Per-DM-pair per-agent source session tracking.
+    ///
+    /// Key: `(dm_context, agent_name)` -- e.g. `("dm:alice:bob", "alice")`.
+    /// Value: the SessionId the agent was in when they first called
+    /// `send_message` for this DM pair (e.g. their web-chat session).
+    ///
+    /// Used by `end_conversation` to route the notification run to the
+    /// peer's source session instead of an invisible `notifications:` session.
+    /// Entries are cleaned up alongside depth expiry.
+    source_sessions: DashMap<(String, String), SessionId>,
 }
 
 /// A request to create a run on a target agent's session.
@@ -1096,7 +1109,7 @@ Each phase delivers independent value and is a PR-sized chunk.
 - `alms-core`: `GroupId`, `AgentGroup`, `GroupMember` types
 - `alms-session/sqlite`: `agent_groups` + `group_members` tables, CRUD methods
 - `alms-coordinator/message_bus`: `send_group()`, `create_group()` methods
-- `alms-runtime`: `CreateGroupTool`, `SendGroupMessageTool` tools
+- `alms-tools`: `CreateGroupTool`, `SendGroupMessageTool` tools
 - `alms-gateway`: `/groups` CRUD endpoints
 - `alms-cli`: `alms group {create, list, show, add-member, remove-member}` commands
 
@@ -1144,8 +1157,8 @@ This phase is UI-only (HTML/JS/CSS) -- no Rust changes.
 **Changes:**
 - `alms-session/sqlite`: `meetings` table (id, group_id, status, summary, round_count, max_rounds, created_at)
 - `alms-coordinator`: Meeting lifecycle management (start, round tracking, auto-end at round cap)
-- `alms-runtime`: `StartMeetingTool`, `EndMeetingTool` (manager-only tools)
-- `alms-runtime`: Meeting context builder — prepends summary block (previous meeting summary + project stats)
+- `alms-tools`: `StartMeetingTool`, `EndMeetingTool` (manager-only tools)
+- `alms-runtime`: Meeting context builder -- prepends summary block (previous meeting summary + project stats)
 - `alms-runtime`: Auto-summary generation at meeting conclusion
 - `alms-gateway`: Meeting API endpoints (`POST /meetings`, `GET /meetings/{id}`, `POST /meetings/{id}/end`)
 
@@ -1168,7 +1181,7 @@ Per `communication-architecture.md` Section 12, this is the core value propositi
 - Merge signal emitted
 
 **Changes:**
-- `alms-runtime`: PR review workflow tools (`submit_review`, `address_findings`, `approve_pr`)
+- `alms-tools`: PR review workflow tools (`submit_review`, `address_findings`, `approve_pr`)
 - Prompt engineering: developer and reviewer system prompts with review loop instructions
 - Integration with `shell_exec` for actual git/GitHub operations
 
@@ -1184,7 +1197,6 @@ The transition from pure hierarchy to peer messaging is additive -- nothing is r
 |---|---|
 | `invoke_agent` tool | Unchanged. Still works for delegation/task decomposition. |
 | `read_subagent_session` tool | Unchanged. Still reads subagent sessions. |
-| `get_task_result` tool | Unchanged. Still polls background subagent tasks. |
 | Subagent sessions (`subagent_*` context_id) | Unchanged. New DM sessions use `dm:*` context_id. |
 | Completion notification loop | Generalized into `run_trigger_loop` that handles all RunTrigger types. |
 | SessionManager / SQLite store | Minor change: add methods to load shared sessions by `SessionId` (not requiring `AgentId`). Shared DM/group sessions are not owned by a single agent. |
