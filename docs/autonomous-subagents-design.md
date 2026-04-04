@@ -213,18 +213,49 @@ New tool that lets the parent selectively read a named subagent's conversation h
 }
 ```
 
-**Returns:**
+**Returns (normal mode, `summary_only=false`):**
 ```json
 {
   "subagent": "reviewer",
   "message_count": 47,
+  "showing": 20,
   "messages": [
     {"role": "user", "content": "Review this PR for security issues"},
     {"role": "assistant", "content": "I'll start by reading the changed files..."},
-    {"role": "assistant", "content": "[tool_call: fs_read('src/auth.rs')]"},
     ...
   ],
-  "summary": "Optional rolling summary if sliding-summary is active"
+  "summary": "Rolling summary text, or null if none exists"
+}
+```
+
+**Returns (`summary_only=true`, summary exists):**
+```json
+{
+  "subagent": "reviewer",
+  "has_summary": true,
+  "summary": "Rolling summary text...",
+  "message_count": 47
+}
+```
+
+**Returns (`summary_only=true`, no summary — fallback):**
+
+When no rolling summary exists, the tool falls back to returning the most
+recent messages (capped at `min(last_n, 10)`) so the caller still gets
+useful context instead of an empty response.
+
+```json
+{
+  "subagent": "reviewer",
+  "has_summary": false,
+  "summary": null,
+  "fallback_messages": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "content": "..."}
+  ],
+  "fallback_message_count": 47,
+  "fallback_showing": 10,
+  "note": "No summary available. Showing the last messages as a fallback."
 }
 ```
 
