@@ -51,6 +51,13 @@ const MAX_SESSION_RETRIES = 10;
 let deltaBuffer = '';
 let flushTimer = null;
 /**
+ * Whether any token_delta events were received for the current run.
+ * Reset on run_created, set on token_delta. Used to suppress the
+ * "(run completed)" system message for normal chat runs where the
+ * streamed response is already visible.
+ */
+let sawTokenDelta = false;
+/**
  * Highest numeric SSE event ID seen on the current stream -- used for
  * manual reconnect via `?last_event_id=<n>`.
  *
@@ -164,6 +171,7 @@ export function openSessionStream(sessionId, opts) {
     on('run_created', (e) => {
         const data = JSON.parse(e.data);
         const queuedBehind = data.queued_behind || 0;
+        sawTokenDelta = false;
 
         if (data.is_notification) {
             // Notification run from subagent completion or peer message --
@@ -229,6 +237,7 @@ export function openSessionStream(sessionId, opts) {
     on('token_delta', (e) => {
         const data = JSON.parse(e.data);
         if (data.source_agent) return; // suppress subagent interleaving
+        sawTokenDelta = true;
         deltaBuffer += data.delta;
         scheduleFlush();
     });
@@ -400,7 +409,10 @@ export function openSessionStream(sessionId, opts) {
             if (status === 'cancelled') {
                 append.push({ id: nextMsgId(), type: 'system', text: '(run cancelled)' });
             }
-            if (status === 'finished') {
+            if (status === 'finished' && !sawTokenDelta) {
+                // Only show "(run completed)" for runs that had no streamed
+                // response (e.g. DM runs using send_message, tool-only runs).
+                // Normal chat runs already display the streamed text.
                 append.push({ id: nextMsgId(), type: 'system', text: '(run completed)' });
             }
 
