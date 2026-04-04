@@ -74,6 +74,26 @@ impl AgentRuntime {
                 ))
             })?;
             info!(sandbox_root = %canonical.display(), "Filesystem sandbox active");
+
+            // Platform-specific sandboxing information
+            #[cfg(target_os = "linux")]
+            if config.shell_policy == "sandboxed" {
+                info!(
+                    sandbox_root = %canonical.display(),
+                    "Landlock filesystem sandbox will be applied to shell commands (Linux 5.13+)"
+                );
+            }
+            #[cfg(not(target_os = "linux"))]
+            if config.shell_policy == "sandboxed" {
+                warn!(
+                    sandbox_root = %canonical.display(),
+                    "Shell sandbox restricts cwd only on this platform (non-Linux). \
+                     Shell commands can access files outside the sandbox root at the OS level. \
+                     For true filesystem isolation, deploy on Linux 5.13+ (Landlock) \
+                     or run the daemon as a restricted OS user."
+                );
+            }
+
             Some(canonical)
         };
         let shell_unrestricted = config.shell_policy == "unrestricted";

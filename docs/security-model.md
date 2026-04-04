@@ -144,12 +144,10 @@ Expose a `shell_exec` tool that is policy-gated.
 
 ### 4.2 Minimal contract for `shell` (renamed from `shell_exec`)
 
-The shell tool's primary interface is now command strings executed via `bash -c`.
-The legacy `argv` mode is preserved as a fallback for backward compatibility.
+The shell tool's interface is command strings executed via `bash -c`.
 
 Request fields:
-- `command` (primary): shell command string, executed via `bash -c` (both Unix and Windows via Git Bash / WSL)
-- `argv` (legacy fallback): array of strings (no shell interpolation), e.g. `["git","status"]`
+- `command`: shell command string, executed via `bash -c` (both Unix and Windows via Git Bash / WSL)
 - `description`: brief description of what the command does (for audit logging)
 - `timeout_ms`: timeout in milliseconds (default 120000, max 600000)
 - `run_in_background`: when `true`, returns a task_id immediately; use `check_task` to poll results
@@ -183,14 +181,13 @@ Response fields:
 3. The canonical path must `starts_with(sandbox_root)` — rejects symlink escapes, `..` traversal, and absolute paths outside the root.
 4. For new files (fs_write), the nearest existing ancestor is canonicalized and remaining components are appended.
 
-**Known limitation:** `shell_exec` sandboxing only restricts the cwd. The executed command itself (e.g. `cat /etc/passwd`) can still access any file the process user can read. Application-level command denylists are fundamentally bypassable — there are infinite ways to read files or exfiltrate data. True shell isolation requires OS-level mechanisms (see §4.4).
+**Known limitation (non-Linux):** On platforms without Landlock support (Windows, macOS, older Linux kernels), shell sandboxing only restricts the cwd. The executed command itself (e.g. `cat /etc/passwd`) can still access any file the process user can read. Application-level command denylists are fundamentally bypassable. On Linux 5.13+, Landlock filesystem restrictions are applied to child processes (see section 4.4).
 
 ### 4.4 Isolation roadmap
 
-**Current (MVP):** `bash -c` command strings (primary) + legacy argv fallback + `env_clear()` + best-effort command denylist + `sandbox_root` path prefix enforcement for fs tools + persistent cwd restriction for shell (validated against sandbox root on each invocation).
+**Current:** `bash -c` command strings + `env_clear()` + best-effort command denylist + `sandbox_root` path prefix enforcement for fs tools + persistent cwd restriction for shell (validated against sandbox root on each invocation) + **Landlock filesystem sandboxing on Linux 5.13+** (fail-closed: if Landlock is supported but enforcement fails, the command is aborted; only gracefully degrades on kernels without Landlock support).
 
-**Next — OS-level isolation:**
-- **Landlock** (Linux 5.13+): kernel LSM that lets an unprivileged process restrict its own filesystem access before exec. The `landlock` crate makes this ~30 lines of Rust. Would make `shell_exec` truly sandboxed on Linux. No root required. Cross-platform story: Linux-only; Windows/macOS need alternative approaches.
+**Next — additional OS-level isolation:**
 - **Restricted OS user**: run the daemon (or just tool execution) as a low-privilege OS user with filesystem ACLs limiting access to the workspace. Battle-tested, simple, works on all platforms. Requires deployment-time setup (create user, set permissions).
 - **`bubblewrap`/`nsjail`**: lightweight containers — new mount namespace with only the workspace visible. Linux-only, external dependency.
 
@@ -274,7 +271,7 @@ Suggested table/event fields:
 
 Default posture recommendations:
 - Workspace-only file access — **implemented**: `sandbox_root = "."` confines fs tools to cwd
-- Shell primary interface is `bash -c` command strings; legacy `argv` mode preserved as fallback — **implemented**: `shell` tool wraps commands with `bash -c`, argv mode uses direct `Command::new()` with args
+- Shell interface is `bash -c` command strings — **implemented**: `shell` tool wraps commands with `bash -c`; Landlock filesystem restrictions applied on Linux 5.13+
 - Shell command denylist (best-effort) — **implemented**: substring-based denylist blocks `rm -rf /`, `mkfs.`, fork bombs, etc.; bypassable, defense-in-depth only
 - Shell env cleared — **implemented**: `env_clear()` prevents secret leakage to child processes
 - Shell cwd restricted — **implemented**: `shell_policy = "sandboxed"` restricts cwd to sandbox_root; persistent cwd validated against sandbox on each invocation
@@ -291,7 +288,7 @@ Default posture recommendations:
 P0 (before public use):
 - [ ] Single capability model, used everywhere
 - [ ] Tool registry enforces capability checks
-- [x] Shell tool — primary interface is `bash -c` command strings; legacy `argv` mode preserved; best-effort command denylist
+- [x] Shell tool — `bash -c` command strings; best-effort command denylist; Landlock on Linux 5.13+
 - [x] Audit log for tool runs + job runs — SQLite-backed audit events
 - [ ] Job principal + capability scoping
 - [x] Output truncation + sanitization — safe UTF-8 truncation on all tool outputs
@@ -300,7 +297,7 @@ P0 (before public use):
 - [x] Shell cwd restriction — sandboxed mode restricts cwd to `sandbox_root`
 
 P1:
-- [ ] Landlock integration (Linux) — kernel-level filesystem restriction for `shell_exec`
+- [x] Landlock integration (Linux) — kernel-level filesystem restriction for shell commands (fail-closed)
 - [ ] Restricted OS user deployment guide — document setup for sandboxed daemon user
 - [ ] Container/jail execution for shell tools (`bubblewrap`/`nsjail`)
 - [x] Secrets store — `data/secrets.json` with optional AES-256-GCM encryption via `ALMS_MASTER_KEY`

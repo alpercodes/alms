@@ -5,8 +5,8 @@
 
 use super::output::truncate_output;
 use super::security::{
-    argv_references_denied_file, command_matches_denylist, command_references_denied_file,
-    is_secret_env_var, platform_critical_env_vars,
+    command_matches_denylist, command_references_denied_file, is_secret_env_var,
+    platform_critical_env_vars,
 };
 use super::types::{ShellInput, ShellOutput, ShellState};
 use crate::{SandboxError, error::SandboxResult};
@@ -35,29 +35,24 @@ pub(crate) async fn execute_command(
     unrestricted: bool,
     default_env: &HashMap<String, String>,
 ) -> SandboxResult<ShellOutput> {
-    // Determine the effective command string and argv for security checks
-    let (effective_command, is_command_mode) = resolve_command(input)?;
+    let command = &input.command;
 
-    // Security: check for denied files
-    if is_command_mode {
-        if let Some(denied) = command_references_denied_file(&effective_command) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Command references denied file '{denied}'"
-            )));
-        }
-        if let Some(pattern) = command_matches_denylist(&effective_command) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Command matches denied pattern '{pattern}'"
-            )));
-        }
-    } else {
-        // argv mode: validate each argument
-        let argv_strs: Vec<&str> = effective_command.split('\0').collect();
-        if let Some(denied) = argv_references_denied_file(&argv_strs) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Command references denied file '{denied}'"
-            )));
-        }
+    if command.trim().is_empty() {
+        return Err(SandboxError::InvalidParameters(
+            "'command' must not be empty".to_string(),
+        ));
+    }
+
+    // Security: check for denied files and destructive patterns
+    if let Some(denied) = command_references_denied_file(command) {
+        return Err(SandboxError::SandboxViolation(format!(
+            "Command references denied file '{denied}'"
+        )));
+    }
+    if let Some(pattern) = command_matches_denylist(command) {
+        return Err(SandboxError::SandboxViolation(format!(
+            "Command matches denied pattern '{pattern}'"
+        )));
     }
 
     let cwd = state.cwd.lock().await.clone();
@@ -68,7 +63,7 @@ pub(crate) async fn execute_command(
     }
 
     // Build and spawn the command
-    let mut cmd = build_command(&effective_command, is_command_mode, &cwd)?;
+    let mut cmd = build_command(command, &cwd, sandbox_root, unrestricted)?;
 
     // Configure environment
     configure_env(&mut cmd, default_env);
@@ -77,7 +72,7 @@ pub(crate) async fn execute_command(
     let timeout = std::time::Duration::from_millis(input.timeout_ms);
 
     debug!(
-        command = %effective_command,
+        command = %command,
         cwd = %cwd.display(),
         timeout_ms = input.timeout_ms,
         "Spawning shell command"
@@ -101,8 +96,8 @@ pub(crate) async fn execute_command(
     let raw_stdout = String::from_utf8_lossy(&result.stdout).to_string();
     let raw_stderr = String::from_utf8_lossy(&result.stderr).to_string();
 
-    // Extract cwd from pwd marker if we used command mode
-    if is_command_mode && let Some(new_cwd) = extract_cwd_from_output(&raw_stdout) {
+    // Extract cwd from pwd marker
+    if let Some(new_cwd) = extract_cwd_from_output(&raw_stdout) {
         let new_path = PathBuf::from(new_cwd);
         // Validate the new cwd against sandbox root before storing.
         // If the command changed directory outside the sandbox (e.g. `cd /etc`),
@@ -138,81 +133,223 @@ pub(crate) async fn execute_command(
     })
 }
 
-/// Resolve the effective command from the input.
-///
-/// Returns `(command_string, is_command_mode)`.
-/// In command mode, the string is the shell command.
-/// In argv mode, the string is null-byte-joined argv elements (for security checks).
-fn resolve_command(input: &ShellInput) -> SandboxResult<(String, bool)> {
-    if let Some(ref command) = input.command {
-        if command.trim().is_empty() {
-            return Err(SandboxError::InvalidParameters(
-                "'command' must not be empty".to_string(),
-            ));
-        }
-        Ok((command.clone(), true))
-    } else if let Some(ref argv) = input.argv {
-        if argv.is_empty() {
-            return Err(SandboxError::InvalidParameters(
-                "'argv' must not be empty".to_string(),
-            ));
-        }
-        // Join with null bytes for security check, but we'll use the Vec directly for spawning
-        Ok((argv.join("\0"), false))
-    } else {
-        Err(SandboxError::InvalidParameters(
-            "Either 'command' or 'argv' is required".to_string(),
-        ))
-    }
-}
-
 /// Build the tokio Command for execution.
 ///
-/// In command mode, wraps with `bash -c` on all platforms. On Windows,
-/// this requires Git Bash or WSL to be available on PATH. We use bash
-/// (not `cmd /c`) on Windows because the pwd marker, exit code capture,
-/// and shell syntax assume POSIX semantics.
-/// In argv mode, spawns the program directly.
+/// Wraps the command with `bash -c` on all platforms. On Windows, this
+/// requires Git Bash or WSL to be available on PATH. We use bash (not
+/// `cmd /c`) because the pwd marker, exit code capture, and shell syntax
+/// all assume POSIX semantics.
+///
+/// On Linux 5.13+ with a sandbox root configured, Landlock filesystem
+/// restrictions are applied via `pre_exec` so the child process can only
+/// access files within the sandbox root.
 fn build_command(
-    effective_command: &str,
-    is_command_mode: bool,
+    command: &str,
     cwd: &Path,
+    sandbox_root: Option<&Path>,
+    unrestricted: bool,
 ) -> SandboxResult<tokio::process::Command> {
-    let mut cmd;
+    let wrapped = wrap_command_with_pwd_marker(command);
 
-    if is_command_mode {
-        // Command string mode: wrap with shell
-        let wrapped = wrap_command_with_pwd_marker(effective_command);
-
-        #[cfg(unix)]
-        {
-            cmd = tokio::process::Command::new("bash");
-            cmd.arg("-c");
-            cmd.arg(&wrapped);
-        }
-        #[cfg(windows)]
-        {
-            // Use bash (Git Bash / WSL) on Windows too — the pwd marker,
-            // exit code capture, and shell syntax all assume POSIX semantics.
-            cmd = tokio::process::Command::new("bash");
-            cmd.arg("-c");
-            cmd.arg(&wrapped);
-        }
-    } else {
-        // Argv mode: spawn directly
-        let argv: Vec<&str> = effective_command.split('\0').collect();
-        cmd = tokio::process::Command::new(argv[0]);
-        if argv.len() > 1 {
-            cmd.args(&argv[1..]);
-        }
-    }
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg("-c");
+    cmd.arg(&wrapped);
 
     cmd.current_dir(cwd);
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
+    // Apply Landlock filesystem sandboxing on Linux when a sandbox root is configured
+    #[cfg(target_os = "linux")]
+    if !unrestricted {
+        if let Some(root) = sandbox_root {
+            apply_landlock_sandbox(&mut cmd, root);
+        }
+    }
+
+    // Suppress unused variable warnings on non-Linux platforms
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = sandbox_root;
+        let _ = unrestricted;
+    }
+
     Ok(cmd)
+}
+
+/// Apply Landlock filesystem restrictions to a command via `pre_exec`.
+///
+/// This restricts the child process (and all its descendants) to only
+/// access files under `sandbox_root`. The restriction is applied using
+/// Linux's Landlock LSM (available since Linux 5.13).
+///
+/// If Landlock is not supported by the running kernel, a warning is logged
+/// and execution continues without filesystem restrictions.
+#[cfg(target_os = "linux")]
+fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path) {
+    use std::os::unix::process::CommandExt;
+
+    // Canonicalize the sandbox root so the Landlock rules match real paths.
+    // If canonicalization fails (dir doesn't exist yet), fall back to the
+    // provided path — Landlock will simply deny all access, which is safer
+    // than allowing everything.
+    let canonical_root =
+        std::fs::canonicalize(sandbox_root).unwrap_or_else(|_| sandbox_root.to_path_buf());
+
+    // We also need to allow access to standard system paths so bash and
+    // basic utilities can execute. These are read-only.
+    //
+    // NOTE: /etc is narrowed to specific entries that bash/coreutils need.
+    // /tmp is excluded — commands that need temp space should use the sandbox root.
+    let system_read_paths: Vec<PathBuf> = vec![
+        PathBuf::from("/usr"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+        // Specific /etc entries needed by the dynamic linker and coreutils:
+        PathBuf::from("/etc/ld.so.cache"),
+        PathBuf::from("/etc/ld.so.conf"),
+        PathBuf::from("/etc/ld.so.conf.d"),
+        PathBuf::from("/etc/alternatives"),
+        PathBuf::from("/etc/nsswitch.conf"),
+        PathBuf::from("/etc/resolv.conf"),
+        PathBuf::from("/etc/passwd"),
+        PathBuf::from("/etc/localtime"),
+        PathBuf::from("/dev/null"),
+        PathBuf::from("/dev/urandom"),
+        PathBuf::from("/dev/zero"),
+        PathBuf::from("/proc/self"),
+    ];
+
+    // Clone what we need into the closure (pre_exec runs after fork, before exec)
+    let root_for_closure = canonical_root.clone();
+    let sys_paths = system_read_paths;
+
+    // SAFETY: pre_exec runs in the child process after fork() but before
+    // exec(). The Landlock syscalls themselves are async-signal-safe, but
+    // we use eprintln! for diagnostics on error paths, which is technically
+    // not async-signal-safe (it may allocate). In practice this is reliable
+    // after fork() on Linux and only executes on error paths. The trade-off
+    // is accepted for debuggability.
+    unsafe {
+        cmd.pre_exec(move || {
+            use landlock::{
+                ABI, Access, AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr,
+                RulesetCreatedAttr, RulesetStatus,
+            };
+
+            // Request V5 features; the landlock crate will degrade to the
+            // highest ABI the running kernel supports (best-effort).
+            let abi = ABI::V5;
+
+            let read_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
+
+            // NOTE: AccessFs::Refer is intentionally not granted for any path.
+            // This means rename()/link() across differently-ruled directories
+            // will be denied. rename() within the sandbox root works because
+            // source and target share the same ruleset entry. This prevents
+            // using rename to move files from system paths into the sandbox.
+            let write_access = read_access
+                | AccessFs::WriteFile
+                | AccessFs::MakeReg
+                | AccessFs::MakeDir
+                | AccessFs::MakeSym
+                | AccessFs::RemoveFile
+                | AccessFs::RemoveDir
+                | AccessFs::Truncate;
+
+            let ruleset = match Ruleset::default().handle_access(AccessFs::from_all(abi)) {
+                Ok(r) => r,
+                Err(e) => {
+                    // handle_access() failure means Landlock is not supported
+                    // by this kernel — gracefully degrade to unsandboxed execution.
+                    eprintln!("[alms] Landlock not supported by kernel, running unsandboxed: {e}");
+                    return Ok(());
+                }
+            };
+
+            // From this point on, the kernel supports Landlock. Any failure
+            // to create or enforce the ruleset is a hard error — we must NOT
+            // run the command unsandboxed when sandboxing was requested and
+            // the kernel confirmed it can apply rules.
+
+            let mut ruleset = match ruleset.create() {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[alms] Landlock ruleset create failed: {e}");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("Landlock ruleset creation failed: {e}"),
+                    ));
+                }
+            };
+
+            // Allow full read+write access to the sandbox root
+            let fd = match PathFd::new(&root_for_closure) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    eprintln!(
+                        "[alms] Landlock: cannot open sandbox root '{}': {e}",
+                        root_for_closure.display()
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Landlock: cannot open sandbox root '{}': {e}",
+                            root_for_closure.display()
+                        ),
+                    ));
+                }
+            };
+            let rule = PathBeneath::new(fd, write_access);
+            if let Err(e) = ruleset.add_rule(rule) {
+                eprintln!("[alms] Landlock: failed to add sandbox root rule: {e}");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Landlock: failed to add sandbox root rule: {e}"),
+                ));
+            }
+
+            // Allow read+execute access to system paths (best-effort: missing
+            // system paths are skipped since not all distros have the same layout)
+            for sys_path in &sys_paths {
+                if sys_path.exists() {
+                    if let Ok(fd) = PathFd::new(sys_path) {
+                        let rule = PathBeneath::new(fd, read_access);
+                        // Best-effort: if a system path can't be added, skip it
+                        let _ = ruleset.add_rule(rule);
+                    }
+                }
+            }
+
+            match ruleset.restrict_self() {
+                Ok(status) => {
+                    if matches!(status.ruleset, RulesetStatus::NotEnforced) {
+                        eprintln!("[alms] Landlock: ruleset was not enforced by kernel");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Landlock ruleset was not enforced by kernel",
+                        ));
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[alms] Landlock restrict_self failed: {e}");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("Landlock restrict_self failed: {e}"),
+                    ));
+                }
+            }
+
+            Ok(())
+        });
+    }
+
+    debug!(
+        sandbox_root = %canonical_root.display(),
+        "Landlock filesystem sandbox configured for child process"
+    );
 }
 
 /// Wrap a command string with a pwd marker so we can detect cwd changes.
@@ -384,81 +521,19 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_command_string() {
-        let input = ShellInput {
-            command: Some("ls -la".to_string()),
-            argv: None,
-            description: None,
-            timeout_ms: 120_000,
-            run_in_background: false,
-        };
-        let (cmd, is_cmd) = resolve_command(&input).unwrap();
-        assert_eq!(cmd, "ls -la");
-        assert!(is_cmd);
-    }
-
-    #[test]
-    fn test_resolve_command_argv() {
-        let input = ShellInput {
-            command: None,
-            argv: Some(vec!["ls".to_string(), "-la".to_string()]),
-            description: None,
-            timeout_ms: 120_000,
-            run_in_background: false,
-        };
-        let (cmd, is_cmd) = resolve_command(&input).unwrap();
-        assert_eq!(cmd, "ls\0-la");
-        assert!(!is_cmd);
-    }
-
-    #[test]
-    fn test_resolve_command_prefers_command_over_argv() {
-        let input = ShellInput {
-            command: Some("echo hello".to_string()),
-            argv: Some(vec!["ls".to_string()]),
-            description: None,
-            timeout_ms: 120_000,
-            run_in_background: false,
-        };
-        let (cmd, is_cmd) = resolve_command(&input).unwrap();
-        assert_eq!(cmd, "echo hello");
-        assert!(is_cmd);
-    }
-
-    #[test]
-    fn test_resolve_command_empty_command() {
-        let input = ShellInput {
-            command: Some("   ".to_string()),
-            argv: None,
-            description: None,
-            timeout_ms: 120_000,
-            run_in_background: false,
-        };
-        assert!(resolve_command(&input).is_err());
-    }
-
-    #[test]
-    fn test_resolve_command_empty_argv() {
-        let input = ShellInput {
-            command: None,
-            argv: Some(vec![]),
-            description: None,
-            timeout_ms: 120_000,
-            run_in_background: false,
-        };
-        assert!(resolve_command(&input).is_err());
-    }
-
-    #[test]
-    fn test_resolve_command_neither() {
-        let input = ShellInput {
-            command: None,
-            argv: None,
-            description: None,
-            timeout_ms: 120_000,
-            run_in_background: false,
-        };
-        assert!(resolve_command(&input).is_err());
+    fn test_build_command_wraps_with_bash() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let cmd = build_command("echo hello", cwd, None, true).unwrap();
+        // The command should be a bash process
+        let inner = cmd.as_std();
+        assert_eq!(inner.get_program(), "bash");
+        let args: Vec<_> = inner.get_args().collect();
+        assert_eq!(args[0], "-c");
+        // The second arg should contain our command and the pwd marker
+        let wrapped = args[1].to_str().unwrap();
+        assert!(wrapped.contains("echo hello"));
+        assert!(wrapped.contains(PWD_MARKER));
     }
 
     #[test]

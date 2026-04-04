@@ -20,6 +20,9 @@ async-trait.workspace = true
 dashmap.workspace = true
 reqwest.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
 [dev-dependencies]
 tokio-test.workspace = true
 wat = "1.0"

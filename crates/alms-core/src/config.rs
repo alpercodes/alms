@@ -617,10 +617,11 @@ pub struct ToolsConfig {
     /// Set to "" for unrestricted filesystem access.
     pub sandbox_root: String,
     /// Shell execution policy: "sandboxed" (default) or "unrestricted".
-    /// In sandboxed mode, shell_exec cwd is restricted to sandbox_root.
-    /// Note: sandboxed mode restricts cwd but cannot prevent the executed
-    /// command from accessing files outside the sandbox. For true shell
-    /// isolation, use a restricted OS user or Landlock (see security-model.md §4.4).
+    /// In sandboxed mode, the shell's persistent cwd is restricted to `sandbox_root`.
+    /// On Linux 5.13+, Landlock filesystem restrictions are also applied so the
+    /// child process can only access files within `sandbox_root` (plus read-only
+    /// system paths like /usr, /bin, /lib). On Windows/macOS, sandboxed mode
+    /// restricts cwd only -- the command can still access files outside the sandbox.
     pub shell_policy: String,
 }
 

@@ -559,7 +559,7 @@ mod tests {
                     id: "call_1".to_string(),
                     function: FunctionCall {
                         name: "shell_exec".to_string(),
-                        arguments: r#"{"argv":["ls"]}"#.to_string(),
+                        arguments: r#"{"command":"ls"}"#.to_string(),
                     },
                 }]),
                 tool_call_id: None,

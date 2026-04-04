@@ -1,13 +1,16 @@
 //! Redesigned shell tool inspired by Claude Code's Bash tool.
 //!
 //! Key improvements over the original `ShellExecTool`:
-//! - **Command strings**: Primary interface is `"command": "ls -la"` via `bash -c`
+//! - **Command strings**: Interface is `"command": "ls -la"` via `bash -c`
 //! - **Persistent cwd**: Working directory persists across calls
 //! - **Output truncation**: 30KB max with head+tail line preservation
 //! - **Background execution**: `run_in_background: true` spawns a task
 //! - **Timeouts**: 120s default, 600s max, configurable via `timeout_ms`
-//! - **Security**: Preserved env_clear, denied files, secret env vars; added command denylist
-//! - **Backward compat**: `argv` still accepted as legacy fallback
+//! - **Security**: env_clear, denied files, secret env vars, command denylist,
+//!   Landlock filesystem sandboxing on Linux 5.13+
+//!
+//! The legacy `argv` mode has been removed. All commands go through `bash -c`
+//! which ensures the denylist and security checks apply uniformly.
 
 pub mod background;
 pub mod exec;
@@ -135,27 +138,16 @@ impl ShellTool {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let argv = params.get("argv").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<String>>()
-        });
-
-        if command.is_none() && argv.is_none() {
+        let Some(command) = command else {
             return Err(SandboxError::InvalidParameters(
-                "Either 'command' or 'argv' is required".to_string(),
+                "'command' parameter is required".to_string(),
             ));
-        }
+        };
 
-        // Validate argv elements are strings if provided
-        if let Some(arr) = params.get("argv").and_then(|v| v.as_array()) {
-            for (i, v) in arr.iter().enumerate() {
-                if !v.is_string() {
-                    return Err(SandboxError::InvalidParameters(format!(
-                        "argv[{i}] must be a string"
-                    )));
-                }
-            }
+        if command.trim().is_empty() {
+            return Err(SandboxError::InvalidParameters(
+                "'command' must not be empty".to_string(),
+            ));
         }
 
         let description = params
@@ -179,7 +171,6 @@ impl ShellTool {
 
         Ok(ShellInput {
             command,
-            argv,
             description,
             timeout_ms,
             run_in_background,
@@ -228,10 +219,11 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and return its output. \
-        Accepts a command string (executed via bash -c) or an argv array. \
+        "Execute a shell command (via bash -c) and return its output. \
         The working directory persists between calls. \
-        Supports background execution and configurable timeouts."
+        Supports background execution and configurable timeouts. \
+        Commands run with the daemon's filesystem access; on Linux 5.13+, \
+        Landlock restricts filesystem access to the sandbox root when enabled."
     }
 
     fn is_builtin(&self) -> bool {
@@ -244,13 +236,7 @@ impl Tool for ShellTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute (via bash -c). This is the preferred interface."
-                },
-                "argv": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Legacy: program and arguments array, e.g. [\"ls\", \"-la\"]. Use 'command' instead.",
-                    "minItems": 1
+                    "description": "The shell command to execute (via bash -c)."
                 },
                 "description": {
                     "type": "string",
@@ -276,9 +262,10 @@ impl Tool for ShellTool {
                 },
                 "check_task": {
                     "type": "string",
-                    "description": "Check the result of a background task by its task_id. Mutually exclusive with 'command' and 'argv' — when present, all other parameters are ignored."
+                    "description": "Check the result of a background task by its task_id. Mutually exclusive with 'command' — when present, all other parameters are ignored."
                 }
-            }
+            },
+            "required": []
         })
     }
 
@@ -368,13 +355,21 @@ mod tests {
         let params = tool.parameters();
         let props = params["properties"].as_object().unwrap();
         assert!(props.contains_key("command"));
-        assert!(props.contains_key("argv"));
+        assert!(!props.contains_key("argv"), "argv mode has been removed");
         assert!(props.contains_key("description"));
         assert!(props.contains_key("timeout_ms"));
         assert!(props.contains_key("timeout_secs"));
         assert!(props.contains_key("run_in_background"));
         assert!(props.contains_key("env"));
         assert!(props.contains_key("check_task"));
+        // `required` is empty at schema level: `check_task` is an alternative to
+        // `command`. Runtime validation in `parse_input()` enforces `command` when
+        // `check_task` is not provided.
+        let required = params["required"].as_array().unwrap();
+        assert!(
+            required.is_empty(),
+            "required should be empty — check_task is mutually exclusive with command"
+        );
     }
 
     #[test]
@@ -382,28 +377,22 @@ mod tests {
         let tool = ShellTool::new();
         let params = serde_json::json!({"command": "ls -la"});
         let input = tool.parse_input(&params).unwrap();
-        assert_eq!(input.command.as_deref(), Some("ls -la"));
-        assert!(input.argv.is_none());
+        assert_eq!(input.command, "ls -la");
         assert_eq!(input.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert!(!input.run_in_background);
     }
 
     #[test]
-    fn test_parse_input_argv() {
+    fn test_parse_input_missing_command() {
         let tool = ShellTool::new();
-        let params = serde_json::json!({"argv": ["ls", "-la"]});
-        let input = tool.parse_input(&params).unwrap();
-        assert!(input.command.is_none());
-        assert_eq!(
-            input.argv.as_deref(),
-            Some(vec!["ls".to_string(), "-la".to_string()].as_slice())
-        );
+        let params = serde_json::json!({});
+        assert!(tool.parse_input(&params).is_err());
     }
 
     #[test]
-    fn test_parse_input_neither() {
+    fn test_parse_input_empty_command() {
         let tool = ShellTool::new();
-        let params = serde_json::json!({});
+        let params = serde_json::json!({"command": "   "});
         assert!(tool.parse_input(&params).is_err());
     }
 
@@ -447,13 +436,6 @@ mod tests {
         assert_eq!(input.description.as_deref(), Some("List files"));
     }
 
-    #[test]
-    fn test_parse_input_non_string_argv_element() {
-        let tool = ShellTool::new();
-        let params = serde_json::json!({"argv": ["echo", 42]});
-        assert!(tool.parse_input(&params).is_err());
-    }
-
     // ── Integration tests (Unix only) ─────────────────────────────────────
 
     #[tokio::test]
@@ -462,18 +444,6 @@ mod tests {
         let tool = ShellTool::new();
         let result = tool
             .execute(serde_json::json!({"command": "echo hello"}))
-            .await
-            .unwrap();
-        assert_eq!(result["exit_code"], 0);
-        assert!(result["stdout"].as_str().unwrap().contains("hello"));
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_shell_tool_argv_echo() {
-        let tool = ShellTool::new();
-        let result = tool
-            .execute(serde_json::json!({"argv": ["echo", "hello"]}))
             .await
             .unwrap();
         assert_eq!(result["exit_code"], 0);
@@ -659,24 +629,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shell_tool_missing_command_and_argv() {
+    async fn test_shell_tool_missing_command() {
         let tool = ShellTool::new();
         let result = tool.execute(serde_json::json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_shell_tool_empty_argv() {
-        let tool = ShellTool::new();
-        let result = tool.execute(serde_json::json!({"argv": []})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_shell_tool_non_string_argv() {
+    async fn test_shell_tool_argv_rejected() {
+        // argv mode has been removed; passing argv without command should fail
         let tool = ShellTool::new();
         let result = tool
-            .execute(serde_json::json!({"argv": ["echo", 42]}))
+            .execute(serde_json::json!({"argv": ["echo", "hello"]}))
             .await;
         assert!(result.is_err());
     }
