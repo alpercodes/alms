@@ -400,6 +400,9 @@ export function openSessionStream(sessionId, opts) {
             if (status === 'cancelled') {
                 append.push({ id: nextMsgId(), type: 'system', text: '(run cancelled)' });
             }
+            if (status === 'finished') {
+                append.push({ id: nextMsgId(), type: 'system', text: '(run completed)' });
+            }
 
             const usage = (data.prompt_tokens || data.completion_tokens)
                 ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
