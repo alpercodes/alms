@@ -20,18 +20,18 @@ use tracing::{info, warn};
 /// for TOML and env-var compatibility.
 ///
 /// Unknown/invalid values deserialize to [`RunSummaryMode::Unknown`] and are
-/// normalized to [`RunSummaryMode::Heuristic`] with a warning during config loading.
+/// normalized to [`RunSummaryMode::Llm`] with a warning during config loading.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunSummaryMode {
     /// No summaries generated, no episodic injection.
     Off,
-    /// One-line summary from first ~120 chars of input (no LLM call). Default.
-    #[default]
+    /// One-line summary from first ~120 chars of input (no LLM call).
     Heuristic,
-    /// Rich summary via agent's model (or `summary_model` if configured).
+    /// Rich summary via agent's model (or `summary_model` if configured). Default.
+    #[default]
     Llm,
-    /// Catch-all for unrecognized values — normalized to `Off` during loading.
+    /// Catch-all for unrecognized values — normalized to `Llm` during loading.
     #[serde(other, rename = "unknown")]
     Unknown,
 }
@@ -574,7 +574,7 @@ impl Default for ContextConfig {
             recent_window: 20,
             summary_interval: 30,
             summary_model: None,
-            run_summary_mode: RunSummaryMode::Heuristic,
+            run_summary_mode: RunSummaryMode::Llm,
             run_summary_budget: 2000,
         }
     }
@@ -584,10 +584,10 @@ impl ContextConfig {
     /// Normalize episodic memory settings: validate mode and enforce the 15%
     /// budget cap. Called during config loading, before hard validation.
     pub fn normalize_episodic(&mut self) {
-        // Normalize Unknown variant (from unrecognized TOML/env values) to Heuristic
+        // Normalize Unknown variant (from unrecognized TOML/env values) to Llm
         if self.run_summary_mode == RunSummaryMode::Unknown {
-            warn!("Unrecognized run_summary_mode, falling back to \"heuristic\"");
-            self.run_summary_mode = RunSummaryMode::Heuristic;
+            warn!("Unrecognized run_summary_mode, falling back to \"llm\"");
+            self.run_summary_mode = RunSummaryMode::Llm;
         }
 
         // Enforce 15% hard cap on run_summary_budget
@@ -1297,7 +1297,7 @@ log_dir = "/var/log/alms"
     #[test]
     fn test_context_config_defaults_episodic() {
         let config = ContextConfig::default();
-        assert_eq!(config.run_summary_mode, RunSummaryMode::Heuristic);
+        assert_eq!(config.run_summary_mode, RunSummaryMode::Llm);
         assert_eq!(config.run_summary_budget, 2000);
     }
 
@@ -1321,7 +1321,7 @@ log_dir = "/var/log/alms"
     }
 
     #[test]
-    fn test_normalize_episodic_unknown_mode_falls_back_to_heuristic() {
+    fn test_normalize_episodic_unknown_mode_falls_back_to_llm() {
         let mut config = ContextConfig {
             run_summary_mode: RunSummaryMode::Unknown,
             ..Default::default()
@@ -1329,8 +1329,8 @@ log_dir = "/var/log/alms"
         config.normalize_episodic();
         assert_eq!(
             config.run_summary_mode,
-            RunSummaryMode::Heuristic,
-            "unknown mode should fall back to Heuristic"
+            RunSummaryMode::Llm,
+            "unknown mode should fall back to Llm"
         );
     }
 
