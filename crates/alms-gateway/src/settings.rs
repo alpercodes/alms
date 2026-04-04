@@ -347,18 +347,154 @@ pub async fn patch_settings(
 
 // ── Persistence helpers ───────────────────────────────────────────────
 
+/// Persisted context overrides — only fields the user explicitly changed
+/// via PATCH /settings are `Some`. Fields that are `None` fall through to
+/// code defaults / TOML / env-var overrides.
+///
+/// Backward-compatible: old `settings.json` files that contain the full
+/// `ContextConfig` will deserialize with all fields set to `Some`, which
+/// is functionally equivalent to the old wholesale-replace behavior (but
+/// new persists will only write the patchable subset).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedContextOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recent_window: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_interval: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_summary_mode: Option<alms_core::config::RunSummaryMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_summary_budget: Option<usize>,
+}
+
+impl PersistedContextOverrides {
+    /// Merge these overrides into a `ContextConfig`, field by field.
+    /// Only fields that are `Some` overwrite the target.
+    pub fn apply_to(&self, ctx: &mut alms_core::config::ContextConfig) {
+        if let Some(ref v) = self.strategy {
+            ctx.strategy = v.clone();
+        }
+        if let Some(v) = self.max_input_tokens {
+            ctx.max_input_tokens = v;
+        }
+        if let Some(v) = self.recent_window {
+            ctx.recent_window = v;
+        }
+        if let Some(v) = self.summary_interval {
+            ctx.summary_interval = v;
+        }
+        if self.summary_model.is_some() {
+            ctx.summary_model = self.summary_model.clone();
+        }
+        if let Some(ref v) = self.run_summary_mode {
+            ctx.run_summary_mode = v.clone();
+        }
+        if let Some(v) = self.run_summary_budget {
+            ctx.run_summary_budget = v;
+        }
+    }
+}
+
+/// Persisted session overrides — only fields the user explicitly changed.
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedSessionOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_messages: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_archive: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_ttl_secs: Option<u64>,
+}
+
+impl PersistedSessionOverrides {
+    /// Merge these overrides into a `SessionConfig`, field by field.
+    pub fn apply_to(&self, sess: &mut alms_session::SessionConfig) {
+        if let Some(v) = self.max_messages {
+            sess.max_messages = v;
+        }
+        if let Some(v) = self.max_context_tokens {
+            sess.max_context_tokens = v;
+        }
+        if let Some(v) = self.idle_timeout_secs {
+            sess.idle_timeout_secs = v;
+        }
+        if let Some(v) = self.auto_archive {
+            sess.auto_archive = v;
+        }
+        if let Some(v) = self.archive_ttl_secs {
+            sess.archive_ttl_secs = v;
+        }
+    }
+}
+
+/// Persisted tools overrides — only fields the user explicitly changed.
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedToolsOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_bytes: Option<usize>,
+}
+
+impl PersistedToolsOverrides {
+    /// Merge these overrides into a `ToolsConfig`, field by field.
+    pub fn apply_to(&self, tools: &mut alms_core::config::ToolsConfig) {
+        if let Some(ref v) = self.shell_policy {
+            tools.shell_policy = v.clone();
+        }
+        if let Some(ref v) = self.sandbox_root {
+            tools.sandbox_root = v.clone();
+        }
+        if let Some(v) = self.timeout_secs {
+            tools.timeout_secs = v;
+        }
+        if let Some(v) = self.max_output_bytes {
+            tools.max_output_bytes = v;
+        }
+    }
+}
+
 /// On-disk representation of the mutable server-level settings.
 ///
 /// Written to `{data_dir}/settings.json` after every PATCH /settings and
 /// loaded on startup to restore the previous configuration.
+///
+/// Only fields explicitly set by the user via PATCH /settings are persisted.
+/// On load, these overrides are merged field-by-field into the resolved
+/// config (code defaults + TOML + env vars), ensuring that:
+/// - Code default changes are picked up for non-overridden fields
+/// - Env var overrides (e.g. `ALMS_RUN_SUMMARY_MODE`) still take precedence
+///   when they exist
+///
+/// Backward-compatible: old `settings.json` files with the full
+/// `ContextConfig` / `SessionConfig` / `ToolsConfig` structs will
+/// deserialize correctly because `serde(default)` fills in `None` for
+/// missing fields, and extra fields in the JSON are silently ignored.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct PersistedSettings {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<alms_core::config::ContextConfig>,
+    pub context: Option<PersistedContextOverrides>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub session: Option<alms_session::SessionConfig>,
+    pub session: Option<PersistedSessionOverrides>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tools: Option<alms_core::config::ToolsConfig>,
+    pub tools: Option<PersistedToolsOverrides>,
 }
 
 /// Return the canonical path for the persisted settings file.
@@ -366,13 +502,47 @@ pub fn settings_path(data_dir: &Path) -> PathBuf {
     data_dir.join("settings.json")
 }
 
-/// Write the current mutable settings to `{data_dir}/settings.json`.
+/// Write the current user-overridden settings to `{data_dir}/settings.json`.
+///
+/// Only persists the fields that PATCH /settings can modify — never writes
+/// fields like `run_summary_mode` or `run_summary_budget` that are not
+/// exposed in the PATCH API, so that code-default and env-var changes to
+/// those fields are always respected on restart.
 fn persist_settings(state: &AppState) {
+    let agent = state.agent_config.read();
+    let ctx = &agent.context_config;
+    let sess = state.session_config.read();
+    let tools = state.tools_config.read();
+
     let persisted = PersistedSettings {
-        context: Some(state.agent_config.read().context_config.clone()),
-        session: Some(state.session_config.read().clone()),
-        tools: Some(state.tools_config.read().clone()),
+        // Only persist the fields that PATCH /settings exposes for context.
+        context: Some(PersistedContextOverrides {
+            strategy: Some(ctx.strategy.clone()),
+            max_input_tokens: Some(ctx.max_input_tokens),
+            recent_window: Some(ctx.recent_window),
+            summary_interval: Some(ctx.summary_interval),
+            summary_model: ctx.summary_model.clone(),
+            // run_summary_mode and run_summary_budget are NOT exposed in
+            // PATCH /settings, so we never persist them. This ensures that
+            // code-default changes and env-var overrides are always respected.
+            run_summary_mode: None,
+            run_summary_budget: None,
+        }),
+        session: Some(PersistedSessionOverrides {
+            max_messages: Some(sess.max_messages),
+            max_context_tokens: Some(sess.max_context_tokens),
+            idle_timeout_secs: Some(sess.idle_timeout_secs),
+            auto_archive: Some(sess.auto_archive),
+            archive_ttl_secs: Some(sess.archive_ttl_secs),
+        }),
+        tools: Some(PersistedToolsOverrides {
+            shell_policy: Some(tools.shell_policy.clone()),
+            sandbox_root: Some(tools.sandbox_root.clone()),
+            timeout_secs: Some(tools.timeout_secs),
+            max_output_bytes: Some(tools.max_output_bytes),
+        }),
     };
+
     let path = settings_path(&state.data_dir);
     match serde_json::to_string_pretty(&persisted) {
         Ok(json) => {
@@ -420,5 +590,228 @@ pub fn load_persisted_settings(data_dir: &Path) -> Option<PersistedSettings> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Simulate the old settings.json format (full ContextConfig with all fields
+    /// present). Verify backward compatibility: all fields deserialize as `Some`.
+    #[test]
+    fn backward_compat_old_settings_json_with_full_context_config() {
+        let old_json = r#"{
+            "context": {
+                "strategy": "truncate",
+                "max_input_tokens": 128000,
+                "run_summary_mode": "off",
+                "run_summary_budget": 2000,
+                "recent_window": 20,
+                "summary_interval": 30,
+                "summary_model": null
+            }
+        }"#;
+        let persisted: PersistedSettings = serde_json::from_str(old_json).unwrap();
+        let ctx = persisted.context.unwrap();
+        assert_eq!(ctx.strategy, Some("truncate".into()));
+        assert_eq!(ctx.max_input_tokens, Some(128_000));
+        assert_eq!(
+            ctx.run_summary_mode,
+            Some(alms_core::config::RunSummaryMode::Off)
+        );
+        assert_eq!(ctx.run_summary_budget, Some(2000));
+    }
+
+    /// New settings.json format omits run_summary_mode and run_summary_budget.
+    /// Verify they deserialize as `None`.
+    #[test]
+    fn new_format_omits_non_patchable_fields() {
+        let new_json = r#"{
+            "context": {
+                "strategy": "truncate",
+                "max_input_tokens": 128000,
+                "recent_window": 20,
+                "summary_interval": 30
+            }
+        }"#;
+        let persisted: PersistedSettings = serde_json::from_str(new_json).unwrap();
+        let ctx = persisted.context.unwrap();
+        assert_eq!(ctx.strategy, Some("truncate".into()));
+        assert_eq!(ctx.max_input_tokens, Some(128_000));
+        // Non-patchable fields should be None
+        assert_eq!(ctx.run_summary_mode, None);
+        assert_eq!(ctx.run_summary_budget, None);
+    }
+
+    /// Context overrides with `None` fields should not overwrite the target.
+    #[test]
+    fn context_overrides_apply_only_some_fields() {
+        let mut ctx = alms_core::config::ContextConfig::default();
+        // Default run_summary_mode is Llm, run_summary_budget is 2000
+        assert_eq!(ctx.run_summary_mode, alms_core::config::RunSummaryMode::Llm);
+        assert_eq!(ctx.run_summary_budget, 2000);
+
+        let overrides = PersistedContextOverrides {
+            strategy: Some("sliding-summary".into()),
+            max_input_tokens: Some(64_000),
+            // Leave everything else as None — should not overwrite
+            ..Default::default()
+        };
+        overrides.apply_to(&mut ctx);
+
+        assert_eq!(ctx.strategy, "sliding-summary");
+        assert_eq!(ctx.max_input_tokens, 64_000);
+        // These should be UNCHANGED from defaults
+        assert_eq!(
+            ctx.run_summary_mode,
+            alms_core::config::RunSummaryMode::Llm,
+            "run_summary_mode should not be overwritten when override is None"
+        );
+        assert_eq!(
+            ctx.run_summary_budget, 2000,
+            "run_summary_budget should not be overwritten when override is None"
+        );
+        assert_eq!(ctx.recent_window, 20);
+        assert_eq!(ctx.summary_interval, 30);
+    }
+
+    /// Session overrides with partial fields should only overwrite `Some` fields.
+    #[test]
+    fn session_overrides_apply_only_some_fields() {
+        let mut sess = alms_session::SessionConfig::default();
+        let original_idle = sess.idle_timeout_secs;
+
+        let overrides = PersistedSessionOverrides {
+            max_messages: Some(500),
+            // Leave everything else as None
+            ..Default::default()
+        };
+        overrides.apply_to(&mut sess);
+
+        assert_eq!(sess.max_messages, 500);
+        assert_eq!(
+            sess.idle_timeout_secs, original_idle,
+            "idle_timeout should be unchanged"
+        );
+    }
+
+    /// Tools overrides with partial fields should only overwrite `Some` fields.
+    #[test]
+    fn tools_overrides_apply_only_some_fields() {
+        let mut tools = alms_core::config::ToolsConfig::default();
+        let original_timeout = tools.timeout_secs;
+
+        let overrides = PersistedToolsOverrides {
+            shell_policy: Some("unrestricted".into()),
+            ..Default::default()
+        };
+        overrides.apply_to(&mut tools);
+
+        assert_eq!(tools.shell_policy, "unrestricted");
+        assert_eq!(
+            tools.timeout_secs, original_timeout,
+            "timeout should be unchanged"
+        );
+    }
+
+    /// Serialization of new format should NOT include run_summary_mode or
+    /// run_summary_budget when they are None.
+    #[test]
+    fn serialized_new_format_excludes_non_patchable_fields() {
+        let persisted = PersistedSettings {
+            context: Some(PersistedContextOverrides {
+                strategy: Some("truncate".into()),
+                max_input_tokens: Some(128_000),
+                recent_window: Some(20),
+                summary_interval: Some(30),
+                summary_model: None,
+                run_summary_mode: None,
+                run_summary_budget: None,
+            }),
+            session: None,
+            tools: None,
+        };
+        let json = serde_json::to_string_pretty(&persisted).unwrap();
+        assert!(
+            !json.contains("run_summary_mode"),
+            "Serialized JSON should not contain run_summary_mode"
+        );
+        assert!(
+            !json.contains("run_summary_budget"),
+            "Serialized JSON should not contain run_summary_budget"
+        );
+    }
+
+    /// Round-trip: serialize then deserialize preserves values.
+    #[test]
+    fn round_trip_serialization() {
+        let original = PersistedSettings {
+            context: Some(PersistedContextOverrides {
+                strategy: Some("sliding-summary".into()),
+                max_input_tokens: Some(64_000),
+                recent_window: Some(10),
+                summary_interval: Some(15),
+                summary_model: Some("gpt-4o-mini".into()),
+                run_summary_mode: None,
+                run_summary_budget: None,
+            }),
+            session: Some(PersistedSessionOverrides {
+                max_messages: Some(5000),
+                max_context_tokens: Some(200_000),
+                idle_timeout_secs: Some(3600),
+                auto_archive: Some(false),
+                archive_ttl_secs: Some(86400),
+            }),
+            tools: Some(PersistedToolsOverrides {
+                shell_policy: Some("unrestricted".into()),
+                sandbox_root: Some("/tmp".into()),
+                timeout_secs: Some(60),
+                max_output_bytes: Some(1_000_000),
+            }),
+        };
+        let json = serde_json::to_string_pretty(&original).unwrap();
+        let deserialized: PersistedSettings = serde_json::from_str(&json).unwrap();
+
+        let ctx = deserialized.context.unwrap();
+        assert_eq!(ctx.strategy, Some("sliding-summary".into()));
+        assert_eq!(ctx.max_input_tokens, Some(64_000));
+        assert_eq!(ctx.summary_model, Some("gpt-4o-mini".into()));
+        assert_eq!(ctx.run_summary_mode, None);
+        assert_eq!(ctx.run_summary_budget, None);
+
+        let sess = deserialized.session.unwrap();
+        assert_eq!(sess.max_messages, Some(5000));
+
+        let tools = deserialized.tools.unwrap();
+        assert_eq!(tools.shell_policy, Some("unrestricted".into()));
+    }
+
+    /// Empty JSON should deserialize to default PersistedSettings (all None).
+    #[test]
+    fn empty_json_deserializes_to_defaults() {
+        let persisted: PersistedSettings = serde_json::from_str("{}").unwrap();
+        assert!(persisted.context.is_none());
+        assert!(persisted.session.is_none());
+        assert!(persisted.tools.is_none());
+    }
+
+    /// Old format with full SessionConfig should still deserialize.
+    #[test]
+    fn backward_compat_old_session_config() {
+        let old_json = r#"{
+            "session": {
+                "idle_timeout_secs": 86400,
+                "auto_archive": true,
+                "archive_ttl_secs": 2592000,
+                "max_messages": 10000,
+                "max_context_tokens": 128000
+            }
+        }"#;
+        let persisted: PersistedSettings = serde_json::from_str(old_json).unwrap();
+        let sess = persisted.session.unwrap();
+        assert_eq!(sess.max_messages, Some(10_000));
+        assert_eq!(sess.idle_timeout_secs, Some(86_400));
+        assert_eq!(sess.auto_archive, Some(true));
     }
 }
