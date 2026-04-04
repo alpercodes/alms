@@ -582,18 +582,28 @@ impl AppState {
 
         // Apply persisted settings from a previous PATCH /settings so that
         // configuration changes survive gateway restarts.
+        //
+        // Persisted settings use `Option<T>` fields — only values the user
+        // explicitly set via PATCH /settings are `Some`. This ensures that:
+        // - Code-default changes (e.g. `run_summary_mode` changing from Off
+        //   to Llm) are picked up for non-overridden fields
+        // - Env-var overrides (e.g. `ALMS_RUN_SUMMARY_MODE`) remain effective
         if let Some(persisted) = crate::settings::load_persisted_settings(&data_dir) {
-            if let Some(ctx) = persisted.context {
-                agent_config_val.context_config = ctx;
+            if let Some(ctx_overrides) = persisted.context {
+                ctx_overrides.apply_to(&mut agent_config_val.context_config);
             }
-            if let Some(sess) = persisted.session {
-                session_config = sess;
+            if let Some(sess_overrides) = persisted.session {
+                sess_overrides.apply_to(&mut session_config);
             }
-            if let Some(t) = persisted.tools {
+            if let Some(tools_overrides) = persisted.tools {
                 // Also sync the two copies kept in agent_config.
-                agent_config_val.sandbox_root = t.sandbox_root.clone();
-                agent_config_val.shell_policy = t.shell_policy.clone();
-                tools_config = t;
+                if let Some(ref root) = tools_overrides.sandbox_root {
+                    agent_config_val.sandbox_root = root.clone();
+                }
+                if let Some(ref policy) = tools_overrides.shell_policy {
+                    agent_config_val.shell_policy = policy.clone();
+                }
+                tools_overrides.apply_to(&mut tools_config);
             }
         }
 
