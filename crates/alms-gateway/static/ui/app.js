@@ -1,9 +1,9 @@
-import { h, html, render, signal, useEffect, useRef, useSignal } from './deps.js';
+import { h, html, render, signal, useEffect, useMemo, useRef, useSignal } from './deps.js';
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
 import { Message, ErrorMessage, WarningMessage, SystemMessage, DmEndedMessage, TokenBadge } from './components/chat/message.js';
-import { ToolRow } from './components/chat/tool-row.js';
+import { ToolRow, ToolGroup } from './components/chat/tool-row.js';
 import { ApprovalCard } from './components/chat/approval-card.js';
 import { MessageQueue } from './components/chat/message-queue.js';
 import { InputArea } from './components/chat/input-area.js';
@@ -18,6 +18,39 @@ import { scrollToBottom } from './utils/format.js';
 // ── App status ──
 export const status = signal('connecting...');
 
+/**
+ * Group consecutive tool messages for parallel display.
+ * Returns the original array with consecutive tool runs replaced by
+ * group marker objects ({ _isToolGroup: true, tools: [...], key }).
+ * Single-tool runs are left as-is (ToolGroup renders them unwrapped).
+ */
+function groupMessages(msgs) {
+    const result = [];
+    let i = 0;
+    while (i < msgs.length) {
+        if (msgs[i].type === 'tool') {
+            const group = [];
+            while (i < msgs.length && msgs[i].type === 'tool') {
+                group.push(msgs[i]);
+                i++;
+            }
+            if (group.length > 1) {
+                result.push({
+                    _isToolGroup: true,
+                    key: 'tg-' + group[0].id,
+                    tools: group,
+                });
+            } else {
+                result.push(group[0]);
+            }
+        } else {
+            result.push(msgs[i]);
+            i++;
+        }
+    }
+    return result;
+}
+
 // ── Chat view ──
 function ChatView() {
     const messagesRef = useRef(null);
@@ -27,7 +60,8 @@ function ChatView() {
         scrollToBottom(messagesRef.current);
     }, [chatMessages.value]);
 
-    
+    // Memoize grouping so it only re-runs when the message array changes
+    const grouped = useMemo(() => groupMessages(chatMessages.value), [chatMessages.value]);
 
     return html`
         <div id="chat">
@@ -37,7 +71,15 @@ function ChatView() {
                         No messages yet. Send a message to start.
                     </div>
                 `}
-                ${chatMessages.value.map((m) => {
+                ${grouped.map((item) => {
+                    if (item._isToolGroup) {
+                        return html`
+                            <${ToolGroup} key=${item.key} count=${item.tools.length}>
+                                ${item.tools.map(t => html`<${ToolRow} key=${t.id} ...${t} />`)}
+                            <//>
+                        `;
+                    }
+                    const m = item;
                     if (m.type === 'user' || m.type === 'agent') {
                         return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} />`;
                     }

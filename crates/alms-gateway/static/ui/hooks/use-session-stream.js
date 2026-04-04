@@ -239,13 +239,15 @@ export function openSessionStream(sessionId, opts) {
         const data = JSON.parse(e.data);
         const toolId = data.tool_invocation_id || data.call_id || nextMsgId();
 
+        const startedAt = Date.now();
+
         if (data.tool === 'invoke_agent') {
             sealLastAgent();
             const name = data.params?.name || data.params?.subagent_name || 'subagent';
             const task = data.params?.task || '';
             chatMessages.value = [...chatMessages.value, {
                 id: toolId, type: 'tool', tool: 'invoke_agent', params: data.params,
-                status: 'running',
+                status: 'running', startedAt,
             }];
             trackSubagentStart(name, task);
         } else if (data.source_agent) {
@@ -256,7 +258,7 @@ export function openSessionStream(sessionId, opts) {
             sealLastAgent();
             chatMessages.value = [...chatMessages.value, {
                 id: toolId, type: 'tool', tool: data.tool, params: data.params,
-                status: 'running',
+                status: 'running', startedAt,
             }];
         }
     });
@@ -271,12 +273,15 @@ export function openSessionStream(sessionId, opts) {
             trackSubagentTool(data.source_agent, { id: matchId, status, result: data.result });
         }
 
+        const endedAt = Date.now();
+
         const msgs = [...chatMessages.value];
         const idx = matchId
             ? msgs.findLastIndex(m => m.type === 'tool' && m.id === matchId)
             : msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
         if (idx >= 0) {
-            msgs[idx] = { ...msgs[idx], status, result: data.result };
+            const durationMs = msgs[idx].startedAt ? endedAt - msgs[idx].startedAt : null;
+            msgs[idx] = { ...msgs[idx], status, result: data.result, durationMs };
             if (msgs[idx].tool === 'invoke_agent') {
                 const name = msgs[idx].params?.name || msgs[idx].params?.subagent_name;
                 const resultObj = typeof data.result === 'object' ? data.result : null;
