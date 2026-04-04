@@ -672,7 +672,7 @@ Returns current server defaults for UI pre-population.
     "recent_window": 20,
     "summary_interval": 10,
     "summary_model": null,
-    "run_summary_mode": "off",
+    "run_summary_mode": "llm",
     "run_summary_budget": 2000
   },
   "session": {

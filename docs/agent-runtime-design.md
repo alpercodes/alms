@@ -251,9 +251,9 @@ After each successful run, the gateway spawns a fire-and-forget `tokio::spawn` t
 
 **Summary modes** (controlled by `context.run_summary_mode` in `alms.toml` or `ALMS_RUN_SUMMARY_MODE` env var):
 
-- **`off`** (default) — No summaries generated. No episodic injection.
+- **`off`** — No summaries generated. No episodic injection.
 - **`heuristic`** — Deterministic, no LLM call. Produces a one-liner from the first ~120 bytes of run input and ~80 bytes of the agent's response (when available). Successive runs in the same session append entries; oldest lines are trimmed when total exceeds ~500 chars.
-- **`llm`** — Lightweight LLM call using `session_summarizer.md` prompt. Receives run input (~2000 chars), agent output (~2000 chars), and existing summary. Produces a concise 1-3 sentence evolving summary. Max 150 output tokens.
+- **`llm`** (default) — Lightweight LLM call using `session_summarizer.md` prompt. Receives run input (~2000 chars), agent output (~2000 chars), and existing summary. Produces a concise 1-3 sentence evolving summary. Max 150 output tokens.
 
 **How episodic context is injected:**
 

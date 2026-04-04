@@ -258,7 +258,7 @@ impl AlmsConfig {
         }
         if let Ok(val) = std::env::var("ALMS_RUN_SUMMARY_MODE") {
             // FromStr always succeeds — unrecognized values become Unknown,
-            // which normalize_episodic() will convert to Off with a warning.
+            // which normalize_episodic() will convert to Llm with a warning.
             self.context.run_summary_mode = val.parse().unwrap_or_default();
         }
         if let Ok(val) = std::env::var("ALMS_RUN_SUMMARY_BUDGET")
