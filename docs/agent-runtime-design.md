@@ -36,13 +36,16 @@ max_context_tokens = 256_000        # storage limit (>= context.max_input_tokens
 
 [context]
 # How to manage the context window sent to the LLM
-strategy = "sliding-summary"        # sliding-summary | full | truncate
+strategy = "truncate"               # truncate (default) | sliding-summary | full
 # Max tokens to send to LLM (should be < model context window)
 max_input_tokens = 128000
 # Number of recent messages to always keep in full
 recent_window = 20
-# How often to update the rolling summary (in messages)
+# How often to update the rolling summary (in messages, sliding-summary only)
 summary_interval = 30
+# Episodic memory: cross-session summary generation after each run
+# run_summary_mode = "llm"          # off | heuristic | llm (default)
+# run_summary_budget = 2000         # max tokens for episodic injection (hard cap: 15% of max_input_tokens)
 
 [tools]
 # Which builtins to enable
@@ -100,7 +103,8 @@ ALMS originally hardcoded `take(50)` messages in the agent loop. No compression,
 │                                              │
 │  ┌──────────────────────────────────────┐   │
 │  │ System Prompt                         │   │
-│  │ (personality + goals + tool schemas)  │   │
+│  │ (personality + goals + user + memories │   │
+│  │  + base prompt + DM addendum*)        │   │
 │  └──────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────┐   │
 │  │ Episodic Summaries (cross-session)    │   │
@@ -123,7 +127,7 @@ ALMS originally hardcoded `take(50)` messages in the agent loop. No compression,
 └─────────────────────────────────────────────┘
 ```
 
-**Strategy: `sliding-summary`** (recommended default):
+**Strategy: `sliding-summary`** (available, but the compiled default is `truncate` for simplicity; `sliding-summary` can be enabled via `alms.toml` or `ALMS_CONTEXT_STRATEGY` env var):
 
 1. **Token counting**: Approximate token count for each message (`chars / 3` as rough estimate for mixed content, or `tiktoken`-style BPE if we add the dep). Track cumulative tokens.
 
@@ -140,20 +144,17 @@ ALMS originally hardcoded `take(50)` messages in the agent loop. No compression,
 
 4. **Smart truncation of tool outputs**: Long tool results (e.g., HTTP responses) are truncated in the context window but preserved in full history. The context version says `[truncated: 45KB response, first 2KB shown]`.
 
-5. **Token observability**: Every run logs:
-   - `context_tokens_used`: how many tokens were sent
-   - `context_breakdown`: `{system_prompt: 800, summary: 1200, recent_messages: 15000, input: 200}`
-   - `compression_ratio`: `full_history_tokens / context_tokens_sent`
+5. **Token observability**: Currently the context builder logs total approximate tokens via `tracing::debug` at build time (message count and estimated tokens). Per-run token usage (prompt + completion) is tracked in `RunOutput.usage` and logged at `info` level. Detailed context breakdown (`context_breakdown`, `compression_ratio`) is not yet implemented — this is a future enhancement.
 
 **Where it plugs in:**
 - Context assembly lives in `agent/context.rs` (uses `ContextBuilder::build()`)
 - ContextBuilder is configured from `[context]` in `alms.toml`
 - Summary updates happen after each run completes (background task, not blocking)
 
-**Alternative strategies** (selectable via config):
+**Available strategies** (selectable via `[context] strategy` in `alms.toml`):
+- `truncate` (default): simple tail of last N messages (no summarization, just drops old ones)
 - `full`: send everything (for small conversations or cheap models)
-- `truncate`: simple tail of last N messages (no summarization, just drops old ones)
-- `sliding-summary`: the smart default described above
+- `sliding-summary`: the smart option described above — uses LLM to compress old messages
 
 **Tool call persistence and context reconstruction:**
 Tool calls and their results are persisted to the session database as structured `Content::ToolCall` / `Content::ToolResult` messages. During context building, these are reconstructed into proper OpenAI-format LLM messages (assistant messages with `tool_calls` array, tool-role messages with `tool_call_id`). This means the LLM has full visibility of previous tool executions across runs — it knows what tools were called, with what parameters, and what results were returned.
@@ -170,38 +171,45 @@ Agents have no persistent identity. Every session starts from the same hardcoded
 **Workspace directory structure:**
 
 ```
-data/agents/{agent_id}/
+data/agents/{agent_name}/
 ├── personality.md        # Who the agent is (tone, style, constraints)
 ├── goals.md              # Current objectives and priorities
 ├── memories.md           # Learned facts, user preferences, past decisions
-└── config.toml           # Agent-specific config overrides (optional)
+└── user.md               # Who the user is: name, preferences, background
 ```
 
-These are plain text files that the user can edit directly, or that the agent can update through the workspace tool.
+These are plain text files that the user can edit directly, or that the agent can update through the workspace tool. Per-agent config overrides (model, posture, etc.) are stored in the agent registry (SQLite), not in workspace files.
 
 **How they feed into the system prompt:**
 
+The workspace prefix is assembled by `build_system_prompt_prefix()` in `workspace.rs` and prepended to the base system prompt. The order is:
+
 ```
 System prompt = [
-  personality.md contents (if exists),
-  goals.md contents (if exists),
-  "Memories:\n" + memories.md contents (if exists),
-  "Available tools: " + tool descriptions,
-  "Instructions: respond to the user's message."
+  personality.md contents (raw, if exists),
+  "## Current Goals\n" + goals.md contents (if exists),
+  "## About the User\n" + user.md contents (if exists, user-facing sessions only),
+  "## Memories\n" + memories.md contents (if exists, truncated at 4000 chars),
+  "\n\n",
+  base_prompt (initial.md or bootstrap.md)
 ]
 ```
+
+For non-user-facing sessions (DM, subagent, job), `user.md` is omitted from the prefix to save tokens and avoid confusion.
+
+Tool descriptions are injected separately by the LLM API layer (via `with_tools()` on the completion request), not in the system prompt text.
 
 The workspace files are read at the **start of each run** (not cached across runs), so edits take effect immediately.
 
 **Size management:**
-- Each workspace file has a soft limit (e.g., 4KB for personality, 2KB for goals, 8KB for memories)
-- If a file exceeds the limit, the ContextBuilder summarizes it before injection
-- Token budget for workspace files comes from the `max_input_tokens` budget
+- `memories.md` is truncated at 4000 characters before injection (hard limit in `build_system_prompt_prefix`)
+- Other workspace files have no enforced size limit — they contribute to the system prompt token count which reduces the history budget
+- Token budget for the entire system prompt (including workspace prefix) comes from the `max_input_tokens` budget
 
 **Memory updates:**
-- The agent can update `memories.md` via a new builtin tool: `workspace_write`
+- The agent can update workspace files via the `workspace_write` tool
 - `workspace_write` takes `{file: "memories.md", content: "..."}` or `{file: "memories.md", append: "..."}`
-- Only `memories.md` and `goals.md` are writable by the agent; `personality.md` is user-only
+- All four workspace files are agent-writable (personality, goals, memories, user) — this is needed for the bootstrap interview to populate `personality.md`
 - Memory writes are audited
 
 **Bootstrap mechanism:**
@@ -316,10 +324,10 @@ alms.toml (config)
 
 Agent Workspace (per agent)
     │
-    ├─→ personality.md ──→ system prompt prefix
-    ├─→ goals.md ────────→ system prompt
-    ├─→ memories.md ─────→ system prompt (summarized if large)
-    └─→ config.toml ─────→ per-agent config overrides
+    ├─→ personality.md ──→ system prompt prefix (raw)
+    ├─→ goals.md ────────→ system prompt prefix (## Current Goals)
+    ├─→ user.md ─────────→ system prompt prefix (## About the User, user-facing only)
+    └─→ memories.md ─────→ system prompt prefix (## Memories, truncated at 4000 chars)
 
 ContextBuilder (per run)
     │
@@ -342,4 +350,4 @@ ContextBuilder (per run)
 
 ---
 
-*Design by Atlas (2026-02-14). Episodic memory section added 2026-03-28. Updated 2026-03-30: tool implementations extracted to `alms-tools` crate, agent.rs split into `agent/` module directory. Implements requirements from `docs/agent-ux-requirements.md`.*
+*Design by Atlas (2026-02-14). Episodic memory section added 2026-03-28. Updated 2026-03-30: tool implementations extracted to `alms-tools` crate, agent.rs split into `agent/` module directory. Updated 2026-04-04: synced workspace, strategy defaults, and token observability sections with actual implementation (audit by Heph). Implements requirements from `docs/agent-ux-requirements.md`.*
