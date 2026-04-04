@@ -1,4 +1,4 @@
-import { h, html, render, signal, useEffect, useMemo, useRef, useSignal } from './deps.js';
+import { h, html, render, signal, useEffect, useRef, useSignal } from './deps.js';
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
@@ -60,8 +60,13 @@ function ChatView() {
         scrollToBottom(messagesRef.current);
     }, [chatMessages.value]);
 
-    // Memoize grouping so it only re-runs when the message array changes
-    const grouped = useMemo(() => groupMessages(chatMessages.value), [chatMessages.value]);
+    // Compute grouping inline — useMemo with signal.value as a dependency
+    // can miss updates because @preact/signals may re-render the component
+    // through an optimised path that skips hook re-evaluation, causing
+    // tool messages added to chatMessages to never appear in the render
+    // output.  groupMessages is O(n) on a small array, so the cost of
+    // recomputing on every render is negligible.
+    const grouped = groupMessages(chatMessages.value);
 
     return html`
         <div id="chat">

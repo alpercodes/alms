@@ -244,32 +244,34 @@ export function openSessionStream(sessionId, opts) {
 
     // -- tool_start --
     on('tool_start', (e) => {
-        flushDeltaBuffer();
-        const data = JSON.parse(e.data);
-        const toolId = data.tool_invocation_id || data.call_id || nextMsgId();
+        batch(() => {
+            flushDeltaBuffer();
+            const data = JSON.parse(e.data);
+            const toolId = data.tool_invocation_id || data.call_id || nextMsgId();
 
-        const startedAt = Date.now();
+            const startedAt = Date.now();
 
-        if (data.tool === 'invoke_agent') {
-            sealLastAgent();
-            const name = data.params?.name || data.params?.subagent_name || 'subagent';
-            const task = data.params?.task || '';
-            chatMessages.value = [...chatMessages.value, {
-                id: toolId, type: 'tool', tool: 'invoke_agent', params: data.params,
-                status: 'running', startedAt,
-            }];
-            trackSubagentStart(name, task);
-        } else if (data.source_agent) {
-            trackSubagentTool(data.source_agent, {
-                id: toolId, tool: data.tool, params: data.params, status: 'running',
-            });
-        } else {
-            sealLastAgent();
-            chatMessages.value = [...chatMessages.value, {
-                id: toolId, type: 'tool', tool: data.tool, params: data.params,
-                status: 'running', startedAt,
-            }];
-        }
+            if (data.tool === 'invoke_agent') {
+                sealLastAgent();
+                const name = data.params?.name || data.params?.subagent_name || 'subagent';
+                const task = data.params?.task || '';
+                chatMessages.value = [...chatMessages.value, {
+                    id: toolId, type: 'tool', tool: 'invoke_agent', params: data.params,
+                    status: 'running', startedAt,
+                }];
+                trackSubagentStart(name, task);
+            } else if (data.source_agent) {
+                trackSubagentTool(data.source_agent, {
+                    id: toolId, tool: data.tool, params: data.params, status: 'running',
+                });
+            } else {
+                sealLastAgent();
+                chatMessages.value = [...chatMessages.value, {
+                    id: toolId, type: 'tool', tool: data.tool, params: data.params,
+                    status: 'running', startedAt,
+                }];
+            }
+        });
     });
 
     // -- tool_end --
