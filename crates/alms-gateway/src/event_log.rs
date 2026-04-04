@@ -1,4 +1,8 @@
-//! Event log for durable SSE event storage (gateway-local)
+//! In-memory SSE event log for replay during current process lifetime (gateway-local).
+//!
+//! Events are stored in `Arc<RwLock<Vec<LoggedEvent>>>` and are lost on
+//! process restart.  This supports `Last-Event-ID` reconnect within a
+//! single gateway lifetime but does **not** provide cross-restart durability.
 
 use alms_core::{RunId, SessionId};
 use chrono::{DateTime, Utc};

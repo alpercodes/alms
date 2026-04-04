@@ -47,7 +47,8 @@ use tracing::info;
 pub struct RunManager {
     pub event_senders: Arc<DashMap<RunId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
     pub runs: Arc<DashMap<RunId, Run>>,
-    /// Persistent event log for reconnect-after-restart support
+    /// In-memory event log for SSE reconnect during current process lifetime.
+    /// Events are lost on restart — this does **not** provide cross-restart durability.
     pub event_log: EventLogManager,
     /// Session-level event senders for persistent SSE streams.
     pub session_senders: Arc<DashMap<SessionId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
