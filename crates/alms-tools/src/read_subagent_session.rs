@@ -59,8 +59,10 @@ impl Tool for ReadSubagentSessionTool {
                 },
                 "summary_only": {
                     "type": "boolean",
-                    "description": "If true, return only the rolling context summary (if one exists), \
-                                    not individual messages. Default: false."
+                    "description": "If true, return the rolling context summary when available. \
+                                    When no summary exists, falls back to returning recent messages \
+                                    (capped at last_n or 10, whichever is smaller) with distinct \
+                                    fallback_messages/fallback_message_count keys. Default: false."
                 }
             },
             "required": ["name"]
@@ -108,24 +110,27 @@ impl Tool for ReadSubagentSessionTool {
             .map(|s| s.text);
 
         if summary_only {
+            // Read message count — needed for both the has-summary and fallback paths.
+            let messages = self
+                .session_manager
+                .get_history(session.id)
+                .map_err(|e| SandboxError::Io(format!("Failed to read session history: {e}")))?;
+            let total = messages.len();
+
             if let Some(ref text) = summary {
                 return Ok(serde_json::json!({
                     "subagent": name,
                     "summary": text,
                     "has_summary": true,
+                    "message_count": total,
                 }));
             }
 
             // No summary available — fall back to the last N messages so the
             // caller still gets useful context instead of an empty response.
             const FALLBACK_COUNT: usize = 10;
-            let messages = self
-                .session_manager
-                .get_history(session.id)
-                .map_err(|e| SandboxError::Io(format!("Failed to read session history: {e}")))?;
-
-            let total = messages.len();
-            let start = total.saturating_sub(FALLBACK_COUNT);
+            let effective_count = last_n.min(FALLBACK_COUNT);
+            let start = total.saturating_sub(effective_count);
             let recent: Vec<Value> = messages[start..]
                 .iter()
                 .map(|m| {
@@ -172,7 +177,7 @@ impl Tool for ReadSubagentSessionTool {
             "message_count": total,
             "showing": recent.len(),
             "messages": recent,
-            "summary": summary.as_deref().unwrap_or(""),
+            "summary": summary.as_deref().map(Value::from).unwrap_or(Value::Null),
         }))
     }
 
@@ -329,6 +334,8 @@ mod tests {
             .unwrap();
         assert_eq!(result["has_summary"], true);
         assert_eq!(result["summary"], "Researched topic X thoroughly");
+        // message_count is present even when has_summary is true
+        assert_eq!(result["message_count"], 1);
         // No fallback messages when a real summary exists
         assert!(result.get("fallback_messages").is_none());
     }
@@ -361,6 +368,51 @@ mod tests {
         assert_eq!(result["fallback_message_count"], 2);
         assert_eq!(result["fallback_showing"], 2);
         assert!(result["note"].as_str().unwrap().contains("fallback"));
+    }
+
+    #[tokio::test]
+    async fn test_summary_only_zero_messages_fallback() {
+        let (tool, mgr) = make_tool();
+        // Create a session with zero messages (session exists but nothing appended)
+        let parent_as_agent = AgentId(tool.parent_session_id.0);
+        let stable_id = AgentId::deterministic(parent_as_agent, "empty-sub");
+        let stable_ctx = format!("subagent_{}_{}", tool.parent_session_id.0, "empty-sub");
+        let _session = mgr.get_or_create(stable_id, &stable_ctx);
+
+        // No summary, no messages — should return empty fallback without panicking
+        let result = tool
+            .execute(serde_json::json!({ "name": "empty-sub", "summary_only": true }))
+            .await
+            .unwrap();
+        assert_eq!(result["has_summary"], false);
+        assert!(result["summary"].is_null());
+        let fallback = result["fallback_messages"].as_array().unwrap();
+        assert!(fallback.is_empty());
+        assert_eq!(result["fallback_message_count"], 0);
+        assert_eq!(result["fallback_showing"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_summary_only_fallback_respects_last_n() {
+        let (tool, mgr) = make_tool();
+        let msgs: Vec<Message> = (0..8)
+            .map(|i| make_msg(Role::User, &format!("msg {i}")))
+            .collect();
+        populate_subagent(&tool, &mgr, "capped", msgs);
+
+        // last_n=3 should cap fallback to 3, not the default 10
+        let result = tool
+            .execute(serde_json::json!({ "name": "capped", "summary_only": true, "last_n": 3 }))
+            .await
+            .unwrap();
+        assert_eq!(result["has_summary"], false);
+        assert_eq!(result["fallback_message_count"], 8);
+        assert_eq!(result["fallback_showing"], 3);
+        let fallback = result["fallback_messages"].as_array().unwrap();
+        assert_eq!(fallback.len(), 3);
+        // Should be the last 3 messages (msg 5, msg 6, msg 7)
+        assert_eq!(fallback[0]["content"], "msg 5");
+        assert_eq!(fallback[2]["content"], "msg 7");
     }
 
     #[tokio::test]
