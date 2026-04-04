@@ -116,9 +116,9 @@ LLM call → ... → emit result → stop
 After each successful run, the gateway may generate a per-session summary and store it in the `session_summaries` SQLite table. On subsequent runs, these summaries are loaded (excluding the current session), formatted with source labels and timestamps, and injected as a system message between the main system prompt and the session history. This gives agents awareness of what they were doing in other conversations without re-reading full transcripts.
 
 Summary generation modes (controlled by `run_summary_mode`):
-- `off` (default) — no summaries, no episodic injection
+- `off` — no summaries, no episodic injection
 - `heuristic` — deterministic one-liner from truncated input + output (zero LLM cost)
-- `llm` — rich 1-3 sentence summary via a lightweight LLM call using `session_summarizer.md` prompt
+- `llm` (default) — rich 1-3 sentence summary via a lightweight LLM call using `session_summarizer.md` prompt
 
 The episodic token budget (`run_summary_budget`, default: 2000) is hard-capped at 15% of `max_input_tokens` and subtracted from the total context budget so episodic content never starves the current conversation.
 
