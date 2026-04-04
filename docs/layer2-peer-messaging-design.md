@@ -7,6 +7,13 @@ Design document for agent-to-agent communication in ALMS.
 **Status**: Phase 1 implemented; DM conversation lifecycle (Phases 1-7 of #384) implemented
 **Relates to**: `docs/product-vision-core.md` (Layer 2), `docs/communication-architecture.md` (product vision), `docs/architecture.md` (Option 2 -- Peer Mesh)
 
+> **Note**: This is a design document written before and during implementation.
+> Some code snippets and structural descriptions may be outdated -- the source
+> code in `crates/` is always authoritative. In particular, peer-messaging tools
+> (`send_message`, `list_agents`, `read_messages`, `ignore_message`) now live in
+> `crates/alms-tools/src/` (moved from `alms-runtime` during the tool extraction
+> refactor). Check the actual `.rs` files for current signatures and output formats.
+
 ---
 
 ## 1. Problem Statement
@@ -188,10 +195,23 @@ A new component that lives in `alms-coordinator` (or a new `alms-bus` crate if n
 /// as needed and triggering runs on the receiving agent.
 pub struct MessageBus {
     session_manager: Arc<SessionManager>,
-    /// Channel to trigger runs on the gateway (reuses existing pattern).
+    /// Channel to trigger runs on the gateway.
     run_trigger_tx: mpsc::UnboundedSender<RunTrigger>,
-    /// Agent registry for name resolution.
-    agent_store: Arc<SqliteStore>,
+    /// Per-DM-pair depth tracker: "dm:a:b" -> (last_sender_name, depth).
+    /// Depth increments each time the sender changes within the same pair.
+    depths: DashMap<String, (String, u32)>,
+    /// Per-DM-pair last activity timestamp for depth expiry.
+    last_activity: DashMap<String, Instant>,
+    /// Per-DM-pair per-agent source session tracking.
+    ///
+    /// Key: `(dm_context, agent_name)` -- e.g. `("dm:alice:bob", "alice")`.
+    /// Value: the SessionId the agent was in when they first called
+    /// `send_message` for this DM pair (e.g. their web-chat session).
+    ///
+    /// Used by `end_conversation` to route the notification run to the
+    /// peer's source session instead of an invisible `notifications:` session.
+    /// Entries are cleaned up alongside depth expiry.
+    source_sessions: DashMap<(String, String), SessionId>,
 }
 
 /// A request to create a run on a target agent's session.
@@ -329,13 +349,14 @@ The notification run does NOT include the DM addendum (no "use send_message to r
 }
 ```
 
-**Implementation:**
+**Implementation** (see `crates/alms-tools/src/send_message.rs` for current code):
 
 ```rust
 pub struct SendMessageTool {
-    bus: Arc<MessageBus>,
+    sender: Arc<dyn MessageSender>,
     sender_agent_id: AgentId,
     sender_name: String,
+    session_manager: Arc<SessionManager>,
     sender_session_id: SessionId,
 }
 
@@ -345,17 +366,19 @@ impl Tool for SendMessageTool {
         let to = params["to"].as_str()...;
         let message = params["message"].as_str()...;
 
-        let delivery = self.bus.send(
+        // Resolve recipient from registry via session_manager.store()
+        let receipt = self.sender.send(
             &self.sender_name,
             self.sender_agent_id,
-            self.sender_session_id,
             to,
+            recipient.id,
             message,
+            Some(self.sender_session_id),
         ).await?;
 
         Ok(json!({
             "delivered": true,
-            "dm_session_id": delivery.recipient_session_id.0.to_string(),
+            "dm_session_id": receipt.session_id.0.to_string(),
             "note": "Message delivered. The recipient will process it asynchronously."
         }))
     }
@@ -373,7 +396,7 @@ Agents need to discover who they can talk to.
 ```json
 {
   "name": "list_agents",
-  "description": "List all registered agents in the system. Returns each agent's name, description, and current status.",
+  "description": "List all registered agents in the system. Returns each agent's name and description. Use this to discover agents you can communicate with via send_message.",
   "parameters": {
     "type": "object",
     "properties": {}
@@ -389,18 +412,19 @@ Returns:
     {
       "name": "reviewer",
       "description": "Code review specialist",
-      "status": "idle",
       "last_active": "2026-03-22T10:00:00Z"
     },
     {
       "name": "developer",
       "description": "Full-stack developer",
-      "status": "running",
       "last_active": "2026-03-22T10:15:00Z"
     }
-  ]
+  ],
+  "count": 2
 }
 ```
+
+The calling agent is excluded from the list (you do not need to discover yourself).
 
 ### 3.9 New Tool: `read_messages`
 
@@ -807,7 +831,7 @@ Agent B runs, processes message, may reply (send_message back) or end (ignore_me
 
 - **`end_conversation` on MessageBus** (`crates/alms-coordinator/src/message_bus.rs`): Uses `depths.remove()` as an atomicity guard. If two agents call `end_conversation` simultaneously for the same DM pair, only the one whose `remove()` returns `Some` proceeds with the marker write and trigger emission. The other returns `Ok(())` early, preventing double notifications.
 
-- **`ConversationEndReason` enum** (`crates/alms-runtime/src/message_sender.rs`): `Ignored` (agent called `ignore_message`) or `DepthExceeded` (MAX_DM_DEPTH hit). Included in the `dm_ended` marker metadata and the `ConversationEnded` `RunTrigger`.
+- **`ConversationEndReason` enum** (`crates/alms-tools/src/message_sender.rs`): `Ignored` (agent called `ignore_message`) or `DepthExceeded` (MAX_DM_DEPTH hit). Included in the `dm_ended` marker metadata and the `ConversationEnded` `RunTrigger`.
 
 - **Notification sessions**: Context ID pattern `notifications:{agent_name}`, one per agent. These are persistent sessions that accumulate all DM-end notifications. They do NOT start with `dm:`, so the existing DM detection code naturally skips DM-specific behavior (no DM addendum, no perspective mapping). Notification sessions are excluded from user-facing context (e.g. the `user.md` workspace file).
 
@@ -918,14 +942,14 @@ GET /agents   -- Add daemon flag to response, add status (idle/running/listening
 - New `RunTrigger` type
 - `Coordinator` gains a reference to `MessageBus` (or `MessageBus` wraps `Coordinator`)
 
-### alms-runtime
+### alms-tools (formerly in alms-runtime -- tools were extracted in a later refactor)
 
-- New `SendMessageTool` (requires `Arc<MessageBus>`)
-- New `ListAgentsTool` (requires `Arc<SqliteStore>`)
-- New `ReadMessagesTool` (requires `Arc<SessionManager>`)
-- New `CreateGroupTool` (requires `Arc<MessageBus>`)
-- New `SendGroupMessageTool` (requires `Arc<MessageBus>`)
-- Register these tools when the runtime has a MessageBus attached
+- `SendMessageTool` (requires `Arc<dyn MessageSender>` + `Arc<SessionManager>`)
+- `ListAgentsTool` (requires `Arc<SessionManager>`)
+- `ReadMessagesTool` (requires `Arc<SessionManager>`)
+- `IgnoreMessageTool` (requires context_id for DM guard)
+- Future: `CreateGroupTool`, `SendGroupMessageTool`
+- Tools registered by the runtime when the MessageBus is available
 
 ### alms-gateway
 
@@ -1029,9 +1053,7 @@ Each phase delivers independent value and is a PR-sized chunk.
 - `alms-coordinator`: Add `RunTrigger` type and `mpsc` channel.
 - `alms-gateway`: Generalize `completion_notification_loop` into `run_trigger_loop`. Wire `MessageBus` into `AppState`.
 - `alms-gateway`: Replace per-session `SessionQueue` with per-agent `AgentQueue` — all runs for a given agent serialize through one queue regardless of target session (Section 7).
-- `alms-runtime`: Add `SendMessageTool`. Register in runtime when MessageBus is available.
-- `alms-runtime`: Add `ListAgentsTool` (reads from `SqliteStore`).
-- `alms-runtime`: Add `ReadMessagesTool` (reads DM session history).
+- `alms-tools`: `SendMessageTool`, `ListAgentsTool`, `ReadMessagesTool`, `IgnoreMessageTool` (extracted from `alms-runtime` during tool refactor). Registered by the runtime when MessageBus is available.
 - `alms-session`: No schema changes (DM sessions are regular sessions with a `dm:*` context_id).
 
 **Loop prevention (must ship with Phase 1):**
@@ -1087,7 +1109,7 @@ Each phase delivers independent value and is a PR-sized chunk.
 - `alms-core`: `GroupId`, `AgentGroup`, `GroupMember` types
 - `alms-session/sqlite`: `agent_groups` + `group_members` tables, CRUD methods
 - `alms-coordinator/message_bus`: `send_group()`, `create_group()` methods
-- `alms-runtime`: `CreateGroupTool`, `SendGroupMessageTool` tools
+- `alms-tools`: `CreateGroupTool`, `SendGroupMessageTool` tools
 - `alms-gateway`: `/groups` CRUD endpoints
 - `alms-cli`: `alms group {create, list, show, add-member, remove-member}` commands
 
@@ -1135,8 +1157,8 @@ This phase is UI-only (HTML/JS/CSS) -- no Rust changes.
 **Changes:**
 - `alms-session/sqlite`: `meetings` table (id, group_id, status, summary, round_count, max_rounds, created_at)
 - `alms-coordinator`: Meeting lifecycle management (start, round tracking, auto-end at round cap)
-- `alms-runtime`: `StartMeetingTool`, `EndMeetingTool` (manager-only tools)
-- `alms-runtime`: Meeting context builder — prepends summary block (previous meeting summary + project stats)
+- `alms-tools`: `StartMeetingTool`, `EndMeetingTool` (manager-only tools)
+- `alms-runtime`: Meeting context builder -- prepends summary block (previous meeting summary + project stats)
 - `alms-runtime`: Auto-summary generation at meeting conclusion
 - `alms-gateway`: Meeting API endpoints (`POST /meetings`, `GET /meetings/{id}`, `POST /meetings/{id}/end`)
 
@@ -1159,7 +1181,7 @@ Per `communication-architecture.md` Section 12, this is the core value propositi
 - Merge signal emitted
 
 **Changes:**
-- `alms-runtime`: PR review workflow tools (`submit_review`, `address_findings`, `approve_pr`)
+- `alms-tools`: PR review workflow tools (`submit_review`, `address_findings`, `approve_pr`)
 - Prompt engineering: developer and reviewer system prompts with review loop instructions
 - Integration with `shell_exec` for actual git/GitHub operations
 
@@ -1175,7 +1197,6 @@ The transition from pure hierarchy to peer messaging is additive -- nothing is r
 |---|---|
 | `invoke_agent` tool | Unchanged. Still works for delegation/task decomposition. |
 | `read_subagent_session` tool | Unchanged. Still reads subagent sessions. |
-| `get_task_result` tool | Unchanged. Still polls background subagent tasks. |
 | Subagent sessions (`subagent_*` context_id) | Unchanged. New DM sessions use `dm:*` context_id. |
 | Completion notification loop | Generalized into `run_trigger_loop` that handles all RunTrigger types. |
 | SessionManager / SQLite store | Minor change: add methods to load shared sessions by `SessionId` (not requiring `AgentId`). Shared DM/group sessions are not owned by a single agent. |
