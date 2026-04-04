@@ -11,7 +11,7 @@
 /// Filenames that must never be accessed by agent tools.
 ///
 /// Single source of truth — imported by `builtin.rs` for fs_read/fs_write
-/// path validation and used here for shell command/argv checks.
+/// path validation and used here for shell command string checks.
 ///
 /// These are checked against the final component of resolved paths in fs_read,
 /// fs_write, and against command strings in shell to prevent agents from

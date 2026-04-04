@@ -265,7 +265,7 @@ impl Tool for ShellTool {
                     "description": "Check the result of a background task by its task_id. Mutually exclusive with 'command' — when present, all other parameters are ignored."
                 }
             },
-            "required": ["command"]
+            "required": []
         })
     }
 
@@ -362,9 +362,14 @@ mod tests {
         assert!(props.contains_key("run_in_background"));
         assert!(props.contains_key("env"));
         assert!(props.contains_key("check_task"));
-        // command is now required
+        // `required` is empty at schema level: `check_task` is an alternative to
+        // `command`. Runtime validation in `parse_input()` enforces `command` when
+        // `check_task` is not provided.
         let required = params["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v.as_str() == Some("command")));
+        assert!(
+            required.is_empty(),
+            "required should be empty — check_task is mutually exclusive with command"
+        );
     }
 
     #[test]

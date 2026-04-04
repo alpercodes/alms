@@ -199,17 +199,27 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
 
     // We also need to allow access to standard system paths so bash and
     // basic utilities can execute. These are read-only.
+    //
+    // NOTE: /etc is narrowed to specific entries that bash/coreutils need.
+    // /tmp is excluded — commands that need temp space should use the sandbox root.
     let system_read_paths: Vec<PathBuf> = vec![
         PathBuf::from("/usr"),
         PathBuf::from("/bin"),
         PathBuf::from("/lib"),
         PathBuf::from("/lib64"),
-        PathBuf::from("/etc"),
+        // Specific /etc entries needed by the dynamic linker and coreutils:
+        PathBuf::from("/etc/ld.so.cache"),
+        PathBuf::from("/etc/ld.so.conf"),
+        PathBuf::from("/etc/ld.so.conf.d"),
+        PathBuf::from("/etc/alternatives"),
+        PathBuf::from("/etc/nsswitch.conf"),
+        PathBuf::from("/etc/resolv.conf"),
+        PathBuf::from("/etc/passwd"),
+        PathBuf::from("/etc/localtime"),
         PathBuf::from("/dev/null"),
         PathBuf::from("/dev/urandom"),
         PathBuf::from("/dev/zero"),
         PathBuf::from("/proc/self"),
-        PathBuf::from("/tmp"),
     ];
 
     // Clone what we need into the closure (pre_exec runs after fork, before exec)
@@ -217,9 +227,11 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
     let sys_paths = system_read_paths;
 
     // SAFETY: pre_exec runs in the child process after fork() but before
-    // exec(). We only call async-signal-safe operations (Landlock syscalls
-    // via the landlock crate). No heap allocation or mutex locking occurs
-    // in the landlock crate's restrict_self path.
+    // exec(). The Landlock syscalls themselves are async-signal-safe, but
+    // we use eprintln! for diagnostics on error paths, which is technically
+    // not async-signal-safe (it may allocate). In practice this is reliable
+    // after fork() on Linux and only executes on error paths. The trade-off
+    // is accepted for debuggability.
     unsafe {
         cmd.pre_exec(move || {
             use landlock::{
@@ -227,11 +239,17 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
                 RulesetCreatedAttr, RulesetStatus,
             };
 
-            // Use the best available ABI, minimum V1 (Linux 5.13)
+            // Request V5 features; the landlock crate will degrade to the
+            // highest ABI the running kernel supports (best-effort).
             let abi = ABI::V5;
 
             let read_access = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::Execute;
 
+            // NOTE: AccessFs::Refer is intentionally not granted for any path.
+            // This means rename()/link() across differently-ruled directories
+            // will be denied. rename() within the sandbox root works because
+            // source and target share the same ruleset entry. This prevents
+            // using rename to move files from system paths into the sandbox.
             let write_access = read_access
                 | AccessFs::WriteFile
                 | AccessFs::MakeReg
@@ -244,38 +262,57 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
             let ruleset = match Ruleset::default().handle_access(AccessFs::from_all(abi)) {
                 Ok(r) => r,
                 Err(e) => {
-                    // Landlock not supported — log and continue without restriction
-                    eprintln!(
-                        "[alms] Landlock ruleset creation failed (kernel may not support it): {e}"
-                    );
+                    // handle_access() failure means Landlock is not supported
+                    // by this kernel — gracefully degrade to unsandboxed execution.
+                    eprintln!("[alms] Landlock not supported by kernel, running unsandboxed: {e}");
                     return Ok(());
                 }
             };
+
+            // From this point on, the kernel supports Landlock. Any failure
+            // to create or enforce the ruleset is a hard error — we must NOT
+            // run the command unsandboxed when sandboxing was requested and
+            // the kernel confirmed it can apply rules.
 
             let mut ruleset = match ruleset.create() {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[alms] Landlock ruleset create failed: {e}");
-                    return Ok(());
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("Landlock ruleset creation failed: {e}"),
+                    ));
                 }
             };
 
             // Allow full read+write access to the sandbox root
-            if let Ok(fd) = PathFd::new(&root_for_closure) {
-                let rule = PathBeneath::new(fd, write_access);
-                if let Err(e) = ruleset.add_rule(rule) {
-                    eprintln!("[alms] Landlock: failed to add sandbox root rule: {e}");
-                    return Ok(());
+            let fd = match PathFd::new(&root_for_closure) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    eprintln!(
+                        "[alms] Landlock: cannot open sandbox root '{}': {e}",
+                        root_for_closure.display()
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Landlock: cannot open sandbox root '{}': {e}",
+                            root_for_closure.display()
+                        ),
+                    ));
                 }
-            } else {
-                eprintln!(
-                    "[alms] Landlock: cannot open sandbox root '{}' for rule",
-                    root_for_closure.display()
-                );
-                return Ok(());
+            };
+            let rule = PathBeneath::new(fd, write_access);
+            if let Err(e) = ruleset.add_rule(rule) {
+                eprintln!("[alms] Landlock: failed to add sandbox root rule: {e}");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Landlock: failed to add sandbox root rule: {e}"),
+                ));
             }
 
-            // Allow read+execute access to system paths
+            // Allow read+execute access to system paths (best-effort: missing
+            // system paths are skipped since not all distros have the same layout)
             for sys_path in &sys_paths {
                 if sys_path.exists() {
                     if let Ok(fd) = PathFd::new(sys_path) {
@@ -290,11 +327,18 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
                 Ok(status) => {
                     if matches!(status.ruleset, RulesetStatus::NotEnforced) {
                         eprintln!("[alms] Landlock: ruleset was not enforced by kernel");
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Landlock ruleset was not enforced by kernel",
+                        ));
                     }
                 }
                 Err(e) => {
                     eprintln!("[alms] Landlock restrict_self failed: {e}");
-                    // Continue without restriction rather than failing the command
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("Landlock restrict_self failed: {e}"),
+                    ));
                 }
             }
 

@@ -441,7 +441,7 @@ mod tests {
                 id: "call_abc123".to_string(),
                 function: FunctionCall {
                     name: "shell_exec".to_string(),
-                    arguments: r#"{"argv":["ls","-la"]}"#.to_string(),
+                    arguments: r#"{"command":"ls -la"}"#.to_string(),
                 },
             }]),
             tool_call_id: None,
@@ -676,7 +676,7 @@ mod tests {
                 role: Role::Assistant,
                 content: Content::ToolCall {
                     name: "shell_exec".to_string(),
-                    params: serde_json::json!({"argv": ["ls"]}),
+                    params: serde_json::json!({"command": "ls"}),
                 },
                 timestamp: Timestamp::now(),
                 metadata: Some(serde_json::json!({"tool_call_id": "call_123"})),
@@ -736,7 +736,7 @@ mod tests {
                 role: Role::Assistant,
                 content: Content::ToolCall {
                     name: "shell_exec".to_string(),
-                    params: serde_json::json!({"argv": ["ls"]}),
+                    params: serde_json::json!({"command": "ls"}),
                 },
                 timestamp: Timestamp::now(),
                 metadata: Some(serde_json::json!({"tool_call_id": "call_A"})),
@@ -746,7 +746,7 @@ mod tests {
                 role: Role::Assistant,
                 content: Content::ToolCall {
                     name: "shell_exec".to_string(),
-                    params: serde_json::json!({"argv": ["df", "-h"]}),
+                    params: serde_json::json!({"command": "df -h"}),
                 },
                 timestamp: Timestamp::now(),
                 metadata: Some(serde_json::json!({"tool_call_id": "call_B"})),
