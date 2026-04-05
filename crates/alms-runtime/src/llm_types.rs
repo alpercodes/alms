@@ -72,14 +72,15 @@ impl LlmMessage {
         self.content.as_deref().unwrap_or("")
     }
 
-    /// Get effective content -- `content` if present, otherwise
-    /// `reasoning_content` as a fallback.  Useful for non-streaming calls
-    /// where a reasoning model may consume all `max_tokens` on thinking
-    /// before producing output content, leaving `content` as `null` while
-    /// `reasoning_content` holds the model's response.
+    /// Get effective content -- `content` if present and non-empty,
+    /// otherwise `reasoning_content` as a fallback.  Useful for non-streaming
+    /// calls where a reasoning model may consume all `max_tokens` on thinking
+    /// before producing output content, leaving `content` as `null` (or empty)
+    /// while `reasoning_content` holds the model's response.
     pub fn effective_content(&self) -> Option<&str> {
         self.content
             .as_deref()
+            .filter(|s| !s.is_empty())
             .or(self.reasoning_content.as_deref())
     }
 }
@@ -464,6 +465,18 @@ mod tests {
             tool_call_id: None,
         };
         assert_eq!(msg.effective_content(), Some("reasoning text"));
+    }
+
+    #[test]
+    fn test_effective_content_empty_string_falls_back_to_reasoning() {
+        let msg = LlmMessage {
+            role: "assistant".into(),
+            content: Some("".into()),
+            reasoning_content: Some("reasoning fallback".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        assert_eq!(msg.effective_content(), Some("reasoning fallback"));
     }
 
     #[test]
