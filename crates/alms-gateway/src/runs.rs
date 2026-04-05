@@ -910,11 +910,46 @@ async fn execute_run(state: AppState, params: RunParams) {
     // message from a prior run (#434, Bug 1).
     let run_start_ts = alms_core::Timestamp::now();
 
+    // System-triggered notification runs (subagent completions, DM-ended
+    // notifications) that land on a user-facing session should NOT persist
+    // the verbose notification input as a Role::User message — that would
+    // show the internal LLM prompt as a "user" bubble on page reload.
+    //
+    // Instead, pre-persist the input as a Role::System message with
+    // `synthetic: true` metadata (so it is excluded from the visible chat
+    // on reload) and then use `run_on_session` to skip the default
+    // Role::User persistence in `runtime.run()`.
+    let is_notification_on_user_session =
+        is_system_triggered && !is_peer_message && !is_internal_context_id(&context_id);
+
     let result = if is_peer_message {
         // Peer-triggered run: the input message is already in the shared
         // session (written by MessageBus with from_agent metadata).
         // Use run_on_session to look up the session by ID directly and
         // skip re-persisting the input (fixes C1 session split + C2 double-write).
+        runtime
+            .run_on_session(&state.session_manager, session_id, &context_id, &input)
+            .await
+    } else if is_notification_on_user_session {
+        // Notification run rerouted to a user-facing session.
+        // Persist the input as a non-synthetic Role::System message so:
+        //  - The context builder includes it in the LLM's context window
+        //  - get_session_messages filters it out (non-synthetic system
+        //    messages are excluded), making it invisible on page reload
+        // Then use run_on_session to skip the default Role::User
+        // persistence that runtime.run() would do.
+        let sys_msg = alms_session::Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: alms_session::Role::System,
+            content: alms_session::Content::Text(input.clone()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "type": "notification_input",
+            })),
+        };
+        if let Err(e) = state.session_manager.append_message(session_id, sys_msg) {
+            warn!("Failed to persist notification input: {e}");
+        }
         runtime
             .run_on_session(&state.session_manager, session_id, &context_id, &input)
             .await
@@ -1649,10 +1684,15 @@ pub(crate) async fn completion_notification_loop(
             };
             let marker = alms_session::Message {
                 id: uuid::Uuid::new_v4().to_string(),
-                role: alms_session::Role::Assistant,
-                content: alms_session::Content::Text(format!("[Subagent '{}' {}]", name, label)),
+                role: alms_session::Role::System,
+                content: alms_session::Content::Text(format!("Subagent '{}' {}.", name, label)),
                 timestamp: alms_core::Timestamp::now(),
-                metadata: None,
+                metadata: Some(serde_json::json!({
+                    "synthetic": true,
+                    "type": "subagent_completion",
+                    "subagent_name": name,
+                    "status": status_str,
+                })),
             };
             if let Err(e) = state.session_manager.append_message(session_id, marker) {
                 warn!("Failed to persist subagent completion marker: {e}");
@@ -2080,6 +2120,35 @@ pub(crate) async fn run_trigger_loop(
                              execute on invisible notifications: session"
                         );
                     }
+                }
+
+                // ── Forward dm_conversation_ended to the PEER's web-chat ──
+                //
+                // The ignore_message path in execute_run calls
+                // notify_dm_ended_to_webchat for the SENDER, but the PEER
+                // (the agent receiving this ConversationEnded trigger) also
+                // needs the visual DM-ended indicator on their web-chat
+                // session.  Without this, the peer's user sees the agent's
+                // response to the notification but not the "conversation
+                // ended" banner (#497).
+                //
+                // For depth_exceeded, NEITHER agent's web-chat gets the
+                // event from execute_run (the depth check happens inside
+                // MessageBus::send), so this call covers both agents.
+                {
+                    let reason_str = reason.to_string();
+                    let dm_context = peer_name_resolved
+                        .as_ref()
+                        .map(|peer_name| alms_core::dm_context_id(from_name, peer_name))
+                        .unwrap_or_default();
+                    notify_dm_ended_to_webchat(
+                        &state,
+                        agent_id,
+                        from_name,
+                        &reason_str,
+                        &dm_context,
+                    )
+                    .await;
                 }
 
                 // ── Fetch DM conversation history (#429) ──
