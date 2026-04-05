@@ -915,10 +915,11 @@ async fn execute_run(state: AppState, params: RunParams) {
     // the verbose notification input as a Role::User message — that would
     // show the internal LLM prompt as a "user" bubble on page reload.
     //
-    // Instead, pre-persist the input as a Role::System message with
-    // `synthetic: true` metadata (so it is excluded from the visible chat
-    // on reload) and then use `run_on_session` to skip the default
-    // Role::User persistence in `runtime.run()`.
+    // Instead, pre-persist the input as a Role::System message *without*
+    // `synthetic` metadata (so get_session_messages filters it out on
+    // reload — non-synthetic system messages are excluded) and then use
+    // `run_on_session` to skip the default Role::User persistence in
+    // `runtime.run()`.
     let is_notification_on_user_session =
         is_system_triggered && !is_peer_message && !is_internal_context_id(&context_id);
 
@@ -938,6 +939,20 @@ async fn execute_run(state: AppState, params: RunParams) {
         //    messages are excluded), making it invisible on page reload
         // Then use run_on_session to skip the default Role::User
         // persistence that runtime.run() would do.
+        //
+        // Trade-off: the notification enters the LLM context as a
+        // `system` message rather than `user`. Some models treat system
+        // messages with lower priority, which could affect response
+        // quality. If notification runs produce lower-quality responses,
+        // consider switching to Role::User with a `hidden: true`
+        // metadata flag and updating get_session_messages to filter it.
+        //
+        // Note: if run_on_session fails after the append below, the
+        // orphaned Role::System message remains in the session. Since
+        // get_session_messages filters it out, it is invisible to users
+        // but still occupies tokens in the context window for future
+        // runs. This is acceptable for MVP — the failure case is rare
+        // and the impact is minor token waste.
         let sys_msg = alms_session::Message {
             id: uuid::Uuid::new_v4().to_string(),
             role: alms_session::Role::System,
@@ -2132,9 +2147,12 @@ pub(crate) async fn run_trigger_loop(
                 // response to the notification but not the "conversation
                 // ended" banner (#497).
                 //
-                // For depth_exceeded, NEITHER agent's web-chat gets the
-                // event from execute_run (the depth check happens inside
-                // MessageBus::send), so this call covers both agents.
+                // For depth_exceeded, the sender does NOT receive a
+                // ConversationEnded trigger (the depth check happens inside
+                // MessageBus::send and only notifies the recipient), so
+                // this call covers the RECIPIENT only. The sender's
+                // web-chat currently lacks a DM-ended indicator for
+                // depth_exceeded — this is a known gap tracked separately.
                 {
                     let reason_str = reason.to_string();
                     let dm_context = peer_name_resolved
