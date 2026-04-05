@@ -3,7 +3,7 @@ import { sessions, activeSessionId } from '../../state/sessions.js';
 import { activeAgentId } from '../../state/agents.js';
 import { chatMessages, nextMsgId } from '../../state/chat.js';
 import { activeRunId, runs } from '../../state/runs.js';
-import { bgRuns } from '../../state/queue.js';
+import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
 import { listSessions, createSession, getSessionMessages } from '../../api/sessions.js';
 import { listRuns } from '../../api/runs.js';
@@ -27,6 +27,7 @@ async function selectSession(sessionId) {
     activeSessionId.value = sessionId;
     activeRunId.value = null;
     chatMessages.value = [];
+    messageQueue.value = [];
     auditEvents.value = null;
 
     // Persist the selection for this agent
@@ -91,6 +92,7 @@ async function newSession() {
         saveActiveSession(activeAgentId.value, resp.session_id);
         activeRunId.value = null;
         chatMessages.value = [];
+        messageQueue.value = [];
         runs.value = [];
         auditEvents.value = null;
         openSessionStream(resp.session_id);
