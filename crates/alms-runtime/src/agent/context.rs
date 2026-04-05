@@ -316,7 +316,7 @@ impl AgentRuntime {
             .choices
             .into_iter()
             .next()
-            .and_then(|c| c.message.content)
+            .and_then(|c| c.message.effective_content().map(|s| s.to_string()))
             .ok_or_else(|| {
                 alms_core::AlmsError::Runtime(
                     "Summarization LLM returned empty response".to_string(),

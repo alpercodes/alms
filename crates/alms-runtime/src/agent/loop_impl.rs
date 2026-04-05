@@ -103,6 +103,7 @@ impl AgentRuntime {
                 messages.push(LlmMessage {
                     role: "assistant".to_string(),
                     content: content.clone(),
+                    reasoning_content: None,
                     tool_calls: Some(tool_calls.clone()),
                     tool_call_id: None,
                 });
@@ -269,6 +270,7 @@ impl AgentRuntime {
                     messages.push(LlmMessage {
                         role: "assistant".to_string(),
                         content: Some(text.clone()),
+                        reasoning_content: None,
                         tool_calls: None,
                         tool_call_id: None,
                     });
@@ -350,7 +352,11 @@ impl AgentRuntime {
                 let choice = response.choices.into_iter().next().ok_or_else(|| {
                     AlmsError::Runtime("LLM returned empty choices array".to_string())
                 })?;
-                Ok((choice.message.content, choice.message.tool_calls, usage))
+                Ok((
+                    choice.message.effective_content().map(|s| s.to_string()),
+                    choice.message.tool_calls,
+                    usage,
+                ))
             }
         }
     }
@@ -595,6 +601,7 @@ impl AgentRuntime {
         let mut stream = self.llm.complete_stream(request).await?;
 
         let mut content = String::new();
+        let mut reasoning_content = String::new();
         let mut tool_call_acc: Vec<(String, String, String)> = Vec::new(); // (id, name, arguments)
         let mut usage: Option<Usage> = None;
 
@@ -642,6 +649,16 @@ impl AgentRuntime {
                 }
             }
 
+            // Accumulate reasoning_content from reasoning models.
+            // This is not emitted as token_delta (it's internal thinking),
+            // but is preserved so we can fall back to it when content is
+            // empty at the end of streaming.
+            if let Some(text) = choice.delta.reasoning_content
+                && !text.is_empty()
+            {
+                reasoning_content.push_str(&text);
+            }
+
             // Accumulate tool call deltas
             if let Some(deltas) = choice.delta.tool_calls {
                 for delta in deltas {
@@ -684,8 +701,16 @@ impl AgentRuntime {
             Some(tool_calls)
         };
 
+        // Fall back to reasoning_content when the model streamed everything
+        // through reasoning (common with reasoning models that exhaust
+        // max_tokens before transitioning to output).
         let content = if content.is_empty() {
-            None
+            if !reasoning_content.is_empty() {
+                info!("Streaming: content empty, falling back to reasoning_content");
+                Some(reasoning_content)
+            } else {
+                None
+            }
         } else {
             Some(content)
         };

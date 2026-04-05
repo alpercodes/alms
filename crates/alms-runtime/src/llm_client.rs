@@ -121,14 +121,28 @@ impl LlmClient {
             )));
         }
 
+        // Read the raw body first so we can log it for diagnostics, then
+        // parse from the text.  This is essential for debugging models that
+        // return content in unexpected fields (e.g. `reasoning_content`).
+        let body_text = response
+            .text()
+            .await
+            .map_err(|e| AlmsError::Runtime(format!("Failed to read response body: {}", e)))?;
+
+        debug!(raw_body_len = body_text.len(), "LLM response body received");
+
         let completion: CompletionResponse = match self.provider {
-            Provider::OpenAi => response
-                .json()
-                .await
-                .map_err(|e| AlmsError::Runtime(format!("Failed to parse response: {}", e)))?,
+            Provider::OpenAi => serde_json::from_str(&body_text).map_err(|e| {
+                error!(body = body_text.as_str(), "Failed to parse OpenAI response");
+                AlmsError::Runtime(format!("Failed to parse response: {}", e))
+            })?,
             Provider::Anthropic => {
                 let anthropic_resp: crate::anthropic::AnthropicResponse =
-                    response.json().await.map_err(|e| {
+                    serde_json::from_str(&body_text).map_err(|e| {
+                        error!(
+                            body = body_text.as_str(),
+                            "Failed to parse Anthropic response"
+                        );
                         AlmsError::Runtime(format!("Failed to parse Anthropic response: {}", e))
                     })?;
                 crate::anthropic::from_anthropic_response(anthropic_resp)
@@ -140,6 +154,29 @@ impl LlmClient {
                 "Completion used {} prompt + {} completion = {} total tokens",
                 usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
             );
+        }
+
+        // Log when content is null but there are completion tokens -- a strong
+        // signal that the model returned content in an unexpected field (e.g.
+        // `reasoning_content` for reasoning models).
+        if let Some(choice) = completion.choices.first()
+            && choice.message.content.is_none()
+        {
+            let has_reasoning = choice.message.reasoning_content.is_some();
+            let has_tool_calls = choice.message.tool_calls.is_some();
+            let comp_tokens = completion
+                .usage
+                .as_ref()
+                .map(|u| u.completion_tokens)
+                .unwrap_or(0);
+            if comp_tokens > 0 {
+                warn!(
+                    comp_tokens,
+                    has_reasoning,
+                    has_tool_calls,
+                    "LLM returned null content with non-zero completion tokens"
+                );
+            }
         }
 
         Ok(completion)
@@ -392,6 +429,7 @@ impl LlmClient {
                             None
                         },
                         content: Some(word.to_string()),
+                        reasoning_content: None,
                         tool_calls: None,
                     },
                     finish_reason: if is_last {

@@ -47,7 +47,12 @@ const HEURISTIC_MAX_TOTAL_BYTES: usize = 500;
 const LLM_CONTEXT_BYTES: usize = 2000;
 
 /// Maximum output tokens for the LLM summarizer call.
-const LLM_MAX_OUTPUT_TOKENS: u32 = 150;
+///
+/// Set high enough to accommodate reasoning models that consume some of the
+/// budget on internal thinking before producing visible output.  The actual
+/// summary text is typically 50-100 tokens, but models like minimax-m2.5 or
+/// deepseek-r1 may spend 100-200 tokens on reasoning first.
+const LLM_MAX_OUTPUT_TOKENS: u32 = 300;
 
 /// Parameters for episodic summary generation.
 pub struct SummaryParams {
@@ -189,15 +194,39 @@ pub async fn generate_and_persist_summary(
     );
 
     // Upsert to database (with source label for injection formatting).
+    // I5: Retry once on transient SQLite errors (e.g. SQLITE_BUSY) so that
+    // a momentary lock contention does not permanently lose a summary.
     if let Some(store) = session_manager.store() {
-        if let Err(e) = store.upsert_session_summary(
-            params.agent_id,
-            params.session_id,
-            &summary_text,
-            Some(params.run_id),
-            Some(&source.source_label),
-        ) {
-            error!("Failed to persist session summary: {e}");
+        let mut persisted = false;
+        for attempt in 1..=2 {
+            match store.upsert_session_summary(
+                params.agent_id,
+                params.session_id,
+                &summary_text,
+                Some(params.run_id),
+                Some(&source.source_label),
+            ) {
+                Ok(()) => {
+                    persisted = true;
+                    break;
+                }
+                Err(e) if attempt < 2 => {
+                    warn!(
+                        attempt,
+                        "Transient failure persisting session summary, retrying: {e}"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    error!(
+                        attempts = 2,
+                        "Failed to persist session summary after retries: {e}"
+                    );
+                }
+            }
+        }
+        if persisted {
+            debug!("Session summary persisted successfully");
         }
     } else {
         warn!("No SQLite store -- session summary not persisted");
@@ -343,15 +372,41 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
 
     match llm.complete(request).await {
         Ok(response) => {
-            let text = response
-                .choices
-                .into_iter()
-                .next()
-                .and_then(|c| c.message.content);
+            let choice = response.choices.into_iter().next();
+            let text = choice.as_ref().and_then(|c| {
+                // Primary: use `content`.
+                // Fallback: use `reasoning_content` -- reasoning models (e.g.
+                // minimax-m2.5, deepseek-r1) may consume all max_tokens on
+                // thinking before producing output, leaving `content` as null
+                // while `reasoning_content` holds useful text.
+                c.message
+                    .content
+                    .as_deref()
+                    .or(c.message.reasoning_content.as_deref())
+            });
             match text {
-                Some(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+                Some(t) if !t.trim().is_empty() => {
+                    // If we fell back to reasoning_content, note it in logs.
+                    if choice.as_ref().is_some_and(|c| c.message.content.is_none()) {
+                        info!("Used reasoning_content as summary (model returned null content)");
+                    }
+                    Some(t.trim().to_string())
+                }
                 _ => {
-                    warn!("LLM summarizer returned empty response");
+                    warn!(
+                        has_content = choice.as_ref().is_some_and(|c| c.message.content.is_some()),
+                        has_reasoning = choice
+                            .as_ref()
+                            .is_some_and(|c| c.message.reasoning_content.is_some()),
+                        has_tool_calls = choice
+                            .as_ref()
+                            .is_some_and(|c| c.message.tool_calls.is_some()),
+                        finish_reason = choice
+                            .as_ref()
+                            .and_then(|c| c.finish_reason.as_deref())
+                            .unwrap_or("unknown"),
+                        "LLM summarizer returned empty response"
+                    );
                     None
                 }
             }
@@ -403,7 +458,10 @@ pub fn format_episodic_for_injection(
     }
 
     let header = "[Your conversation history across sessions — most recent first]\n";
-    let header_tokens = estimate_tokens(header);
+    // I8: Reserve tokens for the XML wrapper tags that delimit episodic data.
+    let xml_overhead_tokens =
+        estimate_tokens("<episodic_memory>\n") + estimate_tokens("\n</episodic_memory>");
+    let header_tokens = estimate_tokens(header) + xml_overhead_tokens;
     if header_tokens >= budget_tokens {
         return None;
     }
@@ -445,13 +503,21 @@ pub fn format_episodic_for_injection(
         return None;
     }
 
+    // I8: Wrap the entire episodic block in XML tags to clearly delimit it as
+    // data (not instructions).  This reduces the risk of a compromised
+    // summariser injecting content that the LLM treats as system instructions.
+    let open_tag = "<episodic_memory>\n";
+    let close_tag = "\n</episodic_memory>";
+
     // Pre-allocate: budget_tokens * 3 approximates the char capacity since
     // estimate_tokens uses chars/3.
     let mut result = String::with_capacity(budget_tokens * 3);
+    result.push_str(open_tag);
     result.push_str(header);
     for entry in &entries {
         result.push_str(entry);
     }
+    result.push_str(close_tag);
 
     Some(result)
 }
@@ -878,7 +944,11 @@ mod tests {
     fn test_format_episodic_single_summary() {
         let summaries = vec![make_summary("Debugged CORS issue in gateway.rs.", 10)];
         let result = format_episodic_for_injection(&summaries, 5000).unwrap();
-        assert!(result.starts_with("[Your conversation history across sessions"));
+        // I8: output is wrapped in XML tags
+        assert!(
+            result.starts_with("<episodic_memory>\n[Your conversation history across sessions")
+        );
+        assert!(result.ends_with("</episodic_memory>"));
         assert!(result.contains("Debugged CORS issue"));
         assert!(result.contains("**User chat (last active:"));
     }
@@ -908,9 +978,9 @@ mod tests {
             make_summary("Summary C with some text.", 15),
         ];
         // Each summary entry is roughly: "\n**Session (last active: ...)**\n<text>"
-        // which is about 70-80 chars => ~25 tokens.  Header is ~20 tokens.
-        // Budget of 70 should fit header + 1-2 entries but not all 3.
-        let result = format_episodic_for_injection(&summaries, 70).unwrap();
+        // which is about 70-80 chars => ~25 tokens.  Header + XML wrapper is ~34 tokens.
+        // Budget of 85 should fit header + wrapper + 1-2 entries but not all 3.
+        let result = format_episodic_for_injection(&summaries, 85).unwrap();
         assert!(result.contains("Summary A"), "Newest must be included");
         // Oldest (C) should be dropped
         assert!(
@@ -1047,10 +1117,14 @@ mod tests {
         let formatted =
             format_episodic_for_injection(&summaries, 5000).expect("Should produce formatted text");
 
-        // Verify structure.
+        // Verify structure.  I8: output wrapped in XML tags.
         assert!(
-            formatted.starts_with("[Your conversation history across sessions"),
-            "Should start with the header"
+            formatted.starts_with("<episodic_memory>\n[Your conversation history across sessions"),
+            "Should start with XML tag and header"
+        );
+        assert!(
+            formatted.ends_with("</episodic_memory>"),
+            "Should end with closing XML tag"
         );
         assert!(
             formatted.contains("**Telegram chat (last active:"),

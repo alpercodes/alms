@@ -61,22 +61,21 @@ impl SqliteStore {
     ) -> AlmsResult<Vec<SessionSummary>> {
         let conn = self.conn.lock();
 
-        let (sql, exclude_str);
-        if let Some(exclude) = exclude_session_id {
-            exclude_str = exclude.0.to_string();
-            sql = "SELECT agent_id, session_id, summary, last_run_id, updated_at, source_label \
-                   FROM session_summaries \
-                   WHERE agent_id = ?1 AND session_id != ?3 \
-                   ORDER BY updated_at DESC \
-                   LIMIT ?2";
+        // M9: Use Option to avoid allocating an unused String in the None branch.
+        let exclude_str = exclude_session_id.map(|e| e.0.to_string());
+        let sql = if exclude_str.is_some() {
+            "SELECT agent_id, session_id, summary, last_run_id, updated_at, source_label \
+             FROM session_summaries \
+             WHERE agent_id = ?1 AND session_id != ?3 \
+             ORDER BY updated_at DESC \
+             LIMIT ?2"
         } else {
-            exclude_str = String::new(); // unused
-            sql = "SELECT agent_id, session_id, summary, last_run_id, updated_at, source_label \
-                   FROM session_summaries \
-                   WHERE agent_id = ?1 \
-                   ORDER BY updated_at DESC \
-                   LIMIT ?2";
-        }
+            "SELECT agent_id, session_id, summary, last_run_id, updated_at, source_label \
+             FROM session_summaries \
+             WHERE agent_id = ?1 \
+             ORDER BY updated_at DESC \
+             LIMIT ?2"
+        };
 
         let mut stmt = conn.prepare(sql).map_err(|e| {
             AlmsError::Runtime(format!("SQLite prepare load_session_summaries: {e}"))
@@ -85,9 +84,9 @@ impl SqliteStore {
         let agent_str = agent_id.0.to_string();
         let limit_val = limit as i64;
 
-        let rows: Vec<SessionSummary> = if exclude_session_id.is_some() {
+        let rows: Vec<SessionSummary> = if let Some(ref ex) = exclude_str {
             stmt.query_map(
-                params![&agent_str, limit_val, &exclude_str],
+                params![&agent_str, limit_val, ex],
                 parse_session_summary_row,
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite query load_session_summaries: {e}")))?

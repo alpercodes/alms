@@ -8,6 +8,13 @@ pub struct LlmMessage {
     /// Content can be null when the LLM returns tool calls only
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Reasoning/thinking content returned by reasoning models (e.g. minimax,
+    /// deepseek-r1).  OpenRouter surfaces this as a separate field on the
+    /// message object.  We capture it so callers can fall back to it when
+    /// `content` is null (common when max_tokens is hit before the model
+    /// transitions from reasoning to output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19,6 +26,7 @@ impl LlmMessage {
         Self {
             role: "system".to_string(),
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -28,6 +36,7 @@ impl LlmMessage {
         Self {
             role: "user".to_string(),
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -37,6 +46,7 @@ impl LlmMessage {
         Self {
             role: "assistant".to_string(),
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -51,14 +61,27 @@ impl LlmMessage {
         Self {
             role: "tool".to_string(),
             content: Some(content.into()),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
         }
     }
 
-    /// Get content as string, defaulting to empty string if None
+    /// Get content as string, defaulting to empty string if None.
     pub fn content_str(&self) -> &str {
         self.content.as_deref().unwrap_or("")
+    }
+
+    /// Get effective content -- `content` if present and non-empty,
+    /// otherwise `reasoning_content` as a fallback.  Useful for non-streaming
+    /// calls where a reasoning model may consume all `max_tokens` on thinking
+    /// before producing output content, leaving `content` as `null` (or empty)
+    /// while `reasoning_content` holds the model's response.
+    pub fn effective_content(&self) -> Option<&str> {
+        self.content
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(self.reasoning_content.as_deref())
     }
 }
 
@@ -221,6 +244,9 @@ pub struct StreamChoice {
 pub struct Delta {
     pub role: Option<String>,
     pub content: Option<String>,
+    /// Reasoning/thinking content delta from reasoning models.
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
@@ -413,5 +439,85 @@ mod tests {
         let config = LlmConfig::from_env();
         assert_eq!(config.provider, "anthropic");
         assert_eq!(config.api_key, "");
+    }
+
+    // -- effective_content / reasoning_content tests --------------------------
+
+    #[test]
+    fn test_effective_content_prefers_content() {
+        let msg = LlmMessage {
+            role: "assistant".into(),
+            content: Some("real content".into()),
+            reasoning_content: Some("thinking...".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        assert_eq!(msg.effective_content(), Some("real content"));
+    }
+
+    #[test]
+    fn test_effective_content_falls_back_to_reasoning() {
+        let msg = LlmMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: Some("reasoning text".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        assert_eq!(msg.effective_content(), Some("reasoning text"));
+    }
+
+    #[test]
+    fn test_effective_content_empty_string_falls_back_to_reasoning() {
+        let msg = LlmMessage {
+            role: "assistant".into(),
+            content: Some("".into()),
+            reasoning_content: Some("reasoning fallback".into()),
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        assert_eq!(msg.effective_content(), Some("reasoning fallback"));
+    }
+
+    #[test]
+    fn test_effective_content_none_when_both_absent() {
+        let msg = LlmMessage {
+            role: "assistant".into(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        assert_eq!(msg.effective_content(), None);
+    }
+
+    #[test]
+    fn test_reasoning_content_deserialized_from_json() {
+        // Simulate the response from a reasoning model via OpenRouter
+        let json = r#"{
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "Let me think about this summary..."
+        }"#;
+        let msg: LlmMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.content.is_none());
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("Let me think about this summary...")
+        );
+        assert_eq!(
+            msg.effective_content(),
+            Some("Let me think about this summary...")
+        );
+    }
+
+    #[test]
+    fn test_reasoning_content_not_serialized_when_none() {
+        let msg = LlmMessage::assistant("hello");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            !json.contains("reasoning_content"),
+            "reasoning_content should be skipped when None: {json}"
+        );
     }
 }
