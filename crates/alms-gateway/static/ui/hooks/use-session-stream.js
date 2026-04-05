@@ -288,9 +288,16 @@ export function openSessionStream(sessionId, opts) {
             const endedAt = Date.now();
 
             const msgs = [...chatMessages.value];
-            const idx = matchId
+            // Primary match: by tool_invocation_id (exact ID correlation).
+            // Fallback: if the primary match fails (e.g. tool message was
+            // reconstructed from history with a different ID scheme), fall
+            // back to matching the last running tool message.
+            let idx = matchId
                 ? msgs.findLastIndex(m => m.type === 'tool' && m.id === matchId)
-                : msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
+                : -1;
+            if (idx < 0) {
+                idx = msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
+            }
             if (idx >= 0) {
                 const durationMs = msgs[idx].startedAt ? endedAt - msgs[idx].startedAt : null;
                 msgs[idx] = { ...msgs[idx], status, result: data.result, durationMs };
@@ -493,6 +500,8 @@ export function closeSessionStream() {
         flushTimer = null;
     }
     flushDeltaBuffer();
+    // Reset per-run state so it does not carry over to the next session.
+    sawTokenDelta = false;
     if (activeSessionEs) {
         activeSessionEs.close();
         activeSessionEs = null;

@@ -83,15 +83,15 @@ async function loadAgentSessions(agentId) {
             activeSessionId.value = selected.id;
             // Re-persist in case the session list changed
             saveActiveSession(agentId, selected.id);
-            const [lastEventId] = await Promise.all([
-                loadHistory(selected.id),
-                loadRunHistory(selected.id),
-            ]);
+            // Load runs first so activeRunId is set before history loads.
+            // This lets mapHistoryMessages mark in-progress tool_calls as
+            // 'running' instead of incorrectly defaulting to 'done'.
+            await loadRunHistory(selected.id);
+            if (gen !== switchGeneration) return; // stale — discard
+            const lastEventId = await loadHistory(selected.id);
             if (gen !== switchGeneration) return; // stale — discard
             // If a run is in-progress, append a thinking indicator so the
-            // user sees the cancel button and "Thinking..." state.  This
-            // runs after both loadHistory and loadRunHistory have settled,
-            // avoiding the race where loadHistory overwrites the indicator.
+            // user sees the cancel button and "Thinking..." state.
             if (activeRunId.value && !chatMessages.value.some(m => m.type === 'thinking')) {
                 chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
             }
@@ -126,7 +126,9 @@ async function loadAgentSessions(agentId) {
 async function loadHistory(sessionId) {
     try {
         const data = await getSessionMessages(sessionId);
-        chatMessages.value = mapHistoryMessages(data.messages || []);
+        chatMessages.value = mapHistoryMessages(data.messages || [], {
+            hasActiveRun: !!activeRunId.value,
+        });
         return data.last_event_id ?? null;
     } catch (err) {
         console.error('[loadHistory] failed:', err);

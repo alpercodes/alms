@@ -10,8 +10,15 @@ import { nextMsgId } from '../state/chat.js';
  *
  * Every entry receives a stable `id` via nextMsgId() so that Preact's
  * VDOM reconciler can correctly match DOM nodes across re-renders.
+ *
+ * @param {Array} msgs - messages from the session history API
+ * @param {object} [opts]
+ * @param {boolean} [opts.hasActiveRun] - true if a run is currently
+ *   queued or running on this session. Used to mark unmatched tool_calls
+ *   as 'running' so the UI shows a spinner instead of a checkmark.
  */
-export function mapHistoryMessages(msgs) {
+export function mapHistoryMessages(msgs, opts) {
+    const hasActiveRun = opts && opts.hasActiveRun;
     // First pass: index all tool_result messages by their tool_id so we
     // can match them to tool_call messages regardless of position.
     const resultMap = new Map();
@@ -49,7 +56,13 @@ export function mapHistoryMessages(msgs) {
                 type: 'tool',
                 tool: m.tool,
                 params: m.params,
-                status: matched ? (matched.ok ? 'done' : 'fail') : 'done',
+                // When no matching tool_result exists: if a run is still
+                // active on this session, the tool is likely in-progress
+                // so show it as 'running' (the tool_end SSE event will
+                // update it). Otherwise default to 'done' (the result was
+                // persisted elsewhere or the run completed before reload).
+                status: matched ? (matched.ok ? 'done' : 'fail')
+                    : (hasActiveRun ? 'running' : 'done'),
                 result: matched ? matched.result : null,
             });
         } else if (m.type === 'image') {
