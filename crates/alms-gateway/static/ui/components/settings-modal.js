@@ -206,6 +206,7 @@ export function SettingsModal({ open, onClose }) {
     const model = useSignal('');
     const maxTokens = useSignal('');
     const posture = useSignal('');
+    const debugMode = useSignal(false);
     const saved = useSignal(false);
 
     // Server-level editable signals — Context
@@ -245,6 +246,7 @@ export function SettingsModal({ open, onClose }) {
                 ? String(localSettings.value.max_tokens)
                 : '';
             posture.value = localSettings.value.posture || '';
+            debugMode.value = !!localSettings.value.debug_mode;
 
             // Populate server-level fields
             ctxStrategy.value = ctx.strategy || 'truncate';
@@ -279,11 +281,12 @@ export function SettingsModal({ open, onClose }) {
     const tools = defaults.tools || {};
 
     const onReset = () => {
-        saveSettings({ provider: null, model: null, max_tokens: null, posture: null });
+        saveSettings({ provider: null, model: null, max_tokens: null, posture: null, debug_mode: null });
         provider.value = '';
         model.value = '';
         maxTokens.value = '';
         posture.value = '';
+        debugMode.value = false;
         saved.value = true;
         setTimeout(() => onClose(), 600);
     };
@@ -301,6 +304,7 @@ export function SettingsModal({ open, onClose }) {
         const mt = parseInt(maxTokens.value, 10);
         updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
         updates.posture = posture.value || null;
+        updates.debug_mode = debugMode.value || null;
         saveSettings(updates);
 
         // 2. Build server settings patch — only include fields that changed from server defaults
@@ -474,6 +478,21 @@ export function SettingsModal({ open, onClose }) {
                         </select>
                         <span class="settings-effective">
                             Effective: ${effPosture}
+                        </span>
+                    </div>
+                </div>
+
+                <div class="settings-grid">
+                    <div class="settings-row">
+                        <label class="settings-label">Debug mode</label>
+                        <label class="settings-toggle">
+                            <input type="checkbox"
+                                   checked=${debugMode.value}
+                                   onChange=${e => { debugMode.value = e.target.checked; }} />
+                            <span>${debugMode.value ? 'enabled' : 'disabled'}</span>
+                        </label>
+                        <span class="settings-hint">
+                            When enabled, shows the full context window sent to the LLM before each response.
                         </span>
                     </div>
                 </div>

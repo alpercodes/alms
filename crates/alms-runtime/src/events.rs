@@ -84,6 +84,23 @@ pub enum RuntimeEvent {
         /// When set, this warning originated from a subagent (not the parent).
         source_agent: Option<String>,
     },
+    /// Debug snapshot of the full context window sent to the LLM.
+    ///
+    /// Only emitted when `debug_mode` is enabled on the agent config.
+    /// The gateway converts this to a `context_debug` SSE event so the
+    /// web UI can display exactly what the LLM sees.
+    ContextDebug {
+        /// The assembled messages array (system prompt, history, user input).
+        messages: Value,
+        /// Names of tools available to the LLM.
+        tool_names: Vec<String>,
+        /// Estimated total token count of the context window.
+        total_tokens: usize,
+        /// Estimated token count of the system prompt alone.
+        system_tokens: usize,
+        /// Number of history messages included in the context.
+        history_message_count: usize,
+    },
 }
 
 /// Sender half of the runtime event channel.
@@ -228,6 +245,47 @@ mod tests {
                 && message.contains("text only")
                 && source_agent.is_none())
         );
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_context_debug_event_roundtrip() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+
+        let messages = serde_json::json!([
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello"},
+        ]);
+
+        tx.send(RuntimeEvent::ContextDebug {
+            messages: messages.clone(),
+            tool_names: vec!["shell_exec".to_string(), "fs_read".to_string()],
+            total_tokens: 150,
+            system_tokens: 100,
+            history_message_count: 0,
+        })
+        .unwrap();
+
+        drop(tx);
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            RuntimeEvent::ContextDebug {
+                messages: m,
+                tool_names,
+                total_tokens,
+                system_tokens,
+                history_message_count,
+            } => {
+                assert_eq!(m, messages);
+                assert_eq!(tool_names, vec!["shell_exec", "fs_read"]);
+                assert_eq!(total_tokens, 150);
+                assert_eq!(system_tokens, 100);
+                assert_eq!(history_message_count, 0);
+            }
+            _ => panic!("Expected ContextDebug event"),
+        }
 
         assert!(rx.recv().await.is_none());
     }

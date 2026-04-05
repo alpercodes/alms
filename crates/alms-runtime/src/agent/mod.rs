@@ -287,6 +287,64 @@ impl AgentRuntime {
         }
     }
 
+    /// Emit a `ContextDebug` event containing the full assembled context
+    /// window that is about to be sent to the LLM.
+    ///
+    /// Only called when `debug_mode` is enabled. Best-effort: failures are
+    /// silently dropped since debug events are informational only.
+    fn emit_context_debug(&self, messages: &[LlmMessage]) {
+        use crate::context::{estimate_llm_message_tokens, estimate_tokens};
+
+        let Some(ref tx) = self.event_sender else {
+            return;
+        };
+
+        // Compute token estimates per message for the debug payload.
+        let total_tokens: usize = messages
+            .iter()
+            .map(|m| estimate_llm_message_tokens(m) + 4)
+            .sum();
+
+        // System prompt tokens (first message is always the system prompt).
+        let system_tokens = messages
+            .first()
+            .filter(|m| m.role == "system")
+            .map(|m| estimate_tokens(m.content_str()))
+            .unwrap_or(0);
+
+        // History message count: everything except the first system message
+        // and the last user message (which is the current input).
+        let history_message_count = messages
+            .len()
+            .saturating_sub(1) // system prompt
+            .saturating_sub(
+                messages
+                    .last()
+                    .filter(|m| m.role == "user")
+                    .map(|_| 1)
+                    .unwrap_or(0),
+            );
+
+        let tool_names: Vec<String> = self
+            .tools
+            .to_definitions()
+            .into_iter()
+            .map(|td| td.function.name)
+            .collect();
+
+        // Serialize messages for the debug payload. Use serde_json::to_value
+        // which handles the full LlmMessage structure including tool_calls.
+        let messages_json = serde_json::to_value(messages).unwrap_or_default();
+
+        let _ = tx.send(crate::events::RuntimeEvent::ContextDebug {
+            messages: messages_json,
+            tool_names,
+            total_tokens,
+            system_tokens,
+            history_message_count,
+        });
+    }
+
     /// Run the agent on a single input
     #[instrument(
         level = "info",
@@ -413,6 +471,14 @@ impl AgentRuntime {
 
         let (tool_calls, result) = match history {
             Ok(h) => {
+                // Emit context debug snapshot when debug_mode is enabled.
+                // This happens after build_context() and before agent_loop()
+                // so the UI sees exactly what the LLM will receive on the
+                // first iteration.
+                if self.config.debug_mode {
+                    self.emit_context_debug(&h);
+                }
+
                 self.agent_loop(
                     session_manager,
                     session_id,

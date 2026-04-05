@@ -130,6 +130,7 @@ struct RunOverrides {
     max_tokens: Option<u32>,
     posture: Option<String>,
     provider: Option<String>,
+    debug_mode: Option<bool>,
 }
 
 /// Bundled parameters for [`execute_run`], avoiding a long positional argument list.
@@ -288,6 +289,9 @@ fn apply_overrides(
     {
         cfg.posture = posture;
     }
+    if let Some(debug) = overrides.debug_mode {
+        cfg.debug_mode = debug;
+    }
 
     MergedConfig {
         agent_config: cfg,
@@ -417,6 +421,7 @@ pub async fn create_run(
         max_tokens: req.max_tokens,
         posture: req.posture.clone(),
         provider: req.provider.clone(),
+        debug_mode: req.debug_mode,
     };
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;
@@ -2355,6 +2360,28 @@ async fn forward_runtime_events(
                     )
                     .await;
             }
+            RuntimeEvent::ContextDebug {
+                messages,
+                tool_names,
+                total_tokens,
+                system_tokens,
+                history_message_count,
+            } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::context_debug(
+                            run_id,
+                            messages,
+                            tool_names,
+                            total_tokens,
+                            system_tokens,
+                            history_message_count,
+                        ),
+                    )
+                    .await;
+            }
         }
     }
 }
@@ -2702,6 +2729,21 @@ mod tests {
         let merged = apply_overrides(base_config(), None, &overrides);
         // Unknown per-run posture keeps server default
         assert!(matches!(merged.agent_config.posture, Posture::FullControl));
+    }
+
+    #[test]
+    fn test_debug_mode_override() {
+        // Off by default
+        let merged = apply_overrides(base_config(), None, &RunOverrides::default());
+        assert!(!merged.agent_config.debug_mode);
+
+        // Enabled via per-run override
+        let overrides = RunOverrides {
+            debug_mode: Some(true),
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(base_config(), None, &overrides);
+        assert!(merged.agent_config.debug_mode);
     }
 
     #[test]

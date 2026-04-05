@@ -382,6 +382,22 @@ export function openSessionStream(sessionId, opts) {
         }
     });
 
+    // -- context_debug: full context window snapshot (debug mode) --
+    on('context_debug', (e) => {
+        batch(() => {
+            const data = JSON.parse(e.data);
+            chatMessages.value = [...chatMessages.value, {
+                id: nextMsgId(),
+                type: 'context_debug',
+                messages: data.messages,
+                toolNames: data.tool_names,
+                totalTokens: data.total_tokens,
+                systemTokens: data.system_tokens,
+                historyMessageCount: data.history_message_count,
+            }];
+        });
+    });
+
     // -- run_warning (non-fatal, e.g. max iterations) --
     on('run_warning', (e) => {
         batch(() => {
