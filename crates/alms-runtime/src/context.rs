@@ -91,7 +91,12 @@ impl ContextBuilder {
 
         // 4. Budget for history — episodic tokens are subtracted from the
         // available space so they do not eat into the history budget.
-        let reserved = system_tokens + input_tokens + episodic_tokens + 500;
+        //
+        // I6: Buffer increased from 500 to 1000 tokens.  The estimate_tokens
+        // heuristic (len/3) overestimates English but underestimates code and
+        // JSON (~2-3 chars/token).  A larger buffer provides a stronger safety
+        // margin against LLM API rejection for max_input_tokens breaches.
+        let reserved = system_tokens + input_tokens + episodic_tokens + 1000;
         let history_budget = self.config.max_input_tokens.saturating_sub(reserved);
 
         // Pre-map the history if perspective is set, then pass the mapped
@@ -550,11 +555,12 @@ mod tests {
 
     #[test]
     fn test_truncate_respects_token_budget() {
-        // Budget 600 tokens with a 500-token response buffer leaves ~100 for history.
+        // Budget 1200 tokens with a 1000-token safety buffer leaves ~200 for history.
+        // System ~5 tokens, input ~2 tokens => reserved ~1007.
         // Each message is ~20 tokens at chars/3, so only a few should fit.
         let config = ContextConfig {
             strategy: "truncate".into(),
-            max_input_tokens: 600,
+            max_input_tokens: 1200,
             recent_window: 100, // allow many messages
             summary_interval: 30,
             summary_model: None,
@@ -577,13 +583,13 @@ mod tests {
 
         let messages = builder.build("System prompt", &history, "Input", None);
 
-        // system + input = 2 fixed messages; history budget ~93 tokens fits ~4-5 messages
+        // system + input = 2 fixed messages; history budget ~193 tokens fits ~9-10 messages
         assert!(
             messages.len() >= 3,
             "should include at least one history message"
         );
         assert!(
-            messages.len() <= 8,
+            messages.len() <= 14,
             "token budget should limit history to a few messages"
         );
     }
@@ -1274,13 +1280,14 @@ mod tests {
 
     #[test]
     fn test_episodic_budget_does_not_eat_history() {
-        // Budget: 600 tokens.  System ~5 tokens, input ~2 tokens, episodic ~33 tokens.
-        // Reserved = 5 + 2 + 33 + 500 = 540.  History budget = 600 - 540 = 60 tokens.
-        // Without episodic, history budget would be 600 - 507 = 93 tokens.
+        // Budget: 1150 tokens.  System ~2 tokens, input ~2 tokens, episodic ~37 tokens.
+        // Reserved (with episodic) = 2 + 2 + 37 + 1000 = 1041.  History = 1150 - 1041 = 109 tokens.
+        // Reserved (no episodic)   = 2 + 2 + 0  + 1000 = 1004.  History = 1150 - 1004 = 146 tokens.
+        // Each message is ~7 tokens, so with-episodic fits ~15, without fits ~20.
         // This verifies that episodic tokens come from the total budget, not history.
         let config = ContextConfig {
             strategy: "truncate".into(),
-            max_input_tokens: 600,
+            max_input_tokens: 1150,
             recent_window: 100,
             summary_interval: 30,
             summary_model: None,
