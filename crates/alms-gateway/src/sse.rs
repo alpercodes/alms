@@ -315,6 +315,33 @@ impl SseEventData {
         )
     }
 
+    /// Debug snapshot of the full context window sent to the LLM.
+    ///
+    /// Only emitted when debug mode is enabled. Contains the assembled
+    /// messages array, tool names, and token count estimates so the web
+    /// UI can display exactly what the LLM sees.
+    pub fn context_debug(
+        run_id: RunId,
+        messages: serde_json::Value,
+        tool_names: Vec<String>,
+        total_tokens: usize,
+        system_tokens: usize,
+        history_message_count: usize,
+    ) -> Self {
+        Self::new(
+            "context_debug",
+            ContextDebugData {
+                run_id: run_id.0.to_string(),
+                messages,
+                tool_names,
+                total_tokens,
+                system_tokens,
+                history_message_count,
+                ts: Utc::now(),
+            },
+        )
+    }
+
     /// Session-level: a DM conversation between two agents has ended.
     ///
     /// Emitted on the DM session SSE stream so the web UI can show a
@@ -587,6 +614,17 @@ struct JobCompletedData {
 }
 
 #[derive(Debug, Serialize)]
+struct ContextDebugData {
+    run_id: String,
+    messages: serde_json::Value,
+    tool_names: Vec<String>,
+    total_tokens: usize,
+    system_tokens: usize,
+    history_message_count: usize,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
 struct DmConversationEndedData {
     session_id: String,
     ended_by: String,
@@ -844,6 +882,27 @@ mod tests {
         assert_eq!(event.data["peer"], "alice");
         assert_eq!(event.data["reason"], "depth_exceeded");
         assert_eq!(event.data["context_id"], "dm:alice:bob");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+    }
+
+    #[test]
+    fn test_context_debug_event() {
+        let run_id = RunId::new();
+        let messages = serde_json::json!([
+            {"role": "system", "content": "prompt"},
+            {"role": "user", "content": "hello"},
+        ]);
+        let tool_names = vec!["shell_exec".to_string(), "fs_read".to_string()];
+
+        let event = SseEventData::context_debug(run_id, messages, tool_names, 500, 200, 3);
+
+        assert_eq!(event.event_type, "context_debug");
+        assert_eq!(event.data["run_id"], run_id.0.to_string());
+        assert_eq!(event.data["total_tokens"], 500);
+        assert_eq!(event.data["system_tokens"], 200);
+        assert_eq!(event.data["history_message_count"], 3);
+        assert_eq!(event.data["tool_names"].as_array().unwrap().len(), 2);
+        assert_eq!(event.data["messages"].as_array().unwrap().len(), 2);
         assert!(event.data["ts"].is_string(), "ts should be a string");
     }
 }

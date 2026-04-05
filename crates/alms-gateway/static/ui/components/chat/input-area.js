@@ -24,6 +24,7 @@ export async function startRun(text) {
         if (settings.model) runBody.model = settings.model;
         if (settings.max_tokens != null) runBody.max_tokens = settings.max_tokens;
         if (settings.posture) runBody.posture = settings.posture;
+        if (settings.debug_mode) runBody.debug_mode = true;
 
         await createRun(runBody);
         // No need to open a per-run SSE stream — the session stream

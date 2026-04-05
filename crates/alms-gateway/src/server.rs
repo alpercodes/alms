@@ -358,13 +358,19 @@ impl RunManager {
     /// Dead subscribers (closed channels) are pruned automatically.
     /// Fans out to both per-run and per-session subscribers.
     pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
-        let is_ephemeral = event.event_type == "token_delta" || event.event_type == "status";
+        let is_ephemeral = event.event_type == "token_delta"
+            || event.event_type == "status"
+            || event.event_type == "context_debug";
 
-        // Per-run event log — skip ephemeral events (token_delta, status) to
-        // avoid persisting high-frequency or transient data. Status events are
-        // superseded within milliseconds by the next phase or by run_finished,
-        // so replaying stale ones on SSE reconnect would be confusing.
-        // Live subscribers still receive these events via fan-out below.
+        // Per-run event log — skip ephemeral events (token_delta, status,
+        // context_debug) to avoid persisting high-frequency or transient data.
+        // Status events are superseded within milliseconds by the next phase
+        // or by run_finished, so replaying stale ones on SSE reconnect would
+        // be confusing. context_debug snapshots can be 100-400KB for large
+        // context windows and are only meaningful at the moment they are
+        // emitted — replaying them on reconnect would waste memory and
+        // bandwidth. Live subscribers still receive these events via fan-out
+        // below.
         if !is_ephemeral {
             let event_id = self
                 .event_log
@@ -383,10 +389,11 @@ impl RunManager {
         }
 
         // Per-session fan-out: forward to session subscribers.
-        // Skip session event LOG for ephemeral events (token_delta, status) —
-        // deltas are high-frequency and status events are transient.
-        // Session reconnect doesn't need individual deltas — the chat history
-        // is loaded via getSessionMessages instead.
+        // Skip session event LOG for ephemeral events (token_delta, status,
+        // context_debug) — deltas are high-frequency, status events are
+        // transient, and context_debug snapshots are large and only meaningful
+        // at the moment of emission. Session reconnect doesn't need individual
+        // deltas — the chat history is loaded via getSessionMessages instead.
         let session_event = if is_ephemeral {
             // Fast path: no logging, just fan out. Leave event_id as None
             // so the dedup filter in stream_with_replay passes it through

@@ -90,6 +90,10 @@ pub struct AgentConfig {
     pub shell_policy: String,
     /// Enabled builtin tools. Empty = all enabled (backward compatible).
     pub enabled_tools: Vec<String>,
+    /// When true, the runtime emits a `ContextDebug` event after building
+    /// the context window, allowing the web UI to display exactly what the
+    /// LLM sees (system prompt, history, tools, token counts).
+    pub debug_mode: bool,
 }
 
 impl Default for AgentConfig {
@@ -104,6 +108,7 @@ impl Default for AgentConfig {
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
             enabled_tools: Vec::new(),
+            debug_mode: false,
         }
     }
 }

@@ -798,6 +798,7 @@ fn agent_config_for_subagent(
         max_tokens: base.max_tokens,
         context_config: base.context_config.clone(),
         prompts: base.prompts.clone(),
+        debug_mode: false,
     };
     (config, model, provider)
 }
@@ -1034,6 +1035,9 @@ async fn run_agent_loop(
                     RuntimeEvent::Warning { code, message, .. } => {
                         parent_fwd.forward_warning(code, message, agent_label);
                     }
+                    // ContextDebug events from subagents are suppressed --
+                    // they are only useful for the top-level agent's context.
+                    RuntimeEvent::ContextDebug { .. } => continue,
                 }
             }
         });

@@ -204,6 +204,11 @@ pub struct CreateRunRequest {
     /// Optional provider override: "openai" | "anthropic" | "openrouter".
     #[serde(default)]
     pub provider: Option<String>,
+    /// When true, the runtime emits a `context_debug` SSE event with the
+    /// full assembled context window before calling the LLM. Used by the
+    /// web UI to inspect exactly what the LLM sees.
+    #[serde(default)]
+    pub debug_mode: Option<bool>,
 }
 
 /// Input to a run

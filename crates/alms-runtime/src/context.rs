@@ -383,7 +383,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// Estimate tokens for a full LlmMessage, including tool_calls if present.
 /// Plain text messages use `content_str()`. Tool call messages (content: None,
 /// tool_calls: Some) estimate from the serialized tool call JSON instead.
-fn estimate_llm_message_tokens(msg: &LlmMessage) -> usize {
+pub(crate) fn estimate_llm_message_tokens(msg: &LlmMessage) -> usize {
     let content_tokens = estimate_tokens(msg.content_str());
     let tool_call_tokens = msg
         .tool_calls

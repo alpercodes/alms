@@ -4,6 +4,7 @@ import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
 import { Message, ErrorMessage, WarningMessage, SystemMessage, DmEndedMessage, TokenBadge } from './components/chat/message.js';
 import { ToolRow, ToolGroup } from './components/chat/tool-row.js';
+import { ContextDebugRow } from './components/chat/context-debug-row.js';
 import { ApprovalCard } from './components/chat/approval-card.js';
 import { MessageQueue } from './components/chat/message-queue.js';
 import { InputArea } from './components/chat/input-area.js';
@@ -98,6 +99,9 @@ function ChatView() {
                     }
                     if (m.type === 'tool') {
                         return html`<${ToolRow} key=${m.id} ...${m} />`;
+                    }
+                    if (m.type === 'context_debug') {
+                        return html`<${ContextDebugRow} key=${m.id} ...${m} />`;
                     }
                     if (m.type === 'approval') {
                         return html`<${ApprovalCard} key=${m.id} ...${m} />`;
