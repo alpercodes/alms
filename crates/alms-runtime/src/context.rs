@@ -285,6 +285,7 @@ impl ContextBuilder {
                 LlmMessage {
                     role: "assistant".to_string(),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(vec![ToolCall {
                         id: tool_call_id,
                         function: FunctionCall {
@@ -437,6 +438,7 @@ mod tests {
         let msg = LlmMessage {
             role: "assistant".to_string(),
             content: None,
+            reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_abc123".to_string(),
                 function: FunctionCall {
@@ -1144,6 +1146,7 @@ mod tests {
             LlmMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".to_string(),
                     function: FunctionCall {
@@ -1157,6 +1160,7 @@ mod tests {
             LlmMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_2".to_string(),
                     function: FunctionCall {

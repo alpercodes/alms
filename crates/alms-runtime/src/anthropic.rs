@@ -334,6 +334,7 @@ pub(crate) fn from_anthropic_response(resp: AnthropicResponse) -> CompletionResp
                 } else {
                     Some(text_parts.join(""))
                 },
+                reasoning_content: None,
                 tool_calls: if tool_calls.is_empty() {
                     None
                 } else {
@@ -379,6 +380,7 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                                     delta: Delta {
                                         role: None,
                                         content: delta.text,
+                                        reasoning_content: None,
                                         tool_calls: None,
                                     },
                                     finish_reason: None,
@@ -397,6 +399,7 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                                         delta: Delta {
                                             role: None,
                                             content: None,
+                                            reasoning_content: None,
                                             tool_calls: Some(vec![ToolCallDelta {
                                                 index,
                                                 id: None,
@@ -437,6 +440,7 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                                 delta: Delta {
                                     role: None,
                                     content: None,
+                                    reasoning_content: None,
                                     tool_calls: Some(vec![ToolCallDelta {
                                         index,
                                         id: Some(id),
@@ -499,6 +503,7 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                                 delta: Delta {
                                     role: Some("assistant".to_string()),
                                     content: None,
+                                    reasoning_content: None,
                                     tool_calls: None,
                                 },
                                 finish_reason: None,
@@ -555,6 +560,7 @@ mod tests {
             LlmMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".to_string(),
                     function: FunctionCall {
@@ -662,6 +668,7 @@ mod tests {
             LlmMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning_content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "c1".to_string(),
                     function: FunctionCall {

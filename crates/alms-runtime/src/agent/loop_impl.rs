@@ -103,6 +103,7 @@ impl AgentRuntime {
                 messages.push(LlmMessage {
                     role: "assistant".to_string(),
                     content: content.clone(),
+                    reasoning_content: None,
                     tool_calls: Some(tool_calls.clone()),
                     tool_call_id: None,
                 });
@@ -269,6 +270,7 @@ impl AgentRuntime {
                     messages.push(LlmMessage {
                         role: "assistant".to_string(),
                         content: Some(text.clone()),
+                        reasoning_content: None,
                         tool_calls: None,
                         tool_call_id: None,
                     });
