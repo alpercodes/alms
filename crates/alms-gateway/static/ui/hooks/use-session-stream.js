@@ -276,36 +276,38 @@ export function openSessionStream(sessionId, opts) {
 
     // -- tool_end --
     on('tool_end', (e) => {
-        const data = JSON.parse(e.data);
-        const matchId = data.tool_invocation_id;
-        const status = data.ok ? 'done' : 'fail';
+        batch(() => {
+            const data = JSON.parse(e.data);
+            const matchId = data.tool_invocation_id;
+            const status = data.ok ? 'done' : 'fail';
 
-        if (data.source_agent) {
-            trackSubagentTool(data.source_agent, { id: matchId, status, result: data.result });
-        }
-
-        const endedAt = Date.now();
-
-        const msgs = [...chatMessages.value];
-        const idx = matchId
-            ? msgs.findLastIndex(m => m.type === 'tool' && m.id === matchId)
-            : msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
-        if (idx >= 0) {
-            const durationMs = msgs[idx].startedAt ? endedAt - msgs[idx].startedAt : null;
-            msgs[idx] = { ...msgs[idx], status, result: data.result, durationMs };
-            if (msgs[idx].tool === 'invoke_agent') {
-                const name = msgs[idx].params?.name || msgs[idx].params?.subagent_name;
-                const resultObj = typeof data.result === 'object' ? data.result : null;
-                const isBackground = resultObj && resultObj.task_id;
-                if (name && !isBackground) {
-                    trackSubagentEnd(name, status);
-                }
+            if (data.source_agent) {
+                trackSubagentTool(data.source_agent, { id: matchId, status, result: data.result });
             }
-            chatMessages.value = msgs;
-        }
-        // When no matching tool message was found (e.g. subagent-only tool
-        // events), skip the chatMessages write to avoid an unnecessary
-        // re-render with a new array reference.
+
+            const endedAt = Date.now();
+
+            const msgs = [...chatMessages.value];
+            const idx = matchId
+                ? msgs.findLastIndex(m => m.type === 'tool' && m.id === matchId)
+                : msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
+            if (idx >= 0) {
+                const durationMs = msgs[idx].startedAt ? endedAt - msgs[idx].startedAt : null;
+                msgs[idx] = { ...msgs[idx], status, result: data.result, durationMs };
+                if (msgs[idx].tool === 'invoke_agent') {
+                    const name = msgs[idx].params?.name || msgs[idx].params?.subagent_name;
+                    const resultObj = typeof data.result === 'object' ? data.result : null;
+                    const isBackground = resultObj && resultObj.task_id;
+                    if (name && !isBackground) {
+                        trackSubagentEnd(name, status);
+                    }
+                }
+                chatMessages.value = msgs;
+            }
+            // When no matching tool message was found (e.g. subagent-only tool
+            // events), skip the chatMessages write to avoid an unnecessary
+            // re-render with a new array reference.
+        });
     });
 
     // -- approval_required --
@@ -323,21 +325,23 @@ export function openSessionStream(sessionId, opts) {
 
     // -- subagent_completed --
     on('subagent_completed', (e) => {
-        const data = JSON.parse(e.data);
-        const name = data.subagent_name || 'subagent';
-        const status = data.status || 'done';
+        batch(() => {
+            const data = JSON.parse(e.data);
+            const name = data.subagent_name || 'subagent';
+            const status = data.status || 'done';
 
-        // Update SubagentBar (stays visible until notification run finishes)
-        trackSubagentEnd(name, status);
+            // Update SubagentBar (stays visible until notification run finishes)
+            trackSubagentEnd(name, status);
 
-        // Show system message in chat
-        const label = status === 'done' ? 'completed'
-            : status === 'fail' ? 'failed'
-            : status === 'cancelled' ? 'cancelled' : 'completed';
-        chatMessages.value = [...chatMessages.value, {
-            id: nextMsgId(), type: 'system',
-            text: `Subagent '${name}' ${label}.`,
-        }];
+            // Show system message in chat
+            const label = status === 'done' ? 'completed'
+                : status === 'fail' ? 'failed'
+                : status === 'cancelled' ? 'cancelled' : 'completed';
+            chatMessages.value = [...chatMessages.value, {
+                id: nextMsgId(), type: 'system',
+                text: `Subagent '${name}' ${label}.`,
+            }];
+        });
     });
 
     // -- job_completed --

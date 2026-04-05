@@ -1,4 +1,4 @@
-import { h, html, render, signal, useEffect, useRef, useSignal } from './deps.js';
+import { h, html, render, signal, effect, useEffect, useRef, useSignal } from './deps.js';
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
@@ -55,10 +55,18 @@ function groupMessages(msgs) {
 function ChatView() {
     const messagesRef = useRef(null);
 
-    // Auto-scroll when messages change
+    // Auto-scroll when messages change.
+    // Use effect() from @preact/signals instead of useEffect with
+    // [chatMessages.value] -- under the optimised re-render path,
+    // Preact can skip hook re-evaluation and the useEffect would
+    // never fire.  effect() subscribes directly to the signal graph.
     useEffect(() => {
-        scrollToBottom(messagesRef.current);
-    }, [chatMessages.value]);
+        const dispose = effect(() => {
+            chatMessages.value; // subscribe to the signal
+            scrollToBottom(messagesRef.current);
+        });
+        return dispose;
+    }, []);
 
     // Compute grouping inline — useMemo with signal.value as a dependency
     // can miss updates because @preact/signals may re-render the component
