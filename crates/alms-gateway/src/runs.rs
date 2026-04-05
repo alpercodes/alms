@@ -2043,9 +2043,20 @@ pub(crate) async fn run_trigger_loop(
                 // notification run (and the LLM's response to it) is visible
                 // to the user.
                 //
-                // If no user-facing session exists, keep the `notifications:`
-                // fallback and emit a marker via `notify_dm_ended_to_webchat`
-                // so the user at least sees that the conversation ended.
+                // NOTE (multi-session edge case): when an agent has multiple
+                // user-facing sessions, this picks the most recently active
+                // one, which may be an unrelated conversation.  This is an
+                // acceptable trade-off for MVP — an invisible notification is
+                // worse than a slightly misplaced one.  The notification
+                // input from `format_dm_ended_notification` includes clear
+                // framing ("[DM conversation ended]") that helps the LLM
+                // compartmentalize even if the target session has unrelated
+                // history.
+                //
+                // If no user-facing session exists, the notification run
+                // proceeds on the invisible `notifications:` session.  The
+                // LLM response will not be visible to the user, but the run
+                // is still recorded for auditability.
                 if source_session_id.is_none() {
                     if let Some(target) = find_user_facing_session(&state.session_manager, agent_id)
                     {
@@ -2057,20 +2068,17 @@ pub(crate) async fn run_trigger_loop(
                         );
                         session_id = target.id;
                         context_id = target.context_id;
-                    } else if let Some(ref peer_name) = peer_name_resolved {
-                        // No user-facing session found — fall back to the
-                        // invisible notifications: session and emit a marker
-                        // so the user sees *something* when they next open a
-                        // session for this agent.
-                        let dm_context = alms_core::dm_context_id(from_name, peer_name);
-                        notify_dm_ended_to_webchat(
-                            &state,
-                            agent_id,
-                            from_name,
-                            &reason.to_string(),
-                            &dm_context,
-                        )
-                        .await;
+                    } else {
+                        // No user-facing session exists — the notification
+                        // run will proceed on the original `notifications:`
+                        // session.  We only log here; the run itself still
+                        // executes so the agent can update workspace files
+                        // (goals/memories) even if no human sees the output.
+                        warn!(
+                            agent_id = %agent_id.0,
+                            "No user-facing session for agent — notification run will \
+                             execute on invisible notifications: session"
+                        );
                     }
                 }
 

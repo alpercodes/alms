@@ -56,7 +56,7 @@ Agents can send messages to any other agent by name via the `send_message` tool.
 - **Start**: First `send_message` creates the shared DM session and begins depth tracking.
 - **Exchange**: Each reply increments a depth counter per DM pair (max: `MAX_DM_DEPTH` = 20). The inactivity timeout is 30 minutes (`DEPTH_EXPIRY_SECS` = 1800).
 - **End**: Triggered by `ignore_message` (agent declines to reply) or depth limit exceeded. `MessageBus::end_conversation()` writes a `dm_ended` marker to the DM session, resets the depth counter, and emits a `ConversationEnded` `RunTrigger` to the peer.
-- **Peer notification**: The peer receives a one-shot notification run on a dedicated `notifications:{agent_name}` session (not the DM session). This run does NOT include the DM addendum. The agent can then report results, update goals/memories, or take other action.
+- **Peer notification**: The peer receives a one-shot notification run. When the peer has a user-facing session, the notification run is rerouted to the most recent one so the user can see both the notification and the agent's LLM response inline (#495). When no user-facing session exists, the run falls back to the invisible `notifications:{agent_name}` session. This run does NOT include the DM addendum. The agent can then report results, update goals/memories, or take other action.
 - **SSE event**: A `dm_conversation_ended` event is emitted on the DM session stream for web UI rendering.
 
 ---

@@ -301,7 +301,7 @@ When called, the run ends early. The ignore is logged but no response is broadca
 **DM conversation lifecycle:** When `ignore_message` is called during a DM run (i.e. the context_id starts with `dm:`), the gateway detects the empty response and signals the end of the conversation via `MessageBus::end_conversation()`. This:
 1. Writes a `dm_ended` metadata marker to the shared DM session (with `ended_by` and `reason` fields).
 2. Resets the depth counter for the DM pair to zero, allowing a fresh conversation immediately.
-3. Emits a `RunTrigger` with `MessageSource::ConversationEnded` targeting the peer agent on a dedicated `notifications:{agent_name}` session.
+3. Emits a `RunTrigger` with `MessageSource::ConversationEnded` targeting the peer agent. When the peer has a user-facing session, `run_trigger_loop` reroutes the notification run to the most recent one so the response is visible to the user (#495). When no user-facing session exists, the run falls back to the `notifications:{agent_name}` session.
 4. Emits a `dm_conversation_ended` SSE event on the DM session stream for web UI rendering. For `ignore_message`, this is emitted in `execute_run` after `end_conversation` returns. For depth-exceeded, it is emitted in `run_trigger_loop` when processing the `ConversationEnded` trigger (#419).
 
 The peer receives a one-shot notification run. The raw `RunTrigger.input` from `end_conversation()` is a simple marker, but `run_trigger_loop` in `runs.rs` enriches it via `format_dm_ended_notification()`, which produces a richer message including the reason and a `read_messages` hint. For example, when the reason is `Ignored`:
@@ -811,7 +811,8 @@ Agent B runs, processes message, may reply (send_message back) or end (ignore_me
   |          [DM conversation ended] Agent "B" ended the conversation (chose not to reply).
   |          You can use read_messages(from: "B") to review the conversation history.
   |          Decide what to do next: report results, update your goals/memories, or take other action.
-  |      - Session: notifications:{agent_a_name} (dedicated, accumulates all notifications)
+  |      - Session: rerouted to the agent's most recent user-facing session (#495);
+  |          falls back to notifications:{agent_a_name} only if no user-facing session exists
   |      - No DM addendum injected (is_peer = false)
   |      - Agent can report results, update goals/memories, etc.
   |
@@ -833,7 +834,7 @@ Agent B runs, processes message, may reply (send_message back) or end (ignore_me
 
 - **`ConversationEndReason` enum** (`crates/alms-tools/src/message_sender.rs`): `Ignored` (agent called `ignore_message`) or `DepthExceeded` (MAX_DM_DEPTH hit). Included in the `dm_ended` marker metadata and the `ConversationEnded` `RunTrigger`.
 
-- **Notification sessions**: Context ID pattern `notifications:{agent_name}`, one per agent. These are persistent sessions that accumulate all DM-end notifications. They do NOT start with `dm:`, so the existing DM detection code naturally skips DM-specific behavior (no DM addendum, no perspective mapping). Notification sessions are excluded from user-facing context (e.g. the `user.md` workspace file).
+- **Notification sessions**: Context ID pattern `notifications:{agent_name}`, one per agent. Since #495, notification runs are rerouted to the agent's most recent user-facing session so the user can see the LLM response inline. The `notifications:` session is only used as a fallback when no user-facing session exists. These sessions do NOT start with `dm:`, so the existing DM detection code naturally skips DM-specific behavior (no DM addendum, no perspective mapping). Notification sessions are excluded from user-facing context (e.g. the `user.md` workspace file).
 
 - **`dm_conversation_ended` SSE event** (`crates/alms-gateway/src/sse.rs`): Emitted on the DM session stream. Payload: `{session_id, ended_by, peer, reason, context_id, ts}`. The frontend should be prepared to handle duplicates (simultaneous ignore from both agents may emit two events).
 
