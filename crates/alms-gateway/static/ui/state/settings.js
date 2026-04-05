@@ -23,11 +23,6 @@ export function saveSettings(updates) {
     localSettings.value = merged;
 }
 
-/** Whether debug mode (context inspection) is enabled. */
-export function isDebugMode() {
-    return !!localSettings.value.debug_mode;
-}
-
 /** Re-fetch server defaults after a PATCH /settings update. */
 export async function refreshServerDefaults() {
     try {
