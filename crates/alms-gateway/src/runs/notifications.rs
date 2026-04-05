@@ -1,0 +1,926 @@
+//! DM notification routing, scheduler integration, and trigger loops.
+
+use super::{RunOverrides, RunParams, find_user_facing_session};
+use crate::cron_utils;
+use crate::server::AppState;
+use crate::sse::SseEventData;
+use alms_core::{JobId, JobSchedule, JobStatus, Run, RunId, RunStatus, SessionId};
+use alms_tools::message_sender::ConversationEndReason;
+use chrono::Utc;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, instrument, warn};
+
+use super::lifecycle::execute_run;
+
+// ---------------------------------------------------------------------------
+// Scheduler integration
+// ---------------------------------------------------------------------------
+
+/// Receives fired job IDs from the scheduler and dispatches agent runs.
+///
+/// Each fired job is handled in its own spawned task so a slow run does not
+/// block the fire loop from processing subsequent firings.
+pub(crate) async fn scheduler_fire_loop(mut rx: mpsc::UnboundedReceiver<JobId>, state: AppState) {
+    while let Some(job_id) = rx.recv().await {
+        // Resolve session for queue keying so jobs on the same session
+        // don't race with each other or with interactive runs.
+        let Some(job) = state.job_store.get(job_id) else {
+            continue;
+        };
+        if job.status == JobStatus::Cancelled {
+            continue;
+        }
+        let state_clone = state.clone();
+        state.agent_queue.enqueue(
+            job.agent_id,
+            Box::pin(async move {
+                if let Err(e) = fire_job_run(state_clone, job_id).await {
+                    error!("Job {} run dispatch failed: {}", job_id, e);
+                }
+            }),
+        );
+    }
+}
+
+/// Create and execute an agent run triggered by a scheduled job.
+#[instrument(level = "info", skip(state), fields(job_id = %job_id))]
+async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<()> {
+    // Look up the job — it may have been cancelled between scheduling and firing.
+    let Some(job) = state.job_store.get(job_id) else {
+        info!("Skipping fired job — not found in store");
+        return Ok(());
+    };
+    if job.status == JobStatus::Cancelled {
+        info!("Skipping fired job — already cancelled");
+        return Ok(());
+    }
+
+    // Use a stable context_id so each job accumulates session history across firings.
+    let context_id = format!("job_{}", job_id.0);
+    let session = state
+        .session_manager
+        .get_or_create(job.agent_id, &context_id);
+    let session_id = session.id;
+
+    let run = Run::for_job(session_id, job.agent_id, job.prompt.clone(), job_id);
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+    // Job runs execute inline (not via agent_queue) so queued_behind is 0.
+    state
+        .run_manager
+        .send_session_event(
+            session_id,
+            run_id,
+            SseEventData::run_created(run_id, session_id, true, Some("job".to_string()), 0),
+        )
+        .await;
+    info!("Job fired -> run {}", run_id.0);
+
+    // Execute the run (awaits completion; errors are handled inside execute_run).
+    // Register the token so scheduled job runs are cancellable via POST /runs/{id}/cancel
+    // in addition to the job-level DELETE /jobs/{id} path.
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    execute_run(
+        state.clone(),
+        RunParams {
+            run_id,
+            session_id,
+            agent_id: job.agent_id,
+            input: run.input,
+            overrides: RunOverrides::default(),
+            context_id,
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: true,
+        },
+    )
+    .await;
+
+    // -- Job completion notification --
+    // Send a notification to the agent's most recent user-facing session
+    // so the user can see that the job ran (even if they weren't watching
+    // the hidden job_* session).
+    notify_job_completion(&state, job.agent_id, &job.prompt, run_id).await;
+
+    // Guard: if the job was cancelled while the run was in progress, do not
+    // overwrite the Cancelled status or re-arm the scheduler.
+    if state
+        .job_store
+        .get(job_id)
+        .map(|j| j.status == JobStatus::Cancelled)
+        .unwrap_or(true)
+    {
+        info!("Job was cancelled during run, skipping post-run update");
+        return Ok(());
+    }
+
+    // Update job record after run completes.
+    let now = Utc::now();
+    let (new_status, next_run_at) = match &job.schedule {
+        JobSchedule::Once { .. } => (JobStatus::Cancelled, None),
+        JobSchedule::Recurring { cron } => {
+            let next = cron_utils::next_after(cron, now);
+            if next.is_none() {
+                warn!("Recurring cron '{}' has no future occurrences", cron);
+            }
+            (JobStatus::Active, next)
+        }
+    };
+
+    state
+        .job_store
+        .record_run(job_id, now, new_status, next_run_at)?;
+
+    // Re-arm recurring jobs with the next computed fire time.
+    if let Some(next) = next_run_at {
+        let delay = (next - now).to_std().unwrap_or(std::time::Duration::ZERO);
+        let instant = tokio::time::Instant::now() + delay;
+        state.scheduler.schedule_once(job_id, instant).await;
+        info!("Recurring job re-armed for {}", next);
+    }
+
+    Ok(())
+}
+
+/// Send a job-completion notification to the agent's most recent user-facing
+/// session. This makes job runs visible in the chat without creating a full
+/// notification run (which would trigger another LLM call).
+async fn notify_job_completion(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    job_prompt: &str,
+    run_id: RunId,
+) {
+    // Determine outcome from the completed run.
+    let (status, summary) = match state.run_manager.get_run(run_id) {
+        Some(run) => match run.status {
+            RunStatus::Completed => {
+                let output = run.output.unwrap_or_default();
+                let summary: String = if output.len() > 200 {
+                    format!("{}...", output.chars().take(200).collect::<String>())
+                } else {
+                    output
+                };
+                ("success", summary)
+            }
+            RunStatus::Failed => {
+                let err = run.error.unwrap_or_else(|| "unknown error".to_string());
+                ("error", err)
+            }
+            RunStatus::Cancelled => ("cancelled", "run was cancelled".to_string()),
+            RunStatus::Queued | RunStatus::Running => {
+                // Shouldn't happen — execute_run already returned.
+                ("unknown", "run still in progress".to_string())
+            }
+        },
+        None => ("error", "run record not found".to_string()),
+    };
+
+    // Find the agent's most recent user-facing session (exclude internal sessions).
+    let Some(target) = find_user_facing_session(&state.session_manager, agent_id) else {
+        debug!(
+            "No user-facing session for agent {} — skipping job notification",
+            agent_id
+        );
+        return;
+    };
+    let target_session_id = target.id;
+
+    // Truncate the prompt for display.
+    let job_name: String = if job_prompt.len() > 60 {
+        format!("{}...", job_prompt.chars().take(60).collect::<String>())
+    } else {
+        job_prompt.to_string()
+    };
+
+    // Send SSE event to the target session so connected UI clients see it.
+    state
+        .run_manager
+        .send_session_event(
+            target_session_id,
+            alms_core::RunId::new(), // no associated run on this session
+            SseEventData::job_completed(target_session_id, &job_name, status, &summary),
+        )
+        .await;
+
+    // Persist a marker message to the session history so it appears on reload.
+    let label = match status {
+        "success" => "completed",
+        "error" => "failed",
+        _ => "finished",
+    };
+    let marker = alms_session::Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: alms_session::Role::System,
+        content: alms_session::Content::Text(format!(
+            "[Scheduled job {label}] {job_name}\n{summary}"
+        )),
+        timestamp: alms_core::Timestamp::now(),
+        metadata: Some(serde_json::json!({
+            "synthetic": true,
+            "type": "job_notification"
+        })),
+    };
+    if let Err(e) = state
+        .session_manager
+        .append_message(target_session_id, marker)
+    {
+        warn!("Failed to persist job completion marker: {e}");
+    }
+
+    info!(
+        "Job notification sent to session {} (status={status})",
+        target_session_id.0
+    );
+}
+
+/// Forward a `dm_conversation_ended` event to the agent's user-facing
+/// web-chat session so the human watching that session sees a notification.
+///
+/// Without this, the `dm_conversation_ended` SSE event only lands on the DM
+/// session's SSE stream (which the user is typically not watching) and the
+/// notification run executes on a `notifications:` session (also invisible
+/// to the web-chat).
+///
+/// This mirrors `notify_job_completion`: find the most recent user-facing
+/// session, emit an SSE event, and persist a marker message so it survives
+/// page reloads.
+pub(super) async fn notify_dm_ended_to_webchat(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    peer_name: &str,
+    reason: &str,
+    context_id: &str,
+) {
+    info!(
+        agent_id = %agent_id,
+        peer = %peer_name,
+        reason = %reason,
+        "notify_dm_ended_to_webchat called — looking for user-facing session"
+    );
+
+    // Find the agent's most recent user-facing session (exclude internal sessions).
+    let Some(target) = find_user_facing_session(&state.session_manager, agent_id) else {
+        info!(
+            agent_id = %agent_id,
+            "No user-facing session for agent — skipping DM ended web-chat notification"
+        );
+        return;
+    };
+    let target_session_id = target.id;
+
+    // Emit SSE event on the web-chat session so connected UI clients see it.
+    let dummy_run_id = RunId::new();
+    state
+        .run_manager
+        .send_session_event(
+            target_session_id,
+            dummy_run_id,
+            SseEventData::dm_conversation_ended(
+                target_session_id,
+                "system",
+                peer_name,
+                reason,
+                context_id,
+            ),
+        )
+        .await;
+
+    // Persist a marker message so it appears on reload.
+    let reason_text = match reason {
+        "ignored" => "no further replies".to_string(),
+        "depth_exceeded" => "message limit reached".to_string(),
+        other => other.to_string(),
+    };
+    let marker = alms_session::Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: alms_session::Role::System,
+        content: alms_session::Content::Text(format!(
+            "[DM conversation ended] Conversation with {peer_name} ended ({reason_text})."
+        )),
+        timestamp: alms_core::Timestamp::now(),
+        metadata: Some(serde_json::json!({
+            "synthetic": true,
+            "type": "dm_ended_notification",
+            "peer": peer_name,
+            "reason": reason,
+            "context_id": context_id,
+        })),
+    };
+    if let Err(e) = state
+        .session_manager
+        .append_message(target_session_id, marker)
+    {
+        warn!("Failed to persist DM ended marker to web-chat session: {e}");
+    }
+
+    info!(
+        "DM ended notification forwarded to web-chat session {} (peer={peer_name}, reason={reason})",
+        target_session_id.0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Subagent completion notifications
+// ---------------------------------------------------------------------------
+
+/// Receives background subagent completion events and creates follow-up
+/// runs on the parent agent's session so the parent is automatically notified.
+///
+/// This mirrors `scheduler_fire_loop`: each notification is enqueued via
+/// `SessionQueue` to respect per-session FIFO ordering.
+pub(crate) async fn completion_notification_loop(
+    mut rx: mpsc::UnboundedReceiver<alms_coordinator::SubagentCompletion>,
+    state: AppState,
+) {
+    while let Some(completion) = rx.recv().await {
+        let session_id = completion.parent_session_id;
+        let agent_id = completion.parent_agent_id;
+
+        // Verify the parent session still exists.
+        let context_id = match state.session_manager.get(session_id) {
+            Ok(session) => session.context_id,
+            Err(_) => {
+                warn!(
+                    session_id = %session_id.0,
+                    task_id = %completion.task_id.0,
+                    "Parent session not found for subagent completion notification — skipping"
+                );
+                continue;
+            }
+        };
+
+        // Notify session subscribers that a subagent completed.
+        // This updates the SubagentBar and shows a system message BEFORE
+        // the notification run starts.
+        let status_str = match completion.status {
+            alms_coordinator::TaskStatus::Completed => "done",
+            alms_coordinator::TaskStatus::Failed => "fail",
+            alms_coordinator::TaskStatus::Cancelled => "cancelled",
+            _ => "done",
+        };
+        state
+            .run_manager
+            .send_session_event(
+                session_id,
+                alms_core::RunId::new(), // no run yet
+                SseEventData::subagent_completed(
+                    session_id,
+                    completion.subagent_name.clone(),
+                    status_str,
+                    &completion.summary,
+                ),
+            )
+            .await;
+
+        // Persist the subagent completion marker to session history so it
+        // survives page refreshes and appears in the chat on reload.
+        {
+            let name = completion.subagent_name.as_deref().unwrap_or("subagent");
+            let label = match status_str {
+                "fail" => "failed",
+                "cancelled" => "cancelled",
+                _ => "completed",
+            };
+            let marker = alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: alms_session::Role::System,
+                content: alms_session::Content::Text(format!("Subagent '{}' {}.", name, label)),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({
+                    "synthetic": true,
+                    "type": "subagent_completion",
+                    "subagent_name": name,
+                    "status": status_str,
+                })),
+            };
+            if let Err(e) = state.session_manager.append_message(session_id, marker) {
+                warn!("Failed to persist subagent completion marker: {e}");
+            }
+        }
+
+        let notification = format_completion_notification(&completion);
+
+        info!(
+            session_id = %session_id.0,
+            task_id = %completion.task_id.0,
+            subagent = ?completion.subagent_name,
+            "Subagent completion -> creating notification run"
+        );
+
+        let run_id = enqueue_triggered_run(
+            &state,
+            agent_id,
+            session_id,
+            notification,
+            context_id,
+            "subagent".to_string(),
+            false, // subagent completion — not a peer message
+        )
+        .await;
+
+        debug!(
+            run_id = %run_id.0,
+            session_id = %session_id.0,
+            task_id = %completion.task_id.0,
+            "Notification run enqueued"
+        );
+    }
+}
+
+/// Creates a run, registers it, sends the SSE `run_created` event, and
+/// enqueues the run at low priority for execution.
+///
+/// Shared helper for [`completion_notification_loop`] and [`run_trigger_loop`],
+/// which both follow the same create-register-enqueue pattern.
+async fn enqueue_triggered_run(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    session_id: SessionId,
+    input: String,
+    context_id: String,
+    source_label: String,
+    is_peer_message: bool,
+) -> RunId {
+    let run = Run::new(session_id, agent_id, input.clone());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    let queued_behind = state.agent_queue.pending_count(&agent_id);
+    state
+        .run_manager
+        .send_session_event(
+            session_id,
+            run_id,
+            SseEventData::run_created(run_id, session_id, true, Some(source_label), queued_behind),
+        )
+        .await;
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    let state_clone = state.clone();
+    state.agent_queue.enqueue_low(
+        agent_id,
+        Box::pin(async move {
+            execute_run(
+                state_clone,
+                RunParams {
+                    run_id,
+                    session_id,
+                    agent_id,
+                    input,
+                    overrides: RunOverrides::default(),
+                    context_id,
+                    cancel_token,
+                    is_peer_message,
+                    // All runs via enqueue_triggered_run are system-triggered
+                    // (no human watching), so Guarded posture is overridden.
+                    is_system_triggered: true,
+                },
+            )
+            .await;
+        }),
+    );
+
+    run_id
+}
+
+/// Template for subagent completion notifications, loaded at compile time from
+/// `crates/alms-runtime/prompts/subagent_completed.md`.
+const SUBAGENT_COMPLETED_TEMPLATE: &str =
+    include_str!("../../../alms-runtime/prompts/subagent_completed.md");
+
+/// Format a human-readable notification message for the parent agent.
+fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> String {
+    let status = match c.status {
+        alms_coordinator::TaskStatus::Completed => "completed",
+        alms_coordinator::TaskStatus::Failed => "failed",
+        alms_coordinator::TaskStatus::Cancelled => "cancelled",
+        _ => "finished",
+    };
+
+    let (label, follow_up) = match &c.subagent_name {
+        Some(name) => (
+            format!("\"{name}\""),
+            format!("Use read_subagent_session(\"{name}\") for the full conversation history."),
+        ),
+        None => (
+            format!("(task {})", c.task_id.0),
+            "The subagent result summary is included above.".to_string(),
+        ),
+    };
+
+    SUBAGENT_COMPLETED_TEMPLATE
+        .replace("{label}", &label)
+        .replace("{status}", status)
+        .replace("{summary}", &c.summary)
+        .replace("{follow_up}", &follow_up)
+}
+
+/// Maximum character length for the formatted conversation transcript
+/// included in DM-ended notifications. Very long conversations are
+/// truncated from the beginning (keeping the most recent messages) so the
+/// agent sees the tail of the discussion.
+pub(super) const DM_HISTORY_MAX_CHARS: usize = 4000;
+
+/// Template for DM-ended notification with conversation history, loaded at
+/// compile time from `crates/alms-runtime/prompts/dm_ended_with_history.md`.
+const DM_ENDED_WITH_HISTORY_TEMPLATE: &str =
+    include_str!("../../../alms-runtime/prompts/dm_ended_with_history.md");
+
+/// Template for DM-ended notification without history (fallback), loaded at
+/// compile time from `crates/alms-runtime/prompts/dm_ended_no_history.md`.
+const DM_ENDED_NO_HISTORY_TEMPLATE: &str =
+    include_str!("../../../alms-runtime/prompts/dm_ended_no_history.md");
+
+/// Format a human-readable notification message for a DM conversation ending.
+///
+/// This is used by `run_trigger_loop` when it receives a
+/// `MessageSource::ConversationEnded` trigger.  The notification tells the
+/// peer agent that the DM conversation has ended, includes the reason, and
+/// — when `conversation_history` is provided — embeds the full DM
+/// transcript so the agent can act immediately without calling
+/// `read_messages`.
+pub(super) fn format_dm_ended_notification(
+    from_name: &str,
+    reason: ConversationEndReason,
+    conversation_history: Option<&str>,
+) -> String {
+    let reason_text = match reason {
+        ConversationEndReason::Ignored => {
+            format!("Agent \"{from_name}\" ended the conversation (chose not to reply).")
+        }
+        ConversationEndReason::DepthExceeded => {
+            format!(
+                "The conversation with agent \"{from_name}\" was terminated \
+                 because the maximum message depth was reached."
+            )
+        }
+    };
+
+    match conversation_history {
+        Some(history) if !history.is_empty() => DM_ENDED_WITH_HISTORY_TEMPLATE
+            .replace("{reason}", &reason_text)
+            .replace("{history}", history),
+        _ => {
+            // Fallback: no history available (session already cleaned up,
+            // or error reading it). Point the agent at read_messages.
+            DM_ENDED_NO_HISTORY_TEMPLATE
+                .replace("{reason}", &reason_text)
+                .replace("{from}", from_name)
+        }
+    }
+}
+
+/// Format a DM session's messages into a human-readable conversation
+/// transcript suitable for embedding in a notification.
+///
+/// Only text messages are included (tool calls, tool results, images, and
+/// system markers like `dm_ended` are skipped). Each message is formatted
+/// as:
+///
+/// ```text
+/// [HH:MM] agent_name: message text
+/// ```
+///
+/// The output is truncated to [`DM_HISTORY_MAX_CHARS`] characters. When
+/// truncation is needed, the oldest messages are dropped and a leading
+/// note indicates how many messages were omitted.
+pub(super) fn format_dm_conversation_history(messages: &[alms_session::Message]) -> String {
+    // Collect renderable lines (only text messages with content).
+    let mut lines: Vec<String> = Vec::new();
+
+    for msg in messages {
+        // Skip non-text content (tool calls, tool results, images).
+        let text = match &msg.content {
+            alms_session::Content::Text(t) => t.as_str(),
+            _ => continue,
+        };
+
+        // Skip empty text (e.g. dm_ended markers with empty body).
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        // Skip system metadata markers (dm_ended, synthetic notifications).
+        if let Some(ref meta) = msg.metadata {
+            let msg_type = meta
+                .get("message_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if msg_type == "dm_ended" {
+                continue;
+            }
+            if meta.get("synthetic").and_then(|v| v.as_bool()) == Some(true) {
+                continue;
+            }
+        }
+
+        // Extract sender name from metadata, or fall back to role.
+        let sender = msg
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("from_agent"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(match msg.role {
+                alms_session::Role::User => "user",
+                alms_session::Role::Assistant => "assistant",
+                alms_session::Role::System => "system",
+                alms_session::Role::Tool => "tool",
+            });
+
+        let ts = msg.timestamp.0.format("%H:%M");
+        lines.push(format!("[{ts}] {sender}: {text}"));
+    }
+
+    if lines.is_empty() {
+        return String::new();
+    }
+
+    // Build the full transcript and truncate from the front if needed.
+    let full = lines.join("\n");
+    if full.len() <= DM_HISTORY_MAX_CHARS {
+        return full;
+    }
+
+    // Walk from the end to find how many lines fit within the budget,
+    // leaving room for the "[N earlier messages omitted]" prefix.
+    let omitted_prefix_budget = 60; // generous estimate
+    let budget = DM_HISTORY_MAX_CHARS.saturating_sub(omitted_prefix_budget);
+    let mut included_start = lines.len();
+    let mut accumulated = 0usize;
+    for (i, line) in lines.iter().enumerate().rev() {
+        // +1 for the newline separator
+        let cost = line.len() + if i < lines.len() - 1 { 1 } else { 0 };
+        if accumulated + cost > budget {
+            break;
+        }
+        accumulated += cost;
+        included_start = i;
+    }
+
+    let omitted = included_start;
+    let truncated_lines = &lines[included_start..];
+    format!(
+        "[{omitted} earlier message(s) omitted]\n{}",
+        truncated_lines.join("\n")
+    )
+}
+
+// ---------------------------------------------------------------------------
+// RunTrigger loop (peer messaging)
+// ---------------------------------------------------------------------------
+
+/// Processes `RunTrigger` events from the `MessageBus`.
+///
+/// Each trigger creates a run on the target agent's session, reusing the
+/// same `execute_run` path as user-initiated and notification runs.
+///
+/// For `Agent` triggers (peer DMs), the message has already been persisted
+/// to the shared DM session by the `MessageBus`; we pass `is_peer = true`
+/// so `execute_run` uses `run_on_session` (no double-write).
+///
+/// For `ConversationEnded` triggers, the notification text has NOT been
+/// persisted — the MessageBus only wrote a `dm_ended` marker to the DM
+/// session, not to the notification session.  We format a richer
+/// notification here and pass `is_peer = false` so `execute_run` uses
+/// `runtime.run()`, which persists the input to the notification session.
+pub(crate) async fn run_trigger_loop(
+    mut rx: mpsc::UnboundedReceiver<alms_coordinator::message_bus::RunTrigger>,
+    state: AppState,
+) {
+    use alms_coordinator::message_bus::MessageSource;
+
+    while let Some(trigger) = rx.recv().await {
+        let mut session_id = trigger.session_id;
+        let agent_id = trigger.agent_id;
+        let mut context_id = trigger.context_id;
+
+        // Build a source label for SSE `run_created` events and determine
+        // whether this is a peer DM run (which needs the DM addendum) or
+        // a notification run (which must NOT get the DM addendum).
+        let (source_label, is_peer, input) = match &trigger.source {
+            MessageSource::Agent { from_name, .. } => (
+                format!("peer:{from_name}"),
+                true,
+                // Peer DM: input already persisted by MessageBus — pass it
+                // through so the Run record has a copy.
+                trigger.input,
+            ),
+            MessageSource::SubagentCompletion => ("subagent".to_string(), false, trigger.input),
+            MessageSource::ConversationEnded {
+                from_name,
+                reason,
+                source_session_id,
+                ..
+            } => {
+                // Resolve the peer (notification recipient) name for SSE
+                // events and DM context reconstruction.
+                let peer_name_resolved = state
+                    .session_manager
+                    .store()
+                    .and_then(|store| store.load_agent_by_id(agent_id).ok())
+                    .flatten()
+                    .map(|r| r.name);
+
+                // -- Emit dm_conversation_ended SSE for depth-exceeded (#419) --
+                //
+                // The ignore_message path emits this event in execute_run
+                // (line ~967). The depth-exceeded path calls
+                // end_conversation deep inside MessageBus::send(), which
+                // has no access to SSE infrastructure. We emit the event
+                // here instead, since the ConversationEnded trigger
+                // carries all the information we need.
+                if *reason == ConversationEndReason::DepthExceeded {
+                    if let Some(ref peer_name) = peer_name_resolved {
+                        let dm_context = alms_core::dm_context_id(from_name, peer_name);
+                        let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
+
+                        info!(
+                            from = %from_name,
+                            peer = %peer_name,
+                            dm_session = %dm_session_id.0,
+                            "Emitting dm_conversation_ended SSE for depth-exceeded"
+                        );
+
+                        // Use a dummy RunId because the notification run has
+                        // not been created yet at this point.
+                        let dummy_run_id = RunId::new();
+                        state
+                            .run_manager
+                            .send_session_event(
+                                dm_session_id,
+                                dummy_run_id,
+                                SseEventData::dm_conversation_ended(
+                                    dm_session_id,
+                                    from_name,
+                                    peer_name,
+                                    &reason.to_string(),
+                                    &dm_context,
+                                ),
+                            )
+                            .await;
+                    } else {
+                        warn!(
+                            agent_id = %agent_id.0,
+                            from = %from_name,
+                            "Skipping dm_conversation_ended SSE for depth-exceeded: \
+                             agent not found in registry, cannot resolve peer name"
+                        );
+                    }
+                }
+
+                // -- Route notification to user-facing session (#495) --
+                //
+                // When the MessageBus has no source_session for the peer (the
+                // common case for agents that only replied from the DM
+                // session), the trigger targets the invisible
+                // `notifications:{agent}` session.  Override the target to
+                // the agent's most recent user-facing session so the
+                // notification run (and the LLM's response to it) is visible
+                // to the user.
+                //
+                // NOTE (multi-session edge case): when an agent has multiple
+                // user-facing sessions, this picks the most recently active
+                // one, which may be an unrelated conversation.  This is an
+                // acceptable trade-off for MVP — an invisible notification is
+                // worse than a slightly misplaced one.  The notification
+                // input from `format_dm_ended_notification` includes clear
+                // framing ("[DM conversation ended]") that helps the LLM
+                // compartmentalize even if the target session has unrelated
+                // history.
+                //
+                // If no user-facing session exists, the notification run
+                // proceeds on the invisible `notifications:` session.  The
+                // LLM response will not be visible to the user, but the run
+                // is still recorded for auditability.
+                if source_session_id.is_none() {
+                    if let Some(target) = find_user_facing_session(&state.session_manager, agent_id)
+                    {
+                        info!(
+                            agent_id = %agent_id.0,
+                            target_session = %target.id.0,
+                            target_context = %target.context_id,
+                            "Rerouting notification run from notifications: to user-facing session"
+                        );
+                        session_id = target.id;
+                        context_id = target.context_id;
+                    } else {
+                        // No user-facing session exists — the notification
+                        // run will proceed on the original `notifications:`
+                        // session.  We only log here; the run itself still
+                        // executes so the agent can update workspace files
+                        // (goals/memories) even if no human sees the output.
+                        warn!(
+                            agent_id = %agent_id.0,
+                            "No user-facing session for agent — notification run will \
+                             execute on invisible notifications: session"
+                        );
+                    }
+                }
+
+                // -- Forward dm_conversation_ended to the PEER's web-chat --
+                //
+                // The ignore_message path in execute_run calls
+                // notify_dm_ended_to_webchat for the SENDER, but the PEER
+                // (the agent receiving this ConversationEnded trigger) also
+                // needs the visual DM-ended indicator on their web-chat
+                // session.  Without this, the peer's user sees the agent's
+                // response to the notification but not the "conversation
+                // ended" banner (#497).
+                //
+                // For depth_exceeded, the sender does NOT receive a
+                // ConversationEnded trigger (the depth check happens inside
+                // MessageBus::send and only notifies the recipient), so
+                // this call covers the RECIPIENT only. The sender's
+                // web-chat currently lacks a DM-ended indicator for
+                // depth_exceeded — this is a known gap tracked separately.
+                {
+                    let reason_str = reason.to_string();
+                    let dm_context = peer_name_resolved
+                        .as_ref()
+                        .map(|peer_name| alms_core::dm_context_id(from_name, peer_name))
+                        .unwrap_or_default();
+                    notify_dm_ended_to_webchat(
+                        &state,
+                        agent_id,
+                        from_name,
+                        &reason_str,
+                        &dm_context,
+                    )
+                    .await;
+                }
+
+                // -- Fetch DM conversation history (#429) --
+                //
+                // Resolve the DM session and format its message history so
+                // the notification includes the full transcript. This saves
+                // the agent an LLM round-trip that would otherwise be spent
+                // calling read_messages.
+                let conversation_history = peer_name_resolved.as_ref().and_then(|peer_name| {
+                    let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
+                    match state.session_manager.get_history(dm_session_id) {
+                        Ok(messages) => {
+                            let formatted = format_dm_conversation_history(&messages);
+                            if formatted.is_empty() {
+                                None
+                            } else {
+                                Some(formatted)
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                dm_session = %dm_session_id.0,
+                                error = %e,
+                                "Failed to fetch DM history for notification — \
+                                 falling back to read_messages hint"
+                            );
+                            None
+                        }
+                    }
+                });
+
+                (
+                    format!("notification:dm_ended:{from_name}"),
+                    // NOT a peer message — the notification run should not get
+                    // the DM addendum injected (it tells the agent to use
+                    // send_message/ignore_message, which is wrong here).
+                    false,
+                    // Format a richer notification that includes the reason,
+                    // the DM conversation transcript (when available), and a
+                    // follow-up hint.
+                    format_dm_ended_notification(
+                        from_name,
+                        *reason,
+                        conversation_history.as_deref(),
+                    ),
+                )
+            }
+        };
+
+        info!(
+            session_id = %session_id.0,
+            agent_id = %agent_id.0,
+            source = %source_label,
+            "RunTrigger -> creating run"
+        );
+
+        enqueue_triggered_run(
+            &state,
+            agent_id,
+            session_id,
+            input,
+            context_id,
+            source_label,
+            is_peer,
+        )
+        .await;
+    }
+}
