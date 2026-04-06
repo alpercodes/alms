@@ -213,10 +213,13 @@ export function openSessionStream(sessionId, opts) {
      *
      * Bounded to SEEN_IDS_MAX entries to prevent unbounded memory growth
      * on long-lived connections (see #510).  When the cap is exceeded the
-     * set is cleared -- dedup only matters for recent events near
-     * reconnection boundaries, so stale entries are safe to discard.
+     * oldest ~20% of entries are evicted.  Since Set preserves insertion
+     * order, the evicted entries are the oldest IDs -- recent IDs (which
+     * a browser auto-reconnect replay would contain) remain in the set.
+     * The cap is set to 2500 to provide good coverage of the server's
+     * 5000-event replay window (SESSION_EVENT_LOG_MAX).
      */
-    const SEEN_IDS_MAX = 1000;
+    const SEEN_IDS_MAX = 2500;
     const seenEventIds = new Set();
 
     /**
@@ -248,10 +251,18 @@ export function openSessionStream(sessionId, opts) {
             if (seenEventIds.has(id)) return;
             seenEventIds.add(id);
             // Prevent unbounded growth (#510): once the set exceeds the
-            // cap, clear it.  Any future reconnect replay will only
-            // contain recent IDs that will be re-added as they arrive.
+            // cap, evict the oldest ~20% of entries.  Set preserves
+            // insertion order, so we delete from the front to shed stale
+            // IDs while keeping recent ones that a browser auto-reconnect
+            // replay would contain.
             if (seenEventIds.size > SEEN_IDS_MAX) {
-                seenEventIds.clear();
+                const evictCount = Math.floor(SEEN_IDS_MAX * 0.2);
+                let i = 0;
+                for (const oldId of seenEventIds) {
+                    if (i++ >= evictCount) break;
+                    seenEventIds.delete(oldId);
+                }
+                console.debug('[sse-dedup] evicted', evictCount, 'stale IDs, size:', seenEventIds.size);
             }
         }
         handler(e);
