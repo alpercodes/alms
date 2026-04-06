@@ -121,6 +121,12 @@ function sealLastAgent() {
         }
         chatMessages.value = updated;
     } else if (hasThinking) {
+        // Defensive check: log if tool messages were lost during thinking removal.
+        const prevTools = msgs.filter(m => m.type === 'tool').length;
+        const filteredTools = filtered.filter(m => m.type === 'tool').length;
+        if (filteredTools < prevTools) {
+            console.warn('[sealLastAgent] tool message count decreased:', prevTools, '->', filteredTools);
+        }
         chatMessages.value = filtered;
     }
 }
@@ -269,6 +275,10 @@ export function openSessionStream(sessionId, opts) {
             flushDeltaBuffer();
             const data = JSON.parse(e.data);
             const toolId = data.tool_invocation_id || data.call_id || nextMsgId();
+            // Diagnostic: log tool count before insertion for #501 investigation.
+            const toolCountBefore = chatMessages.value.filter(m => m.type === 'tool').length;
+            console.debug('[tool_start]', data.tool, 'id=' + toolId,
+                'tool count before insertion:', toolCountBefore);
 
             const startedAt = Date.now();
 
@@ -464,14 +474,12 @@ export function openSessionStream(sessionId, opts) {
             sealLastAgent();
             const data = e.data ? JSON.parse(e.data) : {};
 
-            // Build the final chatMessages array on a local variable.
-            // Previous versions wrote to chatMessages.value multiple times
-            // inside this batch (once for approval resolution, once for
-            // appended messages). While Preact batches deferred subscriber
-            // notifications, each intermediate write still updates the
-            // signal's internal value. Building the final array once
-            // eliminates any chance of an intermediate state being observed
-            // by a concurrent read (e.g. rAF-scheduled flushDeltaBuffer).
+            // Build the approval-resolution-and-append phase on a local
+            // variable so it results in a single chatMessages.value write.
+            // Note: flushDeltaBuffer() and sealLastAgent() above may each
+            // write to chatMessages.value independently, but this section
+            // (approval resolution + appended status/error/token messages)
+            // is collapsed into one write to avoid intermediate states.
             let msgs = [...chatMessages.value];
             const toolCountBefore = msgs.filter(m => m.type === 'tool').length;
 

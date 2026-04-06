@@ -152,9 +152,20 @@ async function loadAgentSessions(agentId) {
 async function loadHistory(sessionId) {
     try {
         const data = await getSessionMessages(sessionId);
-        chatMessages.value = mapHistoryMessages(data.messages || [], {
+        const rawMsgs = data.messages || [];
+        const mapped = mapHistoryMessages(rawMsgs, {
             hasActiveRun: !!activeRunId.value,
         });
+        // Diagnostic: log tool call counts for #501 investigation.
+        const apiToolCalls = rawMsgs.filter(m => m.type === 'tool_call').length;
+        const mappedTools = mapped.filter(m => m.type === 'tool').length;
+        if (apiToolCalls > 0 || mappedTools > 0) {
+            console.debug('[loadHistory] history loaded:',
+                rawMsgs.length, 'API messages,',
+                apiToolCalls, 'tool_calls ->',
+                mappedTools, 'tool rows');
+        }
+        chatMessages.value = mapped;
         return data.last_event_id ?? null;
     } catch (err) {
         console.error('[loadHistory] failed:', err);
