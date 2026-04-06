@@ -54,9 +54,20 @@ async function selectSession(sessionId) {
     try {
         const data = await getSessionMessages(sessionId);
         if (gen !== selectGeneration) return; // stale — discard
-        chatMessages.value = mapHistoryMessages(data.messages || [], {
+        const rawMsgs = data.messages || [];
+        const mapped = mapHistoryMessages(rawMsgs, {
             hasActiveRun: !!activeRunId.value,
         });
+        // Diagnostic: log tool call counts for #501 investigation.
+        const apiToolCalls = rawMsgs.filter(m => m.type === 'tool_call').length;
+        const mappedTools = mapped.filter(m => m.type === 'tool').length;
+        if (apiToolCalls > 0 || mappedTools > 0) {
+            console.debug('[selectSession] history loaded:',
+                rawMsgs.length, 'API messages,',
+                apiToolCalls, 'tool_calls ->',
+                mappedTools, 'tool rows');
+        }
+        chatMessages.value = mapped;
         // Capture the SSE high-water mark so we can skip replay of events
         // that are already reflected in the loaded messages.
         if (data.last_event_id != null) lastEventId = data.last_event_id;
