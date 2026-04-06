@@ -19,6 +19,13 @@
  *   3. tool_end only writes chatMessages.value when a matching tool
  *      message was actually found (avoids unnecessary re-renders for
  *      subagent-only tool events).
+ *
+ *   4. The `on()` event wrapper captures `selectGeneration` at stream-open
+ *      time and discards any event whose generation no longer matches the
+ *      current value.  This prevents stale SSE events (arriving during
+ *      the close→reopen window of a session switch) from mutating state
+ *      for the wrong session.  The rAF-scheduled `flushDeltaBuffer` path
+ *      has the same guard to cover the token_delta→rAF async gap.
  */
 
 import { batch } from '../deps.js';
@@ -28,6 +35,7 @@ import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearCompleted
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
 import { normalizeApproval } from '../utils/approvals.js';
+import { selectGeneration } from '../state/select-generation.js';
 
 /**
  * Map error codes to user-friendly messages.
@@ -51,6 +59,17 @@ let sessionRetryCount = 0;
 const MAX_SESSION_RETRIES = 10;
 let deltaBuffer = '';
 let flushTimer = null;
+/**
+ * The selectGeneration value captured when the current stream was opened.
+ * Used by the rAF-scheduled flushDeltaBuffer() to discard buffered deltas
+ * that belong to a stale stream (i.e. the user switched sessions between
+ * the token_delta event and the rAF callback).
+ *
+ * Not checked by the synchronous closeSessionStream() flush path -- that
+ * flush is intentional (draining the buffer for the current session before
+ * switching away).
+ */
+let streamGeneration = -1;
 /**
  * Whether any token_delta events were received for the current run.
  * Reset on run_created, set on token_delta. Used to suppress the
@@ -95,13 +114,26 @@ function flushDeltaBuffer() {
 
 function scheduleFlush() {
     if (flushTimer === null) {
+        // Capture the generation at schedule time so the rAF callback
+        // can detect if the session was switched before the frame fires.
+        const gen = streamGeneration;
         // Wrap the rAF callback in batch() so the signal write inside
         // flushDeltaBuffer and any subsequent Preact re-render are
         // coalesced into a single pass.  Without batch(), the signal
         // write triggers an immediate synchronous re-render before the
         // rAF callback returns, which can cause a brief intermediate
         // visual state if another SSE event is queued right after.
-        flushTimer = requestAnimationFrame(() => batch(flushDeltaBuffer));
+        flushTimer = requestAnimationFrame(() => {
+            if (gen !== selectGeneration) {
+                // Session was switched between token_delta and rAF --
+                // discard the buffered deltas to avoid writing to the
+                // wrong session's chatMessages.
+                flushTimer = null;
+                deltaBuffer = '';
+                return;
+            }
+            batch(flushDeltaBuffer);
+        });
     }
 }
 
@@ -156,6 +188,12 @@ export function openSessionStream(sessionId, opts) {
     sessionRetryCount = 0;
     lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
 
+    // Capture the current selectGeneration so SSE handlers can detect
+    // stale events from a previous session's stream.  If the user
+    // switches sessions (which bumps selectGeneration), all handlers
+    // on this stream become no-ops.
+    streamGeneration = selectGeneration;
+
     /**
      * Set of SSE event IDs already processed on this stream.
      *
@@ -179,6 +217,13 @@ export function openSessionStream(sessionId, opts) {
      * accept as a replay cursor.
      */
     const on = (type, handler) => es.addEventListener(type, (e) => {
+        // Generation guard: discard events from a stale stream.
+        // When the user switches sessions, bumpSelectGeneration() is
+        // called before the new stream opens.  Any events still arriving
+        // from the old EventSource (before it fully closes) will have a
+        // streamGeneration that no longer matches selectGeneration.
+        if (streamGeneration !== selectGeneration) return;
+
         const id = e.lastEventId;
         // Track highest numeric ID for manual reconnect
         if (id && /^\d+$/.test(id)) {
