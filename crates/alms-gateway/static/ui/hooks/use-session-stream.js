@@ -210,7 +210,13 @@ export function openSessionStream(sessionId, opts) {
      *
      * Ephemeral IDs (prefixed "ephemeral-") are excluded from this set
      * because they are never reused and would only waste memory.
+     *
+     * Bounded to SEEN_IDS_MAX entries to prevent unbounded memory growth
+     * on long-lived connections (see #510).  When the cap is exceeded the
+     * set is cleared -- dedup only matters for recent events near
+     * reconnection boundaries, so stale entries are safe to discard.
      */
+    const SEEN_IDS_MAX = 1000;
     const seenEventIds = new Set();
 
     /**
@@ -241,6 +247,12 @@ export function openSessionStream(sessionId, opts) {
         if (id && !id.startsWith('ephemeral-')) {
             if (seenEventIds.has(id)) return;
             seenEventIds.add(id);
+            // Prevent unbounded growth (#510): once the set exceeds the
+            // cap, clear it.  Any future reconnect replay will only
+            // contain recent IDs that will be re-added as they arrive.
+            if (seenEventIds.size > SEEN_IDS_MAX) {
+                seenEventIds.clear();
+            }
         }
         handler(e);
     });
