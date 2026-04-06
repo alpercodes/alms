@@ -328,6 +328,7 @@ impl SessionManager {
                     && e.value()
                         .context_id
                         .split(':')
+                        .skip(1) // skip the "dm" prefix to avoid matching an agent literally named "dm"
                         .any(|part| part == agent_name)
             })
             .map(|e| e.value().clone())
@@ -715,6 +716,29 @@ mod tests {
         // "charlie" is not a participant -- should not see the DM.
         let with_dms = mgr.list_active_with_dms(agent_id, "charlie");
         assert_eq!(with_dms.len(), 1, "Charlie should only see web-chat");
+        assert_eq!(with_dms[0].context_id, "web-chat");
+    }
+
+    #[test]
+    fn test_list_active_with_dms_skips_prefix_segment() {
+        // Regression: an agent hypothetically named "dm" should NOT match
+        // every DM session via the "dm:" prefix segment.  The `.skip(1)`
+        // in list_active_with_dms ensures we only match participant names.
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+
+        mgr.get_or_create(agent_id, "web-chat");
+
+        let dm_sid = SessionId::deterministic_dm("alice", "bob");
+        mgr.get_or_create_shared(dm_sid, "dm:alice:bob");
+
+        // Searching for "dm" as the agent name should not match "dm:alice:bob".
+        let with_dms = mgr.list_active_with_dms(agent_id, "dm");
+        assert_eq!(
+            with_dms.len(),
+            1,
+            "Agent named 'dm' should not match DM prefix segment"
+        );
         assert_eq!(with_dms[0].context_id, "web-chat");
     }
 }
