@@ -948,6 +948,7 @@ header h1 {
   cursor: pointer;
   transition: background var(--duration-fast), border-color var(--duration-fast);
   overflow: clip;
+  min-height: 28px;
 }
 
 .cd-row:hover {
