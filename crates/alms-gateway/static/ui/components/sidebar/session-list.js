@@ -1,17 +1,15 @@
 import { html, batch } from '../../deps.js';
 import { sessions, activeSessionId } from '../../state/sessions.js';
 import { activeAgentId } from '../../state/agents.js';
-import { chatMessages, nextMsgId } from '../../state/chat.js';
+import { chatMessages } from '../../state/chat.js';
 import { activeRunId, runs } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
-import { listSessions, createSession, getSessionMessages } from '../../api/sessions.js';
-import { listRuns, listApprovals } from '../../api/runs.js';
-import { normalizeApproval } from '../../utils/approvals.js';
-import { mapHistoryMessages } from '../../utils/history.js';
+import { listSessions, createSession } from '../../api/sessions.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
 import { saveActiveSession } from '../../hooks/use-boot.js';
 import { selectGeneration, bumpSelectGeneration } from '../../state/select-generation.js';
+import { loadSession } from '../../utils/load-session.js';
 
 function hasActiveRun(sessionId) {
     if (sessionId === activeSessionId.value && activeRunId.value) return true;
@@ -34,82 +32,13 @@ async function selectSession(sessionId) {
     // Persist the selection for this agent
     saveActiveSession(activeAgentId.value, sessionId);
 
-    // Load runs for new session and restore activeRunId if a run is in-progress.
-    try {
-        const data = await listRuns(sessionId);
-        if (gen !== selectGeneration) return; // stale — discard
-        const loaded = data.runs || [];
-        runs.value = loaded;
-        const active = loaded.find(r => r.status === 'queued' || r.status === 'running');
-        if (active) {
-            activeRunId.value = active.run_id;
-        }
-    } catch {
-        if (gen !== selectGeneration) return;
-        runs.value = [];
-    }
-
-    // Load chat history
-    let lastEventId = null;
-    try {
-        const data = await getSessionMessages(sessionId);
-        if (gen !== selectGeneration) return; // stale — discard
-        const rawMsgs = data.messages || [];
-        const mapped = mapHistoryMessages(rawMsgs, {
-            hasActiveRun: !!activeRunId.value,
-        });
-        // Diagnostic: log tool call counts for #501 investigation.
-        const apiToolCalls = rawMsgs.filter(m => m.type === 'tool_call').length;
-        const mappedTools = mapped.filter(m => m.type === 'tool').length;
-        if (apiToolCalls > 0 || mappedTools > 0) {
-            console.debug('[selectSession] history loaded:',
-                rawMsgs.length, 'API messages,',
-                apiToolCalls, 'tool_calls ->',
-                mappedTools, 'tool rows');
-        }
-        chatMessages.value = mapped;
-        // Capture the SSE high-water mark so we can skip replay of events
-        // that are already reflected in the loaded messages.
-        if (data.last_event_id != null) lastEventId = data.last_event_id;
-    } catch (err) {
-        if (gen !== selectGeneration) return;
-        chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }];
-    }
-
-    // If a run is in-progress, reconstruct pending approval state from the
-    // server. Approval prompts are ephemeral UI state that is lost when the
-    // session stream is closed. On reconnect we query the backend approval
-    // store so the user can still approve/deny waiting tool calls. (Fixes #487 Bug 2)
-    if (activeRunId.value) {
-        if (!chatMessages.value.some(m => m.type === 'thinking')) {
-            chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
-        }
-        try {
-            const approvalData = await listApprovals(sessionId);
-            if (gen !== selectGeneration) return; // stale -- discard
-            const pending = approvalData.approvals || [];
-            if (pending.length > 0) {
-                const approvalMsgs = pending.map(a => {
-                    const norm = normalizeApproval(a);
-                    return {
-                        id: nextMsgId(),
-                        type: 'approval',
-                        approvalId: norm.approvalId,
-                        tool: norm.tool,
-                        params: norm.params,
-                        runId: norm.runId,
-                        resolved: false,
-                    };
-                });
-                chatMessages.value = [...chatMessages.value, ...approvalMsgs];
-            }
-        } catch (err) {
-            console.warn('[selectSession] Failed to load pending approvals:', err);
-        }
-    }
-
-    if (gen !== selectGeneration) return; // final guard before opening stream
-    openSessionStream(sessionId, { lastEventId });
+    // Delegate the run/history/approval/SSE loading to the shared
+    // loadSession() function, passing a stale-check callback tied
+    // to the shared selectGeneration counter.
+    await loadSession(sessionId, {
+        isStale: () => gen !== selectGeneration,
+        logPrefix: 'selectSession',
+    });
 }
 
 async function newSession() {

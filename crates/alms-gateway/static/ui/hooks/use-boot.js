@@ -1,18 +1,16 @@
 import { fetchSettings } from '../api/settings.js';
-import { listSessions, createSession, getSessionMessages } from '../api/sessions.js';
-import { mapHistoryMessages } from '../utils/history.js';
-import { listRuns, listApprovals } from '../api/runs.js';
-import { normalizeApproval } from '../utils/approvals.js';
+import { listSessions, createSession } from '../api/sessions.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
 import { activeRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
-import { chatMessages, nextMsgId } from '../state/chat.js';
-import { messageQueue, bgRuns } from '../state/queue.js';
+import { chatMessages } from '../state/chat.js';
+import { messageQueue } from '../state/queue.js';
 import { wsFiles } from '../state/workspace.js';
 import { auditEvents } from '../state/audit.js';
 import { openSessionStream, closeSessionStream } from './use-session-stream.js';
 import { bumpSelectGeneration } from '../state/select-generation.js';
+import { loadSession } from '../utils/load-session.js';
 
 const AGENT_KEY = 'alms_active_agent';
 
@@ -84,46 +82,13 @@ async function loadAgentSessions(agentId) {
             activeSessionId.value = selected.id;
             // Re-persist in case the session list changed
             saveActiveSession(agentId, selected.id);
-            // Load runs first so activeRunId is set before history loads.
-            // This lets mapHistoryMessages mark in-progress tool_calls as
-            // 'running' instead of incorrectly defaulting to 'done'.
-            await loadRunHistory(selected.id);
-            if (gen !== switchGeneration) return; // stale — discard
-            const lastEventId = await loadHistory(selected.id);
-            if (gen !== switchGeneration) return; // stale — discard
-            // If a run is in-progress, append a thinking indicator and
-            // reconstruct pending approval prompts from the server so the
-            // user can still approve/deny waiting tool calls. (Fixes #487 Bug 2)
-            if (activeRunId.value) {
-                if (!chatMessages.value.some(m => m.type === 'thinking')) {
-                    chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
-                }
-                try {
-                    const approvalData = await listApprovals(selected.id);
-                    if (gen !== switchGeneration) return; // stale — discard
-                    const pending = approvalData.approvals || [];
-                    if (pending.length > 0) {
-                        const approvalMsgs = pending.map(a => {
-                            const norm = normalizeApproval(a);
-                            return {
-                                id: nextMsgId(),
-                                type: 'approval',
-                                approvalId: norm.approvalId,
-                                tool: norm.tool,
-                                params: norm.params,
-                                runId: norm.runId,
-                                resolved: false,
-                            };
-                        });
-                        chatMessages.value = [...chatMessages.value, ...approvalMsgs];
-                    }
-                } catch (err) {
-                    console.warn('[loadAgentSessions] Failed to load pending approvals:', err);
-                }
-            }
-            // Open persistent session stream — skip replay of events
-            // already reflected in the loaded message history.
-            openSessionStream(selected.id, { lastEventId });
+            // Delegate the run/history/approval/SSE loading to the shared
+            // loadSession() function, passing a stale-check callback tied
+            // to this function's local switchGeneration counter.
+            await loadSession(selected.id, {
+                isStale: () => gen !== switchGeneration,
+                logPrefix: 'loadAgentSessions',
+            });
         } else {
             // Create a first session
             const ctx = 'web-chat-' + Date.now();
@@ -141,61 +106,6 @@ async function loadAgentSessions(agentId) {
     } catch (err) {
         if (gen !== switchGeneration) return; // stale — discard
         console.error('[loadAgentSessions] failed:', err);
-    }
-}
-
-/**
- * Load chat history for a session.
- * Returns the last SSE event ID from the server (if available) so the
- * caller can pass it to openSessionStream and skip duplicate replay.
- */
-async function loadHistory(sessionId) {
-    try {
-        const data = await getSessionMessages(sessionId);
-        const rawMsgs = data.messages || [];
-        const mapped = mapHistoryMessages(rawMsgs, {
-            hasActiveRun: !!activeRunId.value,
-        });
-        // Diagnostic: log tool call counts for #501 investigation.
-        const apiToolCalls = rawMsgs.filter(m => m.type === 'tool_call').length;
-        const mappedTools = mapped.filter(m => m.type === 'tool').length;
-        if (apiToolCalls > 0 || mappedTools > 0) {
-            console.debug('[loadHistory] history loaded:',
-                rawMsgs.length, 'API messages,',
-                apiToolCalls, 'tool_calls ->',
-                mappedTools, 'tool rows');
-        }
-        chatMessages.value = mapped;
-        return data.last_event_id ?? null;
-    } catch (err) {
-        console.error('[loadHistory] failed:', err);
-        chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }];
-        return null;
-    }
-}
-
-/**
- * Load run history for a session.
- *
- * If any run is still queued or running, restores `activeRunId` so the
- * caller (loadAgentSessions) can append a thinking indicator after both
- * history and runs have loaded.  This covers page refresh and session
- * switch scenarios where the SSE `run_created` event has already been
- * sent and won't be replayed.
- */
-async function loadRunHistory(sessionId) {
-    try {
-        const data = await listRuns(sessionId);
-        const loaded = data.runs || [];
-        runs.value = loaded;
-
-        // Restore activeRunId from any in-progress run.
-        const active = loaded.find(r => r.status === 'queued' || r.status === 'running');
-        if (active) {
-            activeRunId.value = active.run_id;
-        }
-    } catch {
-        runs.value = [];
     }
 }
 
