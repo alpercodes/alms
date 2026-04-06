@@ -831,7 +831,7 @@ Agent B runs, processes message, may reply (send_message back) or end (ignore_me
 
 - **`DEPTH_EXPIRY_SECS`**: 1800 seconds (30 minutes). Complex agent runs can easily exceed one minute; the original 60s was too short. After this period of inactivity, the depth counter resets automatically. (Decision D5 of #384.)
 
-- **`end_conversation` on MessageBus** (`crates/alms-coordinator/src/message_bus.rs`): Uses `depths.remove()` as an atomicity guard. If two agents call `end_conversation` simultaneously for the same DM pair, only the one whose `remove()` returns `Some` proceeds with the marker write and trigger emission. The other returns `Ok(())` early, preventing double notifications.
+- **`end_conversation` on MessageBus** (`crates/alms-coordinator/src/message_bus/bus.rs`): Uses `depths.remove()` as an atomicity guard. If two agents call `end_conversation` simultaneously for the same DM pair, only the one whose `remove()` returns `Some` proceeds with the marker write and trigger emission. The other returns `Ok(())` early, preventing double notifications.
 
 - **`ConversationEndReason` enum** (`crates/alms-tools/src/message_sender.rs`): `Ignored` (agent called `ignore_message`) or `DepthExceeded` (MAX_DM_DEPTH hit). Included in the `dm_ended` marker metadata and the `ConversationEnded` `RunTrigger`.
 
