@@ -2,7 +2,7 @@
 //!
 //! Tests event ordering and field alignment with docs/api.md
 
-use alms_core::{RunId, TokenUsage};
+use alms_core::{RunId, SessionId, TokenUsage};
 use alms_gateway::sse::{SseEventData, event_channel};
 
 #[tokio::test]
@@ -93,4 +93,41 @@ async fn test_event_sequence_with_error() {
     let error_data = &events[1].data;
     assert_eq!(error_data["error"]["code"], "INTERNAL");
     assert_eq!(error_data["error"]["message"], "Something went wrong");
+}
+
+#[tokio::test]
+async fn test_event_sequence_with_cancellation() {
+    let (tx, mut rx) = event_channel();
+    let run_id = RunId::new();
+    let session_id = SessionId::new();
+
+    // Simulate: run starts, then gets cancelled before finishing
+    tx.send(SseEventData::run_started(run_id, session_id))
+        .unwrap();
+    tx.send(SseEventData::token_delta(run_id, "partial output", None))
+        .unwrap();
+    tx.send(SseEventData::run_cancelled(run_id)).unwrap();
+
+    let events = [
+        rx.recv().await.unwrap(),
+        rx.recv().await.unwrap(),
+        rx.recv().await.unwrap(),
+    ];
+
+    // Verify sequence
+    assert_eq!(events[0].event_type, "run_started");
+    assert_eq!(events[1].event_type, "token_delta");
+    assert_eq!(events[2].event_type, "run_cancelled");
+
+    // Verify run_cancelled structure per API spec
+    let cancelled_data = &events[2].data;
+    assert_eq!(cancelled_data["run_id"], run_id.0.to_string());
+    assert!(
+        cancelled_data["ts"].is_string(),
+        "ts should be a string timestamp"
+    );
+
+    // Verify ts is RFC3339 format
+    let ts_str = cancelled_data["ts"].as_str().unwrap();
+    assert!(ts_str.contains("T"), "ts should be ISO8601/RFC3339");
 }

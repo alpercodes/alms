@@ -886,6 +886,20 @@ mod tests {
     }
 
     #[test]
+    fn test_run_cancelled_event() {
+        let run_id = RunId::new();
+        let event = SseEventData::run_cancelled(run_id);
+
+        assert_eq!(event.event_type, "run_cancelled");
+        assert_eq!(event.data["run_id"], run_id.0.to_string());
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+
+        // Verify ts is RFC3339 format
+        let ts_str = event.data["ts"].as_str().unwrap();
+        assert!(ts_str.contains("T"), "ts should be ISO8601/RFC3339");
+    }
+
+    #[test]
     fn test_context_debug_event() {
         let run_id = RunId::new();
         let messages = serde_json::json!([
