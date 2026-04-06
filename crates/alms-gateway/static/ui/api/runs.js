@@ -8,3 +8,6 @@ export const listRuns = (sessionId, limit = 20) =>
     get(`/runs?session_id=${sessionId}&limit=${limit}`);
 
 export const cancelRun = (runId) => post(`/runs/${runId}/cancel`);
+
+export const listApprovals = (sessionId) =>
+    get(`/approvals?session_id=${sessionId}`);

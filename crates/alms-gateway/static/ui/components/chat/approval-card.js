@@ -14,8 +14,14 @@ export function ApprovalCard({ approvalId, tool, params, resolved, decision }) {
     const onDeny = () => resolveApproval(approvalId, 'deny');
 
     if (resolved) {
-        const icon = decision === 'approve' ? '\u2713' : '\u2717';
-        const label = decision === 'approve' ? 'Approved' : 'Denied';
+        const icon = decision === 'approve' ? '\u2713'
+            : decision === 'cancelled' ? '\u2013'
+            : decision === 'expired' ? '\u2013'
+            : '\u2717';
+        const label = decision === 'approve' ? 'Approved'
+            : decision === 'cancelled' ? 'Cancelled'
+            : decision === 'expired' ? 'Expired'
+            : 'Denied';
         return html`
             <div class="approval-card resolved">
                 <span>${icon} ${label} \u2014 ${tool}</span>

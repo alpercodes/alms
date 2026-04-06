@@ -472,7 +472,12 @@ Cancellation is cooperative — the agent loop checks a `CancellationToken` at f
 If the security posture requires approval, this must be reflected in the API.
 
 ### 6.1 List pending approvals
-`GET /approvals?status=pending&session_id=<uuid>`
+`GET /approvals?session_id=<uuid>`
+
+Returns all pending approvals. The `session_id` query parameter is optional --
+when provided, results are filtered to approvals belonging to runs in that session.
+Resolved approvals are removed from the store automatically, so this endpoint
+always returns only pending items (there is no `status` filter).
 
 ### 6.2 Approve / deny
 `POST /approvals/{approval_id}`

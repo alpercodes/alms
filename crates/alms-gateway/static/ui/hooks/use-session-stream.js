@@ -27,6 +27,7 @@ import { activeRunId } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearCompletedSubagents } from '../state/subagents.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
+import { normalizeApproval } from '../utils/approvals.js';
 
 /**
  * Map error codes to user-friendly messages.
@@ -323,10 +324,21 @@ export function openSessionStream(sessionId, opts) {
             flushDeltaBuffer();
             sealLastAgent();
             const data = JSON.parse(e.data);
-            chatMessages.value = [...chatMessages.value, {
-                id: nextMsgId(), type: 'approval', approvalId: data.approval_id,
-                tool: data.capability, params: data.request, resolved: false,
-            }];
+            // Deduplicate: skip if an approval card with this ID already exists.
+            // This can happen when the approval was reconstructed from the REST
+            // API on session switch and then replayed by the SSE stream.
+            // (Fixes #487 Bug 2 — prevents duplicate approval prompts)
+            const alreadyExists = chatMessages.value.some(
+                m => m.type === 'approval' && m.approvalId === data.approval_id
+            );
+            if (!alreadyExists) {
+                const norm = normalizeApproval(data);
+                chatMessages.value = [...chatMessages.value, {
+                    id: nextMsgId(), type: 'approval', approvalId: norm.approvalId,
+                    tool: norm.tool, params: norm.params, runId: norm.runId,
+                    resolved: false,
+                }];
+            }
         });
     });
 
@@ -423,6 +435,31 @@ export function openSessionStream(sessionId, opts) {
             flushDeltaBuffer();
             sealLastAgent();
             const data = e.data ? JSON.parse(e.data) : {};
+
+            // Resolve any pending approval cards for this run.
+            // When a run ends (cancelled, error, or finished), any unresolved
+            // approval prompts are stale and must be dismissed so the user is
+            // not left with dangling Approve/Deny buttons.  (Fixes #487 Bug 1)
+            //
+            // Scoped to the ending run's ID so concurrent runs (future) do not
+            // accidentally dismiss each other's approval cards.  Approval cards
+            // without a runId (legacy) are always resolved as a fallback.
+            const endingRunId = data.run_id || null;
+            const decision = status === 'cancelled' ? 'cancelled'
+                : status === 'error' ? 'cancelled' : 'expired';
+            let msgs = chatMessages.value;
+            const isStaleApproval = (m) =>
+                m.type === 'approval' && !m.resolved
+                && (!m.runId || !endingRunId || m.runId === endingRunId);
+            const hasUnresolved = msgs.some(isStaleApproval);
+            if (hasUnresolved) {
+                msgs = msgs.map(m =>
+                    isStaleApproval(m)
+                        ? { ...m, resolved: true, decision }
+                        : m
+                );
+                chatMessages.value = msgs;
+            }
 
             // Collect all new messages to append in a single batch to avoid
             // multiple intermediate re-renders (error + tokens + activeRunId).
