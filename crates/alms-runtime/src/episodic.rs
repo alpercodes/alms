@@ -46,13 +46,19 @@ const HEURISTIC_MAX_TOTAL_BYTES: usize = 500;
 /// Same byte-budget caveat as [`HEURISTIC_INPUT_BYTES`].
 const LLM_CONTEXT_BYTES: usize = 2000;
 
-/// Maximum output tokens for the LLM summarizer call.
+/// Default maximum output tokens for the LLM summarizer call.
 ///
-/// Set high enough to accommodate reasoning models that consume some of the
-/// budget on internal thinking before producing visible output.  The actual
-/// summary text is typically 50-100 tokens, but models like minimax-m2.5 or
-/// deepseek-r1 may spend 100-200 tokens on reasoning first.
-const LLM_MAX_OUTPUT_TOKENS: u32 = 300;
+/// Set high enough to accommodate reasoning models that consume a large portion
+/// of the budget on internal thinking before producing visible output.  The
+/// actual summary text is typically 50-150 tokens, but reasoning models (e.g.
+/// deepseek-r1, kimi-k2.5) may spend 200-800 tokens on thinking first.
+///
+/// Configurable via [`ContextConfig::summary_max_tokens`].
+///
+/// Kept as a reference constant; the runtime value is always provided via
+/// `SummaryParams::summary_max_tokens` (sourced from config).
+#[allow(dead_code)]
+const LLM_MAX_OUTPUT_TOKENS: u32 = 1000;
 
 /// Parameters for episodic summary generation.
 pub struct SummaryParams {
@@ -69,6 +75,9 @@ pub struct SummaryParams {
     pub summary_model: Option<String>,
     /// Agent name — used to derive the peer in DM sessions.
     pub agent_name: String,
+    /// Maximum output tokens for the LLM summarizer call.
+    /// The gateway always provides this from [`ContextConfig::summary_max_tokens`].
+    pub summary_max_tokens: u32,
 }
 
 /// Generate or update a session summary.
@@ -114,6 +123,9 @@ pub struct PersistSummaryRequest {
     pub summary_model: Option<String>,
     /// Agent name — used to derive the peer in DM sessions.
     pub agent_name: String,
+    /// Maximum output tokens for the LLM summarizer call.
+    /// The gateway always provides this from [`ContextConfig::summary_max_tokens`].
+    pub summary_max_tokens: u32,
 }
 
 /// Fire-and-forget summary generation + persistence.
@@ -179,6 +191,7 @@ pub async fn generate_and_persist_summary(
         existing_summary,
         summary_model: req.summary_model,
         agent_name: req.agent_name,
+        summary_max_tokens: req.summary_max_tokens,
     };
 
     let summary_text = match generate_session_summary(llm, &params).await {
@@ -368,7 +381,7 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
     let request = CompletionRequest::new(model)
         .with_messages(messages)
         .with_temperature(0.3)
-        .with_max_tokens(LLM_MAX_OUTPUT_TOKENS);
+        .with_max_tokens(params.summary_max_tokens);
 
     match llm.complete(request).await {
         Ok(response) => {
@@ -556,6 +569,7 @@ mod tests {
             existing_summary: existing.map(|s| s.to_string()),
             summary_model: None,
             agent_name: agent_name.to_string(),
+            summary_max_tokens: 1000,
         }
     }
 
@@ -767,6 +781,7 @@ mod tests {
             existing_summary: None,
             summary_model: None,
             agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
         };
         assert!(generate_session_summary(&llm, &params).await.is_none());
     }
@@ -789,6 +804,7 @@ mod tests {
             existing_summary: None,
             summary_model: None,
             agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
         };
         let result = generate_session_summary(&llm, &params).await.unwrap();
         assert!(result.contains("How do I set up CORS?"));
@@ -816,6 +832,7 @@ mod tests {
             existing_summary: None,
             summary_model: None,
             agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
         };
         // Mock LLM returns a canned response -- we just verify it doesn't panic
         // and returns Some.
@@ -841,6 +858,7 @@ mod tests {
             existing_summary: Some("Debugged CORS issue in gateway.rs.".into()),
             summary_model: None,
             agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
         };
         // Should not panic, should return Some
         let result = generate_session_summary(&llm, &params).await;
@@ -868,6 +886,7 @@ mod tests {
                 existing_summary: None,
                 summary_model: None,
                 agent_name: "myagent".into(),
+                summary_max_tokens: 1000,
             };
             assert!(
                 generate_session_summary(&llm, &params).await.is_none(),
@@ -894,6 +913,7 @@ mod tests {
             existing_summary: None,
             summary_model: None,
             agent_name: "alice".into(),
+            summary_max_tokens: 1000,
         };
         let result = generate_session_summary(&llm, &params).await;
         assert!(result.is_some(), "DM sessions should now produce summaries");

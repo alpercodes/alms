@@ -46,6 +46,7 @@ summary_interval = 30
 # Episodic memory: cross-session summary generation after each run
 # run_summary_mode = "llm"          # off | heuristic | llm (default)
 # run_summary_budget = 2000         # max tokens for episodic injection (hard cap: 15% of max_input_tokens)
+# summary_max_tokens = 1000         # max output tokens for LLM summarizer call (0 is auto-corrected to 1000)
 
 [tools]
 # Which builtins to enable

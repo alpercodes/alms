@@ -266,6 +266,11 @@ impl AlmsConfig {
         {
             self.context.run_summary_budget = n;
         }
+        if let Ok(val) = std::env::var("ALMS_SUMMARY_MAX_TOKENS")
+            && let Ok(n) = val.parse()
+        {
+            self.context.summary_max_tokens = n;
+        }
 
         // Logging settings
         if let Ok(val) = std::env::var("ALMS_LOG_FILE_ENABLED") {
@@ -554,8 +559,10 @@ pub struct ContextConfig {
     pub recent_window: usize,
     /// How often to trigger a new summary (in uncovered messages beyond recent_window)
     pub summary_interval: usize,
-    /// Optional separate (cheaper) model for generating summaries.
-    /// Falls back to the agent's default model when None.
+    /// Separate (cheaper) model for generating summaries.
+    /// Falls back to the agent's default model when `None`.
+    /// Defaults to `minimax/minimax-m2.7` to avoid wasting tokens on
+    /// reasoning models that spend most of their budget on thinking.
     pub summary_model: Option<String>,
     /// How run summaries are generated for episodic memory.
     /// See [`RunSummaryMode`] for valid values.
@@ -564,6 +571,13 @@ pub struct ContextConfig {
     /// Hard-capped at 15% of `max_input_tokens` — values exceeding the cap
     /// are clamped down with a warning at load time.
     pub run_summary_budget: usize,
+    /// Maximum output tokens for the LLM summarizer call.
+    ///
+    /// Reasoning models may consume a large portion of the token budget on
+    /// internal thinking before producing visible output.  The default (1000)
+    /// provides enough headroom for models that spend 200-800 tokens on
+    /// reasoning.  The actual summary text is typically 50-150 tokens.
+    pub summary_max_tokens: u32,
 }
 
 impl Default for ContextConfig {
@@ -573,9 +587,10 @@ impl Default for ContextConfig {
             max_input_tokens: 128_000,
             recent_window: 20,
             summary_interval: 30,
-            summary_model: None,
+            summary_model: Some("minimax/minimax-m2.7".into()),
             run_summary_mode: RunSummaryMode::Llm,
             run_summary_budget: 2000,
+            summary_max_tokens: 1000,
         }
     }
 }
@@ -601,6 +616,14 @@ impl ContextConfig {
                 cap,
             );
             self.run_summary_budget = cap;
+        }
+
+        // Zero summary_max_tokens would cause the LLM API to reject the
+        // request, and since summary generation is fire-and-forget the error
+        // gets silently swallowed.  Reset to the default (1000).
+        if self.summary_max_tokens == 0 {
+            warn!("summary_max_tokens is 0, resetting to default (1000)");
+            self.summary_max_tokens = 1000;
         }
     }
 }
@@ -1297,8 +1320,14 @@ log_dir = "/var/log/alms"
     #[test]
     fn test_context_config_defaults_episodic() {
         let config = ContextConfig::default();
+        assert_eq!(
+            config.summary_model,
+            Some("minimax/minimax-m2.7".into()),
+            "summary_model should default to a cheap non-reasoning model"
+        );
         assert_eq!(config.run_summary_mode, RunSummaryMode::Llm);
         assert_eq!(config.run_summary_budget, 2000);
+        assert_eq!(config.summary_max_tokens, 1000);
     }
 
     #[test]
@@ -1401,6 +1430,32 @@ log_dir = "/var/log/alms"
     }
 
     #[test]
+    fn test_normalize_episodic_zero_summary_max_tokens_reset() {
+        let mut config = ContextConfig {
+            summary_max_tokens: 0,
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        assert_eq!(
+            config.summary_max_tokens, 1000,
+            "zero summary_max_tokens should be reset to default 1000"
+        );
+    }
+
+    #[test]
+    fn test_normalize_episodic_nonzero_summary_max_tokens_preserved() {
+        let mut config = ContextConfig {
+            summary_max_tokens: 500,
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        assert_eq!(
+            config.summary_max_tokens, 500,
+            "non-zero summary_max_tokens should be preserved"
+        );
+    }
+
+    #[test]
     fn test_toml_episodic_config() {
         let toml = r#"
 [context]
@@ -1451,5 +1506,36 @@ run_summary_mode = "bogus"
         config.apply_env_overrides();
         // Invalid parse should be silently ignored, keeping the default
         assert_eq!(config.context.run_summary_budget, 2000);
+    }
+
+    #[test]
+    fn test_toml_summary_max_tokens() {
+        let toml = r#"
+[context]
+summary_max_tokens = 2000
+"#;
+        let config: AlmsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.context.summary_max_tokens, 2000);
+    }
+
+    #[test]
+    fn test_env_override_summary_max_tokens() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_SUMMARY_MAX_TOKENS", "1500");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.context.summary_max_tokens, 1500);
+    }
+
+    #[test]
+    fn test_env_override_summary_max_tokens_invalid_ignored() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_SUMMARY_MAX_TOKENS", "not-a-number");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        // Invalid parse should be silently ignored, keeping the default
+        assert_eq!(config.context.summary_max_tokens, 1000);
     }
 }

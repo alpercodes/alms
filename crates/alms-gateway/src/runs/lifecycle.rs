@@ -418,6 +418,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // model, not the server default.  After this line `llm` is consumed by
     // `AgentRuntime::new` and no longer available.
     let run_summary_mode = agent_config.context_config.run_summary_mode.clone();
+    let summary_max_tokens = agent_config.context_config.summary_max_tokens;
     let summary_model_resolved = agent_config
         .context_config
         .summary_model
@@ -823,6 +824,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     context_id: ctx_id,
                     summary_model: summary_model_resolved.clone(),
                     agent_name: agent_name_for_summary.clone(),
+                    summary_max_tokens,
                 };
                 run_mgr.track_in_flight();
                 tokio::spawn(async move {

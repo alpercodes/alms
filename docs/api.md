@@ -676,9 +676,10 @@ Returns current server defaults for UI pre-population.
     "max_input_tokens": 100000,
     "recent_window": 20,
     "summary_interval": 10,
-    "summary_model": null,
+    "summary_model": "minimax/minimax-m2.7",
     "run_summary_mode": "llm",
-    "run_summary_budget": 2000
+    "run_summary_budget": 2000,
+    "summary_max_tokens": 1000
   },
   "session": {
     "max_messages": 200,
