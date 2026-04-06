@@ -99,7 +99,7 @@ Suggested MVP error codes:
 {
   "status": "healthy",
   "service": "alms",
-  "version": "0.1.0"
+  "version": "0.1.5"
 }
 ```
 
@@ -654,7 +654,7 @@ Returns current server defaults for UI pre-population.
 **Response 200**
 ```json
 {
-  "version": "0.1.2",
+  "version": "0.1.5",
   "provider": "openai",
   "model": "openai/gpt-4o",
   "base_url": "https://openrouter.ai/api/v1",
