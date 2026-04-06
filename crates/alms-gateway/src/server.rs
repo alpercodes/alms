@@ -936,14 +936,21 @@ async fn get_session_messages(
                                 .and_then(|md| md.get("ok"))
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
-                            serde_json::json!({
+                            let mut obj = serde_json::json!({
                                 "role": role_str,
                                 "type": "tool_result",
                                 "tool_id": tool_id,
                                 "result": result,
                                 "ok": ok,
                                 "timestamp": m.timestamp,
-                            })
+                            });
+                            // Expose metadata (including tool_invocation_id)
+                            // so the frontend can correlate tool results with
+                            // their invocation across history reconstruction.
+                            if let Some(ref md) = m.metadata {
+                                obj["metadata"] = md.clone();
+                            }
+                            obj
                         }
                         Content::Image { url, alt } => serde_json::json!({
                             "role": role_str,
