@@ -309,24 +309,11 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // -- status: agent phase update --
-    // Phase values correspond to constants in alms-runtime/src/events.rs:
-    //   PHASE_BUILDING_CONTEXT = "building_context"
-    //   PHASE_SUMMARIZING      = "summarizing"
-    //   PHASE_CALLING_LLM      = "calling_llm"
-    //   PHASE_EXECUTING_TOOLS  = "executing_tools"
-    on('status', (e) => {
-        const data = JSON.parse(e.data);
-        const updated = updateMessage(
-            m => m.type === 'thinking',
-            m => ({ ...m, phase: data.phase, phaseDetail: data.detail || null }),
-        );
-        if (!updated) {
-            // Thinking indicator was removed by token_delta flush or tool_start
-            // (e.g. on iteration 2+ of the agent loop). Re-add it so the user
-            // sees the current phase ("Running tools...", "Thinking...", etc.).
-            appendMessage({ id: nextMsgId(), type: 'thinking', phase: data.phase, phaseDetail: data.detail || null });
-        }
-    });
+    // Status SSE events (building_context, calling_llm, executing_tools, etc.)
+    // are emitted by the backend but no longer consumed here. Issue #538 will
+    // add an agent header bar that subscribes to these events. The old handler
+    // that cycled phase labels on the thinking bubble was removed as dead code
+    // (see #344).
 
     // -- token_delta --
     on('token_delta', (e) => {
