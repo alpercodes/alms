@@ -699,9 +699,9 @@ pub(crate) async fn run_trigger_loop(
     use alms_coordinator::message_bus::MessageSource;
 
     while let Some(trigger) = rx.recv().await {
-        let mut session_id = trigger.session_id;
+        let session_id = trigger.session_id;
         let agent_id = trigger.agent_id;
-        let mut context_id = trigger.context_id;
+        let context_id = trigger.context_id;
 
         // Build a source label for SSE `run_created` events and determine
         // whether this is a peer DM run (which needs the DM addendum) or
@@ -777,53 +777,29 @@ pub(crate) async fn run_trigger_loop(
                     }
                 }
 
-                // -- Route notification to user-facing session (#495) --
+                // -- No rerouting for pure recipients --
                 //
-                // When the MessageBus has no source_session for the peer (the
-                // common case for agents that only replied from the DM
-                // session), the trigger targets the invisible
-                // `notifications:{agent}` session.  Override the target to
-                // the agent's most recent user-facing session so the
-                // notification run (and the LLM's response to it) is visible
-                // to the user.
+                // When `source_session_id` is `None`, the agent was a pure
+                // DM recipient who never called `send_message` from a
+                // user-facing session.  The notification run stays on the
+                // invisible `notifications:{agent}` session so it does NOT
+                // pollute the agent's web-chat with the user.
                 //
-                // NOTE (multi-session edge case): when an agent has multiple
-                // user-facing sessions, this picks the most recently active
-                // one, which may be an unrelated conversation.  This is an
-                // acceptable trade-off for MVP — an invisible notification is
-                // worse than a slightly misplaced one.  The notification
-                // input from `format_dm_ended_notification` includes clear
-                // framing ("[DM conversation ended]") that helps the LLM
-                // compartmentalize even if the target session has unrelated
-                // history.
+                // The visual "DM ended" indicator is handled separately by
+                // `notify_dm_ended_to_webchat` below, which sends a
+                // lightweight SSE event + marker message to the web-chat
+                // without creating a full LLM notification run there.
                 //
-                // If no user-facing session exists, the notification run
-                // proceeds on the invisible `notifications:` session.  The
-                // LLM response will not be visible to the user, but the run
-                // is still recorded for auditability.
+                // When `source_session_id` IS present (the agent initiated
+                // the DM from a user-facing session), the MessageBus already
+                // set the trigger's `session_id` to that source session, so
+                // the notification run appears in the correct chat.
                 if source_session_id.is_none() {
-                    if let Some(target) = find_user_facing_session(&state.session_manager, agent_id)
-                    {
-                        info!(
-                            agent_id = %agent_id.0,
-                            target_session = %target.id.0,
-                            target_context = %target.context_id,
-                            "Rerouting notification run from notifications: to user-facing session"
-                        );
-                        session_id = target.id;
-                        context_id = target.context_id;
-                    } else {
-                        // No user-facing session exists — the notification
-                        // run will proceed on the original `notifications:`
-                        // session.  We only log here; the run itself still
-                        // executes so the agent can update workspace files
-                        // (goals/memories) even if no human sees the output.
-                        warn!(
-                            agent_id = %agent_id.0,
-                            "No user-facing session for agent — notification run will \
-                             execute on invisible notifications: session"
-                        );
-                    }
+                    debug!(
+                        agent_id = %agent_id.0,
+                        "No source session for agent — notification run will \
+                         execute on invisible notifications: session (agent was pure recipient)"
+                    );
                 }
 
                 // -- Forward dm_conversation_ended to the PEER's web-chat --
