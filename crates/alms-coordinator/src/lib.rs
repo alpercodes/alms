@@ -819,6 +819,25 @@ fn derive_subagent_identity(task_id: TaskId, request: &SubagentRequest) -> (Agen
     }
 }
 
+/// Resolve a subagent's effective posture.
+///
+/// Background subagents have no human in the loop to approve tool calls,
+/// so `Guarded` posture would cause them to hang indefinitely.  This
+/// function overrides `Guarded` to `Autonomous` for background subagents,
+/// matching the pattern used for system-triggered runs in the gateway
+/// (`resolve_posture_for_run`).  All other combinations are returned
+/// unchanged.
+pub fn resolve_subagent_posture(
+    is_background: bool,
+    posture: alms_runtime::Posture,
+) -> alms_runtime::Posture {
+    if is_background && posture == alms_runtime::Posture::Guarded {
+        alms_runtime::Posture::Autonomous
+    } else {
+        posture
+    }
+}
+
 /// Run the actual agent loop for a subagent.
 ///
 /// Creates a fresh `AgentRuntime`, forwards its events to the parent's
@@ -910,17 +929,15 @@ async fn run_agent_loop(
         )
     };
 
-    // Background subagents have no human in the loop to approve tool calls,
-    // so Guarded posture would cause them to hang indefinitely (the approval
-    // request is auto-denied by the event bridge, but the subagent keeps
-    // retrying until the TTL kills it).  Override to Autonomous, matching
-    // the pattern used for system-triggered runs in the gateway.
-    if is_background && config.posture == alms_runtime::Posture::Guarded {
+    // Resolve posture: background subagents with Guarded posture are
+    // overridden to Autonomous (no human in the loop to approve tool calls).
+    let resolved = resolve_subagent_posture(is_background, config.posture);
+    if resolved != config.posture {
         info!(
             task_id = %task_id.0,
             "Background subagent — overriding Guarded posture to Autonomous"
         );
-        config.posture = alms_runtime::Posture::Autonomous;
+        config.posture = resolved;
     }
 
     // Create a per-subagent event channel
@@ -1604,21 +1621,14 @@ mod tests {
     }
 
     // -- background subagent posture override (Fixes #396) -------------------
+    //
+    // These tests exercise the extracted `resolve_subagent_posture()` helper
+    // directly, so they stay in sync with the logic used by `run_agent_loop`.
 
     #[test]
     fn test_background_subagent_guarded_overridden_to_autonomous() {
-        // Simulate the posture override that run_agent_loop applies for
-        // background subagents: Guarded should become Autonomous.
-        let mut config = AgentConfig::default();
-        config.posture = alms_runtime::Posture::Guarded;
-        let is_background = true;
-
-        if is_background && config.posture == alms_runtime::Posture::Guarded {
-            config.posture = alms_runtime::Posture::Autonomous;
-        }
-
         assert_eq!(
-            config.posture,
+            resolve_subagent_posture(true, alms_runtime::Posture::Guarded),
             alms_runtime::Posture::Autonomous,
             "Guarded posture should be overridden to Autonomous for background subagents"
         );
@@ -1626,16 +1636,8 @@ mod tests {
 
     #[test]
     fn test_background_subagent_autonomous_unchanged() {
-        let mut config = AgentConfig::default();
-        config.posture = alms_runtime::Posture::Autonomous;
-        let is_background = true;
-
-        if is_background && config.posture == alms_runtime::Posture::Guarded {
-            config.posture = alms_runtime::Posture::Autonomous;
-        }
-
         assert_eq!(
-            config.posture,
+            resolve_subagent_posture(true, alms_runtime::Posture::Autonomous),
             alms_runtime::Posture::Autonomous,
             "Autonomous posture should remain unchanged for background subagents"
         );
@@ -1643,16 +1645,8 @@ mod tests {
 
     #[test]
     fn test_background_subagent_full_control_unchanged() {
-        let mut config = AgentConfig::default();
-        config.posture = alms_runtime::Posture::FullControl;
-        let is_background = true;
-
-        if is_background && config.posture == alms_runtime::Posture::Guarded {
-            config.posture = alms_runtime::Posture::Autonomous;
-        }
-
         assert_eq!(
-            config.posture,
+            resolve_subagent_posture(true, alms_runtime::Posture::FullControl),
             alms_runtime::Posture::FullControl,
             "FullControl posture should NOT be overridden for background subagents"
         );
@@ -1660,16 +1654,8 @@ mod tests {
 
     #[test]
     fn test_foreground_subagent_guarded_unchanged() {
-        let mut config = AgentConfig::default();
-        config.posture = alms_runtime::Posture::Guarded;
-        let is_background = false;
-
-        if is_background && config.posture == alms_runtime::Posture::Guarded {
-            config.posture = alms_runtime::Posture::Autonomous;
-        }
-
         assert_eq!(
-            config.posture,
+            resolve_subagent_posture(false, alms_runtime::Posture::Guarded),
             alms_runtime::Posture::Guarded,
             "Guarded posture should be preserved for foreground subagents"
         );
