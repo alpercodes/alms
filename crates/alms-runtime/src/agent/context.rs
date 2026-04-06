@@ -183,6 +183,13 @@ impl AgentRuntime {
         };
 
         if summaries.is_empty() {
+            debug!(
+                agent_id = %self.agent_id.0,
+                session_id = %current_session_id.0,
+                db_limit = db_limit,
+                has_store = session_manager.store().is_some(),
+                "No episodic summaries found for this agent"
+            );
             return None;
         }
 

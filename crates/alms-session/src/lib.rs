@@ -306,6 +306,37 @@ impl SessionManager {
             .collect()
     }
 
+    /// List active sessions for an agent, including shared DM sessions where
+    /// the agent is a participant.
+    ///
+    /// Shared DM sessions are stored under `AgentId::nil()` (sentinel) in the
+    /// in-memory map, so [`list_active`] misses them.  This method supplements
+    /// the normal list with DM sessions whose `context_id` matches
+    /// `dm:...<agent_name>...`.
+    pub fn list_active_with_dms(&self, agent_id: AgentId, agent_name: &str) -> Vec<Session> {
+        let mut sessions = self.list_active(agent_id);
+
+        // Also include shared DM sessions where this agent is a participant.
+        // DM context_ids have the format "dm:{name1}:{name2}" (alphabetical).
+        let sentinel = AgentId(uuid::Uuid::nil());
+        let dm_sessions: Vec<Session> = self
+            .sessions
+            .iter()
+            .filter(|e| {
+                e.key().0 == sentinel
+                    && e.value().context_id.starts_with("dm:")
+                    && e.value()
+                        .context_id
+                        .split(':')
+                        .any(|part| part == agent_name)
+            })
+            .map(|e| e.value().clone())
+            .collect();
+
+        sessions.extend(dm_sessions);
+        sessions
+    }
+
     /// List all sessions across all agents, sorted by last_activity descending.
     pub fn list_all(&self) -> Vec<Session> {
         let mut sessions: Vec<Session> = self.sessions.iter().map(|e| e.value().clone()).collect();
@@ -638,5 +669,52 @@ mod tests {
         assert!(sessions.is_empty());
         let messages = store.load_messages(session.id).unwrap();
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_list_active_with_dms_includes_dm_sessions() {
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+
+        // Create a regular session under the agent's own ID.
+        mgr.get_or_create(agent_id, "web-chat");
+
+        // Create a shared DM session (stored under AgentId::nil sentinel).
+        let dm_sid = SessionId::deterministic_dm("alice", "bob");
+        mgr.get_or_create_shared(dm_sid, "dm:alice:bob");
+
+        // list_active only finds sessions keyed under the agent's own ID.
+        let active = mgr.list_active(agent_id);
+        assert_eq!(active.len(), 1, "list_active should only find web-chat");
+
+        // list_active_with_dms also includes DM sessions where agent is a participant.
+        let with_dms = mgr.list_active_with_dms(agent_id, "alice");
+        assert_eq!(
+            with_dms.len(),
+            2,
+            "list_active_with_dms should find web-chat + DM"
+        );
+        let dm_count = with_dms
+            .iter()
+            .filter(|s| s.context_id.starts_with("dm:"))
+            .count();
+        assert_eq!(dm_count, 1, "Should include exactly one DM session");
+    }
+
+    #[test]
+    fn test_list_active_with_dms_excludes_non_participant() {
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+
+        mgr.get_or_create(agent_id, "web-chat");
+
+        // DM between alice and bob.
+        let dm_sid = SessionId::deterministic_dm("alice", "bob");
+        mgr.get_or_create_shared(dm_sid, "dm:alice:bob");
+
+        // "charlie" is not a participant -- should not see the DM.
+        let with_dms = mgr.list_active_with_dms(agent_id, "charlie");
+        assert_eq!(with_dms.len(), 1, "Charlie should only see web-chat");
+        assert_eq!(with_dms[0].context_id, "web-chat");
     }
 }
