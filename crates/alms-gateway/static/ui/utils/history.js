@@ -21,10 +21,17 @@ export function mapHistoryMessages(msgs, opts) {
     const hasActiveRun = opts && opts.hasActiveRun;
     // First pass: index all tool_result messages by their tool_id so we
     // can match them to tool_call messages regardless of position.
+    // Also build a secondary index by tool_invocation_id (when present in
+    // metadata) so that matching works even if tool_call_id is missing on
+    // either side. (Fixes #509)
     const resultMap = new Map();
+    const resultByInvocationId = new Map();
     for (const m of msgs) {
         if (m.type === 'tool_result' && m.tool_id) {
             resultMap.set(m.tool_id, m);
+        }
+        if (m.type === 'tool_result' && m.metadata && m.metadata.tool_invocation_id) {
+            resultByInvocationId.set(m.metadata.tool_invocation_id, m);
         }
     }
 
@@ -54,7 +61,10 @@ export function mapHistoryMessages(msgs, opts) {
             // reconstructed entries use the same ID as live SSE tool_start
             // events. This eliminates the fallback matching in tool_end.
             const invocationId = (m.metadata && m.metadata.tool_invocation_id) || null;
-            const matched = callId ? resultMap.get(callId) : null;
+            // Match tool_result by LLM tool_call_id (primary), falling back
+            // to tool_invocation_id when the primary key is absent. (#509)
+            const matched = (callId ? resultMap.get(callId) : null)
+                || (invocationId ? resultByInvocationId.get(invocationId) : null);
             entries.push({
                 id: invocationId || callId || nextMsgId(),
                 type: 'tool',

@@ -193,6 +193,7 @@ impl AgentRuntime {
                 self.process_tool_results(
                     &tool_calls,
                     results,
+                    &invocation_ids,
                     &mut messages,
                     &mut tool_call_records,
                     &mut tool_seq,
@@ -546,6 +547,7 @@ impl AgentRuntime {
         &self,
         tool_calls: &[ToolCall],
         results: Vec<AlmsResult<serde_json::Value>>,
+        invocation_ids: &[Uuid],
         messages: &mut Vec<LlmMessage>,
         tool_call_records: &mut Vec<alms_core::ToolCallRecord>,
         tool_seq: &mut u32,
@@ -553,7 +555,9 @@ impl AgentRuntime {
         session_id: alms_core::SessionId,
         is_dm: bool,
     ) {
-        for (tool_call, result) in tool_calls.iter().zip(results) {
+        for ((tool_call, result), invocation_id) in
+            tool_calls.iter().zip(results).zip(invocation_ids)
+        {
             let (content, ok) = match result {
                 Ok(value) => {
                     let ok = tool_result_ok(&value);
@@ -566,6 +570,11 @@ impl AgentRuntime {
             // Persist tool result to session history (skip for DM sessions).
             // Intentionally fire-and-forget -- see persist_assistant_tool_calls
             // for the rationale.
+            //
+            // Include tool_invocation_id in the metadata so history
+            // reconstruction can correlate tool results back to the same
+            // invocation ID used by live SSE tool_start/tool_end events.
+            // (Fixes #509)
             if !is_dm
                 && let Err(e) = session_manager.append_message(
                     session_id,
@@ -578,7 +587,10 @@ impl AgentRuntime {
                                 .unwrap_or(serde_json::Value::String(content.clone())),
                         },
                         timestamp: alms_core::Timestamp::now(),
-                        metadata: Some(serde_json::json!({ "ok": ok })),
+                        metadata: Some(serde_json::json!({
+                            "ok": ok,
+                            "tool_invocation_id": invocation_id.to_string(),
+                        })),
                     },
                 )
             {
