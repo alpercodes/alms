@@ -2,6 +2,7 @@ import { fetchSettings } from '../api/settings.js';
 import { listSessions, createSession, getSessionMessages } from '../api/sessions.js';
 import { mapHistoryMessages } from '../utils/history.js';
 import { listRuns, listApprovals } from '../api/runs.js';
+import { normalizeApproval } from '../utils/approvals.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
 import { activeRunId, runs } from '../state/runs.js';
@@ -102,14 +103,18 @@ async function loadAgentSessions(agentId) {
                     if (gen !== switchGeneration) return; // stale — discard
                     const pending = approvalData.approvals || [];
                     if (pending.length > 0) {
-                        const approvalMsgs = pending.map(a => ({
-                            id: nextMsgId(),
-                            type: 'approval',
-                            approvalId: a.approval_id,
-                            tool: a.tool,
-                            params: a.params,
-                            resolved: false,
-                        }));
+                        const approvalMsgs = pending.map(a => {
+                            const norm = normalizeApproval(a);
+                            return {
+                                id: nextMsgId(),
+                                type: 'approval',
+                                approvalId: norm.approvalId,
+                                tool: norm.tool,
+                                params: norm.params,
+                                runId: norm.runId,
+                                resolved: false,
+                            };
+                        });
                         chatMessages.value = [...chatMessages.value, ...approvalMsgs];
                     }
                 } catch (err) {
