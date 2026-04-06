@@ -117,7 +117,11 @@ impl Tool for ListMySessionsTool {
             .unwrap_or(false);
 
         // Get sessions from the session manager (uses in-memory DashMap).
-        let mut sessions = self.session_manager.list_active(self.agent_id);
+        // list_active_with_dms also includes shared DM sessions where this
+        // agent is a participant (stored under AgentId::nil() sentinel).
+        let mut sessions = self
+            .session_manager
+            .list_active_with_dms(self.agent_id, &self.agent_name);
 
         // Sort by last_activity descending (most recent first).
         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_activity.0));
@@ -442,5 +446,62 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["limit"].is_object());
         assert!(schema["properties"]["include_current"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_includes_dm_sessions() {
+        let mgr = Arc::new(make_manager());
+        let agent_id = AgentId::new();
+        let current = mgr.get_or_create(agent_id, "current-ctx");
+
+        // Create a web session under the agent's own ID.
+        mgr.get_or_create(agent_id, "web-chat");
+
+        // Create a shared DM session (stored under AgentId::nil sentinel).
+        let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+        mgr.get_or_create_shared(dm_session_id, "dm:alice:bob");
+
+        // The tool should see both the web session AND the DM session
+        // because the agent name "alice" appears in the DM context_id.
+        let tool = ListMySessionsTool::new(
+            mgr,
+            agent_id,
+            current.id,
+            "alice".into(), // agent name matches one side of the DM
+        );
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert_eq!(
+            result["showing"], 2,
+            "Should show web-chat + DM session (current excluded)"
+        );
+
+        // Verify the DM session is in the result.
+        let sessions = result["sessions"].as_array().unwrap();
+        let has_dm = sessions
+            .iter()
+            .any(|s| s["context_type"].as_str() == Some("dm"));
+        assert!(has_dm, "DM session should appear in the listing");
+    }
+
+    #[tokio::test]
+    async fn test_dm_sessions_not_shown_for_non_participant() {
+        let mgr = Arc::new(make_manager());
+        let agent_id = AgentId::new();
+        let current = mgr.get_or_create(agent_id, "current-ctx");
+        mgr.get_or_create(agent_id, "web-chat");
+
+        // Create a DM between alice and bob.
+        let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+        mgr.get_or_create_shared(dm_session_id, "dm:alice:bob");
+
+        // Agent named "charlie" should NOT see the alice-bob DM.
+        let tool = ListMySessionsTool::new(mgr, agent_id, current.id, "charlie".into());
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        assert_eq!(
+            result["showing"], 1,
+            "Charlie should only see web-chat, not alice-bob DM"
+        );
     }
 }
