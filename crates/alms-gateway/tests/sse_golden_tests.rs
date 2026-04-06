@@ -94,3 +94,72 @@ async fn test_event_sequence_with_error() {
     assert_eq!(error_data["error"]["code"], "INTERNAL");
     assert_eq!(error_data["error"]["message"], "Something went wrong");
 }
+
+#[tokio::test]
+async fn test_event_sequence_with_cancellation() {
+    let (tx, mut rx) = event_channel();
+    let run_id = RunId::new();
+    let session_id = alms_core::SessionId::new();
+
+    // Simulate: run starts, then gets cancelled before finishing
+    tx.send(SseEventData::run_started(run_id, session_id))
+        .unwrap();
+    tx.send(SseEventData::token_delta(run_id, "partial output", None))
+        .unwrap();
+    tx.send(SseEventData::run_cancelled(run_id)).unwrap();
+
+    let events = [
+        rx.recv().await.unwrap(),
+        rx.recv().await.unwrap(),
+        rx.recv().await.unwrap(),
+    ];
+
+    // Verify sequence
+    assert_eq!(events[0].event_type, "run_started");
+    assert_eq!(events[1].event_type, "token_delta");
+    assert_eq!(events[2].event_type, "run_cancelled");
+
+    // Verify run_cancelled structure per API spec
+    let cancelled_data = &events[2].data;
+    assert_eq!(cancelled_data["run_id"], run_id.0.to_string());
+    assert!(
+        cancelled_data["ts"].is_string(),
+        "ts should be a string timestamp"
+    );
+
+    // Verify ts is RFC3339 format
+    let ts_str = cancelled_data["ts"].as_str().unwrap();
+    assert!(ts_str.contains("T"), "ts should be ISO8601/RFC3339");
+}
+
+/// Tests the pre-start cancellation path where `run_cancelled` is emitted
+/// with NO preceding `run_started` — e.g. when a queued run is cancelled
+/// before execution begins, or the server is shutting down.
+/// See `crates/alms-gateway/src/runs/lifecycle.rs` lines 310-319.
+#[tokio::test]
+async fn test_event_sequence_pre_start_cancellation() {
+    let (tx, mut rx) = event_channel();
+    let run_id = RunId::new();
+
+    // Only connected + run_cancelled — no run_started in between
+    tx.send(SseEventData::connected(run_id)).unwrap();
+    tx.send(SseEventData::run_cancelled(run_id)).unwrap();
+
+    let events = [rx.recv().await.unwrap(), rx.recv().await.unwrap()];
+
+    // Verify sequence: connected directly followed by run_cancelled
+    assert_eq!(events[0].event_type, "connected");
+    assert_eq!(events[1].event_type, "run_cancelled");
+
+    // Verify run_cancelled structure
+    let cancelled_data = &events[1].data;
+    assert_eq!(cancelled_data["run_id"], run_id.0.to_string());
+    assert!(
+        cancelled_data["ts"].is_string(),
+        "ts should be a string timestamp"
+    );
+
+    // Verify ts is RFC3339 format
+    let ts_str = cancelled_data["ts"].as_str().unwrap();
+    assert!(ts_str.contains("T"), "ts should be ISO8601/RFC3339");
+}
