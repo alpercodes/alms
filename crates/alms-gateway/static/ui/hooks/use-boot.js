@@ -4,7 +4,7 @@ import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
 import { activeRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
-import { chatMessages } from '../state/chat.js';
+import { replaceMessages } from '../state/chat-actions.js';
 import { messageQueue } from '../state/queue.js';
 import { wsFiles } from '../state/workspace.js';
 import { auditEvents } from '../state/audit.js';
@@ -98,7 +98,7 @@ async function loadAgentSessions(agentId) {
             if (gen !== switchGeneration) return; // stale — discard
             sessions.value = reloaded.sessions || [];
             activeSessionId.value = resp.session_id;
-            chatMessages.value = [];
+            replaceMessages([]);
             runs.value = [];
             // Open persistent session stream
             openSessionStream(resp.session_id);
@@ -127,7 +127,7 @@ export async function switchAgent(agentId) {
     activeRunId.value = null;
     sessions.value = [];
     runs.value = [];
-    chatMessages.value = [];
+    replaceMessages([]);
     messageQueue.value = [];
     wsFiles.value = null;
     auditEvents.value = null;

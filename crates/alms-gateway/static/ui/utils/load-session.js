@@ -17,6 +17,7 @@ import { listRuns, listApprovals } from '../api/runs.js';
 import { mapHistoryMessages } from './history.js';
 import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
+import { replaceMessages, appendMessage } from '../state/chat-actions.js';
 import { activeRunId, runs } from '../state/runs.js';
 import { openSessionStream } from '../hooks/use-session-stream.js';
 
@@ -74,11 +75,11 @@ export async function loadSession(sessionId, opts) {
                 apiToolCalls, 'tool_calls ->',
                 mappedTools, 'tool rows');
         }
-        chatMessages.value = mapped;
+        replaceMessages(mapped);
         lastEventId = data.last_event_id ?? null;
     } catch (err) {
         if (isStale()) return;
-        chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }];
+        replaceMessages([{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }]);
     }
 
     // Step 3: If a run is in-progress, append a thinking indicator and
@@ -86,7 +87,7 @@ export async function loadSession(sessionId, opts) {
     // can still approve/deny waiting tool calls. (Fixes #487 Bug 2)
     if (activeRunId.value) {
         if (!chatMessages.value.some(m => m.type === 'thinking')) {
-            chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
+            appendMessage({ id: nextMsgId(), type: 'thinking' });
         }
         try {
             const approvalData = await listApprovals(sessionId);
@@ -105,7 +106,7 @@ export async function loadSession(sessionId, opts) {
                         resolved: false,
                     };
                 });
-                chatMessages.value = [...chatMessages.value, ...approvalMsgs];
+                appendMessage(...approvalMsgs);
             }
         } catch (err) {
             console.warn(`[${logPrefix}] Failed to load pending approvals:`, err);

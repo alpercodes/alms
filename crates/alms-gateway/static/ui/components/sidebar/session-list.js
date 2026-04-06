@@ -1,7 +1,7 @@
 import { html, batch } from '../../deps.js';
 import { sessions, activeSessionId } from '../../state/sessions.js';
 import { activeAgentId } from '../../state/agents.js';
-import { chatMessages } from '../../state/chat.js';
+import { replaceMessages } from '../../state/chat-actions.js';
 import { activeRunId, runs } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
@@ -25,7 +25,7 @@ async function selectSession(sessionId) {
     closeSessionStream();
     activeSessionId.value = sessionId;
     activeRunId.value = null;
-    chatMessages.value = [];
+    replaceMessages([]);
     messageQueue.value = [];
     auditEvents.value = null;
 
@@ -59,7 +59,7 @@ async function newSession() {
             activeSessionId.value = resp.session_id;
             saveActiveSession(activeAgentId.value, resp.session_id);
             activeRunId.value = null;
-            chatMessages.value = [];
+            replaceMessages([]);
             messageQueue.value = [];
             runs.value = [];
             auditEvents.value = null;

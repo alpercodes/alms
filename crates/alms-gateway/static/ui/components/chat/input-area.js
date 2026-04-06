@@ -2,17 +2,18 @@ import { html, useRef } from '../../deps.js';
 import { activeSessionId } from '../../state/sessions.js';
 import { activeAgentId, agents } from '../../state/agents.js';
 import { activeRunId, runs } from '../../state/runs.js';
-import { chatMessages, nextMsgId } from '../../state/chat.js';
+import { nextMsgId } from '../../state/chat.js';
+import { appendMessage, transformMessages } from '../../state/chat-actions.js';
 import { messageQueue } from '../../state/queue.js';
 import { localSettings } from '../../state/settings.js';
 import { createRun, cancelRun as apiCancelRun } from '../../api/runs.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
 
 export async function startRun(text) {
-    chatMessages.value = [...chatMessages.value,
+    appendMessage(
         { id: nextMsgId(), type: 'user', role: 'user', text },
         { id: nextMsgId(), type: 'thinking' },
-    ];
+    );
 
     try {
         const runBody = {
@@ -31,9 +32,10 @@ export async function startRun(text) {
         // (opened by use-boot.js) receives all events automatically.
         // run_created → token_delta → run_finished all arrive there.
     } catch (err) {
-        chatMessages.value = chatMessages.value
-            .filter(m => m.type !== 'thinking')
-            .concat([{ id: nextMsgId(), type: 'error', text: `Failed to start run: ${err.error?.message || err.message || err.status || 'unknown error'}` }]);
+        transformMessages(msgs =>
+            [...msgs.filter(m => m.type !== 'thinking'),
+             { id: nextMsgId(), type: 'error', text: `Failed to start run: ${err.error?.message || err.message || err.status || 'unknown error'}` }]
+        );
         console.error('[startRun] failed:', err);
     }
 }
