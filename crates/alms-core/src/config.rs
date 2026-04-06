@@ -559,8 +559,10 @@ pub struct ContextConfig {
     pub recent_window: usize,
     /// How often to trigger a new summary (in uncovered messages beyond recent_window)
     pub summary_interval: usize,
-    /// Optional separate (cheaper) model for generating summaries.
-    /// Falls back to the agent's default model when None.
+    /// Separate (cheaper) model for generating summaries.
+    /// Falls back to the agent's default model when `None`.
+    /// Defaults to `minimax/minimax-m2.7` to avoid wasting tokens on
+    /// reasoning models that spend most of their budget on thinking.
     pub summary_model: Option<String>,
     /// How run summaries are generated for episodic memory.
     /// See [`RunSummaryMode`] for valid values.
@@ -585,7 +587,7 @@ impl Default for ContextConfig {
             max_input_tokens: 128_000,
             recent_window: 20,
             summary_interval: 30,
-            summary_model: None,
+            summary_model: Some("minimax/minimax-m2.7".into()),
             run_summary_mode: RunSummaryMode::Llm,
             run_summary_budget: 2000,
             summary_max_tokens: 1000,
@@ -1310,6 +1312,11 @@ log_dir = "/var/log/alms"
     #[test]
     fn test_context_config_defaults_episodic() {
         let config = ContextConfig::default();
+        assert_eq!(
+            config.summary_model,
+            Some("minimax/minimax-m2.7".into()),
+            "summary_model should default to a cheap non-reasoning model"
+        );
         assert_eq!(config.run_summary_mode, RunSummaryMode::Llm);
         assert_eq!(config.run_summary_budget, 2000);
         assert_eq!(config.summary_max_tokens, 1000);
