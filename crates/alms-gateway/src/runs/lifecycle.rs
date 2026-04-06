@@ -3,7 +3,8 @@
 use super::notifications::notify_dm_ended_to_webchat;
 use super::tools::{RuntimeEventForwarder, forward_runtime_events};
 use super::{
-    RunOverrides, RunParams, is_internal_context_id, resolve_agent_config, validate_provider,
+    RunOverrides, RunParams, apply_overrides, is_internal_context_id, resolve_agent_config,
+    validate_provider,
 };
 use crate::api_error;
 use crate::server::AppState;
@@ -353,23 +354,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     }
 
     // Apply per-run overrides (highest precedence) on top of the resolved config.
-    let mut agent_config = resolved.agent_config;
+    // Uses `apply_overrides()` for the common fields (max_tokens, posture,
+    // debug_mode) to avoid duplicating the logic that lives in runs/mod.rs.
+    // Provider and model require LLM client mutations which `apply_overrides()`
+    // does not handle, so those stay inline.
+    let merged = apply_overrides(resolved.agent_config, None, &overrides);
+    let mut agent_config = merged.agent_config;
     let mut llm = resolved.llm;
-    if let Some(m) = overrides.max_tokens.filter(|&m| m > 0) {
-        agent_config.max_tokens = m;
-    }
-    if let Some(ref p) = overrides.posture
-        && let Ok(posture) = p.parse::<alms_runtime::Posture>()
-    {
-        agent_config.posture = posture;
-    }
     if let Some(ref provider) = overrides.provider {
         info!("Run {} using provider override: {}", run_id.0, provider);
         llm = llm.with_provider_and_secrets(provider, &state.secrets.read());
     }
-    if let Some(ref model) = overrides.model {
+    if let Some(model) = merged.model_override {
         info!("Run {} using model override: {}", run_id.0, model);
-        llm = llm.with_model(model.clone());
+        llm = llm.with_model(model);
     }
 
     // System-triggered runs (peer DMs, notifications, subagent completions)
