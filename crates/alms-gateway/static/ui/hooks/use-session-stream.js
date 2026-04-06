@@ -323,10 +323,19 @@ export function openSessionStream(sessionId, opts) {
             flushDeltaBuffer();
             sealLastAgent();
             const data = JSON.parse(e.data);
-            chatMessages.value = [...chatMessages.value, {
-                id: nextMsgId(), type: 'approval', approvalId: data.approval_id,
-                tool: data.capability, params: data.request, resolved: false,
-            }];
+            // Deduplicate: skip if an approval card with this ID already exists.
+            // This can happen when the approval was reconstructed from the REST
+            // API on session switch and then replayed by the SSE stream.
+            // (Fixes #487 Bug 2 — prevents duplicate approval prompts)
+            const alreadyExists = chatMessages.value.some(
+                m => m.type === 'approval' && m.approvalId === data.approval_id
+            );
+            if (!alreadyExists) {
+                chatMessages.value = [...chatMessages.value, {
+                    id: nextMsgId(), type: 'approval', approvalId: data.approval_id,
+                    tool: data.capability, params: data.request, resolved: false,
+                }];
+            }
         });
     });
 
@@ -423,6 +432,23 @@ export function openSessionStream(sessionId, opts) {
             flushDeltaBuffer();
             sealLastAgent();
             const data = e.data ? JSON.parse(e.data) : {};
+
+            // Resolve any pending approval cards for this run.
+            // When a run ends (cancelled, error, or finished), any unresolved
+            // approval prompts are stale and must be dismissed so the user is
+            // not left with dangling Approve/Deny buttons.  (Fixes #487 Bug 1)
+            const decision = status === 'cancelled' ? 'cancelled'
+                : status === 'error' ? 'cancelled' : 'expired';
+            let msgs = chatMessages.value;
+            const hasUnresolved = msgs.some(m => m.type === 'approval' && !m.resolved);
+            if (hasUnresolved) {
+                msgs = msgs.map(m =>
+                    m.type === 'approval' && !m.resolved
+                        ? { ...m, resolved: true, decision }
+                        : m
+                );
+                chatMessages.value = msgs;
+            }
 
             // Collect all new messages to append in a single batch to avoid
             // multiple intermediate re-renders (error + tokens + activeRunId).

@@ -6,7 +6,7 @@ import { activeRunId, runs } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
 import { listSessions, createSession, getSessionMessages } from '../../api/sessions.js';
-import { listRuns } from '../../api/runs.js';
+import { listRuns, listApprovals } from '../../api/runs.js';
 import { mapHistoryMessages } from '../../utils/history.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
 import { saveActiveSession } from '../../hooks/use-boot.js';
@@ -64,10 +64,32 @@ async function selectSession(sessionId) {
         chatMessages.value = [{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }];
     }
 
-    // If a run is in-progress, append a thinking indicator so the user sees
-    // the cancel button and "Thinking..." state after switching sessions.
-    if (activeRunId.value && !chatMessages.value.some(m => m.type === 'thinking')) {
-        chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
+    // If a run is in-progress, reconstruct pending approval state from the
+    // server. Approval prompts are ephemeral UI state that is lost when the
+    // session stream is closed. On reconnect we query the backend approval
+    // store so the user can still approve/deny waiting tool calls. (Fixes #487 Bug 2)
+    if (activeRunId.value) {
+        if (!chatMessages.value.some(m => m.type === 'thinking')) {
+            chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
+        }
+        try {
+            const approvalData = await listApprovals(sessionId);
+            if (gen !== selectGeneration) return; // stale -- discard
+            const pending = approvalData.approvals || [];
+            if (pending.length > 0) {
+                const approvalMsgs = pending.map(a => ({
+                    id: nextMsgId(),
+                    type: 'approval',
+                    approvalId: a.approval_id,
+                    tool: a.tool,
+                    params: a.params,
+                    resolved: false,
+                }));
+                chatMessages.value = [...chatMessages.value, ...approvalMsgs];
+            }
+        } catch (err) {
+            console.warn('[selectSession] Failed to load pending approvals:', err);
+        }
     }
 
     if (gen !== selectGeneration) return; // final guard before opening stream

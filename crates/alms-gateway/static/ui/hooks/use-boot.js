@@ -1,7 +1,7 @@
 import { fetchSettings } from '../api/settings.js';
 import { listSessions, createSession, getSessionMessages } from '../api/sessions.js';
 import { mapHistoryMessages } from '../utils/history.js';
-import { listRuns } from '../api/runs.js';
+import { listRuns, listApprovals } from '../api/runs.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
 import { activeRunId, runs } from '../state/runs.js';
@@ -90,10 +90,31 @@ async function loadAgentSessions(agentId) {
             if (gen !== switchGeneration) return; // stale — discard
             const lastEventId = await loadHistory(selected.id);
             if (gen !== switchGeneration) return; // stale — discard
-            // If a run is in-progress, append a thinking indicator so the
-            // user sees the cancel button and "Thinking..." state.
-            if (activeRunId.value && !chatMessages.value.some(m => m.type === 'thinking')) {
-                chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
+            // If a run is in-progress, append a thinking indicator and
+            // reconstruct pending approval prompts from the server so the
+            // user can still approve/deny waiting tool calls. (Fixes #487 Bug 2)
+            if (activeRunId.value) {
+                if (!chatMessages.value.some(m => m.type === 'thinking')) {
+                    chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'thinking' }];
+                }
+                try {
+                    const approvalData = await listApprovals(selected.id);
+                    if (gen !== switchGeneration) return; // stale — discard
+                    const pending = approvalData.approvals || [];
+                    if (pending.length > 0) {
+                        const approvalMsgs = pending.map(a => ({
+                            id: nextMsgId(),
+                            type: 'approval',
+                            approvalId: a.approval_id,
+                            tool: a.tool,
+                            params: a.params,
+                            resolved: false,
+                        }));
+                        chatMessages.value = [...chatMessages.value, ...approvalMsgs];
+                    }
+                } catch (err) {
+                    console.warn('[loadAgentSessions] Failed to load pending approvals:', err);
+                }
             }
             // Open persistent session stream — skip replay of events
             // already reflected in the loaded message history.
