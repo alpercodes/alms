@@ -35,13 +35,13 @@ use alms_tools::message_sender::ConversationEndReason;
 use serde::{Deserialize, Serialize};
 
 /// Maximum message forwarding depth. Prevents infinite A -> B -> A loops.
-pub(crate) const MAX_DM_DEPTH: u32 = 20;
+const MAX_DM_DEPTH: u32 = 20;
 
 /// Seconds of inactivity after which the depth counter resets for a DM pair.
 ///
 /// Raised from 60s to 1800s (30 minutes) because complex agent runs can
 /// easily exceed one minute. See discussion on #362 / decision D5 in #384.
-pub(crate) const DEPTH_EXPIRY_SECS: u64 = 1800;
+const DEPTH_EXPIRY_SECS: u64 = 1800;
 
 // ---------------------------------------------------------------------------
 // RunTrigger -- sent to the gateway to create runs
