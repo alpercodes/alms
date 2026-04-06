@@ -50,9 +50,13 @@ export function mapHistoryMessages(msgs, opts) {
             });
         } else if (m.type === 'tool_call') {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;
+            // Prefer tool_invocation_id as the message ID so that history-
+            // reconstructed entries use the same ID as live SSE tool_start
+            // events. This eliminates the fallback matching in tool_end.
+            const invocationId = (m.metadata && m.metadata.tool_invocation_id) || null;
             const matched = callId ? resultMap.get(callId) : null;
             entries.push({
-                id: callId || nextMsgId(),
+                id: invocationId || callId || nextMsgId(),
                 type: 'tool',
                 tool: m.tool,
                 params: m.params,

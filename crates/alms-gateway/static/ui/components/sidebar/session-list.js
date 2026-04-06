@@ -1,4 +1,4 @@
-import { html } from '../../deps.js';
+import { html, batch } from '../../deps.js';
 import { sessions, activeSessionId } from '../../state/sessions.js';
 import { activeAgentId } from '../../state/agents.js';
 import { chatMessages, nextMsgId } from '../../state/chat.js';
@@ -87,14 +87,16 @@ async function newSession() {
         const resp = await createSession(activeAgentId.value, ctx);
         // Reload sessions
         const data = await listSessions(activeAgentId.value);
-        sessions.value = data.sessions || [];
-        activeSessionId.value = resp.session_id;
-        saveActiveSession(activeAgentId.value, resp.session_id);
-        activeRunId.value = null;
-        chatMessages.value = [];
-        messageQueue.value = [];
-        runs.value = [];
-        auditEvents.value = null;
+        batch(() => {
+            sessions.value = data.sessions || [];
+            activeSessionId.value = resp.session_id;
+            saveActiveSession(activeAgentId.value, resp.session_id);
+            activeRunId.value = null;
+            chatMessages.value = [];
+            messageQueue.value = [];
+            runs.value = [];
+            auditEvents.value = null;
+        });
         openSessionStream(resp.session_id);
     } catch (err) {
         console.error('[newSession] failed:', err);
