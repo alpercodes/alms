@@ -465,6 +465,23 @@ header h1 {
   gap: var(--space-3);
 }
 
+/*
+ * Prevent flex children from shrinking when the message list overflows.
+ *
+ * #messages is a flex column with overflow-y:auto.  Without flex-shrink:0
+ * on its children, rapid DOM updates during streaming can cause the flex
+ * algorithm to compress tool rows and messages before the scrollbar
+ * adjusts.  This effect compounds as the conversation grows: more flex
+ * items compete for space, causing tool calls to progressively shrink,
+ * overlap with adjacent messages, and eventually disappear.
+ *
+ * By pinning every direct child to its natural height the browser is
+ * forced to extend the scrollable area instead of squeezing items.
+ */
+#messages > * {
+  flex-shrink: 0;
+}
+
 .msg {
   display: flex;
   flex-direction: column;
@@ -715,7 +732,12 @@ header h1 {
   margin: var(--space-1) 0;
   cursor: pointer;
   transition: background var(--duration-fast), border-color var(--duration-fast);
-  overflow: hidden;
+  /* Use clip instead of hidden so that border-radius rounding is still
+     respected, but the row cannot silently collapse to zero height during
+     flex layout recalculations.  clip does not establish a scroll container
+     and therefore does not participate in flex overflow negotiation. */
+  overflow: clip;
+  min-height: 28px;
 }
 
 .tc-row:hover {
@@ -891,7 +913,7 @@ header h1 {
   border-radius: var(--radius-md);
   background: transparent;
   margin: var(--space-1) 0;
-  overflow: hidden;
+  overflow: clip;
 }
 
 .tc-group .tc-row {
@@ -925,7 +947,8 @@ header h1 {
   margin: var(--space-1) 0;
   cursor: pointer;
   transition: background var(--duration-fast), border-color var(--duration-fast);
-  overflow: hidden;
+  overflow: clip;
+  min-height: 28px;
 }
 
 .cd-row:hover {
