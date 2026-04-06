@@ -132,6 +132,68 @@ async fn test_event_sequence_with_cancellation() {
     assert!(ts_str.contains("T"), "ts should be ISO8601/RFC3339");
 }
 
+/// Tests that a run with debug_mode enabled emits a `context_debug` SSE event
+/// containing the assembled context snapshot (messages, tools, token counts).
+/// This is a regression test for #517 where `debug_mode` was not applied to
+/// the agent config, so `context_debug` events were never emitted.
+#[tokio::test]
+async fn test_event_sequence_with_debug_mode() {
+    let (tx, mut rx) = event_channel();
+    let run_id = RunId::new();
+    let session_id = alms_core::SessionId::new();
+
+    // Simulate a run where debug_mode is enabled: run_started, context_debug,
+    // token_delta, run_finished.
+    tx.send(SseEventData::run_started(run_id, session_id))
+        .unwrap();
+    tx.send(SseEventData::context_debug(
+        run_id,
+        serde_json::json!([
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello"},
+        ]),
+        vec!["shell_exec".to_string(), "fs_read".to_string()],
+        1200,
+        400,
+        2,
+    ))
+    .unwrap();
+    tx.send(SseEventData::token_delta(run_id, "Hi there!", None))
+        .unwrap();
+    tx.send(SseEventData::run_finished(
+        run_id,
+        true,
+        TokenUsage::default(),
+    ))
+    .unwrap();
+
+    let events = [
+        rx.recv().await.unwrap(),
+        rx.recv().await.unwrap(),
+        rx.recv().await.unwrap(),
+        rx.recv().await.unwrap(),
+    ];
+
+    // Verify event sequence includes context_debug after run_started
+    assert_eq!(events[0].event_type, "run_started");
+    assert_eq!(events[1].event_type, "context_debug");
+    assert_eq!(events[2].event_type, "token_delta");
+    assert_eq!(events[3].event_type, "run_finished");
+
+    // Verify context_debug structure
+    let debug_data = &events[1].data;
+    assert_eq!(debug_data["run_id"], run_id.0.to_string());
+    assert_eq!(debug_data["total_tokens"], 1200);
+    assert_eq!(debug_data["system_tokens"], 400);
+    assert_eq!(debug_data["history_message_count"], 2);
+    assert_eq!(debug_data["tool_names"].as_array().unwrap().len(), 2);
+    assert_eq!(debug_data["messages"].as_array().unwrap().len(), 2);
+    assert!(
+        debug_data["ts"].is_string(),
+        "ts should be a string timestamp"
+    );
+}
+
 /// Tests the pre-start cancellation path where `run_cancelled` is emitted
 /// with NO preceding `run_started` — e.g. when a queued run is cancelled
 /// before execution begins, or the server is shutting down.
