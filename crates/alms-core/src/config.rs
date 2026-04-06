@@ -266,6 +266,11 @@ impl AlmsConfig {
         {
             self.context.run_summary_budget = n;
         }
+        if let Ok(val) = std::env::var("ALMS_SUMMARY_MAX_TOKENS")
+            && let Ok(n) = val.parse()
+        {
+            self.context.summary_max_tokens = n;
+        }
 
         // Logging settings
         if let Ok(val) = std::env::var("ALMS_LOG_FILE_ENABLED") {
@@ -564,6 +569,13 @@ pub struct ContextConfig {
     /// Hard-capped at 15% of `max_input_tokens` — values exceeding the cap
     /// are clamped down with a warning at load time.
     pub run_summary_budget: usize,
+    /// Maximum output tokens for the LLM summarizer call.
+    ///
+    /// Reasoning models may consume a large portion of the token budget on
+    /// internal thinking before producing visible output.  The default (1000)
+    /// provides enough headroom for models that spend 200-800 tokens on
+    /// reasoning.  The actual summary text is typically 50-150 tokens.
+    pub summary_max_tokens: u32,
 }
 
 impl Default for ContextConfig {
@@ -576,6 +588,7 @@ impl Default for ContextConfig {
             summary_model: None,
             run_summary_mode: RunSummaryMode::Llm,
             run_summary_budget: 2000,
+            summary_max_tokens: 1000,
         }
     }
 }
@@ -1299,6 +1312,7 @@ log_dir = "/var/log/alms"
         let config = ContextConfig::default();
         assert_eq!(config.run_summary_mode, RunSummaryMode::Llm);
         assert_eq!(config.run_summary_budget, 2000);
+        assert_eq!(config.summary_max_tokens, 1000);
     }
 
     #[test]
@@ -1451,5 +1465,36 @@ run_summary_mode = "bogus"
         config.apply_env_overrides();
         // Invalid parse should be silently ignored, keeping the default
         assert_eq!(config.context.run_summary_budget, 2000);
+    }
+
+    #[test]
+    fn test_toml_summary_max_tokens() {
+        let toml = r#"
+[context]
+summary_max_tokens = 2000
+"#;
+        let config: AlmsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.context.summary_max_tokens, 2000);
+    }
+
+    #[test]
+    fn test_env_override_summary_max_tokens() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_SUMMARY_MAX_TOKENS", "1500");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        assert_eq!(config.context.summary_max_tokens, 1500);
+    }
+
+    #[test]
+    fn test_env_override_summary_max_tokens_invalid_ignored() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = SingleEnvGuard::set("ALMS_SUMMARY_MAX_TOKENS", "not-a-number");
+
+        let mut config = AlmsConfig::default();
+        config.apply_env_overrides();
+        // Invalid parse should be silently ignored, keeping the default
+        assert_eq!(config.context.summary_max_tokens, 1000);
     }
 }
