@@ -30,6 +30,7 @@
 
 import { batch } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
+import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
 import { activeRunId } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearCompletedSubagents } from '../state/subagents.js';
 import { messageQueue } from '../state/queue.js';
@@ -93,23 +94,24 @@ function flushDeltaBuffer() {
     if (!deltaBuffer) return;
     const pending = deltaBuffer;
     deltaBuffer = '';
-    const prev = chatMessages.value;
-    const msgs = prev.filter(m => m.type !== 'thinking');
-    const copy = [...msgs];
-    const last = copy[copy.length - 1];
-    if (last && last.type === 'agent' && !last.sealed) {
-        copy[copy.length - 1] = { ...last, text: last.text + pending };
-    } else {
-        copy.push({ id: nextMsgId(), type: 'agent', role: 'assistant', text: pending, sealed: false });
-    }
-    // Defensive check: log if tool messages were lost during buffer flush.
-    // The only messages that should be removed are 'thinking' indicators.
-    const prevTools = prev.filter(m => m.type === 'tool').length;
-    const copyTools = copy.filter(m => m.type === 'tool').length;
-    if (copyTools < prevTools) {
-        console.warn('[flushDeltaBuffer] tool message count decreased:', prevTools, '->', copyTools);
-    }
-    chatMessages.value = copy;
+    transformMessages(prev => {
+        const msgs = prev.filter(m => m.type !== 'thinking');
+        const copy = [...msgs];
+        const last = copy[copy.length - 1];
+        if (last && last.type === 'agent' && !last.sealed) {
+            copy[copy.length - 1] = { ...last, text: last.text + pending };
+        } else {
+            copy.push({ id: nextMsgId(), type: 'agent', role: 'assistant', text: pending, sealed: false });
+        }
+        // Defensive check: log if tool messages were lost during buffer flush.
+        // The only messages that should be removed are 'thinking' indicators.
+        const prevTools = prev.filter(m => m.type === 'tool').length;
+        const copyTools = copy.filter(m => m.type === 'tool').length;
+        if (copyTools < prevTools) {
+            console.warn('[flushDeltaBuffer] tool message count decreased:', prevTools, '->', copyTools);
+        }
+        return copy;
+    });
 }
 
 function scheduleFlush() {
@@ -143,23 +145,27 @@ function sealLastAgent() {
     const filtered = hasThinking ? msgs.filter(m => m.type !== 'thinking') : msgs;
     const last = filtered[filtered.length - 1];
     if (last && last.type === 'agent' && !last.sealed) {
-        const updated = [...filtered];
-        updated[updated.length - 1] = { ...last, sealed: true };
-        // Defensive check: log if tool messages were lost during seal.
-        const prevTools = msgs.filter(m => m.type === 'tool').length;
-        const updatedTools = updated.filter(m => m.type === 'tool').length;
-        if (updatedTools < prevTools) {
-            console.warn('[sealLastAgent] tool message count decreased:', prevTools, '->', updatedTools);
-        }
-        chatMessages.value = updated;
+        transformMessages(() => {
+            const updated = [...filtered];
+            updated[updated.length - 1] = { ...last, sealed: true };
+            // Defensive check: log if tool messages were lost during seal.
+            const prevTools = msgs.filter(m => m.type === 'tool').length;
+            const updatedTools = updated.filter(m => m.type === 'tool').length;
+            if (updatedTools < prevTools) {
+                console.warn('[sealLastAgent] tool message count decreased:', prevTools, '->', updatedTools);
+            }
+            return updated;
+        });
     } else if (hasThinking) {
-        // Defensive check: log if tool messages were lost during thinking removal.
-        const prevTools = msgs.filter(m => m.type === 'tool').length;
-        const filteredTools = filtered.filter(m => m.type === 'tool').length;
-        if (filteredTools < prevTools) {
-            console.warn('[sealLastAgent] tool message count decreased:', prevTools, '->', filteredTools);
-        }
-        chatMessages.value = filtered;
+        transformMessages(() => {
+            // Defensive check: log if tool messages were lost during thinking removal.
+            const prevTools = msgs.filter(m => m.type === 'tool').length;
+            const filteredTools = filtered.filter(m => m.type === 'tool').length;
+            if (filteredTools < prevTools) {
+                console.warn('[sealLastAgent] tool message count decreased:', prevTools, '->', filteredTools);
+            }
+            return filtered;
+        });
     }
 }
 
@@ -250,21 +256,19 @@ export function openSessionStream(sessionId, opts) {
             // show thinking indicator with source context
             batch(() => {
                 activeRunId.value = data.run_id;
-                chatMessages.value = [...chatMessages.value, {
+                appendMessage({
                     id: nextMsgId(), type: 'thinking', source: data.source, queuedBehind,
-                }];
+                });
             });
         } else if (queuedBehind > 0) {
             // User-initiated run but agent is busy -- update the existing
             // thinking indicator (added by startRun) with queue position
             batch(() => {
                 activeRunId.value = data.run_id;
-                const msgs = [...chatMessages.value];
-                const idx = msgs.findLastIndex(m => m.type === 'thinking');
-                if (idx >= 0) {
-                    msgs[idx] = { ...msgs[idx], queuedBehind };
-                }
-                chatMessages.value = msgs;
+                updateMessage(
+                    m => m.type === 'thinking',
+                    m => ({ ...m, queuedBehind }),
+                );
             });
         } else {
             activeRunId.value = data.run_id;
@@ -275,12 +279,10 @@ export function openSessionStream(sessionId, opts) {
     // -- run_started: the run has been dequeued and is now executing --
     on('run_started', (_e) => {
         // Transition thinking indicator from "queued" to active "Thinking..."
-        const msgs = [...chatMessages.value];
-        const idx = msgs.findLastIndex(m => m.type === 'thinking');
-        if (idx >= 0 && msgs[idx].queuedBehind > 0) {
-            msgs[idx] = { ...msgs[idx], queuedBehind: 0 };
-            chatMessages.value = msgs;
-        }
+        updateMessage(
+            m => m.type === 'thinking' && m.queuedBehind > 0,
+            m => ({ ...m, queuedBehind: 0 }),
+        );
     });
 
     // -- status: agent phase update --
@@ -291,17 +293,15 @@ export function openSessionStream(sessionId, opts) {
     //   PHASE_EXECUTING_TOOLS  = "executing_tools"
     on('status', (e) => {
         const data = JSON.parse(e.data);
-        const msgs = [...chatMessages.value];
-        const idx = msgs.findLastIndex(m => m.type === 'thinking');
-        if (idx >= 0) {
-            msgs[idx] = { ...msgs[idx], phase: data.phase, phaseDetail: data.detail || null };
-            chatMessages.value = msgs;
-        } else {
+        const updated = updateMessage(
+            m => m.type === 'thinking',
+            m => ({ ...m, phase: data.phase, phaseDetail: data.detail || null }),
+        );
+        if (!updated) {
             // Thinking indicator was removed by token_delta flush or tool_start
             // (e.g. on iteration 2+ of the agent loop). Re-add it so the user
             // sees the current phase ("Running tools...", "Thinking...", etc.).
-            msgs.push({ id: nextMsgId(), type: 'thinking', phase: data.phase, phaseDetail: data.detail || null });
-            chatMessages.value = msgs;
+            appendMessage({ id: nextMsgId(), type: 'thinking', phase: data.phase, phaseDetail: data.detail || null });
         }
     });
 
@@ -331,10 +331,10 @@ export function openSessionStream(sessionId, opts) {
                 sealLastAgent();
                 const name = data.params?.name || data.params?.subagent_name || 'subagent';
                 const task = data.params?.task || '';
-                chatMessages.value = [...chatMessages.value, {
+                appendMessage({
                     id: toolId, type: 'tool', tool: 'invoke_agent', params: data.params,
                     status: 'running', startedAt,
-                }];
+                });
                 trackSubagentStart(name, task);
             } else if (data.source_agent) {
                 trackSubagentTool(data.source_agent, {
@@ -342,10 +342,10 @@ export function openSessionStream(sessionId, opts) {
                 });
             } else {
                 sealLastAgent();
-                chatMessages.value = [...chatMessages.value, {
+                appendMessage({
                     id: toolId, type: 'tool', tool: data.tool, params: data.params,
                     status: 'running', startedAt,
-                }];
+                });
             }
         });
     });
@@ -363,29 +363,40 @@ export function openSessionStream(sessionId, opts) {
 
             const endedAt = Date.now();
 
-            const msgs = [...chatMessages.value];
+            const applyToolEnd = (m) => {
+                const durationMs = m.startedAt ? endedAt - m.startedAt : null;
+                return { ...m, status, result: data.result, durationMs };
+            };
+
             // Primary match: by tool_invocation_id (exact ID correlation).
             // Fallback: if the primary match fails (e.g. tool message was
             // reconstructed from history with a different ID scheme), fall
             // back to matching the last running tool message.
-            let idx = matchId
-                ? msgs.findLastIndex(m => m.type === 'tool' && m.id === matchId)
-                : -1;
-            if (idx < 0) {
-                idx = msgs.findLastIndex(m => m.type === 'tool' && m.status === 'running');
+            let found = matchId && updateMessage(
+                m => m.type === 'tool' && m.id === matchId,
+                applyToolEnd,
+            );
+            if (!found) {
+                found = updateMessage(
+                    m => m.type === 'tool' && m.status === 'running',
+                    applyToolEnd,
+                );
             }
-            if (idx >= 0) {
-                const durationMs = msgs[idx].startedAt ? endedAt - msgs[idx].startedAt : null;
-                msgs[idx] = { ...msgs[idx], status, result: data.result, durationMs };
-                if (msgs[idx].tool === 'invoke_agent') {
-                    const name = msgs[idx].params?.name || msgs[idx].params?.subagent_name;
+            if (found) {
+                // Check if the matched tool was invoke_agent and track subagent end.
+                // Re-read from the signal since updateMessage already wrote it.
+                const updated = chatMessages.value;
+                const updatedMsg = matchId
+                    ? updated.find(m => m.type === 'tool' && m.id === matchId)
+                    : updated.findLast(m => m.type === 'tool' && m.status === status);
+                if (updatedMsg && updatedMsg.tool === 'invoke_agent') {
+                    const name = updatedMsg.params?.name || updatedMsg.params?.subagent_name;
                     const resultObj = typeof data.result === 'object' ? data.result : null;
                     const isBackground = resultObj && resultObj.task_id;
                     if (name && !isBackground) {
                         trackSubagentEnd(name, status);
                     }
                 }
-                chatMessages.value = msgs;
             } else if (!data.source_agent) {
                 // tool_end arrived for a non-subagent tool, but no matching
                 // tool message was found in chatMessages. This means the
@@ -393,7 +404,7 @@ export function openSessionStream(sessionId, opts) {
                 // diagnosis. (Relates to #501 Bug 4 investigation)
                 console.warn('[tool_end] no matching tool message found for',
                     matchId, '- tool messages in chat:',
-                    msgs.filter(m => m.type === 'tool').length);
+                    chatMessages.value.filter(m => m.type === 'tool').length);
             }
             // When no matching tool message was found for subagent-only tool
             // events, skip the chatMessages write to avoid an unnecessary
@@ -410,17 +421,17 @@ export function openSessionStream(sessionId, opts) {
             // Deduplicate: skip if an approval card with this ID already exists.
             // This can happen when the approval was reconstructed from the REST
             // API on session switch and then replayed by the SSE stream.
-            // (Fixes #487 Bug 2 — prevents duplicate approval prompts)
+            // (Fixes #487 Bug 2 -- prevents duplicate approval prompts)
             const alreadyExists = chatMessages.value.some(
                 m => m.type === 'approval' && m.approvalId === data.approval_id
             );
             if (!alreadyExists) {
                 const norm = normalizeApproval(data);
-                chatMessages.value = [...chatMessages.value, {
+                appendMessage({
                     id: nextMsgId(), type: 'approval', approvalId: norm.approvalId,
                     tool: norm.tool, params: norm.params, runId: norm.runId,
                     resolved: false,
-                }];
+                });
             }
         });
     });
@@ -439,10 +450,10 @@ export function openSessionStream(sessionId, opts) {
             const label = status === 'done' ? 'completed'
                 : status === 'fail' ? 'failed'
                 : status === 'cancelled' ? 'cancelled' : 'completed';
-            chatMessages.value = [...chatMessages.value, {
+            appendMessage({
                 id: nextMsgId(), type: 'system',
                 text: `Subagent '${name}' ${label}.`,
-            }];
+            });
         });
     });
 
@@ -453,10 +464,10 @@ export function openSessionStream(sessionId, opts) {
         const status = data.status === 'success' ? 'completed'
             : data.status === 'cancelled' ? 'cancelled' : 'failed';
         const summary = data.summary ? `: ${data.summary}` : '';
-        chatMessages.value = [...chatMessages.value, {
+        appendMessage({
             id: nextMsgId(), type: 'system',
             text: `Scheduled job ${status} -- ${name}${summary}`,
-        }];
+        });
     });
 
     // -- dm_conversation_ended --
@@ -468,27 +479,25 @@ export function openSessionStream(sessionId, opts) {
             'depth_exceeded': 'message limit reached',
         };
         const reason = reasonLabels[data.reason] || data.reason || 'conversation ended';
-        chatMessages.value = [...chatMessages.value, {
+        appendMessage({
             id: nextMsgId(), type: 'dm_ended', peer, reason,
-        }];
+        });
     });
 
     // -- approval_resolved --
     on('approval_resolved', (e) => {
         const data = JSON.parse(e.data);
-        const msgs = [...chatMessages.value];
-        const idx = msgs.findLastIndex(m => m.type === 'approval' && m.approvalId === data.approval_id);
-        if (idx >= 0) {
-            msgs[idx] = { ...msgs[idx], resolved: true, decision: data.decision };
-            chatMessages.value = msgs;
-        }
+        updateMessage(
+            m => m.type === 'approval' && m.approvalId === data.approval_id,
+            m => ({ ...m, resolved: true, decision: data.decision }),
+        );
     });
 
     // -- context_debug: full context window snapshot (debug mode) --
     on('context_debug', (e) => {
         batch(() => {
             const data = JSON.parse(e.data);
-            chatMessages.value = [...chatMessages.value, {
+            appendMessage({
                 id: nextMsgId(),
                 type: 'context_debug',
                 messages: data.messages,
@@ -496,7 +505,7 @@ export function openSessionStream(sessionId, opts) {
                 totalTokens: data.total_tokens,
                 systemTokens: data.system_tokens,
                 historyMessageCount: data.history_message_count,
-            }];
+            });
         });
     });
 
@@ -508,7 +517,7 @@ export function openSessionStream(sessionId, opts) {
             const data = JSON.parse(e.data);
             const code = data.warning?.code || 'UNKNOWN';
             const msg = data.warning?.message || 'Warning';
-            chatMessages.value = [...chatMessages.value, { id: nextMsgId(), type: 'warning', code, text: msg }];
+            appendMessage({ id: nextMsgId(), type: 'warning', code, text: msg });
         });
     });
 
@@ -519,67 +528,67 @@ export function openSessionStream(sessionId, opts) {
             sealLastAgent();
             const data = e.data ? JSON.parse(e.data) : {};
 
-            // Build the approval-resolution-and-append phase on a local
-            // variable so it results in a single chatMessages.value write.
+            // Build the approval-resolution-and-append phase via
+            // transformMessages so it results in a single signal write.
             // Note: flushDeltaBuffer() and sealLastAgent() above may each
             // write to chatMessages.value independently, but this section
             // (approval resolution + appended status/error/token messages)
             // is collapsed into one write to avoid intermediate states.
-            let msgs = [...chatMessages.value];
-            const toolCountBefore = msgs.filter(m => m.type === 'tool').length;
-
-            // Resolve any pending approval cards for this run.
-            // When a run ends (cancelled, error, or finished), any unresolved
-            // approval prompts are stale and must be dismissed so the user is
-            // not left with dangling Approve/Deny buttons.  (Fixes #487 Bug 1)
-            //
-            // Scoped to the ending run's ID so concurrent runs (future) do not
-            // accidentally dismiss each other's approval cards.  Approval cards
-            // without a runId (legacy) are always resolved as a fallback.
             const endingRunId = data.run_id || null;
             const decision = status === 'cancelled' ? 'cancelled'
                 : status === 'error' ? 'cancelled' : 'expired';
-            const isStaleApproval = (m) =>
-                m.type === 'approval' && !m.resolved
-                && (!m.runId || !endingRunId || m.runId === endingRunId);
-            msgs = msgs.map(m =>
-                isStaleApproval(m)
-                    ? { ...m, resolved: true, decision }
-                    : m
-            );
+            transformMessages(prev => {
+                const toolCountBefore = prev.filter(m => m.type === 'tool').length;
 
-            if (status === 'error') {
-                const code = data.error?.code || 'INTERNAL';
-                const rawMsg = typeof data.error === 'string'
-                    ? data.error : (data.error?.message || 'Run failed');
-                const text = friendlyErrorMessage(code, rawMsg);
-                msgs.push({ id: nextMsgId(), type: 'error', code, text });
-            }
-            if (status === 'cancelled') {
-                msgs.push({ id: nextMsgId(), type: 'system', text: '(run cancelled)' });
-            }
-            if (status === 'finished' && !sawTokenDelta) {
-                // Only show "(run completed)" for runs that had no streamed
-                // response (e.g. DM runs using send_message, tool-only runs).
-                // Normal chat runs already display the streamed text.
-                msgs.push({ id: nextMsgId(), type: 'system', text: '(run completed)' });
-            }
+                // Resolve any pending approval cards for this run.
+                // When a run ends (cancelled, error, or finished), any unresolved
+                // approval prompts are stale and must be dismissed so the user is
+                // not left with dangling Approve/Deny buttons.  (Fixes #487 Bug 1)
+                //
+                // Scoped to the ending run's ID so concurrent runs (future) do not
+                // accidentally dismiss each other's approval cards.  Approval cards
+                // without a runId (legacy) are always resolved as a fallback.
+                const isStaleApproval = (m) =>
+                    m.type === 'approval' && !m.resolved
+                    && (!m.runId || !endingRunId || m.runId === endingRunId);
+                let msgs = prev.map(m =>
+                    isStaleApproval(m)
+                        ? { ...m, resolved: true, decision }
+                        : m
+                );
 
-            const usage = (data.prompt_tokens || data.completion_tokens)
-                ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
-                : data.usage;
-            if (usage) {
-                msgs.push({ id: nextMsgId(), type: 'tokens', usage });
-            }
+                if (status === 'error') {
+                    const code = data.error?.code || 'INTERNAL';
+                    const rawMsg = typeof data.error === 'string'
+                        ? data.error : (data.error?.message || 'Run failed');
+                    const text = friendlyErrorMessage(code, rawMsg);
+                    msgs = [...msgs, { id: nextMsgId(), type: 'error', code, text }];
+                }
+                if (status === 'cancelled') {
+                    msgs = [...msgs, { id: nextMsgId(), type: 'system', text: '(run cancelled)' }];
+                }
+                if (status === 'finished' && !sawTokenDelta) {
+                    // Only show "(run completed)" for runs that had no streamed
+                    // response (e.g. DM runs using send_message, tool-only runs).
+                    // Normal chat runs already display the streamed text.
+                    msgs = [...msgs, { id: nextMsgId(), type: 'system', text: '(run completed)' }];
+                }
 
-            // Defensive check: log if tool messages were lost.
-            const toolCountAfter = msgs.filter(m => m.type === 'tool').length;
-            if (toolCountAfter < toolCountBefore) {
-                console.warn('[handleRunEnd] tool message count decreased:', toolCountBefore, '->', toolCountAfter);
-            }
+                const usage = (data.prompt_tokens || data.completion_tokens)
+                    ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
+                    : data.usage;
+                if (usage) {
+                    msgs = [...msgs, { id: nextMsgId(), type: 'tokens', usage }];
+                }
 
-            // Single write: avoids multiple intermediate signal updates.
-            chatMessages.value = msgs;
+                // Defensive check: log if tool messages were lost.
+                const toolCountAfter = msgs.filter(m => m.type === 'tool').length;
+                if (toolCountAfter < toolCountBefore) {
+                    console.warn('[handleRunEnd] tool message count decreased:', toolCountBefore, '->', toolCountAfter);
+                }
+
+                return msgs;
+            });
             activeRunId.value = null;
         });
 
