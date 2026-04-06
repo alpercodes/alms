@@ -99,7 +99,7 @@ on what was accomplished, not internal steps.
 **Code path**: `generate_llm()` in `episodic.rs` -> `include_str!("../prompts/session_summarizer.md")`
 
 **Key constraints**:
-- Max 150 output tokens
+- Configurable output token limit via `context.summary_max_tokens` (default 1000). The higher default provides headroom for reasoning models that consume tokens on internal thinking before producing visible output.
 - Uses `summary_model` if configured, otherwise falls back to the agent's default model
 - Errors are logged and swallowed -- summary failure must never fail the run
 

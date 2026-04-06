@@ -617,6 +617,14 @@ impl ContextConfig {
             );
             self.run_summary_budget = cap;
         }
+
+        // Zero summary_max_tokens would cause the LLM API to reject the
+        // request, and since summary generation is fire-and-forget the error
+        // gets silently swallowed.  Reset to the default (1000).
+        if self.summary_max_tokens == 0 {
+            warn!("summary_max_tokens is 0, resetting to default (1000)");
+            self.summary_max_tokens = 1000;
+        }
     }
 }
 
@@ -1418,6 +1426,32 @@ log_dir = "/var/log/alms"
         assert_eq!(
             config.run_summary_budget, 600,
             "budget should be clamped to 15% of 4_000 = 600"
+        );
+    }
+
+    #[test]
+    fn test_normalize_episodic_zero_summary_max_tokens_reset() {
+        let mut config = ContextConfig {
+            summary_max_tokens: 0,
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        assert_eq!(
+            config.summary_max_tokens, 1000,
+            "zero summary_max_tokens should be reset to default 1000"
+        );
+    }
+
+    #[test]
+    fn test_normalize_episodic_nonzero_summary_max_tokens_preserved() {
+        let mut config = ContextConfig {
+            summary_max_tokens: 500,
+            ..Default::default()
+        };
+        config.normalize_episodic();
+        assert_eq!(
+            config.summary_max_tokens, 500,
+            "non-zero summary_max_tokens should be preserved"
         );
     }
 

@@ -824,7 +824,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     context_id: ctx_id,
                     summary_model: summary_model_resolved.clone(),
                     agent_name: agent_name_for_summary.clone(),
-                    summary_max_tokens: Some(summary_max_tokens),
+                    summary_max_tokens,
                 };
                 run_mgr.track_in_flight();
                 tokio::spawn(async move {
