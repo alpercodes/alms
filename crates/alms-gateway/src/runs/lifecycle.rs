@@ -363,6 +363,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     {
         agent_config.posture = posture;
     }
+    if let Some(debug) = overrides.debug_mode {
+        agent_config.debug_mode = debug;
+    }
     if let Some(ref provider) = overrides.provider {
         info!("Run {} using provider override: {}", run_id.0, provider);
         llm = llm.with_provider_and_secrets(provider, &state.secrets.read());
