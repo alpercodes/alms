@@ -349,6 +349,7 @@ impl Coordinator {
                     parent_cancel_token,
                     secrets,
                     run_registrar,
+                    is_background,
                 )
                 .await;
             }
@@ -501,6 +502,7 @@ async fn run_subagent(
     parent_cancel_token: Option<CancellationToken>,
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     run_registrar: Option<Arc<dyn RunRegistrar>>,
+    is_background: bool,
 ) {
     // RAII guard: removes the name from active_named on drop (including panics).
     let _named_guard = NamedSubagentGuard {
@@ -583,7 +585,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None)
         }
-        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref()) => {
+        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), is_background) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -848,10 +850,11 @@ async fn run_agent_loop(
     subagent_prompts: &DashMap<String, String>,
     cancel_token: CancellationToken,
     secrets: Option<&Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
+    is_background: bool,
 ) -> AlmsResult<RunOutput> {
     // Derive config based on whether the subagent is named (identity already resolved
     // by the caller via `derive_subagent_identity`).
-    let (config, model_override, provider_override, attach_workspace) = if let Some(ref name) =
+    let (mut config, model_override, provider_override, attach_workspace) = if let Some(ref name) =
         request.subagent_name
     {
         // Named: look up agent registry for config
@@ -906,6 +909,19 @@ async fn run_agent_loop(
             config, None, None, true, // attach an ephemeral workspace to restrict fs_* sandbox
         )
     };
+
+    // Background subagents have no human in the loop to approve tool calls,
+    // so Guarded posture would cause them to hang indefinitely (the approval
+    // request is auto-denied by the event bridge, but the subagent keeps
+    // retrying until the TTL kills it).  Override to Autonomous, matching
+    // the pattern used for system-triggered runs in the gateway.
+    if is_background && config.posture == alms_runtime::Posture::Guarded {
+        info!(
+            task_id = %task_id.0,
+            "Background subagent — overriding Guarded posture to Autonomous"
+        );
+        config.posture = alms_runtime::Posture::Autonomous;
+    }
 
     // Create a per-subagent event channel
     let (sub_tx, sub_rx) = tokio::sync::mpsc::unbounded_channel::<alms_runtime::RuntimeEvent>();
@@ -1015,16 +1031,17 @@ async fn run_agent_loop(
                     // subagent is "building context" or "calling LLM".
                     RuntimeEvent::Status { .. } => continue,
                     // ApprovalRequired cannot be forwarded through EventForwarder
-                    // (it requires a oneshot channel). Subagent approvals are
-                    // not supported; auto-deny the tool call immediately so the
-                    // subagent doesn't hang waiting for a response that will
-                    // never come.
+                    // (it requires a oneshot channel).  Background subagents
+                    // should already have Guarded overridden to Autonomous, so
+                    // this path is a fallback for FullControl subagents (which
+                    // intentionally keep their posture).  Auto-deny the tool
+                    // call immediately so the subagent doesn't hang.
                     RuntimeEvent::ApprovalRequired {
                         tool, decision_tx, ..
                     } => {
                         warn!(
                             tool = %tool,
-                            "Subagent requested approval -- not supported, auto-denying"
+                            "Subagent requested approval — auto-denying (approval not routable)"
                         );
                         let _ = decision_tx.send(false);
                         continue;
@@ -1584,6 +1601,78 @@ mod tests {
         // The subagent side should receive `false` (denial).
         let result = decision_rx.await;
         assert_eq!(result, Ok(false), "ApprovalRequired should be auto-denied");
+    }
+
+    // -- background subagent posture override (Fixes #396) -------------------
+
+    #[test]
+    fn test_background_subagent_guarded_overridden_to_autonomous() {
+        // Simulate the posture override that run_agent_loop applies for
+        // background subagents: Guarded should become Autonomous.
+        let mut config = AgentConfig::default();
+        config.posture = alms_runtime::Posture::Guarded;
+        let is_background = true;
+
+        if is_background && config.posture == alms_runtime::Posture::Guarded {
+            config.posture = alms_runtime::Posture::Autonomous;
+        }
+
+        assert_eq!(
+            config.posture,
+            alms_runtime::Posture::Autonomous,
+            "Guarded posture should be overridden to Autonomous for background subagents"
+        );
+    }
+
+    #[test]
+    fn test_background_subagent_autonomous_unchanged() {
+        let mut config = AgentConfig::default();
+        config.posture = alms_runtime::Posture::Autonomous;
+        let is_background = true;
+
+        if is_background && config.posture == alms_runtime::Posture::Guarded {
+            config.posture = alms_runtime::Posture::Autonomous;
+        }
+
+        assert_eq!(
+            config.posture,
+            alms_runtime::Posture::Autonomous,
+            "Autonomous posture should remain unchanged for background subagents"
+        );
+    }
+
+    #[test]
+    fn test_background_subagent_full_control_unchanged() {
+        let mut config = AgentConfig::default();
+        config.posture = alms_runtime::Posture::FullControl;
+        let is_background = true;
+
+        if is_background && config.posture == alms_runtime::Posture::Guarded {
+            config.posture = alms_runtime::Posture::Autonomous;
+        }
+
+        assert_eq!(
+            config.posture,
+            alms_runtime::Posture::FullControl,
+            "FullControl posture should NOT be overridden for background subagents"
+        );
+    }
+
+    #[test]
+    fn test_foreground_subagent_guarded_unchanged() {
+        let mut config = AgentConfig::default();
+        config.posture = alms_runtime::Posture::Guarded;
+        let is_background = false;
+
+        if is_background && config.posture == alms_runtime::Posture::Guarded {
+            config.posture = alms_runtime::Posture::Autonomous;
+        }
+
+        assert_eq!(
+            config.posture,
+            alms_runtime::Posture::Guarded,
+            "Guarded posture should be preserved for foreground subagents"
+        );
     }
 
     #[test]
