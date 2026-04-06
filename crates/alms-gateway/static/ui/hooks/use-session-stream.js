@@ -74,7 +74,8 @@ function flushDeltaBuffer() {
     if (!deltaBuffer) return;
     const pending = deltaBuffer;
     deltaBuffer = '';
-    const msgs = chatMessages.value.filter(m => m.type !== 'thinking');
+    const prev = chatMessages.value;
+    const msgs = prev.filter(m => m.type !== 'thinking');
     const copy = [...msgs];
     const last = copy[copy.length - 1];
     if (last && last.type === 'agent' && !last.sealed) {
@@ -82,12 +83,25 @@ function flushDeltaBuffer() {
     } else {
         copy.push({ id: nextMsgId(), type: 'agent', role: 'assistant', text: pending, sealed: false });
     }
+    // Defensive check: log if tool messages were lost during buffer flush.
+    // The only messages that should be removed are 'thinking' indicators.
+    const prevTools = prev.filter(m => m.type === 'tool').length;
+    const copyTools = copy.filter(m => m.type === 'tool').length;
+    if (copyTools < prevTools) {
+        console.warn('[flushDeltaBuffer] tool message count decreased:', prevTools, '->', copyTools);
+    }
     chatMessages.value = copy;
 }
 
 function scheduleFlush() {
     if (flushTimer === null) {
-        flushTimer = requestAnimationFrame(flushDeltaBuffer);
+        // Wrap the rAF callback in batch() so the signal write inside
+        // flushDeltaBuffer and any subsequent Preact re-render are
+        // coalesced into a single pass.  Without batch(), the signal
+        // write triggers an immediate synchronous re-render before the
+        // rAF callback returns, which can cause a brief intermediate
+        // visual state if another SSE event is queued right after.
+        flushTimer = requestAnimationFrame(() => batch(flushDeltaBuffer));
     }
 }
 
@@ -99,8 +113,20 @@ function sealLastAgent() {
     if (last && last.type === 'agent' && !last.sealed) {
         const updated = [...filtered];
         updated[updated.length - 1] = { ...last, sealed: true };
+        // Defensive check: log if tool messages were lost during seal.
+        const prevTools = msgs.filter(m => m.type === 'tool').length;
+        const updatedTools = updated.filter(m => m.type === 'tool').length;
+        if (updatedTools < prevTools) {
+            console.warn('[sealLastAgent] tool message count decreased:', prevTools, '->', updatedTools);
+        }
         chatMessages.value = updated;
     } else if (hasThinking) {
+        // Defensive check: log if tool messages were lost during thinking removal.
+        const prevTools = msgs.filter(m => m.type === 'tool').length;
+        const filteredTools = filtered.filter(m => m.type === 'tool').length;
+        if (filteredTools < prevTools) {
+            console.warn('[sealLastAgent] tool message count decreased:', prevTools, '->', filteredTools);
+        }
         chatMessages.value = filtered;
     }
 }
@@ -249,6 +275,10 @@ export function openSessionStream(sessionId, opts) {
             flushDeltaBuffer();
             const data = JSON.parse(e.data);
             const toolId = data.tool_invocation_id || data.call_id || nextMsgId();
+            // Diagnostic: log tool count before insertion for #501 investigation.
+            const toolCountBefore = chatMessages.value.filter(m => m.type === 'tool').length;
+            console.debug('[tool_start]', data.tool, 'id=' + toolId,
+                'tool count before insertion:', toolCountBefore);
 
             const startedAt = Date.now();
 
@@ -311,9 +341,17 @@ export function openSessionStream(sessionId, opts) {
                     }
                 }
                 chatMessages.value = msgs;
+            } else if (!data.source_agent) {
+                // tool_end arrived for a non-subagent tool, but no matching
+                // tool message was found in chatMessages. This means the
+                // tool_start message was lost or never arrived. Log for
+                // diagnosis. (Relates to #501 Bug 4 investigation)
+                console.warn('[tool_end] no matching tool message found for',
+                    matchId, '- tool messages in chat:',
+                    msgs.filter(m => m.type === 'tool').length);
             }
-            // When no matching tool message was found (e.g. subagent-only tool
-            // events), skip the chatMessages write to avoid an unnecessary
+            // When no matching tool message was found for subagent-only tool
+            // events, skip the chatMessages write to avoid an unnecessary
             // re-render with a new array reference.
         });
     });
@@ -436,6 +474,15 @@ export function openSessionStream(sessionId, opts) {
             sealLastAgent();
             const data = e.data ? JSON.parse(e.data) : {};
 
+            // Build the approval-resolution-and-append phase on a local
+            // variable so it results in a single chatMessages.value write.
+            // Note: flushDeltaBuffer() and sealLastAgent() above may each
+            // write to chatMessages.value independently, but this section
+            // (approval resolution + appended status/error/token messages)
+            // is collapsed into one write to avoid intermediate states.
+            let msgs = [...chatMessages.value];
+            const toolCountBefore = msgs.filter(m => m.type === 'tool').length;
+
             // Resolve any pending approval cards for this run.
             // When a run ends (cancelled, error, or finished), any unresolved
             // approval prompts are stale and must be dismissed so the user is
@@ -447,51 +494,47 @@ export function openSessionStream(sessionId, opts) {
             const endingRunId = data.run_id || null;
             const decision = status === 'cancelled' ? 'cancelled'
                 : status === 'error' ? 'cancelled' : 'expired';
-            let msgs = chatMessages.value;
             const isStaleApproval = (m) =>
                 m.type === 'approval' && !m.resolved
                 && (!m.runId || !endingRunId || m.runId === endingRunId);
-            const hasUnresolved = msgs.some(isStaleApproval);
-            if (hasUnresolved) {
-                msgs = msgs.map(m =>
-                    isStaleApproval(m)
-                        ? { ...m, resolved: true, decision }
-                        : m
-                );
-                chatMessages.value = msgs;
-            }
-
-            // Collect all new messages to append in a single batch to avoid
-            // multiple intermediate re-renders (error + tokens + activeRunId).
-            const append = [];
+            msgs = msgs.map(m =>
+                isStaleApproval(m)
+                    ? { ...m, resolved: true, decision }
+                    : m
+            );
 
             if (status === 'error') {
                 const code = data.error?.code || 'INTERNAL';
                 const rawMsg = typeof data.error === 'string'
                     ? data.error : (data.error?.message || 'Run failed');
                 const text = friendlyErrorMessage(code, rawMsg);
-                append.push({ id: nextMsgId(), type: 'error', code, text });
+                msgs.push({ id: nextMsgId(), type: 'error', code, text });
             }
             if (status === 'cancelled') {
-                append.push({ id: nextMsgId(), type: 'system', text: '(run cancelled)' });
+                msgs.push({ id: nextMsgId(), type: 'system', text: '(run cancelled)' });
             }
             if (status === 'finished' && !sawTokenDelta) {
                 // Only show "(run completed)" for runs that had no streamed
                 // response (e.g. DM runs using send_message, tool-only runs).
                 // Normal chat runs already display the streamed text.
-                append.push({ id: nextMsgId(), type: 'system', text: '(run completed)' });
+                msgs.push({ id: nextMsgId(), type: 'system', text: '(run completed)' });
             }
 
             const usage = (data.prompt_tokens || data.completion_tokens)
                 ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
                 : data.usage;
             if (usage) {
-                append.push({ id: nextMsgId(), type: 'tokens', usage });
+                msgs.push({ id: nextMsgId(), type: 'tokens', usage });
             }
 
-            if (append.length > 0) {
-                chatMessages.value = [...chatMessages.value, ...append];
+            // Defensive check: log if tool messages were lost.
+            const toolCountAfter = msgs.filter(m => m.type === 'tool').length;
+            if (toolCountAfter < toolCountBefore) {
+                console.warn('[handleRunEnd] tool message count decreased:', toolCountBefore, '->', toolCountAfter);
             }
+
+            // Single write: avoids multiple intermediate signal updates.
+            chatMessages.value = msgs;
             activeRunId.value = null;
         });
 
