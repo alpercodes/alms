@@ -108,6 +108,12 @@ impl AgentRuntime {
                     tool_call_id: None,
                 });
 
+                // Pre-compute stable invocation IDs for each tool call.
+                // These correlate tool_start / tool_end SSE events with
+                // persisted session history, so history reconstruction uses
+                // the same IDs as live streaming.
+                let invocation_ids: Vec<Uuid> = tool_calls.iter().map(|_| Uuid::new_v4()).collect();
+
                 // Persist assistant text and tool call entries to session
                 // history. Intentionally fire-and-forget: session persistence
                 // failures are logged as warnings but do not abort the run.
@@ -122,6 +128,7 @@ impl AgentRuntime {
                         session_id,
                         content.as_deref(),
                         &tool_calls,
+                        &invocation_ids,
                     );
                 }
 
@@ -170,6 +177,7 @@ impl AgentRuntime {
                 let results = match self
                     .run_tool_calls(
                         &tool_calls,
+                        &invocation_ids,
                         dm_check.conflicting_tools,
                         session_manager,
                         session_id,
@@ -376,6 +384,7 @@ impl AgentRuntime {
     async fn run_tool_calls(
         &self,
         tool_calls: &[ToolCall],
+        invocation_ids: &[Uuid],
         conflicting_tools: &[&str],
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
@@ -387,7 +396,7 @@ impl AgentRuntime {
                 // is not detected until the tool completes, which is acceptable
                 // since guarded tools block on approval (which IS cancellation-aware).
                 let mut results = Vec::with_capacity(tool_calls.len());
-                for tc in tool_calls {
+                for (tc, &inv_id) in tool_calls.iter().zip(invocation_ids) {
                     if conflicting_tools.contains(&tc.function.name.as_str()) {
                         results.push(Err(AlmsError::ToolExecution(DM_CONFLICT_MSG.to_string())));
                         continue;
@@ -398,7 +407,7 @@ impl AgentRuntime {
                         return Err(AlmsError::Cancelled);
                     }
                     results.push(
-                        self.execute_tool_call(tc, session_manager, session_id)
+                        self.execute_tool_call(tc, inv_id, session_manager, session_id)
                             .await,
                     );
                 }
@@ -418,7 +427,12 @@ impl AgentRuntime {
                     Vec::new()
                 } else {
                     let exec_futures = exec_indices.iter().map(|&i| {
-                        self.execute_tool_call(&tool_calls[i], session_manager, session_id)
+                        self.execute_tool_call(
+                            &tool_calls[i],
+                            invocation_ids[i],
+                            session_manager,
+                            session_id,
+                        )
                     });
                     if let Some(ref token) = self.cancel_token {
                         tokio::select! {
@@ -481,6 +495,7 @@ impl AgentRuntime {
         session_id: alms_core::SessionId,
         content: Option<&str>,
         tool_calls: &[ToolCall],
+        invocation_ids: &[Uuid],
     ) {
         // Persist assistant text content (if any) before tool calls.
         if let Some(text) = content
@@ -500,7 +515,7 @@ impl AgentRuntime {
         }
 
         // Persist tool calls to session history.
-        for tc in tool_calls {
+        for (tc, invocation_id) in tool_calls.iter().zip(invocation_ids) {
             if let Err(e) = session_manager.append_message(
                 session_id,
                 SessionMessage {
@@ -513,7 +528,10 @@ impl AgentRuntime {
                         }),
                     },
                     timestamp: alms_core::Timestamp::now(),
-                    metadata: Some(serde_json::json!({ "tool_call_id": tc.id })),
+                    metadata: Some(serde_json::json!({
+                        "tool_call_id": tc.id,
+                        "tool_invocation_id": invocation_id.to_string(),
+                    })),
                 },
             ) {
                 warn!("Failed to persist tool call to session: {}", e);
@@ -721,17 +739,19 @@ impl AgentRuntime {
     /// Execute a tool call, emitting tool_start/tool_end events and handling approvals.
     #[instrument(
         level = "info",
-        skip(self, tool_call, session_manager),
+        skip(self, tool_call, invocation_id, session_manager),
         fields(
             agent_id = %self.agent_id.0,
             tool_name = %tool_call.function.name,
             tool_call_id = %tool_call.id,
+            invocation_id = %invocation_id,
             session_id = %session_id.0
         )
     )]
     pub(crate) async fn execute_tool_call(
         &self,
         tool_call: &ToolCall,
+        invocation_id: Uuid,
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
     ) -> AlmsResult<serde_json::Value> {
@@ -792,9 +812,6 @@ impl AgentRuntime {
             );
             return Err(err);
         }
-
-        // Stable ID for correlating tool_start / tool_end SSE events
-        let invocation_id = Uuid::new_v4();
 
         // Emit tool_start
         if let Some(ref sender) = self.event_sender {

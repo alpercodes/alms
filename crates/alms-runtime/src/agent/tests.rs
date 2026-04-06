@@ -373,7 +373,7 @@ async fn test_guarded_posture_sequential_approvals() {
     for tc in &tool_calls {
         results.push(
             runtime
-                .execute_tool_call(tc, &session_manager, session.id)
+                .execute_tool_call(tc, uuid::Uuid::new_v4(), &session_manager, session.id)
                 .await,
         );
     }

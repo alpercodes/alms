@@ -1,9 +1,9 @@
-import { html } from '../../deps.js';
+import { html, batch } from '../../deps.js';
 import { sessions, activeSessionId } from '../../state/sessions.js';
 import { activeAgentId } from '../../state/agents.js';
 import { chatMessages, nextMsgId } from '../../state/chat.js';
 import { activeRunId, runs } from '../../state/runs.js';
-import { bgRuns } from '../../state/queue.js';
+import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
 import { listSessions, createSession, getSessionMessages } from '../../api/sessions.js';
 import { listRuns } from '../../api/runs.js';
@@ -27,6 +27,7 @@ async function selectSession(sessionId) {
     activeSessionId.value = sessionId;
     activeRunId.value = null;
     chatMessages.value = [];
+    messageQueue.value = [];
     auditEvents.value = null;
 
     // Persist the selection for this agent
@@ -52,7 +53,9 @@ async function selectSession(sessionId) {
     try {
         const data = await getSessionMessages(sessionId);
         if (gen !== selectGeneration) return; // stale — discard
-        chatMessages.value = mapHistoryMessages(data.messages || []);
+        chatMessages.value = mapHistoryMessages(data.messages || [], {
+            hasActiveRun: !!activeRunId.value,
+        });
         // Capture the SSE high-water mark so we can skip replay of events
         // that are already reflected in the loaded messages.
         if (data.last_event_id != null) lastEventId = data.last_event_id;
@@ -73,17 +76,27 @@ async function selectSession(sessionId) {
 
 async function newSession() {
     if (!activeAgentId.value) return;
+
+    // Close old stream immediately and invalidate in-flight selectSession()
+    // fetches so they do not overwrite the new session state.
+    closeSessionStream();
+    bumpSelectGeneration();
+
     try {
         const ctx = 'web-chat-' + Date.now();
         const resp = await createSession(activeAgentId.value, ctx);
         // Reload sessions
         const data = await listSessions(activeAgentId.value);
-        sessions.value = data.sessions || [];
-        activeSessionId.value = resp.session_id;
-        saveActiveSession(activeAgentId.value, resp.session_id);
-        activeRunId.value = null;
-        chatMessages.value = [];
-        runs.value = [];
+        batch(() => {
+            sessions.value = data.sessions || [];
+            activeSessionId.value = resp.session_id;
+            saveActiveSession(activeAgentId.value, resp.session_id);
+            activeRunId.value = null;
+            chatMessages.value = [];
+            messageQueue.value = [];
+            runs.value = [];
+            auditEvents.value = null;
+        });
         openSessionStream(resp.session_id);
     } catch (err) {
         console.error('[newSession] failed:', err);
