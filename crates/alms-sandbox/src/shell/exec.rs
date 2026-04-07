@@ -188,8 +188,6 @@ fn build_command(
 /// and execution continues without filesystem restrictions.
 #[cfg(target_os = "linux")]
 fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path) {
-    use std::os::unix::process::CommandExt;
-
     // Canonicalize the sandbox root so the Landlock rules match real paths.
     // If canonicalization fails (dir doesn't exist yet), fall back to the
     // provided path — Landlock will simply deny all access, which is safer
@@ -274,7 +272,7 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
             // run the command unsandboxed when sandboxing was requested and
             // the kernel confirmed it can apply rules.
 
-            let mut ruleset = match ruleset.create() {
+            let ruleset = match ruleset.create() {
                 Ok(r) => r,
                 Err(e) => {
                     eprintln!("[alms] Landlock ruleset create failed: {e}");
@@ -303,22 +301,29 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
                 }
             };
             let rule = PathBeneath::new(fd, write_access);
-            if let Err(e) = ruleset.add_rule(rule) {
-                eprintln!("[alms] Landlock: failed to add sandbox root rule: {e}");
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("Landlock: failed to add sandbox root rule: {e}"),
-                ));
-            }
+            let ruleset = match ruleset.add_rule(rule) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[alms] Landlock: failed to add sandbox root rule: {e}");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("Landlock: failed to add sandbox root rule: {e}"),
+                    ));
+                }
+            };
 
             // Allow read+execute access to system paths (best-effort: missing
             // system paths are skipped since not all distros have the same layout)
+            let mut ruleset = ruleset;
             for sys_path in &sys_paths {
                 if sys_path.exists() {
                     if let Ok(fd) = PathFd::new(sys_path) {
                         let rule = PathBeneath::new(fd, read_access);
                         // Best-effort: if a system path can't be added, skip it
-                        let _ = ruleset.add_rule(rule);
+                        ruleset = match ruleset.add_rule(rule) {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
                     }
                 }
             }
