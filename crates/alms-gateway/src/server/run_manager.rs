@@ -1,0 +1,844 @@
+//! Run tracking, event broadcasting, cancellation, and persistence.
+//!
+//! [`RunManager`] is the central piece of run lifecycle management in the
+//! gateway.  It owns the in-memory run map, per-run and per-session SSE
+//! senders, in-flight counters for graceful shutdown, and optional SQLite
+//! persistence.
+
+use crate::event_log::{EventLogManager, LoggedEvent};
+use crate::sse::SseEventData;
+use alms_core::{Run, RunId, SessionId};
+use dashmap::DashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
+
+/// Run manager for tracking runs and their event streams
+#[derive(Debug, Clone)]
+pub struct RunManager {
+    pub event_senders: Arc<DashMap<RunId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
+    pub runs: Arc<DashMap<RunId, Run>>,
+    /// In-memory event log for SSE reconnect during current process lifetime.
+    /// Events are lost on restart — this does **not** provide cross-restart durability.
+    pub event_log: EventLogManager,
+    /// Session-level event senders for persistent SSE streams.
+    pub session_senders: Arc<DashMap<SessionId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
+    /// Session-level event log for reconnect support.
+    pub session_event_log: crate::event_log::SessionEventLogManager,
+    /// Counter of in-flight (spawned but not yet finished) run tasks.
+    in_flight: Arc<AtomicUsize>,
+    /// Notified when an in-flight run completes (counter reaches zero).
+    drain_notify: Arc<tokio::sync::Notify>,
+    /// Per-run cancellation tokens for cooperative cancellation.
+    cancel_tokens: Arc<DashMap<RunId, CancellationToken>>,
+    /// Optional SQLite store for run persistence.
+    sqlite_store: Option<Arc<alms_session::SqliteStore>>,
+}
+
+impl RunManager {
+    pub fn new() -> Self {
+        Self {
+            event_senders: Arc::new(DashMap::new()),
+            runs: Arc::new(DashMap::new()),
+            event_log: EventLogManager::new(),
+            session_senders: Arc::new(DashMap::new()),
+            session_event_log: crate::event_log::SessionEventLogManager::new(),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            drain_notify: Arc::new(tokio::sync::Notify::new()),
+            cancel_tokens: Arc::new(DashMap::new()),
+            sqlite_store: None,
+        }
+    }
+
+    /// Set the SQLite store for run persistence.
+    pub fn with_store(mut self, store: Arc<alms_session::SqliteStore>) -> Self {
+        self.sqlite_store = Some(store);
+        self
+    }
+
+    /// Load persisted runs from SQLite into the in-memory DashMap.
+    ///
+    /// First marks any stale `queued`/`running` rows as `failed` (leftovers
+    /// from a previous process that crashed or was killed), then loads recent
+    /// terminal runs (completed/failed/cancelled) from the last 7 days.
+    pub fn hydrate_from_store(&self) {
+        let Some(store) = &self.sqlite_store else {
+            return;
+        };
+
+        // Mark stale queued/running runs as failed before loading.
+        match store.mark_stale_runs_failed() {
+            Ok(count) if count > 0 => {
+                info!(
+                    "Marked {} stale queued/running runs as failed (gateway restarted)",
+                    count
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to mark stale runs as failed: {}", e);
+            }
+            _ => {}
+        }
+
+        match store.load_all_runs() {
+            Ok(runs) => {
+                let loaded = runs.len();
+                for run in runs {
+                    self.runs.insert(run.run_id, run);
+                }
+                if loaded > 0 {
+                    info!("Loaded {} persisted runs from SQLite", loaded);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load runs from SQLite: {}", e);
+            }
+        }
+    }
+
+    /// Increment the in-flight counter. Call when spawning a run task.
+    pub fn track_in_flight(&self) {
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Decrement the in-flight counter and wake drain waiters.
+    pub fn untrack_in_flight(&self) {
+        let prev = self.in_flight.fetch_sub(1, Ordering::AcqRel);
+        if prev == 1 {
+            self.drain_notify.notify_waiters();
+        }
+    }
+
+    /// Wait until all in-flight runs complete, or timeout expires.
+    /// Returns `true` if drained, `false` on timeout.
+    ///
+    /// Uses an absolute deadline so the timeout is not reset when
+    /// intermediate notifications arrive (e.g. individual runs completing
+    /// while others are still in progress).
+    pub async fn wait_drain(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            // Register the notification future BEFORE checking the counter
+            // to avoid lost wakeups.
+            let notified = self.drain_notify.notified();
+            if self.in_flight.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => return false,
+            }
+        }
+    }
+
+    pub fn register_sender(&self, run_id: RunId, sender: mpsc::UnboundedSender<SseEventData>) {
+        self.event_senders.entry(run_id).or_default().push(sender);
+    }
+
+    pub fn remove_senders(&self, run_id: RunId) {
+        self.event_senders.remove(&run_id);
+    }
+
+    /// Remove sender entries for runs that have already reached a terminal
+    /// state. This is a defense-in-depth measure against the TOCTOU race in
+    /// SSE subscription (see #149): if a sender is registered between the
+    /// status check and `remove_senders` in `execute_run`, the entry becomes
+    /// orphaned. Calling this periodically (or on demand) cleans up any
+    /// leaked entries.
+    pub fn purge_terminal_senders(&self) {
+        self.event_senders.retain(|run_id, _| {
+            let is_terminal = self
+                .runs
+                .get(run_id)
+                .map(|r| {
+                    matches!(
+                        r.status,
+                        alms_core::RunStatus::Completed
+                            | alms_core::RunStatus::Failed
+                            | alms_core::RunStatus::Cancelled
+                    )
+                })
+                .unwrap_or(true); // run not found => definitely stale
+            if is_terminal {
+                tracing::debug!(run_id = %run_id.0, "Purged orphaned sender entry for terminal run");
+            }
+            !is_terminal
+        });
+    }
+
+    pub fn insert_run(&self, run: Run) {
+        if let Some(store) = &self.sqlite_store
+            && let Err(e) = store.save_run(&run)
+        {
+            tracing::warn!(run_id = %run.run_id.0, "Failed to persist new run to SQLite: {e}");
+        }
+        self.runs.insert(run.run_id, run);
+    }
+
+    pub fn get_run(&self, run_id: RunId) -> Option<Run> {
+        self.runs.get(&run_id).map(|r| r.value().clone())
+    }
+
+    pub fn update_run(&self, run: Run) {
+        if let Some(store) = &self.sqlite_store
+            && let Err(e) = store.save_run(&run)
+        {
+            tracing::warn!(run_id = %run.run_id.0, "Failed to persist run update to SQLite: {e}");
+        }
+        self.runs.insert(run.run_id, run);
+    }
+
+    /// Atomically transition a run to Running state and persist the snapshot.
+    ///
+    /// The run data is cloned while still holding the DashMap lock, so the
+    /// persisted state cannot reflect a concurrent mutation.
+    pub fn mark_run_as_running(&self, run_id: RunId) {
+        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_running());
+        self.persist_snapshot(run_id, snapshot);
+    }
+
+    /// Atomically transition a run to Completed state and persist the snapshot.
+    pub fn mark_run_as_completed(
+        &self,
+        run_id: RunId,
+        output: String,
+        usage: alms_core::TokenUsage,
+    ) {
+        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_completed(output, usage));
+        self.persist_snapshot(run_id, snapshot);
+    }
+
+    /// Atomically transition a run to Failed state and persist the snapshot.
+    pub fn mark_run_as_failed(&self, run_id: RunId, error: String) {
+        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_failed(error));
+        self.persist_snapshot(run_id, snapshot);
+    }
+
+    /// Atomically transition a run to Cancelled state and persist the snapshot.
+    pub fn mark_run_as_cancelled(&self, run_id: RunId) {
+        let snapshot = self.modify_and_snapshot(run_id, |r| r.mark_cancelled());
+        self.persist_snapshot(run_id, snapshot);
+    }
+
+    /// Modify a run in the DashMap and return a clone while still under lock.
+    ///
+    /// Returns `None` if the run does not exist (callers always `insert_run`
+    /// first, so this should not happen in practice).
+    fn modify_and_snapshot(&self, run_id: RunId, f: impl FnOnce(&mut Run)) -> Option<Run> {
+        let mut entry = self.runs.get_mut(&run_id)?;
+        f(entry.value_mut());
+        Some(entry.clone())
+    }
+
+    /// Persist a previously-snapshotted run to SQLite (if store is configured).
+    fn persist_snapshot(&self, run_id: RunId, snapshot: Option<Run>) {
+        if let Some(store) = &self.sqlite_store
+            && let Some(run) = snapshot
+            && let Err(e) = store.save_run(&run)
+        {
+            tracing::warn!(run_id = %run_id.0, "Failed to persist run to SQLite: {e}");
+        }
+    }
+
+    /// Store a per-run cancellation token.
+    pub fn register_cancel_token(&self, run_id: RunId, token: CancellationToken) {
+        self.cancel_tokens.insert(run_id, token);
+    }
+
+    /// Trigger cancellation for a run. Returns true if the token was found.
+    pub fn cancel_run(&self, run_id: RunId) -> bool {
+        if let Some(entry) = self.cancel_tokens.get(&run_id) {
+            entry.value().cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a per-run cancellation token (cleanup after run ends).
+    pub fn remove_cancel_token(&self, run_id: RunId) {
+        self.cancel_tokens.remove(&run_id);
+    }
+
+    /// Cancel every registered in-flight run.
+    ///
+    /// Called during graceful shutdown so that agent loops exit at their next
+    /// cancellation check-point instead of running to completion.
+    pub fn cancel_all_in_flight(&self) -> usize {
+        let mut count = 0;
+        for entry in self.cancel_tokens.iter() {
+            entry.value().cancel();
+            count += 1;
+        }
+        count
+    }
+
+    /// Return the current value of the in-flight counter.
+    pub fn in_flight_count(&self) -> usize {
+        self.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Cancel any in-progress runs spawned by a given job.
+    ///
+    /// Iterates in-memory runs, finds those with `job_id == Some(target)` that
+    /// are still `Queued` or `Running`, and triggers their cancellation tokens.
+    /// Returns the number of runs cancelled.
+    pub fn cancel_runs_for_job(&self, target: alms_core::JobId) -> usize {
+        let active_run_ids: Vec<RunId> = self
+            .runs
+            .iter()
+            .filter(|entry| {
+                let run = entry.value();
+                run.job_id == Some(target)
+                    && matches!(
+                        run.status,
+                        alms_core::RunStatus::Queued | alms_core::RunStatus::Running
+                    )
+            })
+            .map(|entry| entry.key().to_owned())
+            .collect();
+
+        let mut cancelled = 0;
+        for run_id in active_run_ids {
+            if self.cancel_run(run_id) {
+                tracing::info!(
+                    run_id = %run_id.0,
+                    job_id = %target,
+                    "Cancelled in-progress run for cancelled job"
+                );
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
+    /// List runs for a session, newest first, up to `limit`.
+    pub fn list_by_session(&self, session_id: SessionId, limit: usize) -> Vec<Run> {
+        let mut runs: Vec<Run> = self
+            .runs
+            .iter()
+            .filter(|e| e.value().session_id == session_id)
+            .map(|e| e.value().clone())
+            .collect();
+        runs.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        runs.truncate(limit);
+        runs
+    }
+
+    /// Send event to all active subscribers AND persist to event log.
+    /// Dead subscribers (closed channels) are pruned automatically.
+    /// Fans out to both per-run and per-session subscribers.
+    pub async fn send_event(&self, run_id: RunId, session_id: SessionId, mut event: SseEventData) {
+        let is_ephemeral = event.event_type == "token_delta"
+            || event.event_type == "status"
+            || event.event_type == "context_debug";
+
+        // Per-run event log — skip ephemeral events (token_delta, status,
+        // context_debug) to avoid persisting high-frequency or transient data.
+        // Status events are superseded within milliseconds by the next phase
+        // or by run_finished, so replaying stale ones on SSE reconnect would
+        // be confusing. context_debug snapshots can be 100-400KB for large
+        // context windows and are only meaningful at the moment they are
+        // emitted — replaying them on reconnect would waste memory and
+        // bandwidth. Live subscribers still receive these events via fan-out
+        // below.
+        if !is_ephemeral {
+            let event_id = self
+                .event_log
+                .log_event(run_id, session_id, &event.event_type, event.data.clone())
+                .await;
+            event.event_id = Some(event_id);
+        }
+
+        if let Some(mut senders) = self.event_senders.get_mut(&run_id) {
+            let before = senders.len();
+            senders.retain(|sender| sender.send(event.clone()).is_ok());
+            let pruned = before - senders.len();
+            if pruned > 0 {
+                tracing::debug!(run_id = %run_id.0, pruned, "Pruned dead SSE subscriber(s)");
+            }
+        }
+
+        // Per-session fan-out: forward to session subscribers.
+        // Skip session event LOG for ephemeral events (token_delta, status,
+        // context_debug) — deltas are high-frequency, status events are
+        // transient, and context_debug snapshots are large and only meaningful
+        // at the moment of emission. Session reconnect doesn't need individual
+        // deltas — the chat history is loaded via getSessionMessages instead.
+        let session_event = if is_ephemeral {
+            // Fast path: no logging, just fan out. Leave event_id as None
+            // so the dedup filter in stream_with_replay passes it through
+            // (dedup only drops Some(id) where id <= max_replay_id).
+            event
+        } else {
+            let session_event_id = self
+                .session_event_log
+                .log_event(session_id, run_id, &event.event_type, event.data.clone())
+                .await;
+            let mut e = event;
+            e.event_id = Some(session_event_id);
+            e
+        };
+
+        if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
+            senders.retain(|sender| sender.send(session_event.clone()).is_ok());
+            if senders.is_empty() {
+                drop(senders);
+                self.session_senders.remove(&session_id);
+            }
+        }
+    }
+
+    /// Send a session-only event (not associated with a specific run).
+    pub async fn send_session_event(
+        &self,
+        session_id: SessionId,
+        run_id: RunId,
+        event: SseEventData,
+    ) {
+        let session_event_id = self
+            .session_event_log
+            .log_event(session_id, run_id, &event.event_type, event.data.clone())
+            .await;
+        let mut tagged = event;
+        tagged.event_id = Some(session_event_id);
+
+        if let Some(mut senders) = self.session_senders.get_mut(&session_id) {
+            senders.retain(|sender| sender.send(tagged.clone()).is_ok());
+            if senders.is_empty() {
+                drop(senders);
+                self.session_senders.remove(&session_id);
+            }
+        }
+    }
+
+    pub fn register_session_sender(
+        &self,
+        session_id: SessionId,
+        sender: mpsc::UnboundedSender<SseEventData>,
+    ) {
+        self.session_senders
+            .entry(session_id)
+            .or_default()
+            .push(sender);
+    }
+
+    /// Close all active SSE sender channels (both per-run and per-session).
+    ///
+    /// Dropping the senders causes the corresponding `UnboundedReceiverStream`
+    /// in each SSE response to terminate, which allows Axum's graceful
+    /// shutdown to complete instead of waiting indefinitely for long-lived
+    /// SSE connections.
+    pub fn close_all_senders(&self) {
+        let run_count = self.event_senders.len();
+        let session_count = self.session_senders.len();
+        self.event_senders.clear();
+        self.session_senders.clear();
+        if run_count + session_count > 0 {
+            info!(
+                "Closed {} per-run and {} per-session SSE sender(s) for shutdown",
+                run_count, session_count
+            );
+        }
+    }
+
+    /// Get per-run events from a specific ID for reconnect
+    pub async fn events_from(&self, run_id: RunId, from_id: u64) -> Vec<LoggedEvent> {
+        self.event_log.events_from(run_id, from_id).await
+    }
+
+    /// Get per-session events from a specific ID for reconnect
+    pub async fn session_events_from(
+        &self,
+        session_id: SessionId,
+        from_id: u64,
+    ) -> Vec<LoggedEvent> {
+        self.session_event_log
+            .events_from(session_id, from_id)
+            .await
+    }
+
+    /// Return the highest session-level event ID, or `None` if no events exist.
+    ///
+    /// Exposed to the REST messages endpoint so the client can pass
+    /// `?last_event_id=<n>` when opening the SSE stream.
+    pub async fn latest_session_event_id(&self, session_id: SessionId) -> Option<u64> {
+        self.session_event_log.latest_event_id(session_id).await
+    }
+}
+
+impl Default for RunManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl alms_core::RunRegistrar for RunManager {
+    fn register_run(&self, run: Run) {
+        self.insert_run(run);
+    }
+
+    fn update_run(&self, run: Run) {
+        RunManager::update_run(self, run);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alms_core::AgentId;
+
+    #[tokio::test]
+    async fn test_drain_immediate_when_no_in_flight() {
+        let rm = RunManager::new();
+        assert!(rm.wait_drain(std::time::Duration::from_millis(100)).await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_waits_for_in_flight() {
+        let rm = RunManager::new();
+        rm.track_in_flight();
+
+        let rm2 = rm.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            rm2.untrack_in_flight();
+        });
+
+        assert!(rm.wait_drain(std::time::Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_times_out() {
+        let rm = RunManager::new();
+        rm.track_in_flight();
+        // Never untrack — should time out.
+        assert!(!rm.wait_drain(std::time::Duration::from_millis(50)).await);
+    }
+
+    /// Verify that intermediate notifications (in_flight going 1->0->1) do
+    /// not reset the absolute deadline in `wait_drain`.
+    #[tokio::test(start_paused = true)]
+    async fn test_drain_timeout_is_absolute_not_per_notification() {
+        let rm = RunManager::new();
+        rm.track_in_flight(); // run A
+
+        let rm2 = rm.clone();
+        tokio::spawn(async move {
+            // After 20ms: run A finishes (1->0, notifies), run B starts (0->1)
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            rm2.untrack_in_flight();
+            rm2.track_in_flight();
+
+            // After another 20ms: same pattern
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            rm2.untrack_in_flight();
+            rm2.track_in_flight();
+
+            // After another 20ms: same — now 60ms total, past the 50ms deadline
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            rm2.untrack_in_flight();
+            rm2.track_in_flight();
+            // Never untrack the last one
+        });
+
+        // 50ms total timeout — should fire even though notifications arrived
+        // at 20ms and 40ms (which would have reset the timer before the fix).
+        assert!(!rm.wait_drain(std::time::Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn test_multi_subscriber_broadcast() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+        let session_id = SessionId::new();
+
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        rm.register_sender(run_id, tx1);
+        rm.register_sender(run_id, tx2);
+
+        rm.send_event(run_id, session_id, SseEventData::connected(run_id))
+            .await;
+
+        let e1 = rx1.recv().await.expect("subscriber 1 should receive");
+        let e2 = rx2.recv().await.expect("subscriber 2 should receive");
+        assert_eq!(e1.event_type, "connected");
+        assert_eq!(e2.event_type, "connected");
+    }
+
+    #[tokio::test]
+    async fn test_dead_subscriber_pruned() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+        let session_id = SessionId::new();
+
+        let (tx_alive, mut rx_alive) = mpsc::unbounded_channel();
+        let (tx_dead, rx_dead) = mpsc::unbounded_channel();
+        rm.register_sender(run_id, tx_alive);
+        rm.register_sender(run_id, tx_dead);
+
+        // Drop the dead receiver so its sender becomes closed
+        drop(rx_dead);
+
+        rm.send_event(run_id, session_id, SseEventData::connected(run_id))
+            .await;
+
+        // Alive subscriber still gets the event
+        let e = rx_alive
+            .recv()
+            .await
+            .expect("alive subscriber should receive");
+        assert_eq!(e.event_type, "connected");
+
+        // Dead sender should have been pruned — only 1 sender left
+        let senders = rm.event_senders.get(&run_id).unwrap();
+        assert_eq!(senders.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remove_senders_cleans_all() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        rm.register_sender(run_id, tx1);
+        rm.register_sender(run_id, tx2);
+
+        assert!(rm.event_senders.contains_key(&run_id));
+        rm.remove_senders(run_id);
+        assert!(!rm.event_senders.contains_key(&run_id));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_run_triggers_token() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token.clone());
+
+        assert!(!token.is_cancelled());
+        assert!(rm.cancel_run(run_id));
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_unknown_run_returns_false() {
+        let rm = RunManager::new();
+        assert!(!rm.cancel_run(RunId::new()));
+    }
+
+    #[tokio::test]
+    async fn test_remove_cancel_token_cleanup() {
+        let rm = RunManager::new();
+        let run_id = RunId::new();
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token);
+
+        rm.remove_cancel_token(run_id);
+        // After removal, cancel_run should return false
+        assert!(!rm.cancel_run(run_id));
+    }
+
+    #[tokio::test]
+    async fn test_mark_run_as_cancelled() {
+        let rm = RunManager::new();
+        let run = Run::new(SessionId::new(), AgentId::new(), "test".to_string());
+        let run_id = run.run_id;
+        rm.insert_run(run);
+        rm.mark_run_as_running(run_id);
+        rm.mark_run_as_cancelled(run_id);
+
+        let r = rm.get_run(run_id).unwrap();
+        assert_eq!(r.status, alms_core::RunStatus::Cancelled);
+        assert!(r.ended_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_purge_terminal_senders_removes_completed() {
+        let rm = RunManager::new();
+        let active_id = RunId::new();
+        let done_id = RunId::new();
+
+        // Insert two runs: one running, one completed.
+        let mut active_run = Run::new(SessionId::new(), AgentId::new(), "active".to_string());
+        let mut done_run = Run::new(SessionId::new(), AgentId::new(), "done".to_string());
+        // Override IDs for deterministic test.
+        active_run.run_id = active_id;
+        done_run.run_id = done_id;
+
+        rm.insert_run(active_run);
+        rm.insert_run(done_run);
+        rm.mark_run_as_running(active_id);
+        rm.mark_run_as_running(done_id);
+        rm.mark_run_as_completed(done_id, "output".into(), Default::default());
+
+        // Register senders for both.
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        rm.register_sender(active_id, tx1);
+        rm.register_sender(done_id, tx2);
+
+        assert!(rm.event_senders.contains_key(&active_id));
+        assert!(rm.event_senders.contains_key(&done_id));
+
+        rm.purge_terminal_senders();
+
+        // Active run's sender should be kept, completed run's sender removed.
+        assert!(rm.event_senders.contains_key(&active_id));
+        assert!(!rm.event_senders.contains_key(&done_id));
+    }
+
+    #[tokio::test]
+    async fn test_purge_terminal_senders_removes_missing_runs() {
+        let rm = RunManager::new();
+        let orphan_id = RunId::new();
+
+        // Register a sender for a run that doesn't exist in the runs map.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        rm.register_sender(orphan_id, tx);
+        assert!(rm.event_senders.contains_key(&orphan_id));
+
+        rm.purge_terminal_senders();
+
+        // Sender for nonexistent run should be purged.
+        assert!(!rm.event_senders.contains_key(&orphan_id));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_runs_for_job_cancels_active_run() {
+        let rm = RunManager::new();
+        let job_id = alms_core::JobId::new();
+
+        // Create a run associated with the job.
+        let mut run = Run::for_job(
+            SessionId::new(),
+            AgentId::new(),
+            "job prompt".to_string(),
+            job_id,
+        );
+        let run_id = run.run_id;
+        run.mark_running();
+        rm.insert_run(run);
+
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token.clone());
+
+        assert!(!token.is_cancelled());
+        let cancelled = rm.cancel_runs_for_job(job_id);
+        assert_eq!(cancelled, 1);
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_runs_for_job_skips_completed_run() {
+        let rm = RunManager::new();
+        let job_id = alms_core::JobId::new();
+
+        // Create a completed run for the same job — should not be cancelled.
+        let run = Run::for_job(
+            SessionId::new(),
+            AgentId::new(),
+            "done prompt".to_string(),
+            job_id,
+        );
+        let run_id = run.run_id;
+        rm.insert_run(run);
+        rm.mark_run_as_running(run_id);
+        rm.mark_run_as_completed(run_id, "output".into(), Default::default());
+
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token.clone());
+
+        let cancelled = rm.cancel_runs_for_job(job_id);
+        assert_eq!(cancelled, 0);
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_runs_for_job_ignores_other_jobs() {
+        let rm = RunManager::new();
+        let target_job = alms_core::JobId::new();
+        let other_job = alms_core::JobId::new();
+
+        // Create a running run for a *different* job.
+        let mut run = Run::for_job(
+            SessionId::new(),
+            AgentId::new(),
+            "other prompt".to_string(),
+            other_job,
+        );
+        let run_id = run.run_id;
+        run.mark_running();
+        rm.insert_run(run);
+
+        let token = CancellationToken::new();
+        rm.register_cancel_token(run_id, token.clone());
+
+        let cancelled = rm.cancel_runs_for_job(target_job);
+        assert_eq!(cancelled, 0);
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_in_flight_cancels_all_tokens() {
+        let rm = RunManager::new();
+
+        let t1 = CancellationToken::new();
+        let t2 = CancellationToken::new();
+        let t3 = CancellationToken::new();
+        rm.register_cancel_token(RunId::new(), t1.clone());
+        rm.register_cancel_token(RunId::new(), t2.clone());
+        rm.register_cancel_token(RunId::new(), t3.clone());
+
+        let count = rm.cancel_all_in_flight();
+        assert_eq!(count, 3);
+        assert!(t1.is_cancelled());
+        assert!(t2.is_cancelled());
+        assert!(t3.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_all_in_flight_empty() {
+        let rm = RunManager::new();
+        assert_eq!(rm.cancel_all_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_count() {
+        let rm = RunManager::new();
+        assert_eq!(rm.in_flight_count(), 0);
+        rm.track_in_flight();
+        assert_eq!(rm.in_flight_count(), 1);
+        rm.track_in_flight();
+        assert_eq!(rm.in_flight_count(), 2);
+        rm.untrack_in_flight();
+        assert_eq!(rm.in_flight_count(), 1);
+    }
+
+    /// After cancelling all tokens, runs that check their cancel_token
+    /// should exit promptly, allowing wait_drain to complete quickly.
+    #[tokio::test]
+    async fn test_cancel_all_unblocks_drain() {
+        let rm = RunManager::new();
+        rm.track_in_flight();
+        let token = CancellationToken::new();
+        rm.register_cancel_token(RunId::new(), token.clone());
+
+        let rm2 = rm.clone();
+        tokio::spawn(async move {
+            // Simulate a run that checks its cancel token and exits.
+            token.cancelled().await;
+            rm2.untrack_in_flight();
+        });
+
+        // Cancel all tokens — the spawned "run" should exit and untrack.
+        rm.cancel_all_in_flight();
+
+        // Should drain almost immediately (well within 1s).
+        assert!(rm.wait_drain(std::time::Duration::from_secs(1)).await);
+    }
+}
