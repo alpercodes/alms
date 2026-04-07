@@ -312,17 +312,27 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
                 }
             };
 
-            // Allow read+execute access to system paths (best-effort: missing
-            // system paths are skipped since not all distros have the same layout)
+            // Allow read+execute access to system paths (missing paths are
+            // skipped since not all distros have the same layout, but if a
+            // present path fails to be added, that is a hard error — bash
+            // won't work under the sandbox without /usr, /lib, etc.)
             let mut ruleset = ruleset;
             for sys_path in &sys_paths {
                 if sys_path.exists() {
                     if let Ok(fd) = PathFd::new(sys_path) {
                         let rule = PathBeneath::new(fd, read_access);
-                        // Best-effort: if a system path can't be added, skip it
                         ruleset = match ruleset.add_rule(rule) {
                             Ok(r) => r,
-                            Err(_) => continue,
+                            Err(e) => {
+                                eprintln!(
+                                    "[alms] Landlock: failed to add system path rule for {}: {e}",
+                                    sys_path.display()
+                                );
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    format!("Landlock: failed to add system path rule: {e}"),
+                                ));
+                            }
                         };
                     }
                 }
