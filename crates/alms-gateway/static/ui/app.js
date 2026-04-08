@@ -95,7 +95,7 @@ function ChatView() {
                     }
                     const m = item;
                     if (m.type === 'user' || m.type === 'agent') {
-                        return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} />`;
+                        return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} fromAgent=${m.fromAgent} />`;
                     }
                     if (m.type === 'tool') {
                         return html`<${ToolRow} key=${m.id} ...${m} />`;
@@ -107,9 +107,14 @@ function ChatView() {
                         return html`<${ApprovalCard} key=${m.id} ...${m} />`;
                     }
                     if (m.type === 'image') {
-                        const cls = m.role === 'user' ? 'user' : 'agent';
+                        // DM images carry fromAgent — treat them as agent
+                        // messages so they render on the correct side. (#546)
+                        const isDmImage = !!(m.fromAgent);
+                        const cls = (m.role === 'user' && !isDmImage) ? 'user' : 'agent';
                         const agentName = activeAgent.value?.name;
-                        const label = m.role === 'user' ? '>' : (agentName ? `${agentName} $` : '$');
+                        const label = (m.role === 'user' && !isDmImage) ? '>'
+                            : m.fromAgent ? `${m.fromAgent} $`
+                            : (agentName ? `${agentName} $` : '$');
                         return html`
                             <div key=${m.id} class="msg ${cls}">
                                 <div class="msg-label">${label}</div>

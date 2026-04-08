@@ -1,10 +1,15 @@
 import { html, renderMarkdown } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
 
-export function Message({ type, role, text, sealed }) {
+export function Message({ type, role, text, sealed, fromAgent }) {
     const cls = type === 'user' ? 'user' : 'agent';
     const agentName = activeAgent.value?.name;
-    const label = type === 'user' ? '>' : (agentName ? `${agentName} $` : '$');
+    // DM messages carry a fromAgent name — use it as the label so the
+    // user can see which agent sent the message.  Falls back to the
+    // active agent name for normal assistant messages. (#546)
+    const label = type === 'user' ? '>'
+        : fromAgent ? `${fromAgent} $`
+        : (agentName ? `${agentName} $` : '$');
     const streaming = type === 'agent' && sealed === false;
 
     // Render Markdown for sealed (finished) agent messages only.
