@@ -10,6 +10,7 @@ import { openSessionStream, closeSessionStream } from '../../hooks/use-session-s
 import { saveActiveSession } from '../../hooks/use-boot.js';
 import { selectGeneration, bumpSelectGeneration } from '../../state/select-generation.js';
 import { loadSession } from '../../utils/load-session.js';
+import { closeSidebar } from '../header.js';
 
 function hasActiveRun(sessionId) {
     if (sessionId === activeSessionId.value && activeRunId.value) return true;
@@ -19,6 +20,8 @@ function hasActiveRun(sessionId) {
 
 async function selectSession(sessionId) {
     if (sessionId === activeSessionId.value) return;
+
+    closeSidebar(); // auto-close sidebar overlay on mobile
 
     const gen = bumpSelectGeneration();
 

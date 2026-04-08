@@ -1,11 +1,22 @@
-import { h, html, computed } from '../deps.js';
+import { h, html, computed, signal } from '../deps.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { activePanel, activePanelTab } from '../state/panel.js';
 import { localSettings, serverDefaults } from '../state/settings.js';
 import { theme, toggleTheme } from '../state/theme.js';
 import { switchAgent } from '../hooks/use-boot.js';
-import { IconGear, IconSun, IconMoon } from '../utils/icons.js';
+import { IconGear, IconSun, IconMoon, IconMenu, IconX } from '../utils/icons.js';
 import { activeOverrideCount } from './settings-modal.js';
+
+/** Sidebar open/close state — shared so Sidebar and backdrop can react */
+export const sidebarOpen = signal(false);
+
+export function toggleSidebar() {
+    sidebarOpen.value = !sidebarOpen.value;
+}
+
+export function closeSidebar() {
+    sidebarOpen.value = false;
+}
 
 const TABS = ['agents', 'workspace', 'jobs', 'audit'];
 
@@ -38,6 +49,10 @@ export function Header({ onOpenSettings, status }) {
 
     return html`
         <header>
+            <button class="sidebar-toggle-btn" title="Toggle sessions" aria-label="Toggle sessions"
+                    onClick=${toggleSidebar}>
+                ${sidebarOpen.value ? html`<${IconX} />` : html`<${IconMenu} />`}
+            </button>
             <h1>ALMS</h1>
             <span class="header-sep">/</span>
             <select id="agent-select" title="Active agent"

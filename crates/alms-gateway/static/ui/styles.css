@@ -315,6 +315,26 @@ header h1 {
 .hbtn:hover { color: var(--text-primary); background: var(--surface-3); }
 .hbtn.active { color: var(--accent); background: var(--accent-muted); }
 
+/* Sidebar toggle — hidden on desktop, shown via media query */
+.sidebar-toggle-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all var(--duration-normal);
+  flex-shrink: 0;
+}
+.sidebar-toggle-btn:hover { background: var(--surface-3); color: var(--text-primary); }
+
+/* Sidebar backdrop — hidden by default, shown via media query when sidebar is open */
+.sidebar-backdrop { display: none; }
+
 /* ══════════════════════════════════════════════════════════════════════
    Main Layout
    ══════════════════════════════════════════════════════════════════════ */
@@ -1996,13 +2016,15 @@ select.settings-input-sm {
   justify-content: center;
   align-items: center;
   background: var(--surface-0);
+  padding: var(--space-4);
 }
 .onboard-card {
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-xl);
   padding: var(--space-8);
-  width: 440px;
+  max-width: 440px;
+  width: 100%;
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
@@ -2109,6 +2131,59 @@ select.settings-input-sm {
     z-index: 100;
     width: 100%;
     max-width: var(--drawer-width);
+  }
+
+  /* 2a: Collapse sidebar on narrow viewports */
+  #sidebar {
+    display: none;
+  }
+
+  /* Compact header: wrap controls and hide low-priority items */
+  header {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: var(--header-height);
+    padding: var(--space-2) var(--space-3);
+    gap: var(--space-2);
+  }
+  /* Collapse spacer so it doesn't force premature wrapping at 700-850px */
+  .header-spacer {
+    flex: 0;
+  }
+  .header-btns {
+    flex-wrap: wrap;
+  }
+
+  /* 2c: Show sidebar toggle button (hidden on desktop) */
+  .sidebar-toggle-btn {
+    display: flex;
+  }
+
+  /* 2d: Sidebar as overlay when toggled open */
+  #sidebar.sidebar-open {
+    display: flex;
+    position: fixed;
+    top: var(--header-height);
+    left: 0;
+    bottom: 0;
+    z-index: 200;
+    width: var(--sidebar-expanded);
+    max-width: 80vw;
+    box-shadow: var(--shadow-overlay);
+  }
+
+  /* Backdrop behind sidebar overlay */
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 199;
+    background: var(--overlay-backdrop);
+  }
+
+  /* 2e: Stack settings grid to single column */
+  .settings-grid {
+    grid-template-columns: 1fr;
   }
 }
 
