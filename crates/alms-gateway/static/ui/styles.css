@@ -1996,13 +1996,15 @@ select.settings-input-sm {
   justify-content: center;
   align-items: center;
   background: var(--surface-0);
+  padding: var(--space-4);
 }
 .onboard-card {
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-xl);
   padding: var(--space-8);
-  width: 440px;
+  max-width: 440px;
+  width: 100%;
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
@@ -2109,6 +2111,28 @@ select.settings-input-sm {
     z-index: 100;
     width: 100%;
     max-width: var(--drawer-width);
+  }
+
+  /* 2a: Collapse sidebar on narrow viewports */
+  #sidebar {
+    display: none;
+  }
+
+  /* Compact header: wrap controls and hide low-priority items */
+  header {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: var(--header-height);
+    padding: var(--space-2) var(--space-3);
+    gap: var(--space-2);
+  }
+  .header-btns {
+    flex-wrap: wrap;
+  }
+
+  /* 2b: Stack settings grid to single column */
+  .settings-grid {
+    grid-template-columns: 1fr;
   }
 }
 
