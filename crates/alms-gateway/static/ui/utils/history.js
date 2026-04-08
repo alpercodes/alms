@@ -95,13 +95,18 @@ export function mapHistoryMessages(msgs, opts) {
                 result: matched ? matched.result : null,
             });
         } else if (m.type === 'image') {
+            // DM image messages use the same metadata pattern as text. (#546)
+            const isDmImg = m.role === 'user'
+                && m.metadata && m.metadata.message_type === 'dm'
+                && m.metadata.from_agent;
             entries.push({
                 id: nextMsgId(),
                 type: 'image',
-                role: m.role,
+                role: isDmImg ? 'assistant' : m.role,
                 url: m.url || '',
                 alt: m.alt || '',
                 sealed: true,
+                fromAgent: isDmImg ? m.metadata.from_agent : undefined,
             });
         }
         // tool_result entries are consumed via resultMap -- skip them here

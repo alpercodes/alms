@@ -416,7 +416,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // a user-facing session.  The context_debug SSE event is ephemeral (not
     // persisted), so the cost is negligible — and it lets users inspect the
     // LLM context for notification runs without special client-side plumbing.
-    // (#546 Bug 2)
+    // (#546 — debug_mode for notification runs)
     let agent_config = if is_system_triggered
         && !is_peer_message
         && !is_internal_context_id(&context_id)
