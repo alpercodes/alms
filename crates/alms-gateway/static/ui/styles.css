@@ -126,6 +126,7 @@
   --space-12: 48px;
 
   /* ── Radius ── */
+  --radius-xs: 2px;
   --radius-sm: 4px;
   --radius-md: 6px;
   --radius-lg: 8px;
@@ -1837,7 +1838,7 @@ select.settings-input-sm {
 
 /* Error message in settings */
 .settings-error {
-  background: var(--error-bg, rgba(239,68,68,0.1));
+  background: var(--error-muted);
   color: var(--error);
   font-size: var(--text-xs);
   padding: var(--space-2);
