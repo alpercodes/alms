@@ -47,13 +47,28 @@ export function mapHistoryMessages(msgs, opts) {
             // differently from agent/user messages.
             const isSynthetic = m.role === 'system'
                 && m.metadata && m.metadata.synthetic;
+
+            // DM messages from peer agents are stored as role "user" with
+            // metadata.message_type="dm" and metadata.from_agent set.
+            // Render them as agent messages (left side) so they are not
+            // confused with human-user messages (right side). (#546)
+            const isDm = m.role === 'user'
+                && m.metadata && m.metadata.message_type === 'dm'
+                && m.metadata.from_agent;
+
+            const type = isSynthetic ? 'notification'
+                : isDm ? 'agent'
+                : (m.role === 'user' ? 'user' : 'agent');
+
             entries.push({
                 id: nextMsgId(),
-                type: isSynthetic ? 'notification' : (m.role === 'user' ? 'user' : 'agent'),
+                type,
                 role: m.role,
                 text: m.content || '',
                 metadata: m.metadata || null,
                 sealed: true,
+                // Carry the sender name so Message can show it as the label.
+                fromAgent: isDm ? m.metadata.from_agent : undefined,
             });
         } else if (m.type === 'tool_call') {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;

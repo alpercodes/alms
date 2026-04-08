@@ -412,6 +412,27 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             agent_config
         };
 
+    // Enable debug_mode for system-triggered notification runs that land on
+    // a user-facing session.  The context_debug SSE event is ephemeral (not
+    // persisted), so the cost is negligible — and it lets users inspect the
+    // LLM context for notification runs without special client-side plumbing.
+    // (#546 Bug 2)
+    let agent_config = if is_system_triggered
+        && !is_peer_message
+        && !is_internal_context_id(&context_id)
+        && !agent_config.debug_mode
+    {
+        let mut cfg = agent_config;
+        cfg.debug_mode = true;
+        debug!(
+            "Run {} is a notification on user-facing session — enabling debug_mode",
+            run_id.0
+        );
+        cfg
+    } else {
+        agent_config
+    };
+
     // Capture summary config before agent_config and llm are consumed.
     // C1 fix: resolve the summary model *from the per-agent LLM client* so
     // that when `summary_model` is None we fall back to the agent's configured

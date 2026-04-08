@@ -95,7 +95,7 @@ function ChatView() {
                     }
                     const m = item;
                     if (m.type === 'user' || m.type === 'agent') {
-                        return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} />`;
+                        return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} fromAgent=${m.fromAgent} />`;
                     }
                     if (m.type === 'tool') {
                         return html`<${ToolRow} key=${m.id} ...${m} />`;
