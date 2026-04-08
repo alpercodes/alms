@@ -331,6 +331,23 @@ fn trim_oldest_lines(text: &str, max_chars: usize) -> String {
 // LLM mode
 // ---------------------------------------------------------------------------
 
+/// Extract the peer agent name from a DM `context_id`.
+///
+/// DM context IDs have the form `"dm:{name1}:{name2}"` (alphabetically sorted).
+/// The peer is whichever name is not `agent_name`.  Returns `None` for non-DM
+/// sessions or malformed context IDs.
+fn extract_dm_peer(context_id: &str, agent_name: &str) -> Option<String> {
+    let rest = context_id.strip_prefix("dm:")?;
+    let (a, b) = rest.split_once(':')?;
+    if a == agent_name {
+        Some(b.to_string())
+    } else if b == agent_name {
+        Some(a.to_string())
+    } else {
+        None
+    }
+}
+
 /// Generate a summary via a lightweight LLM call.
 async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String> {
     if params.run_input.is_empty() && params.run_output.is_empty() {
@@ -339,7 +356,21 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
 
     let system_prompt = include_str!("../prompts/session_summarizer.md").trim();
 
+    // Detect DM sessions and extract the peer agent name so the summarizer
+    // uses the actual agent name instead of "user".
+    let dm_peer = extract_dm_peer(&params.context_id, &params.agent_name);
+
     let mut user_content = String::new();
+
+    // For DM sessions, prepend context so the LLM knows who the participants
+    // are and uses actual agent names instead of generic "user"/"agent".
+    if let Some(ref peer) = dm_peer {
+        user_content.push_str(&format!(
+            "Context: This is a DM conversation between agent \"{}\" and agent \"{peer}\". \
+             Use their actual names in the summary, not \"user\" or \"agent\".\n\n",
+            params.agent_name
+        ));
+    }
 
     // Include existing summary for the LLM to extend.
     if let Some(ref existing) = params.existing_summary
@@ -351,17 +382,27 @@ async fn generate_llm(llm: &LlmClient, params: &SummaryParams) -> Option<String>
     }
 
     // Truncated run input.
+    // For DM sessions, label with the peer's name instead of "User".
     let input_snippet = truncate_to_char_boundary(&params.run_input, LLM_CONTEXT_BYTES);
-    user_content.push_str("User input:\n");
+    let input_label = match &dm_peer {
+        Some(peer) => format!("{peer}'s message"),
+        None => "User input".to_string(),
+    };
+    user_content.push_str(&format!("{input_label}:\n"));
     user_content.push_str(input_snippet);
     if params.run_input.len() > input_snippet.len() {
         user_content.push_str("\n[...truncated]");
     }
 
     // Truncated run output.
+    // For DM sessions, label with this agent's name instead of "Agent".
     if !params.run_output.is_empty() {
         let output_snippet = truncate_to_char_boundary(&params.run_output, LLM_CONTEXT_BYTES);
-        user_content.push_str("\n\nAgent response:\n");
+        let output_label = match &dm_peer {
+            Some(_) => format!("{}'s response", params.agent_name),
+            None => "Agent response".to_string(),
+        };
+        user_content.push_str(&format!("\n\n{output_label}:\n"));
         user_content.push_str(output_snippet);
         if params.run_output.len() > output_snippet.len() {
             user_content.push_str("\n[...truncated]");
@@ -1242,5 +1283,38 @@ mod tests {
             header_count3, 3,
             "Only labelled entries should produce headers"
         );
+    }
+
+    // -- extract_dm_peer -------------------------------------------------------
+
+    #[test]
+    fn test_extract_dm_peer_alice_sees_bob() {
+        assert_eq!(
+            extract_dm_peer("dm:alice:bob", "alice"),
+            Some("bob".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_dm_peer_bob_sees_alice() {
+        assert_eq!(
+            extract_dm_peer("dm:alice:bob", "bob"),
+            Some("alice".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_dm_peer_non_dm_returns_none() {
+        assert_eq!(extract_dm_peer("web-chat-123", "alice"), None);
+    }
+
+    #[test]
+    fn test_extract_dm_peer_malformed_dm_returns_none() {
+        assert_eq!(extract_dm_peer("dm:alice", "alice"), None);
+    }
+
+    #[test]
+    fn test_extract_dm_peer_agent_not_in_context_returns_none() {
+        assert_eq!(extract_dm_peer("dm:alice:bob", "charlie"), None);
     }
 }
