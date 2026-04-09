@@ -6,7 +6,7 @@ use alms_session::SqliteStore;
 /// Resolves the database path via `AlmsConfig` (which reads `alms.toml` and
 /// env vars), ensuring the CLI uses the same database as the gateway.
 /// Precedence: `ALMS_DB_PATH` env var > `{data_dir}/alms.db` (where
-/// `data_dir` comes from config / `ALMS_DATA_DIR` env var, default `./data`).
+/// `data_dir` comes from config / `ALMS_DATA_DIR` env var, default `./.alms`).
 pub(crate) fn open_db() -> anyhow::Result<SqliteStore> {
     let (store, _) = open_db_with_config()?;
     Ok(store)

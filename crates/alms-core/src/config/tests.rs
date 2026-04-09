@@ -329,7 +329,7 @@ fn test_workspace_dir_default() {
     let _guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
 
     let config = ServerConfig::default();
-    assert_eq!(config.workspace_dir(), PathBuf::from("./data/workspace"));
+    assert_eq!(config.workspace_dir(), PathBuf::from("./.alms/workspace"));
 }
 
 #[test]
@@ -399,8 +399,8 @@ fn test_logging_config_defaults() {
 #[test]
 fn test_logging_resolve_log_dir_default() {
     let config = LoggingConfig::default();
-    let resolved = config.resolve_log_dir("./data");
-    assert_eq!(resolved, PathBuf::from("./data/logs"));
+    let resolved = config.resolve_log_dir("./.alms");
+    assert_eq!(resolved, PathBuf::from("./.alms/logs"));
 }
 
 /// Verify that `resolve_log_dir` produces valid paths even when
@@ -545,7 +545,7 @@ fn test_load_produces_absolute_data_dir() {
     let _lock = ENV_LOCK.lock().unwrap();
     // Use mock LLM to avoid API key validation failure.
     let _mock_guard = SingleEnvGuard::set("ALMS_LLM_MOCK", "1");
-    // Clear ALMS_DATA_DIR to ensure the default `./data` is used.
+    // Clear ALMS_DATA_DIR to ensure the default `./.alms` is used.
     let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
 
     let config = AlmsConfig::load().expect("load should succeed with mock LLM");
@@ -593,7 +593,7 @@ fn test_db_path_is_absolute_after_load() {
 #[test]
 fn test_load_or_default_resolves_data_dir() {
     let _lock = ENV_LOCK.lock().unwrap();
-    // Clear data dir env to use the relative default "./data".
+    // Clear data dir env to use the relative default "./.alms".
     let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
     // Mock LLM irrelevant here -- load_or_default() swallows errors.
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");

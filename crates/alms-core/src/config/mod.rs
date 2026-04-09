@@ -5,7 +5,7 @@
 //! 2. Config file (alms.toml)
 //! 3. Environment variables (non-secret `ALMS_*` prefix)
 //!
-//! Secrets (API keys, tokens) are loaded exclusively from `data/secrets.json`
+//! Secrets (API keys, tokens) are loaded exclusively from `.alms/secrets.json`
 //! via `alms auth set`. Environment variable fallback has been removed for
 //! security — agents can read env vars via `shell_exec`.
 
@@ -74,6 +74,9 @@ impl AlmsConfig {
         // relative to a changed cwd. This is the canonical fix for issue #300
         // (stray data/alms.db inside agent workspace directories).
         config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
+
+        // Check for legacy ./data directory and warn about migration.
+        config.warn_legacy_data_dir();
 
         // Normalize episodic memory settings (soft corrections with warnings)
         config.context.normalize_episodic();
@@ -316,6 +319,67 @@ impl AlmsConfig {
         }
 
         Ok(())
+    }
+
+    /// Warn if a legacy `./data` directory exists but the new `.alms/`
+    /// directory does not. This helps users who upgrade from older versions
+    /// discover that the default data directory has changed.
+    ///
+    /// Does not auto-migrate — too risky. Just logs a warning.
+    fn warn_legacy_data_dir(&self) {
+        // Only warn when the default `.alms` directory is in use (not a
+        // custom ALMS_DATA_DIR override). We check the *raw* default value
+        // before absolute-path resolution.
+        let data_path = Path::new(&self.server.data_dir);
+
+        // The data_dir has already been resolved to an absolute path at
+        // this point, so check whether it ends with `.alms`.
+        let is_default = data_path.file_name().is_some_and(|name| name == ".alms");
+
+        if !is_default {
+            return;
+        }
+
+        // Check for legacy ./data in the parent directory (the workspace root).
+        if let Some(parent) = data_path.parent() {
+            let legacy_dir = parent.join("data");
+            if legacy_dir.is_dir() && !data_path.is_dir() {
+                warn!(
+                    legacy = %legacy_dir.display(),
+                    current = %data_path.display(),
+                    "Found legacy data directory. The default data directory has \
+                     changed from ./data to ./.alms. To migrate, run: \
+                     mv {} {}",
+                    legacy_dir.display(),
+                    data_path.display(),
+                );
+            }
+        }
+    }
+
+    /// Ensure the data directory exists, creating it if necessary.
+    ///
+    /// Logs a message when a new `.alms/` directory is created (first run),
+    /// similar to how `git init` reports creating `.git/`.
+    pub fn ensure_data_dir(&self) {
+        let data_path = Path::new(&self.server.data_dir);
+        let already_exists = data_path.is_dir();
+
+        if let Err(e) = std::fs::create_dir_all(data_path) {
+            warn!(
+                path = %data_path.display(),
+                error = %e,
+                "Could not create data directory"
+            );
+            return;
+        }
+
+        if !already_exists {
+            info!(
+                path = %data_path.display(),
+                "Initialized ALMS data directory"
+            );
+        }
     }
 
     /// Check for deprecated API key environment variables and log warnings.

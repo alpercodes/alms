@@ -670,7 +670,7 @@ Returns current server defaults for UI pre-population.
   "enabled_tools": ["echo", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"],
   "agent_id": "<uuid>",
   "agents": [{"name": "main", "id": "<uuid>", "is_default": true, "model": null, "needs_bootstrap": false}],
-  "workspace_dir": "./data/workspace",
+  "workspace_dir": "./.alms/workspace",
   "context": {
     "strategy": "truncate",
     "max_input_tokens": 100000,

@@ -68,8 +68,12 @@ impl std::str::FromStr for RunSummaryMode {
 #[serde(default)]
 pub struct ServerConfig {
     pub bind: String,
-    /// Base directory for ALMS data files (SQLite DB, workspace, secrets).
-    /// Override with `ALMS_DATA_DIR` env var. Default: `./data`.
+    /// Base directory for ALMS instance data (SQLite DB, workspace, secrets).
+    /// Override with `ALMS_DATA_DIR` env var. Default: `./.alms`.
+    ///
+    /// Follows the CWD-as-workspace model (like `.git/` or `.cargo/`):
+    /// `cd` into your project directory, run `alms gateway`, and all
+    /// instance-specific state lives under `.alms/` in the project root.
     pub data_dir: String,
     /// Bearer token for API authentication — loaded from env only
     #[serde(skip)]
@@ -80,7 +84,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: "127.0.0.1:8080".into(),
-            data_dir: "./data".into(),
+            data_dir: "./.alms".into(),
             auth_token: None,
         }
     }

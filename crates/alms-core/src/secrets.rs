@@ -45,7 +45,7 @@ pub fn secrets_path(data_dir: &Path) -> PathBuf {
 pub fn secrets_path_from_db(db_path: Option<&str>) -> PathBuf {
     db_path
         .and_then(|p| Path::new(p).parent().map(|d| d.join("secrets.json")))
-        .unwrap_or_else(|| secrets_path(Path::new("./data")))
+        .unwrap_or_else(|| secrets_path(Path::new("./.alms")))
 }
 
 /// In-memory secrets store backed by an optionally-encrypted JSON file.

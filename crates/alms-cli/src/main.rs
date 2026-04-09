@@ -196,7 +196,16 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Gateway { bind } => {
-            info!("Starting ALMS Gateway...");
+            // Ensure the data directory exists (creates .alms/ on first run).
+            config.ensure_data_dir();
+
+            info!(
+                data_dir = %config.server.data_dir,
+                workspace = %std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| ".".into()),
+                "Starting ALMS Gateway"
+            );
 
             // Warn about deprecated API key env vars (ignored for security).
             alms_core::AlmsConfig::warn_deprecated_secret_env_vars();

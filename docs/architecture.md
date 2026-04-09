@@ -161,11 +161,11 @@ Multi-provider LLM support with streaming. Provider selected via `llm.provider` 
 - **OpenAI / OpenRouter** — OpenAI-compatible chat completions API (default)
 - **Anthropic** — Messages API with full streaming, tool use, and response format mapping
 
-API keys loaded exclusively from `data/secrets.json` via `alms auth set`. Provider-aware key selection: each provider prefers its own key, falls back to others.
+API keys loaded exclusively from `.alms/secrets.json` via `alms auth set`. Provider-aware key selection: each provider prefers its own key, falls back to others.
 
 ### Session Manager (`alms-session`)
 
-Owns conversation history and workspace state. Backed by **SQLite** (`./data/alms.db`) for durable persistence of sessions, audit events, scheduled jobs, and the agent registry.
+Owns conversation history and workspace state. Backed by **SQLite** (`./.alms/alms.db`) for durable persistence of sessions, audit events, scheduled jobs, and the agent registry.
 
 **Hierarchy:**
 ```

@@ -1,14 +1,15 @@
 # ALMS Configuration
 # Copy to alms.toml and customize. All values shown are defaults.
-# Secrets (API keys, tokens) are stored in data/secrets.json via `alms auth set`
+# Secrets (API keys, tokens) are stored in .alms/secrets.json via `alms auth set`
 # or the web UI. They are never stored in this file or read from env vars.
 # Set ALMS_MASTER_KEY env var to encrypt secrets at rest (AES-256-GCM).
 
 [server]
 bind = "127.0.0.1:8080"
 # Data directory for SQLite DB, secrets, workspace files.
+# Follows the CWD-as-workspace model (like .git/ or .cargo/).
 # Override with ALMS_DATA_DIR env var.
-# data_dir = "./data"
+# data_dir = "./.alms"
 
 [llm]
 # LLM provider: "openrouter" (default), "openai", or "anthropic"
@@ -104,9 +105,9 @@ shell_policy = "sandboxed"
 # Override with: ALMS_LOG_FILE_ENABLED=false
 file_enabled = true
 
-# Directory for persistent log files. Default: "{data_dir}/logs/" (i.e. ./data/logs/).
+# Directory for persistent log files. Default: "{data_dir}/logs/" (i.e. ./.alms/logs/).
 # Override with: ALMS_LOG_DIR=/custom/log/path
-# log_dir = "./data/logs"
+# log_dir = "./.alms/logs"
 
 # Log level for file output. Stderr level is controlled by RUST_LOG (default: info).
 # File output defaults to "debug" for more detail in post-hoc investigation.
