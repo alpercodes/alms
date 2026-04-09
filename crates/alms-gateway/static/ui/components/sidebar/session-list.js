@@ -5,6 +5,7 @@ import { replaceMessages } from '../../state/chat-actions.js';
 import { activeRunId, runs } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
+import { sessionSwitchLoading } from '../../state/loading.js';
 import { listSessions, createSession } from '../../api/sessions.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
 import { saveActiveSession } from '../../hooks/use-boot.js';
@@ -31,6 +32,7 @@ async function selectSession(sessionId) {
     replaceMessages([]);
     messageQueue.value = [];
     auditEvents.value = null;
+    sessionSwitchLoading.value = true;
 
     // Persist the selection for this agent
     saveActiveSession(activeAgentId.value, sessionId);
@@ -38,10 +40,16 @@ async function selectSession(sessionId) {
     // Delegate the run/history/approval/SSE loading to the shared
     // loadSession() function, passing a stale-check callback tied
     // to the shared selectGeneration counter.
-    await loadSession(sessionId, {
-        isStale: () => gen !== selectGeneration,
-        logPrefix: 'selectSession',
-    });
+    try {
+        await loadSession(sessionId, {
+            isStale: () => gen !== selectGeneration,
+            logPrefix: 'selectSession',
+        });
+    } finally {
+        if (gen === selectGeneration) {
+            sessionSwitchLoading.value = false;
+        }
+    }
 }
 
 async function newSession() {

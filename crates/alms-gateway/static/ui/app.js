@@ -15,6 +15,7 @@ import { OnboardingView } from './components/onboarding.js';
 import { agents, activeAgent } from './state/agents.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
 import { scrollToBottom } from './utils/format.js';
+import { sessionSwitchLoading, agentSwitchLoading, bootRetryAvailable } from './state/loading.js';
 
 // ── App status ──
 export const status = signal('connecting...');
@@ -80,7 +81,10 @@ function ChatView() {
     return html`
         <div id="chat">
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>
-                ${chatMessages.value.length === 0 && html`
+                ${(sessionSwitchLoading.value || agentSwitchLoading.value) && html`
+                    <div class="loading-state">Loading session...</div>
+                `}
+                ${!sessionSwitchLoading.value && !agentSwitchLoading.value && chatMessages.value.length === 0 && html`
                     <div class="empty-state">
                         No messages yet. Send a message to start.
                     </div>
@@ -157,8 +161,7 @@ function ChatView() {
                     if (m.type === 'thinking') {
                         let label = 'Thinking';
                         if (m.queuedBehind > 0) {
-                            const n = m.queuedBehind;
-                            label = 'Agent is busy -- your message is queued (' + n + ' ahead)';
+                            label = 'Agent is busy -- your message is queued';
                         } else if (m.source && m.source.startsWith('peer:')) {
                             label = 'Replying to message from ' + m.source.slice(5);
                         } else if (m.source === 'job') {
@@ -206,8 +209,19 @@ function App() {
 // Mount and boot
 render(html`<${App} />`, document.getElementById('app'));
 
-boot().then(() => {
-    status.value = 'connected';
-}).catch(() => {
-    status.value = 'offline';
-});
+function runBoot() {
+    bootRetryAvailable.value = false;
+    status.value = 'connecting...';
+    boot().then(() => {
+        status.value = 'connected';
+        bootRetryAvailable.value = false;
+    }).catch(() => {
+        status.value = 'offline';
+        bootRetryAvailable.value = true;
+    });
+}
+
+// Expose for retry button
+window.__almsBoot = runBoot;
+
+runBoot();
