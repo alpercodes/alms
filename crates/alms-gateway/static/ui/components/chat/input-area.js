@@ -89,6 +89,7 @@ export function InputArea() {
             <div class="input-container">
                 <textarea id="prompt" ref=${promptRef} rows="1"
                           placeholder="Send a message..."
+                          aria-label="Message input"
                           disabled=${!canSend}
                           onKeyDown=${onKeyDown}
                           onInput=${onInput}></textarea>
