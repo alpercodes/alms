@@ -15,7 +15,7 @@ import { OnboardingView } from './components/onboarding.js';
 import { agents, activeAgent } from './state/agents.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
 import { scrollToBottom } from './utils/format.js';
-import { sessionSwitchLoading, agentSwitchLoading, bootRetryAvailable } from './state/loading.js';
+import { sessionSwitchLoading, agentSwitchLoading, bootRetryAvailable, setRunBoot } from './state/loading.js';
 
 // ── App status ──
 export const status = signal('connecting...');
@@ -81,7 +81,10 @@ function ChatView() {
     return html`
         <div id="chat">
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>
-                ${(sessionSwitchLoading.value || agentSwitchLoading.value) && html`
+                ${agentSwitchLoading.value && html`
+                    <div class="loading-state">Loading agent...</div>
+                `}
+                ${!agentSwitchLoading.value && sessionSwitchLoading.value && html`
                     <div class="loading-state">Loading session...</div>
                 `}
                 ${!sessionSwitchLoading.value && !agentSwitchLoading.value && chatMessages.value.length === 0 && html`
@@ -209,19 +212,18 @@ function App() {
 // Mount and boot
 render(html`<${App} />`, document.getElementById('app'));
 
-function runBoot() {
+function doRunBoot() {
     bootRetryAvailable.value = false;
     status.value = 'connecting...';
     boot().then(() => {
         status.value = 'connected';
-        bootRetryAvailable.value = false;
     }).catch(() => {
         status.value = 'offline';
         bootRetryAvailable.value = true;
     });
 }
 
-// Expose for retry button
-window.__almsBoot = runBoot;
+// Register so other modules can trigger a retry via the loading module
+setRunBoot(doRunBoot);
 
-runBoot();
+doRunBoot();

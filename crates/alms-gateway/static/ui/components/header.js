@@ -6,7 +6,7 @@ import { theme, toggleTheme } from '../state/theme.js';
 import { switchAgent } from '../hooks/use-boot.js';
 import { IconGear, IconSun, IconMoon, IconMenu, IconX } from '../utils/icons.js';
 import { activeOverrideCount } from './settings-modal.js';
-import { bootRetryAvailable } from '../state/loading.js';
+import { bootRetryAvailable, runBoot } from '../state/loading.js';
 
 /** Sidebar open/close state — shared so Sidebar and backdrop can react */
 export const sidebarOpen = signal(false);
@@ -81,7 +81,7 @@ export function Header({ onOpenSettings, status }) {
             <span class="status-dot ${statusClass}" aria-hidden="true"></span>
             <span id="status">${status.value}</span>
             ${bootRetryAvailable.value && html`
-                <button class="retry-btn" onClick=${() => window.__almsBoot && window.__almsBoot()}>Retry</button>
+                <button class="retry-btn" onClick=${runBoot}>Retry</button>
             `}
 
             <div class="header-btns">

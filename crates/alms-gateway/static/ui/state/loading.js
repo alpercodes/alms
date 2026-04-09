@@ -12,3 +12,9 @@ import { signal } from '../deps.js';
 export const sessionSwitchLoading = signal(false);
 export const agentSwitchLoading = signal(false);
 export const bootRetryAvailable = signal(false);
+
+/** Set by app.js during initialization; callable from any module. */
+let _runBoot = null;
+
+export function setRunBoot(fn) { _runBoot = fn; }
+export function runBoot() { if (_runBoot) _runBoot(); }

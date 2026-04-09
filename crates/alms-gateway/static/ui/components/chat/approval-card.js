@@ -6,21 +6,30 @@ async function resolveApproval(approvalId, decision) {
         await post(`/approvals/${approvalId}`, { decision });
     } catch (err) {
         console.error('[resolveApproval] failed:', err);
+        throw err;
     }
 }
 
 export function ApprovalCard({ approvalId, tool, params, resolved, decision }) {
     const submitting = useSignal(false);
 
-    const onApprove = () => {
+    const onApprove = async () => {
         if (submitting.value) return;
         submitting.value = true;
-        resolveApproval(approvalId, 'approve');
+        try {
+            await resolveApproval(approvalId, 'approve');
+        } catch (_) {
+            submitting.value = false;
+        }
     };
-    const onDeny = () => {
+    const onDeny = async () => {
         if (submitting.value) return;
         submitting.value = true;
-        resolveApproval(approvalId, 'deny');
+        try {
+            await resolveApproval(approvalId, 'deny');
+        } catch (_) {
+            submitting.value = false;
+        }
     };
 
     if (resolved) {

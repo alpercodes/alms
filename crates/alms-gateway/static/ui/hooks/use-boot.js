@@ -135,9 +135,15 @@ export async function switchAgent(agentId) {
     wsFiles.value = null;
     auditEvents.value = null;
 
+    // loadAgentSessions() bumps switchGeneration synchronously (before its
+    // first await), so we start the call, then read the updated counter.
+    const promise = loadAgentSessions(agentId);
+    const gen = switchGeneration;
     try {
-        await loadAgentSessions(agentId);
+        await promise;
     } finally {
-        agentSwitchLoading.value = false;
+        if (gen === switchGeneration) {
+            agentSwitchLoading.value = false;
+        }
     }
 }
