@@ -100,15 +100,17 @@ function AgentEditModal({ agent, onClose }) {
 function AgentCard({ agent, isActive, onEdit }) {
     const error = useSignal('');
     const confirming = useSignal(false);
+    const deleteTimer = useSignal(null);
     const serverModel = serverDefaults.value.model || 'default';
 
     const onDeleteClick = () => {
         confirming.value = true;
         // Auto-revert after 3 seconds if not confirmed
-        setTimeout(() => { confirming.value = false; }, 3000);
+        deleteTimer.value = setTimeout(() => { confirming.value = false; }, 3000);
     };
 
     const onDeleteConfirm = async () => {
+        if (deleteTimer.value) { clearTimeout(deleteTimer.value); deleteTimer.value = null; }
         confirming.value = false;
         try {
             await deleteAgent(agent.id);
@@ -125,6 +127,7 @@ function AgentCard({ agent, isActive, onEdit }) {
     };
 
     const onDeleteCancel = () => {
+        if (deleteTimer.value) { clearTimeout(deleteTimer.value); deleteTimer.value = null; }
         confirming.value = false;
     };
 
