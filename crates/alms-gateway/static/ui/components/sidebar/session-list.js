@@ -77,13 +77,17 @@ export function SessionList() {
     return html`
         <div class="sidebar-section" style="flex:0 0 auto">
             <div class="sidebar-label">Sessions</div>
-            <div id="session-list">
+            <div id="session-list" role="listbox" aria-label="Sessions">
                 ${sessions.value.length === 0
                     ? html`<div class="run-empty">No sessions</div>`
                     : sessions.value.map(s => html`
                         <div class="session-item ${s.id === activeSessionId.value ? 'active' : ''} ${hasActiveRun(s.id) ? 'has-run' : ''}"
+                             role="option"
+                             aria-selected=${s.id === activeSessionId.value}
+                             tabindex="0"
                              title=${'ID: ' + s.id + '\nContext: ' + s.context_id}
-                             onClick=${() => selectSession(s.id)}>
+                             onClick=${() => selectSession(s.id)}
+                             onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(s.id); } }}>
                             ${s.context_id || s.id.slice(0, 8)}
                         </div>
                     `)

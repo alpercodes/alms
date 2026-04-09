@@ -99,10 +99,19 @@ function AgentEditModal({ agent, onClose }) {
 
 function AgentCard({ agent, isActive, onEdit }) {
     const error = useSignal('');
+    const confirming = useSignal(false);
+    const deleteTimer = useSignal(null);
     const serverModel = serverDefaults.value.model || 'default';
 
-    const onDelete = async () => {
-        if (!confirm('Delete agent "' + agent.name + '"?')) return;
+    const onDeleteClick = () => {
+        confirming.value = true;
+        // Auto-revert after 3 seconds if not confirmed
+        deleteTimer.value = setTimeout(() => { confirming.value = false; }, 3000);
+    };
+
+    const onDeleteConfirm = async () => {
+        if (deleteTimer.value) { clearTimeout(deleteTimer.value); deleteTimer.value = null; }
+        confirming.value = false;
         try {
             await deleteAgent(agent.id);
             await refreshAgents();
@@ -115,6 +124,11 @@ function AgentCard({ agent, isActive, onEdit }) {
         } catch (err) {
             error.value = err.error?.message || err.message || 'Delete failed';
         }
+    };
+
+    const onDeleteCancel = () => {
+        if (deleteTimer.value) { clearTimeout(deleteTimer.value); deleteTimer.value = null; }
+        confirming.value = false;
     };
 
     const onSetDefault = async () => {
@@ -148,7 +162,13 @@ function AgentCard({ agent, isActive, onEdit }) {
                 ${!agent.is_default && html`
                     <button class="agent-card-btn" onClick=${onSetDefault}>Set Default</button>
                 `}
-                <button class="agent-card-btn" style="color:var(--error);" onClick=${onDelete}>Delete</button>
+                ${confirming.value
+                    ? html`
+                        <button class="agent-card-btn" style="color:var(--error); font-weight:600;" onClick=${onDeleteConfirm}>Confirm?</button>
+                        <button class="agent-card-btn" onClick=${onDeleteCancel}>Cancel</button>
+                    `
+                    : html`<button class="agent-card-btn" style="color:var(--error);" onClick=${onDeleteClick}>Delete</button>`
+                }
             </div>
         </div>
     `;
@@ -187,6 +207,7 @@ export function AgentsTab() {
         <div class="agent-list-container">
             <div class="agent-create-row">
                 <input type="text" placeholder="New agent name..."
+                       aria-label="Agent name"
                        value=${newName.value}
                        onInput=${e => { newName.value = e.target.value; }}
                        onKeyDown=${e => { if (e.key === 'Enter') onCreate(); }}

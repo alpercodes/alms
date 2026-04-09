@@ -259,9 +259,9 @@ header h1 {
   background: var(--text-disabled);
   flex-shrink: 0;
 }
-.status-dot.ok { background: var(--success); }
-.status-dot.running { background: var(--warning); animation: pulse 1.5s ease-in-out infinite; }
-.status-dot.error { background: var(--error); }
+.status-dot.ok { background: var(--success); border-radius: var(--radius-full); }
+.status-dot.running { background: var(--warning); border-radius: var(--radius-full); animation: pulse 1.5s ease-in-out infinite; }
+.status-dot.error { background: var(--error); border-radius: 0; }
 
 #status {
   font-size: var(--text-xs);
@@ -2330,3 +2330,4 @@ select.settings-input-sm {
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+

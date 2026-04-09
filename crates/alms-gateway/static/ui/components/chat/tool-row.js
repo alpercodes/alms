@@ -144,7 +144,8 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent, duratio
     const paramsText = formatJson(params);
 
     return html`
-        <div class="tc-row ${statusCls} ${isDm ? 'tc-dm' : ''}" onClick=${toggle}>
+        <div class="tc-row ${statusCls} ${isDm ? 'tc-dm' : ''}" role="button" tabindex="0"
+             onClick=${toggle} onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e); } }}>
             <div class="tc-header">
                 <span class="tc-chevron">${chevron}</span>
                 ${isRunning

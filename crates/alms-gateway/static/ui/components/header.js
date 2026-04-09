@@ -77,7 +77,7 @@ export function Header({ onOpenSettings, status }) {
 
             <div class="header-spacer"></div>
 
-            <span class="status-dot ${statusClass}"></span>
+            <span class="status-dot ${statusClass}" aria-hidden="true"></span>
             <span id="status">${status.value}</span>
 
             <div class="header-btns">

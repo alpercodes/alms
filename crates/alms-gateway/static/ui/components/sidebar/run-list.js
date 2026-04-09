@@ -27,11 +27,11 @@ export function RunList() {
                 Runs
                 <span id="session-tokens">${sessionTokens.value}</span>
             </div>
-            <div id="run-list">
+            <div id="run-list" role="list" aria-label="Runs">
                 ${runs.value.length === 0
                     ? html`<div class="run-empty">No runs yet</div>`
                     : runs.value.map(run => html`
-                        <div class="run-item ${run.status}">
+                        <div class="run-item ${run.status}" role="listitem">
                             <span class="run-status">${STATUS_ICONS[run.status] || '\u00B7'}</span>
                             <span class="run-meta" title=${run.run_id}>
                                 ${fmtDate(run.ts || run.started_at || '')}

@@ -51,7 +51,9 @@ function ContextMessage({ msg, index }) {
     }
 
     return html`
-        <div class="cd-msg" onClick=${(e) => { e.stopPropagation(); expanded.value = !expanded.value; }}>
+        <div class="cd-msg" role="button" tabindex="0"
+             onClick=${(e) => { e.stopPropagation(); expanded.value = !expanded.value; }}
+             onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); expanded.value = !expanded.value; } }}>
             <div class="cd-msg-header">
                 <span class="cd-msg-chevron">${expanded.value ? '\u25BC' : '\u25B6'}</span>
                 <span class="cd-msg-role ${roleClass(role)}">${role}</span>
@@ -85,7 +87,8 @@ export function ContextDebugRow({ messages, toolNames, totalTokens, systemTokens
     const msgCount = Array.isArray(messages) ? messages.length : 0;
 
     return html`
-        <div class="cd-row" onClick=${toggle}>
+        <div class="cd-row" role="button" tabindex="0"
+             onClick=${toggle} onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e); } }}>
             <div class="cd-header">
                 <span class="cd-chevron">${expanded.value ? '\u25BC' : '\u25B6'}</span>
                 <span class="cd-icon">CTX</span>
