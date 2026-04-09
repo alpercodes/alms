@@ -350,7 +350,7 @@ impl Gateway {
             let mut telegram = TelegramChannel::new();
 
             // Persist update offset per agent alongside the DB file
-            // e.g. ./data/telegram_offset_{agent_name}
+            // e.g. .alms/telegram_offset_{agent_name}
             if let Some(ref db_path) = self.config.db_path {
                 let data_dir = std::path::Path::new(db_path)
                     .parent()

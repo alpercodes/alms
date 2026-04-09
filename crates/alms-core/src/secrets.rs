@@ -1,6 +1,6 @@
 //! Secure API key storage with optional encryption at rest.
 //!
-//! Keys are stored in a JSON file (`data/secrets.json`). When the
+//! Keys are stored in a JSON file (`.alms/secrets.json`). When the
 //! `ALMS_MASTER_KEY` environment variable is set, the file is encrypted
 //! using AES-256-GCM with an HKDF-SHA256 derived key. Without the env var
 //! the file is stored as plain text (with a warning log).

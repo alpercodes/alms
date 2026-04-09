@@ -62,7 +62,7 @@ poll_interval_secs = 5
 ```
 
 **Principles:**
-- Secrets (API keys, tokens) come from **`data/secrets.json`** via `alms auth set`, never config files or env vars
+- Secrets (API keys, tokens) come from **`.alms/secrets.json`** via `alms auth set`, never config files or env vars
 - Every field has a default — zero-config startup should work (with mock LLM)
 - Human-readable durations (`"24h"`, `"30d"`, `"5m"`)
 - Validation on startup: reject invalid values with clear messages before starting

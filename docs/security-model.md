@@ -300,7 +300,7 @@ P1:
 - [x] Landlock integration (Linux) — kernel-level filesystem restriction for shell commands (fail-closed)
 - [ ] Restricted OS user deployment guide — document setup for sandboxed daemon user
 - [ ] Container/jail execution for shell tools (`bubblewrap`/`nsjail`)
-- [x] Secrets store — `data/secrets.json` with optional AES-256-GCM encryption via `ALMS_MASTER_KEY`
+- [x] Secrets store — `.alms/secrets.json` with optional AES-256-GCM encryption via `ALMS_MASTER_KEY`
 - [ ] Secrets redaction in transcripts/audit logs
 - [ ] Per-domain network allowlists
 

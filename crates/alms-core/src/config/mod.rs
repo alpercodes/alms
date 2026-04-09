@@ -101,6 +101,7 @@ impl AlmsConfig {
                 let mut cfg = Self::default();
                 cfg.apply_env_overrides();
                 cfg.server.data_dir = crate::resolve_to_absolute(Path::new(&cfg.server.data_dir));
+                cfg.warn_legacy_data_dir();
                 cfg.context.normalize_episodic();
                 cfg
             }
@@ -142,7 +143,7 @@ impl AlmsConfig {
     /// Apply environment variable overrides for non-secret settings.
     ///
     /// API keys and tokens are NOT loaded from env vars — they must be
-    /// configured via `alms auth set` and stored in `data/secrets.json`.
+    /// configured via `alms auth set` and stored in `.alms/secrets.json`.
     pub fn apply_env_overrides(&mut self) {
         // LLM settings (non-secret only)
         if let Ok(provider) = std::env::var("ALMS_LLM_PROVIDER") {
