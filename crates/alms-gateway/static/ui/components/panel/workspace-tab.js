@@ -68,7 +68,7 @@ export function WorkspaceTab() {
         return html`<div class="ws-notice">No agent selected</div>`;
     }
     if (wsFiles.value === null) {
-        return html`<div style="color:var(--text-disabled); padding:var(--space-4); font-size:var(--text-sm);">Loading...</div>`;
+        return html`<div class="loading-state">Loading...</div>`;
     }
     if (wsFiles.value === 'unavailable') {
         return html`<div class="ws-notice">Workspace not configured for this agent</div>`;

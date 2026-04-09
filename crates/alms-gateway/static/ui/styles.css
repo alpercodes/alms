@@ -462,7 +462,7 @@ header h1 {
 .run-item.failed    .run-status { color: var(--error); }
 .run-item.cancelled .run-status { color: var(--text-disabled); }
 .run-item.running   .run-status { color: var(--warning); }
-.run-empty { padding: var(--space-2) var(--space-3); font-size: var(--text-xs); color: var(--text-disabled); font-style: italic; }
+.run-empty { padding: var(--space-4); font-size: var(--text-sm); color: var(--text-disabled); font-style: italic; text-align: center; }
 
 /* ══════════════════════════════════════════════════════════════════════
    Chat Area
@@ -1568,7 +1568,7 @@ header h1 {
 .job-status-active    { color: var(--success); }
 .job-status-cancelled { color: var(--text-disabled); text-decoration: line-through; }
 .job-status-pending   { color: var(--warning); }
-.jobs-empty { font-size: var(--text-xs); color: var(--text-disabled); font-style: italic; }
+.jobs-empty { padding: var(--space-4); font-size: var(--text-sm); color: var(--text-disabled); font-style: italic; text-align: center; }
 .jobs-error { font-size: var(--text-xs); color: var(--error); }
 .jobs-success { font-size: var(--text-xs); color: var(--success); }
 .schedule-mode-toggle { display: flex; gap: var(--space-1); }
@@ -1925,10 +1925,21 @@ select.settings-input-sm {
 .agent-card-btn.danger { color: var(--error); border-color: var(--error); }
 .agent-card-btn.danger:hover { background: var(--error-muted); }
 .agent-create-row { display: flex; gap: var(--space-2); align-items: center; }
-.agent-create-row input { flex: 1; }
+.agent-create-row input {
+  flex: 1;
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  padding: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  border-radius: var(--radius-sm);
+}
 
 .agent-card.active {
-  border-left-color: var(--accent);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 var(--radius-lg) var(--radius-lg) 0;
+  background: var(--accent-muted);
 }
 .agent-card-header {
   display: flex;
@@ -2004,7 +2015,7 @@ select.settings-input-sm {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.audit-empty { font-size: var(--text-xs); color: var(--text-disabled); font-style: italic; padding: var(--space-2) 0; }
+.audit-empty { padding: var(--space-4); font-size: var(--text-sm); color: var(--text-disabled); font-style: italic; text-align: center; }
 
 /* ══════════════════════════════════════════════════════════════════════
    Onboarding
@@ -2329,5 +2340,39 @@ select.settings-input-sm {
 .sa-tool-summary { color: var(--text-secondary); }
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   Shared utility classes (visual consistency)
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Generic empty state — replaces .run-empty, .audit-empty, inline-styled empties */
+.empty-state {
+  padding: var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-disabled);
+  font-style: italic;
+  text-align: center;
+}
+
+/* Generic loading state — replaces inline-styled loading divs */
+.loading-state {
+  padding: var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-disabled);
+}
+
+/* Generic inline error — replaces scattered inline error styles */
+.inline-error {
+  font-size: var(--text-xs);
+  color: var(--error);
+}
+
+/* System message — matches .msg-error / .msg-warning pattern (4b) */
+.msg-system {
+  font-size: var(--text-xs);
+  color: var(--text-disabled);
+  text-align: center;
+  padding: var(--space-1) 0;
 }
 

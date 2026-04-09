@@ -84,7 +84,7 @@ function AgentEditModal({ agent, onClose }) {
                     </select>
                 </div>
 
-                ${error.value && html`<div style="color:var(--error); font-size:var(--text-xs);">${error.value}</div>`}
+                ${error.value && html`<div class="inline-error">${error.value}</div>`}
 
                 <div class="settings-footer">
                     <button class="settings-cancel" onClick=${onClose}>Cancel</button>
@@ -210,8 +210,7 @@ export function AgentsTab() {
                        aria-label="Agent name"
                        value=${newName.value}
                        onInput=${e => { newName.value = e.target.value; }}
-                       onKeyDown=${e => { if (e.key === 'Enter') onCreate(); }}
-                       style="flex:1; background:var(--surface-2); color:var(--text-primary); border:1px solid var(--border-default); padding:var(--space-2); font-family:var(--font-mono); font-size:var(--text-sm);" />
+                       onKeyDown=${e => { if (e.key === 'Enter') onCreate(); }} />
                 <button class="agent-card-btn" onClick=${onCreate}
                         disabled=${loading.value}>
                     ${loading.value ? '...' : '+ Create'}
@@ -221,7 +220,7 @@ export function AgentsTab() {
             ${error.value && html`<div class="agent-error">${error.value}</div>`}
 
             ${agents.value.length === 0
-                ? html`<div style="color:var(--text-disabled); font-style:italic; padding:var(--space-4); font-size:var(--text-sm);">No agents</div>`
+                ? html`<div class="empty-state">No agents</div>`
                 : agents.value.map(a => html`
                     <${AgentCard} key=${a.id} agent=${a}
                                   isActive=${a.id === activeAgentId.value}

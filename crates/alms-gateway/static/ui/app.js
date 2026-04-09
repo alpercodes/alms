@@ -81,7 +81,7 @@ function ChatView() {
         <div id="chat">
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>
                 ${chatMessages.value.length === 0 && html`
-                    <div style="color: var(--text-disabled); font-style: italic; padding: var(--space-8); text-align: center; font-size: var(--text-sm);">
+                    <div class="empty-state">
                         No messages yet. Send a message to start.
                     </div>
                 `}

@@ -182,7 +182,7 @@ function ApiKeysSection() {
                     </div>
                 `;
             })}
-            ${error.value && html`<div style="color:var(--error); font-size:var(--text-xs);">${error.value}</div>`}
+            ${error.value && html`<div class="inline-error">${error.value}</div>`}
         </div>
     `;
 }
