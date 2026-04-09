@@ -8,6 +8,7 @@ import { replaceMessages } from '../state/chat-actions.js';
 import { messageQueue } from '../state/queue.js';
 import { wsFiles } from '../state/workspace.js';
 import { auditEvents } from '../state/audit.js';
+import { agentSwitchLoading } from '../state/loading.js';
 import { openSessionStream, closeSessionStream } from './use-session-stream.js';
 import { bumpSelectGeneration } from '../state/select-generation.js';
 import { loadSession } from '../utils/load-session.js';
@@ -62,6 +63,7 @@ export async function boot() {
         }
     } catch (err) {
         console.error('[boot] failed:', err);
+        throw err;
     }
 }
 
@@ -121,6 +123,7 @@ export async function switchAgent(agentId) {
 
     activeAgentId.value = agentId;
     localStorage.setItem(AGENT_KEY, agentId);
+    agentSwitchLoading.value = true;
 
     // Reset all state
     activeSessionId.value = null;
@@ -132,5 +135,15 @@ export async function switchAgent(agentId) {
     wsFiles.value = null;
     auditEvents.value = null;
 
-    await loadAgentSessions(agentId);
+    // loadAgentSessions() bumps switchGeneration synchronously (before its
+    // first await), so we start the call, then read the updated counter.
+    const promise = loadAgentSessions(agentId);
+    const gen = switchGeneration;
+    try {
+        await promise;
+    } finally {
+        if (gen === switchGeneration) {
+            agentSwitchLoading.value = false;
+        }
+    }
 }

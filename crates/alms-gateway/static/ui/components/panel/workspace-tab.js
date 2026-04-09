@@ -26,10 +26,14 @@ async function loadWorkspace() {
 function FileEditor({ agentId, filename, content }) {
     const draft = useSignal(content || '');
     const flash = useSignal('');
+    const saving = useSignal(false);
 
     useEffect(() => { draft.value = content || ''; }, [content]);
 
     const onSave = async () => {
+        if (saving.value) return;
+        saving.value = true;
+        flash.value = '';
         try {
             await updateWorkspaceFile(agentId, filename, draft.value);
             flash.value = 'Saved';
@@ -37,6 +41,8 @@ function FileEditor({ agentId, filename, content }) {
             await loadWorkspace();
         } catch (err) {
             flash.value = 'Error: ' + (err.error?.message || err.message || 'save failed');
+        } finally {
+            saving.value = false;
         }
     };
 
@@ -48,7 +54,9 @@ function FileEditor({ agentId, filename, content }) {
                       value=${draft.value}
                       onInput=${e => { draft.value = e.target.value; }}></textarea>
             <div style="display:flex; align-items:center; gap:var(--space-2);">
-                <button class="ws-save" onClick=${onSave}>Save</button>
+                <button class="ws-save" onClick=${onSave} disabled=${saving.value}>
+                    ${saving.value ? 'Saving...' : 'Save'}
+                </button>
                 ${flash.value && html`
                     <span class="ws-flash" style="color:${flash.value.startsWith('Error') ? 'var(--error)' : 'var(--success)'}">
                         ${flash.value}
