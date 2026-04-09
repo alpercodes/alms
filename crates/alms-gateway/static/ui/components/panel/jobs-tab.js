@@ -189,7 +189,7 @@ export function JobsTab() {
                           onInput=${e => { prompt.value = e.target.value; }}></textarea>
 
                 ${!agentId.value && html`
-                    <div style="color:var(--text-muted); font-size:var(--text-xs); font-style:italic;">
+                    <div class="empty-state">
                         No agents available. Create an agent first.
                     </div>
                 `}

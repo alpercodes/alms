@@ -27,7 +27,7 @@ export function AuditTab() {
         return html`<div class="audit-empty">No session selected</div>`;
     }
     if (auditEvents.value === null) {
-        return html`<div style="color:var(--text-disabled); padding:var(--space-4); font-size:var(--text-sm);">Loading...</div>`;
+        return html`<div class="loading-state">Loading...</div>`;
     }
     if (auditEvents.value.length === 0) {
         return html`<div class="audit-empty">No audit events</div>`;

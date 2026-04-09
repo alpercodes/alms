@@ -70,7 +70,7 @@ export function WarningMessage({ text, code }) {
 
 export function SystemMessage({ text }) {
     return html`
-        <div style="font-size: var(--text-xs); color: var(--text-disabled); text-align: center;">
+        <div class="msg-system">
             ${text}
         </div>
     `;
