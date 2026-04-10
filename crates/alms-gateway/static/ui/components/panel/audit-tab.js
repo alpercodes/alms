@@ -4,6 +4,7 @@ import { activeSessionId } from '../../state/sessions.js';
 import { activePanelTab } from '../../state/panel.js';
 import { getAudit } from '../../api/audit.js';
 import { fmtDate } from '../../utils/format.js';
+import { PREVIEW_LEN } from '../../utils/constants.js';
 
 const PAGE_SIZE = 50;
 
@@ -67,7 +68,7 @@ export function AuditTab() {
                     </span>
                     ${ev.timestamp && html`<span class="audit-time">${fmtDate(ev.timestamp)}</span>`}
                     ${ev.params && html`
-                        <div class="audit-params">${JSON.stringify(ev.params).slice(0, 120)}</div>
+                        <div class="audit-params">${JSON.stringify(ev.params).slice(0, PREVIEW_LEN)}</div>
                     `}
                 </div>
             `)}
