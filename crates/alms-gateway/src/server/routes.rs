@@ -12,7 +12,8 @@ use crate::approvals::{list_approvals, resolve_approval};
 use crate::auth_keys;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
-    cancel_run, create_run, get_run_status, get_run_tool_calls, list_runs, stream_run_events,
+    cancel_run, create_run, get_run_status, get_run_tool_calls, is_internal_context_id, list_runs,
+    stream_run_events,
 };
 use crate::settings::{get_settings, patch_settings};
 use crate::workspace::{get_workspace, update_workspace_file};
@@ -129,15 +130,16 @@ async fn health_check() -> impl IntoResponse {
 
 /// GET /sessions?agent_id=<uuid> — list sessions, optionally filtered by agent.
 ///
-/// Excludes internal sessions created by the coordinator (subagent_*) and
-/// scheduler (job_*) — these are implementation details not shown in the UI.
+/// Excludes internal sessions (DM, notifications, episodic, subagent, job)
+/// — these are implementation details not shown in the UI.  Uses the same
+/// `INTERNAL_SESSION_PREFIXES` list as `find_user_facing_session` to keep
+/// the filter consistent.
 async fn list_sessions(
     State(state): State<AppState>,
     Query(params): Query<ListSessionsQuery>,
 ) -> impl IntoResponse {
     let mut sessions = state.session_manager.list_all();
-    sessions
-        .retain(|s| !s.context_id.starts_with("subagent_") && !s.context_id.starts_with("job_"));
+    sessions.retain(|s| !is_internal_context_id(&s.context_id));
     if let Some(agent_id) = params.agent_id {
         sessions.retain(|s| s.agent_id == agent_id);
     }
