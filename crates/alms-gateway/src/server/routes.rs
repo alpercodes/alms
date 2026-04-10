@@ -21,6 +21,7 @@ use alms_core::{AgentId, SessionId};
 use alms_session::{Content, Role};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, Query, State, WebSocketUpgrade},
     http::{StatusCode, header},
     response::IntoResponse,
@@ -28,6 +29,7 @@ use axum::{
 };
 use rust_embed::Embed;
 use serde::Deserialize;
+use std::borrow::Cow;
 use tracing::info;
 
 /// Static UI assets embedded into the binary at compile time.
@@ -60,6 +62,15 @@ async fn serve_embedded_index() -> axum::response::Response {
     serve_embedded_file("index.html")
 }
 
+/// Convert a `Cow<'static, [u8]>` into `Bytes` without copying when the
+/// data is statically borrowed (the common case in release builds).
+fn cow_to_bytes(data: Cow<'static, [u8]>) -> Bytes {
+    match data {
+        Cow::Borrowed(slice) => Bytes::from_static(slice),
+        Cow::Owned(vec) => Bytes::from(vec),
+    }
+}
+
 /// Look up a file in the embedded assets and return it with the correct
 /// `Content-Type` and `Cache-Control: no-store`.
 fn serve_embedded_file(path: &str) -> axum::response::Response {
@@ -72,7 +83,7 @@ fn serve_embedded_file(path: &str) -> axum::response::Response {
                     (header::CONTENT_TYPE, mime.to_string()),
                     (header::CACHE_CONTROL, "no-store".to_string()),
                 ],
-                file.data.into_owned(),
+                cow_to_bytes(file.data),
             )
                 .into_response()
         }
@@ -87,7 +98,7 @@ fn serve_embedded_file(path: &str) -> axum::response::Response {
                         (header::CONTENT_TYPE, mime.to_string()),
                         (header::CACHE_CONTROL, "no-store".to_string()),
                     ],
-                    index.data.into_owned(),
+                    cow_to_bytes(index.data),
                 )
                     .into_response()
             } else {
