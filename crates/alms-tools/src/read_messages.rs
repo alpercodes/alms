@@ -6,9 +6,45 @@
 
 use alms_core::SessionId;
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
-use alms_session::SessionManager;
+use alms_session::{Content, Message, SessionManager};
 use serde_json::Value;
 use std::sync::Arc;
+
+/// Returns `true` if the message is a synthetic marker that should be
+/// filtered out of the `read_messages` response.
+///
+/// Synthetic markers include:
+/// - Messages with empty text content (e.g. `dm_ended` marker bodies).
+/// - Messages with a `message_type` metadata field (e.g. `dm_ended`).
+/// - Messages flagged as `synthetic: true` in metadata.
+/// - Non-text content (tool calls, tool results, images).
+fn is_synthetic_marker(msg: &Message) -> bool {
+    // Non-text content (tool calls, tool results, images) are internal
+    // bookkeeping and should not appear in DM conversation output.
+    let text = match &msg.content {
+        Content::Text(t) => t.as_str(),
+        _ => return true,
+    };
+
+    // Empty text bodies are metadata-only markers (e.g. dm_ended).
+    if text.trim().is_empty() {
+        return true;
+    }
+
+    // Check metadata for marker indicators.
+    if let Some(ref meta) = msg.metadata {
+        // Any message with a `message_type` field is a system marker.
+        if meta.get("message_type").and_then(|v| v.as_str()).is_some() {
+            return true;
+        }
+        // Synthetic notification markers.
+        if meta.get("synthetic").and_then(|v| v.as_bool()) == Some(true) {
+            return true;
+        }
+    }
+
+    false
+}
 
 /// Built-in tool that reads the DM conversation history with another agent.
 ///
@@ -86,10 +122,20 @@ impl Tool for ReadMessagesTool {
             .get_history(session_id)
             .map_err(|e| SandboxError::Io(format!("Failed to read DM history: {e}")))?;
 
-        let total = messages.len();
-        let start = total.saturating_sub(last_n);
+        // Filter out synthetic markers (dm_ended, empty bodies, tool
+        // calls/results, synthetic notifications) so agents only see
+        // real conversational messages. Apply last_n AFTER filtering
+        // so the requested count reflects actual messages, not raw
+        // session entries.
+        let real_messages: Vec<&Message> = messages
+            .iter()
+            .filter(|m| !is_synthetic_marker(m))
+            .collect();
 
-        let recent: Vec<Value> = messages[start..]
+        let visible_count = real_messages.len();
+        let start = visible_count.saturating_sub(last_n);
+
+        let recent: Vec<Value> = real_messages[start..]
             .iter()
             .map(|m| {
                 let from_agent = m
@@ -124,7 +170,7 @@ impl Tool for ReadMessagesTool {
 
         Ok(serde_json::json!({
             "peer": from,
-            "message_count": total,
+            "message_count": visible_count,
             "showing": recent.len(),
             "messages": recent,
             "summary": summary.as_deref().unwrap_or(""),
@@ -255,5 +301,154 @@ mod tests {
         let schema = tool.parameters();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "from"));
+    }
+
+    /// Regression test for #558: dm_ended markers and other synthetic
+    /// messages must not appear in read_messages output.
+    #[tokio::test]
+    async fn test_filters_dm_ended_markers_and_synthetic_messages() {
+        let (tool, mgr) = make_tool();
+
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let dm_ctx = dm_context_id("alice", "bob");
+        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
+
+        // Real message from bob
+        let real_msg = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: Content::Text("Hello Alice!".into()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({"from_agent": "bob"})),
+        };
+
+        // dm_ended marker (empty content, no from_agent)
+        let dm_ended_marker = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: Content::Text(String::new()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "message_type": "dm_ended",
+                "ended_by": "alice",
+                "reason": "ignored",
+            })),
+        };
+
+        // Synthetic notification marker
+        let synthetic_marker = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::System,
+            content: Content::Text("synthetic notification".into()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({"synthetic": true})),
+        };
+
+        // Tool result (should also be filtered)
+        let tool_result = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "t1".into(),
+                result: serde_json::json!({"ok": true}),
+            },
+            timestamp: alms_core::Timestamp::now(),
+            metadata: None,
+        };
+
+        mgr.append_message(session_id, real_msg).unwrap();
+        mgr.append_message(session_id, dm_ended_marker).unwrap();
+        mgr.append_message(session_id, synthetic_marker).unwrap();
+        mgr.append_message(session_id, tool_result).unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "from": "bob" }))
+            .await
+            .unwrap();
+
+        // Only the real message should be visible
+        assert_eq!(result["message_count"], 1);
+        assert_eq!(result["showing"], 1);
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["from"], "bob");
+        assert_eq!(msgs[0]["content"], "Hello Alice!");
+    }
+
+    /// Verify that the is_synthetic_marker helper correctly classifies messages.
+    #[test]
+    fn test_is_synthetic_marker_classification() {
+        // Real text message: NOT a marker
+        let real = Message {
+            id: "1".into(),
+            role: Role::User,
+            content: Content::Text("Hello".into()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({"from_agent": "alice"})),
+        };
+        assert!(!is_synthetic_marker(&real));
+
+        // Empty text: IS a marker
+        let empty = Message {
+            id: "2".into(),
+            role: Role::User,
+            content: Content::Text(String::new()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: None,
+        };
+        assert!(is_synthetic_marker(&empty));
+
+        // Whitespace-only text: IS a marker
+        let whitespace = Message {
+            id: "3".into(),
+            role: Role::User,
+            content: Content::Text("   \n  ".into()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: None,
+        };
+        assert!(is_synthetic_marker(&whitespace));
+
+        // dm_ended with message_type: IS a marker
+        let dm_ended = Message {
+            id: "4".into(),
+            role: Role::User,
+            content: Content::Text(String::new()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({"message_type": "dm_ended"})),
+        };
+        assert!(is_synthetic_marker(&dm_ended));
+
+        // Non-empty text with message_type: IS a marker
+        let typed = Message {
+            id: "5".into(),
+            role: Role::User,
+            content: Content::Text("some text".into()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({"message_type": "dm_ended"})),
+        };
+        assert!(is_synthetic_marker(&typed));
+
+        // synthetic=true: IS a marker
+        let synthetic = Message {
+            id: "6".into(),
+            role: Role::System,
+            content: Content::Text("notification".into()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({"synthetic": true})),
+        };
+        assert!(is_synthetic_marker(&synthetic));
+
+        // Tool result: IS a marker
+        let tool_res = Message {
+            id: "7".into(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "t1".into(),
+                result: serde_json::json!("ok"),
+            },
+            timestamp: alms_core::Timestamp::now(),
+            metadata: None,
+        };
+        assert!(is_synthetic_marker(&tool_res));
     }
 }
