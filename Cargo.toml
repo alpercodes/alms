@@ -85,6 +85,9 @@ hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 
+# Embedded static assets
+rust-embed = { version = "8", features = ["mime-guess"] }
+
 # Testing
 tokio-test = "0.4"
 
