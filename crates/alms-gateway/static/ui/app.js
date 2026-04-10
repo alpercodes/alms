@@ -68,12 +68,21 @@ function ChatView() {
     // [chatMessages.value] -- under the optimised re-render path,
     // Preact can skip hook re-evaluation and the useEffect would
     // never fire.  effect() subscribes directly to the signal graph.
+    //
+    // The scroll is deferred via requestAnimationFrame so it runs
+    // after Preact has committed the new DOM elements.  Without this,
+    // scrollHeight still reflects the old content and the container
+    // does not scroll to the bottom when switching sessions (#562).
     useEffect(() => {
+        let rafId = 0;
         const dispose = effect(() => {
             chatMessages.value; // subscribe to the signal
-            scrollToBottom(messagesRef.current);
+            cancelAnimationFrame(rafId);
+            rafId = requestAnimationFrame(() => {
+                scrollToBottom(messagesRef.current);
+            });
         });
-        return dispose;
+        return () => { cancelAnimationFrame(rafId); dispose(); };
     }, []);
 
     // Compute grouping inline — useMemo with signal.value as a dependency
