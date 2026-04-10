@@ -1,6 +1,5 @@
 //! Run creation, execution, and completion — the core run lifecycle.
 
-use super::notifications::notify_dm_ended_to_webchat;
 use super::tools::{RuntimeEventForwarder, forward_runtime_events};
 use super::{
     RunOverrides, RunParams, apply_overrides, is_internal_context_id, resolve_agent_config,
@@ -926,18 +925,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                                     )
                                     .await;
 
-                                // Forward to the initiating agent's web-chat
-                                // session so the user watching that session
-                                // sees the notification (the DM session event
-                                // above is invisible to the web-chat).
-                                notify_dm_ended_to_webchat(
-                                    &state,
-                                    agent_id,
-                                    &peer_name,
-                                    &end_reason.to_string(),
-                                    &context_id,
-                                )
-                                .await;
+                                // NOTE: The sender's web-chat SSE marker is
+                                // handled by the sender's self-notification
+                                // run in `run_trigger_loop` (notifications.rs),
+                                // which calls `notify_dm_ended_to_webchat` for
+                                // every ConversationEnded trigger recipient.
+                                // Calling it here as well would cause a
+                                // duplicate marker for the sender. See #556.
                             }
                             Err(e) => {
                                 warn!(

@@ -808,7 +808,8 @@ async fn test_source_sessions_cleaned_up_after_end_conversation() {
     )
     .await
     .unwrap();
-    let _ = rx.try_recv(); // drain notification trigger
+    let _ = rx.try_recv(); // drain peer notification trigger
+    let _ = rx.try_recv(); // drain sender self-notification trigger (#556)
 
     // Source session map should be empty now.
     assert!(
@@ -898,8 +899,10 @@ async fn test_both_agents_have_source_sessions() {
     .await
     .unwrap();
 
-    // Blumbum's notification should route to web-chat-B.
-    let trigger = rx.try_recv().expect("should have received notification");
+    // Blumbum's notification (peer) should route to web-chat-B.
+    let trigger = rx
+        .try_recv()
+        .expect("should have received peer notification");
     assert_eq!(trigger.agent_id, blumbum_id);
     assert_eq!(
         trigger.session_id, webchat_b,
@@ -915,6 +918,34 @@ async fn test_both_agents_have_source_sessions() {
                 *source_session_id,
                 Some(webchat_b),
                 "source_session_id should be blumbum's web-chat-B"
+            );
+        }
+        other => panic!("expected ConversationEnded, got {:?}", other),
+    }
+
+    // Chamunchuk's self-notification (sender with source session, #556)
+    // should route to web-chat-A.
+    let sender_trigger = rx
+        .try_recv()
+        .expect("should have received sender self-notification (#556)");
+    assert_eq!(sender_trigger.agent_id, chamunchuk_id);
+    assert_eq!(
+        sender_trigger.session_id, webchat_a,
+        "chamunchuk's self-notification should go to web-chat-A"
+    );
+    assert_eq!(sender_trigger.context_id, "web-chat-A");
+
+    match &sender_trigger.source {
+        MessageSource::ConversationEnded {
+            from_name,
+            source_session_id,
+            ..
+        } => {
+            assert_eq!(from_name, "blumbum", "from_name should be the peer");
+            assert_eq!(
+                *source_session_id,
+                Some(webchat_a),
+                "source_session_id should be chamunchuk's web-chat-A"
             );
         }
         other => panic!("expected ConversationEnded, got {:?}", other),
@@ -960,8 +991,10 @@ async fn test_both_agents_have_source_sessions() {
     .await
     .unwrap();
 
-    // Chamunchuk's notification should route to web-chat-A.
-    let trigger = rx.try_recv().expect("should have received notification");
+    // Chamunchuk's notification (peer) should route to web-chat-A.
+    let trigger = rx
+        .try_recv()
+        .expect("should have received peer notification");
     assert_eq!(trigger.agent_id, chamunchuk_id);
     assert_eq!(
         trigger.session_id, webchat_a,
@@ -981,6 +1014,178 @@ async fn test_both_agents_have_source_sessions() {
         }
         other => panic!("expected ConversationEnded, got {:?}", other),
     }
+
+    // Blumbum's self-notification (sender with source session, #556)
+    // should route to web-chat-B.
+    let sender_trigger = rx
+        .try_recv()
+        .expect("should have received sender self-notification (#556)");
+    assert_eq!(sender_trigger.agent_id, blumbum_id);
+    assert_eq!(
+        sender_trigger.session_id, webchat_b,
+        "blumbum's self-notification should go to web-chat-B"
+    );
+    assert_eq!(sender_trigger.context_id, "web-chat-B");
+
+    match &sender_trigger.source {
+        MessageSource::ConversationEnded {
+            from_name,
+            source_session_id,
+            ..
+        } => {
+            assert_eq!(from_name, "chamunchuk", "from_name should be the peer");
+            assert_eq!(
+                *source_session_id,
+                Some(webchat_b),
+                "source_session_id should be blumbum's web-chat-B"
+            );
+        }
+        other => panic!("expected ConversationEnded, got {:?}", other),
+    }
+}
+
+/// Regression test for #556: when the initiating agent (the one with a
+/// source session) ends the DM conversation, they should receive a
+/// self-notification run in their source session so the user watching
+/// that session sees the conversation outcome with transcript.
+///
+/// Before this fix, only the PEER received a notification; the initiator
+/// only got a lightweight SSE marker without a full notification run.
+#[tokio::test]
+async fn test_initiator_gets_self_notification_when_ending_dm() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    // Alice sends from her web-chat session (she is the initiator).
+    let alice_session = SessionId::new();
+    bus.session_manager
+        .get_or_create_shared(alice_session, "web-chat-alice");
+    bus.send(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        "Hello Bob!",
+        Some(alice_session),
+    )
+    .await
+    .unwrap();
+    let _ = rx.try_recv(); // drain send trigger
+
+    // Bob replies without a source session (pure DM recipient).
+    bus.send("bob", bob_id, "alice", alice_id, "Hi Alice!", None)
+        .await
+        .unwrap();
+    let _ = rx.try_recv(); // drain send trigger
+
+    // Alice (the initiator) ends the conversation.
+    bus.end_conversation(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    // Trigger 1: Bob's notification (peer) goes to notifications:bob.
+    let peer_trigger = rx
+        .try_recv()
+        .expect("should have received peer notification for bob");
+    assert_eq!(peer_trigger.agent_id, bob_id);
+    assert_eq!(peer_trigger.context_id, "notifications:bob");
+
+    // Trigger 2 (#556): Alice's self-notification goes to her source session.
+    let self_trigger = rx
+        .try_recv()
+        .expect("should have received sender self-notification for alice (#556)");
+    assert_eq!(self_trigger.agent_id, alice_id);
+    assert_eq!(
+        self_trigger.session_id, alice_session,
+        "initiator's self-notification should go to their source session"
+    );
+    assert_eq!(self_trigger.context_id, "web-chat-alice");
+
+    // The self-notification should appear as if it came FROM the peer.
+    match &self_trigger.source {
+        MessageSource::ConversationEnded {
+            from_name,
+            source_session_id,
+            ..
+        } => {
+            assert_eq!(from_name, "bob", "from_name should be the peer");
+            assert_eq!(
+                *source_session_id,
+                Some(alice_session),
+                "source_session_id should be alice's web-chat session"
+            );
+        }
+        other => panic!("expected ConversationEnded, got {:?}", other),
+    }
+
+    // No more triggers.
+    assert!(rx.try_recv().is_err(), "should not have any more triggers");
+}
+
+/// When a pure DM recipient (no source session) ends the conversation,
+/// they should NOT receive a self-notification (no source session to
+/// route it to). Only the peer gets notified.
+#[tokio::test]
+async fn test_recipient_no_self_notification_when_ending_dm() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    // Alice sends from her web-chat session.
+    let alice_session = SessionId::new();
+    bus.session_manager
+        .get_or_create_shared(alice_session, "web-chat-alice");
+    bus.send(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        "Hello Bob!",
+        Some(alice_session),
+    )
+    .await
+    .unwrap();
+    let _ = rx.try_recv(); // drain send trigger
+
+    // Bob replies without a source session (pure DM recipient).
+    bus.send("bob", bob_id, "alice", alice_id, "Hi Alice!", None)
+        .await
+        .unwrap();
+    let _ = rx.try_recv(); // drain send trigger
+
+    // Bob (the recipient, no source session) ends the conversation.
+    bus.end_conversation(
+        "bob",
+        bob_id,
+        "alice",
+        alice_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    // Only one trigger: Alice's notification (peer) goes to her source session.
+    let peer_trigger = rx
+        .try_recv()
+        .expect("should have received peer notification for alice");
+    assert_eq!(peer_trigger.agent_id, alice_id);
+    assert_eq!(
+        peer_trigger.session_id, alice_session,
+        "alice's notification should go to her source session"
+    );
+
+    // No self-notification for Bob (he has no source session).
+    assert!(
+        rx.try_recv().is_err(),
+        "bob should NOT receive a self-notification (no source session)"
+    );
 }
 
 /// S3: end_conversation should reject sender == peer (self-message guard).

@@ -342,17 +342,37 @@ impl MessageSender for MessageBus {
             .append_message(session_id, marker)
             .map_err(|e| SendError::Internal(e.to_string()))?;
 
-        // --- Look up peer's source session for notification routing ---
+        // --- Look up source sessions for notification routing ---
         //
-        // If the peer originally called `send_message` from a user-facing
-        // session (e.g. web-chat-12345), the notification run should go to
-        // that session so the user sees the agent's reaction. If there is
-        // no source session (the peer was invoked directly by a DM trigger),
-        // fall back to the `notifications:{peer_name}` session.
+        // Both the peer AND the sender may need notification runs:
+        //
+        // - **Peer** (the other agent): always gets a notification so it
+        //   knows the conversation ended. Routed to the peer's source
+        //   session if available, otherwise to `notifications:{peer_name}`.
+        //
+        // - **Sender** (the agent that ended the conversation): gets a
+        //   notification run ONLY if they have a source session (meaning
+        //   they initiated the DM from a user-facing session). This
+        //   ensures the user watching the initiator's web-chat sees the
+        //   notification with the conversation transcript. Agents without
+        //   a source session (pure DM recipients) do NOT get a
+        //   self-notification.
+        //
+        // Both lookups must happen BEFORE `remove_source_sessions_for_dm`
+        // cleans up the map.
+
+        // Peer's source session
         let peer_source_key = (dm_context.clone(), peer_name.to_string());
         let peer_source_session = self
             .source_sessions
             .get(&peer_source_key)
+            .map(|entry| *entry.value());
+
+        // Sender's source session (#556)
+        let sender_source_key = (dm_context.clone(), sender_name.to_string());
+        let sender_source_session = self
+            .source_sessions
+            .get(&sender_source_key)
             .map(|entry| *entry.value());
 
         let (target_session_id, target_context_id) = if let Some(source_sid) = peer_source_session {
@@ -387,7 +407,7 @@ impl MessageSender for MessageBus {
         let trigger = RunTrigger {
             agent_id: peer_agent_id,
             session_id: target_session_id,
-            input,
+            input: input.clone(),
             source: MessageSource::ConversationEnded {
                 from_agent: sender_agent_id,
                 from_name: sender_name.to_string(),
@@ -402,6 +422,48 @@ impl MessageSender for MessageBus {
                 error = %e,
                 "Failed to send RunTrigger for conversation end notification (receiver dropped)"
             );
+        }
+
+        // --- Emit RunTrigger for the sender (initiator notification, #556) ---
+        //
+        // When the sender has a source session, they initiated the DM from
+        // a user-facing session and the user expects to see the conversation
+        // outcome there. Without this trigger, the initiator only receives a
+        // lightweight SSE marker (via notify_dm_ended_to_webchat) but no
+        // actual notification run with the conversation transcript.
+        //
+        // Pure DM recipients (no source session) do NOT get a self-notification
+        // because there is no user-facing session to route it to.
+        if let Some(source_sid) = sender_source_session {
+            let ctx = self
+                .session_manager
+                .get(source_sid)
+                .ok()
+                .map(|s| s.context_id.clone())
+                .unwrap_or_else(|| format!("notifications:{sender_name}"));
+            info!(
+                sender = %sender_name,
+                source_session = %source_sid.0,
+                "Routing self-notification to sender's source session (#556)"
+            );
+            let sender_trigger = RunTrigger {
+                agent_id: sender_agent_id,
+                session_id: source_sid,
+                input,
+                source: MessageSource::ConversationEnded {
+                    from_agent: peer_agent_id,
+                    from_name: peer_name.to_string(),
+                    reason,
+                    source_session_id: Some(source_sid),
+                },
+                context_id: ctx,
+            };
+            if let Err(e) = self.run_trigger_tx.send(sender_trigger) {
+                warn!(
+                    error = %e,
+                    "Failed to send RunTrigger for sender self-notification (receiver dropped)"
+                );
+            }
         }
 
         info!(
