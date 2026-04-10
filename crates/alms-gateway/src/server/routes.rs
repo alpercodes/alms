@@ -21,32 +21,92 @@ use alms_core::{AgentId, SessionId};
 use alms_session::{Content, Role};
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, Query, State, WebSocketUpgrade},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::IntoResponse,
     routing::{get, post},
 };
+use rust_embed::Embed;
 use serde::Deserialize;
-use tower_http::services::{ServeDir, ServeFile};
-use tower_http::set_header::SetResponseHeaderLayer;
+use std::borrow::Cow;
 use tracing::info;
+
+/// Static UI assets embedded into the binary at compile time.
+///
+/// During release builds every file under `static/ui/` is baked into the
+/// binary so the server works from any working directory.
+#[derive(Embed)]
+#[folder = "static/ui/"]
+struct UiAssets;
 
 /// Routes that do NOT require authentication
 pub(crate) fn public_router() -> Router<AppState> {
-    // Static files get Cache-Control: no-store so browsers always fetch fresh
-    // JS/CSS after a deployment, matching the HTML endpoint at `/`.
-    let static_files = ServeDir::new("crates/alms-gateway/static/ui")
-        .fallback(ServeFile::new("crates/alms-gateway/static/ui/index.html"));
-    let static_with_cache = tower::ServiceBuilder::new()
-        .layer(SetResponseHeaderLayer::overriding(
-            axum::http::header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("no-store"),
-        ))
-        .service(static_files);
-
     Router::new()
         .route("/health", get(health_check))
-        .nest_service("/ui", static_with_cache)
+        .route("/ui/{*path}", get(serve_embedded_asset))
+        .route("/ui", get(serve_embedded_index))
+        .route("/ui/", get(serve_embedded_index))
+}
+
+/// Serve a static asset from the embedded UI files.
+///
+/// Falls back to `index.html` for paths that don't match any file so that
+/// client-side routing (SPA) works correctly.
+async fn serve_embedded_asset(Path(path): Path<String>) -> axum::response::Response {
+    serve_embedded_file(&path)
+}
+
+/// Serve the embedded `index.html` for bare `/ui` and `/ui/` requests.
+async fn serve_embedded_index() -> axum::response::Response {
+    serve_embedded_file("index.html")
+}
+
+/// Convert a `Cow<'static, [u8]>` into `Bytes` without copying when the
+/// data is statically borrowed (the common case in release builds).
+fn cow_to_bytes(data: Cow<'static, [u8]>) -> Bytes {
+    match data {
+        Cow::Borrowed(slice) => Bytes::from_static(slice),
+        Cow::Owned(vec) => Bytes::from(vec),
+    }
+}
+
+/// Look up a file in the embedded assets and return it with the correct
+/// `Content-Type` and `Cache-Control: no-store`.
+fn serve_embedded_file(path: &str) -> axum::response::Response {
+    match UiAssets::get(path) {
+        Some(file) => {
+            let mime = file.metadata.mimetype();
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, mime.to_string()),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
+                cow_to_bytes(file.data),
+            )
+                .into_response()
+        }
+        // SPA fallback: if the path has no extension (likely a client-side
+        // route), serve index.html.  Otherwise return 404.
+        None if !path.contains('.') => {
+            if let Some(index) = UiAssets::get("index.html") {
+                let mime = index.metadata.mimetype();
+                (
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, mime.to_string()),
+                        (header::CACHE_CONTROL, "no-store".to_string()),
+                    ],
+                    cow_to_bytes(index.data),
+                )
+                    .into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Routes that require authentication (all except /health)
@@ -108,15 +168,9 @@ pub(crate) fn protected_router() -> Router<AppState> {
         .route("/ws", get(websocket_handler))
 }
 
-/// Serve the embedded web UI
-async fn serve_ui() -> impl IntoResponse {
-    (
-        [
-            ("Cache-Control", "no-store"),
-            ("Content-Type", "text/html; charset=utf-8"),
-        ],
-        include_str!("../../static/ui/index.html"),
-    )
+/// Serve the embedded web UI (the `/` route behind auth).
+async fn serve_ui() -> axum::response::Response {
+    serve_embedded_file("index.html")
 }
 
 /// Health check endpoint
