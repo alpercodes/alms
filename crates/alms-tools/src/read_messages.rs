@@ -4,47 +4,12 @@
 //! The session is looked up by its deterministic SessionId (derived from the
 //! sorted name pair) rather than by `(agent_id, context_id)`.
 
+use crate::dm_filter;
 use alms_core::SessionId;
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
-use alms_session::{Content, Message, SessionManager};
+use alms_session::{Message, SessionManager};
 use serde_json::Value;
 use std::sync::Arc;
-
-/// Returns `true` if the message is a synthetic marker that should be
-/// filtered out of the `read_messages` response.
-///
-/// Synthetic markers include:
-/// - Messages with empty text content (e.g. `dm_ended` marker bodies).
-/// - Messages with a `message_type` metadata field (e.g. `dm_ended`).
-/// - Messages flagged as `synthetic: true` in metadata.
-/// - Non-text content (tool calls, tool results, images).
-fn is_synthetic_marker(msg: &Message) -> bool {
-    // Non-text content (tool calls, tool results, images) are internal
-    // bookkeeping and should not appear in DM conversation output.
-    let text = match &msg.content {
-        Content::Text(t) => t.as_str(),
-        _ => return true,
-    };
-
-    // Empty text bodies are metadata-only markers (e.g. dm_ended).
-    if text.trim().is_empty() {
-        return true;
-    }
-
-    // Check metadata for marker indicators.
-    if let Some(ref meta) = msg.metadata {
-        // Any message with a `message_type` field is a system marker.
-        if meta.get("message_type").and_then(|v| v.as_str()).is_some() {
-            return true;
-        }
-        // Synthetic notification markers.
-        if meta.get("synthetic").and_then(|v| v.as_bool()) == Some(true) {
-            return true;
-        }
-    }
-
-    false
-}
 
 /// Built-in tool that reads the DM conversation history with another agent.
 ///
@@ -129,7 +94,7 @@ impl Tool for ReadMessagesTool {
         // session entries.
         let real_messages: Vec<&Message> = messages
             .iter()
-            .filter(|m| !is_synthetic_marker(m))
+            .filter(|m| !dm_filter::is_synthetic_marker(m))
             .collect();
 
         let visible_count = real_messages.len();
@@ -137,7 +102,7 @@ impl Tool for ReadMessagesTool {
 
         let recent: Vec<Value> = real_messages[start..]
             .iter()
-            .map(|m| {
+            .map(|m: &&Message| {
                 let from_agent = m
                     .metadata
                     .as_ref()
@@ -194,6 +159,23 @@ mod tests {
         (tool, mgr)
     }
 
+    /// Helper to create a DM message with production-format metadata.
+    /// `MessageBus::send()` stamps every real DM with `"message_type": "dm"`,
+    /// `"from_agent"`, and `"from_agent_id"`.
+    fn make_dm_msg(from_name: &str, text: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: Content::Text(text.to_string()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "from_agent": from_name,
+                "from_agent_id": uuid::Uuid::new_v4().to_string(),
+                "message_type": "dm",
+            })),
+        }
+    }
+
     #[tokio::test]
     async fn test_missing_from_is_error() {
         let (tool, _) = make_tool();
@@ -225,27 +207,15 @@ mod tests {
     async fn test_reads_dm_messages_from_shared_session() {
         let (tool, mgr) = make_tool();
 
-        // Create a shared DM session and populate it
+        // Create a shared DM session and populate it with production-format messages
         let session_id = SessionId::deterministic_dm("alice", "bob");
         let dm_ctx = dm_context_id("alice", "bob");
         let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
 
-        let msg1 = Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: Role::User,
-            content: Content::Text("Hello Bob!".into()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: Some(serde_json::json!({"from_agent": "alice"})),
-        };
-        let msg2 = Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: Role::User,
-            content: Content::Text("Hi Alice!".into()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: Some(serde_json::json!({"from_agent": "bob"})),
-        };
-        mgr.append_message(session_id, msg1).unwrap();
-        mgr.append_message(session_id, msg2).unwrap();
+        mgr.append_message(session_id, make_dm_msg("alice", "Hello Bob!"))
+            .unwrap();
+        mgr.append_message(session_id, make_dm_msg("bob", "Hi Alice!"))
+            .unwrap();
 
         let result = tool
             .execute(serde_json::json!({ "from": "bob" }))
@@ -273,14 +243,8 @@ mod tests {
         let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
 
         for i in 0..10 {
-            let msg = Message {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: Role::User,
-                content: Content::Text(format!("msg {i}")),
-                timestamp: alms_core::Timestamp::now(),
-                metadata: Some(serde_json::json!({"from_agent": "bob"})),
-            };
-            mgr.append_message(session_id, msg).unwrap();
+            mgr.append_message(session_id, make_dm_msg("bob", &format!("msg {i}")))
+                .unwrap();
         }
 
         let result = tool
@@ -304,7 +268,8 @@ mod tests {
     }
 
     /// Regression test for #558: dm_ended markers and other synthetic
-    /// messages must not appear in read_messages output.
+    /// messages must not appear in read_messages output, but real DM
+    /// messages (with `"message_type": "dm"`) must be preserved.
     #[tokio::test]
     async fn test_filters_dm_ended_markers_and_synthetic_messages() {
         let (tool, mgr) = make_tool();
@@ -313,14 +278,8 @@ mod tests {
         let dm_ctx = dm_context_id("alice", "bob");
         let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
 
-        // Real message from bob
-        let real_msg = Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: Role::User,
-            content: Content::Text("Hello Alice!".into()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: Some(serde_json::json!({"from_agent": "bob"})),
-        };
+        // Real message from bob -- production format with "message_type": "dm"
+        let real_msg = make_dm_msg("bob", "Hello Alice!");
 
         // dm_ended marker (empty content, no from_agent)
         let dm_ended_marker = Message {
@@ -375,80 +334,42 @@ mod tests {
         assert_eq!(msgs[0]["content"], "Hello Alice!");
     }
 
-    /// Verify that the is_synthetic_marker helper correctly classifies messages.
-    #[test]
-    fn test_is_synthetic_marker_classification() {
-        // Real text message: NOT a marker
-        let real = Message {
-            id: "1".into(),
-            role: Role::User,
-            content: Content::Text("Hello".into()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: Some(serde_json::json!({"from_agent": "alice"})),
-        };
-        assert!(!is_synthetic_marker(&real));
+    /// Verify that real DM messages with production metadata are NOT
+    /// incorrectly filtered. This is the critical regression test for C1:
+    /// the original filter matched ANY `message_type` value, which would
+    /// discard all real DM messages since MessageBus stamps them with
+    /// `"message_type": "dm"`.
+    #[tokio::test]
+    async fn test_real_dm_messages_with_message_type_dm_are_preserved() {
+        let (tool, mgr) = make_tool();
 
-        // Empty text: IS a marker
-        let empty = Message {
-            id: "2".into(),
-            role: Role::User,
-            content: Content::Text(String::new()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: None,
-        };
-        assert!(is_synthetic_marker(&empty));
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let dm_ctx = dm_context_id("alice", "bob");
+        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
 
-        // Whitespace-only text: IS a marker
-        let whitespace = Message {
-            id: "3".into(),
-            role: Role::User,
-            content: Content::Text("   \n  ".into()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: None,
-        };
-        assert!(is_synthetic_marker(&whitespace));
+        // Three real DM messages with production metadata
+        mgr.append_message(session_id, make_dm_msg("alice", "Hey Bob"))
+            .unwrap();
+        mgr.append_message(session_id, make_dm_msg("bob", "Hey Alice"))
+            .unwrap();
+        mgr.append_message(session_id, make_dm_msg("alice", "How are you?"))
+            .unwrap();
 
-        // dm_ended with message_type: IS a marker
-        let dm_ended = Message {
-            id: "4".into(),
-            role: Role::User,
-            content: Content::Text(String::new()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: Some(serde_json::json!({"message_type": "dm_ended"})),
-        };
-        assert!(is_synthetic_marker(&dm_ended));
+        let result = tool
+            .execute(serde_json::json!({ "from": "bob" }))
+            .await
+            .unwrap();
 
-        // Non-empty text with message_type: IS a marker
-        let typed = Message {
-            id: "5".into(),
-            role: Role::User,
-            content: Content::Text("some text".into()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: Some(serde_json::json!({"message_type": "dm_ended"})),
-        };
-        assert!(is_synthetic_marker(&typed));
-
-        // synthetic=true: IS a marker
-        let synthetic = Message {
-            id: "6".into(),
-            role: Role::System,
-            content: Content::Text("notification".into()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: Some(serde_json::json!({"synthetic": true})),
-        };
-        assert!(is_synthetic_marker(&synthetic));
-
-        // Tool result: IS a marker
-        let tool_res = Message {
-            id: "7".into(),
-            role: Role::Tool,
-            content: Content::ToolResult {
-                tool_id: "t1".into(),
-                result: serde_json::json!("ok"),
-            },
-            timestamp: alms_core::Timestamp::now(),
-            metadata: None,
-        };
-        assert!(is_synthetic_marker(&tool_res));
+        // All three real messages must be visible
+        assert_eq!(result["message_count"], 3);
+        assert_eq!(result["showing"], 3);
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["from"], "you");
+        assert_eq!(msgs[0]["content"], "Hey Bob");
+        assert_eq!(msgs[1]["from"], "bob");
+        assert_eq!(msgs[1]["content"], "Hey Alice");
+        assert_eq!(msgs[2]["from"], "you");
+        assert_eq!(msgs[2]["content"], "How are you?");
     }
 }

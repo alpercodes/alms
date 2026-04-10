@@ -11,6 +11,7 @@
 //! **Does NOT depend on** `alms-runtime` or `alms-coordinator` (no cycles).
 //! Tools are registered on an `AgentRuntime` by the gateway (`alms-gateway`).
 
+pub mod dm_filter;
 pub mod event_forwarder;
 pub mod ignore_message;
 pub mod invoke_agent;
