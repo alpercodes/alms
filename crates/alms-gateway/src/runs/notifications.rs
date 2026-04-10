@@ -802,22 +802,26 @@ pub(crate) async fn run_trigger_loop(
                     );
                 }
 
-                // -- Forward dm_conversation_ended to the PEER's web-chat --
+                // -- Forward dm_conversation_ended to the agent's web-chat --
                 //
-                // The ignore_message path in execute_run calls
-                // notify_dm_ended_to_webchat for the SENDER, but the PEER
-                // (the agent receiving this ConversationEnded trigger) also
+                // Every agent that receives a ConversationEnded trigger
                 // needs the visual DM-ended indicator on their web-chat
-                // session.  Without this, the peer's user sees the agent's
-                // response to the notification but not the "conversation
-                // ended" banner (#497).
+                // session.  This covers:
                 //
-                // For depth_exceeded, the sender does NOT receive a
-                // ConversationEnded trigger (the depth check happens inside
-                // MessageBus::send and only notifies the recipient), so
-                // this call covers the RECIPIENT only. The sender's
-                // web-chat currently lacks a DM-ended indicator for
-                // depth_exceeded — this is a known gap tracked separately.
+                // - **Peer** (the other agent in the DM): always receives
+                //   a ConversationEnded trigger, needs the banner (#497).
+                //
+                // - **Sender** (the agent that called ignore_message):
+                //   receives a self-notification trigger (#556) and gets
+                //   the banner here.  The ignore_message path in
+                //   execute_run (lifecycle.rs) does NOT call
+                //   notify_dm_ended_to_webchat — it defers to this path
+                //   to avoid duplicates.
+                //
+                // For depth_exceeded, only the recipient gets a
+                // ConversationEnded trigger (the depth check happens
+                // inside MessageBus::send), so this call covers the
+                // recipient only.
                 {
                     let reason_str = reason.to_string();
                     let dm_context = peer_name_resolved

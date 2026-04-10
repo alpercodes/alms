@@ -72,17 +72,23 @@ pub enum MessageSource {
     SubagentCompletion,
     /// A DM conversation was ended (ignore_message or depth exceeded).
     ///
-    /// The peer receives a one-shot notification run so it can act on the
-    /// conversation outcome. See #384 for the full lifecycle design.
+    /// Both the peer and the sender (when the sender has a source session)
+    /// receive a one-shot notification run so they can act on the
+    /// conversation outcome. See #384 for the full lifecycle design and
+    /// #556 for the sender self-notification addition.
     ConversationEnded {
         from_agent: AgentId,
         from_name: String,
         reason: ConversationEndReason,
-        /// The session the peer was in when they first called `send_message`
-        /// for this DM pair (e.g. `web-chat-12345`). If present, the
-        /// notification run is routed to this session so the user sees the
-        /// agent's reaction. If `None`, the notification falls back to the
-        /// `notifications:{agent}` session.
+        /// The session the target agent was in when they first called
+        /// `send_message` for this DM pair (e.g. `web-chat-12345`).
+        /// If present, the notification run is routed to this session so
+        /// the user sees the agent's reaction. If `None`, the notification
+        /// falls back to the `notifications:{agent}` session.
+        ///
+        /// For the peer trigger, this is the peer's source session.
+        /// For the sender self-notification (#556), this is the sender's
+        /// own source session.
         source_session_id: Option<SessionId>,
     },
 }
