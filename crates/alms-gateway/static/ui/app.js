@@ -1,4 +1,4 @@
-import { h, html, render, signal, effect, useEffect, useRef, useSignal } from './deps.js';
+import { html, render, signal, effect, useEffect, useRef, useSignal } from './deps.js';
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
