@@ -199,6 +199,22 @@ Returns the full chat history for a session, including tool calls and results.
 
 System messages are excluded from the response.
 
+### 4.5 Delete session
+`DELETE /sessions/{session_id}`
+
+Deletes a session by UUID. The session must not have any active (queued or running) runs.
+
+**Response 200**
+```json
+{
+  "ok": true,
+  "deleted": "<uuid>"
+}
+```
+
+**Response 404** — session not found
+**Response 409 ACTIVE_RUNS** — cannot delete a session that has queued or running runs. Cancel or wait for active runs to finish before retrying.
+
 ---
 
 ## 5) Runs (agent executions)

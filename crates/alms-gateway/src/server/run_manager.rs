@@ -314,6 +314,18 @@ impl RunManager {
         cancelled
     }
 
+    /// Returns `true` if any queued or running runs exist for the given session.
+    pub fn has_active_runs(&self, session_id: SessionId) -> bool {
+        self.runs.iter().any(|e| {
+            let r = e.value();
+            r.session_id == session_id
+                && matches!(
+                    r.status,
+                    alms_core::RunStatus::Queued | alms_core::RunStatus::Running
+                )
+        })
+    }
+
     /// List runs for a session, newest first, up to `limit`.
     pub fn list_by_session(&self, session_id: SessionId, limit: usize) -> Vec<Run> {
         let mut runs: Vec<Run> = self

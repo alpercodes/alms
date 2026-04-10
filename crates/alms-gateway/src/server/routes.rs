@@ -184,14 +184,29 @@ async fn delete_session_by_id(
 ) -> impl IntoResponse {
     // Look up the session to get agent_id + context_id, then delete.
     match state.session_manager.get(session_id) {
-        Ok(session) => match state
-            .session_manager
-            .delete(session.agent_id, &session.context_id)
-        {
-            Ok(()) => Json(serde_json::json!({ "ok": true, "deleted": session_id.0.to_string() }))
-                .into_response(),
-            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e).into_response(),
-        },
+        Ok(session) => {
+            // Refuse to delete a session that has active (queued/running) runs.
+            if state.run_manager.has_active_runs(session_id) {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    "ACTIVE_RUNS",
+                    "Cannot delete session with active runs",
+                )
+                .into_response();
+            }
+            match state
+                .session_manager
+                .delete(session.agent_id, &session.context_id)
+            {
+                Ok(()) => {
+                    Json(serde_json::json!({ "ok": true, "deleted": session_id.0.to_string() }))
+                        .into_response()
+                }
+                Err(e) => {
+                    api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e).into_response()
+                }
+            }
+        }
         Err(_) => {
             api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response()
         }

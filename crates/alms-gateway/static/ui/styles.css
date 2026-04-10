@@ -414,18 +414,6 @@ header h1 {
   white-space: nowrap;
 }
 
-/* DM session badge */
-.session-dm-badge {
-  flex-shrink: 0;
-  font-size: var(--text-2xs);
-  font-weight: 600;
-  color: var(--dm-accent, var(--info));
-  background: color-mix(in srgb, var(--dm-accent, var(--info)) 15%, transparent);
-  padding: 0 4px;
-  border-radius: var(--radius-sm);
-  margin-right: var(--space-1);
-}
-
 /* Session delete button — appears on hover */
 .session-delete-btn {
   flex-shrink: 0;

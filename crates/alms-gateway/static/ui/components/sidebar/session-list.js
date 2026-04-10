@@ -81,15 +81,10 @@ async function newSession() {
     }
 }
 
-function isDmSession(contextId) {
-    return contextId && contextId.startsWith('dm:');
-}
-
 function SessionItem({ session }) {
     const confirming = useSignal(false);
     const deleteTimer = useSignal(null);
     const isActive = session.id === activeSessionId.value;
-    const isDm = isDmSession(session.context_id);
 
     const onDeleteClick = (e) => {
         e.stopPropagation();
@@ -136,7 +131,6 @@ function SessionItem({ session }) {
              title=${'ID: ' + session.id + '\nContext: ' + session.context_id}
              onClick=${() => selectSession(session.id)}
              onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(session.id); } }}>
-            ${isDm && html`<span class="session-dm-badge" title="Direct message session">DM</span>`}
             <span class="session-label">${session.context_id || session.id.slice(0, 8)}</span>
             ${confirming.value
                 ? html`

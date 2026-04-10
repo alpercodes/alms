@@ -22,9 +22,6 @@ const sessionTokens = computed(() => {
 
 function selectRun(runId) {
     activeRunId.value = activeRunId.value === runId ? null : runId;
-    // Scroll to the first message from this run if visible in the chat area
-    const el = document.querySelector(`[data-run-id="${runId}"]`);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 export function RunList() {

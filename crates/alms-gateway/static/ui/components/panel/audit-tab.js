@@ -33,10 +33,15 @@ export function AuditTab() {
 
     const onLoadMore = async () => {
         loadingMore.value = true;
-        const newLimit = auditLimit.value + PAGE_SIZE;
-        auditLimit.value = newLimit;
-        await loadAudit(newLimit);
-        loadingMore.value = false;
+        try {
+            const newLimit = auditLimit.value + PAGE_SIZE;
+            auditLimit.value = newLimit;
+            await loadAudit(newLimit);
+        } catch (err) {
+            console.error('[AuditTab] loadMore failed:', err);
+        } finally {
+            loadingMore.value = false;
+        }
     };
 
     if (!activeSessionId.value) {
