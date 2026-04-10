@@ -165,10 +165,6 @@ function ChatView() {
                             const reasonLabels = { 'ignored': 'no further replies', 'depth_exceeded': 'message limit reached' };
                             return html`<${DmEndedMessage} key=${m.id} peer=${md.peer || 'unknown'} reason=${reasonLabels[md.reason] || md.reason || 'conversation ended'} />`;
                         }
-                        // job_notification: render as a JobCompletionCard
-                        if (md.type === 'job_notification') {
-                            return html`<${JobCompletionCard} key=${m.id} jobName=${m.jobName || ''} status=${m.status || 'success'} summary=${m.summary || ''} ts=${m.ts || null} />`;
-                        }
                         // Other synthetic markers: render as system message
                         return html`<${SystemMessage} key=${m.id} text=${m.text} />`;
                     }

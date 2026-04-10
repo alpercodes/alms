@@ -8,21 +8,32 @@ import { nextMsgId } from '../state/chat.js';
  *
  * where label is "completed", "failed", or "finished".
  *
+ * When metadata contains `job_status`, that is the authoritative source
+ * (one of "success", "error", "cancelled", "unknown").  The text label
+ * is only used as a fallback for markers persisted before this field
+ * was added.
+ *
  * @param {string} content - raw marker text
+ * @param {object} [metadata] - message metadata (may contain job_status)
  * @returns {{ jobName: string, status: string, summary: string }}
  */
-function parseJobNotification(content) {
+function parseJobNotification(content, metadata) {
     // Match: [Scheduled job completed] My job prompt\nSummary text
     const match = content.match(/^\[Scheduled job (\w+)\]\s*(.*)/s);
     if (!match) {
-        return { jobName: content, status: 'success', summary: '' };
+        const mdStatus = metadata && metadata.job_status;
+        return { jobName: content, status: mdStatus || 'success', summary: '' };
     }
     const label = match[1]; // completed | failed | finished
     const rest = match[2] || '';
 
-    // Map the label back to the SSE status value
-    const status = label === 'failed' ? 'error'
+    // Prefer the authoritative status from metadata when available.
+    const mdStatus = metadata && metadata.job_status;
+    const status = mdStatus
+        ? mdStatus
+        : label === 'failed' ? 'error'
         : label === 'completed' ? 'success'
+        : label === 'finished' ? 'cancelled'
         : 'success';
 
     // Split on first newline: job name vs summary
@@ -103,7 +114,7 @@ export function mapHistoryMessages(msgs, opts) {
             // where label is "completed", "failed", or "finished".
             if (isSynthetic && m.metadata.type === 'job_notification') {
                 const content = m.content || '';
-                const parsed = parseJobNotification(content);
+                const parsed = parseJobNotification(content, m.metadata);
                 entries.push({
                     id: nextMsgId(),
                     type: 'job_completed',

@@ -14,7 +14,7 @@ import { html, useSignal, renderMarkdown } from '../../deps.js';
  *   ts       - string, ISO 8601 timestamp (optional)
  */
 
-const COLLAPSE_THRESHOLD = 200;
+const COLLAPSE_THRESHOLD = 150;
 
 function formatTimestamp(ts) {
     if (!ts) return '';

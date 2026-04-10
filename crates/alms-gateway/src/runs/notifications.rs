@@ -222,7 +222,8 @@ async fn notify_job_completion(
         timestamp: alms_core::Timestamp::now(),
         metadata: Some(serde_json::json!({
             "synthetic": true,
-            "type": "job_notification"
+            "type": "job_notification",
+            "job_status": status
         })),
     };
     if let Err(e) = state
