@@ -145,6 +145,7 @@ function ApiKeysSection() {
                         <div class="api-key-row" key=${p}>
                             <span class="api-key-provider">${p}</span>
                             <input class="settings-input" type="password"
+                                   autocomplete="off"
                                    placeholder="Paste API key..."
                                    value=${newKey.value}
                                    onInput=${e => { newKey.value = e.target.value; }}
