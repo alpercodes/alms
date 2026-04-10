@@ -1,5 +1,5 @@
 import { html, computed } from '../../deps.js';
-import { runs } from '../../state/runs.js';
+import { runs, activeRunId } from '../../state/runs.js';
 import { fmtDate } from '../../utils/format.js';
 
 const STATUS_ICONS = {
@@ -20,6 +20,10 @@ const sessionTokens = computed(() => {
     return (prompt + completion > 0) ? `${prompt}p/${completion}c` : '';
 });
 
+function selectRun(runId) {
+    activeRunId.value = activeRunId.value === runId ? null : runId;
+}
+
 export function RunList() {
     return html`
         <div class="sidebar-section" id="run-history-section" style="flex:1">
@@ -31,7 +35,11 @@ export function RunList() {
                 ${runs.value.length === 0
                     ? html`<div class="run-empty">No runs yet</div>`
                     : runs.value.map(run => html`
-                        <div class="run-item ${run.status}" role="listitem">
+                        <div class="run-item ${run.status} ${run.run_id === activeRunId.value ? 'selected' : ''}"
+                             role="listitem"
+                             tabindex="0"
+                             onClick=${() => selectRun(run.run_id)}
+                             onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectRun(run.run_id); } }}>
                             <span class="run-status">${STATUS_ICONS[run.status] || '\u00B7'}</span>
                             <span class="run-meta" title=${run.run_id}>
                                 ${fmtDate(run.ts || run.started_at || '')}
