@@ -1,21 +1,7 @@
 import { html, useSignal } from '../../deps.js';
 import { activeSubagents } from '../../state/subagents.js';
-
-const PREVIEW_LEN = 100;
-
-function toolSummary(tool) {
-    if (!tool.params) return '';
-    switch (tool.tool) {
-        case 'shell':
-        case 'shell_exec':
-            if (tool.params.command) return tool.params.command;
-            return tool.params.argv ? tool.params.argv.join(' ') : '';
-        case 'fs_read': return tool.params.path || '';
-        case 'fs_write': return tool.params.path || '';
-        case 'fs_list': return tool.params.path || '.';
-        default: return '';
-    }
-}
+import { toolSummary } from '../../utils/tool-summary.js';
+import { SUBAGENT_PREVIEW_LEN, TOOL_SUMMARY_LEN } from '../../utils/constants.js';
 
 function SubagentPanel({ name, info, onClose }) {
     const icon = info.status === 'running' ? '\u23f3'
@@ -25,7 +11,7 @@ function SubagentPanel({ name, info, onClose }) {
         <div class="sa-panel">
             <div class="sa-panel-header">
                 <span class="sa-panel-name">${icon} ${name}</span>
-                <span class="sa-panel-task">${info.task.slice(0, PREVIEW_LEN)}${info.task.length > PREVIEW_LEN ? '\u2026' : ''}</span>
+                <span class="sa-panel-task">${info.task.slice(0, SUBAGENT_PREVIEW_LEN)}${info.task.length > SUBAGENT_PREVIEW_LEN ? '\u2026' : ''}</span>
                 <button class="sa-panel-close" onClick=${onClose}>\u00d7</button>
             </div>
             <div class="sa-panel-tools">
@@ -34,8 +20,8 @@ function SubagentPanel({ name, info, onClose }) {
                     : info.tools.map(t => {
                         const statusIcon = t.status === 'running' ? '\u23f3'
                             : t.status === 'done' ? '\u2713' : '\u2717';
-                        const summary = toolSummary(t);
-                        const truncSummary = summary.slice(0, 80) + (summary.length > 80 ? '\u2026' : '');
+                        const summary = toolSummary(t.tool, t.params);
+                        const truncSummary = summary.slice(0, TOOL_SUMMARY_LEN) + (summary.length > TOOL_SUMMARY_LEN ? '\u2026' : '');
                         return html`
                             <div class="sa-tool-row ${t.status || ''}">
                                 <span>${statusIcon}</span>

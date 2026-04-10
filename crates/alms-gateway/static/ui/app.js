@@ -17,6 +17,12 @@ import { SubagentBar } from './components/chat/subagent-bar.js';
 import { scrollToBottom } from './utils/format.js';
 import { sessionSwitchLoading, agentSwitchLoading, bootRetryAvailable, setRunBoot } from './state/loading.js';
 
+// ── Dynamic page title ──
+effect(() => {
+    const agent = activeAgent.value;
+    document.title = agent ? `ALMS - ${agent.name}` : 'ALMS';
+});
+
 // ── App status ──
 export const status = signal('connecting...');
 

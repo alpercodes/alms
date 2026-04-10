@@ -1,4 +1,5 @@
 import { html, useSignal } from '../../deps.js';
+import { PREVIEW_LEN } from '../../utils/constants.js';
 
 /**
  * Collapsible debug display for the full LLM context window.
@@ -39,7 +40,7 @@ function ContextMessage({ msg, index }) {
     const content = msg.content || '';
     const hasToolCalls = msg.tool_calls && msg.tool_calls.length > 0;
     const hasToolCallId = !!msg.tool_call_id;
-    const preview = truncate(content, 120);
+    const preview = truncate(content, PREVIEW_LEN);
 
     let label = `[${index}] ${role}`;
     if (hasToolCallId) {
