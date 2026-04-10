@@ -470,13 +470,13 @@ export function openSessionStream(sessionId, opts) {
     // -- job_completed --
     on('job_completed', (e) => {
         const data = JSON.parse(e.data);
-        const name = data.job_name || 'job';
-        const status = data.status === 'success' ? 'completed'
-            : data.status === 'cancelled' ? 'cancelled' : 'failed';
-        const summary = data.summary ? `: ${data.summary}` : '';
         appendMessage({
-            id: nextMsgId(), type: 'system',
-            text: `Scheduled job ${status} -- ${name}${summary}`,
+            id: nextMsgId(),
+            type: 'job_completed',
+            jobName: data.job_name || 'job',
+            status: data.status || 'success',
+            summary: data.summary || '',
+            ts: data.ts || null,
         });
     });
 

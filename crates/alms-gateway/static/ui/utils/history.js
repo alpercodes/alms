@@ -1,6 +1,43 @@
 import { nextMsgId } from '../state/chat.js';
 
 /**
+ * Parse a persisted job notification marker into structured fields.
+ *
+ * The backend persists job completion markers with the format:
+ *   [Scheduled job {label}] {job_name}\n{summary}
+ *
+ * where label is "completed", "failed", or "finished".
+ *
+ * @param {string} content - raw marker text
+ * @returns {{ jobName: string, status: string, summary: string }}
+ */
+function parseJobNotification(content) {
+    // Match: [Scheduled job completed] My job prompt\nSummary text
+    const match = content.match(/^\[Scheduled job (\w+)\]\s*(.*)/s);
+    if (!match) {
+        return { jobName: content, status: 'success', summary: '' };
+    }
+    const label = match[1]; // completed | failed | finished
+    const rest = match[2] || '';
+
+    // Map the label back to the SSE status value
+    const status = label === 'failed' ? 'error'
+        : label === 'completed' ? 'success'
+        : 'success';
+
+    // Split on first newline: job name vs summary
+    const nlIdx = rest.indexOf('\n');
+    if (nlIdx >= 0) {
+        return {
+            jobName: rest.slice(0, nlIdx).trim(),
+            status,
+            summary: rest.slice(nlIdx + 1).trim(),
+        };
+    }
+    return { jobName: rest.trim(), status, summary: '' };
+}
+
+/**
  * Map API message history to chatMessages entries.
  *
  * Pairs tool_call messages with their matching tool_result by
@@ -60,16 +97,34 @@ export function mapHistoryMessages(msgs, opts) {
                 : isDm ? 'agent'
                 : (m.role === 'user' ? 'user' : 'agent');
 
-            entries.push({
-                id: nextMsgId(),
-                type,
-                role: m.role,
-                text: m.content || '',
-                metadata: m.metadata || null,
-                sealed: true,
-                // Carry the sender name so Message can show it as the label.
-                fromAgent: isDm ? m.metadata.from_agent : undefined,
-            });
+            // Parse job_notification markers into structured fields for
+            // the JobCompletionCard component.  The persisted format is:
+            //   [Scheduled job {label}] {job_name}\n{summary}
+            // where label is "completed", "failed", or "finished".
+            if (isSynthetic && m.metadata.type === 'job_notification') {
+                const content = m.content || '';
+                const parsed = parseJobNotification(content);
+                entries.push({
+                    id: nextMsgId(),
+                    type: 'job_completed',
+                    jobName: parsed.jobName,
+                    status: parsed.status,
+                    summary: parsed.summary,
+                    ts: m.timestamp || null,
+                    metadata: m.metadata || null,
+                });
+            } else {
+                entries.push({
+                    id: nextMsgId(),
+                    type,
+                    role: m.role,
+                    text: m.content || '',
+                    metadata: m.metadata || null,
+                    sealed: true,
+                    // Carry the sender name so Message can show it as the label.
+                    fromAgent: isDm ? m.metadata.from_agent : undefined,
+                });
+            }
         } else if (m.type === 'tool_call') {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;
             // Prefer tool_invocation_id as the message ID so that history-
