@@ -24,7 +24,7 @@ use axum::{
     extract::{Path, Query, State, WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::Deserialize;
 use tower_http::services::{ServeDir, ServeFile};
@@ -56,6 +56,7 @@ pub(crate) fn protected_router() -> Router<AppState> {
         .route("/", get(serve_ui))
         // Sessions
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/{session_id}", delete(delete_session_by_id))
         .route("/sessions/{session_id}/messages", get(get_session_messages))
         .route(
             "/sessions/{session_id}/events",
@@ -174,6 +175,27 @@ async fn get_session(
     let session = state.session_manager.get_or_create(agent_id, context_id);
 
     Json(session)
+}
+
+/// DELETE /sessions/{session_id} — delete a session by ID.
+async fn delete_session_by_id(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> impl IntoResponse {
+    // Look up the session to get agent_id + context_id, then delete.
+    match state.session_manager.get(session_id) {
+        Ok(session) => match state
+            .session_manager
+            .delete(session.agent_id, &session.context_id)
+        {
+            Ok(()) => Json(serde_json::json!({ "ok": true, "deleted": session_id.0.to_string() }))
+                .into_response(),
+            Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e).into_response(),
+        },
+        Err(_) => {
+            api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response()
+        }
+    }
 }
 
 /// GET /sessions/{session_id}/messages — return chat history including tool calls

@@ -1,4 +1,4 @@
-import { html, batch } from '../../deps.js';
+import { html, batch, useSignal } from '../../deps.js';
 import { sessions, activeSessionId } from '../../state/sessions.js';
 import { activeAgentId } from '../../state/agents.js';
 import { replaceMessages } from '../../state/chat-actions.js';
@@ -6,7 +6,7 @@ import { activeRunId, runs } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
 import { sessionSwitchLoading } from '../../state/loading.js';
-import { listSessions, createSession } from '../../api/sessions.js';
+import { listSessions, createSession, deleteSession } from '../../api/sessions.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
 import { saveActiveSession } from '../../hooks/use-boot.js';
 import { selectGeneration, bumpSelectGeneration } from '../../state/select-generation.js';
@@ -81,6 +81,85 @@ async function newSession() {
     }
 }
 
+function isDmSession(contextId) {
+    return contextId && contextId.startsWith('dm:');
+}
+
+function SessionItem({ session }) {
+    const confirming = useSignal(false);
+    const deleteTimer = useSignal(null);
+    const isActive = session.id === activeSessionId.value;
+    const isDm = isDmSession(session.context_id);
+
+    const onDeleteClick = (e) => {
+        e.stopPropagation();
+        confirming.value = true;
+        deleteTimer.value = setTimeout(() => { confirming.value = false; }, 3000);
+    };
+
+    const onDeleteConfirm = async (e) => {
+        e.stopPropagation();
+        if (deleteTimer.value) { clearTimeout(deleteTimer.value); deleteTimer.value = null; }
+        confirming.value = false;
+        try {
+            await deleteSession(session.id);
+            // If we deleted the active session, clear it
+            if (session.id === activeSessionId.value) {
+                closeSessionStream();
+                batch(() => {
+                    activeSessionId.value = null;
+                    activeRunId.value = null;
+                    replaceMessages([]);
+                    runs.value = [];
+                    auditEvents.value = null;
+                });
+            }
+            // Refresh session list
+            const data = await listSessions(activeAgentId.value);
+            sessions.value = data.sessions || [];
+        } catch (err) {
+            console.error('[deleteSession] failed:', err);
+        }
+    };
+
+    const onDeleteCancel = (e) => {
+        e.stopPropagation();
+        if (deleteTimer.value) { clearTimeout(deleteTimer.value); deleteTimer.value = null; }
+        confirming.value = false;
+    };
+
+    return html`
+        <div class="session-item ${isActive ? 'active' : ''} ${hasActiveRun(session.id) ? 'has-run' : ''}"
+             role="option"
+             aria-selected=${isActive}
+             tabindex="0"
+             title=${'ID: ' + session.id + '\nContext: ' + session.context_id}
+             onClick=${() => selectSession(session.id)}
+             onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(session.id); } }}>
+            ${isDm && html`<span class="session-dm-badge" title="Direct message session">DM</span>`}
+            <span class="session-label">${session.context_id || session.id.slice(0, 8)}</span>
+            ${confirming.value
+                ? html`
+                    <button class="session-delete-btn session-delete-confirm"
+                            title="Confirm delete"
+                            onClick=${onDeleteConfirm}
+                            onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); onDeleteConfirm(e); } }}>Yes</button>
+                    <button class="session-delete-btn"
+                            title="Cancel"
+                            onClick=${onDeleteCancel}
+                            onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); onDeleteCancel(e); } }}>No</button>
+                `
+                : html`
+                    <button class="session-delete-btn"
+                            title="Delete session"
+                            onClick=${onDeleteClick}
+                            onKeyDown=${(e) => { if (e.key === 'Enter') { e.preventDefault(); onDeleteClick(e); } }}>\u00D7</button>
+                `
+            }
+        </div>
+    `;
+}
+
 export function SessionList() {
     return html`
         <div class="sidebar-section" style="flex:0 0 auto">
@@ -89,15 +168,7 @@ export function SessionList() {
                 ${sessions.value.length === 0
                     ? html`<div class="run-empty">No sessions</div>`
                     : sessions.value.map(s => html`
-                        <div class="session-item ${s.id === activeSessionId.value ? 'active' : ''} ${hasActiveRun(s.id) ? 'has-run' : ''}"
-                             role="option"
-                             aria-selected=${s.id === activeSessionId.value}
-                             tabindex="0"
-                             title=${'ID: ' + s.id + '\nContext: ' + s.context_id}
-                             onClick=${() => selectSession(s.id)}
-                             onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(s.id); } }}>
-                            ${s.context_id || s.id.slice(0, 8)}
-                        </div>
+                        <${SessionItem} key=${s.id} session=${s} />
                     `)
                 }
             </div>
