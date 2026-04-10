@@ -6,6 +6,7 @@ import { Message, ErrorMessage, WarningMessage, SystemMessage, DmEndedMessage, T
 import { ToolRow, ToolGroup } from './components/chat/tool-row.js';
 import { ContextDebugRow } from './components/chat/context-debug-row.js';
 import { ApprovalCard } from './components/chat/approval-card.js';
+import { JobCompletionCard } from './components/chat/job-completion-card.js';
 import { MessageQueue } from './components/chat/message-queue.js';
 import { InputArea } from './components/chat/input-area.js';
 import { chatMessages } from './state/chat.js';
@@ -128,6 +129,9 @@ function ChatView() {
                     if (m.type === 'approval') {
                         return html`<${ApprovalCard} key=${m.id} ...${m} />`;
                     }
+                    if (m.type === 'job_completed') {
+                        return html`<${JobCompletionCard} key=${m.id} jobName=${m.jobName} status=${m.status} summary=${m.summary} ts=${m.ts} />`;
+                    }
                     if (m.type === 'image') {
                         // DM images carry fromAgent — treat them as agent
                         // messages so they render on the correct side. (#546)
@@ -170,7 +174,7 @@ function ChatView() {
                             const reasonLabels = { 'ignored': 'no further replies', 'depth_exceeded': 'message limit reached' };
                             return html`<${DmEndedMessage} key=${m.id} peer=${md.peer || 'unknown'} reason=${reasonLabels[md.reason] || md.reason || 'conversation ended'} />`;
                         }
-                        // job_notification and other synthetic markers: render as system message
+                        // Other synthetic markers: render as system message
                         return html`<${SystemMessage} key=${m.id} text=${m.text} />`;
                     }
                     if (m.type === 'tokens') {

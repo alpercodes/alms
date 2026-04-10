@@ -2462,6 +2462,107 @@ select.settings-input-sm {
   color: var(--error);
 }
 
+/* ── Job completion card ── */
+.job-card {
+  align-self: flex-start;
+  max-width: 100%;
+  width: 100%;
+  background: var(--surface-1);
+  border: 1px solid var(--info);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  margin: var(--space-2) 0;
+}
+.job-card--error {
+  border-color: var(--error);
+}
+.job-card--cancelled {
+  border-color: var(--border-subtle);
+}
+.job-card-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+.job-card-icon {
+  flex-shrink: 0;
+  font-size: var(--text-sm);
+}
+.job-card--success .job-card-icon { color: var(--success); }
+.job-card--error .job-card-icon { color: var(--error); }
+.job-card--cancelled .job-card-icon { color: var(--text-disabled); }
+.job-card-badge {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+}
+.job-card--success .job-card-badge {
+  background: var(--success-muted);
+  color: var(--success);
+}
+.job-card--error .job-card-badge {
+  background: var(--error-muted);
+  color: var(--error);
+}
+.job-card--cancelled .job-card-badge {
+  background: var(--surface-2);
+  color: var(--text-disabled);
+}
+.job-card-label {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+.job-card-time {
+  margin-left: auto;
+  color: var(--text-disabled);
+}
+.job-card-name {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.job-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.job-card-summary {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.5;
+  overflow: auto;
+  max-height: 300px;
+}
+.job-card-summary-truncated {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.job-card-toggle {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--info);
+  padding: 0;
+}
+.job-card-toggle:hover {
+  text-decoration: underline;
+}
+
 /* System message — matches .msg-error / .msg-warning pattern (4b) */
 .msg-system {
   font-size: var(--text-xs);

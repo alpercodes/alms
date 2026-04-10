@@ -1,6 +1,54 @@
 import { nextMsgId } from '../state/chat.js';
 
 /**
+ * Parse a persisted job notification marker into structured fields.
+ *
+ * The backend persists job completion markers with the format:
+ *   [Scheduled job {label}] {job_name}\n{summary}
+ *
+ * where label is "completed", "failed", or "finished".
+ *
+ * When metadata contains `job_status`, that is the authoritative source
+ * (one of "success", "error", "cancelled", "unknown").  The text label
+ * is only used as a fallback for markers persisted before this field
+ * was added.
+ *
+ * @param {string} content - raw marker text
+ * @param {object} [metadata] - message metadata (may contain job_status)
+ * @returns {{ jobName: string, status: string, summary: string }}
+ */
+function parseJobNotification(content, metadata) {
+    // Match: [Scheduled job completed] My job prompt\nSummary text
+    const match = content.match(/^\[Scheduled job (\w+)\]\s*(.*)/s);
+    if (!match) {
+        const mdStatus = metadata && metadata.job_status;
+        return { jobName: content, status: mdStatus || 'success', summary: '' };
+    }
+    const label = match[1]; // completed | failed | finished
+    const rest = match[2] || '';
+
+    // Prefer the authoritative status from metadata when available.
+    const mdStatus = metadata && metadata.job_status;
+    const status = mdStatus
+        ? mdStatus
+        : label === 'failed' ? 'error'
+        : label === 'completed' ? 'success'
+        : label === 'finished' ? 'cancelled'
+        : 'success';
+
+    // Split on first newline: job name vs summary
+    const nlIdx = rest.indexOf('\n');
+    if (nlIdx >= 0) {
+        return {
+            jobName: rest.slice(0, nlIdx).trim(),
+            status,
+            summary: rest.slice(nlIdx + 1).trim(),
+        };
+    }
+    return { jobName: rest.trim(), status, summary: '' };
+}
+
+/**
  * Map API message history to chatMessages entries.
  *
  * Pairs tool_call messages with their matching tool_result by
@@ -60,16 +108,34 @@ export function mapHistoryMessages(msgs, opts) {
                 : isDm ? 'agent'
                 : (m.role === 'user' ? 'user' : 'agent');
 
-            entries.push({
-                id: nextMsgId(),
-                type,
-                role: m.role,
-                text: m.content || '',
-                metadata: m.metadata || null,
-                sealed: true,
-                // Carry the sender name so Message can show it as the label.
-                fromAgent: isDm ? m.metadata.from_agent : undefined,
-            });
+            // Parse job_notification markers into structured fields for
+            // the JobCompletionCard component.  The persisted format is:
+            //   [Scheduled job {label}] {job_name}\n{summary}
+            // where label is "completed", "failed", or "finished".
+            if (isSynthetic && m.metadata.type === 'job_notification') {
+                const content = m.content || '';
+                const parsed = parseJobNotification(content, m.metadata);
+                entries.push({
+                    id: nextMsgId(),
+                    type: 'job_completed',
+                    jobName: parsed.jobName,
+                    status: parsed.status,
+                    summary: parsed.summary,
+                    ts: m.timestamp || null,
+                    metadata: m.metadata || null,
+                });
+            } else {
+                entries.push({
+                    id: nextMsgId(),
+                    type,
+                    role: m.role,
+                    text: m.content || '',
+                    metadata: m.metadata || null,
+                    sealed: true,
+                    // Carry the sender name so Message can show it as the label.
+                    fromAgent: isDm ? m.metadata.from_agent : undefined,
+                });
+            }
         } else if (m.type === 'tool_call') {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;
             // Prefer tool_invocation_id as the message ID so that history-
