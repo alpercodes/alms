@@ -4,9 +4,10 @@
 //! The session is looked up by its deterministic SessionId (derived from the
 //! sorted name pair) rather than by `(agent_id, context_id)`.
 
+use crate::dm_filter;
 use alms_core::SessionId;
 use alms_sandbox::{SandboxError, Tool, error::SandboxResult};
-use alms_session::SessionManager;
+use alms_session::{Message, SessionManager};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -86,12 +87,22 @@ impl Tool for ReadMessagesTool {
             .get_history(session_id)
             .map_err(|e| SandboxError::Io(format!("Failed to read DM history: {e}")))?;
 
-        let total = messages.len();
-        let start = total.saturating_sub(last_n);
-
-        let recent: Vec<Value> = messages[start..]
+        // Filter out synthetic markers (dm_ended, empty bodies, tool
+        // calls/results, synthetic notifications) so agents only see
+        // real conversational messages. Apply last_n AFTER filtering
+        // so the requested count reflects actual messages, not raw
+        // session entries.
+        let real_messages: Vec<&Message> = messages
             .iter()
-            .map(|m| {
+            .filter(|m| !dm_filter::is_synthetic_marker(m))
+            .collect();
+
+        let visible_count = real_messages.len();
+        let start = visible_count.saturating_sub(last_n);
+
+        let recent: Vec<Value> = real_messages[start..]
+            .iter()
+            .map(|m: &&Message| {
                 let from_agent = m
                     .metadata
                     .as_ref()
@@ -124,7 +135,7 @@ impl Tool for ReadMessagesTool {
 
         Ok(serde_json::json!({
             "peer": from,
-            "message_count": total,
+            "message_count": visible_count,
             "showing": recent.len(),
             "messages": recent,
             "summary": summary.as_deref().unwrap_or(""),
@@ -146,6 +157,23 @@ mod tests {
         let mgr = Arc::new(SessionManager::new(SessionConfig::default()));
         let tool = ReadMessagesTool::new(mgr.clone(), "alice".into());
         (tool, mgr)
+    }
+
+    /// Helper to create a DM message with production-format metadata.
+    /// `MessageBus::send()` stamps every real DM with `"message_type": "dm"`,
+    /// `"from_agent"`, and `"from_agent_id"`.
+    fn make_dm_msg(from_name: &str, text: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: Content::Text(text.to_string()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "from_agent": from_name,
+                "from_agent_id": uuid::Uuid::new_v4().to_string(),
+                "message_type": "dm",
+            })),
+        }
     }
 
     #[tokio::test]
@@ -179,27 +207,15 @@ mod tests {
     async fn test_reads_dm_messages_from_shared_session() {
         let (tool, mgr) = make_tool();
 
-        // Create a shared DM session and populate it
+        // Create a shared DM session and populate it with production-format messages
         let session_id = SessionId::deterministic_dm("alice", "bob");
         let dm_ctx = dm_context_id("alice", "bob");
         let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
 
-        let msg1 = Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: Role::User,
-            content: Content::Text("Hello Bob!".into()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: Some(serde_json::json!({"from_agent": "alice"})),
-        };
-        let msg2 = Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            role: Role::User,
-            content: Content::Text("Hi Alice!".into()),
-            timestamp: alms_core::Timestamp::now(),
-            metadata: Some(serde_json::json!({"from_agent": "bob"})),
-        };
-        mgr.append_message(session_id, msg1).unwrap();
-        mgr.append_message(session_id, msg2).unwrap();
+        mgr.append_message(session_id, make_dm_msg("alice", "Hello Bob!"))
+            .unwrap();
+        mgr.append_message(session_id, make_dm_msg("bob", "Hi Alice!"))
+            .unwrap();
 
         let result = tool
             .execute(serde_json::json!({ "from": "bob" }))
@@ -227,14 +243,8 @@ mod tests {
         let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
 
         for i in 0..10 {
-            let msg = Message {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: Role::User,
-                content: Content::Text(format!("msg {i}")),
-                timestamp: alms_core::Timestamp::now(),
-                metadata: Some(serde_json::json!({"from_agent": "bob"})),
-            };
-            mgr.append_message(session_id, msg).unwrap();
+            mgr.append_message(session_id, make_dm_msg("bob", &format!("msg {i}")))
+                .unwrap();
         }
 
         let result = tool
@@ -255,5 +265,111 @@ mod tests {
         let schema = tool.parameters();
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "from"));
+    }
+
+    /// Regression test for #558: dm_ended markers and other synthetic
+    /// messages must not appear in read_messages output, but real DM
+    /// messages (with `"message_type": "dm"`) must be preserved.
+    #[tokio::test]
+    async fn test_filters_dm_ended_markers_and_synthetic_messages() {
+        let (tool, mgr) = make_tool();
+
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let dm_ctx = dm_context_id("alice", "bob");
+        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
+
+        // Real message from bob -- production format with "message_type": "dm"
+        let real_msg = make_dm_msg("bob", "Hello Alice!");
+
+        // dm_ended marker (empty content, no from_agent)
+        let dm_ended_marker = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::User,
+            content: Content::Text(String::new()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "message_type": "dm_ended",
+                "ended_by": "alice",
+                "reason": "ignored",
+            })),
+        };
+
+        // Synthetic notification marker
+        let synthetic_marker = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::System,
+            content: Content::Text("synthetic notification".into()),
+            timestamp: alms_core::Timestamp::now(),
+            metadata: Some(serde_json::json!({"synthetic": true})),
+        };
+
+        // Tool result (should also be filtered)
+        let tool_result = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "t1".into(),
+                result: serde_json::json!({"ok": true}),
+            },
+            timestamp: alms_core::Timestamp::now(),
+            metadata: None,
+        };
+
+        mgr.append_message(session_id, real_msg).unwrap();
+        mgr.append_message(session_id, dm_ended_marker).unwrap();
+        mgr.append_message(session_id, synthetic_marker).unwrap();
+        mgr.append_message(session_id, tool_result).unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "from": "bob" }))
+            .await
+            .unwrap();
+
+        // Only the real message should be visible
+        assert_eq!(result["message_count"], 1);
+        assert_eq!(result["showing"], 1);
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["from"], "bob");
+        assert_eq!(msgs[0]["content"], "Hello Alice!");
+    }
+
+    /// Verify that real DM messages with production metadata are NOT
+    /// incorrectly filtered. This is the critical regression test for C1:
+    /// the original filter matched ANY `message_type` value, which would
+    /// discard all real DM messages since MessageBus stamps them with
+    /// `"message_type": "dm"`.
+    #[tokio::test]
+    async fn test_real_dm_messages_with_message_type_dm_are_preserved() {
+        let (tool, mgr) = make_tool();
+
+        let session_id = SessionId::deterministic_dm("alice", "bob");
+        let dm_ctx = dm_context_id("alice", "bob");
+        let _session = mgr.get_or_create_shared(session_id, &dm_ctx);
+
+        // Three real DM messages with production metadata
+        mgr.append_message(session_id, make_dm_msg("alice", "Hey Bob"))
+            .unwrap();
+        mgr.append_message(session_id, make_dm_msg("bob", "Hey Alice"))
+            .unwrap();
+        mgr.append_message(session_id, make_dm_msg("alice", "How are you?"))
+            .unwrap();
+
+        let result = tool
+            .execute(serde_json::json!({ "from": "bob" }))
+            .await
+            .unwrap();
+
+        // All three real messages must be visible
+        assert_eq!(result["message_count"], 3);
+        assert_eq!(result["showing"], 3);
+        let msgs = result["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["from"], "you");
+        assert_eq!(msgs[0]["content"], "Hey Bob");
+        assert_eq!(msgs[1]["from"], "bob");
+        assert_eq!(msgs[1]["content"], "Hey Alice");
+        assert_eq!(msgs[2]["from"], "you");
+        assert_eq!(msgs[2]["content"], "How are you?");
     }
 }
