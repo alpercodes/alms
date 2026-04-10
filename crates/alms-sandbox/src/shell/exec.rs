@@ -316,23 +316,23 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
             // won't work under the sandbox without /usr, /lib, etc.)
             let mut ruleset = ruleset;
             for sys_path in &sys_paths {
-                if sys_path.exists() {
-                    if let Ok(fd) = PathFd::new(sys_path) {
-                        let rule = PathBeneath::new(fd, read_access);
-                        ruleset = match ruleset.add_rule(rule) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!(
-                                    "[alms] Landlock: failed to add system path rule for {}: {e}",
-                                    sys_path.display()
-                                );
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::PermissionDenied,
-                                    format!("Landlock: failed to add system path rule: {e}"),
-                                ));
-                            }
-                        };
-                    }
+                if sys_path.exists()
+                    && let Ok(fd) = PathFd::new(sys_path)
+                {
+                    let rule = PathBeneath::new(fd, read_access);
+                    ruleset = match ruleset.add_rule(rule) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!(
+                                "[alms] Landlock: failed to add system path rule for {}: {e}",
+                                sys_path.display()
+                            );
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                format!("Landlock: failed to add system path rule: {e}"),
+                            ));
+                        }
+                    };
                 }
             }
 
