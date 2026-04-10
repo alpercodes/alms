@@ -162,10 +162,8 @@ fn build_command(
 
     // Apply Landlock filesystem sandboxing on Linux when a sandbox root is configured
     #[cfg(target_os = "linux")]
-    if !unrestricted {
-        if let Some(root) = sandbox_root {
-            apply_landlock_sandbox(&mut cmd, root);
-        }
+    if !unrestricted && let Some(root) = sandbox_root {
+        apply_landlock_sandbox(&mut cmd, root);
     }
 
     // Suppress unused variable warnings on non-Linux platforms
