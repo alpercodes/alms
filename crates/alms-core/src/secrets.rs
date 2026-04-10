@@ -1,6 +1,6 @@
 //! Secure API key storage with optional encryption at rest.
 //!
-//! Keys are stored in a JSON file (`data/secrets.json`). When the
+//! Keys are stored in a JSON file (`.alms/secrets.json`). When the
 //! `ALMS_MASTER_KEY` environment variable is set, the file is encrypted
 //! using AES-256-GCM with an HKDF-SHA256 derived key. Without the env var
 //! the file is stored as plain text (with a warning log).
@@ -45,7 +45,7 @@ pub fn secrets_path(data_dir: &Path) -> PathBuf {
 pub fn secrets_path_from_db(db_path: Option<&str>) -> PathBuf {
     db_path
         .and_then(|p| Path::new(p).parent().map(|d| d.join("secrets.json")))
-        .unwrap_or_else(|| secrets_path(Path::new("./data")))
+        .unwrap_or_else(|| secrets_path(Path::new("./.alms")))
 }
 
 /// In-memory secrets store backed by an optionally-encrypted JSON file.

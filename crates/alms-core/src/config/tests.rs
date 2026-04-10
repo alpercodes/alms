@@ -329,7 +329,7 @@ fn test_workspace_dir_default() {
     let _guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
 
     let config = ServerConfig::default();
-    assert_eq!(config.workspace_dir(), PathBuf::from("./data/workspace"));
+    assert_eq!(config.workspace_dir(), PathBuf::from("./.alms/workspace"));
 }
 
 #[test]
@@ -399,8 +399,8 @@ fn test_logging_config_defaults() {
 #[test]
 fn test_logging_resolve_log_dir_default() {
     let config = LoggingConfig::default();
-    let resolved = config.resolve_log_dir("./data");
-    assert_eq!(resolved, PathBuf::from("./data/logs"));
+    let resolved = config.resolve_log_dir("./.alms");
+    assert_eq!(resolved, PathBuf::from("./.alms/logs"));
 }
 
 /// Verify that `resolve_log_dir` produces valid paths even when
@@ -545,7 +545,7 @@ fn test_load_produces_absolute_data_dir() {
     let _lock = ENV_LOCK.lock().unwrap();
     // Use mock LLM to avoid API key validation failure.
     let _mock_guard = SingleEnvGuard::set("ALMS_LLM_MOCK", "1");
-    // Clear ALMS_DATA_DIR to ensure the default `./data` is used.
+    // Clear ALMS_DATA_DIR to ensure the default `./.alms` is used.
     let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
 
     let config = AlmsConfig::load().expect("load should succeed with mock LLM");
@@ -593,7 +593,7 @@ fn test_db_path_is_absolute_after_load() {
 #[test]
 fn test_load_or_default_resolves_data_dir() {
     let _lock = ENV_LOCK.lock().unwrap();
-    // Clear data dir env to use the relative default "./data".
+    // Clear data dir env to use the relative default "./.alms".
     let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
     // Mock LLM irrelevant here -- load_or_default() swallows errors.
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
@@ -829,4 +829,119 @@ fn test_env_override_summary_max_tokens_invalid_ignored() {
     config.apply_env_overrides();
     // Invalid parse should be silently ignored, keeping the default
     assert_eq!(config.context.summary_max_tokens, 1000);
+}
+
+// ---- warn_legacy_data_dir / ensure_data_dir tests ----
+
+/// Helper: create a temp dir with a unique UUID suffix, returning the
+/// root path. The caller is responsible for cleanup via `remove_dir_all`.
+fn temp_root(label: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("alms-cfg-{label}-{}", uuid::Uuid::new_v4()))
+}
+
+/// Fresh install: no `./data/`, no `.alms/` — `ensure_data_dir` creates
+/// the `.alms/` directory.
+#[test]
+fn test_ensure_data_dir_fresh_install() {
+    let root = temp_root("fresh");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let alms_dir = root.join(".alms");
+    assert!(!alms_dir.exists(), "precondition: .alms should not exist");
+    assert!(
+        !root.join("data").exists(),
+        "precondition: data should not exist"
+    );
+
+    let mut cfg = AlmsConfig::default();
+    cfg.server.data_dir = alms_dir.to_string_lossy().into_owned();
+
+    cfg.ensure_data_dir();
+
+    assert!(
+        alms_dir.is_dir(),
+        ".alms/ should be created by ensure_data_dir"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Legacy: `./data/` exists but `.alms/` does not — `warn_legacy_data_dir`
+/// should fire (no panic, method completes successfully).
+#[test]
+fn test_warn_legacy_data_dir_legacy_exists() {
+    let root = temp_root("legacy");
+    std::fs::create_dir_all(root.join("data")).unwrap();
+
+    let alms_dir = root.join(".alms");
+    assert!(!alms_dir.exists(), "precondition: .alms should not exist");
+    assert!(
+        root.join("data").is_dir(),
+        "precondition: data should exist"
+    );
+
+    let mut cfg = AlmsConfig::default();
+    cfg.server.data_dir = alms_dir.to_string_lossy().into_owned();
+
+    // Should not panic — the warning is emitted via tracing.
+    cfg.warn_legacy_data_dir();
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Both `./data/` and `.alms/` exist — no warning (already migrated).
+#[test]
+fn test_warn_legacy_data_dir_both_exist() {
+    let root = temp_root("both");
+    std::fs::create_dir_all(root.join("data")).unwrap();
+    std::fs::create_dir_all(root.join(".alms")).unwrap();
+
+    let alms_dir = root.join(".alms");
+
+    let mut cfg = AlmsConfig::default();
+    cfg.server.data_dir = alms_dir.to_string_lossy().into_owned();
+
+    // Should complete without issue (legacy dir present but .alms also exists).
+    cfg.warn_legacy_data_dir();
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Neither `./data/` nor `.alms/` exist — no warning (fresh install).
+#[test]
+fn test_warn_legacy_data_dir_neither_exists() {
+    let root = temp_root("neither");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let alms_dir = root.join(".alms");
+    assert!(!alms_dir.exists());
+    assert!(!root.join("data").exists());
+
+    let mut cfg = AlmsConfig::default();
+    cfg.server.data_dir = alms_dir.to_string_lossy().into_owned();
+
+    // No legacy dir, no .alms — should be silent.
+    cfg.warn_legacy_data_dir();
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Custom `data_dir` (not ending in `.alms`) — no warning regardless of
+/// whether a `data` directory exists nearby, because the user explicitly
+/// chose a non-default path.
+#[test]
+fn test_warn_legacy_data_dir_custom_data_dir() {
+    let root = temp_root("custom");
+    std::fs::create_dir_all(root.join("data")).unwrap();
+
+    // Point data_dir to a custom path that does NOT end in `.alms`
+    let custom_dir = root.join("my-custom-dir");
+
+    let mut cfg = AlmsConfig::default();
+    cfg.server.data_dir = custom_dir.to_string_lossy().into_owned();
+
+    // Even though ./data/ exists, custom data_dir should suppress the warning.
+    cfg.warn_legacy_data_dir();
+
+    let _ = std::fs::remove_dir_all(&root);
 }

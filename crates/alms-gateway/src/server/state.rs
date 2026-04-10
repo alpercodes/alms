@@ -75,8 +75,8 @@ impl AppState {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| {
                 std::env::current_dir()
-                    .map(|cwd| cwd.join("data"))
-                    .unwrap_or_else(|_| std::path::PathBuf::from("./data"))
+                    .map(|cwd| cwd.join(".alms"))
+                    .unwrap_or_else(|_| std::path::PathBuf::from("./.alms"))
             });
         let session_manager = gateway.session_manager().clone();
         let llm = gateway.llm().clone();
