@@ -5,11 +5,12 @@ import { SUBAGENT_PREVIEW_LEN, TOOL_SUMMARY_LEN } from '../../utils/constants.js
 
 function SubagentPanel({ name, info, onClose }) {
     const icon = info.status === 'done' ? '\u2713' : info.status === 'fail' ? '\u2717' : null;
+    const label = info.displayName || name;
 
     return html`
         <div class="sa-panel">
             <div class="sa-panel-header">
-                <span class="sa-panel-name">${info.status === 'running' ? html`<span class="tc-spinner"></span>` : icon} ${name}</span>
+                <span class="sa-panel-name">${info.status === 'running' ? html`<span class="tc-spinner"></span>` : icon} ${label}</span>
                 <span class="sa-panel-task">${info.task.slice(0, SUBAGENT_PREVIEW_LEN)}${info.task.length > SUBAGENT_PREVIEW_LEN ? '\u2026' : ''}</span>
                 <button class="sa-panel-close" onClick=${onClose}>\u00d7</button>
             </div>
@@ -53,6 +54,7 @@ export function SubagentBar() {
                 const activity = lastTool && lastTool.status === 'running'
                     ? lastTool.tool
                     : '';
+                const label = info.displayName || name;
 
                 return html`
                     <button class="sa-chip ${isRunning ? 'running' : info.status}"
@@ -61,7 +63,7 @@ export function SubagentBar() {
                             ? html`<span class="tc-spinner"></span>`
                             : html`<span>${icon}</span>`
                         }
-                        <span class="sa-chip-name">${name}</span>
+                        <span class="sa-chip-name">${label}</span>
                         ${activity && html`<span class="sa-chip-activity">${activity}</span>`}
                         ${toolCount > 0 && html`<span class="sa-chip-count">${toolCount}</span>`}
                     </button>
