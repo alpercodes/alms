@@ -15,7 +15,8 @@ use uuid::Uuid;
 /// Implemented by `Coordinator` to allow tools to spawn subagents.
 #[async_trait]
 pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
-    /// Spawn a subagent, await its completion, and return the response text.
+    /// Spawn a subagent, await its completion, and return the response text
+    /// along with the subagent's own session ID.
     ///
     /// Named subagents (`subagent_name` = Some) must be pre-registered in the
     /// agent registry via `alms agent create`. Their config (model, posture)
@@ -24,6 +25,8 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
     /// `parent_event_fwd` is a type-erased event forwarder. When provided,
     /// the subagent's tool events are forwarded into the parent run's SSE
     /// stream so the UI can show subagent activity inline.
+    ///
+    /// Returns `(response_text, subagent_session_id)`.
     async fn dispatch(
         &self,
         task: String,
@@ -32,14 +35,17 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
         parent_event_fwd: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
         parent_cancel_token: Option<CancellationToken>,
-    ) -> AlmsResult<String>;
+    ) -> AlmsResult<(String, SessionId)>;
 
-    /// Fire a subagent in the background and return its task ID immediately.
+    /// Fire a subagent in the background and return its task ID immediately,
+    /// along with the subagent's own session ID.
     ///
     /// The subagent runs concurrently with the parent's loop. Results are
     /// delivered automatically via the completion notification system.
     /// Subagent tool events are still forwarded into `parent_event_fwd`
     /// when provided.
+    ///
+    /// Returns `(task_uuid, subagent_session_id)`.
     async fn dispatch_background(
         &self,
         _task: String,
@@ -48,7 +54,7 @@ pub trait SubagentDispatcher: Send + Sync + std::fmt::Debug {
         _parent_event_fwd: Option<Arc<dyn EventForwarder>>,
         _subagent_name: Option<String>,
         _parent_cancel_token: Option<CancellationToken>,
-    ) -> AlmsResult<Uuid> {
+    ) -> AlmsResult<(Uuid, SessionId)> {
         Err(AlmsError::Runtime(
             "dispatch_background not supported by this dispatcher".to_string(),
         ))

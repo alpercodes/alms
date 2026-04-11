@@ -374,6 +374,7 @@ pub(crate) async fn completion_notification_loop(
                     completion.subagent_name.clone(),
                     status_str,
                     &completion.summary,
+                    completion.subagent_session_id,
                 ),
             )
             .await;
