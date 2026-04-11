@@ -89,6 +89,28 @@ export function mapHistoryMessages(msgs, opts) {
     const entries = [];
     for (const m of msgs) {
         if (m.type === 'text' || !m.type) {
+            // DM-ended markers are persisted by MessageBus::end_conversation
+            // on the DM session with role "user", empty content, and
+            // metadata.message_type === "dm_ended".  Map them to the
+            // 'dm_ended' chat message type so DmConversationView renders
+            // the correct divider banner after a page reload.
+            const isDmEndedMarker = m.metadata
+                && m.metadata.message_type === 'dm_ended';
+            if (isDmEndedMarker) {
+                const reasonLabels = {
+                    'ignored': 'no further replies',
+                    'depth_exceeded': 'message limit reached',
+                };
+                const rawReason = m.metadata.reason || '';
+                entries.push({
+                    id: nextMsgId(),
+                    type: 'dm_ended',
+                    peer: m.metadata.ended_by || 'unknown',
+                    reason: reasonLabels[rawReason] || rawReason || 'conversation ended',
+                });
+                continue;
+            }
+
             // Synthetic system markers (job notifications, DM-ended markers)
             // are returned with role "system" and metadata.synthetic=true.
             // Render them as notification entries so the UI can style them
