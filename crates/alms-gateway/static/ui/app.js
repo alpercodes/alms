@@ -160,7 +160,7 @@ function ChatView() {
                         return html`<${ErrorMessage} key=${m.id} text=${m.text} code=${m.code} />`;
                     }
                     if (m.type === 'warning') {
-                        return html`<${WarningMessage} key=${m.id} text=${m.text} code=${m.code} />`;
+                        return html`<${WarningMessage} key=${m.id} id=${m.id} text=${m.text} code=${m.code} />`;
                     }
                     if (m.type === 'system') {
                         return html`<${SystemMessage} key=${m.id} text=${m.text} />`;

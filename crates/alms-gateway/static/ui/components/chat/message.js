@@ -1,5 +1,6 @@
-import { html, renderMarkdown } from '../../deps.js';
+import { html, useSignal, renderMarkdown } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
+import { filterMessages } from '../../state/chat-actions.js';
 
 export function Message({ type, role, text, sealed, fromAgent }) {
     const cls = type === 'user' ? 'user' : 'agent';
@@ -55,14 +56,40 @@ export function ErrorMessage({ text, code }) {
     `;
 }
 
-export function WarningMessage({ text, code }) {
-    const codeCls = code ? `msg-warning--${code.toLowerCase()}` : '';
+export function WarningMessage({ id, text, code }) {
+    const collapsed = useSignal(false);
+    const dismissed = useSignal(false);
+
+    if (dismissed.value) return null;
+
+    const onToggle = () => { collapsed.value = !collapsed.value; };
+    const onDismiss = (e) => {
+        e.stopPropagation();
+        dismissed.value = true;
+        if (id) filterMessages(m => m.id !== id);
+    };
+
+    const collapsedCls = collapsed.value ? 'msg-warning--collapsed' : '';
     return html`
-        <div class="msg msg-warning ${codeCls}" data-code=${code || ''}>
-            <div class="msg-warning-icon">\u26A0</div>
+        <div class="msg msg-warning ${collapsedCls}" data-code=${code || ''}>
+            <div class="msg-warning-icon">\u26A0\uFE0F</div>
             <div class="msg-warning-body">
-                <div class="msg-warning-title">Warning</div>
-                <div class="msg-warning-text">${text}</div>
+                <div class="msg-warning-header" onClick=${onToggle}>
+                    <div class="msg-warning-title">Warning</div>
+                    ${code && html`<span class="msg-warning-code">${code}</span>`}
+                    <button class="msg-warning-toggle"
+                            title=${collapsed.value ? 'Expand' : 'Collapse'}
+                            aria-label=${collapsed.value ? 'Expand warning' : 'Collapse warning'}>
+                        ${collapsed.value ? '\u25B6' : '\u25BC'}
+                    </button>
+                    <button class="msg-warning-dismiss" onClick=${onDismiss}
+                            title="Dismiss" aria-label="Dismiss warning">
+                        \u2715
+                    </button>
+                </div>
+                ${!collapsed.value && html`
+                    <div class="msg-warning-text">${text}</div>
+                `}
             </div>
         </div>
     `;
