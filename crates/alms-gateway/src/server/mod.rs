@@ -14,7 +14,7 @@ mod state;
 pub use run_manager::RunManager;
 pub use state::AppState;
 
-use crate::auth::{AuthToken, require_auth};
+use crate::auth::{AuthToken, no_cache, require_auth};
 use crate::cron_utils;
 use crate::gateway::Gateway;
 use crate::runs::{completion_notification_loop, run_trigger_loop, scheduler_fire_loop};
@@ -160,6 +160,7 @@ pub async fn serve_with_gateway(bind_addr: &str, gateway: Gateway) -> AlmsResult
     let app = routes::public_router()
         .merge(
             routes::protected_router()
+                .layer(middleware::from_fn(no_cache))
                 .layer(middleware::from_fn(require_auth))
                 .layer(Extension(auth_token)),
         )
