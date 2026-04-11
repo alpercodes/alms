@@ -32,7 +32,7 @@ import { batch } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
 import { activeRunId } from '../state/runs.js';
-import { trackSubagentStart, trackSubagentEnd, trackSubagentTool } from '../state/subagents.js';
+import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId } from '../state/subagents.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
 import { normalizeApproval } from '../utils/approvals.js';
@@ -345,7 +345,7 @@ export function openSessionStream(sessionId, opts) {
                     id: toolId, type: 'tool', tool: 'invoke_agent', params: data.params,
                     status: 'running', startedAt,
                 });
-                trackSubagentStart(name, task);
+                trackSubagentStart(name, task, toolId);
             } else if (data.source_agent) {
                 trackSubagentTool(data.source_agent, {
                     id: toolId, tool: data.tool, params: data.params, status: 'running',
@@ -400,11 +400,20 @@ export function openSessionStream(sessionId, opts) {
                     ? updated.find(m => m.type === 'tool' && m.id === matchId)
                     : updated.findLast(m => m.type === 'tool' && m.status === status);
                 if (updatedMsg && updatedMsg.tool === 'invoke_agent') {
-                    const name = updatedMsg.params?.name || updatedMsg.params?.subagent_name;
                     const resultObj = typeof data.result === 'object' ? data.result : null;
                     const isBackground = resultObj && resultObj.task_id;
-                    if (name && !isBackground) {
-                        trackSubagentEnd(name, status);
+                    if (!isBackground) {
+                        // Resolve the subagent name: prefer the explicit name
+                        // from params, fall back to looking up the entry by the
+                        // invoke_agent tool_invocation_id (handles unnamed
+                        // subagents whose bar entry may have been renamed by
+                        // trackSubagentTool to the backend-assigned label).
+                        const name = updatedMsg.params?.name
+                            || updatedMsg.params?.subagent_name
+                            || findSubagentByToolInvocationId(matchId);
+                        if (name) {
+                            trackSubagentEnd(name, status);
+                        }
                     }
                 }
             } else if (!data.source_agent) {
