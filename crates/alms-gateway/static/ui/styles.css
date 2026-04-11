@@ -1111,6 +1111,54 @@ header h1 {
   background: var(--error-muted);
 }
 
+/* ── Code block variant for shell output and file content ── */
+.tc-detail-content.tc-code-block {
+  background: var(--surface-0);
+  border-color: var(--border-default);
+  tab-size: 4;
+  -moz-tab-size: 4;
+  line-height: 1.6;
+}
+
+/* File path header in fs_read results */
+.tc-detail-label.tc-file-header {
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  font-size: var(--text-2xs);
+  padding: 2px 0;
+  letter-spacing: normal;
+  text-transform: none;
+  font-weight: 500;
+}
+
+/* Result size indicator in the collapsed header */
+.tc-result-size {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  background: var(--surface-3);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+  flex-shrink: 0;
+  font-weight: 500;
+}
+
+/* "Show more" / "Show less" toggle button */
+.tc-show-more {
+  all: unset;
+  font-size: var(--text-2xs);
+  font-family: var(--font-mono);
+  color: var(--info);
+  cursor: pointer;
+  padding: 2px 0;
+  margin-top: 2px;
+  font-weight: 500;
+}
+.tc-show-more:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
 /* ── Parallel tool group ── */
 .tc-group {
   border: 1px solid var(--border-subtle);
