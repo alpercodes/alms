@@ -1,6 +1,9 @@
 import { html, useSignal } from '../../deps.js';
-import { toolSummary } from '../../utils/tool-summary.js';
+import { toolSummary, fmtSize } from '../../utils/tool-summary.js';
 import { TOOL_SUMMARY_LEN } from '../../utils/constants.js';
+
+/** Threshold (in characters) above which result text is truncated with a toggle. */
+const RESULT_TRUNCATE_LEN = 500;
 
 /** Format a duration in milliseconds to a human-readable string. */
 function fmtDuration(ms) {
@@ -25,6 +28,16 @@ function formatJson(val) {
         }
     }
     return JSON.stringify(val, null, 2);
+}
+
+/**
+ * Compute the byte size of a result for the size indicator.
+ * Uses Blob to compute actual UTF-8 byte size.
+ */
+function resultByteSize(result) {
+    if (result == null) return 0;
+    const text = typeof result === 'string' ? result : JSON.stringify(result);
+    return new Blob([text]).size;
 }
 
 /** Determine the tool icon based on tool name. */
@@ -67,9 +80,224 @@ function toolIcon(tool) {
     }
 }
 
+/**
+ * Extract a short filename from a path for display headers.
+ */
+function shortPath(path) {
+    if (!path) return '';
+    // Normalize separators and take the last 2 segments
+    const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
+    if (parts.length <= 2) return parts.join('/');
+    return '\u2026/' + parts.slice(-2).join('/');
+}
+
+/**
+ * Render the structured parameters section for a specific tool type.
+ * Returns an htm template for the params display.
+ */
+function renderParams(tool, params) {
+    if (!params) return null;
+
+    switch (tool) {
+        case 'shell':
+        case 'shell_exec':
+            if (params.command) {
+                return html`
+                    <div class="tc-detail-section">
+                        <div class="tc-detail-label">Command</div>
+                        <pre class="tc-detail-content tc-code-block">${params.command}</pre>
+                    </div>
+                `;
+            }
+            break;
+        case 'fs_read':
+            if (params.path) {
+                return html`
+                    <div class="tc-detail-section">
+                        <div class="tc-detail-label">Path</div>
+                        <pre class="tc-detail-content">${params.path}</pre>
+                    </div>
+                `;
+            }
+            break;
+        case 'fs_write':
+            return html`
+                <div class="tc-detail-section">
+                    <div class="tc-detail-label">
+                        ${params.mode === 'append' ? 'Append to' : 'Write to'}
+                    </div>
+                    <pre class="tc-detail-content">${params.path || ''}</pre>
+                </div>
+                ${params.content && html`
+                    <div class="tc-detail-section">
+                        <div class="tc-detail-label">Content</div>
+                        <pre class="tc-detail-content tc-code-block">${params.content}</pre>
+                    </div>
+                `}
+            `;
+        case 'invoke_agent': {
+            const name = params.name || params.subagent_name || '';
+            return html`
+                ${name && html`
+                    <div class="tc-detail-section">
+                        <div class="tc-detail-label">Agent</div>
+                        <pre class="tc-detail-content">${name}</pre>
+                    </div>
+                `}
+                ${params.task && html`
+                    <div class="tc-detail-section">
+                        <div class="tc-detail-label">Task</div>
+                        <pre class="tc-detail-content">${params.task}</pre>
+                    </div>
+                `}
+            `;
+        }
+        case 'http_get':
+            if (params.url) {
+                return html`
+                    <div class="tc-detail-section">
+                        <div class="tc-detail-label">URL</div>
+                        <pre class="tc-detail-content">${params.url}</pre>
+                    </div>
+                `;
+            }
+            break;
+        case 'send_message':
+            return html`
+                ${params.to && html`
+                    <div class="tc-detail-section">
+                        <div class="tc-detail-label">To</div>
+                        <pre class="tc-detail-content">${params.to}</pre>
+                    </div>
+                `}
+                ${params.message && html`
+                    <div class="tc-detail-section">
+                        <div class="tc-detail-label">Message</div>
+                        <pre class="tc-detail-content">${params.message}</pre>
+                    </div>
+                `}
+            `;
+    }
+
+    // Fallback: raw JSON for tools without specialized rendering
+    const text = formatJson(params);
+    if (!text) return null;
+    return html`
+        <div class="tc-detail-section">
+            <div class="tc-detail-label">Parameters</div>
+            <pre class="tc-detail-content">${text}</pre>
+        </div>
+    `;
+}
+
+/**
+ * Render the structured result section for a specific tool type.
+ * Includes truncation with "Show more" toggle for large results.
+ */
+function ResultSection({ tool, params, result, isFail, showFull }) {
+    const text = formatJson(result);
+    if (!text) return null;
+
+    const isLong = text.length > RESULT_TRUNCATE_LEN;
+    const displayText = (!showFull.value && isLong)
+        ? text.slice(0, RESULT_TRUNCATE_LEN) + '\u2026'
+        : text;
+
+    const expandedCls = showFull.value ? ' tc-detail-expanded' : '';
+
+    const toggleFull = (e) => {
+        e.stopPropagation();
+        showFull.value = !showFull.value;
+    };
+
+    // Shell / shell_exec: render output as a code block
+    if ((tool === 'shell' || tool === 'shell_exec') && !isFail) {
+        return html`
+            <div class="tc-detail-section">
+                <div class="tc-detail-label">Output</div>
+                <pre class="tc-detail-content tc-code-block${expandedCls}">${displayText}</pre>
+                ${isLong && html`
+                    <button class="tc-show-more" onClick=${toggleFull}>
+                        ${showFull.value ? 'Show less' : 'Show more'}
+                    </button>
+                `}
+            </div>
+        `;
+    }
+
+    // fs_read: show file path header with monospace content
+    if (tool === 'fs_read' && !isFail) {
+        const path = params?.path || '';
+        return html`
+            <div class="tc-detail-section">
+                <div class="tc-detail-label tc-file-header">
+                    ${path ? shortPath(path) : 'File content'}
+                </div>
+                <pre class="tc-detail-content tc-code-block${expandedCls}">${displayText}</pre>
+                ${isLong && html`
+                    <button class="tc-show-more" onClick=${toggleFull}>
+                        ${showFull.value ? 'Show less' : 'Show more'}
+                    </button>
+                `}
+            </div>
+        `;
+    }
+
+    // fs_write: show path and confirmation
+    if (tool === 'fs_write' && !isFail) {
+        return html`
+            <div class="tc-detail-section">
+                <div class="tc-detail-label">Result</div>
+                <pre class="tc-detail-content">${displayText}</pre>
+            </div>
+        `;
+    }
+
+    // invoke_agent: show subagent response summary
+    if (tool === 'invoke_agent' && !isFail) {
+        // The result may be a string or an object with a response/output field
+        let responseText = '';
+        if (typeof result === 'object' && result !== null) {
+            responseText = result.response || result.output || result.result || JSON.stringify(result, null, 2);
+        } else {
+            responseText = text;
+        }
+        const truncResponse = (!showFull.value && responseText.length > RESULT_TRUNCATE_LEN)
+            ? responseText.slice(0, RESULT_TRUNCATE_LEN) + '\u2026'
+            : responseText;
+
+        return html`
+            <div class="tc-detail-section">
+                <div class="tc-detail-label">Subagent response</div>
+                <pre class="tc-detail-content${expandedCls}">${truncResponse}</pre>
+                ${responseText.length > RESULT_TRUNCATE_LEN && html`
+                    <button class="tc-show-more" onClick=${toggleFull}>
+                        ${showFull.value ? 'Show less' : 'Show more'}
+                    </button>
+                `}
+            </div>
+        `;
+    }
+
+    // Default: show result with truncation
+    const label = isFail ? 'Error' : 'Result';
+    return html`
+        <div class="tc-detail-section">
+            <div class="tc-detail-label">${label}</div>
+            <pre class="tc-detail-content${expandedCls} ${isFail ? 'tc-detail-error' : ''}">${displayText}</pre>
+            ${isLong && !isFail && html`
+                <button class="tc-show-more" onClick=${toggleFull}>
+                    ${showFull.value ? 'Show less' : 'Show more'}
+                </button>
+            `}
+        </div>
+    `;
+}
+
 
 export function ToolRow({ tool, params, status, result, id, sourceAgent, durationMs }) {
     const expanded = useSignal(false);
+    const showFull = useSignal(false);
     const toggle = (e) => {
         e.stopPropagation();
         expanded.value = !expanded.value;
@@ -93,8 +321,9 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent, duratio
     const icon = toolIcon(tool);
     const duration = fmtDuration(durationMs);
 
-    const resultText = formatJson(result);
-    const paramsText = formatJson(params);
+    // Result size indicator (only shown when result exists and is not trivially small)
+    const size = result != null ? resultByteSize(result) : 0;
+    const sizeLabel = size >= 100 ? fmtSize(size) : '';
 
     return html`
         <div class="tc-row ${statusCls} ${isDm ? 'tc-dm' : ''}" role="button" tabindex="0"
@@ -108,6 +337,7 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent, duratio
                 <span class="tc-name">${tool}</span>
                 ${truncSummary && html`<span class="tc-summary">${truncSummary}</span>`}
                 <span class="tc-spacer"></span>
+                ${sizeLabel && html`<span class="tc-result-size">${sizeLabel}</span>`}
                 ${duration && html`<span class="tc-duration">${duration}</span>`}
                 ${isFail && html`<span class="tc-status-badge tc-badge-fail">failed</span>`}
                 ${isCancelled && html`<span class="tc-status-badge tc-badge-cancelled">cancelled</span>`}
@@ -115,18 +345,9 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent, duratio
             </div>
             ${expanded.value && html`
                 <div class="tc-detail" onClick=${(e) => e.stopPropagation()}>
-                    ${paramsText && html`
-                        <div class="tc-detail-section">
-                            <div class="tc-detail-label">Parameters</div>
-                            <pre class="tc-detail-content">${paramsText}</pre>
-                        </div>
-                    `}
-                    ${resultText && html`
-                        <div class="tc-detail-section">
-                            <div class="tc-detail-label">${isFail ? 'Error' : 'Result'}</div>
-                            <pre class="tc-detail-content ${isFail ? 'tc-detail-error' : ''}">${resultText}</pre>
-                        </div>
-                    `}
+                    ${renderParams(tool, params)}
+                    ${html`<${ResultSection} tool=${tool} params=${params}
+                        result=${result} isFail=${isFail} showFull=${showFull} />`}
                 </div>
             `}
         </div>

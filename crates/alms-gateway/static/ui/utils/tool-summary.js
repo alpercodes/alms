@@ -25,19 +25,40 @@ export function toolSummary(tool, params) {
             return params.path || '.';
         case 'workspace_write':
             return `${params.file || ''}: ${(params.content || '').slice(0, 60)}`;
-        case 'http_get':
-            return params.url || '';
+        case 'http_get': {
+            if (!params.url) return '';
+            try {
+                const host = new URL(params.url).hostname;
+                return host + ' ' + params.url;
+            } catch {
+                return params.url;
+            }
+        }
         case 'math':
             return params.operation ? params.operation + '(' + [params.a, params.b, params.n].filter(v => v !== undefined).join(', ') + ')' : '';
         case 'echo':
             return params.message || params.text || '';
         case 'send_message':
             return params.to ? `to ${params.to}` : '';
-        case 'invoke_agent':
-            return params.name || params.subagent_name || '';
-        case 'read_session':
-        case 'read_subagent_session':
-            return params.session_id ? params.session_id.slice(0, 8) + '...' : '';
+        case 'invoke_agent': {
+            const name = params.name || params.subagent_name || '';
+            const task = params.task || '';
+            if (name && task) {
+                const taskPreview = task.length > 60 ? task.slice(0, 60) + '\u2026' : task;
+                return `${name}: ${taskPreview}`;
+            }
+            return name;
+        }
+        case 'read_session': {
+            const sid = params.session_id ? params.session_id.slice(0, 8) + '\u2026' : '';
+            const tail = params.last_n ? ` (last ${params.last_n})` : '';
+            return sid + tail;
+        }
+        case 'read_subagent_session': {
+            const name = params.name || '';
+            const tail = params.last_n ? ` (last ${params.last_n})` : '';
+            return name + tail;
+        }
         case 'list_agents':
         case 'list_my_sessions':
             return '';
@@ -53,4 +74,15 @@ export function toolSummary(tool, params) {
             }).join(' ');
         }
     }
+}
+
+/**
+ * Format a byte count into a human-readable size string.
+ * @param {number} bytes
+ * @returns {string} e.g. "1.2 KB", "3.4 MB"
+ */
+export function fmtSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
