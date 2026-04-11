@@ -67,7 +67,7 @@ async function newSession() {
         const ctx = 'web-chat-' + Date.now();
         const resp = await createSession(activeAgentId.value, ctx);
         // Reload sessions
-        const data = await listSessions(activeAgentId.value);
+        const data = await listSessions(activeAgentId.value, { includeDms: true });
         batch(() => {
             sessions.value = data.sessions || [];
             activeSessionId.value = resp.session_id;
@@ -86,10 +86,24 @@ async function newSession() {
     }
 }
 
+/**
+ * Format a DM session label from its participants array.
+ * e.g. ["alice", "bob"] -> "alice <-> bob"
+ */
+function dmLabel(session) {
+    const parts = session.participants;
+    if (Array.isArray(parts) && parts.length >= 2) {
+        return parts.join(' <-> ');
+    }
+    // Fallback: use context_id
+    return session.context_id || session.id.slice(0, 8);
+}
+
 function SessionItem({ session }) {
     const confirming = useSignal(false);
     const deleteTimer = useSignal(null);
     const isActive = session.id === activeSessionId.value;
+    const isDm = session.session_type === 'dm';
 
     const onDeleteClick = (e) => {
         e.stopPropagation();
@@ -117,7 +131,7 @@ function SessionItem({ session }) {
                 });
             }
             // Refresh session list
-            const data = await listSessions(activeAgentId.value);
+            const data = await listSessions(activeAgentId.value, { includeDms: true });
             sessions.value = data.sessions || [];
         } catch (err) {
             console.error('[deleteSession] failed:', err);
@@ -130,15 +144,19 @@ function SessionItem({ session }) {
         confirming.value = false;
     };
 
+    const label = isDm ? dmLabel(session) : (session.context_id || session.id.slice(0, 8));
+    const dmClass = isDm ? ' session-item-dm' : '';
+
     return html`
-        <div class="session-item ${isActive ? 'active' : ''} ${hasActiveRun(session.id) ? 'has-run' : ''}"
+        <div class="session-item${dmClass} ${isActive ? 'active' : ''} ${hasActiveRun(session.id) ? 'has-run' : ''}"
              role="option"
              aria-selected=${isActive}
              tabindex="0"
-             title=${'ID: ' + session.id + '\nContext: ' + session.context_id}
+             title=${'ID: ' + session.id + '\nContext: ' + session.context_id + (isDm ? '\nType: DM' : '')}
              onClick=${() => selectSession(session.id)}
              onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(session.id); } }}>
-            <span class="session-label">${session.context_id || session.id.slice(0, 8)}</span>
+            ${isDm && html`<span class="session-dm-icon" aria-hidden="true" title="DM conversation">\u2194</span>`}
+            <span class="session-label">${label}</span>
             ${confirming.value
                 ? html`
                     <button class="session-delete-btn session-delete-confirm"
@@ -162,16 +180,29 @@ function SessionItem({ session }) {
 }
 
 export function SessionList() {
+    const allSessions = sessions.value;
+    const chatSessions = allSessions.filter(s => s.session_type !== 'dm');
+    const dmSessions = allSessions.filter(s => s.session_type === 'dm');
+
     return html`
         <div class="sidebar-section" style="flex:0 0 auto">
             <div class="sidebar-label">Sessions</div>
             <div id="session-list" role="listbox" aria-label="Sessions">
-                ${sessions.value.length === 0
+                ${chatSessions.length === 0 && dmSessions.length === 0
                     ? html`<div class="run-empty">No sessions</div>`
-                    : sessions.value.map(s => html`
-                        <${SessionItem} key=${s.id} session=${s} />
-                    `)
+                    : null
                 }
+                ${chatSessions.map(s => html`
+                    <${SessionItem} key=${s.id} session=${s} />
+                `)}
+                ${dmSessions.length > 0 && html`
+                    <div class="session-dm-divider">
+                        <span class="session-dm-divider-label">DM conversations</span>
+                    </div>
+                    ${dmSessions.map(s => html`
+                        <${SessionItem} key=${s.id} session=${s} />
+                    `)}
+                `}
             </div>
             <button id="new-session-btn" onClick=${newSession}>+ New session</button>
         </div>

@@ -75,7 +75,7 @@ async function loadAgentSessions(agentId) {
     const gen = ++switchGeneration;
 
     try {
-        const data = await listSessions(agentId);
+        const data = await listSessions(agentId, { includeDms: true });
         if (gen !== switchGeneration) return; // stale — discard
         const agentSessions = data.sessions || [];
         sessions.value = agentSessions;
@@ -97,7 +97,7 @@ async function loadAgentSessions(agentId) {
             const ctx = 'web-chat-' + Date.now();
             const resp = await createSession(agentId, ctx);
             if (gen !== switchGeneration) return; // stale — discard
-            const reloaded = await listSessions(agentId);
+            const reloaded = await listSessions(agentId, { includeDms: true });
             if (gen !== switchGeneration) return; // stale — discard
             sessions.value = reloaded.sessions || [];
             activeSessionId.value = resp.session_id;
