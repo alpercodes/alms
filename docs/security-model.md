@@ -100,6 +100,9 @@ ALMS should support multiple security postures.
 - creating/modifying cronjobs
 - reading secrets
 
+### Auto-approved tools
+Certain inherently safe, read-only tools bypass the approval gate entirely — even in Guarded posture. These tools implement `is_auto_approved() -> true` in the `Tool` trait. The current auto-approved set is: `datetime`, `echo`, `list_agents`, `list_my_sessions`, `read_session`, `read_messages`, `read_subagent_session`. All other tools (including `shell`, `fs_write`, `invoke_agent`, etc.) still require approval in Guarded posture.
+
 ### Approval UI/UX
 Approvals must show:
 - exact command / action
@@ -278,6 +281,7 @@ Default posture recommendations:
 - Strict output truncation — **implemented**: 30KB stdout/stderr cap with head+tail line preservation, 32KB fs_read cap, UTF-8 safe truncation
 - No `sudo` — not yet enforced (command denylist not implemented; use OS-level restrictions)
 - Network allowlist empty by default — not yet implemented
+- Auto-approved tools skip approval in Guarded posture — **implemented**: `datetime`, `echo`, `list_agents`, `list_my_sessions`, `read_session`, `read_messages`, `read_subagent_session` return `is_auto_approved() = true`; all other tools still require user approval
 - Cronjob creation requires approval — implemented via Guarded posture
   - **Exception:** When a run is system-triggered — peer-to-peer DMs (via `send_message`), notification runs (e.g., `ConversationEnded`), subagent completions, and scheduled jobs — Guarded posture is automatically overridden to Autonomous via the `is_system_triggered` flag, because there is no human in the loop to approve tool calls (the run would hang indefinitely otherwise). This means a system-triggered run on a Guarded agent can execute tools — including cronjob creation — without approval. The override is safe because `is_system_triggered` is set internally by the gateway's `enqueue_triggered_run` helper and `fire_job_run` function (not controllable via the HTTP `create_run` API), but operators should be aware of this trade-off when configuring agent postures.
 

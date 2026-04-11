@@ -386,6 +386,78 @@ async fn test_guarded_posture_sequential_approvals() {
     );
 }
 
+#[tokio::test]
+async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
+    // Prove that an auto-approved tool (echo) executes successfully under
+    // Guarded posture WITHOUT ever emitting an ApprovalRequired event.
+    // This is the positive-case complement to
+    // `test_guarded_posture_sequential_approvals` (which verifies that
+    // non-auto-approved tools DO require approval).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // Include only `echo` — an auto-approved builtin.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["echo".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(config).unwrap(),
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: None,
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        agent_name: None,
+    };
+
+    let tc = ToolCall::new("tc1", "echo", r#"{"message":"hello"}"#);
+
+    // Execute the auto-approved tool — should succeed without blocking.
+    let result = runtime
+        .execute_tool_call(&tc, uuid::Uuid::new_v4(), &session_manager, session.id)
+        .await;
+    assert!(
+        result.is_ok(),
+        "Auto-approved tool should execute without approval"
+    );
+
+    // Drop the runtime's sender so the channel closes.
+    drop(runtime);
+
+    // Drain all events and verify no ApprovalRequired was ever emitted.
+    let mut saw_approval = false;
+    let mut saw_tool_start = false;
+    let mut saw_tool_end = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            RuntimeEvent::ApprovalRequired { .. } => saw_approval = true,
+            RuntimeEvent::ToolStart { .. } => saw_tool_start = true,
+            RuntimeEvent::ToolEnd { .. } => saw_tool_end = true,
+            _ => {}
+        }
+    }
+    assert!(
+        !saw_approval,
+        "Auto-approved tool must NOT emit ApprovalRequired"
+    );
+    assert!(saw_tool_start, "Should have emitted ToolStart");
+    assert!(saw_tool_end, "Should have emitted ToolEnd");
+}
+
 #[test]
 fn test_invalid_sandbox_root_fails_closed() {
     let config = crate::llm_types::LlmConfig {
