@@ -32,7 +32,7 @@ import { batch } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
 import { activeRunId } from '../state/runs.js';
-import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId } from '../state/subagents.js';
+import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { setAgentPhase, clearAgentPhase } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
@@ -424,6 +424,11 @@ export function openSessionStream(sessionId, opts) {
                             || updatedMsg.params?.subagent_name
                             || findSubagentByToolInvocationId(matchId);
                         if (name) {
+                            // Capture session_id from invoke_agent result for
+                            // drill-down navigation before ending the subagent.
+                            if (resultObj && resultObj.session_id) {
+                                setSubagentSessionId(name, resultObj.session_id);
+                            }
                             trackSubagentEnd(name, status);
                         }
                     }
@@ -473,17 +478,38 @@ export function openSessionStream(sessionId, opts) {
             const data = JSON.parse(e.data);
             const name = data.subagent_name || 'subagent';
             const status = data.status || 'done';
+            const sessionId = data.subagent_session_id || null;
+            const summary = data.summary || '';
 
-            // Update SubagentBar (stays visible until notification run finishes)
+            // Look up subagent entry for metadata (task, tool count, duration)
+            const entry = activeSubagents.value[name]
+                || Object.values(activeSubagents.value).find(
+                    e => e.displayName === name || (name === 'subagent' && e.status === 'running')
+                );
+
+            const task = entry ? entry.task : '';
+            const toolCount = entry ? entry.tools.length : 0;
+            const durationMs = entry && entry.startedAt ? Date.now() - entry.startedAt : null;
+
+            // If subagent_session_id is provided, store it on the subagent entry
+            if (sessionId) {
+                setSubagentSessionId(name, sessionId);
+            }
+
+            // Update SubagentBar (stays visible until auto-remove delay)
             trackSubagentEnd(name, status);
 
-            // Show system message in chat
-            const label = status === 'done' ? 'completed'
-                : status === 'fail' ? 'failed'
-                : status === 'cancelled' ? 'cancelled' : 'completed';
+            // Render a rich completion card instead of a plain system message
             appendMessage({
-                id: nextMsgId(), type: 'system',
-                text: `Subagent '${name}' ${label}.`,
+                id: nextMsgId(),
+                type: 'subagent_completed',
+                name,
+                task,
+                status,
+                toolCount,
+                durationMs,
+                sessionId,
+                summary,
             });
         });
     });

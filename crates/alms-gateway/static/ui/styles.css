@@ -2645,6 +2645,20 @@ select.settings-input-sm {
   padding: 0 var(--space-1);
 }
 .sa-panel-close:hover { color: var(--text-primary); }
+.sa-panel-view-btn {
+  background: none;
+  border: 1px solid var(--info);
+  color: var(--info);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-sm);
+  transition: all var(--duration-fast);
+}
+.sa-panel-view-btn:hover {
+  background: var(--info-muted);
+}
 .sa-panel-tools { padding: var(--space-1) 0; }
 .sa-panel-empty {
   color: var(--text-disabled);
@@ -3035,5 +3049,149 @@ select.settings-input-sm {
   font-size: var(--text-2xs);
   color: var(--text-disabled);
   font-style: italic;
+}
+
+/* ── Subagent completion card ── */
+.sa-card {
+  align-self: flex-start;
+  max-width: 100%;
+  width: 100%;
+  background: var(--surface-1);
+  border: 1px solid var(--info);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  margin: var(--space-2) 0;
+}
+.sa-card--fail {
+  border-color: var(--error);
+}
+.sa-card--cancelled {
+  border-color: var(--border-subtle);
+}
+.sa-card-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+.sa-card-icon {
+  flex-shrink: 0;
+  font-size: var(--text-sm);
+}
+.sa-card--done .sa-card-icon { color: var(--success); }
+.sa-card--fail .sa-card-icon { color: var(--error); }
+.sa-card--cancelled .sa-card-icon { color: var(--text-disabled); }
+.sa-card-badge {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+}
+.sa-card--done .sa-card-badge {
+  background: var(--success-muted);
+  color: var(--success);
+}
+.sa-card--fail .sa-card-badge {
+  background: var(--error-muted);
+  color: var(--error);
+}
+.sa-card--cancelled .sa-card-badge {
+  background: var(--surface-2);
+  color: var(--text-disabled);
+}
+.sa-card-label {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+.sa-card-meta {
+  color: var(--text-disabled);
+  font-size: var(--text-2xs);
+}
+.sa-card-name {
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.sa-card-task {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.sa-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.sa-card-summary {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.sa-card-toggle {
+  align-self: flex-start;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--info);
+  padding: 0;
+}
+.sa-card-toggle:hover {
+  text-decoration: underline;
+}
+.sa-card-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+.sa-card-view-btn {
+  background: none;
+  border: 1px solid var(--info);
+  color: var(--info);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  transition: all var(--duration-fast);
+}
+.sa-card-view-btn:hover {
+  background: var(--info-muted);
+}
+
+/* ── Subagent breadcrumb (back to parent) ── */
+.sa-breadcrumb {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  position: sticky;
+  top: 0;
+  z-index: 5;
+}
+.sa-breadcrumb-btn {
+  background: none;
+  border: 1px solid var(--info);
+  color: var(--info);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  transition: all var(--duration-fast);
+}
+.sa-breadcrumb-btn:hover {
+  background: var(--info-muted);
 }
 

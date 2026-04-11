@@ -253,12 +253,28 @@ function ResultSection({ tool, params, result, isFail, showFull }) {
         `;
     }
 
-    // invoke_agent: show subagent response summary
-    if (tool === 'invoke_agent' && !isFail) {
-        // The result may be a string or an object with a response/output field
+    // invoke_agent: show formatted subagent result summary
+    if (tool === 'invoke_agent') {
+        const resultObj = typeof result === 'object' && result !== null ? result : null;
+        const isBackground = resultObj && resultObj.task_id;
+
+        // Background subagent: just show the task_id
+        if (isBackground) {
+            return html`
+                <div class="tc-detail-section">
+                    <div class="tc-detail-label">Background task started</div>
+                    <pre class="tc-detail-content">task_id: ${resultObj.task_id}</pre>
+                </div>
+            `;
+        }
+
+        // Extract response text from various result shapes
         let responseText = '';
-        if (typeof result === 'object' && result !== null) {
-            responseText = result.response || result.output || result.result || JSON.stringify(result, null, 2);
+        if (resultObj) {
+            responseText = resultObj.response || resultObj.output || resultObj.result || '';
+            if (!responseText && typeof result !== 'string') {
+                responseText = JSON.stringify(result, null, 2);
+            }
         } else {
             responseText = text;
         }
@@ -266,14 +282,21 @@ function ResultSection({ tool, params, result, isFail, showFull }) {
             ? responseText.slice(0, RESULT_TRUNCATE_LEN) + '\u2026'
             : responseText;
 
+        // Build a status line for the subagent
+        const statusLine = isFail ? 'Failed' : 'Completed';
+
         return html`
             <div class="tc-detail-section">
-                <div class="tc-detail-label">Subagent response</div>
-                <pre class="tc-detail-content${expandedCls}">${truncResponse}</pre>
-                ${responseText.length > RESULT_TRUNCATE_LEN && html`
-                    <button class="tc-show-more" onClick=${toggleFull}>
-                        ${showFull.value ? 'Show less' : 'Show more'}
-                    </button>
+                <div class="tc-detail-label">
+                    Subagent ${statusLine}
+                </div>
+                ${responseText && html`
+                    <pre class="tc-detail-content${expandedCls} ${isFail ? 'tc-detail-error' : ''}">${truncResponse}</pre>
+                    ${responseText.length > RESULT_TRUNCATE_LEN && html`
+                        <button class="tc-show-more" onClick=${toggleFull}>
+                            ${showFull.value ? 'Show less' : 'Show more'}
+                        </button>
+                    `}
                 `}
             </div>
         `;
