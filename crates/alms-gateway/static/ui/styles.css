@@ -1,6 +1,6 @@
 
-/* ── Light mode ── */
-[data-theme='light'] {
+/* ── Light mode (html prefix for higher specificity than :root) ── */
+html[data-theme='light'] {
   --surface-0: #ffffff;
   --surface-1: #f4f4f5;
   --surface-2: #e4e4e7;
@@ -902,7 +902,7 @@ header h1 {
   letter-spacing: 0.02em;
   white-space: nowrap;
 }
-[data-theme='light'] .msg-warning-code {
+html[data-theme='light'] .msg-warning-code {
   background: rgba(202, 138, 4, 0.15);
 }
 .msg-warning-toggle {
