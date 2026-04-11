@@ -9,8 +9,8 @@ use crate::api_error;
 use crate::server::AppState;
 use crate::sse::SseEventData;
 use alms_core::{
-    CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus, RunStatusResponse,
-    SessionId,
+    AgentId, CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus,
+    RunStatusResponse, SessionId, classify_session_type,
 };
 use alms_runtime::RuntimeEvent;
 use alms_tools::message_sender::{ConversationEndReason, MessageSender as _};
@@ -18,29 +18,193 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
 };
 use chrono::Utc;
 use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-/// GET /runs?session_id=<uuid>&limit=<n> — list runs for a session
+/// GET /runs?session_id=<uuid>&limit=<n> — list runs for a session (existing)
+/// GET /runs?agent_id=<uuid>&limit=<n> — list runs across all sessions for an agent
+///
+/// Exactly one of `session_id` or `agent_id` must be provided. Providing both
+/// returns 400 BAD_REQUEST.
+/// When `agent_id` is provided, the response includes enriched run entries
+/// with `session_type`, `trigger`, `context_id`, and `duration_ms` fields
+/// for the agent run log panel.
+#[instrument(level = "info", skip(state, params))]
 pub async fn list_runs(
     State(state): State<AppState>,
     Query(params): Query<ListRunsQuery>,
-) -> impl IntoResponse {
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let limit = params.limit.unwrap_or(50);
-    let runs = state.run_manager.list_by_session(params.session_id, limit);
-    let responses: Vec<RunStatusResponse> = runs.into_iter().map(RunStatusResponse::from).collect();
-    Json(serde_json::json!({ "runs": responses }))
+
+    // Reject ambiguous requests that supply both filters.
+    if params.session_id.is_some() && params.agent_id.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "AMBIGUOUS_FILTER",
+            "Provide either `session_id` or `agent_id`, not both",
+        ));
+    }
+
+    if let Some(agent_id) = params.agent_id {
+        // Agent-level listing: cross-session runs with enriched metadata.
+        let runs = state.run_manager.list_by_agent(agent_id, limit);
+        let entries: Vec<AgentRunEntry> = runs
+            .into_iter()
+            .map(|run| enrich_run(&state, run))
+            .collect();
+        Ok(Json(serde_json::json!({ "runs": entries })))
+    } else if let Some(session_id) = params.session_id {
+        // Session-level listing: original behaviour (backwards-compatible).
+        let runs = state.run_manager.list_by_session(session_id, limit);
+        let responses: Vec<RunStatusResponse> =
+            runs.into_iter().map(RunStatusResponse::from).collect();
+        Ok(Json(serde_json::json!({ "runs": responses })))
+    } else {
+        Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "MISSING_FILTER",
+            "At least one of `session_id` or `agent_id` must be provided",
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ListRunsQuery {
-    pub session_id: SessionId,
+    pub session_id: Option<SessionId>,
+    pub agent_id: Option<AgentId>,
     pub limit: Option<usize>,
+}
+
+/// Enriched run entry for the agent run log panel.
+///
+/// Extends `RunStatusResponse` with session type classification, trigger
+/// derivation, context ID, and computed duration.
+#[derive(Debug, Serialize)]
+pub struct AgentRunEntry {
+    pub run_id: RunId,
+    pub session_id: SessionId,
+    pub agent_id: AgentId,
+    pub status: RunStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub usage: Option<alms_core::TokenUsage>,
+    pub ts: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<alms_core::JobId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<RunId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_count: Option<u32>,
+    /// Session type: "chat", "dm", "notification", "job", "subagent",
+    /// "telegram", "episodic"
+    pub session_type: String,
+    /// Trigger derivation: "user", "scheduled", "subagent", "dm",
+    /// "notification", "telegram"
+    pub trigger: String,
+    /// The session's context_id (for display and navigation).
+    pub context_id: String,
+    /// Run duration in milliseconds (None if run has not ended).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+}
+
+/// Enrich a `Run` with session type, trigger, context_id, and duration.
+fn enrich_run(state: &AppState, run: Run) -> AgentRunEntry {
+    // Look up the session to get context_id for classification.
+    let (context_id, session_type) = match state.session_manager.get(run.session_id) {
+        Ok(session) => {
+            let st = classify_session_type(&session.context_id).to_string();
+            (session.context_id.clone(), st)
+        }
+        Err(_) => ("unknown".to_string(), "chat".to_string()),
+    };
+
+    // Derive trigger from run metadata and session context.
+    let trigger = derive_trigger(&run, &context_id);
+
+    // Compute duration if both started_at and ended_at are present.
+    let duration_ms = match (run.started_at, run.ended_at) {
+        (Some(start), Some(end)) => Some((end - start).num_milliseconds()),
+        _ => None,
+    };
+
+    let ts = run
+        .ended_at
+        .unwrap_or_else(|| run.started_at.unwrap_or(run.created_at));
+
+    // Attach tool call count if SQLite is available.
+    let tool_call_count = state
+        .session_manager
+        .store()
+        .and_then(|store| store.count_tool_calls(run.run_id).ok());
+
+    /// Max characters to include in the `response` field of listing entries.
+    /// Full text is available via `GET /runs/{run_id}`.
+    const RESPONSE_TRUNCATE_LEN: usize = 200;
+
+    let response = run.output.map(|s| {
+        if s.len() > RESPONSE_TRUNCATE_LEN {
+            let mut truncated = s[..RESPONSE_TRUNCATE_LEN].to_string();
+            truncated.push_str("...");
+            truncated
+        } else {
+            s
+        }
+    });
+
+    AgentRunEntry {
+        run_id: run.run_id,
+        session_id: run.session_id,
+        agent_id: run.agent_id,
+        status: run.status,
+        response,
+        error: run.error,
+        started_at: run.started_at,
+        ended_at: run.ended_at,
+        usage: run.usage,
+        ts,
+        job_id: run.job_id,
+        parent_run_id: run.parent_run_id,
+        tool_call_count,
+        session_type,
+        trigger,
+        context_id,
+        duration_ms,
+    }
+}
+
+/// Derive the trigger type for a run based on its metadata and session context.
+///
+/// Priority:
+/// 1. `job_id` present -> "scheduled"
+/// 2. `parent_run_id` present -> "subagent"
+/// 3. Delegate to [`classify_session_type`] for context_id-based classification,
+///    mapping session types to trigger names (dm, notification, telegram).
+/// 4. Default -> "user"
+fn derive_trigger(run: &Run, context_id: &str) -> String {
+    if run.job_id.is_some() {
+        return "scheduled".to_string();
+    }
+    if run.parent_run_id.is_some() {
+        return "subagent".to_string();
+    }
+    // Delegate to the canonical session type classifier for context_id-based
+    // triggers, avoiding duplicated prefix checks.
+    match classify_session_type(context_id) {
+        "dm" => "dm".to_string(),
+        "notification" => "notification".to_string(),
+        "telegram" => "telegram".to_string(),
+        _ => "user".to_string(),
+    }
 }
 
 /// GET /runs/{run_id}/tool-calls — list tool call records for a run.
@@ -1079,5 +1243,88 @@ pub async fn get_run_status(
             "NOT_FOUND",
             "Run not found",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alms_core::{AgentId, SessionId, job::JobId};
+
+    /// Helper to create a basic run for testing.
+    fn test_run() -> Run {
+        Run::new(SessionId::new(), AgentId::new(), "test".into())
+    }
+
+    #[test]
+    fn test_derive_trigger_user() {
+        let run = test_run();
+        assert_eq!(derive_trigger(&run, "web"), "user");
+        assert_eq!(derive_trigger(&run, "default"), "user");
+        assert_eq!(derive_trigger(&run, "my-context"), "user");
+    }
+
+    #[test]
+    fn test_derive_trigger_scheduled() {
+        let run = Run::for_job(
+            SessionId::new(),
+            AgentId::new(),
+            "job task".into(),
+            JobId::new(),
+        );
+        assert_eq!(derive_trigger(&run, "job_abc"), "scheduled");
+        // job_id takes priority even if context_id looks like DM
+        assert_eq!(derive_trigger(&run, "dm:alice:bob"), "scheduled");
+    }
+
+    #[test]
+    fn test_derive_trigger_subagent() {
+        let run = Run::for_subagent(
+            SessionId::new(),
+            AgentId::new(),
+            "subtask".into(),
+            RunId::new(),
+        );
+        assert_eq!(derive_trigger(&run, "subagent_task_1"), "subagent");
+        // parent_run_id takes priority over context_id prefix
+        assert_eq!(derive_trigger(&run, "web"), "subagent");
+    }
+
+    #[test]
+    fn test_derive_trigger_dm() {
+        let run = test_run();
+        assert_eq!(derive_trigger(&run, "dm:alice:bob"), "dm");
+    }
+
+    #[test]
+    fn test_derive_trigger_notification() {
+        let run = test_run();
+        assert_eq!(derive_trigger(&run, "notifications:alice"), "notification");
+    }
+
+    #[test]
+    fn test_derive_trigger_telegram() {
+        let run = test_run();
+        assert_eq!(derive_trigger(&run, "telegram_123"), "telegram");
+    }
+
+    #[test]
+    fn test_derive_trigger_priority_job_over_context() {
+        // job_id should win over parent_run_id and context_id
+        let mut run = Run::for_job(
+            SessionId::new(),
+            AgentId::new(),
+            "job+sub".into(),
+            JobId::new(),
+        );
+        run.parent_run_id = Some(RunId::new());
+        assert_eq!(derive_trigger(&run, "dm:a:b"), "scheduled");
+    }
+
+    #[test]
+    fn test_derive_trigger_priority_subagent_over_context() {
+        // parent_run_id should win over context_id prefix
+        let run = Run::for_subagent(SessionId::new(), AgentId::new(), "sub".into(), RunId::new());
+        assert_eq!(derive_trigger(&run, "dm:a:b"), "subagent");
     }
 }

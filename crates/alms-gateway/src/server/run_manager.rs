@@ -339,6 +339,19 @@ impl RunManager {
         runs
     }
 
+    /// List runs for an agent across all sessions, newest first, up to `limit`.
+    pub fn list_by_agent(&self, agent_id: alms_core::AgentId, limit: usize) -> Vec<Run> {
+        let mut runs: Vec<Run> = self
+            .runs
+            .iter()
+            .filter(|e| e.value().agent_id == agent_id)
+            .map(|e| e.value().clone())
+            .collect();
+        runs.sort_by_key(|r| std::cmp::Reverse(r.created_at));
+        runs.truncate(limit);
+        runs
+    }
+
     /// Send event to all active subscribers AND persist to event log.
     /// Dead subscribers (closed channels) are pruned automatically.
     /// Fans out to both per-run and per-session subscribers.
@@ -852,5 +865,80 @@ mod tests {
 
         // Should drain almost immediately (well within 1s).
         assert!(rm.wait_drain(std::time::Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn test_list_by_agent_filters_by_agent_id() {
+        let rm = RunManager::new();
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+
+        // Insert 3 runs for agent_a and 1 for agent_b.
+        rm.insert_run(Run::new(SessionId::new(), agent_a, "a1".into()));
+        rm.insert_run(Run::new(SessionId::new(), agent_a, "a2".into()));
+        rm.insert_run(Run::new(SessionId::new(), agent_a, "a3".into()));
+        rm.insert_run(Run::new(SessionId::new(), agent_b, "b1".into()));
+
+        let runs_a = rm.list_by_agent(agent_a, 50);
+        assert_eq!(runs_a.len(), 3);
+        assert!(runs_a.iter().all(|r| r.agent_id == agent_a));
+
+        let runs_b = rm.list_by_agent(agent_b, 50);
+        assert_eq!(runs_b.len(), 1);
+        assert_eq!(runs_b[0].agent_id, agent_b);
+    }
+
+    #[tokio::test]
+    async fn test_list_by_agent_respects_limit() {
+        let rm = RunManager::new();
+        let agent_id = AgentId::new();
+
+        for i in 0..5 {
+            rm.insert_run(Run::new(SessionId::new(), agent_id, format!("run {i}")));
+        }
+
+        let runs = rm.list_by_agent(agent_id, 3);
+        assert_eq!(runs.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_list_by_agent_sorted_newest_first() {
+        let rm = RunManager::new();
+        let agent_id = AgentId::new();
+
+        let r1 = Run::new(SessionId::new(), agent_id, "first".into());
+        let r2 = Run::new(SessionId::new(), agent_id, "second".into());
+        rm.insert_run(r1);
+        rm.insert_run(r2);
+
+        let runs = rm.list_by_agent(agent_id, 50);
+        assert_eq!(runs.len(), 2);
+        // Newest first: second run should come before first.
+        assert!(runs[0].created_at >= runs[1].created_at);
+    }
+
+    #[tokio::test]
+    async fn test_list_by_agent_spans_multiple_sessions() {
+        let rm = RunManager::new();
+        let agent_id = AgentId::new();
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+
+        rm.insert_run(Run::new(session_a, agent_id, "sa".into()));
+        rm.insert_run(Run::new(session_b, agent_id, "sb".into()));
+
+        let runs = rm.list_by_agent(agent_id, 50);
+        assert_eq!(runs.len(), 2);
+
+        let session_ids: std::collections::HashSet<_> = runs.iter().map(|r| r.session_id).collect();
+        assert!(session_ids.contains(&session_a));
+        assert!(session_ids.contains(&session_b));
+    }
+
+    #[tokio::test]
+    async fn test_list_by_agent_empty() {
+        let rm = RunManager::new();
+        let runs = rm.list_by_agent(AgentId::new(), 50);
+        assert!(runs.is_empty());
     }
 }
