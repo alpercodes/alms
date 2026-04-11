@@ -561,11 +561,23 @@ export function openSessionStream(sessionId, opts) {
                 const isStaleApproval = (m) =>
                     m.type === 'approval' && !m.resolved
                     && (!m.runId || !endingRunId || m.runId === endingRunId);
-                let msgs = prev.map(m =>
-                    isStaleApproval(m)
-                        ? { ...m, resolved: true, decision }
-                        : m
-                );
+
+                // Mark any still-running tool messages as cancelled.
+                // When a run is cancelled (or errors) mid-tool-execution, the
+                // backend emits run_cancelled but never emits tool_end for in-
+                // flight tools, leaving the spinner animation stuck.  (Fixes #593)
+                const isStuckTool = (m) =>
+                    m.type === 'tool' && m.status === 'running';
+
+                let msgs = prev.map(m => {
+                    if (isStaleApproval(m)) {
+                        return { ...m, resolved: true, decision };
+                    }
+                    if (isStuckTool(m)) {
+                        return { ...m, status: 'cancelled' };
+                    }
+                    return m;
+                });
 
                 if (status === 'error') {
                     const code = data.error?.code || 'INTERNAL';
