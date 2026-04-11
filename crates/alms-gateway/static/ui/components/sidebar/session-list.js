@@ -8,6 +8,7 @@ import { auditEvents } from '../../state/audit.js';
 import { sessionSwitchLoading } from '../../state/loading.js';
 import { listSessions, createSession, deleteSession } from '../../api/sessions.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
+import { clearAllSubagents } from '../../state/subagents.js';
 import { saveActiveSession } from '../../hooks/use-boot.js';
 import { selectGeneration, bumpSelectGeneration } from '../../state/select-generation.js';
 import { loadSession } from '../../utils/load-session.js';
@@ -32,6 +33,7 @@ async function selectSession(sessionId) {
     replaceMessages([]);
     messageQueue.value = [];
     auditEvents.value = null;
+    clearAllSubagents();
     sessionSwitchLoading.value = true;
 
     // Persist the selection for this agent
@@ -74,6 +76,7 @@ async function newSession() {
             messageQueue.value = [];
             runs.value = [];
             auditEvents.value = null;
+            clearAllSubagents();
         });
         openSessionStream(resp.session_id);
     } catch (err) {
@@ -107,6 +110,7 @@ function SessionItem({ session }) {
                     replaceMessages([]);
                     runs.value = [];
                     auditEvents.value = null;
+                    clearAllSubagents();
                 });
             }
             // Refresh session list

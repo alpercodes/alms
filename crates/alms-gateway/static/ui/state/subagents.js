@@ -52,6 +52,11 @@ export function clearCompletedSubagents() {
     activeSubagents.value = filtered;
 }
 
+/** Clear all subagent entries regardless of status. */
+export function clearAllSubagents() {
+    activeSubagents.value = {};
+}
+
 /** Check if any subagents are still running. */
 export function hasRunningSubagents() {
     return Object.values(activeSubagents.value).some(s => s.status === 'running');
