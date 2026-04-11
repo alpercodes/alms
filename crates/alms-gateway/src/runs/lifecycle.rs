@@ -670,12 +670,24 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // `notification_input: true` metadata. This ensures:
     //
     //  1. The context builder includes it as a **user** message in the LLM
-    //     context window, satisfying the Anthropic Messages API requirement
-    //     that the conversation ends with a user message. (The previous
-    //     approach used Role::System, which Anthropic extracts into the
-    //     top-level system field — leaving the messages array ending with
-    //     an assistant message from the prior conversation, causing API
-    //     rejection.)
+    //     context window. This is required across all providers:
+    //
+    //     - **Anthropic (direct)**: The Anthropic Messages API extracts
+    //       system messages into the top-level `system` field. With the
+    //       previous Role::System approach, the messages array ended with
+    //       an assistant message from the prior conversation, causing API
+    //       rejection. Role::User ensures a valid trailing user turn.
+    //
+    //     - **OpenRouter (all models)**: OpenRouter uses the OpenAI chat
+    //       completions format. While the API technically accepts a
+    //       trailing system message, models are not trained to generate
+    //       responses to system messages without a subsequent user turn.
+    //       When proxying to Claude, OpenRouter performs the same system
+    //       message extraction as the direct Anthropic API, causing the
+    //       identical failure. For non-Claude models, a trailing system
+    //       message produces empty or confused responses. Role::User
+    //       ensures the notification is a clear conversation turn that
+    //       all models respond to naturally.
     //
     //  2. `get_session_messages` filters it out via the
     //     `notification_input` metadata flag, making it invisible on page
@@ -698,8 +710,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // Notification run landing on a user-facing session.
         //
         // Pre-persist the input as Role::User with `notification_input`
-        // metadata so the context builder sees it as a user message (the
-        // LLM needs a trailing user turn for Anthropic compatibility).
+        // metadata so the context builder sees it as a user message.
+        // This is required for all providers — see the detailed comment
+        // above `is_notification_on_user_session` for the full rationale.
+        //
         // `get_session_messages` filters it out on reload so the internal
         // prompt never appears as a "user" bubble.
         //
