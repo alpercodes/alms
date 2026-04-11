@@ -97,6 +97,14 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Check whether a tool is auto-approved (bypasses approval in guarded posture).
+    pub fn is_auto_approved(&self, name: &str) -> bool {
+        self.registry
+            .lookup(name)
+            .map(|t| t.is_auto_approved())
+            .unwrap_or(false)
+    }
+
     /// Execute a tool by name via sandbox
     pub async fn execute(&self, name: &str, params: Value) -> AlmsResult<Value> {
         debug!("Executing tool via sandbox: {}", name);

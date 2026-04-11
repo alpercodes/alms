@@ -79,6 +79,10 @@ impl Tool for ListAgentsTool {
     fn is_builtin(&self) -> bool {
         true
     }
+
+    fn is_auto_approved(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

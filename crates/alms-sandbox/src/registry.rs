@@ -155,7 +155,7 @@ impl ToolRegistry {
         enabled: &[String],
     ) {
         use crate::builtin::{
-            EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
+            DatetimeTool, EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
         };
         use crate::shell::{SHELL_TOOL_ALIAS, SHELL_TOOL_NAME, ShellTool};
 
@@ -175,6 +175,7 @@ impl ToolRegistry {
 
         let all_tools: Vec<Arc<dyn Tool>> = vec![
             Arc::new(EchoTool::new()),
+            Arc::new(DatetimeTool::new()),
             Arc::new(MathTool::new()),
             Arc::new(HttpGetTool::new()),
             Arc::clone(&shell_tool),
@@ -220,7 +221,9 @@ impl ToolRegistry {
             "send_message",
             "workspace_write",
             "list_agents",
+            "list_my_sessions",
             "read_messages",
+            "read_session",
             "ignore_message",
         ];
         for name in enabled {
@@ -437,6 +440,7 @@ mod tests {
     fn test_empty_enabled_registers_all_builtins() {
         let registry = ToolRegistry::with_builtin_tools_sandboxed(None, false, &[]);
         assert!(registry.contains("echo"));
+        assert!(registry.contains("datetime"));
         assert!(registry.contains("math"));
         assert!(registry.contains("http_get"));
         assert!(registry.contains("shell")); // primary name
@@ -444,8 +448,8 @@ mod tests {
         assert!(registry.contains("fs_read"));
         assert!(registry.contains("fs_write"));
         assert!(registry.contains("fs_list"));
-        // 7 builtins + 1 alias (shell_exec -> shell) = 8 entries
-        assert_eq!(registry.len(), 8);
+        // 8 builtins + 1 alias (shell_exec -> shell) = 9 entries
+        assert_eq!(registry.len(), 9);
     }
 
     #[test]
@@ -482,6 +486,25 @@ mod tests {
             .register_native("invoke_agent", |_| Ok(Value::Null))
             .unwrap();
         assert!(registry.contains("invoke_agent"));
-        assert_eq!(registry.len(), 9); // 7 builtins + 1 alias + 1 dynamic
+        assert_eq!(registry.len(), 10); // 8 builtins + 1 alias + 1 dynamic
+    }
+
+    #[test]
+    fn test_auto_approved_tools_via_registry() {
+        let registry = ToolRegistry::with_builtin_tools();
+        // echo and datetime are auto-approved
+        let echo = registry.lookup("echo").unwrap();
+        assert!(echo.is_auto_approved(), "echo should be auto-approved");
+        let datetime = registry.lookup("datetime").unwrap();
+        assert!(
+            datetime.is_auto_approved(),
+            "datetime should be auto-approved"
+        );
+        // shell is NOT auto-approved
+        let shell = registry.lookup("shell").unwrap();
+        assert!(
+            !shell.is_auto_approved(),
+            "shell should NOT be auto-approved"
+        );
     }
 }

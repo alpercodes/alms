@@ -838,8 +838,17 @@ impl AgentRuntime {
             });
         }
 
-        // Guarded posture: block until user approves or denies
-        if self.config.posture == Posture::Guarded {
+        // Guarded posture: block until user approves or denies.
+        // Auto-approved tools (datetime, echo, read-only tools) bypass this
+        // gate — they are inherently safe and requiring approval adds friction
+        // with zero security benefit.
+        let auto_approved = self.tools.is_auto_approved(name);
+        if self.config.posture == Posture::Guarded && auto_approved {
+            debug!(
+                tool_name = %name,
+                "Auto-approved tool — skipping approval gate in guarded posture"
+            );
+        } else if self.config.posture == Posture::Guarded {
             let sender = self.event_sender.as_ref().ok_or_else(|| {
                 alms_core::AlmsError::Runtime(
                     "Guarded posture requires an event sender for approvals".to_string(),

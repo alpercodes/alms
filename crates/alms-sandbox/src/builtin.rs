@@ -1,6 +1,7 @@
 use crate::shell::security::DENIED_FILENAMES;
 use crate::{SandboxError, Tool, error::SandboxResult};
 use alms_core::truncate_to_char_boundary;
+use chrono::Utc;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 
@@ -152,6 +153,10 @@ impl Tool for EchoTool {
         true
     }
 
+    fn is_auto_approved(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -172,6 +177,57 @@ impl Tool for EchoTool {
         } else {
             Ok(params)
         }
+    }
+}
+
+/// Datetime tool - returns the current date and time.
+///
+/// Agents use this to know what time it is. Returns ISO 8601 timestamp,
+/// human-readable format, and UTC offset. Always auto-approved.
+#[derive(Debug, Clone, Default)]
+pub struct DatetimeTool;
+
+impl DatetimeTool {
+    /// Create a new datetime tool
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for DatetimeTool {
+    fn name(&self) -> &str {
+        "datetime"
+    }
+
+    fn description(&self) -> &str {
+        "Returns the current date and time in ISO 8601 format, \
+         a human-readable format, and the timezone. \
+         Use this whenever you need to know the current time."
+    }
+
+    fn is_builtin(&self) -> bool {
+        true
+    }
+
+    fn is_auto_approved(&self) -> bool {
+        true
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+        })
+    }
+
+    async fn execute(&self, _params: Value) -> SandboxResult<Value> {
+        let now = Utc::now();
+        Ok(serde_json::json!({
+            "iso": now.to_rfc3339(),
+            "human": now.format("%A, %B %-d, %Y %-I:%M %p").to_string(),
+            "timezone": "UTC",
+        }))
     }
 }
 
@@ -801,6 +857,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, serde_json::json!({"key": "value"}));
+    }
+
+    // ── DatetimeTool ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_datetime_tool_returns_valid_fields() {
+        let tool = DatetimeTool::new();
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+
+        // Must contain all three expected fields
+        assert!(result.get("iso").is_some(), "missing 'iso' field");
+        assert!(result.get("human").is_some(), "missing 'human' field");
+        assert_eq!(result["timezone"], "UTC");
+
+        // ISO string must parse back into a valid DateTime
+        let iso_str = result["iso"].as_str().unwrap();
+        chrono::DateTime::parse_from_rfc3339(iso_str)
+            .unwrap_or_else(|_| panic!("invalid ISO 8601: {}", iso_str));
+    }
+
+    #[test]
+    fn test_datetime_tool_is_auto_approved() {
+        let tool = DatetimeTool::new();
+        assert!(tool.is_auto_approved());
+        assert!(tool.is_builtin());
+    }
+
+    // ── Auto-approved flag on builtins ────────────────────────────────────
+
+    #[test]
+    fn test_echo_is_auto_approved() {
+        assert!(EchoTool::new().is_auto_approved());
+    }
+
+    #[test]
+    fn test_dangerous_tools_are_not_auto_approved() {
+        // Tools that modify state must NOT be auto-approved.
+        assert!(!MathTool::new().is_auto_approved());
+        assert!(!HttpGetTool::new().is_auto_approved());
+        assert!(!FsReadTool::new().is_auto_approved());
+        assert!(!FsWriteTool::new().is_auto_approved());
+        assert!(!FsListTool::new().is_auto_approved());
     }
 
     #[tokio::test]
