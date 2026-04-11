@@ -17,7 +17,7 @@ use crate::runs::{
 };
 use crate::settings::{get_settings, patch_settings};
 use crate::workspace::{get_workspace, update_workspace_file};
-use alms_core::{AgentId, SessionId};
+use alms_core::{AgentId, SessionId, dm_participants};
 use alms_session::{Content, Role};
 use axum::{
     Json, Router,
@@ -183,27 +183,76 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
-/// GET /sessions?agent_id=<uuid> — list sessions, optionally filtered by agent.
+/// GET /sessions?agent_id=<uuid>&include_dms=true — list sessions.
 ///
-/// Excludes internal sessions (DM, notifications, episodic, subagent, job)
-/// — these are implementation details not shown in the UI.  Uses the same
-/// `INTERNAL_SESSION_PREFIXES` list as `find_user_facing_session` to keep
-/// the filter consistent.
+/// By default, excludes internal sessions (DM, notifications, episodic,
+/// subagent, job) — these are implementation details not shown in the
+/// regular UI. Uses the same `INTERNAL_SESSION_PREFIXES` list as
+/// `find_user_facing_session` to keep the filter consistent.
+///
+/// When `include_dms=true` is set, DM sessions (`dm:*` context IDs) are
+/// included in the response. Other internal session types remain excluded.
+/// DM sessions are stored under `AgentId::nil()` (sentinel), so the
+/// `agent_id` filter is not applied to them — instead they are included
+/// based on participant names parsed from the context ID.
+///
+/// Each session in the response is enriched with:
+/// - `session_type`: `"dm"` for DM sessions, `"chat"` for regular sessions
+/// - `participants`: `[name1, name2]` for DM sessions (parsed from `context_id`),
+///   absent for regular sessions
 async fn list_sessions(
     State(state): State<AppState>,
     Query(params): Query<ListSessionsQuery>,
 ) -> impl IntoResponse {
-    let mut sessions = state.session_manager.list_all();
-    sessions.retain(|s| !is_internal_context_id(&s.context_id));
-    if let Some(agent_id) = params.agent_id {
-        sessions.retain(|s| s.agent_id == agent_id);
+    let include_dms = params.include_dms.unwrap_or(false);
+    let all_sessions = state.session_manager.list_all();
+
+    let mut result: Vec<serde_json::Value> = Vec::new();
+
+    for session in all_sessions {
+        let is_dm = session.context_id.starts_with("dm:");
+        let is_internal = is_internal_context_id(&session.context_id);
+
+        if is_dm {
+            // DM sessions: only include when explicitly requested
+            if !include_dms {
+                continue;
+            }
+            // agent_id filter does not apply to DM sessions (they use nil sentinel)
+        } else if is_internal {
+            // Other internal sessions: always excluded
+            continue;
+        } else {
+            // Regular user-facing sessions: apply agent_id filter
+            if let Some(agent_id) = params.agent_id
+                && session.agent_id != agent_id
+            {
+                continue;
+            }
+        }
+
+        // Build the enriched JSON object
+        let mut obj = serde_json::to_value(&session).unwrap_or_default();
+        if is_dm {
+            obj["session_type"] = serde_json::json!("dm");
+            if let Some((a, b)) = dm_participants(&session.context_id) {
+                obj["participants"] = serde_json::json!([a, b]);
+            }
+        } else {
+            obj["session_type"] = serde_json::json!("chat");
+        }
+        result.push(obj);
     }
-    Json(serde_json::json!({ "sessions": sessions }))
+
+    Json(serde_json::json!({ "sessions": result }))
 }
 
 #[derive(Debug, Deserialize)]
 struct ListSessionsQuery {
     agent_id: Option<AgentId>,
+    /// When `true`, DM sessions (`dm:*` context IDs) are included in the
+    /// response alongside regular user-facing sessions.
+    include_dms: Option<bool>,
 }
 
 /// Create a new session
