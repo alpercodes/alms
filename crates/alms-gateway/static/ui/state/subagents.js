@@ -41,23 +41,7 @@ export function trackSubagentEnd(name, status) {
     };
 }
 
-/** Clear completed/failed/cancelled subagents, keep running ones. */
-export function clearCompletedSubagents() {
-    const filtered = {};
-    for (const [name, info] of Object.entries(activeSubagents.value)) {
-        if (info.status === 'running') {
-            filtered[name] = info;
-        }
-    }
-    activeSubagents.value = filtered;
-}
-
 /** Clear all subagent entries regardless of status. */
 export function clearAllSubagents() {
     activeSubagents.value = {};
-}
-
-/** Check if any subagents are still running. */
-export function hasRunningSubagents() {
-    return Object.values(activeSubagents.value).some(s => s.status === 'running');
 }
