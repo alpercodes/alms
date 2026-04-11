@@ -331,22 +331,8 @@ async fn test_guarded_posture_sequential_approvals() {
     };
 
     let tool_calls = vec![
-        ToolCall {
-            id: "tc1".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "echo".to_string(),
-                arguments: r#"{"text":"first"}"#.to_string(),
-            },
-        },
-        ToolCall {
-            id: "tc2".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "echo".to_string(),
-                arguments: r#"{"text":"second"}"#.to_string(),
-            },
-        },
+        ToolCall::new("tc1", "echo", r#"{"text":"first"}"#),
+        ToolCall::new("tc2", "echo", r#"{"text":"second"}"#),
     ];
 
     // Track the order: approval_count increments only after each approval resolves.
@@ -998,25 +984,19 @@ async fn test_dm_addendum_survives_tool_loop_rebuild() {
 /// early (the agent gets another iteration to choose one).
 #[test]
 fn test_dm_conflict_blocks_both_tools() {
-    use crate::llm_types::{FunctionCall, ToolCall};
+    use crate::llm_types::ToolCall;
 
     let tool_calls = vec![
-        ToolCall {
-            id: "tc_send".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "send_message".to_string(),
-                arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
-            },
-        },
-        ToolCall {
-            id: "tc_ignore".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "ignore_message".to_string(),
-                arguments: r#"{"reason":"nothing to add"}"#.to_string(),
-            },
-        },
+        ToolCall::new(
+            "tc_send",
+            "send_message",
+            r#"{"to":"alice","message":"hi"}"#,
+        ),
+        ToolCall::new(
+            "tc_ignore",
+            "ignore_message",
+            r#"{"reason":"nothing to add"}"#,
+        ),
     ];
 
     let check = dm::detect_dm_conflict(&tool_calls);
@@ -1040,16 +1020,13 @@ fn test_dm_conflict_blocks_both_tools() {
 /// should be no conflict.
 #[test]
 fn test_ignore_message_alone_no_conflict() {
-    use crate::llm_types::{FunctionCall, ToolCall};
+    use crate::llm_types::ToolCall;
 
-    let tool_calls = vec![ToolCall {
-        id: "tc_ignore".to_string(),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name: "ignore_message".to_string(),
-            arguments: r#"{"reason":"not relevant"}"#.to_string(),
-        },
-    }];
+    let tool_calls = vec![ToolCall::new(
+        "tc_ignore",
+        "ignore_message",
+        r#"{"reason":"not relevant"}"#,
+    )];
 
     let check = dm::detect_dm_conflict(&tool_calls);
 
@@ -1068,33 +1045,20 @@ fn test_ignore_message_alone_no_conflict() {
 /// tool should still be eligible for execution.
 #[test]
 fn test_dm_conflict_preserves_non_conflicting_tools() {
-    use crate::llm_types::{FunctionCall, ToolCall};
+    use crate::llm_types::ToolCall;
 
     let tool_calls = vec![
-        ToolCall {
-            id: "tc_echo".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "echo".to_string(),
-                arguments: r#"{"message":"hello"}"#.to_string(),
-            },
-        },
-        ToolCall {
-            id: "tc_send".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "send_message".to_string(),
-                arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
-            },
-        },
-        ToolCall {
-            id: "tc_ignore".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "ignore_message".to_string(),
-                arguments: r#"{"reason":"nothing to add"}"#.to_string(),
-            },
-        },
+        ToolCall::new("tc_echo", "echo", r#"{"message":"hello"}"#),
+        ToolCall::new(
+            "tc_send",
+            "send_message",
+            r#"{"to":"alice","message":"hi"}"#,
+        ),
+        ToolCall::new(
+            "tc_ignore",
+            "ignore_message",
+            r#"{"reason":"nothing to add"}"#,
+        ),
     ];
 
     let check = dm::detect_dm_conflict(&tool_calls);
@@ -1127,16 +1091,13 @@ fn test_dm_conflict_preserves_non_conflicting_tools() {
 /// should be no conflict.
 #[test]
 fn test_send_message_alone_no_conflict() {
-    use crate::llm_types::{FunctionCall, ToolCall};
+    use crate::llm_types::ToolCall;
 
-    let tool_calls = vec![ToolCall {
-        id: "tc_send".to_string(),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name: "send_message".to_string(),
-            arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
-        },
-    }];
+    let tool_calls = vec![ToolCall::new(
+        "tc_send",
+        "send_message",
+        r#"{"to":"alice","message":"hi"}"#,
+    )];
 
     let check = dm::detect_dm_conflict(&tool_calls);
     assert!(
@@ -1149,16 +1110,9 @@ fn test_send_message_alone_no_conflict() {
 /// When neither DM tool is present, there should be no conflict.
 #[test]
 fn test_no_dm_tools_no_conflict() {
-    use crate::llm_types::{FunctionCall, ToolCall};
+    use crate::llm_types::ToolCall;
 
-    let tool_calls = vec![ToolCall {
-        id: "tc_echo".to_string(),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name: "echo".to_string(),
-            arguments: r#"{"message":"hello"}"#.to_string(),
-        },
-    }];
+    let tool_calls = vec![ToolCall::new("tc_echo", "echo", r#"{"message":"hello"}"#)];
 
     let check = dm::detect_dm_conflict(&tool_calls);
     assert!(!check.conflict);
@@ -1170,16 +1124,13 @@ fn test_no_dm_tools_no_conflict() {
 /// In a DM run, `send_message` alone should terminate the loop.
 #[test]
 fn test_dm_send_terminates_in_dm_context() {
-    use crate::llm_types::{FunctionCall, ToolCall};
+    use crate::llm_types::ToolCall;
 
-    let tool_calls = vec![ToolCall {
-        id: "tc_send".to_string(),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name: "send_message".to_string(),
-            arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
-        },
-    }];
+    let tool_calls = vec![ToolCall::new(
+        "tc_send",
+        "send_message",
+        r#"{"to":"alice","message":"hi"}"#,
+    )];
 
     assert!(
         dm::should_terminate_after_dm_send(&tool_calls, true, false),
@@ -1192,16 +1143,13 @@ fn test_dm_send_terminates_in_dm_context() {
 /// another agent, and may have more work to do).
 #[test]
 fn test_dm_send_does_not_terminate_outside_dm() {
-    use crate::llm_types::{FunctionCall, ToolCall};
+    use crate::llm_types::ToolCall;
 
-    let tool_calls = vec![ToolCall {
-        id: "tc_send".to_string(),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name: "send_message".to_string(),
-            arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
-        },
-    }];
+    let tool_calls = vec![ToolCall::new(
+        "tc_send",
+        "send_message",
+        r#"{"to":"alice","message":"hi"}"#,
+    )];
 
     assert!(
         !dm::should_terminate_after_dm_send(&tool_calls, false, false),
@@ -1213,25 +1161,15 @@ fn test_dm_send_does_not_terminate_outside_dm() {
 /// do NOT terminate — let the agent retry on the next iteration.
 #[test]
 fn test_dm_send_does_not_terminate_on_conflict() {
-    use crate::llm_types::{FunctionCall, ToolCall};
+    use crate::llm_types::ToolCall;
 
     let tool_calls = vec![
-        ToolCall {
-            id: "tc_send".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "send_message".to_string(),
-                arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
-            },
-        },
-        ToolCall {
-            id: "tc_ignore".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "ignore_message".to_string(),
-                arguments: r#"{"reason":"done"}"#.to_string(),
-            },
-        },
+        ToolCall::new(
+            "tc_send",
+            "send_message",
+            r#"{"to":"alice","message":"hi"}"#,
+        ),
+        ToolCall::new("tc_ignore", "ignore_message", r#"{"reason":"done"}"#),
     ];
 
     assert!(
@@ -1244,16 +1182,9 @@ fn test_dm_send_does_not_terminate_on_conflict() {
 /// returns false even in a DM context.
 #[test]
 fn test_dm_send_no_dm_tools() {
-    use crate::llm_types::{FunctionCall, ToolCall};
+    use crate::llm_types::ToolCall;
 
-    let tool_calls = vec![ToolCall {
-        id: "tc_echo".to_string(),
-        call_type: "function".to_string(),
-        function: FunctionCall {
-            name: "echo".to_string(),
-            arguments: r#"{"message":"hello"}"#.to_string(),
-        },
-    }];
+    let tool_calls = vec![ToolCall::new("tc_echo", "echo", r#"{"message":"hello"}"#)];
 
     assert!(
         !dm::should_terminate_after_dm_send(&tool_calls, true, false),

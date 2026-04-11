@@ -144,6 +144,24 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
+impl ToolCall {
+    /// Create a new tool call with `type` defaulting to `"function"`.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
+}
+
 /// Function call details
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCall {
@@ -538,14 +556,7 @@ mod tests {
 
     #[test]
     fn test_tool_call_serializes_type_function() {
-        let tc = ToolCall {
-            id: "call_1".to_string(),
-            call_type: "function".to_string(),
-            function: FunctionCall {
-                name: "echo".to_string(),
-                arguments: r#"{"text":"hi"}"#.to_string(),
-            },
-        };
+        let tc = ToolCall::new("call_1", "echo", r#"{"text":"hi"}"#);
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
@@ -589,14 +600,7 @@ mod tests {
             role: "assistant".to_string(),
             content: None,
             reasoning_content: None,
-            tool_calls: Some(vec![ToolCall {
-                id: "call_x".to_string(),
-                call_type: "function".to_string(),
-                function: FunctionCall {
-                    name: "echo".to_string(),
-                    arguments: "{}".to_string(),
-                },
-            }]),
+            tool_calls: Some(vec![ToolCall::new("call_x", "echo", "{}")]),
             tool_call_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();

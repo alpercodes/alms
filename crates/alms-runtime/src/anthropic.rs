@@ -299,14 +299,7 @@ pub(crate) fn from_anthropic_response(resp: AnthropicResponse) -> CompletionResp
                 text_parts.push(text.clone());
             }
             ContentBlock::ToolUse { id, name, input } => {
-                tool_calls.push(ToolCall {
-                    id: id.clone(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: name.clone(),
-                        arguments: input.to_string(),
-                    },
-                });
+                tool_calls.push(ToolCall::new(id.clone(), name.clone(), input.to_string()));
             }
             ContentBlock::ToolResult { .. } => {
                 // Tool results shouldn't appear in responses
@@ -562,14 +555,11 @@ mod tests {
                 role: "assistant".to_string(),
                 content: None,
                 reasoning_content: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_1".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "shell_exec".to_string(),
-                        arguments: r#"{"command":"ls"}"#.to_string(),
-                    },
-                }]),
+                tool_calls: Some(vec![ToolCall::new(
+                    "call_1",
+                    "shell_exec",
+                    r#"{"command":"ls"}"#,
+                )]),
                 tool_call_id: None,
             },
             LlmMessage::tool_result("call_1", "file1.txt"),
@@ -671,14 +661,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: None,
                 reasoning_content: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: "c1".to_string(),
-                    call_type: "function".to_string(),
-                    function: FunctionCall {
-                        name: "echo".to_string(),
-                        arguments: "{}".to_string(),
-                    },
-                }]),
+                tool_calls: Some(vec![ToolCall::new("c1", "echo", "{}")]),
                 tool_call_id: None,
             },
             LlmMessage::tool_result("c1", "result1"),
