@@ -318,16 +318,14 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // -- status: agent phase update (live indicator in header bar) --
+    // Note: no source_agent filter needed -- subagent status events are
+    // routed to their own session streams, not the parent's.  If that
+    // routing ever changes, the header bar would flash subagent phases
+    // and a source_agent guard would need to be added here.
     on('status', (e) => {
         const data = JSON.parse(e.data);
         setAgentPhase(data.phase, data.detail || null);
     });
-
-    // -- run_created: track DM-triggered runs for cross-channel awareness --
-    // When source starts with "peer:", the agent is responding to a DM.
-    // Set the phase to 'dm' so the header bar shows "Chatting with {peer}...".
-    // This is handled inside the existing run_created handler below via
-    // the dmPeerFromSource helper.
 
     // -- token_delta --
     on('token_delta', (e) => {
