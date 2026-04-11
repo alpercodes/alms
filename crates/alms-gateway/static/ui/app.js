@@ -7,6 +7,7 @@ import { ToolRow, ToolGroup } from './components/chat/tool-row.js';
 import { ContextDebugRow } from './components/chat/context-debug-row.js';
 import { ApprovalCard } from './components/chat/approval-card.js';
 import { JobCompletionCard } from './components/chat/job-completion-card.js';
+import { SubagentCompletionCard } from './components/chat/subagent-completion-card.js';
 import { MessageQueue } from './components/chat/message-queue.js';
 import { InputArea } from './components/chat/input-area.js';
 import { chatMessages } from './state/chat.js';
@@ -16,6 +17,7 @@ import { OnboardingView } from './components/onboarding.js';
 import { agents, activeAgent } from './state/agents.js';
 import { isDmSession } from './state/sessions.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
+import { parentSessionId, navigateToParentSession } from './state/subagents.js';
 import { AgentHeaderBar } from './components/chat/agent-header-bar.js';
 import { DmConversationView } from './components/chat/dm-conversation-view.js';
 import { scrollToBottom } from './utils/format.js';
@@ -115,6 +117,13 @@ function ChatView() {
             `}
             ${!agentSwitchLoading.value && !sessionSwitchLoading.value && !dmActive && html`
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>
+                ${parentSessionId.value && html`
+                    <div class="sa-breadcrumb">
+                        <button class="sa-breadcrumb-btn" onClick=${() => navigateToParentSession()}>
+                            \u2190 Back to parent session
+                        </button>
+                    </div>
+                `}
                 ${chatMessages.value.length === 0 && html`
                     <div class="empty-state">
                         No messages yet. Send a message to start.
@@ -143,6 +152,12 @@ function ChatView() {
                     }
                     if (m.type === 'job_completed') {
                         return html`<${JobCompletionCard} key=${m.id} jobName=${m.jobName} status=${m.status} summary=${m.summary} ts=${m.ts} />`;
+                    }
+                    if (m.type === 'subagent_completed') {
+                        return html`<${SubagentCompletionCard} key=${m.id}
+                            name=${m.name} task=${m.task} status=${m.status}
+                            toolCount=${m.toolCount} durationMs=${m.durationMs}
+                            sessionId=${m.sessionId} summary=${m.summary} />`;
                     }
                     if (m.type === 'image') {
                         // DM images carry fromAgent — treat them as agent

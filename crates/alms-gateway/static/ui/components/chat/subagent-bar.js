@@ -1,5 +1,5 @@
 import { html, useSignal } from '../../deps.js';
-import { activeSubagents } from '../../state/subagents.js';
+import { activeSubagents, navigateToSubagentSession } from '../../state/subagents.js';
 import { toolSummary } from '../../utils/tool-summary.js';
 import { SUBAGENT_PREVIEW_LEN, TOOL_SUMMARY_LEN } from '../../utils/constants.js';
 
@@ -7,11 +7,21 @@ function SubagentPanel({ name, info, onClose }) {
     const icon = info.status === 'done' ? '\u2713' : info.status === 'fail' ? '\u2717' : null;
     const label = info.displayName || name;
 
+    const onViewSession = (e) => {
+        e.stopPropagation();
+        if (info.sessionId) {
+            navigateToSubagentSession(info.sessionId);
+        }
+    };
+
     return html`
         <div class="sa-panel">
             <div class="sa-panel-header">
                 <span class="sa-panel-name">${info.status === 'running' ? html`<span class="tc-spinner"></span>` : icon} ${label}</span>
                 <span class="sa-panel-task">${info.task.slice(0, SUBAGENT_PREVIEW_LEN)}${info.task.length > SUBAGENT_PREVIEW_LEN ? '\u2026' : ''}</span>
+                ${info.sessionId && html`
+                    <button class="sa-panel-view-btn" onClick=${onViewSession}>View session</button>
+                `}
                 <button class="sa-panel-close" onClick=${onClose}>\u00d7</button>
             </div>
             <div class="sa-panel-tools">

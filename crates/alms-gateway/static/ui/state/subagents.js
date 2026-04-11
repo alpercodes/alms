@@ -1,8 +1,9 @@
 import { signal } from '../deps.js';
+import { activeSessionId } from './sessions.js';
 
 /**
  * Active subagents and their tool activity.
- * Shape: { [key]: { status, tools, task, toolInvocationId, displayName } }
+ * Shape: { [key]: { status, tools, task, toolInvocationId, displayName, startedAt, sessionId } }
  *
  * Keys are unique identifiers for each subagent invocation:
  *   - Named subagents use the agent name as the key (e.g. "reviewer").
@@ -15,14 +16,28 @@ import { signal } from '../deps.js';
  * `toolInvocationId` is the tool_invocation_id of the parent's invoke_agent
  * call. Stored so that tool_end for invoke_agent can look up the correct
  * subagent entry even when the subagent has no name param.
+ *
+ * `startedAt` is the Date.now() timestamp when the subagent was started.
+ * Used to compute duration when the subagent completes.
+ *
+ * `sessionId` is the subagent's session UUID, populated from the
+ * invoke_agent result or the subagent_completed event. Used for
+ * drill-down navigation ("View session").
  */
 export const activeSubagents = signal({});
+
+/**
+ * When viewing a subagent session, stores the parent session ID so the
+ * user can navigate back. Null when viewing a top-level session.
+ */
+export const parentSessionId = signal(null);
 
 /** Pending auto-remove timers keyed by subagent key. */
 const removeTimers = {};
 
-/** Delay (ms) before a completed subagent chip is removed from the bar. */
-const REMOVE_DELAY_MS = 3000;
+/** Delay (ms) before a completed subagent chip is removed from the bar.
+ *  Set to 15 seconds so completed subagents remain visible longer. */
+const REMOVE_DELAY_MS = 15000;
 
 /**
  * Track a subagent invocation.
@@ -54,6 +69,8 @@ export function trackSubagentStart(name, task, toolInvocationId) {
             task: task || '',
             toolInvocationId: toolInvocationId || null,
             displayName: name,
+            startedAt: Date.now(),
+            sessionId: null,
         },
     };
 }
@@ -165,6 +182,121 @@ export function findSubagentByToolInvocationId(toolInvocationId) {
         if (info.toolInvocationId === toolInvocationId) return name;
     }
     return null;
+}
+
+/**
+ * Set the session ID on a subagent entry.
+ * Called when the invoke_agent result includes a session_id, or when the
+ * subagent_completed event arrives with a session_id.
+ *
+ * @param {string} name - The subagent key
+ * @param {string} sessionId - The subagent's session UUID
+ */
+export function setSubagentSessionId(name, sessionId) {
+    let current = activeSubagents.value[name];
+    // Fallback search for unnamed subagents (same logic as trackSubagentEnd)
+    let key = name;
+    if (!current && name === 'subagent') {
+        for (const [k, info] of Object.entries(activeSubagents.value)) {
+            if (k.startsWith('subagent-')) {
+                key = k;
+                current = info;
+                break;
+            }
+        }
+    }
+    if (!current) return;
+    activeSubagents.value = {
+        ...activeSubagents.value,
+        [key]: { ...current, sessionId },
+    };
+}
+
+/**
+ * Dynamically import the modules needed for session navigation.
+ * Uses Promise.all so all modules load in parallel.
+ * Dynamic imports break the circular dependency (subagents.js is
+ * imported by session-list.js which imports these same modules).
+ */
+async function loadNavDeps() {
+    const [loadMod, sseMod, chatMod, runsMod, genMod, loadingMod] = await Promise.all([
+        import('../utils/load-session.js'),
+        import('../hooks/use-session-stream.js'),
+        import('../state/chat-actions.js'),
+        import('../state/runs.js'),
+        import('../state/select-generation.js'),
+        import('../state/loading.js'),
+    ]);
+    return {
+        loadSession: loadMod.loadSession,
+        closeSessionStream: sseMod.closeSessionStream,
+        replaceMessages: chatMod.replaceMessages,
+        activeRunId: runsMod.activeRunId,
+        selectedRunId: runsMod.selectedRunId,
+        bumpSelectGeneration: genMod.bumpSelectGeneration,
+        selectGeneration: genMod,
+        sessionSwitchLoading: loadingMod.sessionSwitchLoading,
+    };
+}
+
+/**
+ * Perform the actual session switch (shared by drill-down and back navigation).
+ *
+ * @param {string} targetSessionId - The session to navigate to
+ * @param {string} logPrefix - Label for diagnostic log messages
+ */
+async function doSessionSwitch(targetSessionId, logPrefix) {
+    const deps = await loadNavDeps();
+    const gen = deps.bumpSelectGeneration();
+    deps.closeSessionStream();
+    activeSessionId.value = targetSessionId;
+    deps.activeRunId.value = null;
+    deps.selectedRunId.value = null;
+    deps.replaceMessages([]);
+    clearAllSubagents();
+    deps.sessionSwitchLoading.value = true;
+
+    try {
+        await deps.loadSession(targetSessionId, {
+            isStale: () => gen !== deps.selectGeneration.selectGeneration,
+            logPrefix,
+        });
+    } finally {
+        if (gen === deps.selectGeneration.selectGeneration) {
+            deps.sessionSwitchLoading.value = false;
+        }
+    }
+}
+
+/**
+ * Navigate to a subagent's session by switching the active session.
+ * Stores the current session as the parent so the user can navigate back.
+ *
+ * @param {string} sessionId - The subagent session to navigate to
+ */
+export function navigateToSubagentSession(sessionId) {
+    if (!sessionId) return;
+    // Store current session as parent for breadcrumb navigation
+    const currentSession = activeSessionId.value;
+    if (currentSession) {
+        parentSessionId.value = currentSession;
+    }
+    doSessionSwitch(sessionId, 'navigateToSubagent').catch(err => {
+        console.error('[navigateToSubagentSession] failed:', err);
+    });
+}
+
+/**
+ * Navigate back to the parent session from a subagent drill-down view.
+ * Clears the parentSessionId signal after navigation.
+ */
+export function navigateToParentSession() {
+    const parent = parentSessionId.value;
+    if (!parent) return;
+    parentSessionId.value = null;
+    doSessionSwitch(parent, 'navigateToParent').catch(err => {
+        console.error('[navigateToParentSession] failed:', err);
+    });
 }
 
 /** Clear all subagent entries regardless of status. */

@@ -8,7 +8,7 @@ import { auditEvents } from '../../state/audit.js';
 import { sessionSwitchLoading } from '../../state/loading.js';
 import { listSessions, createSession, deleteSession } from '../../api/sessions.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
-import { clearAllSubagents } from '../../state/subagents.js';
+import { clearAllSubagents, parentSessionId } from '../../state/subagents.js';
 import { saveActiveSession } from '../../hooks/use-boot.js';
 import { selectGeneration, bumpSelectGeneration } from '../../state/select-generation.js';
 import { loadSession } from '../../utils/load-session.js';
@@ -35,6 +35,7 @@ async function selectSession(sessionId) {
     messageQueue.value = [];
     auditEvents.value = null;
     clearAllSubagents();
+    parentSessionId.value = null; // clear breadcrumb on manual session switch
     sessionSwitchLoading.value = true;
 
     // Persist the selection for this agent
