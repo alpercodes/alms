@@ -628,8 +628,13 @@ export function openSessionStream(sessionId, opts) {
         if (messageQueue.value.length > 0) {
             const next = messageQueue.value[0];
             messageQueue.value = messageQueue.value.slice(1);
+            // Capture activeSessionId synchronously before the async
+            // import().then() microtask gap -- the value could change
+            // if the user switches sessions between now and when the
+            // .then() callback fires.  (Fixes #526)
+            const capturedSessionId = activeSessionId.value;
             import('../components/chat/input-area.js').then(mod => {
-                if (mod.startRun) mod.startRun(next.text);
+                if (mod.startRun) mod.startRun(next.text, { sessionId: capturedSessionId });
             }).catch(err => {
                 console.error('[session-stream] Failed to process queued message:', err);
             });
