@@ -566,6 +566,46 @@ header h1 {
   text-overflow: ellipsis;
 }
 
+/* ── Agent status indicator (live phase label) ── */
+.agent-status-label {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+  animation: agent-status-fadein var(--duration-normal) ease-out;
+}
+
+.agent-status-label::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  margin-right: var(--space-1);
+  vertical-align: middle;
+  animation: agent-status-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes agent-status-fadein {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes agent-status-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* On narrow viewports, hide the status label to save space */
+@media (max-width: 480px) {
+  .agent-status-label {
+    display: none;
+  }
+}
+
 .agent-header-bar-right {
   display: flex;
   align-items: center;

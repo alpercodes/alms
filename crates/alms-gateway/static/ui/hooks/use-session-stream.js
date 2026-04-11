@@ -33,6 +33,7 @@ import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
 import { activeRunId } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId } from '../state/subagents.js';
+import { setAgentPhase, clearAgentPhase } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
 import { normalizeApproval } from '../utils/approvals.js';
@@ -274,6 +275,14 @@ export function openSessionStream(sessionId, opts) {
         const queuedBehind = data.queued_behind || 0;
         sawTokenDelta = false;
 
+        // Cross-channel DM awareness: when the run source starts with
+        // "peer:", the agent is responding to a DM from another agent.
+        // Set the header bar phase to 'dm' with the peer name so the
+        // user sees "Chatting with {peer}..." while this run executes.
+        if (data.source && data.source.startsWith('peer:')) {
+            setAgentPhase('dm', data.source.slice(5));
+        }
+
         if (data.is_notification) {
             // Notification run from subagent completion or peer message --
             // show thinking indicator with source context
@@ -308,12 +317,17 @@ export function openSessionStream(sessionId, opts) {
         );
     });
 
-    // -- status: agent phase update --
-    // Status SSE events (building_context, calling_llm, executing_tools, etc.)
-    // are emitted by the backend but no longer consumed here. Issue #538 will
-    // add an agent header bar that subscribes to these events. The old handler
-    // that cycled phase labels on the thinking bubble was removed as dead code
-    // (see #344).
+    // -- status: agent phase update (live indicator in header bar) --
+    on('status', (e) => {
+        const data = JSON.parse(e.data);
+        setAgentPhase(data.phase, data.detail || null);
+    });
+
+    // -- run_created: track DM-triggered runs for cross-channel awareness --
+    // When source starts with "peer:", the agent is responding to a DM.
+    // Set the phase to 'dm' so the header bar shows "Chatting with {peer}...".
+    // This is handled inside the existing run_created handler below via
+    // the dmPeerFromSource helper.
 
     // -- token_delta --
     on('token_delta', (e) => {
@@ -621,6 +635,7 @@ export function openSessionStream(sessionId, opts) {
                 return msgs;
             });
             activeRunId.value = null;
+            clearAgentPhase();
         });
 
         // Process queued user messages via dynamic import
@@ -670,6 +685,7 @@ export function closeSessionStream() {
     flushDeltaBuffer();
     // Reset per-run state so it does not carry over to the next session.
     sawTokenDelta = false;
+    clearAgentPhase();
     if (activeSessionEs) {
         activeSessionEs.close();
         activeSessionEs = null;
