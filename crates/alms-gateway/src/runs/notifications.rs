@@ -819,10 +819,10 @@ pub(crate) async fn run_trigger_loop(
                 //   notify_dm_ended_to_webchat — it defers to this path
                 //   to avoid duplicates.
                 //
-                // For depth_exceeded, only the recipient gets a
-                // ConversationEnded trigger (the depth check happens
-                // inside MessageBus::send), so this call covers the
-                // recipient only.
+                // For depth_exceeded, both the recipient and the
+                // sender (when the sender has a source session) get
+                // ConversationEnded triggers — `end_conversation`
+                // emits both (#556).
                 {
                     let reason_str = reason.to_string();
                     let dm_context = peer_name_resolved

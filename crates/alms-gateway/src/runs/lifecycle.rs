@@ -663,14 +663,26 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
     // System-triggered notification runs (subagent completions, DM-ended
     // notifications) that land on a user-facing session should NOT persist
-    // the verbose notification input as a Role::User message — that would
-    // show the internal LLM prompt as a "user" bubble on page reload.
+    // the verbose notification input as a normal Role::User message — that
+    // would show the internal LLM prompt as a "user" bubble on page reload.
     //
-    // Instead, pre-persist the input as a Role::System message *without*
-    // `synthetic` metadata (so get_session_messages filters it out on
-    // reload — non-synthetic system messages are excluded) and then use
-    // `run_on_session` to skip the default Role::User persistence in
-    // `runtime.run()`.
+    // Instead, pre-persist the input as a Role::User message with
+    // `notification_input: true` metadata. This ensures:
+    //
+    //  1. The context builder includes it as a **user** message in the LLM
+    //     context window, satisfying the Anthropic Messages API requirement
+    //     that the conversation ends with a user message. (The previous
+    //     approach used Role::System, which Anthropic extracts into the
+    //     top-level system field — leaving the messages array ending with
+    //     an assistant message from the prior conversation, causing API
+    //     rejection.)
+    //
+    //  2. `get_session_messages` filters it out via the
+    //     `notification_input` metadata flag, making it invisible on page
+    //     reload.
+    //
+    // Then use `run_on_session` to skip the default Role::User persistence
+    // in `runtime.run()`.
     let is_notification_on_user_session =
         is_system_triggered && !is_peer_message && !is_internal_context_id(&context_id);
 
@@ -683,37 +695,32 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             .run_on_session(&state.session_manager, session_id, &context_id, &input)
             .await
     } else if is_notification_on_user_session {
-        // Notification run rerouted to a user-facing session.
-        // Persist the input as a non-synthetic Role::System message so:
-        //  - The context builder includes it in the LLM's context window
-        //  - get_session_messages filters it out (non-synthetic system
-        //    messages are excluded), making it invisible on page reload
-        // Then use run_on_session to skip the default Role::User
-        // persistence that runtime.run() would do.
+        // Notification run landing on a user-facing session.
         //
-        // Trade-off: the notification enters the LLM context as a
-        // `system` message rather than `user`. Some models treat system
-        // messages with lower priority, which could affect response
-        // quality. If notification runs produce lower-quality responses,
-        // consider switching to Role::User with a `hidden: true`
-        // metadata flag and updating get_session_messages to filter it.
+        // Pre-persist the input as Role::User with `notification_input`
+        // metadata so the context builder sees it as a user message (the
+        // LLM needs a trailing user turn for Anthropic compatibility).
+        // `get_session_messages` filters it out on reload so the internal
+        // prompt never appears as a "user" bubble.
         //
-        // Note: if run_on_session fails after the append below, the
-        // orphaned Role::System message remains in the session. Since
-        // get_session_messages filters it out, it is invisible to users
-        // but still occupies tokens in the context window for future
-        // runs. This is acceptable for MVP — the failure case is rare
+        // Then use `run_on_session` to skip the default Role::User
+        // persistence in `runtime.run()`.
+        //
+        // Note: if `run_on_session` fails after the append, the orphaned
+        // message remains in the session. It is invisible on reload (the
+        // API filter hides it) but occupies tokens in the context window
+        // for future runs. This is acceptable — the failure case is rare
         // and the impact is minor token waste.
-        let sys_msg = alms_session::Message {
+        let notif_msg = alms_session::Message {
             id: uuid::Uuid::new_v4().to_string(),
-            role: alms_session::Role::System,
+            role: alms_session::Role::User,
             content: alms_session::Content::Text(input.clone()),
             timestamp: alms_core::Timestamp::now(),
             metadata: Some(serde_json::json!({
-                "type": "notification_input",
+                "notification_input": true,
             })),
         };
-        if let Err(e) = state.session_manager.append_message(session_id, sys_msg) {
+        if let Err(e) = state.session_manager.append_message(session_id, notif_msg) {
             warn!("Failed to persist notification input: {e}");
         }
         runtime

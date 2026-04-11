@@ -293,6 +293,24 @@ async fn get_session_messages(
             let visible: Vec<serde_json::Value> = messages
                 .into_iter()
                 .filter_map(|m| {
+                    // Filter out notification input messages (Role::User
+                    // with `notification_input: true` metadata). These are
+                    // internal LLM prompts persisted by execute_run for
+                    // notification runs landing on user-facing sessions.
+                    // They must be Role::User for Anthropic API
+                    // compatibility but should not appear as "user" bubbles
+                    // in the chat UI.
+                    let is_notification_input = m
+                        .metadata
+                        .as_ref()
+                        .and_then(|md| md.get("notification_input"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if is_notification_input {
+                        skipped += 1;
+                        return None;
+                    }
+
                     let role_str = match m.role {
                         Role::User => "user",
                         Role::Assistant => "assistant",
