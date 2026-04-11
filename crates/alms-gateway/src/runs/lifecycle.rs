@@ -29,15 +29,26 @@ use tracing::{debug, error, info, instrument, warn};
 /// GET /runs?session_id=<uuid>&limit=<n> — list runs for a session (existing)
 /// GET /runs?agent_id=<uuid>&limit=<n> — list runs across all sessions for an agent
 ///
-/// At least one of `session_id` or `agent_id` must be provided.
+/// Exactly one of `session_id` or `agent_id` must be provided. Providing both
+/// returns 400 BAD_REQUEST.
 /// When `agent_id` is provided, the response includes enriched run entries
 /// with `session_type`, `trigger`, `context_id`, and `duration_ms` fields
 /// for the agent run log panel.
+#[instrument(level = "info", skip(state, params))]
 pub async fn list_runs(
     State(state): State<AppState>,
     Query(params): Query<ListRunsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let limit = params.limit.unwrap_or(50);
+
+    // Reject ambiguous requests that supply both filters.
+    if params.session_id.is_some() && params.agent_id.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "AMBIGUOUS_FILTER",
+            "Provide either `session_id` or `agent_id`, not both",
+        ));
+    }
 
     if let Some(agent_id) = params.agent_id {
         // Agent-level listing: cross-session runs with enriched metadata.
@@ -136,12 +147,26 @@ fn enrich_run(state: &AppState, run: Run) -> AgentRunEntry {
         .store()
         .and_then(|store| store.count_tool_calls(run.run_id).ok());
 
+    /// Max characters to include in the `response` field of listing entries.
+    /// Full text is available via `GET /runs/{run_id}`.
+    const RESPONSE_TRUNCATE_LEN: usize = 200;
+
+    let response = run.output.map(|s| {
+        if s.len() > RESPONSE_TRUNCATE_LEN {
+            let mut truncated = s[..RESPONSE_TRUNCATE_LEN].to_string();
+            truncated.push_str("...");
+            truncated
+        } else {
+            s
+        }
+    });
+
     AgentRunEntry {
         run_id: run.run_id,
         session_id: run.session_id,
         agent_id: run.agent_id,
         status: run.status,
-        response: run.output,
+        response,
         error: run.error,
         started_at: run.started_at,
         ended_at: run.ended_at,
@@ -162,23 +187,23 @@ fn enrich_run(state: &AppState, run: Run) -> AgentRunEntry {
 /// Priority:
 /// 1. `job_id` present -> "scheduled"
 /// 2. `parent_run_id` present -> "subagent"
-/// 3. context_id starts with "dm:" -> "dm"
-/// 4. context_id starts with "notifications:" -> "notification"
-/// 5. context_id starts with "telegram_" -> "telegram"
-/// 6. Default -> "user"
+/// 3. Delegate to [`classify_session_type`] for context_id-based classification,
+///    mapping session types to trigger names (dm, notification, telegram).
+/// 4. Default -> "user"
 fn derive_trigger(run: &Run, context_id: &str) -> String {
     if run.job_id.is_some() {
-        "scheduled".to_string()
-    } else if run.parent_run_id.is_some() {
-        "subagent".to_string()
-    } else if context_id.starts_with("dm:") {
-        "dm".to_string()
-    } else if context_id.starts_with("notifications:") {
-        "notification".to_string()
-    } else if context_id.starts_with("telegram_") {
-        "telegram".to_string()
-    } else {
-        "user".to_string()
+        return "scheduled".to_string();
+    }
+    if run.parent_run_id.is_some() {
+        return "subagent".to_string();
+    }
+    // Delegate to the canonical session type classifier for context_id-based
+    // triggers, avoiding duplicated prefix checks.
+    match classify_session_type(context_id) {
+        "dm" => "dm".to_string(),
+        "notification" => "notification".to_string(),
+        "telegram" => "telegram".to_string(),
+        _ => "user".to_string(),
     }
 }
 

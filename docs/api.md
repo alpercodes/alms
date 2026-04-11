@@ -535,6 +535,77 @@ Cancellation is cooperative — the agent loop checks a `CancellationToken` at f
 (iteration boundary, LLM call, tool execution, approval wait). The run transitions to
 `cancelled` status and emits a `run_cancelled` SSE event.
 
+### 5.6 List runs
+`GET /runs?session_id=<uuid>&limit=<n>` — list runs for a session (original behaviour).
+`GET /runs?agent_id=<uuid>&limit=<n>` — list runs across all sessions for an agent.
+
+Exactly one of `session_id` or `agent_id` must be provided. Providing both returns 400.
+
+**Query parameters**
+| Parameter    | Required | Description |
+|-------------|----------|-------------|
+| `session_id` | one-of   | Filter runs by session |
+| `agent_id`   | one-of   | Filter runs across all sessions for an agent |
+| `limit`      | no       | Max results (default 50) |
+
+**Response 200 (session_id)**
+```json
+{
+  "runs": [
+    {
+      "run_id": "<uuid>",
+      "session_id": "<uuid>",
+      "agent_id": "<uuid>",
+      "status": "completed",
+      "response": "...",
+      "started_at": "2026-04-10T12:00:00Z",
+      "ended_at": "2026-04-10T12:00:05Z",
+      "usage": { "prompt_tokens": 150, "completion_tokens": 42 },
+      "ts": "2026-04-10T12:00:05Z"
+    }
+  ]
+}
+```
+
+**Response 200 (agent_id)** — enriched entries for the agent run log panel:
+```json
+{
+  "runs": [
+    {
+      "run_id": "<uuid>",
+      "session_id": "<uuid>",
+      "agent_id": "<uuid>",
+      "status": "completed",
+      "response": "First 200 chars of output...",
+      "started_at": "2026-04-10T12:00:00Z",
+      "ended_at": "2026-04-10T12:00:05Z",
+      "usage": { "prompt_tokens": 150, "completion_tokens": 42 },
+      "ts": "2026-04-10T12:00:05Z",
+      "session_type": "chat",
+      "trigger": "user",
+      "context_id": "web",
+      "duration_ms": 5000,
+      "tool_call_count": 3
+    }
+  ]
+}
+```
+
+`session_type` values: `"chat"`, `"dm"`, `"notification"`, `"job"`, `"subagent"`, `"telegram"`, `"episodic"`.
+
+`trigger` values: `"user"`, `"scheduled"`, `"subagent"`, `"dm"`, `"notification"`, `"telegram"`.
+
+Notes:
+- `response` is truncated to 200 characters in agent-level listings. Use `GET /runs/{run_id}` for the full text.
+- `tool_call_count` is present when SQLite persistence is enabled.
+- Runs are sorted newest-first (by `ended_at`, falling back to `started_at` then `created_at`).
+
+**Response 400** — missing or ambiguous filter:
+```json
+{ "error": { "code": "MISSING_FILTER", "message": "..." } }
+{ "error": { "code": "AMBIGUOUS_FILTER", "message": "..." } }
+```
+
 ---
 
 ## 6) Approvals (minimal but real)
