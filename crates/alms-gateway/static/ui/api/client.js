@@ -16,7 +16,7 @@ export async function apiFetch(path, opts = {}) {
         headers['Content-Type'] = 'application/json';
         opts.body = JSON.stringify(opts.body);
     }
-    const res = await fetch(path, { ...opts, headers });
+    const res = await fetch(path, { ...opts, headers, cache: 'no-store' });
     if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw { status: res.status, ...body };
