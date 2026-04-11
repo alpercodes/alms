@@ -327,6 +327,20 @@ impl SessionManager {
             .ok_or_else(|| alms_core::AlmsError::SessionNotFound(session_id.0.to_string()))
     }
 
+    /// Find the last message in a session that satisfies `predicate`.
+    ///
+    /// Performs a reverse scan inside the DashMap read guard and clones only the
+    /// single matching [`Message`], avoiding a full `Vec<Message>` clone that
+    /// [`get_history`] would require.
+    pub fn find_last_message<F>(&self, session_id: SessionId, predicate: F) -> Option<Message>
+    where
+        F: Fn(&Message) -> bool,
+    {
+        self.history
+            .get(&session_id)
+            .and_then(|h| h.iter().rev().find(|m| predicate(m)).cloned())
+    }
+
     /// Append audit event
     pub fn append_audit(&self, session_id: SessionId, event: AuditEvent) -> AlmsResult<()> {
         if let Some(mut audit) = self.audit.get_mut(&session_id) {
@@ -849,5 +863,46 @@ mod tests {
         // Only one session should exist in total.
         let all = mgr.list_all();
         assert_eq!(all.len(), 1, "Only one session should exist");
+    }
+
+    #[test]
+    fn test_find_last_message_returns_last_match() {
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+        let session = mgr.get_or_create(agent_id, "ctx-find");
+
+        mgr.append_message(session.id, make_msg("first")).unwrap();
+        mgr.append_message(session.id, make_msg("second")).unwrap();
+        mgr.append_message(session.id, make_msg("third")).unwrap();
+
+        // Should find "third" — the last message matching the predicate.
+        let found = mgr.find_last_message(
+            session.id,
+            |m| matches!(&m.content, Content::Text(t) if t.contains("ird")),
+        );
+        assert!(found.is_some());
+        assert!(matches!(&found.unwrap().content, Content::Text(t) if t == "third"));
+
+        // Should find "first" when only the first message matches.
+        let found = mgr.find_last_message(
+            session.id,
+            |m| matches!(&m.content, Content::Text(t) if t == "first"),
+        );
+        assert!(found.is_some());
+        assert!(matches!(&found.unwrap().content, Content::Text(t) if t == "first"));
+
+        // Should return None when nothing matches.
+        let found = mgr.find_last_message(session.id, |_| false);
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_find_last_message_nonexistent_session() {
+        let mgr = make_manager();
+        let bogus = SessionId::new();
+
+        // Non-existent session should return None (not panic).
+        let found = mgr.find_last_message(bogus, |_| true);
+        assert!(found.is_none());
     }
 }

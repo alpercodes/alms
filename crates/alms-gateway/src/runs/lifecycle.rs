@@ -818,20 +818,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             let run_output_for_summary = run_input_for_summary.as_ref().map(|_| {
                 if context_id.starts_with("dm:")
                     && let Some(ref name) = agent_name
-                    && let Ok(history) = state.session_manager.get_history(session_id)
-                    && let Some(last_own) = history.iter().rev().find(|m| {
-                        // Scope to messages written *during this run* to avoid
-                        // picking up stale outbound messages from prior runs
-                        // (e.g. when ignore_message was called in the current
-                        // run — #434 Bug 1).
-                        m.timestamp.0 >= run_start_ts.0
-                            && m.metadata.as_ref().is_some_and(|meta| {
-                                meta.get("from_agent").and_then(|v| v.as_str()) == Some(name)
-                                    && meta.get("message_type").and_then(|v| v.as_str())
-                                        == Some("dm")
-                            })
-                            && matches!(m.content, alms_session::Content::Text(_))
-                    })
+                    && let Some(last_own) =
+                        state.session_manager.find_last_message(session_id, |m| {
+                            // Scope to messages written *during this run* to avoid
+                            // picking up stale outbound messages from prior runs
+                            // (e.g. when ignore_message was called in the current
+                            // run — #434 Bug 1).
+                            m.timestamp.0 >= run_start_ts.0
+                                && m.metadata.as_ref().is_some_and(|meta| {
+                                    meta.get("from_agent").and_then(|v| v.as_str()) == Some(name)
+                                        && meta.get("message_type").and_then(|v| v.as_str())
+                                            == Some("dm")
+                                })
+                                && matches!(m.content, alms_session::Content::Text(_))
+                        })
                     && let alms_session::Content::Text(ref text) = last_own.content
                     && !text.is_empty()
                 {
