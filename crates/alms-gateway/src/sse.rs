@@ -283,6 +283,7 @@ impl SseEventData {
         subagent_name: Option<String>,
         status: &str,
         summary: &str,
+        subagent_session_id: alms_core::SessionId,
     ) -> Self {
         Self::new(
             "subagent_completed",
@@ -291,6 +292,7 @@ impl SseEventData {
                 subagent_name,
                 status: status.to_string(),
                 summary: summary.chars().take(200).collect(),
+                subagent_session_id: subagent_session_id.0.to_string(),
                 ts: Utc::now(),
             },
         )
@@ -601,6 +603,8 @@ struct SubagentCompletedData {
     subagent_name: Option<String>,
     status: String,
     summary: String,
+    /// The subagent's own session ID (so the frontend can navigate to it).
+    subagent_session_id: String,
     ts: DateTime<Utc>,
 }
 

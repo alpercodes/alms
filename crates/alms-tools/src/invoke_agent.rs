@@ -131,7 +131,7 @@ impl Tool for InvokeAgentTool {
             // session subscribers directly (not through the parent's runtime
             // channel). This provides live activity for the SubagentBar
             // without blocking the parent run from finishing. See #231.
-            let task_id = self
+            let (task_id, sub_session_id) = self
                 .dispatcher
                 .dispatch_background(
                     task,
@@ -144,10 +144,13 @@ impl Tool for InvokeAgentTool {
                 .await
                 .map_err(|e| SandboxError::Io(format!("Subagent error: {}", e)))?;
 
-            return Ok(serde_json::json!({ "task_id": task_id.to_string() }));
+            return Ok(serde_json::json!({
+                "task_id": task_id.to_string(),
+                "session_id": sub_session_id.0.to_string(),
+            }));
         }
 
-        let response = self
+        let (response, sub_session_id) = self
             .dispatcher
             .dispatch(
                 task,
@@ -160,7 +163,10 @@ impl Tool for InvokeAgentTool {
             .await
             .map_err(|e| SandboxError::Io(format!("Subagent error: {}", e)))?;
 
-        Ok(serde_json::json!({ "response": response }))
+        Ok(serde_json::json!({
+            "response": response,
+            "session_id": sub_session_id.0.to_string(),
+        }))
     }
 
     fn is_builtin(&self) -> bool {
@@ -189,8 +195,8 @@ mod tests {
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
-        ) -> AlmsResult<String> {
-            Ok(self.0.clone())
+        ) -> AlmsResult<(String, SessionId)> {
+            Ok((self.0.clone(), SessionId::new()))
         }
     }
 
@@ -211,6 +217,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["response"], "subagent done");
+        assert!(
+            result.get("session_id").is_some(),
+            "foreground result should include session_id"
+        );
     }
 
     #[tokio::test]
@@ -234,7 +244,7 @@ mod tests {
                 _parent_event_tx: Option<Arc<dyn EventForwarder>>,
                 _subagent_name: Option<String>,
                 _parent_cancel_token: Option<CancellationToken>,
-            ) -> AlmsResult<String> {
+            ) -> AlmsResult<(String, SessionId)> {
                 Err(alms_core::AlmsError::Runtime("subagent failed".to_string()))
             }
         }
@@ -270,8 +280,8 @@ mod tests {
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
-        ) -> AlmsResult<String> {
-            Ok("foreground".to_string())
+        ) -> AlmsResult<(String, SessionId)> {
+            Ok(("foreground".to_string(), SessionId::new()))
         }
 
         async fn dispatch_background(
@@ -282,8 +292,8 @@ mod tests {
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             _subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
-        ) -> AlmsResult<Uuid> {
-            Ok(self.0)
+        ) -> AlmsResult<(Uuid, SessionId)> {
+            Ok((self.0, SessionId::new()))
         }
     }
 
@@ -305,8 +315,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Must have a "task_id" field and no "response" field
+        // Must have "task_id" and "session_id" fields, and no "response" field
         assert!(result.get("task_id").is_some(), "missing task_id field");
+        assert!(
+            result.get("session_id").is_some(),
+            "missing session_id field in background result"
+        );
         assert!(
             result.get("response").is_none(),
             "unexpected response field"
@@ -352,9 +366,9 @@ mod tests {
             _parent_event_tx: Option<Arc<dyn EventForwarder>>,
             subagent_name: Option<String>,
             _parent_cancel_token: Option<CancellationToken>,
-        ) -> AlmsResult<String> {
+        ) -> AlmsResult<(String, SessionId)> {
             *self.0.lock().unwrap() = Some(subagent_name);
-            Ok("ok".to_string())
+            Ok(("ok".to_string(), SessionId::new()))
         }
     }
 

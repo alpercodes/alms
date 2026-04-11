@@ -90,6 +90,8 @@ pub struct SubagentCompletion {
     pub parent_session_id: SessionId,
     /// Parent agent ID (for run creation).
     pub parent_agent_id: AgentId,
+    /// The subagent's own session ID (so the frontend can navigate to it).
+    pub subagent_session_id: SessionId,
 }
 
 /// Handle to a running subagent
@@ -102,6 +104,8 @@ pub struct SubagentHandle {
     pub parent_run_id: Option<RunId>,
     pub parent_session_id: SessionId,
     pub parent_agent_id: AgentId,
+    /// The subagent's own session ID (for frontend navigation).
+    pub subagent_session_id: SessionId,
     /// Whether this was spawned via `dispatch_background` (triggers completion notification).
     pub is_background: bool,
     /// Receiver for the final TaskResult — taken by `dispatch()` to await completion.
@@ -257,7 +261,7 @@ impl Coordinator {
         parent_event_tx: Option<Arc<dyn EventForwarder>>,
         is_background: bool,
         parent_cancel_token: Option<CancellationToken>,
-    ) -> AlmsResult<TaskId> {
+    ) -> AlmsResult<(TaskId, SessionId)> {
         // Reject concurrent invocations of the same named subagent to prevent
         // session corruption from parallel writes to the same session history.
         if let Some(ref name) = request.subagent_name
@@ -288,6 +292,14 @@ impl Coordinator {
             }
         };
 
+        // Derive the subagent's session early so it can be stored in the handle
+        // (for completion notifications) and returned to the caller (for tool results).
+        let (sub_agent_id, sub_context_id) = derive_subagent_identity(task_id, &request);
+        let sub_session = self
+            .session_manager
+            .get_or_create(sub_agent_id, &sub_context_id);
+        let sub_session_id = sub_session.id;
+
         let handle = SubagentHandle {
             task_id,
             status: TaskStatus::Pending,
@@ -296,6 +308,7 @@ impl Coordinator {
             parent_run_id,
             parent_session_id,
             parent_agent_id,
+            subagent_session_id: sub_session_id,
             is_background,
             result_rx: Some(result_rx),
             completed_result: None,
@@ -356,7 +369,7 @@ impl Coordinator {
             .instrument(span),
         );
 
-        Ok(task_id)
+        Ok((task_id, sub_session_id))
     }
 
     /// Take the result receiver for a task (can only be called once per task).
@@ -377,7 +390,7 @@ impl SubagentDispatcher for Coordinator {
         parent_event_tx: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
         parent_cancel_token: Option<CancellationToken>,
-    ) -> AlmsResult<String> {
+    ) -> AlmsResult<(String, SessionId)> {
         let request = SubagentRequest {
             task,
             timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
@@ -386,7 +399,7 @@ impl SubagentDispatcher for Coordinator {
             subagent_name,
         };
 
-        let task_id = self
+        let (task_id, sub_session_id) = self
             .spawn_subagent(request, parent_event_tx, false, parent_cancel_token)
             .await?;
 
@@ -402,10 +415,13 @@ impl SubagentDispatcher for Coordinator {
         })?;
 
         match task_result.status {
-            TaskStatus::Completed => Ok(task_result.result["response"]
-                .as_str()
-                .unwrap_or("[no response]")
-                .to_string()),
+            TaskStatus::Completed => Ok((
+                task_result.result["response"]
+                    .as_str()
+                    .unwrap_or("[no response]")
+                    .to_string(),
+                sub_session_id,
+            )),
             TaskStatus::Failed => Err(alms_core::AlmsError::Runtime(
                 task_result.result["error"]
                     .as_str()
@@ -434,7 +450,7 @@ impl SubagentDispatcher for Coordinator {
         parent_event_tx: Option<Arc<dyn EventForwarder>>,
         subagent_name: Option<String>,
         parent_cancel_token: Option<CancellationToken>,
-    ) -> alms_core::AlmsResult<Uuid> {
+    ) -> alms_core::AlmsResult<(Uuid, SessionId)> {
         let request = SubagentRequest {
             task,
             timeout: Duration::from_secs(SUBAGENT_TTL_SECS),
@@ -442,7 +458,7 @@ impl SubagentDispatcher for Coordinator {
             parent_run_id,
             subagent_name,
         };
-        let task_id = self
+        let (task_id, sub_session_id) = self
             .spawn_subagent(request, parent_event_tx, true, parent_cancel_token)
             .await?;
 
@@ -454,9 +470,10 @@ impl SubagentDispatcher for Coordinator {
 
         info!(
             task_id = %task_id.0,
+            sub_session_id = %sub_session_id.0,
             "Background subagent spawned (non-blocking)"
         );
-        Ok(task_id.0)
+        Ok((task_id.0, sub_session_id))
     }
 }
 
@@ -548,14 +565,23 @@ async fn run_subagent(
     // run_agent_loop future is dropped.
     let (sub_agent_id, sub_context_id) = derive_subagent_identity(task_id, &request);
 
+    // Resolve the subagent's session early so we can (a) register the run
+    // and (b) include the session ID in the completion notification / tool result.
+    let sub_session = session_manager.get_or_create(sub_agent_id, &sub_context_id);
+    let sub_session_id = sub_session.id;
+
     // Register the subagent run with the RunRegistrar (if available) so it
     // appears in GET /runs, the UI sidebar, and CLI `alms run list`.
     let subagent_run = if let Some(ref registrar) = run_registrar {
-        let session = session_manager.get_or_create(sub_agent_id, &sub_context_id);
         let mut run = if let Some(parent_rid) = request.parent_run_id {
-            Run::for_subagent(session.id, sub_agent_id, request.task.clone(), parent_rid)
+            Run::for_subagent(
+                sub_session_id,
+                sub_agent_id,
+                request.task.clone(),
+                parent_rid,
+            )
         } else {
-            Run::new(session.id, sub_agent_id, request.task.clone())
+            Run::new(sub_session_id, sub_agent_id, request.task.clone())
         };
         run.mark_running();
         registrar.register_run(run.clone());
@@ -670,7 +696,11 @@ async fn run_subagent(
         handle.status = new_status;
         handle.completed_result = Some(task_result.clone());
         if handle.is_background {
-            Some((handle.parent_session_id, handle.parent_agent_id))
+            Some((
+                handle.parent_session_id,
+                handle.parent_agent_id,
+                handle.subagent_session_id,
+            ))
         } else {
             None
         }
@@ -680,7 +710,7 @@ async fn run_subagent(
 
     // Fire completion notification for background subagents so the gateway
     // can auto-create a follow-up run on the parent session.
-    if let Some((parent_session_id, parent_agent_id)) = background_info
+    if let Some((parent_session_id, parent_agent_id, subagent_session_id)) = background_info
         && let Some(ref tx) = completion_tx
     {
         let summary = truncate_for_notification(&task_result.result);
@@ -691,6 +721,7 @@ async fn run_subagent(
             summary,
             parent_session_id,
             parent_agent_id,
+            subagent_session_id,
         };
         if let Err(e) = tx.send(completion) {
             warn!(
@@ -1153,12 +1184,18 @@ mod tests {
             )
             .await;
 
-        let response = result.expect("dispatch should succeed");
+        let (response, sub_session_id) = result.expect("dispatch should succeed");
         // Mock LLM echoes "[mock] <input>" — the agent runtime wraps it as
         // the assistant response.
         assert!(
             response.contains("mock"),
             "Expected mock response, got: {response}"
+        );
+        // The subagent session ID should be a valid (non-nil) UUID.
+        assert_ne!(
+            sub_session_id.0,
+            uuid::Uuid::nil(),
+            "subagent session ID should be non-nil"
         );
     }
 
@@ -1167,7 +1204,7 @@ mod tests {
     #[tokio::test]
     async fn test_dispatch_background_spawns() {
         let coord = test_coordinator();
-        let task_uuid = coord
+        let (task_uuid, sub_session_id) = coord
             .dispatch_background(
                 "Background work".to_string(),
                 test_session_id(),
@@ -1181,6 +1218,12 @@ mod tests {
 
         // The returned UUID should be non-nil (a real task was created).
         assert_ne!(task_uuid, uuid::Uuid::nil());
+        // The subagent session ID should be non-nil too.
+        assert_ne!(
+            sub_session_id.0,
+            uuid::Uuid::nil(),
+            "subagent session ID should be non-nil"
+        );
 
         // Wait briefly for the mock LLM to complete — the task should
         // eventually reach a terminal state in the DashMap.
@@ -1220,7 +1263,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord
+        let (task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
             .await
             .unwrap();
@@ -1253,7 +1296,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord
+        let (task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
             .await
             .unwrap();
@@ -1281,7 +1324,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord
+        let (task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
             .await
             .unwrap();
@@ -1316,7 +1359,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: None,
         };
-        let task_id = coord
+        let (task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
             .await
             .unwrap();
@@ -1407,7 +1450,7 @@ mod tests {
         let parent_session = test_session_id();
 
         // First invocation with name "reviewer"
-        let r1 = coord
+        let (r1, sub_sid_1) = coord
             .dispatch(
                 "First task".to_string(),
                 parent_session,
@@ -1421,7 +1464,7 @@ mod tests {
         assert!(r1.contains("mock"), "Expected mock response: {r1}");
 
         // Second invocation with same name — should reuse session (history preserved)
-        let r2 = coord
+        let (r2, sub_sid_2) = coord
             .dispatch(
                 "Follow up".to_string(),
                 parent_session,
@@ -1433,6 +1476,12 @@ mod tests {
             .await
             .expect("second dispatch should succeed");
         assert!(r2.contains("mock"), "Expected mock response: {r2}");
+
+        // Named subagents reuse sessions — both calls should return the same session ID.
+        assert_eq!(
+            sub_sid_1, sub_sid_2,
+            "Named subagent should reuse the same session across invocations"
+        );
 
         // Verify session was reused: the session manager should have exactly one
         // session for the derived (agent_id, context_id) pair
@@ -1476,7 +1525,7 @@ mod tests {
             parent_run_id: None,
             subagent_name: Some("researcher".to_string()),
         };
-        let _task_id = coord
+        let (_task_id, _sub_session_id) = coord
             .spawn_subagent(request, None, false, None)
             .await
             .unwrap();
@@ -1523,7 +1572,7 @@ mod tests {
         let parent_session = test_session_id();
 
         // Two invocations without name — each should get a fresh session
-        let _r1 = coord
+        let (_r1, sub_sid_1) = coord
             .dispatch(
                 "Task one".to_string(),
                 parent_session,
@@ -1535,7 +1584,7 @@ mod tests {
             .await
             .expect("first dispatch should succeed");
 
-        let _r2 = coord
+        let (_r2, sub_sid_2) = coord
             .dispatch(
                 "Task two".to_string(),
                 parent_session,
@@ -1546,6 +1595,12 @@ mod tests {
             )
             .await
             .expect("second dispatch should succeed");
+
+        // Ephemeral subagents get unique sessions — IDs should differ.
+        assert_ne!(
+            sub_sid_1, sub_sid_2,
+            "Ephemeral subagents should have different session IDs"
+        );
 
         // Each ephemeral invocation creates its own session, so we can't
         // look up a single session with all 4 messages. This test verifies
