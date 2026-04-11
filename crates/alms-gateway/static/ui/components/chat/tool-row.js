@@ -31,26 +31,8 @@ function formatJson(val) {
 }
 
 /**
- * Get the plain-text result content for a tool result.
- * For string results that look like JSON, returns the pretty-printed JSON.
- * For object results, returns the JSON string.
- */
-function getResultText(result) {
-    if (result == null) return '';
-    if (typeof result === 'string') {
-        try {
-            const parsed = JSON.parse(result);
-            return JSON.stringify(parsed, null, 2);
-        } catch {
-            return result;
-        }
-    }
-    return JSON.stringify(result, null, 2);
-}
-
-/**
  * Compute the byte size of a result for the size indicator.
- * Uses the raw string length as a rough proxy for byte size.
+ * Uses Blob to compute actual UTF-8 byte size.
  */
 function resultByteSize(result) {
     if (result == null) return 0;
@@ -213,13 +195,15 @@ function renderParams(tool, params) {
  * Includes truncation with "Show more" toggle for large results.
  */
 function ResultSection({ tool, params, result, isFail, showFull }) {
-    const text = getResultText(result);
+    const text = formatJson(result);
     if (!text) return null;
 
     const isLong = text.length > RESULT_TRUNCATE_LEN;
     const displayText = (!showFull.value && isLong)
         ? text.slice(0, RESULT_TRUNCATE_LEN) + '\u2026'
         : text;
+
+    const expandedCls = showFull.value ? ' tc-detail-expanded' : '';
 
     const toggleFull = (e) => {
         e.stopPropagation();
@@ -231,7 +215,7 @@ function ResultSection({ tool, params, result, isFail, showFull }) {
         return html`
             <div class="tc-detail-section">
                 <div class="tc-detail-label">Output</div>
-                <pre class="tc-detail-content tc-code-block">${displayText}</pre>
+                <pre class="tc-detail-content tc-code-block${expandedCls}">${displayText}</pre>
                 ${isLong && html`
                     <button class="tc-show-more" onClick=${toggleFull}>
                         ${showFull.value ? 'Show less' : 'Show more'}
@@ -249,7 +233,7 @@ function ResultSection({ tool, params, result, isFail, showFull }) {
                 <div class="tc-detail-label tc-file-header">
                     ${path ? shortPath(path) : 'File content'}
                 </div>
-                <pre class="tc-detail-content tc-code-block">${displayText}</pre>
+                <pre class="tc-detail-content tc-code-block${expandedCls}">${displayText}</pre>
                 ${isLong && html`
                     <button class="tc-show-more" onClick=${toggleFull}>
                         ${showFull.value ? 'Show less' : 'Show more'}
@@ -285,7 +269,7 @@ function ResultSection({ tool, params, result, isFail, showFull }) {
         return html`
             <div class="tc-detail-section">
                 <div class="tc-detail-label">Subagent response</div>
-                <pre class="tc-detail-content">${truncResponse}</pre>
+                <pre class="tc-detail-content${expandedCls}">${truncResponse}</pre>
                 ${responseText.length > RESULT_TRUNCATE_LEN && html`
                     <button class="tc-show-more" onClick=${toggleFull}>
                         ${showFull.value ? 'Show less' : 'Show more'}
@@ -300,7 +284,7 @@ function ResultSection({ tool, params, result, isFail, showFull }) {
     return html`
         <div class="tc-detail-section">
             <div class="tc-detail-label">${label}</div>
-            <pre class="tc-detail-content ${isFail ? 'tc-detail-error' : ''}">${displayText}</pre>
+            <pre class="tc-detail-content${expandedCls} ${isFail ? 'tc-detail-error' : ''}">${displayText}</pre>
             ${isLong && !isFail && html`
                 <button class="tc-show-more" onClick=${toggleFull}>
                     ${showFull.value ? 'Show less' : 'Show more'}

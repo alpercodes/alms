@@ -49,11 +49,15 @@ export function toolSummary(tool, params) {
             }
             return name;
         }
-        case 'read_session':
-        case 'read_subagent_session': {
+        case 'read_session': {
             const sid = params.session_id ? params.session_id.slice(0, 8) + '\u2026' : '';
             const tail = params.last_n ? ` (last ${params.last_n})` : '';
             return sid + tail;
+        }
+        case 'read_subagent_session': {
+            const name = params.name || '';
+            const tail = params.last_n ? ` (last ${params.last_n})` : '';
+            return name + tail;
         }
         case 'list_agents':
         case 'list_my_sessions':

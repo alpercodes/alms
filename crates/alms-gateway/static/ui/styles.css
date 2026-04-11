@@ -1105,6 +1105,10 @@ header h1 {
   line-height: 1.5;
 }
 
+.tc-detail-content.tc-detail-expanded {
+  max-height: none;
+}
+
 .tc-detail-error {
   color: var(--error);
   border-color: var(--error);
