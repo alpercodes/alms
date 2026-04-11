@@ -79,7 +79,8 @@ export function WarningMessage({ id, text, code }) {
                     ${code && html`<span class="msg-warning-code">${code}</span>`}
                     <button class="msg-warning-toggle"
                             title=${collapsed.value ? 'Expand' : 'Collapse'}
-                            aria-label=${collapsed.value ? 'Expand warning' : 'Collapse warning'}>
+                            aria-label=${collapsed.value ? 'Expand warning' : 'Collapse warning'}
+                            aria-expanded=${!collapsed.value}>
                         ${collapsed.value ? '\u25B6' : '\u25BC'}
                     </button>
                     <button class="msg-warning-dismiss" onClick=${onDismiss}

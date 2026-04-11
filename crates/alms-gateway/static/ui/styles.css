@@ -867,7 +867,6 @@ header h1 {
   border-left: 3px solid var(--warning);
   border-radius: var(--radius-sm);
   margin: var(--space-2) 0;
-  transition: opacity 0.15s ease;
 }
 .msg.msg-warning--collapsed {
   padding-bottom: var(--space-2);
