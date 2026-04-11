@@ -32,7 +32,7 @@ import { batch } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
 import { activeRunId } from '../state/runs.js';
-import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, clearAllSubagents } from '../state/subagents.js';
+import { trackSubagentStart, trackSubagentEnd, trackSubagentTool } from '../state/subagents.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
 import { normalizeApproval } from '../utils/approvals.js';
@@ -601,8 +601,6 @@ export function openSessionStream(sessionId, opts) {
             });
             activeRunId.value = null;
         });
-
-        clearAllSubagents();
 
         // Process queued user messages via dynamic import
         // (avoids circular dependency with input-area.js)
