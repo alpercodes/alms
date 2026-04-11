@@ -62,7 +62,7 @@ function groupMessages(msgs) {
 }
 
 // ── Chat view ──
-function ChatView({ onOpenSettings }) {
+function ChatView() {
     const messagesRef = useRef(null);
 
     // Auto-scroll when messages change.
@@ -221,7 +221,7 @@ function App() {
             ? html`
                 <div id="main">
                     <${Sidebar} />
-                    <${ChatView} onOpenSettings=${() => { settingsOpen.value = true; }} />
+                    <${ChatView} />
                     <${PanelContainer} />
                 </div>`
             : html`<${OnboardingView} />`
