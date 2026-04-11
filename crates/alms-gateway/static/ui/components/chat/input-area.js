@@ -26,7 +26,7 @@ export async function startRun(text, opts) {
     );
 
     try {
-        const sessionId = (opts && opts.sessionId) || activeSessionId.value;
+        const sessionId = opts?.sessionId || activeSessionId.value;
         const runBody = {
             session_id: sessionId,
             input: { type: 'text', text },
