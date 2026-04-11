@@ -392,10 +392,10 @@ impl AgentRuntime {
     ) -> AlmsResult<Vec<AlmsResult<serde_json::Value>>> {
         match self.config.posture {
             Posture::Guarded => {
-                // Sequential execution: cancellation checked between each tool.
-                // Note: cancellation during active tool execution (post-approval)
-                // is not detected until the tool completes, which is acceptable
-                // since guarded tools block on approval (which IS cancellation-aware).
+                // Sequential execution with cancellation support during each tool.
+                // Cancellation is checked between tools AND races against each
+                // individual tool execution so that long-running tools (e.g. shell
+                // commands) can be interrupted mid-flight.
                 let mut results = Vec::with_capacity(tool_calls.len());
                 for (tc, &inv_id) in tool_calls.iter().zip(invocation_ids) {
                     if conflicting_tools.contains(&tc.function.name.as_str()) {
@@ -407,10 +407,16 @@ impl AgentRuntime {
                     {
                         return Err(AlmsError::Cancelled);
                     }
-                    results.push(
+                    let result = if let Some(ref token) = self.cancel_token {
+                        tokio::select! {
+                            r = self.execute_tool_call(tc, inv_id, session_manager, session_id) => r,
+                            _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                        }
+                    } else {
                         self.execute_tool_call(tc, inv_id, session_manager, session_id)
-                            .await,
-                    );
+                            .await
+                    };
+                    results.push(result);
                 }
                 Ok(results)
             }
