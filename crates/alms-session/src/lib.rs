@@ -332,9 +332,11 @@ impl SessionManager {
     /// Performs a reverse scan inside the DashMap read guard and clones only the
     /// single matching [`Message`], avoiding a full `Vec<Message>` clone that
     /// [`get_history`] would require.
-    pub fn find_last_message<F>(&self, session_id: SessionId, predicate: F) -> Option<Message>
+    ///
+    /// Returns `None` if the session does not exist **or** no message matches.
+    pub fn find_last_message<F>(&self, session_id: SessionId, mut predicate: F) -> Option<Message>
     where
-        F: Fn(&Message) -> bool,
+        F: FnMut(&Message) -> bool,
     {
         self.history
             .get(&session_id)
