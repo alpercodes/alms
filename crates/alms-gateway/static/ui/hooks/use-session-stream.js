@@ -324,6 +324,7 @@ export function openSessionStream(sessionId, opts) {
     // and a source_agent guard would need to be added here.
     on('status', (e) => {
         const data = JSON.parse(e.data);
+        console.debug('[status]', data.phase, data.detail || '');
         setAgentPhase(data.phase, data.detail || null);
     });
 
