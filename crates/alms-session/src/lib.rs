@@ -127,6 +127,64 @@ impl SessionManager {
         session
     }
 
+    /// Get or create a session with a specific `SessionId`.
+    ///
+    /// Like [`get_or_create`](Self::get_or_create), this is keyed on
+    /// `(agent_id, context_id)` so subsequent calls to `get_or_create` with
+    /// the same key will find the session created here. The difference is
+    /// that when the session does not yet exist, the caller-provided
+    /// `session_id` is used instead of generating a random UUID v4.
+    ///
+    /// This is needed when a `RunTrigger` carries a deterministic
+    /// `SessionId` (e.g. `SessionId::deterministic("notifications:agent")`)
+    /// but the run execution path goes through `runtime.run()` ->
+    /// `get_or_create()`. Pre-creating the session here ensures the
+    /// deterministic ID is preserved.
+    pub fn get_or_create_with_id(
+        &self,
+        session_id: SessionId,
+        agent_id: AgentId,
+        context_id: impl Into<String>,
+    ) -> Session {
+        let context_id = context_id.into();
+        let key = (agent_id, context_id.clone());
+
+        let session = self
+            .sessions
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let now = alms_core::Timestamp::now();
+                let session = Session {
+                    id: session_id,
+                    agent_id,
+                    context_id,
+                    created_at: now,
+                    last_activity: now,
+                    status: types::SessionStatus::Active,
+                };
+                self.session_by_id.insert(session_id, key);
+                self.history.insert(session_id, Vec::new());
+                self.audit.insert(session_id, Vec::new());
+                self.summaries.entry(session_id).or_default();
+
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save_session(&session)
+                {
+                    warn!("Failed to persist session {}: {}", session_id.0, e);
+                }
+
+                info!(
+                    "Created new session with predetermined ID: {:?}",
+                    session_id
+                );
+                session
+            })
+            .clone();
+
+        debug!("get_or_create_with_id session: {:?}", session.id);
+        session
+    }
+
     /// Get or create a shared session by a known `SessionId`.
     ///
     /// Shared sessions (DM, group) are not owned by a single agent. They use

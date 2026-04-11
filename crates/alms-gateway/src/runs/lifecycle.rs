@@ -727,6 +727,21 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             .run_on_session(&state.session_manager, session_id, &context_id, &input)
             .await
     } else {
+        // Pre-create the session with the trigger's session_id so that
+        // `runtime.run()` -> `get_or_create(agent_id, context_id)` finds
+        // the existing session instead of generating a new random UUID.
+        //
+        // Without this, system-triggered runs on internal sessions (e.g.
+        // `notifications:{agent}`) hit a session ID mismatch: the Run
+        // record carries the deterministic SessionId from the trigger, but
+        // `get_or_create` inside `runtime.run()` creates a session with a
+        // random UUID because no session with that `(agent_id, context_id)`
+        // key exists yet.  Fixes #585.
+        if is_system_triggered {
+            state
+                .session_manager
+                .get_or_create_with_id(session_id, agent_id, &context_id);
+        }
         runtime
             .run(&state.session_manager, &context_id, input)
             .await
