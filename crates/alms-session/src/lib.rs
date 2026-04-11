@@ -799,4 +799,59 @@ mod tests {
         );
         assert_eq!(with_dms[0].context_id, "web-chat");
     }
+
+    #[test]
+    fn test_get_or_create_with_id_preserves_session_id() {
+        // Happy-path: calling get_or_create_with_id with a specific SessionId
+        // should create a session that carries that exact ID and the correct
+        // agent_id / context_id.
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+        let predetermined_id = SessionId::deterministic("notifications:test-agent");
+
+        let session =
+            mgr.get_or_create_with_id(predetermined_id, agent_id, "notifications:test-agent");
+
+        assert_eq!(
+            session.id, predetermined_id,
+            "Session ID must match the caller-provided value"
+        );
+        assert_eq!(session.agent_id, agent_id);
+        assert_eq!(session.context_id, "notifications:test-agent");
+        assert_eq!(session.status, SessionStatus::Active);
+
+        // Also verify it is retrievable via the standard get() path.
+        let fetched = mgr
+            .get(predetermined_id)
+            .expect("session should be findable by ID");
+        assert_eq!(fetched.id, predetermined_id);
+    }
+
+    #[test]
+    fn test_get_or_create_with_id_idempotent_with_get_or_create() {
+        // Idempotency: pre-creating a session with get_or_create_with_id, then
+        // calling the regular get_or_create with the same (agent_id, context_id)
+        // key should return the SAME session (with the predetermined ID), not a
+        // new one.
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+        let predetermined_id = SessionId::deterministic("notifications:test-agent");
+
+        // Pre-create with a specific ID.
+        let first =
+            mgr.get_or_create_with_id(predetermined_id, agent_id, "notifications:test-agent");
+        assert_eq!(first.id, predetermined_id);
+
+        // Regular get_or_create with the same key should find the existing session.
+        let second = mgr.get_or_create(agent_id, "notifications:test-agent");
+        assert_eq!(
+            second.id, predetermined_id,
+            "get_or_create must return the pre-created session, not a new one"
+        );
+        assert_eq!(first.id, second.id);
+
+        // Only one session should exist in total.
+        let all = mgr.list_all();
+        assert_eq!(all.len(), 1, "Only one session should exist");
+    }
 }
