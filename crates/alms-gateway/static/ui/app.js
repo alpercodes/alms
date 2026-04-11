@@ -14,8 +14,10 @@ import { PanelContainer } from './components/panel/index.js';
 import { SettingsModal } from './components/settings-modal.js';
 import { OnboardingView } from './components/onboarding.js';
 import { agents, activeAgent } from './state/agents.js';
+import { isDmSession } from './state/sessions.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
 import { AgentHeaderBar } from './components/chat/agent-header-bar.js';
+import { DmConversationView } from './components/chat/dm-conversation-view.js';
 import { scrollToBottom } from './utils/format.js';
 import { sessionSwitchLoading, agentSwitchLoading, bootRetryAvailable, setRunBoot } from './state/loading.js';
 
@@ -95,17 +97,25 @@ function ChatView() {
     // recomputing on every render is negligible.
     const grouped = groupMessages(chatMessages.value);
 
+    const dmActive = isDmSession.value;
+
     return html`
-        <div id="chat">
+        <div id="chat" class=${dmActive ? 'chat-dm' : ''}>
             <${AgentHeaderBar} />
+            ${(agentSwitchLoading.value || sessionSwitchLoading.value) && html`
+                <div id="messages" role="log" aria-live="polite">
+                    ${agentSwitchLoading.value
+                        ? html`<div class="loading-state">Loading agent...</div>`
+                        : html`<div class="loading-state">Loading session...</div>`
+                    }
+                </div>
+            `}
+            ${!agentSwitchLoading.value && !sessionSwitchLoading.value && dmActive && html`
+                <${DmConversationView} />
+            `}
+            ${!agentSwitchLoading.value && !sessionSwitchLoading.value && !dmActive && html`
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>
-                ${agentSwitchLoading.value && html`
-                    <div class="loading-state">Loading agent...</div>
-                `}
-                ${!agentSwitchLoading.value && sessionSwitchLoading.value && html`
-                    <div class="loading-state">Loading session...</div>
-                `}
-                ${!sessionSwitchLoading.value && !agentSwitchLoading.value && chatMessages.value.length === 0 && html`
+                ${chatMessages.value.length === 0 && html`
                     <div class="empty-state">
                         No messages yet. Send a message to start.
                     </div>
@@ -207,6 +217,7 @@ function ChatView() {
             <${MessageQueue} />
             <${SubagentBar} />
             <${InputArea} />
+            `}
         </div>
     `;
 }
