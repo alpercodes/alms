@@ -1,5 +1,6 @@
 import { html, useSignal, useCallback, useEffect, useRef } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
+import { agentStatus } from '../../state/agent-status.js';
 import { activePanel, togglePanel } from '../../state/panel.js';
 import { IconFolder } from '../../utils/icons.js';
 import { AgentEditModal } from '../panel/agents-tab.js';
@@ -43,6 +44,9 @@ export function AgentHeaderBar() {
         <div class="agent-header-bar">
             <div class="agent-header-bar-left">
                 <span class="agent-header-bar-name">${agent.name}</span>
+                ${agentStatus.value && html`
+                    <span class="agent-status-label">${agentStatus.value}</span>
+                `}
             </div>
             <div class="agent-header-bar-right">
                 <button class="hbtn agent-bar-btn ${activePanel.value === 'workspace' ? 'active' : ''}"
