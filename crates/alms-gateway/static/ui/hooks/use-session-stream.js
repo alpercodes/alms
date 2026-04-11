@@ -541,11 +541,15 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // -- run_warning (non-fatal, e.g. max iterations) --
+    // Subagent warnings (source_agent set) are suppressed in the parent
+    // chat -- they are visible via the SubagentBar drill-down into the
+    // subagent's own session.  (#602)
     on('run_warning', (e) => {
+        const data = JSON.parse(e.data);
+        if (data.source_agent) return;
         batch(() => {
             flushDeltaBuffer();
             sealLastAgent();
-            const data = JSON.parse(e.data);
             const code = data.warning?.code || 'UNKNOWN';
             const msg = data.warning?.message || 'Warning';
             appendMessage({ id: nextMsgId(), type: 'warning', code, text: msg });
