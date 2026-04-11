@@ -11,34 +11,48 @@
 import { html, useEffect, useRef, effect, renderMarkdown } from '../../deps.js';
 import { chatMessages } from '../../state/chat.js';
 import { dmParticipants } from '../../state/sessions.js';
+import { activeAgent } from '../../state/agents.js';
 import { scrollToBottom } from '../../utils/format.js';
 
 /**
  * Determine which "side" a message belongs to in the DM view.
  * The first participant in the alphabetically-sorted participants array
  * is rendered on the left, the second on the right.
+ *
+ * @param {object} msg - chat message entry
+ * @param {string[]} participants - alphabetically sorted participant names
+ * @param {string|null} perspectiveAgent - name of the active agent whose
+ *   session we are viewing; used to assign the correct side for messages
+ *   without an explicit fromAgent.
  */
-function messageSide(msg, participants) {
+function messageSide(msg, participants, perspectiveAgent) {
     // DM messages from peer agents have fromAgent set
     if (msg.fromAgent) {
         return msg.fromAgent === participants[0] ? 'left' : 'right';
     }
     // Agent (assistant) messages without fromAgent: these are from the
-    // perspective agent. In DM sessions the perspective agent is the one
-    // whose session we loaded. Map based on role.
+    // perspective agent (the active agent whose session we loaded).
+    // Use the active agent name to determine which side they belong on,
+    // since participants are alphabetically sorted and the perspective
+    // agent may be either participants[0] or participants[1].
     if (msg.type === 'agent' || msg.role === 'assistant') {
-        // Without fromAgent, we cannot definitively know which agent.
-        // Default to left (first participant).
+        if (perspectiveAgent) {
+            return perspectiveAgent === participants[0] ? 'left' : 'right';
+        }
         return 'left';
     }
     if (msg.type === 'user' || msg.role === 'user') {
+        if (perspectiveAgent) {
+            // User (incoming peer) messages are on the opposite side
+            return perspectiveAgent === participants[0] ? 'right' : 'left';
+        }
         return 'right';
     }
     return 'center';
 }
 
-function DmMessage({ msg, participants }) {
-    const side = messageSide(msg, participants);
+function DmMessage({ msg, participants, perspectiveAgent }) {
+    const side = messageSide(msg, participants, perspectiveAgent);
     const agentName = msg.fromAgent || (side === 'left' ? participants[0] : participants[1]) || '?';
 
     const rendered = renderMarkdown(msg.text || '');
@@ -78,6 +92,7 @@ export function DmConversationView() {
     }, []);
 
     const msgs = chatMessages.value;
+    const perspectiveAgent = activeAgent.value ? activeAgent.value.name : null;
     const label = participants.length >= 2
         ? `${participants[0]} <-> ${participants[1]}`
         : 'DM conversation';
@@ -126,8 +141,23 @@ export function DmConversationView() {
                         </div>
                     `;
                 }
+                if (m.type === 'image') {
+                    const side = messageSide(m, participants, perspectiveAgent);
+                    const agentName = m.fromAgent || (side === 'left' ? participants[0] : participants[1]) || '?';
+                    return html`
+                        <div key=${m.id} class="dm-msg dm-msg-${side}">
+                            <div class="dm-msg-name">${agentName}</div>
+                            <div class="dm-msg-bubble">
+                                ${m.url
+                                    ? html`<img src=${m.url} alt=${m.alt || ''} class="dm-msg-image" />`
+                                    : `[Image${m.alt ? ': ' + m.alt : ''}]`
+                                }
+                            </div>
+                        </div>
+                    `;
+                }
                 if (m.type === 'user' || m.type === 'agent') {
-                    return html`<${DmMessage} key=${m.id} msg=${m} participants=${participants} />`;
+                    return html`<${DmMessage} key=${m.id} msg=${m} participants=${participants} perspectiveAgent=${perspectiveAgent} />`;
                 }
                 return null;
             })}

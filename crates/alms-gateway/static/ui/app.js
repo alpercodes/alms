@@ -100,7 +100,7 @@ function ChatView() {
     const dmActive = isDmSession.value;
 
     return html`
-        <div id="chat" class=${dmActive ? 'chat-dm' : ''}>
+        <div id="chat">
             <${AgentHeaderBar} />
             ${(agentSwitchLoading.value || sessionSwitchLoading.value) && html`
                 <div id="messages" role="log" aria-live="polite">

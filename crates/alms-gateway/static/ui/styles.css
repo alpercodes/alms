@@ -2996,6 +2996,13 @@ select.settings-input-sm {
   padding: 0;
 }
 
+/* Image messages inside DM bubbles */
+.dm-msg-image {
+  max-width: 100%;
+  border-radius: var(--radius-md);
+  display: block;
+}
+
 /* Error / thinking / tool messages in DM view */
 .dm-msg-error {
   font-size: var(--text-xs);
