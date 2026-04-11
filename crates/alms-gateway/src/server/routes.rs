@@ -12,8 +12,8 @@ use crate::approvals::{list_approvals, resolve_approval};
 use crate::auth_keys;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
-    cancel_run, create_run, get_run_status, get_run_tool_calls, is_internal_context_id, list_runs,
-    stream_run_events,
+    cancel_run, classify_session_type, create_run, get_run_status, get_run_tool_calls,
+    is_internal_context_id, list_runs, stream_run_events,
 };
 use crate::settings::{get_settings, patch_settings};
 use crate::workspace::{get_workspace, update_workspace_file};
@@ -183,64 +183,98 @@ async fn health_check() -> impl IntoResponse {
     }))
 }
 
-/// GET /sessions?agent_id=<uuid>&include_dms=true — list sessions.
+/// GET /sessions?agent_id=<uuid>&include_dms=true&include_notifications=true — list sessions.
 ///
 /// By default, excludes internal sessions (DM, notifications, episodic,
 /// subagent, job) — these are implementation details not shown in the
 /// regular UI. Uses the same `INTERNAL_SESSION_PREFIXES` list as
 /// `find_user_facing_session` to keep the filter consistent.
 ///
-/// When `include_dms=true` is set, DM sessions (`dm:*` context IDs) are
-/// included in the response. Other internal session types remain excluded.
-/// DM sessions are stored under `AgentId::nil()` (sentinel), so the
-/// `agent_id` filter is not applied to them — instead they are included
-/// based on participant names parsed from the context ID.
+/// Optional inclusion flags allow the UI to selectively surface internal
+/// session types that have user-visible value:
+///
+/// - `include_dms=true` — include DM sessions (`dm:*` context IDs).
+///   DM sessions are stored under `AgentId::nil()` (sentinel), so the
+///   `agent_id` filter is not applied to them — instead they are included
+///   based on participant names parsed from the context ID.
+///
+/// - `include_notifications=true` — include notification sessions
+///   (`notifications:*` context IDs). These contain agent activity
+///   triggered by DM endings, subagent completions, etc.
 ///
 /// Each session in the response is enriched with:
-/// - `session_type`: `"dm"` for DM sessions, `"chat"` for regular sessions
-/// - `participants`: `[name1, name2]` for DM sessions (parsed from `context_id`),
-///   absent for regular sessions
+/// - `session_type`: one of `"chat"`, `"dm"`, `"notification"`, `"job"`,
+///   `"subagent"`, `"telegram"`, `"episodic"` (derived from `context_id`)
+/// - `participants`: `[name1, name2]` for DM sessions (parsed from `context_id`)
+/// - `agent_name`: agent name extracted from `notifications:{agent}` context IDs
 async fn list_sessions(
     State(state): State<AppState>,
     Query(params): Query<ListSessionsQuery>,
 ) -> impl IntoResponse {
     let include_dms = params.include_dms.unwrap_or(false);
+    let include_notifications = params.include_notifications.unwrap_or(false);
     let all_sessions = state.session_manager.list_all();
 
     let mut result: Vec<serde_json::Value> = Vec::new();
 
     for session in all_sessions {
-        let is_dm = session.context_id.starts_with("dm:");
+        let session_type = classify_session_type(&session.context_id);
         let is_internal = is_internal_context_id(&session.context_id);
 
-        if is_dm {
-            // DM sessions: only include when explicitly requested
-            if !include_dms {
+        match session_type {
+            "dm" => {
+                // DM sessions: only include when explicitly requested
+                if !include_dms {
+                    continue;
+                }
+                // agent_id filter does not apply to DM sessions (they use nil sentinel)
+            }
+            "notification" => {
+                // Notification sessions: only include when explicitly requested
+                if !include_notifications {
+                    continue;
+                }
+                // Apply agent_id filter to notification sessions
+                if let Some(agent_id) = params.agent_id
+                    && session.agent_id != agent_id
+                {
+                    continue;
+                }
+            }
+            _ if is_internal => {
+                // Other internal sessions (job, subagent, episodic): always excluded
                 continue;
             }
-            // agent_id filter does not apply to DM sessions (they use nil sentinel)
-        } else if is_internal {
-            // Other internal sessions: always excluded
-            continue;
-        } else {
-            // Regular user-facing sessions: apply agent_id filter
-            if let Some(agent_id) = params.agent_id
-                && session.agent_id != agent_id
-            {
-                continue;
+            _ => {
+                // Regular user-facing sessions: apply agent_id filter
+                if let Some(agent_id) = params.agent_id
+                    && session.agent_id != agent_id
+                {
+                    continue;
+                }
             }
         }
 
         // Build the enriched JSON object
         let mut obj = serde_json::to_value(&session).unwrap_or_default();
-        if is_dm {
-            obj["session_type"] = serde_json::json!("dm");
-            if let Some((a, b)) = dm_participants(&session.context_id) {
-                obj["participants"] = serde_json::json!([a, b]);
+        obj["session_type"] = serde_json::json!(session_type);
+
+        // Type-specific enrichments
+        match session_type {
+            "dm" => {
+                if let Some((a, b)) = dm_participants(&session.context_id) {
+                    obj["participants"] = serde_json::json!([a, b]);
+                }
             }
-        } else {
-            obj["session_type"] = serde_json::json!("chat");
+            "notification" => {
+                // Extract agent name from "notifications:{agent}" context_id
+                if let Some(agent_name) = session.context_id.strip_prefix("notifications:") {
+                    obj["agent_name"] = serde_json::json!(agent_name);
+                }
+            }
+            _ => {}
         }
+
         result.push(obj);
     }
 
@@ -253,6 +287,10 @@ struct ListSessionsQuery {
     /// When `true`, DM sessions (`dm:*` context IDs) are included in the
     /// response alongside regular user-facing sessions.
     include_dms: Option<bool>,
+    /// When `true`, notification sessions (`notifications:*` context IDs)
+    /// are included in the response. These sessions contain agent activity
+    /// triggered by DM conversation endings, subagent completions, etc.
+    include_notifications: Option<bool>,
 }
 
 /// Create a new session

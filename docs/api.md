@@ -131,6 +131,7 @@ subagent, job) are excluded by default.
 |-----------|------|---------|-------------|
 | `agent_id` | UUID | _(none)_ | Filter sessions by agent UUID. Does not apply to DM sessions (they use a nil sentinel agent). |
 | `include_dms` | bool | `false` | When `true`, DM sessions (`dm:*` context IDs) are included alongside regular sessions. Other internal session types remain excluded. |
+| `include_notifications` | bool | `false` | When `true`, notification sessions (`notifications:*` context IDs) are included. These contain agent activity triggered by DM conversation endings, subagent completions, etc. The `agent_id` filter applies to notification sessions. |
 
 **Response 200**
 ```json
@@ -140,7 +141,7 @@ subagent, job) are excluded by default.
       "session_id": "<uuid>",
       "agent_id": "<uuid>",
       "context_id": "telegram_main_1853446411",
-      "session_type": "chat",
+      "session_type": "telegram",
       "created_at": "2026-02-11T07:00:00Z",
       "last_activity": "2026-02-11T07:52:00Z",
       "status": "active"
@@ -154,6 +155,16 @@ subagent, job) are excluded by default.
       "created_at": "2026-02-11T08:00:00Z",
       "last_activity": "2026-02-11T08:15:00Z",
       "status": "active"
+    },
+    {
+      "session_id": "<uuid>",
+      "agent_id": "<uuid>",
+      "context_id": "notifications:alice",
+      "session_type": "notification",
+      "agent_name": "alice",
+      "created_at": "2026-02-11T09:00:00Z",
+      "last_activity": "2026-02-11T09:30:00Z",
+      "status": "active"
     }
   ]
 }
@@ -163,11 +174,25 @@ subagent, job) are excluded by default.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `session_type` | string | `"chat"` for regular sessions, `"dm"` for DM sessions. Always present. |
+| `session_type` | string | Session type derived from the `context_id`. Always present. See table below. |
 | `participants` | string[] | Participant names parsed from the DM context ID (e.g. `["alice", "bob"]`). Only present when `session_type` is `"dm"`. |
+| `agent_name` | string | Agent name extracted from the notification context ID (e.g. `"alice"` from `"notifications:alice"`). Only present when `session_type` is `"notification"`. |
 
-> **Note**: The second session object (DM) only appears when `?include_dms=true` is set.
+**`session_type` values**
+
+| Value | Context ID pattern | Description |
+|-------|-------------------|-------------|
+| `"chat"` | _(default)_ | Regular web chat sessions (no recognised prefix). |
+| `"dm"` | `dm:{a}:{b}` | Direct message session between two agents. |
+| `"notification"` | `notifications:{agent}` | Notification session for an agent (DM endings, subagent completions). |
+| `"telegram"` | `telegram_{name}_{chat_id}` | Telegram channel session. |
+| `"job"` | `job_{id}` | Scheduled job session. |
+| `"subagent"` | `subagent_{task}` | Subagent execution session. |
+| `"episodic"` | `episodic:{id}` | Episodic memory session. |
+
+> **Note**: DM sessions only appear when `?include_dms=true` is set. Notification sessions only appear when `?include_notifications=true` is set.
 > DM sessions use `AgentId::nil()` as a sentinel, so the `agent_id` filter does not apply to them.
+> Job, subagent, and episodic sessions are always excluded from the listing.
 
 ### 4.2 Create session
 `POST /sessions`

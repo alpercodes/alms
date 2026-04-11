@@ -113,6 +113,11 @@ pub(crate) fn is_internal_context_id(context_id: &str) -> bool {
         .any(|prefix| context_id.starts_with(prefix))
 }
 
+// `classify_session_type` lives in `alms_core` as the single source of truth.
+// Re-exported here so that crate-internal callers (routes.rs) can still use the
+// `crate::runs::classify_session_type` path unchanged.
+pub(crate) use alms_core::classify_session_type;
+
 /// Find the most recent user-facing session for the given agent.
 ///
 /// Returns `None` if the agent has no non-internal sessions.  Sessions are
@@ -1151,13 +1156,15 @@ mod tests {
     #[test]
     fn test_user_facing_context_ids() {
         // Plain context IDs (web chat, telegram, etc.) are user-facing.
-        for ctx in &["web", "default", "telegram:123", "my-custom-context"] {
+        for ctx in &["web", "default", "telegram_123", "my-custom-context"] {
             assert!(
                 !is_internal_context_id(ctx),
                 "context_id '{ctx}' should NOT be classified as internal"
             );
         }
     }
+
+    // classify_session_type tests live in alms-core (single source of truth).
 
     #[test]
     fn test_find_user_facing_session_excludes_internal() {
