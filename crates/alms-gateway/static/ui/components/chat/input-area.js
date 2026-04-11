@@ -9,15 +9,26 @@ import { localSettings } from '../../state/settings.js';
 import { createRun, cancelRun as apiCancelRun } from '../../api/runs.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
 
-export async function startRun(text) {
+/**
+ * Start a new run with the given text.
+ *
+ * @param {string} text -- the user message to send
+ * @param {object} [opts]
+ * @param {string} [opts.sessionId] -- override for activeSessionId.value.
+ *   Used by handleRunEnd's queued-message path to avoid a microtask gap
+ *   where activeSessionId could change between dequeue and execution
+ *   (see issue #526).
+ */
+export async function startRun(text, opts) {
     appendMessage(
         { id: nextMsgId(), type: 'user', role: 'user', text },
         { id: nextMsgId(), type: 'thinking' },
     );
 
     try {
+        const sessionId = opts?.sessionId || activeSessionId.value;
         const runBody = {
-            session_id: activeSessionId.value,
+            session_id: sessionId,
             input: { type: 'text', text },
         };
         const settings = localSettings.value;
