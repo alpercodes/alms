@@ -127,6 +127,64 @@ impl SessionManager {
         session
     }
 
+    /// Get or create a session with a specific `SessionId`.
+    ///
+    /// Like [`get_or_create`](Self::get_or_create), this is keyed on
+    /// `(agent_id, context_id)` so subsequent calls to `get_or_create` with
+    /// the same key will find the session created here. The difference is
+    /// that when the session does not yet exist, the caller-provided
+    /// `session_id` is used instead of generating a random UUID v4.
+    ///
+    /// This is needed when a `RunTrigger` carries a deterministic
+    /// `SessionId` (e.g. `SessionId::deterministic("notifications:agent")`)
+    /// but the run execution path goes through `runtime.run()` ->
+    /// `get_or_create()`. Pre-creating the session here ensures the
+    /// deterministic ID is preserved.
+    pub fn get_or_create_with_id(
+        &self,
+        session_id: SessionId,
+        agent_id: AgentId,
+        context_id: impl Into<String>,
+    ) -> Session {
+        let context_id = context_id.into();
+        let key = (agent_id, context_id.clone());
+
+        let session = self
+            .sessions
+            .entry(key.clone())
+            .or_insert_with(|| {
+                let now = alms_core::Timestamp::now();
+                let session = Session {
+                    id: session_id,
+                    agent_id,
+                    context_id,
+                    created_at: now,
+                    last_activity: now,
+                    status: types::SessionStatus::Active,
+                };
+                self.session_by_id.insert(session_id, key);
+                self.history.insert(session_id, Vec::new());
+                self.audit.insert(session_id, Vec::new());
+                self.summaries.entry(session_id).or_default();
+
+                if let Some(store) = &self.store
+                    && let Err(e) = store.save_session(&session)
+                {
+                    warn!("Failed to persist session {}: {}", session_id.0, e);
+                }
+
+                info!(
+                    "Created new session with predetermined ID: {:?}",
+                    session_id
+                );
+                session
+            })
+            .clone();
+
+        debug!("get_or_create_with_id session: {:?}", session.id);
+        session
+    }
+
     /// Get or create a shared session by a known `SessionId`.
     ///
     /// Shared sessions (DM, group) are not owned by a single agent. They use
@@ -740,5 +798,60 @@ mod tests {
             "Agent named 'dm' should not match DM prefix segment"
         );
         assert_eq!(with_dms[0].context_id, "web-chat");
+    }
+
+    #[test]
+    fn test_get_or_create_with_id_preserves_session_id() {
+        // Happy-path: calling get_or_create_with_id with a specific SessionId
+        // should create a session that carries that exact ID and the correct
+        // agent_id / context_id.
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+        let predetermined_id = SessionId::deterministic("notifications:test-agent");
+
+        let session =
+            mgr.get_or_create_with_id(predetermined_id, agent_id, "notifications:test-agent");
+
+        assert_eq!(
+            session.id, predetermined_id,
+            "Session ID must match the caller-provided value"
+        );
+        assert_eq!(session.agent_id, agent_id);
+        assert_eq!(session.context_id, "notifications:test-agent");
+        assert_eq!(session.status, SessionStatus::Active);
+
+        // Also verify it is retrievable via the standard get() path.
+        let fetched = mgr
+            .get(predetermined_id)
+            .expect("session should be findable by ID");
+        assert_eq!(fetched.id, predetermined_id);
+    }
+
+    #[test]
+    fn test_get_or_create_with_id_idempotent_with_get_or_create() {
+        // Idempotency: pre-creating a session with get_or_create_with_id, then
+        // calling the regular get_or_create with the same (agent_id, context_id)
+        // key should return the SAME session (with the predetermined ID), not a
+        // new one.
+        let mgr = make_manager();
+        let agent_id = AgentId::new();
+        let predetermined_id = SessionId::deterministic("notifications:test-agent");
+
+        // Pre-create with a specific ID.
+        let first =
+            mgr.get_or_create_with_id(predetermined_id, agent_id, "notifications:test-agent");
+        assert_eq!(first.id, predetermined_id);
+
+        // Regular get_or_create with the same key should find the existing session.
+        let second = mgr.get_or_create(agent_id, "notifications:test-agent");
+        assert_eq!(
+            second.id, predetermined_id,
+            "get_or_create must return the pre-created session, not a new one"
+        );
+        assert_eq!(first.id, second.id);
+
+        // Only one session should exist in total.
+        let all = mgr.list_all();
+        assert_eq!(all.len(), 1, "Only one session should exist");
     }
 }
