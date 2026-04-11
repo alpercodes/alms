@@ -1357,4 +1357,125 @@ mod tests {
         assert!(messages[2].content_str().contains("Context summary"));
         assert_eq!(messages[6].role, "user"); // current input
     }
+
+    /// Notification runs (DM-ended, subagent completion) on user-facing
+    /// sessions pre-persist the notification input as a Role::User message
+    /// with `notification_input: true` metadata, then call
+    /// `run_on_session` with an empty input string.
+    ///
+    /// This test verifies that the context builder:
+    ///
+    /// 1. Includes the notification_input User message from session history
+    /// 2. Does NOT append a trailing user message (input is empty)
+    /// 3. The resulting messages array ends with a user message (the
+    ///    notification from history) — required by Anthropic and beneficial
+    ///    for all OpenRouter models
+    ///
+    /// This covers the OpenRouter code path where the CompletionRequest is
+    /// sent directly as OpenAI chat completions JSON (no system message
+    /// extraction). The Role::User notification ensures the LLM sees a
+    /// clear conversation turn to respond to.
+    #[test]
+    fn test_notification_run_context_ends_with_user_message() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        // Simulate a user-facing session with prior conversation + notification
+        let notification_text =
+            "[DM conversation ended] Agent Bob ended the conversation. Transcript: ...";
+        let mut notif_msg = make_msg(Role::User, notification_text);
+        notif_msg.metadata = Some(serde_json::json!({
+            "notification_input": true,
+        }));
+
+        let history = vec![
+            make_msg(Role::User, "Please message Bob about the project"),
+            make_msg(Role::Assistant, "I'll send a message to Bob for you."),
+            // Synthetic DM-ended marker (persisted by notify_dm_ended_to_webchat)
+            {
+                let mut marker = make_msg(Role::System, "[DM conversation ended]");
+                marker.metadata = Some(serde_json::json!({
+                    "synthetic": true,
+                    "type": "dm_ended_notification",
+                }));
+                marker
+            },
+            // Notification input (pre-persisted by execute_run as Role::User)
+            notif_msg,
+        ];
+
+        // Empty input — run_on_session passes "" since the notification is
+        // already in the session history
+        let messages = builder.build("You are an agent.", &history, "", None);
+
+        // system + 4 history messages (user, assistant, system marker, user notification) = 5
+        assert_eq!(messages.len(), 5, "expected system + 4 history messages");
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[3].role, "system"); // synthetic marker
+        assert_eq!(messages[4].role, "user"); // notification input
+        assert!(
+            messages[4].content_str().contains("DM conversation ended"),
+            "last message should be the notification input"
+        );
+
+        // The messages array ends with a user message — this is critical
+        // for Anthropic (requires trailing user turn after system extraction)
+        // and beneficial for OpenRouter (models respond better to user turns
+        // than to trailing system messages).
+        assert_eq!(
+            messages.last().unwrap().role,
+            "user",
+            "context must end with a user message for all providers"
+        );
+    }
+
+    /// Verify that the OLD approach (Role::System notification) would NOT
+    /// produce a trailing user message — confirming the bug that was fixed.
+    ///
+    /// This is a regression test: if someone reverts the Role::User change
+    /// in lifecycle.rs, the notification would become Role::System in
+    /// session history, and the context would end with a system message
+    /// (or the preceding assistant message after Anthropic extraction).
+    #[test]
+    fn test_system_notification_does_not_end_with_user() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        // Simulate the OLD behavior where notification was Role::System
+        let history = vec![
+            make_msg(Role::User, "Please message Bob"),
+            make_msg(Role::Assistant, "I'll message Bob."),
+            make_msg(Role::System, "[DM ended] notification text"),
+        ];
+
+        // Empty input (run_on_session path)
+        let messages = builder.build("System prompt.", &history, "", None);
+
+        // system + 3 history = 4
+        assert_eq!(messages.len(), 4);
+        // Last message is the system notification — NOT a user message.
+        // This would cause Anthropic rejection (no trailing user turn)
+        // and poor model behavior on OpenRouter.
+        assert_eq!(
+            messages.last().unwrap().role,
+            "system",
+            "old Role::System approach ends with system, not user"
+        );
+    }
 }

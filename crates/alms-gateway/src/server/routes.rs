@@ -297,8 +297,10 @@ async fn get_session_messages(
                     // with `notification_input: true` metadata). These are
                     // internal LLM prompts persisted by execute_run for
                     // notification runs landing on user-facing sessions.
-                    // They must be Role::User for Anthropic API
-                    // compatibility but should not appear as "user" bubbles
+                    // They must be Role::User for LLM API compatibility
+                    // (Anthropic requires a trailing user turn; OpenRouter
+                    // models produce poor responses to trailing system
+                    // messages) but should not appear as "user" bubbles
                     // in the chat UI.
                     let is_notification_input = m
                         .metadata
