@@ -23,11 +23,17 @@ import { signal, computed } from '../deps.js';
 export const agentPhase = signal({ phase: null, detail: null });
 
 /**
- * Human-readable status label derived from the raw phase.
- * Returns null when idle (no active phase).
+ * Derive a human-readable status label from a raw phase + detail pair.
+ * Returns null when idle (phase is null/undefined).
+ *
+ * Extracted as a pure function so callers that read agentPhase.value
+ * directly (e.g. AgentHeaderBar) can derive the label without going
+ * through the computed signal -- this avoids a subtle @preact/signals
+ * reactivity edge-case where computed signals accessed via .value in
+ * function component render bodies occasionally fail to trigger
+ * re-renders (observed with @preact/signals@1.3.0 + Preact 10.24.3).
  */
-export const agentStatus = computed(() => {
-    const { phase, detail } = agentPhase.value;
+export function phaseToLabel(phase, detail) {
     if (!phase) return null;
 
     switch (phase) {
@@ -44,6 +50,20 @@ export const agentStatus = computed(() => {
         default:
             return null;
     }
+}
+
+/**
+ * Human-readable status label derived from the raw phase.
+ * Returns null when idle (no active phase).
+ *
+ * NOTE: Some components read agentPhase.value directly and call
+ * phaseToLabel() instead of using this computed signal, to work
+ * around a @preact/signals reactivity edge-case.  Both approaches
+ * produce the same labels.
+ */
+export const agentStatus = computed(() => {
+    const { phase, detail } = agentPhase.value;
+    return phaseToLabel(phase, detail);
 });
 
 /**

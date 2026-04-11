@@ -1,6 +1,6 @@
 import { html, useSignal, useCallback, useEffect, useRef } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
-import { agentStatus } from '../../state/agent-status.js';
+import { agentPhase, phaseToLabel } from '../../state/agent-status.js';
 import { activePanel, togglePanel } from '../../state/panel.js';
 import { IconFolder } from '../../utils/icons.js';
 import { AgentEditModal } from '../panel/agents-tab.js';
@@ -13,6 +13,12 @@ import { AgentEditModal } from '../panel/agents-tab.js';
  */
 export function AgentHeaderBar() {
     const agent = activeAgent.value;
+    // Read agentPhase.value directly (raw signal) and derive the label
+    // inline instead of going through the agentStatus computed signal.
+    // This avoids a @preact/signals reactivity edge-case where the
+    // computed signal occasionally fails to trigger component re-renders.
+    const { phase, detail } = agentPhase.value;
+    const statusLabel = phaseToLabel(phase, detail);
     const menuOpen = useSignal(false);
     const editOpen = useSignal(false);
     const menuRef = useRef(null);
@@ -44,8 +50,8 @@ export function AgentHeaderBar() {
         <div class="agent-header-bar">
             <div class="agent-header-bar-left">
                 <span class="agent-header-bar-name">${agent.name}</span>
-                ${agentStatus.value && html`
-                    <span class="agent-status-label">${agentStatus.value}</span>
+                ${statusLabel && html`
+                    <span class="agent-status-label">${statusLabel}</span>
                 `}
             </div>
             <div class="agent-header-bar-right">
