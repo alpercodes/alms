@@ -246,25 +246,10 @@ pub(super) fn resolve_posture_for_run(
 
 /// Extract the peer agent name from a `dm:{name1}:{name2}` context ID.
 ///
-/// The DM context ID format is `dm:{first}:{second}` where the names are
-/// alphabetically sorted (see [`alms_core::dm_context_id`]). The peer is
-/// whichever name is NOT the current agent.
-///
-/// Returns `None` if the context ID does not match the expected format or
-/// neither name matches `agent_name`.
-///
-/// Note: `split_once(':')` is safe because agent names are restricted to
-/// `[a-z0-9-]` by `validate_agent_name` — colons cannot appear in names.
+/// Delegates to [`alms_core::dm_peer`].  Returns `None` if the context ID
+/// does not match the expected format or neither name matches `agent_name`.
 pub(super) fn extract_peer_from_dm_context(context_id: &str, agent_name: &str) -> Option<String> {
-    let rest = context_id.strip_prefix("dm:")?;
-    let (first, second) = rest.split_once(':')?;
-    if first == agent_name {
-        Some(second.to_string())
-    } else if second == agent_name {
-        Some(first.to_string())
-    } else {
-        None
-    }
+    alms_core::dm_peer(context_id, agent_name).map(|s| s.to_string())
 }
 
 /// RAII guard that calls [`RunManager::untrack_in_flight`] on drop.

@@ -25,15 +25,14 @@ pub struct SourceLabel {
 pub fn derive_source_label(context_id: &str, agent_name: &str) -> Option<SourceLabel> {
     // DM sessions: "dm:{name1}:{name2}" (alphabetically sorted).
     // Determine the peer by finding the name that isn't ours.
-    if let Some(rest) = context_id.strip_prefix("dm:") {
-        if let Some((a, b)) = rest.split_once(':') {
-            let peer = if a == agent_name { b } else { a };
+    if context_id.starts_with("dm:") {
+        if let Some(peer) = crate::dm_peer(context_id, agent_name) {
             return Some(SourceLabel {
                 source_type: "dm".into(),
                 source_label: format!("DM with {peer}"),
             });
         }
-        // Malformed dm: context_id -- exclude to be safe.
+        // Malformed or agent not a participant -- exclude to be safe.
         return None;
     }
 
