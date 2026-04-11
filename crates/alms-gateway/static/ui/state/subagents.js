@@ -2,32 +2,97 @@ import { signal } from '../deps.js';
 
 /**
  * Active subagents and their tool activity.
- * Shape: { [name]: { status: 'running'|'done'|'fail'|'cancelled', tools: [...], task: string } }
+ * Shape: { [key]: { status, tools, task, toolInvocationId, displayName } }
+ *
+ * Keys are unique identifiers for each subagent invocation:
+ *   - Named subagents use the agent name as the key (e.g. "reviewer").
+ *   - Unnamed subagents use "subagent-{toolInvocationId_prefix}" so that
+ *     concurrent unnamed invocations each get their own slot.
+ *
+ * `displayName` is the human-friendly label shown in the SubagentBar chip.
+ * For named subagents it equals the key; for unnamed ones it is "subagent".
+ *
+ * `toolInvocationId` is the tool_invocation_id of the parent's invoke_agent
+ * call. Stored so that tool_end for invoke_agent can look up the correct
+ * subagent entry even when the subagent has no name param.
  */
 export const activeSubagents = signal({});
 
-/** Pending auto-remove timers keyed by subagent name. */
+/** Pending auto-remove timers keyed by subagent key. */
 const removeTimers = {};
 
 /** Delay (ms) before a completed subagent chip is removed from the bar. */
 const REMOVE_DELAY_MS = 3000;
 
-/** Track a subagent invocation. */
-export function trackSubagentStart(name, task) {
-    // Cancel any pending removal from a previous invocation with the same name.
-    if (removeTimers[name]) {
-        clearTimeout(removeTimers[name]);
-        delete removeTimers[name];
+/**
+ * Track a subagent invocation.
+ *
+ * @param {string} name - Display name for the subagent chip (from invoke_agent params).
+ * @param {string} task - The task description.
+ * @param {string} [toolInvocationId] - The invoke_agent tool_invocation_id
+ *   from the parent. Stored for matching on tool_end.
+ */
+export function trackSubagentStart(name, task, toolInvocationId) {
+    // For unnamed subagents (name === 'subagent'), derive a unique key from
+    // the toolInvocationId so concurrent unnamed invocations do not overwrite
+    // each other. Named subagents keep the name as the key.
+    const isUnnamed = (name === 'subagent');
+    const key = (isUnnamed && toolInvocationId)
+        ? 'subagent-' + toolInvocationId.slice(0, 8)
+        : name;
+
+    // Cancel any pending removal from a previous invocation with the same key.
+    if (removeTimers[key]) {
+        clearTimeout(removeTimers[key]);
+        delete removeTimers[key];
     }
     activeSubagents.value = {
         ...activeSubagents.value,
-        [name]: { status: 'running', tools: [], task: task || '' },
+        [key]: {
+            status: 'running',
+            tools: [],
+            task: task || '',
+            toolInvocationId: toolInvocationId || null,
+            displayName: name,
+        },
     };
 }
 
-/** Add a tool event to a subagent. */
+/**
+ * Add a tool event to a subagent.
+ *
+ * The `name` parameter is the backend-assigned source_agent label, which for
+ * unnamed subagents looks like "subagent-{task_id_prefix}". This is matched
+ * directly against the entry key (which was derived the same way at start
+ * time for unnamed subagents) or via the stored toolInvocationId as a
+ * fallback.
+ */
 export function trackSubagentTool(name, tool) {
-    const current = activeSubagents.value[name];
+    let current = activeSubagents.value[name];
+
+    // Fallback: if no direct key match, search by toolInvocationId prefix.
+    // The tool_start handler registers unnamed subagents under
+    // "subagent-{toolInvocationId_prefix}" but the backend labels forwarded
+    // events with "subagent-{task_id_prefix}" (a different ID). Try to match
+    // by finding a running unnamed entry.
+    if (!current && name.startsWith('subagent-')) {
+        for (const [key, info] of Object.entries(activeSubagents.value)) {
+            if (key.startsWith('subagent-') && info.status === 'running') {
+                current = info;
+                // Migrate the entry to the backend-assigned key so future
+                // tool events match directly.
+                const { [key]: entry, ...rest } = activeSubagents.value;
+                activeSubagents.value = { ...rest, [name]: entry };
+                // Migrate any pending removal timer.
+                if (removeTimers[key]) {
+                    clearTimeout(removeTimers[key]);
+                    delete removeTimers[key];
+                }
+                break;
+            }
+        }
+    }
+
     if (!current) return;
     const tools = [...current.tools];
     const idx = tools.findIndex(t => t.id === tool.id);
@@ -47,24 +112,59 @@ export function trackSubagentTool(name, tool) {
  *
  * The entry stays visible for REMOVE_DELAY_MS so the user can see the
  * final status (checkmark / X) before it disappears.
+ *
+ * For unnamed subagents the backend sends `subagent_name: null`, which
+ * resolves to the fallback name "subagent". Since the entry key is
+ * "subagent-{id}", a direct lookup would miss. When `name` is "subagent"
+ * and no exact match exists, we search for any running entry whose key
+ * starts with "subagent-" and end that one instead.
  */
 export function trackSubagentEnd(name, status) {
-    const current = activeSubagents.value[name];
+    let key = name;
+    let current = activeSubagents.value[key];
+
+    // Fallback for unnamed subagents: the backend sends subagent_name=null,
+    // so the caller passes "subagent" — but the entry key is "subagent-{id}".
+    if (!current && name === 'subagent') {
+        for (const [k, info] of Object.entries(activeSubagents.value)) {
+            if (k.startsWith('subagent-') && info.status === 'running') {
+                key = k;
+                current = info;
+                break;
+            }
+        }
+    }
+
     if (!current) return;
     activeSubagents.value = {
         ...activeSubagents.value,
-        [name]: { ...current, status },
+        [key]: { ...current, status },
     };
 
     // Schedule auto-removal after a brief delay.
-    if (removeTimers[name]) {
-        clearTimeout(removeTimers[name]);
+    if (removeTimers[key]) {
+        clearTimeout(removeTimers[key]);
     }
-    removeTimers[name] = setTimeout(() => {
-        delete removeTimers[name];
-        const { [name]: _, ...rest } = activeSubagents.value;
+    removeTimers[key] = setTimeout(() => {
+        delete removeTimers[key];
+        const { [key]: _, ...rest } = activeSubagents.value;
         activeSubagents.value = rest;
     }, REMOVE_DELAY_MS);
+}
+
+/**
+ * Find the subagent name associated with a given invoke_agent tool
+ * invocation ID. Returns the name key, or null if not found.
+ *
+ * Used by tool_end for invoke_agent when the tool params lack a name
+ * (unnamed/ephemeral subagents).
+ */
+export function findSubagentByToolInvocationId(toolInvocationId) {
+    if (!toolInvocationId) return null;
+    for (const [name, info] of Object.entries(activeSubagents.value)) {
+        if (info.toolInvocationId === toolInvocationId) return name;
+    }
+    return null;
 }
 
 /** Clear all subagent entries regardless of status. */
