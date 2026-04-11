@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Default value for `ToolCall::call_type` — always `"function"`.
+fn default_tool_call_type() -> String {
+    "function".to_string()
+}
+
 /// LLM message for API calls
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmMessage {
@@ -124,11 +129,37 @@ impl ToolDefinition {
     }
 }
 
-/// Tool call from LLM
+/// Tool call from LLM.
+///
+/// Serializes to the OpenAI format: `{"id": "...", "type": "function", "function": {...}}`.
+/// The `type` field is required by the OpenAI spec and enforced by strict providers
+/// (e.g. Z.AI via OpenRouter). It defaults to `"function"` on deserialization so
+/// responses that omit it (common with many providers) still parse correctly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
+    /// Always `"function"` — required by the OpenAI tool-call wire format.
+    #[serde(rename = "type", default = "default_tool_call_type")]
+    pub call_type: String,
     pub function: FunctionCall,
+}
+
+impl ToolCall {
+    /// Create a new tool call with `type` defaulting to `"function"`.
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            call_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.into(),
+            },
+        }
+    }
 }
 
 /// Function call details
@@ -518,6 +549,68 @@ mod tests {
         assert!(
             !json.contains("reasoning_content"),
             "reasoning_content should be skipped when None: {json}"
+        );
+    }
+
+    // -- ToolCall type field tests (fixes "Tool type cannot be empty" on strict providers) --
+
+    #[test]
+    fn test_tool_call_serializes_type_function() {
+        let tc = ToolCall::new("call_1", "echo", r#"{"text":"hi"}"#);
+        let json = serde_json::to_string(&tc).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(
+            parsed.get("type").and_then(|v| v.as_str()),
+            Some("function"),
+            "ToolCall must serialize with \"type\": \"function\": {json}"
+        );
+        assert_eq!(parsed.get("id").and_then(|v| v.as_str()), Some("call_1"));
+        assert!(parsed.get("function").is_some());
+    }
+
+    #[test]
+    fn test_tool_call_deserializes_with_type() {
+        let json =
+            r#"{"id":"call_1","type":"function","function":{"name":"echo","arguments":"{}"}}"#;
+        let tc: ToolCall = serde_json::from_str(json).unwrap();
+        assert_eq!(tc.id, "call_1");
+        assert_eq!(tc.call_type, "function");
+        assert_eq!(tc.function.name, "echo");
+    }
+
+    #[test]
+    fn test_tool_call_deserializes_without_type_defaults_to_function() {
+        // Many providers omit "type" in tool_calls within responses.
+        // Verify that deserialization defaults to "function".
+        let json = r#"{"id":"call_2","function":{"name":"shell","arguments":"{}"}}"#;
+        let tc: ToolCall = serde_json::from_str(json).unwrap();
+        assert_eq!(tc.id, "call_2");
+        assert_eq!(
+            tc.call_type, "function",
+            "Missing type field should default to \"function\""
+        );
+        assert_eq!(tc.function.name, "shell");
+    }
+
+    #[test]
+    fn test_tool_call_in_message_serializes_type() {
+        // Verify that tool calls embedded in LlmMessage serialize the type field.
+        let msg = LlmMessage {
+            role: "assistant".to_string(),
+            content: None,
+            reasoning_content: None,
+            tool_calls: Some(vec![ToolCall::new("call_x", "echo", "{}")]),
+            tool_call_id: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        let tc = &parsed["tool_calls"][0];
+        assert_eq!(
+            tc.get("type").and_then(|v| v.as_str()),
+            Some("function"),
+            "tool_calls in messages must include \"type\": \"function\": {json}"
         );
     }
 }

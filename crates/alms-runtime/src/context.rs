@@ -3,7 +3,7 @@
 //! Manages what the LLM actually sees — assembles system prompt,
 //! history (possibly compressed), and current input within a token budget.
 
-use crate::llm_types::{FunctionCall, LlmMessage, ToolCall};
+use crate::llm_types::{LlmMessage, ToolCall};
 use alms_core::config::ContextConfig;
 use alms_core::truncate_to_char_boundary;
 use alms_session::{Content, Message, Role};
@@ -291,13 +291,11 @@ impl ContextBuilder {
                     role: "assistant".to_string(),
                     content: None,
                     reasoning_content: None,
-                    tool_calls: Some(vec![ToolCall {
-                        id: tool_call_id,
-                        function: FunctionCall {
-                            name: name.clone(),
-                            arguments: params.to_string(),
-                        },
-                    }]),
+                    tool_calls: Some(vec![ToolCall::new(
+                        tool_call_id,
+                        name.clone(),
+                        params.to_string(),
+                    )]),
                     tool_call_id: None,
                 }
             }
@@ -444,13 +442,11 @@ mod tests {
             role: "assistant".to_string(),
             content: None,
             reasoning_content: None,
-            tool_calls: Some(vec![ToolCall {
-                id: "call_abc123".to_string(),
-                function: FunctionCall {
-                    name: "shell_exec".to_string(),
-                    arguments: r#"{"command":"ls -la"}"#.to_string(),
-                },
-            }]),
+            tool_calls: Some(vec![ToolCall::new(
+                "call_abc123",
+                "shell_exec",
+                r#"{"command":"ls -la"}"#,
+            )]),
             tool_call_id: None,
         };
         let tokens = estimate_llm_message_tokens(&msg);
@@ -1153,13 +1149,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: None,
                 reasoning_content: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_1".to_string(),
-                    function: FunctionCall {
-                        name: "echo".to_string(),
-                        arguments: "{}".to_string(),
-                    },
-                }]),
+                tool_calls: Some(vec![ToolCall::new("call_1", "echo", "{}")]),
                 tool_call_id: None,
             },
             LlmMessage::assistant("some text in between"),
@@ -1167,13 +1157,7 @@ mod tests {
                 role: "assistant".to_string(),
                 content: None,
                 reasoning_content: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: "call_2".to_string(),
-                    function: FunctionCall {
-                        name: "echo".to_string(),
-                        arguments: "{}".to_string(),
-                    },
-                }]),
+                tool_calls: Some(vec![ToolCall::new("call_2", "echo", "{}")]),
                 tool_call_id: None,
             },
         ];

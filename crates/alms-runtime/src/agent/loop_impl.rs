@@ -720,10 +720,7 @@ impl AgentRuntime {
         let tool_calls: Vec<ToolCall> = tool_call_acc
             .into_iter()
             .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
-            .map(|(id, name, arguments)| ToolCall {
-                id,
-                function: FunctionCall { name, arguments },
-            })
+            .map(|(id, name, arguments)| ToolCall::new(id, name, arguments))
             .collect();
         let tool_calls = if tool_calls.is_empty() {
             None
