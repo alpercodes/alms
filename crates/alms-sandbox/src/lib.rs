@@ -8,7 +8,9 @@ pub mod registry;
 pub mod sandbox;
 pub mod shell;
 
-pub use builtin::{EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool};
+pub use builtin::{
+    DatetimeTool, EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
+};
 pub use error::{SandboxError, SandboxResult};
 pub use registry::ToolRegistry;
 pub use sandbox::{Sandbox, SandboxConfig};
@@ -46,6 +48,17 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
 
     /// Check if this is a WASM tool
     fn is_wasm(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool bypasses the approval workflow in guarded posture.
+    ///
+    /// Tools that are inherently safe and read-only (e.g. `datetime`, `echo`,
+    /// `list_agents`) return `true` here so that operators are not prompted
+    /// for approval on zero-risk operations.
+    ///
+    /// Defaults to `false` — most tools require approval in guarded mode.
+    fn is_auto_approved(&self) -> bool {
         false
     }
 }

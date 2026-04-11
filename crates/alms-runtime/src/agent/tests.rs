@@ -305,8 +305,10 @@ async fn test_guarded_posture_sequential_approvals() {
         mock: true,
         ..LlmConfig::default()
     };
+    // Use `math` — a tool that is NOT auto-approved — so the approval
+    // workflow is exercised. (Auto-approved tools like `echo` skip approval.)
     let tools =
-        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["echo".to_string()]);
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
     let session_config = SessionConfig::default();
     let session_manager = SessionManager::new(session_config);
     let agent_id = AgentId::new();
@@ -331,8 +333,8 @@ async fn test_guarded_posture_sequential_approvals() {
     };
 
     let tool_calls = vec![
-        ToolCall::new("tc1", "echo", r#"{"text":"first"}"#),
-        ToolCall::new("tc2", "echo", r#"{"text":"second"}"#),
+        ToolCall::new("tc1", "math", r#"{"operation":"add","a":1,"b":2}"#),
+        ToolCall::new("tc2", "math", r#"{"operation":"add","a":3,"b":4}"#),
     ];
 
     // Track the order: approval_count increments only after each approval resolves.
