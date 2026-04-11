@@ -2,7 +2,7 @@ import { html, batch, useSignal } from '../../deps.js';
 import { sessions, activeSessionId } from '../../state/sessions.js';
 import { activeAgentId } from '../../state/agents.js';
 import { replaceMessages } from '../../state/chat-actions.js';
-import { activeRunId, runs } from '../../state/runs.js';
+import { activeRunId, selectedRunId, runs } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
 import { sessionSwitchLoading } from '../../state/loading.js';
@@ -29,6 +29,7 @@ async function selectSession(sessionId) {
     closeSessionStream();
     activeSessionId.value = sessionId;
     activeRunId.value = null;
+    selectedRunId.value = null;
     replaceMessages([]);
     messageQueue.value = [];
     auditEvents.value = null;
@@ -70,6 +71,7 @@ async function newSession() {
             activeSessionId.value = resp.session_id;
             saveActiveSession(activeAgentId.value, resp.session_id);
             activeRunId.value = null;
+            selectedRunId.value = null;
             replaceMessages([]);
             messageQueue.value = [];
             runs.value = [];
@@ -104,6 +106,7 @@ function SessionItem({ session }) {
                 batch(() => {
                     activeSessionId.value = null;
                     activeRunId.value = null;
+                    selectedRunId.value = null;
                     replaceMessages([]);
                     runs.value = [];
                     auditEvents.value = null;

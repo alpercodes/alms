@@ -2,7 +2,7 @@ import { fetchSettings } from '../api/settings.js';
 import { listSessions, createSession } from '../api/sessions.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { sessions, activeSessionId } from '../state/sessions.js';
-import { activeRunId, runs } from '../state/runs.js';
+import { activeRunId, selectedRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
 import { replaceMessages } from '../state/chat-actions.js';
 import { messageQueue } from '../state/queue.js';
@@ -128,6 +128,7 @@ export async function switchAgent(agentId) {
     // Reset all state
     activeSessionId.value = null;
     activeRunId.value = null;
+    selectedRunId.value = null;
     sessions.value = [];
     runs.value = [];
     replaceMessages([]);

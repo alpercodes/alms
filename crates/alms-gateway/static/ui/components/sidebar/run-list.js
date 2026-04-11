@@ -1,5 +1,5 @@
 import { html, computed } from '../../deps.js';
-import { runs, activeRunId } from '../../state/runs.js';
+import { runs, selectedRunId } from '../../state/runs.js';
 import { fmtDate } from '../../utils/format.js';
 
 const STATUS_ICONS = {
@@ -21,7 +21,7 @@ const sessionTokens = computed(() => {
 });
 
 function selectRun(runId) {
-    activeRunId.value = activeRunId.value === runId ? null : runId;
+    selectedRunId.value = selectedRunId.value === runId ? null : runId;
 }
 
 export function RunList() {
@@ -35,7 +35,7 @@ export function RunList() {
                 ${runs.value.length === 0
                     ? html`<div class="run-empty">No runs yet</div>`
                     : runs.value.map(run => html`
-                        <div class="run-item ${run.status} ${run.run_id === activeRunId.value ? 'selected' : ''}"
+                        <div class="run-item ${run.status} ${run.run_id === selectedRunId.value ? 'selected' : ''}"
                              role="listitem"
                              tabindex="0"
                              onClick=${() => selectRun(run.run_id)}
