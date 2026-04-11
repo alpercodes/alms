@@ -5,6 +5,7 @@
 //! session_id, context_type, context_id, message count, last activity, and
 //! the episodic summary if one exists.
 
+use alms_core::classify_session_type;
 use alms_core::source_label::derive_source_label;
 use alms_core::{AgentId, SessionId};
 use alms_sandbox::{Tool, error::SandboxResult};
@@ -44,35 +45,13 @@ impl ListMySessionsTool {
     }
 }
 
-/// Derive context_type from a context_id string.
-///
-/// This is the machine-readable type used for the `context_type` field
-/// in the tool output. Uses the same logic as `derive_source_label` but
-/// returns only the type string without the human-readable label.
-fn context_type_from_id(context_id: &str) -> &'static str {
-    if context_id.starts_with("dm:") {
-        "dm"
-    } else if context_id.starts_with("telegram_") {
-        "telegram"
-    } else if context_id.starts_with("job_") {
-        "job"
-    } else if context_id.starts_with("subagent_") {
-        "subagent"
-    } else if context_id.starts_with("episodic:") {
-        "episodic"
-    } else if context_id.starts_with("notifications:") {
-        "notification"
-    } else {
-        "web"
-    }
-}
-
 /// Returns `true` for internal session types that should be hidden from
 /// the agent's session listing.
 fn is_internal_session(context_id: &str) -> bool {
-    context_id.starts_with("subagent_")
-        || context_id.starts_with("episodic:")
-        || context_id.starts_with("notifications:")
+    matches!(
+        classify_session_type(context_id),
+        "subagent" | "episodic" | "notification"
+    )
 }
 
 #[async_trait::async_trait]
@@ -83,7 +62,7 @@ impl Tool for ListMySessionsTool {
 
     fn description(&self) -> &str {
         "List your conversation sessions across all channels. Returns session ID, \
-         context type (web, telegram, dm, job), last activity time, message count, \
+         context type (chat, telegram, dm, job), last activity time, message count, \
          and the episodic summary if one exists. Use this to recall what you have \
          worked on and with whom."
     }
@@ -148,7 +127,7 @@ impl Tool for ListMySessionsTool {
         let mut session_list = Vec::with_capacity(filtered.len());
         for session in filtered {
             // Derive context type and source label.
-            let ctx_type = context_type_from_id(&session.context_id);
+            let ctx_type = classify_session_type(&session.context_id);
             let source_label = derive_source_label(&session.context_id, &self.agent_name)
                 .map(|sl| sl.source_label)
                 .unwrap_or_else(|| ctx_type.to_string());
@@ -216,42 +195,19 @@ mod tests {
         ListMySessionsTool::new(mgr, agent_id, current_session_id, "test-agent".into())
     }
 
-    // -- context_type_from_id --
+    // -- classify_session_type integration (canonical tests in alms-core) --
 
     #[test]
-    fn test_context_type_web() {
-        assert_eq!(context_type_from_id("web-chat-2026-03-25"), "web");
-        assert_eq!(context_type_from_id("some-random-context"), "web");
+    fn test_context_type_chat_default() {
+        // Verify the tool uses classify_session_type from alms-core
+        // (returns "chat" not "web" for unrecognized context IDs).
+        assert_eq!(classify_session_type("web-chat-2026-03-25"), "chat");
+        assert_eq!(classify_session_type("some-random-context"), "chat");
     }
 
     #[test]
     fn test_context_type_telegram() {
-        assert_eq!(context_type_from_id("telegram_mybot_12345"), "telegram");
-    }
-
-    #[test]
-    fn test_context_type_dm() {
-        assert_eq!(context_type_from_id("dm:alice:bob"), "dm");
-    }
-
-    #[test]
-    fn test_context_type_job() {
-        assert_eq!(context_type_from_id("job_abc123"), "job");
-    }
-
-    #[test]
-    fn test_context_type_subagent() {
-        assert_eq!(context_type_from_id("subagent_task_1"), "subagent");
-    }
-
-    #[test]
-    fn test_context_type_episodic() {
-        assert_eq!(context_type_from_id("episodic:main"), "episodic");
-    }
-
-    #[test]
-    fn test_context_type_notification() {
-        assert_eq!(context_type_from_id("notifications:bob"), "notification");
+        assert_eq!(classify_session_type("telegram_mybot_12345"), "telegram");
     }
 
     // -- is_internal_session --

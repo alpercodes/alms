@@ -24,6 +24,43 @@ pub use run::{
 };
 pub use source_label::{derive_source_label, truncate_to_char_boundary};
 
+/// Classify a session's type from its `context_id`.
+///
+/// Returns a string suitable for the `session_type` field in the session
+/// list API response and the `context_type` field in the `list_my_sessions`
+/// tool output.
+///
+/// This is the **single source of truth** for context-ID classification --
+/// all callers (gateway session list, tool output, etc.) should use this
+/// function rather than maintaining their own prefix checks.
+///
+/// Mapping:
+///
+/// - `"dm:{a}:{b}"` -> `"dm"`
+/// - `"notifications:{agent}"` -> `"notification"`
+/// - `"job_{id}"` -> `"job"`
+/// - `"subagent_{task}"` -> `"subagent"`
+/// - `"episodic:{id}"` -> `"episodic"`
+/// - `"telegram_{id}"` -> `"telegram"`
+/// - anything else -> `"chat"`
+pub fn classify_session_type(context_id: &str) -> &'static str {
+    if context_id.starts_with("dm:") {
+        "dm"
+    } else if context_id.starts_with("notifications:") {
+        "notification"
+    } else if context_id.starts_with("job_") {
+        "job"
+    } else if context_id.starts_with("subagent_") {
+        "subagent"
+    } else if context_id.starts_with("episodic:") {
+        "episodic"
+    } else if context_id.starts_with("telegram_") {
+        "telegram"
+    } else {
+        "chat"
+    }
+}
+
 /// Sentinel string returned by the agent loop when the max-iterations limit is
 /// hit.  Defined once so that the runtime (`agent.rs`) and the gateway
 /// (`runs.rs`) stay in sync.
@@ -466,5 +503,57 @@ mod tests {
             std::path::Path::new(&result).is_absolute(),
             "Result should still be an absolute path, got: {result}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_session_type tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_session_type_dm() {
+        assert_eq!(classify_session_type("dm:alice:bob"), "dm");
+        assert_eq!(classify_session_type("dm:x:y"), "dm");
+    }
+
+    #[test]
+    fn test_classify_session_type_notification() {
+        assert_eq!(classify_session_type("notifications:alice"), "notification");
+        assert_eq!(
+            classify_session_type("notifications:my-agent"),
+            "notification"
+        );
+    }
+
+    #[test]
+    fn test_classify_session_type_job() {
+        assert_eq!(
+            classify_session_type("job_550e8400-e29b-41d4-a716-446655440000"),
+            "job"
+        );
+        assert_eq!(classify_session_type("job_abc"), "job");
+    }
+
+    #[test]
+    fn test_classify_session_type_subagent() {
+        assert_eq!(classify_session_type("subagent_research"), "subagent");
+        assert_eq!(classify_session_type("subagent_task_1"), "subagent");
+    }
+
+    #[test]
+    fn test_classify_session_type_episodic() {
+        assert_eq!(classify_session_type("episodic:main"), "episodic");
+    }
+
+    #[test]
+    fn test_classify_session_type_telegram() {
+        assert_eq!(classify_session_type("telegram_mybot_12345"), "telegram");
+        assert_eq!(classify_session_type("telegram_main_999"), "telegram");
+    }
+
+    #[test]
+    fn test_classify_session_type_chat_default() {
+        assert_eq!(classify_session_type("web"), "chat");
+        assert_eq!(classify_session_type("default"), "chat");
+        assert_eq!(classify_session_type("my-custom-context"), "chat");
     }
 }
