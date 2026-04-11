@@ -1,8 +1,8 @@
-//! Bearer token authentication middleware.
+//! Bearer token authentication middleware and API response headers.
 
 use axum::{
     Extension,
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -80,6 +80,20 @@ pub async fn require_auth(
         "Missing or invalid Bearer token",
     )
     .into_response()
+}
+
+/// Axum middleware that adds `Cache-Control: no-store` to every response.
+///
+/// Applied to the authenticated API router so browsers never heuristically
+/// cache JSON API responses. Static asset routes are on the public router
+/// and already set their own `Cache-Control` header, so this middleware
+/// does not interfere with them.
+pub async fn no_cache(req: Request<axum::body::Body>, next: Next) -> Response {
+    let mut response = next.run(req).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    response
 }
 
 #[cfg(test)]
@@ -268,5 +282,27 @@ mod tests {
         assert!(!is_sse_endpoint("/sessions/abc/messages"));
         assert!(!is_sse_endpoint("/agents"));
         assert!(!is_sse_endpoint("/health"));
+    }
+
+    // --- no_cache middleware tests ---
+
+    /// Build a test router with the no_cache middleware applied.
+    fn app_with_no_cache() -> Router {
+        Router::new()
+            .route("/api", get(dummy))
+            .layer(middleware::from_fn(no_cache))
+    }
+
+    #[tokio::test]
+    async fn test_no_cache_sets_cache_control_header() {
+        let resp = app_with_no_cache()
+            .oneshot(HttpRequest::get("/api").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
     }
 }
