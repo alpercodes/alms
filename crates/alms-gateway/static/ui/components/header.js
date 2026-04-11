@@ -1,6 +1,6 @@
 import { h, html, computed, signal } from '../deps.js';
 import { agents, activeAgentId } from '../state/agents.js';
-import { activePanel, activePanelTab } from '../state/panel.js';
+import { activePanel, togglePanel } from '../state/panel.js';
 import { localSettings, serverDefaults } from '../state/settings.js';
 import { theme, toggleTheme } from '../state/theme.js';
 import { switchAgent } from '../hooks/use-boot.js';
@@ -19,22 +19,13 @@ export function closeSidebar() {
     sidebarOpen.value = false;
 }
 
-const TABS = ['agents', 'workspace', 'jobs', 'audit'];
+const TABS = ['agents', 'jobs', 'audit'];
 
 const effectivePosture = computed(() => {
     const local = localSettings.value.posture;
     const server = serverDefaults.value.posture;
     return local || server || 'guarded';
 });
-
-function togglePanel(tab) {
-    if (activePanel.value === tab) {
-        activePanel.value = null;
-    } else {
-        activePanel.value = tab;
-        activePanelTab.value = tab;
-    }
-}
 
 export function Header({ onOpenSettings, status }) {
     const onAgentChange = (e) => {

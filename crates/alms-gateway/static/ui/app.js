@@ -15,6 +15,7 @@ import { SettingsModal } from './components/settings-modal.js';
 import { OnboardingView } from './components/onboarding.js';
 import { agents, activeAgent } from './state/agents.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
+import { AgentHeaderBar } from './components/chat/agent-header-bar.js';
 import { scrollToBottom } from './utils/format.js';
 import { sessionSwitchLoading, agentSwitchLoading, bootRetryAvailable, setRunBoot } from './state/loading.js';
 
@@ -96,6 +97,7 @@ function ChatView() {
 
     return html`
         <div id="chat">
+            <${AgentHeaderBar} />
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>
                 ${agentSwitchLoading.value && html`
                     <div class="loading-state">Loading agent...</div>
