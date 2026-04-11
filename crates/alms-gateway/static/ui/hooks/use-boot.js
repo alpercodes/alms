@@ -12,6 +12,7 @@ import { agentSwitchLoading } from '../state/loading.js';
 import { openSessionStream, closeSessionStream } from './use-session-stream.js';
 import { bumpSelectGeneration } from '../state/select-generation.js';
 import { loadSession } from '../utils/load-session.js';
+import { clearAllSubagents } from '../state/subagents.js';
 
 const AGENT_KEY = 'alms_active_agent';
 
@@ -134,6 +135,7 @@ export async function switchAgent(agentId) {
     messageQueue.value = [];
     wsFiles.value = null;
     auditEvents.value = null;
+    clearAllSubagents();
 
     // loadAgentSessions() bumps switchGeneration synchronously (before its
     // first await), so we start the call, then read the updated counter.
