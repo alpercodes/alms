@@ -78,6 +78,10 @@ async function loadAgentSessions(agentId) {
         const data = await listSessions(agentId, { includeDms: true });
         if (gen !== switchGeneration) return; // stale — discard
         const agentSessions = data.sessions || [];
+        const dmCount = agentSessions.filter(s => s.session_type === 'dm').length;
+        if (dmCount > 0) {
+            console.debug('[loadAgentSessions] loaded', agentSessions.length, 'sessions,', dmCount, 'DM');
+        }
         sessions.value = agentSessions;
 
         if (agentSessions.length > 0) {
