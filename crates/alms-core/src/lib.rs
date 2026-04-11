@@ -147,6 +147,47 @@ pub fn dm_context_id(a: &str, b: &str) -> String {
     format!("dm:{first}:{second}")
 }
 
+/// Parse a DM `context_id` into its two participant names.
+///
+/// DM context IDs have the form `"dm:{name1}:{name2}"` (alphabetically sorted).
+/// Returns `None` if the string does not match the expected format.
+///
+/// ```
+/// # use alms_core::dm_participants;
+/// assert_eq!(dm_participants("dm:alice:bob"), Some(("alice", "bob")));
+/// assert_eq!(dm_participants("web-chat-123"), None);
+/// assert_eq!(dm_participants("dm:alice"), None);
+/// ```
+pub fn dm_participants(context_id: &str) -> Option<(&str, &str)> {
+    let rest = context_id.strip_prefix("dm:")?;
+    rest.split_once(':')
+}
+
+/// Extract the peer agent name from a DM `context_id`.
+///
+/// DM context IDs have the form `"dm:{name1}:{name2}"` (alphabetically sorted).
+/// The peer is whichever name is NOT `agent_name`.  Returns `None` if the
+/// context ID does not match the expected format or neither name matches
+/// `agent_name`.
+///
+/// ```
+/// # use alms_core::dm_peer;
+/// assert_eq!(dm_peer("dm:alice:bob", "alice"), Some("bob"));
+/// assert_eq!(dm_peer("dm:alice:bob", "bob"), Some("alice"));
+/// assert_eq!(dm_peer("dm:alice:bob", "charlie"), None);
+/// assert_eq!(dm_peer("web-chat-123", "alice"), None);
+/// ```
+pub fn dm_peer<'a>(context_id: &'a str, agent_name: &str) -> Option<&'a str> {
+    let (a, b) = dm_participants(context_id)?;
+    if a == agent_name {
+        Some(b)
+    } else if b == agent_name {
+        Some(a)
+    } else {
+        None
+    }
+}
+
 /// Timestamp wrapper for consistent handling
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Timestamp(pub DateTime<Utc>);
@@ -263,6 +304,60 @@ mod tests {
         let a = "developer";
         let b = "reviewer";
         assert_eq!(dm_context_id(a, b), dm_context_id(b, a));
+    }
+
+    // -- dm_participants -------------------------------------------------------
+
+    #[test]
+    fn test_dm_participants_valid() {
+        assert_eq!(dm_participants("dm:alice:bob"), Some(("alice", "bob")));
+    }
+
+    #[test]
+    fn test_dm_participants_non_dm() {
+        assert_eq!(dm_participants("web-chat-123"), None);
+    }
+
+    #[test]
+    fn test_dm_participants_malformed_no_second_colon() {
+        assert_eq!(dm_participants("dm:alice"), None);
+    }
+
+    #[test]
+    fn test_dm_participants_empty() {
+        assert_eq!(dm_participants(""), None);
+    }
+
+    // -- dm_peer ---------------------------------------------------------------
+
+    #[test]
+    fn test_dm_peer_first_name() {
+        assert_eq!(dm_peer("dm:alice:bob", "alice"), Some("bob"));
+    }
+
+    #[test]
+    fn test_dm_peer_second_name() {
+        assert_eq!(dm_peer("dm:alice:bob", "bob"), Some("alice"));
+    }
+
+    #[test]
+    fn test_dm_peer_not_participant() {
+        assert_eq!(dm_peer("dm:alice:bob", "charlie"), None);
+    }
+
+    #[test]
+    fn test_dm_peer_non_dm_context() {
+        assert_eq!(dm_peer("web-chat-123", "alice"), None);
+    }
+
+    #[test]
+    fn test_dm_peer_malformed() {
+        assert_eq!(dm_peer("dm:alice", "alice"), None);
+    }
+
+    #[test]
+    fn test_dm_peer_empty() {
+        assert_eq!(dm_peer("", "alice"), None);
     }
 
     #[test]

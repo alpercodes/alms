@@ -333,19 +333,10 @@ fn trim_oldest_lines(text: &str, max_chars: usize) -> String {
 
 /// Extract the peer agent name from a DM `context_id`.
 ///
-/// DM context IDs have the form `"dm:{name1}:{name2}"` (alphabetically sorted).
-/// The peer is whichever name is not `agent_name`.  Returns `None` for non-DM
-/// sessions or malformed context IDs.
+/// Delegates to [`alms_core::dm_peer`].  Returns `None` for non-DM sessions
+/// or malformed context IDs.
 fn extract_dm_peer(context_id: &str, agent_name: &str) -> Option<String> {
-    let rest = context_id.strip_prefix("dm:")?;
-    let (a, b) = rest.split_once(':')?;
-    if a == agent_name {
-        Some(b.to_string())
-    } else if b == agent_name {
-        Some(a.to_string())
-    } else {
-        None
-    }
+    alms_core::dm_peer(context_id, agent_name).map(|s| s.to_string())
 }
 
 /// Generate a summary via a lightweight LLM call.

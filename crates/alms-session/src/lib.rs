@@ -382,12 +382,8 @@ impl SessionManager {
             .iter()
             .filter(|e| {
                 e.key().0 == sentinel
-                    && e.value().context_id.starts_with("dm:")
-                    && e.value()
-                        .context_id
-                        .split(':')
-                        .skip(1) // skip the "dm" prefix to avoid matching an agent literally named "dm"
-                        .any(|part| part == agent_name)
+                    && alms_core::dm_participants(&e.value().context_id)
+                        .is_some_and(|(a, b)| a == agent_name || b == agent_name)
             })
             .map(|e| e.value().clone())
             .collect();

@@ -113,24 +113,11 @@ pub(crate) fn dm_tool_was_called(records: &[alms_core::ToolCallRecord]) -> bool 
 impl AgentRuntime {
     /// Extract the peer agent name from a DM context_id.
     ///
-    /// The context_id has the form `"dm:{name1}:{name2}"` where names are
-    /// sorted alphabetically.  The peer is whichever name is NOT this agent's
-    /// own `agent_name`.  Returns `None` if the context_id is malformed or
-    /// `agent_name` is not set.
+    /// Delegates to [`alms_core::dm_peer`] for parsing.  Returns `None` if the
+    /// context_id is malformed or `agent_name` is not set.
     pub(crate) fn dm_peer_name(&self, context_id: &str) -> Option<String> {
         let name = self.agent_name.as_deref()?;
-        let parts: Vec<&str> = context_id.splitn(3, ':').collect();
-        if parts.len() != 3 {
-            return None;
-        }
-        // parts[0] == "dm", parts[1] and parts[2] are the two agent names.
-        if parts[1] == name {
-            Some(parts[2].to_string())
-        } else if parts[2] == name {
-            Some(parts[1].to_string())
-        } else {
-            None
-        }
+        alms_core::dm_peer(context_id, name).map(|s| s.to_string())
     }
 
     /// Build the DM recipient addendum for a given peer name.
