@@ -113,6 +113,36 @@ pub(crate) fn is_internal_context_id(context_id: &str) -> bool {
         .any(|prefix| context_id.starts_with(prefix))
 }
 
+/// Classify a session's type from its `context_id`.
+///
+/// Returns a string suitable for the `session_type` field in the session
+/// list API response. The mapping is:
+///
+/// - `"dm:{a}:{b}"` -> `"dm"`
+/// - `"notifications:{agent}"` -> `"notification"`
+/// - `"job_{id}"` -> `"job"`
+/// - `"subagent_{task}"` -> `"subagent"`
+/// - `"episodic:{id}"` -> `"episodic"`
+/// - `"telegram:{id}"` -> `"telegram"`
+/// - anything else -> `"chat"`
+pub(crate) fn classify_session_type(context_id: &str) -> &'static str {
+    if context_id.starts_with("dm:") {
+        "dm"
+    } else if context_id.starts_with("notifications:") {
+        "notification"
+    } else if context_id.starts_with("job_") {
+        "job"
+    } else if context_id.starts_with("subagent_") {
+        "subagent"
+    } else if context_id.starts_with("episodic:") {
+        "episodic"
+    } else if context_id.starts_with("telegram:") {
+        "telegram"
+    } else {
+        "chat"
+    }
+}
+
 /// Find the most recent user-facing session for the given agent.
 ///
 /// Returns `None` if the agent has no non-internal sessions.  Sessions are
@@ -1157,6 +1187,57 @@ mod tests {
                 "context_id '{ctx}' should NOT be classified as internal"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_session_type tests (#606)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_session_type_dm() {
+        assert_eq!(classify_session_type("dm:alice:bob"), "dm");
+        assert_eq!(classify_session_type("dm:x:y"), "dm");
+    }
+
+    #[test]
+    fn test_classify_session_type_notification() {
+        assert_eq!(classify_session_type("notifications:alice"), "notification");
+        assert_eq!(
+            classify_session_type("notifications:my-agent"),
+            "notification"
+        );
+    }
+
+    #[test]
+    fn test_classify_session_type_job() {
+        assert_eq!(
+            classify_session_type("job_550e8400-e29b-41d4-a716-446655440000"),
+            "job"
+        );
+        assert_eq!(classify_session_type("job_abc"), "job");
+    }
+
+    #[test]
+    fn test_classify_session_type_subagent() {
+        assert_eq!(classify_session_type("subagent_research"), "subagent");
+        assert_eq!(classify_session_type("subagent_task_1"), "subagent");
+    }
+
+    #[test]
+    fn test_classify_session_type_episodic() {
+        assert_eq!(classify_session_type("episodic:main"), "episodic");
+    }
+
+    #[test]
+    fn test_classify_session_type_telegram() {
+        assert_eq!(classify_session_type("telegram:12345"), "telegram");
+    }
+
+    #[test]
+    fn test_classify_session_type_chat_default() {
+        assert_eq!(classify_session_type("web"), "chat");
+        assert_eq!(classify_session_type("default"), "chat");
+        assert_eq!(classify_session_type("my-custom-context"), "chat");
     }
 
     #[test]
