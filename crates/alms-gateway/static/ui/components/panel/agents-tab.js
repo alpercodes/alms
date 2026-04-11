@@ -15,7 +15,7 @@ async function refreshAgents() {
 }
 
 /** Small popup modal for editing agent settings. */
-function AgentEditModal({ agent, onClose }) {
+export function AgentEditModal({ agent, onClose }) {
     const model = useSignal(agent.model || '');
     const posture = useSignal(agent.posture || '');
     const provider = useSignal(agent.provider || '');

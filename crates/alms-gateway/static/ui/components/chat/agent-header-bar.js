@@ -1,24 +1,42 @@
-import { html } from '../../deps.js';
+import { html, useSignal, useCallback, useEffect, useRef } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
-import { activePanel, activePanelTab } from '../../state/panel.js';
-import { IconGear, IconFolder } from '../../utils/icons.js';
-
-function togglePanel(tab) {
-    if (activePanel.value === tab) {
-        activePanel.value = null;
-    } else {
-        activePanel.value = tab;
-        activePanelTab.value = tab;
-    }
-}
+import { activePanel, togglePanel } from '../../state/panel.js';
+import { IconFolder } from '../../utils/icons.js';
+import { AgentEditModal } from '../panel/agents-tab.js';
 
 /**
  * Persistent header bar at the top of the chat area showing the active
- * agent name and quick-access buttons for Settings and Workspace panels.
+ * agent name and quick-access buttons for Workspace and a three-dot
+ * context menu with agent-specific settings.
  * Hidden when no agent is selected.
  */
-export function AgentHeaderBar({ onOpenSettings }) {
+export function AgentHeaderBar() {
     const agent = activeAgent.value;
+    const menuOpen = useSignal(false);
+    const editOpen = useSignal(false);
+    const menuRef = useRef(null);
+
+    const toggleMenu = useCallback(() => {
+        menuOpen.value = !menuOpen.value;
+    }, []);
+
+    const openAgentSettings = useCallback(() => {
+        menuOpen.value = false;
+        editOpen.value = true;
+    }, []);
+
+    // Close menu when clicking outside
+    useEffect(() => {
+        if (!menuOpen.value) return;
+        const onClickOutside = (e) => {
+            if (menuRef.current && !menuRef.current.contains(e.target)) {
+                menuOpen.value = false;
+            }
+        };
+        document.addEventListener('click', onClickOutside, true);
+        return () => document.removeEventListener('click', onClickOutside, true);
+    }, [menuOpen.value]);
+
     if (!agent) return null;
 
     return html`
@@ -27,21 +45,36 @@ export function AgentHeaderBar({ onOpenSettings }) {
                 <span class="agent-header-bar-name">${agent.name}</span>
             </div>
             <div class="agent-header-bar-right">
-                <button class="agent-header-bar-btn ${activePanel.value === 'workspace' ? 'active' : ''}"
+                <button class="hbtn agent-bar-btn ${activePanel.value === 'workspace' ? 'active' : ''}"
                         title="Workspace files"
                         aria-label="Open workspace panel"
                         onClick=${() => togglePanel('workspace')}>
                     <${IconFolder} />
-                    <span class="agent-header-bar-btn-label">Workspace</span>
+                    <span class="agent-bar-btn-label">Workspace</span>
                 </button>
-                <button class="agent-header-bar-btn"
-                        title="Agent settings"
-                        aria-label="Open settings"
-                        onClick=${onOpenSettings}>
-                    <${IconGear} />
-                    <span class="agent-header-bar-btn-label">Settings</span>
-                </button>
+                <div class="agent-menu-anchor" ref=${menuRef}>
+                    <button class="hbtn agent-bar-btn"
+                            title="Agent menu"
+                            aria-label="Open agent menu"
+                            aria-expanded=${menuOpen.value}
+                            onClick=${toggleMenu}>
+                        <span class="agent-menu-dots" aria-hidden="true">\u22EF</span>
+                    </button>
+                    ${menuOpen.value && html`
+                        <div class="agent-menu-dropdown">
+                            <button class="agent-menu-item" onClick=${openAgentSettings}>
+                                Settings
+                            </button>
+                        </div>
+                    `}
+                </div>
             </div>
+
+            ${editOpen.value && html`
+                <${AgentEditModal}
+                    agent=${agent}
+                    onClose=${() => { editOpen.value = false; }} />
+            `}
         </div>
     `;
 }

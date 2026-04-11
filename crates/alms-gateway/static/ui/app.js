@@ -97,7 +97,7 @@ function ChatView({ onOpenSettings }) {
 
     return html`
         <div id="chat">
-            <${AgentHeaderBar} onOpenSettings=${onOpenSettings} />
+            <${AgentHeaderBar} />
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>
                 ${agentSwitchLoading.value && html`
                     <div class="loading-state">Loading agent...</div>
