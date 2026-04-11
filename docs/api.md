@@ -122,7 +122,15 @@ But channels (Telegram) naturally bring `context_id` (chat id). So MVP should su
 ### 4.1 List sessions
 `GET /sessions`
 
-Returns all active sessions.
+Returns all active sessions. Internal sessions (DM, notifications, episodic,
+subagent, job) are excluded by default.
+
+**Query parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `agent_id` | UUID | _(none)_ | Filter sessions by agent UUID. Does not apply to DM sessions (they use a nil sentinel agent). |
+| `include_dms` | bool | `false` | When `true`, DM sessions (`dm:*` context IDs) are included alongside regular sessions. Other internal session types remain excluded. |
 
 **Response 200**
 ```json
@@ -132,13 +140,34 @@ Returns all active sessions.
       "session_id": "<uuid>",
       "agent_id": "<uuid>",
       "context_id": "telegram_main_1853446411",
+      "session_type": "chat",
       "created_at": "2026-02-11T07:00:00Z",
       "last_activity": "2026-02-11T07:52:00Z",
+      "status": "active"
+    },
+    {
+      "session_id": "<uuid>",
+      "agent_id": "00000000-0000-0000-0000-000000000000",
+      "context_id": "dm:alice:bob",
+      "session_type": "dm",
+      "participants": ["alice", "bob"],
+      "created_at": "2026-02-11T08:00:00Z",
+      "last_activity": "2026-02-11T08:15:00Z",
       "status": "active"
     }
   ]
 }
 ```
+
+**Response fields**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_type` | string | `"chat"` for regular sessions, `"dm"` for DM sessions. Always present. |
+| `participants` | string[] | Participant names parsed from the DM context ID (e.g. `["alice", "bob"]`). Only present when `session_type` is `"dm"`. |
+
+> **Note**: The second session object (DM) only appears when `?include_dms=true` is set.
+> DM sessions use `AgentId::nil()` as a sentinel, so the `agent_id` filter does not apply to them.
 
 ### 4.2 Create session
 `POST /sessions`
