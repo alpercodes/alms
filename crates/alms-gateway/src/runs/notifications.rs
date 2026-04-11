@@ -213,25 +213,13 @@ async fn notify_job_completion(
         "error" => "failed",
         _ => "finished",
     };
-    let marker = alms_session::Message {
-        id: uuid::Uuid::new_v4().to_string(),
-        role: alms_session::Role::System,
-        content: alms_session::Content::Text(format!(
-            "[Scheduled job {label}] {job_name}\n{summary}"
-        )),
-        timestamp: alms_core::Timestamp::now(),
-        metadata: Some(serde_json::json!({
-            "synthetic": true,
-            "type": "job_notification",
-            "job_status": status
-        })),
-    };
-    if let Err(e) = state
-        .session_manager
-        .append_message(target_session_id, marker)
-    {
-        warn!("Failed to persist job completion marker: {e}");
-    }
+    super::markers::persist_lifecycle_marker(
+        &state.session_manager,
+        target_session_id,
+        "job_notification",
+        format!("[Scheduled job {label}] {job_name}\n{summary}"),
+        serde_json::json!({"job_status": status}),
+    );
 
     info!(
         "Job notification sent to session {} (status={status})",
@@ -297,27 +285,17 @@ pub(super) async fn notify_dm_ended_to_webchat(
         "depth_exceeded" => "message limit reached".to_string(),
         other => other.to_string(),
     };
-    let marker = alms_session::Message {
-        id: uuid::Uuid::new_v4().to_string(),
-        role: alms_session::Role::System,
-        content: alms_session::Content::Text(format!(
-            "[DM conversation ended] Conversation with {peer_name} ended ({reason_text})."
-        )),
-        timestamp: alms_core::Timestamp::now(),
-        metadata: Some(serde_json::json!({
-            "synthetic": true,
-            "type": "dm_ended_notification",
+    super::markers::persist_lifecycle_marker(
+        &state.session_manager,
+        target_session_id,
+        "dm_ended_notification",
+        format!("[DM conversation ended] Conversation with {peer_name} ended ({reason_text})."),
+        serde_json::json!({
             "peer": peer_name,
             "reason": reason,
             "context_id": context_id,
-        })),
-    };
-    if let Err(e) = state
-        .session_manager
-        .append_message(target_session_id, marker)
-    {
-        warn!("Failed to persist DM ended marker to web-chat session: {e}");
-    }
+        }),
+    );
 
     info!(
         "DM ended notification forwarded to web-chat session {} (peer={peer_name}, reason={reason})",
@@ -388,21 +366,16 @@ pub(crate) async fn completion_notification_loop(
                 "cancelled" => "cancelled",
                 _ => "completed",
             };
-            let marker = alms_session::Message {
-                id: uuid::Uuid::new_v4().to_string(),
-                role: alms_session::Role::System,
-                content: alms_session::Content::Text(format!("Subagent '{}' {}.", name, label)),
-                timestamp: alms_core::Timestamp::now(),
-                metadata: Some(serde_json::json!({
-                    "synthetic": true,
-                    "type": "subagent_completion",
+            super::markers::persist_lifecycle_marker(
+                &state.session_manager,
+                session_id,
+                "subagent_completion",
+                format!("Subagent '{}' {}.", name, label),
+                serde_json::json!({
                     "subagent_name": name,
                     "status": status_str,
-                })),
-            };
-            if let Err(e) = state.session_manager.append_message(session_id, marker) {
-                warn!("Failed to persist subagent completion marker: {e}");
-            }
+                }),
+            );
         }
 
         let notification = format_completion_notification(&completion);
@@ -600,30 +573,18 @@ pub(super) fn format_dm_conversation_history(messages: &[alms_session::Message])
     let mut lines: Vec<String> = Vec::new();
 
     for msg in messages {
-        // Skip non-text content (tool calls, tool results, images).
-        let text = match &msg.content {
-            alms_session::Content::Text(t) => t.as_str(),
-            _ => continue,
-        };
-
-        // Skip empty text (e.g. dm_ended markers with empty body).
-        if text.trim().is_empty() {
+        // Use the centralised filter from alms-tools to skip non-text,
+        // empty, and synthetic markers — eliminates duplicated logic.
+        // See #627 (persist_lifecycle_marker consolidation).
+        if alms_tools::dm_filter::is_synthetic_marker(msg) {
             continue;
         }
 
-        // Skip system metadata markers (dm_ended, synthetic notifications).
-        if let Some(ref meta) = msg.metadata {
-            let msg_type = meta
-                .get("message_type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if msg_type == "dm_ended" {
-                continue;
-            }
-            if meta.get("synthetic").and_then(|v| v.as_bool()) == Some(true) {
-                continue;
-            }
-        }
+        // After the filter, content is guaranteed to be non-empty text.
+        let text = match &msg.content {
+            alms_session::Content::Text(t) => t.as_str(),
+            _ => continue, // defensive — should not reach here
+        };
 
         // Extract sender name from metadata, or fall back to role.
         let sender = msg
