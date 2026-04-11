@@ -478,7 +478,7 @@ export function openSessionStream(sessionId, opts) {
             const data = JSON.parse(e.data);
             const name = data.subagent_name || 'subagent';
             const status = data.status || 'done';
-            const sessionId = data.session_id || null;
+            const sessionId = data.subagent_session_id || null;
             const summary = data.summary || '';
 
             // Look up subagent entry for metadata (task, tool count, duration)
@@ -491,7 +491,7 @@ export function openSessionStream(sessionId, opts) {
             const toolCount = entry ? entry.tools.length : 0;
             const durationMs = entry && entry.startedAt ? Date.now() - entry.startedAt : null;
 
-            // If session_id is provided, store it on the subagent entry
+            // If subagent_session_id is provided, store it on the subagent entry
             if (sessionId) {
                 setSubagentSessionId(name, sessionId);
             }
