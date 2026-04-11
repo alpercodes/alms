@@ -814,6 +814,9 @@ header h1 {
 .tc-row.tc-running {
   border-left-color: var(--info);
 }
+.tc-row.tc-cancelled {
+  border-left-color: var(--warning);
+}
 
 /* DM tool calls get a distinct accent */
 .tc-row.tc-dm {
@@ -915,6 +918,10 @@ header h1 {
 .tc-badge-fail {
   color: var(--error);
   background: var(--error-muted);
+}
+.tc-badge-cancelled {
+  color: var(--warning);
+  background: var(--warning-muted);
 }
 
 /* ── Detail panel (expanded) ── */

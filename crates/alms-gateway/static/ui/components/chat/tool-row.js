@@ -83,9 +83,11 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent, duratio
     const isRunning = status === 'running';
     const isFail = status === 'fail';
     const isDone = status === 'done';
+    const isCancelled = status === 'cancelled';
     const isDm = tool === 'send_message';
 
-    const statusCls = isFail ? 'tc-fail' : isDone ? 'tc-done' : 'tc-running';
+    const statusCls = isFail ? 'tc-fail' : isDone ? 'tc-done'
+        : isCancelled ? 'tc-cancelled' : 'tc-running';
 
     const chevron = expanded.value ? '\u25BC' : '\u25B6';
     const icon = toolIcon(tool);
@@ -108,6 +110,7 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent, duratio
                 <span class="tc-spacer"></span>
                 ${duration && html`<span class="tc-duration">${duration}</span>`}
                 ${isFail && html`<span class="tc-status-badge tc-badge-fail">failed</span>`}
+                ${isCancelled && html`<span class="tc-status-badge tc-badge-cancelled">cancelled</span>`}
                 ${isDone && html`<span class="tc-status-icon">\u2713</span>`}
             </div>
             ${expanded.value && html`
