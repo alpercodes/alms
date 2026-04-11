@@ -333,6 +333,7 @@ async fn test_guarded_posture_sequential_approvals() {
     let tool_calls = vec![
         ToolCall {
             id: "tc1".to_string(),
+            call_type: "function".to_string(),
             function: FunctionCall {
                 name: "echo".to_string(),
                 arguments: r#"{"text":"first"}"#.to_string(),
@@ -340,6 +341,7 @@ async fn test_guarded_posture_sequential_approvals() {
         },
         ToolCall {
             id: "tc2".to_string(),
+            call_type: "function".to_string(),
             function: FunctionCall {
                 name: "echo".to_string(),
                 arguments: r#"{"text":"second"}"#.to_string(),
@@ -1001,6 +1003,7 @@ fn test_dm_conflict_blocks_both_tools() {
     let tool_calls = vec![
         ToolCall {
             id: "tc_send".to_string(),
+            call_type: "function".to_string(),
             function: FunctionCall {
                 name: "send_message".to_string(),
                 arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
@@ -1008,6 +1011,7 @@ fn test_dm_conflict_blocks_both_tools() {
         },
         ToolCall {
             id: "tc_ignore".to_string(),
+            call_type: "function".to_string(),
             function: FunctionCall {
                 name: "ignore_message".to_string(),
                 arguments: r#"{"reason":"nothing to add"}"#.to_string(),
@@ -1040,6 +1044,7 @@ fn test_ignore_message_alone_no_conflict() {
 
     let tool_calls = vec![ToolCall {
         id: "tc_ignore".to_string(),
+        call_type: "function".to_string(),
         function: FunctionCall {
             name: "ignore_message".to_string(),
             arguments: r#"{"reason":"not relevant"}"#.to_string(),
@@ -1068,6 +1073,7 @@ fn test_dm_conflict_preserves_non_conflicting_tools() {
     let tool_calls = vec![
         ToolCall {
             id: "tc_echo".to_string(),
+            call_type: "function".to_string(),
             function: FunctionCall {
                 name: "echo".to_string(),
                 arguments: r#"{"message":"hello"}"#.to_string(),
@@ -1075,6 +1081,7 @@ fn test_dm_conflict_preserves_non_conflicting_tools() {
         },
         ToolCall {
             id: "tc_send".to_string(),
+            call_type: "function".to_string(),
             function: FunctionCall {
                 name: "send_message".to_string(),
                 arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
@@ -1082,6 +1089,7 @@ fn test_dm_conflict_preserves_non_conflicting_tools() {
         },
         ToolCall {
             id: "tc_ignore".to_string(),
+            call_type: "function".to_string(),
             function: FunctionCall {
                 name: "ignore_message".to_string(),
                 arguments: r#"{"reason":"nothing to add"}"#.to_string(),
@@ -1123,6 +1131,7 @@ fn test_send_message_alone_no_conflict() {
 
     let tool_calls = vec![ToolCall {
         id: "tc_send".to_string(),
+        call_type: "function".to_string(),
         function: FunctionCall {
             name: "send_message".to_string(),
             arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
@@ -1144,6 +1153,7 @@ fn test_no_dm_tools_no_conflict() {
 
     let tool_calls = vec![ToolCall {
         id: "tc_echo".to_string(),
+        call_type: "function".to_string(),
         function: FunctionCall {
             name: "echo".to_string(),
             arguments: r#"{"message":"hello"}"#.to_string(),
@@ -1164,6 +1174,7 @@ fn test_dm_send_terminates_in_dm_context() {
 
     let tool_calls = vec![ToolCall {
         id: "tc_send".to_string(),
+        call_type: "function".to_string(),
         function: FunctionCall {
             name: "send_message".to_string(),
             arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
@@ -1185,6 +1196,7 @@ fn test_dm_send_does_not_terminate_outside_dm() {
 
     let tool_calls = vec![ToolCall {
         id: "tc_send".to_string(),
+        call_type: "function".to_string(),
         function: FunctionCall {
             name: "send_message".to_string(),
             arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
@@ -1206,6 +1218,7 @@ fn test_dm_send_does_not_terminate_on_conflict() {
     let tool_calls = vec![
         ToolCall {
             id: "tc_send".to_string(),
+            call_type: "function".to_string(),
             function: FunctionCall {
                 name: "send_message".to_string(),
                 arguments: r#"{"to":"alice","message":"hi"}"#.to_string(),
@@ -1213,6 +1226,7 @@ fn test_dm_send_does_not_terminate_on_conflict() {
         },
         ToolCall {
             id: "tc_ignore".to_string(),
+            call_type: "function".to_string(),
             function: FunctionCall {
                 name: "ignore_message".to_string(),
                 arguments: r#"{"reason":"done"}"#.to_string(),
@@ -1234,6 +1248,7 @@ fn test_dm_send_no_dm_tools() {
 
     let tool_calls = vec![ToolCall {
         id: "tc_echo".to_string(),
+        call_type: "function".to_string(),
         function: FunctionCall {
             name: "echo".to_string(),
             arguments: r#"{"message":"hello"}"#.to_string(),

@@ -293,6 +293,7 @@ impl ContextBuilder {
                     reasoning_content: None,
                     tool_calls: Some(vec![ToolCall {
                         id: tool_call_id,
+                        call_type: "function".to_string(),
                         function: FunctionCall {
                             name: name.clone(),
                             arguments: params.to_string(),
@@ -446,6 +447,7 @@ mod tests {
             reasoning_content: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call_abc123".to_string(),
+                call_type: "function".to_string(),
                 function: FunctionCall {
                     name: "shell_exec".to_string(),
                     arguments: r#"{"command":"ls -la"}"#.to_string(),
@@ -1155,6 +1157,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".to_string(),
+                    call_type: "function".to_string(),
                     function: FunctionCall {
                         name: "echo".to_string(),
                         arguments: "{}".to_string(),
@@ -1169,6 +1172,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_2".to_string(),
+                    call_type: "function".to_string(),
                     function: FunctionCall {
                         name: "echo".to_string(),
                         arguments: "{}".to_string(),

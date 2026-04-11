@@ -301,6 +301,7 @@ pub(crate) fn from_anthropic_response(resp: AnthropicResponse) -> CompletionResp
             ContentBlock::ToolUse { id, name, input } => {
                 tool_calls.push(ToolCall {
                     id: id.clone(),
+                    call_type: "function".to_string(),
                     function: FunctionCall {
                         name: name.clone(),
                         arguments: input.to_string(),
@@ -563,6 +564,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_1".to_string(),
+                    call_type: "function".to_string(),
                     function: FunctionCall {
                         name: "shell_exec".to_string(),
                         arguments: r#"{"command":"ls"}"#.to_string(),
@@ -671,6 +673,7 @@ mod tests {
                 reasoning_content: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "c1".to_string(),
+                    call_type: "function".to_string(),
                     function: FunctionCall {
                         name: "echo".to_string(),
                         arguments: "{}".to_string(),

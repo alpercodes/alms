@@ -722,6 +722,7 @@ impl AgentRuntime {
             .filter(|(id, name, _)| !id.is_empty() && !name.is_empty())
             .map(|(id, name, arguments)| ToolCall {
                 id,
+                call_type: "function".to_string(),
                 function: FunctionCall { name, arguments },
             })
             .collect();
