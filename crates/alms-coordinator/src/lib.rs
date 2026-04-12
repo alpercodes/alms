@@ -92,6 +92,21 @@ pub struct SubagentCompletion {
     pub parent_agent_id: AgentId,
     /// The subagent's own session ID (so the frontend can navigate to it).
     pub subagent_session_id: SessionId,
+    /// The task/prompt given to the subagent (for display in completion cards).
+    pub task_description: Option<String>,
+    /// Number of tool calls the subagent made during its run.
+    pub tool_count: Option<u32>,
+    /// Wall-clock duration of the subagent run in milliseconds.
+    pub duration_ms: Option<u64>,
+    /// Token usage from the subagent run (prompt + completion).
+    pub token_usage: Option<SubagentTokenUsage>,
+}
+
+/// Token usage breakdown for a subagent run, included in completion events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentTokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 /// Handle to a running subagent
@@ -714,6 +729,17 @@ async fn run_subagent(
         && let Some(ref tx) = completion_tx
     {
         let summary = truncate_for_notification(&task_result.result);
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let (tool_count, token_usage) = match &run_output {
+            Some(output) => (
+                Some(output.tool_calls.len() as u32),
+                Some(SubagentTokenUsage {
+                    prompt_tokens: output.usage.prompt_tokens,
+                    completion_tokens: output.usage.completion_tokens,
+                }),
+            ),
+            None => (None, None),
+        };
         let completion = SubagentCompletion {
             task_id,
             subagent_name: request.subagent_name.clone(),
@@ -722,6 +748,10 @@ async fn run_subagent(
             parent_session_id,
             parent_agent_id,
             subagent_session_id,
+            task_description: Some(request.task.clone()),
+            tool_count,
+            duration_ms: Some(elapsed_ms),
+            token_usage,
         };
         if let Err(e) = tx.send(completion) {
             warn!(
