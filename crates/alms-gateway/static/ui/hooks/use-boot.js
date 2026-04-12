@@ -1,7 +1,7 @@
 import { fetchSettings } from '../api/settings.js';
 import { listSessions, createSession } from '../api/sessions.js';
 import { agents, activeAgentId } from '../state/agents.js';
-import { sessions, activeSessionId } from '../state/sessions.js';
+import { sessions, activeSessionId, showNotifications } from '../state/sessions.js';
 import { activeRunId, selectedRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
 import { replaceMessages } from '../state/chat-actions.js';
@@ -75,12 +75,16 @@ async function loadAgentSessions(agentId) {
     const gen = ++switchGeneration;
 
     try {
-        const data = await listSessions(agentId, { includeDms: true });
+        const data = await listSessions(agentId, {
+            includeDms: true,
+            includeNotifications: showNotifications.value,
+        });
         if (gen !== switchGeneration) return; // stale — discard
         const agentSessions = data.sessions || [];
         const dmCount = agentSessions.filter(s => s.session_type === 'dm').length;
-        if (dmCount > 0) {
-            console.debug('[loadAgentSessions] loaded', agentSessions.length, 'sessions,', dmCount, 'DM');
+        const notifCount = agentSessions.filter(s => s.session_type === 'notification').length;
+        if (dmCount > 0 || notifCount > 0) {
+            console.debug('[loadAgentSessions] loaded', agentSessions.length, 'sessions,', dmCount, 'DM,', notifCount, 'notification');
         }
         sessions.value = agentSessions;
 
@@ -101,7 +105,10 @@ async function loadAgentSessions(agentId) {
             const ctx = 'web-chat-' + Date.now();
             const resp = await createSession(agentId, ctx);
             if (gen !== switchGeneration) return; // stale — discard
-            const reloaded = await listSessions(agentId, { includeDms: true });
+            const reloaded = await listSessions(agentId, {
+                includeDms: true,
+                includeNotifications: showNotifications.value,
+            });
             if (gen !== switchGeneration) return; // stale — discard
             sessions.value = reloaded.sessions || [];
             activeSessionId.value = resp.session_id;
