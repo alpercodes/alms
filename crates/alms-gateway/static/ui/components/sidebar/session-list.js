@@ -223,8 +223,18 @@ function SessionItem({ session }) {
 }
 
 /**
+ * Internal session types that are hidden when notifications are toggled off.
+ */
+const INTERNAL_SESSION_TYPES = new Set(['notification', 'job', 'subagent']);
+
+/**
  * Toggle notification session visibility.  Persists the choice to
  * localStorage and reloads the session list from the API.
+ *
+ * When toggling OFF, if the currently active session is an internal
+ * type (notification/job/subagent), we navigate away to the first
+ * available chat session to avoid leaving a hidden session active
+ * (which would render InputArea instead of the read-only footer).
  */
 async function toggleNotifications() {
     const next = !showNotifications.value;
@@ -238,7 +248,42 @@ async function toggleNotifications() {
             includeDms: true,
             includeNotifications: next,
         });
-        sessions.value = data.sessions || [];
+        const newSessions = data.sessions || [];
+
+        // If toggling OFF and the active session is internal, navigate away.
+        if (!next && activeSessionId.value) {
+            const activeSess = sessions.value.find(s => s.id === activeSessionId.value);
+            if (activeSess && INTERNAL_SESSION_TYPES.has(activeSess.session_type)) {
+                closeSessionStream();
+                const fallback = newSessions.find(s => !INTERNAL_SESSION_TYPES.has(s.session_type));
+                batch(() => {
+                    sessions.value = newSessions;
+                    activeSessionId.value = fallback ? fallback.id : null;
+                    activeRunId.value = null;
+                    selectedRunId.value = null;
+                    replaceMessages([]);
+                    messageQueue.value = [];
+                    auditEvents.value = null;
+                    clearAllSubagents();
+                    parentSessionId.value = null;
+                });
+                if (fallback) {
+                    saveActiveSession(activeAgentId.value, fallback.id);
+                    sessionSwitchLoading.value = true;
+                    try {
+                        await loadSession(fallback.id, {
+                            isStale: () => false,
+                            logPrefix: 'toggleNotifications',
+                        });
+                    } finally {
+                        sessionSwitchLoading.value = false;
+                    }
+                }
+                return;
+            }
+        }
+
+        sessions.value = newSessions;
     } catch (err) {
         console.error('[toggleNotifications] reload failed:', err);
     }

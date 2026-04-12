@@ -111,6 +111,7 @@ function ChatView() {
         : session?.session_type === 'subagent' ? 'Subagent session'
         : 'Internal session';
     const internalIcon = notifActive ? '\u26A1' : session?.session_type === 'job' ? '\u23F0' : '\u2699';
+    const internalTypeCls = session?.session_type ? 'internal-session-' + session.session_type : '';
 
     return html`
         <div id="chat">
@@ -128,7 +129,7 @@ function ChatView() {
             `}
             ${!agentSwitchLoading.value && !sessionSwitchLoading.value && !dmActive && html`
             ${internalActive && html`
-                <div class="internal-session-header">
+                <div class="internal-session-header ${internalTypeCls}">
                     <span class="internal-session-header-icon" aria-hidden="true">${internalIcon}</span>
                     <span class="internal-session-header-label">${internalLabel}</span>
                     <span class="internal-session-header-badge">read-only</span>
