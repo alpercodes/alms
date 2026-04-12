@@ -145,9 +145,11 @@ export function DmConversationView() {
                     return html`<${DmDivider} key=${m.id} text=${m.text || 'Warning'} />`;
                 }
                 if (m.type === 'run_boundary') {
+                    // Completed runs are the normal case -- skip them to
+                    // reduce noise.  Only show failed/cancelled boundaries.
+                    if (!m.status || m.status === 'completed') return null;
                     const label = m.status === 'failed' ? 'run failed'
-                        : m.status === 'cancelled' ? 'run cancelled'
-                        : 'run completed';
+                        : 'run cancelled';
                     return html`<${DmDivider} key=${m.id} text=${label} />`;
                 }
                 if (m.type === 'subagent_completed') {

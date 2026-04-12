@@ -2837,6 +2837,21 @@ select.settings-input-sm {
   font-style: italic;
   letter-spacing: 0.02em;
 }
+/* Completed runs: minimal thin line, no label, reduced spacing */
+.run-boundary--completed {
+  gap: 0;
+  padding: 0 var(--space-4);
+  margin: var(--space-1) 0;
+}
+.run-boundary--completed::before {
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+  opacity: 0.5;
+}
+.run-boundary--completed::after {
+  display: none;
+}
 .run-boundary--failed {
   color: var(--error);
 }

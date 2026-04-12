@@ -106,20 +106,27 @@ export function SystemMessage({ text }) {
 
 /**
  * Run boundary divider -- rendered between runs to show where one run
- * ended and the next began.  Visually similar to dm-ended banners:
- * a subtle centered label with horizontal rules on each side.
+ * ended and the next began.
+ *
+ * Completed runs render as a very subtle thin line with no text (the
+ * normal/expected case does not need a label).  Failed and cancelled
+ * runs keep the labeled treatment since those are actionable.
  *
  * Props:
  *   status - 'completed' | 'cancelled' | 'failed'
  *   error  - optional error message (for failed runs)
  */
 export function RunBoundary({ status, error }) {
+    // Completed runs: subtle thin-line separator, no text.
+    if (!status || status === 'completed') {
+        return html`<div class="run-boundary run-boundary--completed" />`;
+    }
+
     const statusCls = status === 'failed' ? 'run-boundary--failed'
         : status === 'cancelled' ? 'run-boundary--cancelled'
         : '';
     const label = status === 'failed' ? 'run failed'
-        : status === 'cancelled' ? 'run cancelled'
-        : 'run completed';
+        : 'run cancelled';
     return html`
         <div class="run-boundary ${statusCls}">
             <span class="run-boundary-label">${label}</span>
