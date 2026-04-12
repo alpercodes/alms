@@ -2055,3 +2055,93 @@ async fn test_depth_fully_replenished_after_end_conversation() {
         "should hit DepthExceeded again after full replenishment"
     );
 }
+
+/// Regression test for #656: when agent A is running on DM session X
+/// (dm:A:B) and calls send_message to agent C, the source session for
+/// the A-C DM pair must NOT be recorded as the A-B DM session.
+///
+/// Before the fix, the guard only rejected `sid == dm_session_id` (the
+/// specific DM for the current pair), so a *different* DM session would
+/// slip through and be recorded as the source. When the A-C DM ended,
+/// the notification run would be routed to the A-B DM session.
+#[tokio::test]
+async fn test_cross_dm_source_session_not_recorded() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+    let charlie_id = AgentId::new();
+
+    // Create a DM session between alice and bob.
+    let dm_ab_session = SessionId::deterministic_dm("alice", "bob");
+    let dm_ab_context = dm_context_id("alice", "bob");
+    bus.session_manager
+        .get_or_create_shared(dm_ab_session, &dm_ab_context);
+
+    // Alice sends to bob from a web-chat session (establishes source).
+    let alice_webchat = SessionId::new();
+    bus.session_manager
+        .get_or_create_shared(alice_webchat, "web-chat-alice");
+    bus.send(
+        "alice",
+        alice_id,
+        "bob",
+        bob_id,
+        "hello bob",
+        Some(alice_webchat),
+    )
+    .await
+    .unwrap();
+    let _ = rx.try_recv(); // drain bob's trigger
+
+    // Now alice is running on the dm:alice:bob session and calls
+    // send_message to charlie. The sender_session_id is the DM session.
+    bus.send(
+        "alice",
+        alice_id,
+        "charlie",
+        charlie_id,
+        "hello charlie",
+        Some(dm_ab_session),
+    )
+    .await
+    .unwrap();
+    let _ = rx.try_recv(); // drain charlie's trigger
+
+    // The source session for the alice-charlie DM should NOT have been
+    // recorded (dm:alice:bob is not user-facing).
+    let ac_context = dm_context_id("alice", "charlie");
+    let key = (ac_context.clone(), "alice".to_string());
+    assert!(
+        !bus.source_sessions.contains_key(&key),
+        "DM session should not be recorded as source session for a different DM pair"
+    );
+
+    // End the alice-charlie conversation.
+    bus.end_conversation(
+        "alice",
+        alice_id,
+        "charlie",
+        charlie_id,
+        ConversationEndReason::Ignored,
+    )
+    .await
+    .unwrap();
+
+    // The notification for charlie should go to notifications:charlie
+    // (no source session), NOT to dm:alice:bob.
+    let trigger = rx
+        .try_recv()
+        .expect("should receive charlie's notification");
+    assert_eq!(trigger.agent_id, charlie_id);
+    assert!(
+        trigger.context_id.starts_with("notifications:"),
+        "notification should go to notifications: session, got: {}",
+        trigger.context_id,
+    );
+
+    // Alice should NOT get a self-notification (no user-facing source session).
+    assert!(
+        rx.try_recv().is_err(),
+        "alice should not get a self-notification when source was a DM session"
+    );
+}
