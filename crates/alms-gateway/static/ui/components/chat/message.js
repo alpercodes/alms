@@ -104,6 +104,29 @@ export function SystemMessage({ text }) {
     `;
 }
 
+/**
+ * Run boundary divider -- rendered between runs to show where one run
+ * ended and the next began.  Visually similar to dm-ended banners:
+ * a subtle centered label with horizontal rules on each side.
+ *
+ * Props:
+ *   status - 'completed' | 'cancelled' | 'failed'
+ *   error  - optional error message (for failed runs)
+ */
+export function RunBoundary({ status, error }) {
+    const statusCls = status === 'failed' ? 'run-boundary--failed'
+        : status === 'cancelled' ? 'run-boundary--cancelled'
+        : '';
+    const label = status === 'failed' ? 'run failed'
+        : status === 'cancelled' ? 'run cancelled'
+        : 'run completed';
+    return html`
+        <div class="run-boundary ${statusCls}">
+            <span class="run-boundary-label">${label}</span>
+        </div>
+    `;
+}
+
 export function DmEndedMessage({ peer, reason }) {
     return html`
         <div class="dm-ended-banner">

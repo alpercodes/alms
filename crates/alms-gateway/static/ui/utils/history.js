@@ -49,6 +49,40 @@ function parseJobNotification(content, metadata) {
 }
 
 /**
+ * Build an index of session-level tool call records so that history
+ * messages of type "tool_call" can be enriched with params/result
+ * even when the session_messages table only has bare content blocks.
+ *
+ * DM sessions store tool calls exclusively in the per-run
+ * `run_tool_calls` table, so without this merge the tool rows would
+ * appear empty after a page reload.
+ *
+ * The index is keyed by tool_id (the provider-assigned tool_call_id
+ * that correlates assistant tool_call messages with their results).
+ *
+ * Each key maps to { call, result } where call is the assistant-role
+ * record and result is the tool-role record.
+ *
+ * @param {Array} toolCalls - records from GET /sessions/{id}/tool-calls
+ * @returns {Map<string, { call: object|null, result: object|null }>}
+ */
+function buildToolCallIndex(toolCalls) {
+    const index = new Map();
+    for (const tc of toolCalls) {
+        const key = tc.tool_id;
+        if (!key) continue;
+        const entry = index.get(key) || { call: null, result: null };
+        if (tc.role === 'assistant' || tc.role === 'Assistant') {
+            entry.call = tc;
+        } else if (tc.role === 'tool' || tc.role === 'Tool') {
+            entry.result = tc;
+        }
+        index.set(key, entry);
+    }
+    return index;
+}
+
+/**
  * Map API message history to chatMessages entries.
  *
  * Pairs tool_call messages with their matching tool_result by
@@ -64,9 +98,17 @@ function parseJobNotification(content, metadata) {
  * @param {boolean} [opts.hasActiveRun] - true if a run is currently
  *   queued or running on this session. Used to mark unmatched tool_calls
  *   as 'running' so the UI shows a spinner instead of a checkmark.
+ * @param {Array} [opts.sessionToolCalls] - tool call records from
+ *   GET /sessions/{id}/tool-calls, used to enrich tool rows that
+ *   lack params/result in the session message history (DM sessions).
  */
 export function mapHistoryMessages(msgs, opts) {
     const hasActiveRun = opts && opts.hasActiveRun;
+    const sessionToolCalls = (opts && opts.sessionToolCalls) || [];
+    const toolCallIndex = sessionToolCalls.length > 0
+        ? buildToolCallIndex(sessionToolCalls)
+        : new Map();
+
     // First pass: index all tool_result messages by their tool_id so we
     // can match them to tool_call messages regardless of position.
     // Also build a secondary index by tool_invocation_id (when present in
@@ -111,10 +153,10 @@ export function mapHistoryMessages(msgs, opts) {
                 continue;
             }
 
-            // Synthetic system markers (job notifications, DM-ended markers)
-            // are returned with role "system" and metadata.synthetic=true.
-            // Render them as notification entries so the UI can style them
-            // differently from agent/user messages.
+            // Synthetic system markers (job notifications, DM-ended markers,
+            // run boundaries, run warnings, subagent completions) are
+            // returned with role "system" and metadata.synthetic=true.
+            // Route them to the correct chat message types.
             const isSynthetic = m.role === 'system'
                 && m.metadata && m.metadata.synthetic;
 
@@ -126,14 +168,10 @@ export function mapHistoryMessages(msgs, opts) {
                 && m.metadata && m.metadata.message_type === 'dm'
                 && m.metadata.from_agent;
 
-            const type = isSynthetic ? 'notification'
-                : isDm ? 'agent'
-                : (m.role === 'user' ? 'user' : 'agent');
+            // --- Synthetic marker routing ---
 
             // Parse job_notification markers into structured fields for
-            // the JobCompletionCard component.  The persisted format is:
-            //   [Scheduled job {label}] {job_name}\n{summary}
-            // where label is "completed", "failed", or "finished".
+            // the JobCompletionCard component.
             if (isSynthetic && m.metadata.type === 'job_notification') {
                 const content = m.content || '';
                 const parsed = parseJobNotification(content, m.metadata);
@@ -146,18 +184,82 @@ export function mapHistoryMessages(msgs, opts) {
                     ts: m.timestamp || null,
                     metadata: m.metadata || null,
                 });
-            } else {
+                continue;
+            }
+
+            // Run boundary markers -> run_boundary dividers between runs.
+            if (isSynthetic && m.metadata.type === 'run_boundary') {
+                const runStatus = m.metadata.status || 'completed';
                 entries.push({
                     id: nextMsgId(),
-                    type,
-                    role: m.role,
+                    type: 'run_boundary',
+                    status: runStatus,
+                    runId: m.metadata.run_id || null,
+                    error: m.metadata.error || null,
                     text: m.content || '',
-                    metadata: m.metadata || null,
-                    sealed: true,
-                    // Carry the sender name so Message can show it as the label.
-                    fromAgent: isDm ? m.metadata.from_agent : undefined,
                 });
+                continue;
             }
+
+            // Run warning markers -> warning messages.
+            if (isSynthetic && m.metadata.type === 'run_warning') {
+                // Suppress subagent warnings in the parent chat (same as
+                // the SSE handler in use-session-stream.js).
+                if (m.metadata.source_agent) continue;
+                entries.push({
+                    id: nextMsgId(),
+                    type: 'warning',
+                    code: m.metadata.code || 'UNKNOWN',
+                    text: m.content || 'Warning',
+                });
+                continue;
+            }
+
+            // Subagent completion markers -> subagent_completed cards.
+            if (isSynthetic && m.metadata.type === 'subagent_completion') {
+                entries.push({
+                    id: nextMsgId(),
+                    type: 'subagent_completed',
+                    name: m.metadata.subagent_name || 'subagent',
+                    task: '',
+                    status: m.metadata.status || 'done',
+                    toolCount: 0,
+                    durationMs: null,
+                    sessionId: m.metadata.session_id || null,
+                    summary: '',
+                });
+                continue;
+            }
+
+            // DM-ended notification markers (persisted on the webchat
+            // session, not the DM session itself).
+            if (isSynthetic && m.metadata.type === 'dm_ended_notification') {
+                entries.push({
+                    id: nextMsgId(),
+                    type: 'notification',
+                    role: 'system',
+                    text: m.content || '',
+                    metadata: m.metadata,
+                    sealed: true,
+                });
+                continue;
+            }
+
+            // Fallback for other synthetic markers.
+            const type = isSynthetic ? 'notification'
+                : isDm ? 'agent'
+                : (m.role === 'user' ? 'user' : 'agent');
+
+            entries.push({
+                id: nextMsgId(),
+                type,
+                role: m.role,
+                text: m.content || '',
+                metadata: m.metadata || null,
+                sealed: true,
+                // Carry the sender name so Message can show it as the label.
+                fromAgent: isDm ? m.metadata.from_agent : undefined,
+            });
         } else if (m.type === 'tool_call') {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;
             // Prefer tool_invocation_id as the message ID so that history-
@@ -168,19 +270,46 @@ export function mapHistoryMessages(msgs, opts) {
             // to tool_invocation_id when the primary key is absent. (#509)
             const matched = (callId ? resultMap.get(callId) : null)
                 || (invocationId ? resultByInvocationId.get(invocationId) : null);
+
+            // Enrich from session-level tool call records when the message
+            // history lacks params or the matched result is empty.  This is
+            // critical for DM sessions where tool calls live only in
+            // run_tool_calls.
+            let toolName = m.tool;
+            let params = m.params;
+            let result = matched ? matched.result : null;
+            let resultOk = matched ? matched.ok : null;
+
+            if (callId && toolCallIndex.has(callId)) {
+                const enriched = toolCallIndex.get(callId);
+                if (enriched.call) {
+                    if (!toolName) toolName = enriched.call.tool_name || toolName;
+                    if (!params && enriched.call.params) {
+                        try { params = JSON.parse(enriched.call.params); }
+                        catch { params = null; }
+                    }
+                }
+                if (enriched.result && result == null) {
+                    try { result = JSON.parse(enriched.result.result); }
+                    catch { result = enriched.result.result; }
+                    // If we got a result from the tool call index, it completed.
+                    if (resultOk == null) resultOk = true;
+                }
+            }
+
             entries.push({
                 id: invocationId || callId || nextMsgId(),
                 type: 'tool',
-                tool: m.tool,
-                params: m.params,
+                tool: toolName,
+                params: params,
                 // When no matching tool_result exists: if a run is still
                 // active on this session, the tool is likely in-progress
                 // so show it as 'running' (the tool_end SSE event will
                 // update it). Otherwise default to 'done' (the result was
                 // persisted elsewhere or the run completed before reload).
-                status: matched ? (matched.ok ? 'done' : 'fail')
+                status: resultOk != null ? (resultOk ? 'done' : 'fail')
                     : (hasActiveRun ? 'running' : 'done'),
-                result: matched ? matched.result : null,
+                result: result,
             });
         } else if (m.type === 'image') {
             // DM image messages use the same metadata pattern as text. (#546)
@@ -199,5 +328,56 @@ export function mapHistoryMessages(msgs, opts) {
         }
         // tool_result entries are consumed via resultMap -- skip them here
     }
+
+    // --- Merge tool calls from session-level endpoint ---
+    // For DM sessions, tool calls may not appear in session_messages at all
+    // (they are only in run_tool_calls).  Reconstruct them from the
+    // session-level tool call records if they were not already covered by
+    // the message history.
+    if (sessionToolCalls.length > 0) {
+        const existingToolIds = new Set();
+        for (const e of entries) {
+            if (e.type === 'tool' && e.id) existingToolIds.add(e.id);
+        }
+        // Also track tool_ids that appeared as history messages.
+        for (const m of msgs) {
+            if (m.type === 'tool_call') {
+                const callId = m.metadata && m.metadata.tool_call_id;
+                if (callId) existingToolIds.add(callId);
+                const invId = m.metadata && m.metadata.tool_invocation_id;
+                if (invId) existingToolIds.add(invId);
+            }
+        }
+
+        // Group session tool calls by tool_id, pairing calls with results.
+        for (const [toolId, pair] of toolCallIndex) {
+            if (existingToolIds.has(toolId)) continue;
+            if (!pair.call) continue; // skip orphan results
+
+            let params = null;
+            if (pair.call.params) {
+                try { params = JSON.parse(pair.call.params); }
+                catch { /* leave null */ }
+            }
+            let result = null;
+            let ok = null;
+            if (pair.result && pair.result.result) {
+                try { result = JSON.parse(pair.result.result); }
+                catch { result = pair.result.result; }
+                ok = true;
+            }
+
+            entries.push({
+                id: toolId || nextMsgId(),
+                type: 'tool',
+                tool: pair.call.tool_name || 'unknown',
+                params: params,
+                status: ok != null ? (ok ? 'done' : 'fail')
+                    : (hasActiveRun ? 'running' : 'done'),
+                result: result,
+            });
+        }
+    }
+
     return entries;
 }

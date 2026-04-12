@@ -133,8 +133,26 @@ export function DmConversationView() {
                 if (m.type === 'thinking') {
                     return html`<div key=${m.id} class="dm-msg dm-msg-center"><div class="dm-msg-thinking">Thinking...</div></div>`;
                 }
+                if (m.type === 'warning') {
+                    return html`<${DmDivider} key=${m.id} text=${m.text || 'Warning'} />`;
+                }
+                if (m.type === 'run_boundary') {
+                    const label = m.status === 'failed' ? 'run failed'
+                        : m.status === 'cancelled' ? 'run cancelled'
+                        : 'run completed';
+                    return html`<${DmDivider} key=${m.id} text=${label} />`;
+                }
+                if (m.type === 'subagent_completed') {
+                    const text = `Subagent '${m.name || 'subagent'}' ${m.status === 'fail' ? 'failed' : 'completed'}`;
+                    return html`<${DmDivider} key=${m.id} text=${text} />`;
+                }
+                if (m.type === 'job_completed') {
+                    return html`<${DmDivider} key=${m.id} text=${`Job '${m.jobName || 'job'}' ${m.status || 'completed'}`} />`;
+                }
                 if (m.type === 'tool') {
-                    // Tool calls in DMs are minimal -- show as a compact note
+                    // Tool calls in DMs -- show as a compact note with name
+                    // and status. Params and result are available via expand
+                    // in the non-DM view, but DM view keeps it minimal.
                     return html`
                         <div key=${m.id} class="dm-msg dm-msg-center">
                             <div class="dm-msg-tool">${m.tool}(${m.status})</div>
