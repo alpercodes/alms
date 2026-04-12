@@ -891,7 +891,7 @@ impl Tool for FsEditTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "file_path": {
+                "path": {
                     "type": "string",
                     "description": "Path to the file to edit."
                 },
@@ -908,17 +908,15 @@ impl Tool for FsEditTool {
                     "description": "When true, replace all occurrences instead of requiring uniqueness. Default: false."
                 }
             },
-            "required": ["file_path", "old_string", "new_string"]
+            "required": ["path", "old_string", "new_string"]
         })
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
-        let file_path = params
-            .get("file_path")
+        let path = params
+            .get("path")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                SandboxError::InvalidParameters("'file_path' is required".to_string())
-            })?;
+            .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
         let old_string = params
             .get("old_string")
@@ -947,39 +945,52 @@ impl Tool for FsEditTool {
         }
 
         // Deny-list check on raw path.
-        if is_denied_path(Path::new(file_path)) {
+        if is_denied_path(Path::new(path)) {
             return Err(SandboxError::SandboxViolation(format!(
                 "Access to '{}' is denied",
-                file_path
+                path
             )));
         }
 
         // Resolve path within sandbox (or use as-is when unsandboxed).
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
-            check_sandbox_path_async(file_path, root).await?
+            check_sandbox_path_async(path, root).await?
         } else {
-            PathBuf::from(file_path)
+            PathBuf::from(path)
         };
 
         // Deny-list check on resolved path.
         if is_denied_path(&resolved) {
             return Err(SandboxError::SandboxViolation(format!(
                 "Access to '{}' is denied",
-                file_path
+                path
             )));
         }
 
         // Special case: empty old_string means "create file".
         if old_string.is_empty() {
             return self
-                .handle_empty_old_string(&resolved, file_path, new_string)
+                .handle_empty_old_string(&resolved, path, new_string)
                 .await;
+        }
+
+        // File size guard — reject files larger than 2 MiB.
+        const MAX_EDIT_BYTES: u64 = 2 * 1024 * 1024;
+        let meta = tokio::fs::metadata(&resolved)
+            .await
+            .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+        if meta.len() > MAX_EDIT_BYTES {
+            return Err(SandboxError::InvalidParameters(format!(
+                "File too large for fs_edit ({} bytes, max {}). Use fs_write for full file replacement.",
+                meta.len(),
+                MAX_EDIT_BYTES
+            )));
         }
 
         // Read existing file content.
         let content = tokio::fs::read_to_string(&resolved)
             .await
-            .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", file_path, e)))?;
+            .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
 
         // Count occurrences.
         let count = content.matches(old_string).count();
@@ -987,14 +998,14 @@ impl Tool for FsEditTool {
         if count == 0 {
             return Err(SandboxError::InvalidParameters(format!(
                 "old_string not found in '{}'",
-                file_path
+                path
             )));
         }
 
         if !replace_all && count > 1 {
             return Err(SandboxError::InvalidParameters(format!(
                 "old_string appears {} times in '{}'; set replace_all to true or provide a more unique string",
-                count, file_path
+                count, path
             )));
         }
 
@@ -1009,12 +1020,12 @@ impl Tool for FsEditTool {
         // Write back.
         tokio::fs::write(&resolved, &new_content)
             .await
-            .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", file_path, e)))?;
+            .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", path, e)))?;
 
         let replacements = if replace_all { count } else { 1 };
         Ok(serde_json::json!({
             "ok": true,
-            "path": file_path,
+            "path": path,
             "replacements": replacements
         }))
     }
@@ -1762,7 +1773,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "world",
                 "new_string": "rust"
             }))
@@ -1783,7 +1794,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "aaa",
                 "new_string": "xxx"
             }))
@@ -1806,7 +1817,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "aaa",
                 "new_string": "xxx",
                 "replace_all": true
@@ -1831,7 +1842,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "missing",
                 "new_string": "replacement"
             }))
@@ -1850,7 +1861,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "world",
                 "new_string": "world"
             }))
@@ -1869,7 +1880,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "",
                 "new_string": "brand new content"
             }))
@@ -1890,7 +1901,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "",
                 "new_string": "new content"
             }))
@@ -1910,7 +1921,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "",
                 "new_string": "replacement"
             }))
@@ -1927,7 +1938,7 @@ mod tests {
         let tool = FsEditTool::sandboxed(root);
         let result = tool
             .execute(serde_json::json!({
-                "file_path": "../../etc/passwd",
+                "path": "../../etc/passwd",
                 "old_string": "root",
                 "new_string": "hacked"
             }))
@@ -1945,7 +1956,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": secrets.to_str().unwrap(),
+                "path": secrets.to_str().unwrap(),
                 "old_string": "value",
                 "new_string": "hacked"
             }))
@@ -1962,7 +1973,7 @@ mod tests {
 
         let tool = FsEditTool::new();
         tool.execute(serde_json::json!({
-            "file_path": path.to_str().unwrap(),
+            "path": path.to_str().unwrap(),
             "old_string": "TARGET",
             "new_string": "REPLACED"
         }))
@@ -1984,7 +1995,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "old_line2\nold_line3",
                 "new_string": "new_line2\nnew_line3\nnew_extra"
             }))
@@ -2007,7 +2018,7 @@ mod tests {
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
-                "file_path": path.to_str().unwrap(),
+                "path": path.to_str().unwrap(),
                 "old_string": "v\u{00e4}rlden! \u{1f600}",
                 "new_string": "\u{4e16}\u{754c}"
             }))
@@ -2029,5 +2040,31 @@ mod tests {
     #[test]
     fn test_fs_edit_description_nonempty() {
         assert!(!FsEditTool::new().description().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_rejects_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        // Create a file just over 2 MiB.
+        let content = "x".repeat(2 * 1024 * 1024 + 1);
+        std::fs::write(&path, &content).unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "x",
+                "new_string": "y",
+                "replace_all": true
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("too large"),
+            "error should mention size limit, got: {err}"
+        );
     }
 }
