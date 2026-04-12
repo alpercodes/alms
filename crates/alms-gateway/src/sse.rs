@@ -348,6 +348,30 @@ impl SseEventData {
         )
     }
 
+    /// Session-level: a new message was persisted to a DM session.
+    ///
+    /// Emitted by the `dm_event_loop` when the `MessageBus` notifies that a
+    /// peer message was written to the shared DM session. This enables live
+    /// rendering of DM messages in the web UI without requiring a page
+    /// reload. See #632.
+    pub fn dm_message(
+        session_id: alms_core::SessionId,
+        from_agent: &str,
+        from_agent_id: &str,
+        message: &str,
+    ) -> Self {
+        Self::new(
+            "dm_message",
+            DmMessageData {
+                session_id: session_id.0.to_string(),
+                from_agent: from_agent.to_string(),
+                from_agent_id: from_agent_id.to_string(),
+                message: message.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
+
     /// Session-level: a DM conversation between two agents has ended.
     ///
     /// Emitted on the DM session SSE stream so the web UI can show a
@@ -639,6 +663,15 @@ struct ContextDebugData {
 }
 
 #[derive(Debug, Serialize)]
+struct DmMessageData {
+    session_id: String,
+    from_agent: String,
+    from_agent_id: String,
+    message: String,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
 struct DmConversationEndedData {
     session_id: String,
     ended_by: String,
@@ -897,6 +930,25 @@ mod tests {
         assert_eq!(event.data["peer"], "alice");
         assert_eq!(event.data["reason"], "depth_exceeded");
         assert_eq!(event.data["context_id"], "dm:alice:bob");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+    }
+
+    #[test]
+    fn test_dm_message_event() {
+        let session_id = alms_core::SessionId::new();
+        let agent_id = alms_core::AgentId::new();
+        let event = SseEventData::dm_message(
+            session_id,
+            "alice",
+            &agent_id.0.to_string(),
+            "Hello Bob!",
+        );
+
+        assert_eq!(event.event_type, "dm_message");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["from_agent"], "alice");
+        assert_eq!(event.data["from_agent_id"], agent_id.0.to_string());
+        assert_eq!(event.data["message"], "Hello Bob!");
         assert!(event.data["ts"].is_string(), "ts should be a string");
     }
 

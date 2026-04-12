@@ -528,6 +528,26 @@ export function openSessionStream(sessionId, opts) {
         });
     });
 
+    // -- dm_message: live DM message from peer agent (#632) --
+    on('dm_message', (e) => {
+        batch(() => {
+            const data = JSON.parse(e.data);
+            // Insert the message as a user-role DM message with fromAgent
+            // metadata so the DM conversation view can render it on the
+            // correct side. These messages were already persisted to the
+            // session by the MessageBus -- this SSE event just ensures the
+            // live viewer sees them immediately.
+            appendMessage({
+                id: nextMsgId(),
+                type: 'user',
+                role: 'user',
+                text: data.message,
+                fromAgent: data.from_agent,
+                fromAgentId: data.from_agent_id,
+            });
+        });
+    });
+
     // -- dm_conversation_ended --
     on('dm_conversation_ended', (e) => {
         const data = JSON.parse(e.data);

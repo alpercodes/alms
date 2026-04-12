@@ -4,13 +4,14 @@
 //! DMs via shared sessions, and `end_conversation()` handles the DM
 //! lifecycle end (marker write, depth reset, peer notification).
 
-use super::{DEPTH_EXPIRY_SECS, MAX_DM_DEPTH, MessageSource, RunTrigger};
+use super::{DEPTH_EXPIRY_SECS, DmEvent, MAX_DM_DEPTH, MessageSource, RunTrigger};
 use alms_core::{AgentId, SessionId, dm_context_id};
 use alms_session::SessionManager;
 use alms_tools::message_sender::{
     ConversationEndReason, DeliveryReceipt, MessageSender, SendError,
 };
 use async_trait::async_trait;
+use chrono::Utc;
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,6 +31,9 @@ pub struct MessageBus {
     pub(super) session_manager: Arc<SessionManager>,
     /// Channel to trigger runs on the gateway.
     run_trigger_tx: mpsc::UnboundedSender<RunTrigger>,
+    /// Channel to notify the gateway of DM message persistence so SSE events
+    /// can be emitted to viewers watching the DM session. See #632.
+    dm_event_tx: Option<mpsc::UnboundedSender<DmEvent>>,
     /// Per-DM-pair depth tracker: "dm:a:b" -> (last_sender_name, depth).
     /// Depth increments each time the sender changes within the same pair.
     pub(super) depths: DashMap<String, (String, u32)>,
@@ -56,10 +60,22 @@ impl MessageBus {
         Self {
             session_manager,
             run_trigger_tx,
+            dm_event_tx: None,
             depths: DashMap::new(),
             last_activity: DashMap::new(),
             source_sessions: DashMap::new(),
         }
+    }
+
+    /// Attach a DM event channel for SSE forwarding.
+    ///
+    /// When set, the MessageBus emits [`DmEvent`] notifications whenever a
+    /// message is persisted to a DM session. The gateway's `dm_event_loop`
+    /// consumes these and pushes SSE events to viewers watching that session.
+    /// See #632.
+    pub fn with_dm_event_channel(mut self, tx: mpsc::UnboundedSender<DmEvent>) -> Self {
+        self.dm_event_tx = Some(tx);
+        self
     }
 
     /// Remove all source-session entries for a given DM context.
@@ -223,6 +239,22 @@ impl MessageSender for MessageBus {
         self.session_manager
             .append_message(session.id, msg)
             .map_err(|e| SendError::Internal(e.to_string()))?;
+
+        // --- Emit DmEvent for SSE forwarding (#632) ---
+        //
+        // Notify the gateway that a new message was persisted to the DM
+        // session so it can push an SSE event to any web UI client watching
+        // this session live.  Without this, DM messages are invisible during
+        // live viewing and only appear on reload.
+        if let Some(ref tx) = self.dm_event_tx {
+            let _ = tx.send(DmEvent {
+                session_id,
+                from_agent: sender_name.to_string(),
+                from_agent_id: sender_agent_id,
+                message: message.to_string(),
+                ts: Utc::now(),
+            });
+        }
 
         // --- Update last activity for depth expiry ---
         self.last_activity

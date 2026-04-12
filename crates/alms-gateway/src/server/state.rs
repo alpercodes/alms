@@ -68,6 +68,7 @@ impl AppState {
         run_trigger_tx: tokio::sync::mpsc::UnboundedSender<
             alms_coordinator::message_bus::RunTrigger,
         >,
+        dm_event_tx: tokio::sync::mpsc::UnboundedSender<alms_coordinator::message_bus::DmEvent>,
     ) -> AlmsResult<Self> {
         let workspace_dir = gateway.workspace_dir().map(|p| p.to_path_buf());
         let data_dir = gateway
@@ -159,10 +160,10 @@ impl AppState {
         let coordinator = Arc::new(coord);
 
         // Create the peer-messaging MessageBus (Layer 2).
-        let message_bus = Arc::new(alms_coordinator::message_bus::MessageBus::new(
-            session_manager.clone(),
-            run_trigger_tx,
-        ));
+        let message_bus = Arc::new(
+            alms_coordinator::message_bus::MessageBus::new(session_manager.clone(), run_trigger_tx)
+                .with_dm_event_channel(dm_event_tx),
+        );
 
         // Migrate any legacy UUID-based workspace directories to name-based paths.
         if let Some(ws_dir) = &workspace_dir

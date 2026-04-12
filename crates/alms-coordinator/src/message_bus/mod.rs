@@ -32,6 +32,7 @@ pub use bus::MessageBus;
 
 use alms_core::{AgentId, SessionId};
 use alms_tools::message_sender::ConversationEndReason;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Maximum message forwarding depth. Prevents infinite A -> B -> A loops.
@@ -58,6 +59,30 @@ pub struct RunTrigger {
     pub source: MessageSource,
     /// Context ID for the target session (needed by execute_run).
     pub context_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// DmEvent -- forwarded to the gateway for SSE emission to DM session viewers
+// ---------------------------------------------------------------------------
+
+/// An event that occurs on a DM session and needs to be forwarded to SSE
+/// subscribers watching that session.
+///
+/// The `MessageBus` has no access to the gateway's SSE infrastructure, so it
+/// sends these events via a channel that the gateway's `dm_event_loop`
+/// consumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DmEvent {
+    /// The DM session that the message was persisted to.
+    pub session_id: SessionId,
+    /// The agent who sent/authored the message.
+    pub from_agent: String,
+    /// The agent ID of the sender.
+    pub from_agent_id: AgentId,
+    /// The message text that was persisted.
+    pub message: String,
+    /// Timestamp of the message.
+    pub ts: DateTime<Utc>,
 }
 
 /// Who originated the message.
