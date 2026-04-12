@@ -131,7 +131,14 @@ export function DmConversationView() {
                     return null; // suppress token badges in DM view
                 }
                 if (m.type === 'thinking') {
-                    return html`<div key=${m.id} class="dm-msg dm-msg-center"><div class="dm-msg-thinking">Thinking...</div></div>`;
+                    // Show which agent is thinking when source info is available.
+                    // DM thinking messages carry source like "peer:AgentName".
+                    let thinkLabel = 'Thinking\u2026';
+                    if (m.source) {
+                        const name = m.source.startsWith('peer:') ? m.source.slice(5) : m.source;
+                        if (name) thinkLabel = `${name} is thinking\u2026`;
+                    }
+                    return html`<div key=${m.id} class="dm-msg dm-msg-center"><div class="dm-msg-thinking">${thinkLabel}</div></div>`;
                 }
                 if (m.type === 'warning') {
                     return html`<${DmDivider} key=${m.id} text=${m.text || 'Warning'} />`;

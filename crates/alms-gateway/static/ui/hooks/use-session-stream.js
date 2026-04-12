@@ -33,7 +33,7 @@ import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
 import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
-import { setAgentPhase, clearAgentPhase } from '../state/agent-status.js';
+import { agentPhase, setAgentPhase, clearAgentPhase } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
 import { normalizeApproval } from '../utils/approvals.js';
@@ -327,6 +327,12 @@ export function openSessionStream(sessionId, opts) {
     on('status', (e) => {
         const data = JSON.parse(e.data);
         console.debug('[status]', data.phase, data.detail || '');
+        // When the agent is in a DM conversation (phase 'dm', set by
+        // run_created for peer: sources), don't let subsequent status
+        // events (building_context, calling_llm, etc.) overwrite the
+        // "Chatting with ..." label.  The DM phase persists until the
+        // run ends and clearAgentPhase() is called.
+        if (agentPhase.value.phase === 'dm') return;
         setAgentPhase(data.phase, data.detail || null);
     });
 
