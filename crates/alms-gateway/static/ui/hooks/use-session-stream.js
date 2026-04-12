@@ -316,6 +316,7 @@ export function openSessionStream(sessionId, opts) {
             m => m.type === 'thinking' && m.queuedBehind > 0,
             m => ({ ...m, queuedBehind: 0 }),
         );
+        bumpRunListGeneration();
     });
 
     // -- status: agent phase update (live indicator in header bar) --
