@@ -308,7 +308,7 @@ export function SessionList() {
     const showNotif = showNotifications.value;
 
     return html`
-        <div class="sidebar-section" style="flex:0 0 auto">
+        <div class="sidebar-section" style="flex:1; min-height:0">
             <div class="sidebar-label">
                 Sessions
                 <button class="notif-toggle ${showNotif ? 'active' : ''}"
