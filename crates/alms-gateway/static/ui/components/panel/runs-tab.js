@@ -54,7 +54,7 @@ function fmtDuration(ms) {
 /** Format a token count with k suffix for large values. */
 function fmtTokens(n) {
     if (n == null) return '--';
-    if (n >= 10000) return (n / 1000).toFixed(1) + 'k';
+    if (n >= 10000) return (n / 1000).toFixed(0) + 'k';
     if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
     return String(n);
 }
@@ -121,7 +121,7 @@ export function RunsTab() {
         error.value = '';
         try {
             const data = await listAgentRuns(activeAgentId.value, PAGE_SIZE);
-            agentRuns.value = data.runs || data || [];
+            agentRuns.value = data.runs || [];
         } catch (err) {
             console.error('[RunsTab] fetch failed:', err);
             error.value = err.error?.message || err.message || 'Failed to load runs';
@@ -180,14 +180,14 @@ export function RunsTab() {
                             <span class="runs-tab-session-type">
                                 ${SESSION_TYPE_LABELS[run.session_type] || run.session_type || ''}
                             </span>
-                            <span class="runs-tab-time">${timeAgo(run.created_at)}</span>
+                            <span class="runs-tab-time">${timeAgo(run.ts)}</span>
                         </div>
                         <div class="runs-tab-row-bottom">
                             <span class="runs-tab-duration">${fmtDuration(run.duration_ms)}</span>
                             <span class="runs-tab-tools">${run.tool_call_count != null ? run.tool_call_count + ' tools' : ''}</span>
                             <span class="runs-tab-tokens">
                                 ${run.usage
-                                    ? fmtTokens(run.usage.input_tokens) + ' in / ' + fmtTokens(run.usage.output_tokens) + ' out'
+                                    ? fmtTokens(run.usage.prompt_tokens) + ' in / ' + fmtTokens(run.usage.completion_tokens) + ' out'
                                     : ''}
                             </span>
                         </div>
