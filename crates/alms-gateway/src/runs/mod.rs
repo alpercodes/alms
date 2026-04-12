@@ -24,7 +24,7 @@ pub use lifecycle::{
     ListRunsQuery, cancel_run, create_run, get_run_status, get_run_tool_calls, list_runs,
 };
 pub(crate) use notifications::{
-    completion_notification_loop, run_trigger_loop, scheduler_fire_loop,
+    completion_notification_loop, dm_event_loop, run_trigger_loop, scheduler_fire_loop,
 };
 pub use streaming::{SessionEventsQuery, stream_run_events, stream_session_events};
 

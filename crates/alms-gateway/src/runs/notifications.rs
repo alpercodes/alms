@@ -893,6 +893,46 @@ pub(crate) async fn run_trigger_loop(
 }
 
 // ---------------------------------------------------------------------------
+// DM event loop (live message SSE forwarding, #632)
+// ---------------------------------------------------------------------------
+
+/// Receives [`DmEvent`] notifications from the `MessageBus` and emits
+/// `dm_message` SSE events to any web UI client watching the DM session.
+///
+/// Without this loop, DM messages are invisible during live viewing and only
+/// appear on page reload. See #632 bugs 1 and 4.
+pub(crate) async fn dm_event_loop(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<alms_coordinator::message_bus::DmEvent>,
+    state: AppState,
+) {
+    while let Some(event) = rx.recv().await {
+        debug!(
+            session_id = %event.session_id.0,
+            from = %event.from_agent,
+            "DmEvent -> emitting dm_message SSE"
+        );
+
+        // Use a dummy RunId since dm_message is a session-level event not
+        // tied to a specific run.
+        let dummy_run_id = alms_core::RunId::new();
+        state
+            .run_manager
+            .send_session_event(
+                event.session_id,
+                dummy_run_id,
+                SseEventData::dm_message(
+                    event.session_id,
+                    &event.from_agent,
+                    &event.from_agent_id.0.to_string(),
+                    &event.message,
+                    event.ts,
+                ),
+            )
+            .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -923,12 +963,14 @@ mod tests {
         // The trigger_tx is consumed by AppState's MessageBus; the test
         // feeds run_trigger_loop via a separate channel below.
         let (trigger_tx, _bus_rx) = mpsc::unbounded_channel();
+        let (dm_event_tx, _dm_event_rx) = mpsc::unbounded_channel();
         let state = AppState::new(
             gateway,
             scheduler,
             shutdown_token.clone(),
             completion_tx,
             trigger_tx,
+            dm_event_tx,
         )
         .unwrap();
 
