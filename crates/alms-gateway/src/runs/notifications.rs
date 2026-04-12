@@ -572,7 +572,7 @@ const SUBAGENT_COMPLETED_TEMPLATE: &str =
     include_str!("../../../alms-runtime/prompts/subagent_completed.md");
 
 /// Format a human-readable notification message for the parent agent.
-fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> String {
+pub(super) fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> String {
     let status = match c.status {
         alms_coordinator::TaskStatus::Completed => "completed",
         alms_coordinator::TaskStatus::Failed => "failed",

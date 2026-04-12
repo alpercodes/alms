@@ -10,6 +10,8 @@
 //! - [`tools`] — runtime event forwarding bridge
 
 pub(crate) mod dm_lifecycle;
+#[cfg(test)]
+mod integration_tests;
 pub(crate) mod lifecycle;
 pub(crate) mod markers;
 pub(crate) mod notifications;
