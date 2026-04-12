@@ -16,3 +16,11 @@ export const getSessionMessages = (sessionId) =>
 
 export const deleteSession = (sessionId) =>
     del(`/sessions/${sessionId}`);
+
+/**
+ * Fetch all tool call records across all runs for a session.
+ * Returns { session_id, tool_calls: [...] } where each entry is a
+ * flattened ToolCallRecord with an additional run_id field.
+ */
+export const getSessionToolCalls = (sessionId) =>
+    get(`/sessions/${sessionId}/tool-calls`);

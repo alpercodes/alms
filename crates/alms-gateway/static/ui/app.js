@@ -2,7 +2,7 @@ import { html, render, signal, effect, useEffect, useRef, useSignal } from './de
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
-import { Message, ErrorMessage, WarningMessage, SystemMessage, DmEndedMessage, TokenBadge } from './components/chat/message.js';
+import { Message, ErrorMessage, WarningMessage, SystemMessage, DmEndedMessage, RunBoundary, TokenBadge } from './components/chat/message.js';
 import { ToolRow, ToolGroup } from './components/chat/tool-row.js';
 import { ContextDebugRow } from './components/chat/context-debug-row.js';
 import { ApprovalCard } from './components/chat/approval-card.js';
@@ -186,6 +186,9 @@ function ChatView() {
                     }
                     if (m.type === 'warning') {
                         return html`<${WarningMessage} key=${m.id} id=${m.id} text=${m.text} code=${m.code} />`;
+                    }
+                    if (m.type === 'run_boundary') {
+                        return html`<${RunBoundary} key=${m.id} status=${m.status} error=${m.error} />`;
                     }
                     if (m.type === 'system') {
                         return html`<${SystemMessage} key=${m.id} text=${m.text} />`;

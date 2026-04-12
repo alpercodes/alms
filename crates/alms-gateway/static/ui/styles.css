@@ -2833,6 +2833,54 @@ select.settings-input-sm {
   padding: var(--space-1) 0;
 }
 
+/* ── Run boundary divider ── */
+.run-boundary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  justify-content: center;
+  padding: var(--space-1) var(--space-4);
+  margin: var(--space-1) 0;
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  position: relative;
+}
+.run-boundary::before,
+.run-boundary::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+.run-boundary-label {
+  white-space: nowrap;
+  font-style: italic;
+  letter-spacing: 0.02em;
+}
+.run-boundary--failed {
+  color: var(--error);
+}
+.run-boundary--failed::before,
+.run-boundary--failed::after {
+  background: var(--error-muted);
+}
+.run-boundary--cancelled {
+  color: var(--warning);
+}
+.run-boundary--cancelled::before,
+.run-boundary--cancelled::after {
+  background: var(--warning-muted);
+}
+.run-boundary-error {
+  text-align: center;
+  font-size: var(--text-2xs);
+  color: var(--error);
+  padding: 0 var(--space-4);
+  margin-top: calc(-1 * var(--space-1));
+  margin-bottom: var(--space-1);
+  word-break: break-word;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
    DM Session — Sidebar Styling (#604)
    ══════════════════════════════════════════════════════════════════════ */

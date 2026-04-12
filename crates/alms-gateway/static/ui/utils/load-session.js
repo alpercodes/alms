@@ -7,12 +7,13 @@
  *
  * The loading sequence is:
  *   1. Fetch runs -> restore activeRunId for any in-progress run
- *   2. Fetch message history -> mapHistoryMessages -> set chatMessages
- *   3. If active run: append thinking indicator + reconstruct approvals
- *   4. Open SSE stream with lastEventId to skip event replay
+ *   2. Fetch message history + session tool calls in parallel
+ *   3. Merge tool call data into history -> mapHistoryMessages -> set chatMessages
+ *   4. If active run: append thinking indicator + reconstruct approvals
+ *   5. Open SSE stream with lastEventId to skip event replay
  */
 
-import { getSessionMessages } from '../api/sessions.js';
+import { getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
 import { listRuns, listApprovals } from '../api/runs.js';
 import { mapHistoryMessages } from './history.js';
 import { normalizeApproval } from './approvals.js';
@@ -57,26 +58,42 @@ export async function loadSession(sessionId, opts) {
         runs.value = [];
     }
 
-    // Step 2: Fetch message history and map to chat entries.
+    // Step 2: Fetch message history and session-level tool calls in
+    // parallel.  The tool call records enrich tool rows for DM sessions
+    // where tool calls are stored only in run_tool_calls, not in
+    // session_messages.  (#609, #632, #634)
     let lastEventId = null;
     try {
-        const data = await getSessionMessages(sessionId);
+        const [historyData, toolCallData] = await Promise.all([
+            getSessionMessages(sessionId),
+            getSessionToolCalls(sessionId).catch(err => {
+                // Non-fatal: the endpoint may not exist on older backends.
+                console.warn(`[${logPrefix}] Failed to load session tool calls:`, err);
+                return { tool_calls: [] };
+            }),
+        ]);
         if (isStale()) return;
-        const rawMsgs = data.messages || [];
+
+        const rawMsgs = historyData.messages || [];
+        const sessionToolCalls = toolCallData.tool_calls || [];
+
         const mapped = mapHistoryMessages(rawMsgs, {
             hasActiveRun: !!activeRunId.value,
+            sessionToolCalls,
         });
+
         // Diagnostic: log tool call counts for #501 investigation.
         const apiToolCalls = rawMsgs.filter(m => m.type === 'tool_call').length;
         const mappedTools = mapped.filter(m => m.type === 'tool').length;
-        if (apiToolCalls > 0 || mappedTools > 0) {
+        if (apiToolCalls > 0 || mappedTools > 0 || sessionToolCalls.length > 0) {
             console.debug(`[${logPrefix}] history loaded:`,
                 rawMsgs.length, 'API messages,',
                 apiToolCalls, 'tool_calls ->',
-                mappedTools, 'tool rows');
+                mappedTools, 'tool rows,',
+                sessionToolCalls.length, 'session tool call records');
         }
         replaceMessages(mapped);
-        lastEventId = data.last_event_id ?? null;
+        lastEventId = historyData.last_event_id ?? null;
     } catch (err) {
         if (isStale()) return;
         replaceMessages([{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }]);
