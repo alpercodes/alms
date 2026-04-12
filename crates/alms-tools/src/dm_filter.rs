@@ -1,26 +1,26 @@
 //! Shared DM message filter — identifies synthetic markers that should be
 //! excluded from DM conversation output.
 //!
-//! This centralises the filtering logic so that `read_messages`, `read_session`,
-//! and any future DM-reading code paths stay consistent. The reference
-//! behaviour matches `format_dm_conversation_history()` in `alms-gateway`.
+//! This centralises the filtering logic so that `read_messages`,
+//! `read_session`, `format_dm_conversation_history`, and any future
+//! DM-reading code paths stay consistent.
+//!
+//! All lifecycle markers persisted via `persist_lifecycle_marker` carry
+//! `"synthetic": true` in their metadata, so the filter only needs a
+//! single metadata check (plus structural guards for non-text and empty
+//! messages).  See issue #627 and Tim's architectural audit (#613).
 
 use alms_session::{Content, Message};
-
-/// Known `message_type` values that represent synthetic system markers.
-/// Real DM messages carry `"message_type": "dm"` — those must NOT be filtered.
-const SYNTHETIC_MESSAGE_TYPES: &[&str] = &["dm_ended"];
 
 /// Returns `true` if the message is a synthetic marker that should be
 /// filtered out of DM conversation output.
 ///
 /// Synthetic markers include:
 /// - Non-text content (tool calls, tool results, images).
-/// - Messages with empty or whitespace-only text (e.g. `dm_ended` marker bodies).
-/// - Messages whose `message_type` metadata matches a known synthetic type
-///   (currently: `dm_ended`). Note: `"message_type": "dm"` is a *real* DM
-///   message and is explicitly preserved.
-/// - Messages flagged as `synthetic: true` in metadata.
+/// - Messages with empty or whitespace-only text (e.g. `dm_ended`
+///   marker bodies written by the MessageBus).
+/// - Messages flagged as `synthetic: true` in metadata (all lifecycle
+///   markers from `persist_lifecycle_marker` carry this flag).
 pub fn is_synthetic_marker(msg: &Message) -> bool {
     // Non-text content (tool calls, tool results, images) are internal
     // bookkeeping and should not appear in DM conversation output.
@@ -29,25 +29,17 @@ pub fn is_synthetic_marker(msg: &Message) -> bool {
         _ => return true,
     };
 
-    // Empty text bodies are metadata-only markers (e.g. dm_ended).
+    // Empty text bodies are metadata-only markers (e.g. dm_ended marker
+    // written by MessageBus::end_conversation with empty content).
     if text.trim().is_empty() {
         return true;
     }
 
-    // Check metadata for marker indicators.
-    if let Some(ref meta) = msg.metadata {
-        // Only filter messages whose `message_type` is a known synthetic
-        // marker. Real DM messages have `"message_type": "dm"` and must
-        // NOT be filtered.
-        if let Some(msg_type) = meta.get("message_type").and_then(|v| v.as_str())
-            && SYNTHETIC_MESSAGE_TYPES.contains(&msg_type)
-        {
-            return true;
-        }
-        // Synthetic notification markers.
-        if meta.get("synthetic").and_then(|v| v.as_bool()) == Some(true) {
-            return true;
-        }
+    // Single canonical check: all lifecycle markers set "synthetic": true.
+    if let Some(ref meta) = msg.metadata
+        && meta.get("synthetic").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return true;
     }
 
     false
@@ -105,12 +97,32 @@ mod tests {
     }
 
     #[test]
-    fn dm_ended_with_text_is_filtered() {
+    fn dm_ended_with_text_and_synthetic_is_filtered() {
+        // In production, dm_ended markers from the MessageBus always have
+        // empty text. Lifecycle markers from persist_lifecycle_marker
+        // always have synthetic: true. This test verifies that the
+        // synthetic flag works even when the message has non-empty text.
+        let msg = msg_with_meta(
+            "some leftover text",
+            Some(serde_json::json!({"message_type": "dm_ended", "synthetic": true})),
+        );
+        assert!(is_synthetic_marker(&msg));
+    }
+
+    #[test]
+    fn dm_ended_with_text_but_no_synthetic_is_not_filtered() {
+        // A hypothetical dm_ended marker with non-empty text but without
+        // synthetic: true. This is not produced by any current code path,
+        // but the filter should only rely on structural checks (non-text,
+        // empty) and the single synthetic flag.
         let msg = msg_with_meta(
             "some leftover text",
             Some(serde_json::json!({"message_type": "dm_ended"})),
         );
-        assert!(is_synthetic_marker(&msg));
+        assert!(
+            !is_synthetic_marker(&msg),
+            "dm_ended with non-empty text and no synthetic flag should not be filtered"
+        );
     }
 
     #[test]

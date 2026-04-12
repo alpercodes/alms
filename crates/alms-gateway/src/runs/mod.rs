@@ -9,6 +9,7 @@
 //! - [`tools`] — runtime event forwarding bridge
 
 pub(crate) mod lifecycle;
+pub(crate) mod markers;
 pub(crate) mod notifications;
 pub(crate) mod streaming;
 mod tools;
