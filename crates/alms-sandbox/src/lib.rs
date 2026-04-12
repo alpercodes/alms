@@ -9,7 +9,7 @@ pub mod sandbox;
 pub mod shell;
 
 pub use builtin::{
-    DatetimeTool, EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
+    DatetimeTool, EchoTool, FsEditTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
 };
 pub use error::{SandboxError, SandboxResult};
 pub use registry::ToolRegistry;

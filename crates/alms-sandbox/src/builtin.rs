@@ -843,6 +843,235 @@ impl Tool for FsListTool {
     }
 }
 
+/// Search-and-replace editing tool for files.
+///
+/// Performs exact string matching (no regex). By default, the search string
+/// must appear exactly once in the file (uniqueness guard). Set `replace_all`
+/// to replace every occurrence.
+///
+/// Special case: when `old_string` is empty and the file does not exist (or
+/// exists but is empty), the file is created/overwritten with `new_string`.
+#[derive(Debug, Clone, Default)]
+pub struct FsEditTool {
+    sandbox_root: Option<PathBuf>,
+}
+
+impl FsEditTool {
+    /// Create an unrestricted fs_edit tool (no sandbox check).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a sandboxed fs_edit tool. Paths must resolve within `root`.
+    pub fn sandboxed(root: PathBuf) -> Self {
+        Self {
+            sandbox_root: Some(root),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for FsEditTool {
+    fn name(&self) -> &str {
+        "fs_edit"
+    }
+
+    fn description(&self) -> &str {
+        "Search and replace text in a file. Finds an exact string and replaces it. \
+         By default the search string must appear exactly once (uniqueness guard). \
+         Set replace_all to true to replace every occurrence. \
+         When old_string is empty and the file does not exist, creates the file with new_string."
+    }
+
+    fn is_builtin(&self) -> bool {
+        true
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the file to edit."
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "Exact text to find and replace."
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "Replacement text (must differ from old_string)."
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "When true, replace all occurrences instead of requiring uniqueness. Default: false."
+                }
+            },
+            "required": ["file_path", "old_string", "new_string"]
+        })
+    }
+
+    async fn execute(&self, params: Value) -> SandboxResult<Value> {
+        let file_path = params
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SandboxError::InvalidParameters("'file_path' is required".to_string())
+            })?;
+
+        let old_string = params
+            .get("old_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SandboxError::InvalidParameters("'old_string' is required".to_string())
+            })?;
+
+        let new_string = params
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SandboxError::InvalidParameters("'new_string' is required".to_string())
+            })?;
+
+        let replace_all = params
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // No-op rejection: old_string == new_string
+        if old_string == new_string {
+            return Err(SandboxError::InvalidParameters(
+                "old_string and new_string must differ".to_string(),
+            ));
+        }
+
+        // Deny-list check on raw path.
+        if is_denied_path(Path::new(file_path)) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Access to '{}' is denied",
+                file_path
+            )));
+        }
+
+        // Resolve path within sandbox (or use as-is when unsandboxed).
+        let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
+            check_sandbox_path_async(file_path, root).await?
+        } else {
+            PathBuf::from(file_path)
+        };
+
+        // Deny-list check on resolved path.
+        if is_denied_path(&resolved) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Access to '{}' is denied",
+                file_path
+            )));
+        }
+
+        // Special case: empty old_string means "create file".
+        if old_string.is_empty() {
+            return self
+                .handle_empty_old_string(&resolved, file_path, new_string)
+                .await;
+        }
+
+        // Read existing file content.
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
+            .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", file_path, e)))?;
+
+        // Count occurrences.
+        let count = content.matches(old_string).count();
+
+        if count == 0 {
+            return Err(SandboxError::InvalidParameters(format!(
+                "old_string not found in '{}'",
+                file_path
+            )));
+        }
+
+        if !replace_all && count > 1 {
+            return Err(SandboxError::InvalidParameters(format!(
+                "old_string appears {} times in '{}'; set replace_all to true or provide a more unique string",
+                count, file_path
+            )));
+        }
+
+        // Perform the replacement.
+        let new_content = if replace_all {
+            content.replace(old_string, new_string)
+        } else {
+            // Replace only the first (and only) occurrence.
+            content.replacen(old_string, new_string, 1)
+        };
+
+        // Write back.
+        tokio::fs::write(&resolved, &new_content)
+            .await
+            .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", file_path, e)))?;
+
+        let replacements = if replace_all { count } else { 1 };
+        Ok(serde_json::json!({
+            "ok": true,
+            "path": file_path,
+            "replacements": replacements
+        }))
+    }
+}
+
+impl FsEditTool {
+    /// Handle the special case where `old_string` is empty.
+    ///
+    /// - File does not exist: create it with `new_string`.
+    /// - File exists and is empty: write `new_string`.
+    /// - File exists and has content: error.
+    async fn handle_empty_old_string(
+        &self,
+        resolved: &Path,
+        display_path: &str,
+        new_string: &str,
+    ) -> SandboxResult<Value> {
+        let file_exists = tokio::fs::metadata(resolved).await.is_ok();
+
+        if file_exists {
+            let content = tokio::fs::read_to_string(resolved).await.map_err(|e| {
+                SandboxError::Io(format!("Failed to read '{}': {}", display_path, e))
+            })?;
+
+            if !content.is_empty() {
+                return Err(SandboxError::InvalidParameters(format!(
+                    "old_string is empty but '{}' has existing content; \
+                     use a non-empty old_string to edit, or clear the file first",
+                    display_path
+                )));
+            }
+        }
+
+        // Create parent directories if needed.
+        if let Some(parent) = resolved.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                SandboxError::Io(format!(
+                    "Failed to create dirs for '{}': {}",
+                    display_path, e
+                ))
+            })?;
+        }
+
+        tokio::fs::write(resolved, new_string)
+            .await
+            .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", display_path, e)))?;
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "path": display_path,
+            "replacements": 1
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,6 +1173,7 @@ mod tests {
         assert!(!FsReadTool::new().is_auto_approved());
         assert!(!FsWriteTool::new().is_auto_approved());
         assert!(!FsListTool::new().is_auto_approved());
+        assert!(!FsEditTool::new().is_auto_approved());
     }
 
     #[tokio::test]
@@ -1009,6 +1239,7 @@ mod tests {
         assert!(!FsReadTool::new().description().is_empty());
         assert!(!FsWriteTool::new().description().is_empty());
         assert!(!FsListTool::new().description().is_empty());
+        assert!(!FsEditTool::new().description().is_empty());
     }
 
     // ── safe_truncate ─────────────────────────────────────────────────────────
@@ -1518,5 +1749,285 @@ mod tests {
                 resolved.display()
             );
         }
+    }
+
+    // ── FsEditTool ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_fs_edit_unique_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello world").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "world",
+                "new_string": "rust"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["replacements"], 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello rust");
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_reject_multiple_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "aaa bbb aaa ccc aaa").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "aaa",
+                "new_string": "xxx"
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("3 times"),
+            "error should mention count, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_replace_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "aaa bbb aaa ccc aaa").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "aaa",
+                "new_string": "xxx",
+                "replace_all": true
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["replacements"], 3);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "xxx bbb xxx ccc xxx"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello world").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "missing",
+                "new_string": "replacement"
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_noop_rejection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "hello world").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "world",
+                "new_string": "world"
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("must differ"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_empty_old_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new_file.txt");
+        assert!(!path.exists());
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "",
+                "new_string": "brand new content"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["replacements"], 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "brand new content");
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_empty_old_on_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "",
+                "new_string": "new content"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_empty_old_on_nonempty_file_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.txt");
+        std::fs::write(&path, "existing content").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "",
+                "new_string": "replacement"
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("existing content"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_sandbox_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = FsEditTool::sandboxed(root);
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": "../../etc/passwd",
+                "old_string": "root",
+                "new_string": "hacked"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("outside sandbox"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_denied_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = dir.path().join("secrets.json");
+        std::fs::write(&secrets, r#"{"key": "value"}"#).unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": secrets.to_str().unwrap(),
+                "old_string": "value",
+                "new_string": "hacked"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_preserves_surrounding_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "before TARGET after").unwrap();
+
+        let tool = FsEditTool::new();
+        tool.execute(serde_json::json!({
+            "file_path": path.to_str().unwrap(),
+            "old_string": "TARGET",
+            "new_string": "REPLACED"
+        }))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "before REPLACED after"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_multiline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "line1\nold_line2\nold_line3\nline4").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "old_line2\nold_line3",
+                "new_string": "new_line2\nnew_line3\nnew_extra"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["replacements"], 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "line1\nnew_line2\nnew_line3\nnew_extra\nline4"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_unicode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unicode.txt");
+        std::fs::write(&path, "Hej v\u{00e4}rlden! \u{1f600} foo").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "file_path": path.to_str().unwrap(),
+                "old_string": "v\u{00e4}rlden! \u{1f600}",
+                "new_string": "\u{4e16}\u{754c}"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["replacements"], 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "Hej \u{4e16}\u{754c} foo"
+        );
+    }
+
+    #[test]
+    fn test_fs_edit_not_auto_approved() {
+        assert!(!FsEditTool::new().is_auto_approved());
+    }
+
+    #[test]
+    fn test_fs_edit_description_nonempty() {
+        assert!(!FsEditTool::new().description().is_empty());
     }
 }

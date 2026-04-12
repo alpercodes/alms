@@ -167,9 +167,9 @@ impl AgentRuntime {
         let enabled = &self.config.enabled_tools;
         let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
 
-        // Re-register fs_read/fs_write/fs_list sandboxed to the workspace
-        // directory so file operations default to the agent's workspace
-        // instead of the project root.
+        // Re-register fs_read/fs_write/fs_list/fs_edit sandboxed to the
+        // workspace directory so file operations default to the agent's
+        // workspace instead of the project root.
         if tool_enabled("fs_read") {
             self.tools
                 .register(std::sync::Arc::new(alms_sandbox::FsReadTool::sandboxed(
@@ -185,6 +185,12 @@ impl AgentRuntime {
         if tool_enabled("fs_list") {
             self.tools
                 .register(std::sync::Arc::new(alms_sandbox::FsListTool::sandboxed(
+                    ws_root.clone(),
+                )));
+        }
+        if tool_enabled("fs_edit") {
+            self.tools
+                .register(std::sync::Arc::new(alms_sandbox::FsEditTool::sandboxed(
                     ws_root.clone(),
                 )));
         }
