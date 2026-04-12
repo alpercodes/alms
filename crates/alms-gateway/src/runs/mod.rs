@@ -4,10 +4,12 @@
 //!
 //! This module is split into focused submodules:
 //! - [`lifecycle`] — run creation, execution, completion
+//! - [`dm_lifecycle`] — consolidated DM post-run lifecycle (ignore_message detection, conversation end)
 //! - [`streaming`] — SSE event streaming (per-run and per-session)
 //! - [`notifications`] — DM notification routing, scheduler integration, trigger loops
 //! - [`tools`] — runtime event forwarding bridge
 
+pub(crate) mod dm_lifecycle;
 pub(crate) mod lifecycle;
 pub(crate) mod markers;
 pub(crate) mod notifications;
@@ -613,21 +615,15 @@ mod tests {
         }
     }
 
-    /// Helper: evaluates the three-way condition for ignore_message detection.
-    ///
-    /// Mirrors the production logic in `execute_run()`: the condition is
-    /// `is_peer_message && ran_ignore_message && context_id.starts_with("dm:")`.
-    ///
-    /// Uses `alms_core::ran_ignore_message_successfully` which requires a
-    /// matching non-conflict `Tool`-role result for each `Assistant`-role
-    /// `ignore_message` record.
+    /// Helper: delegates to the canonical `should_signal_dm_end` in
+    /// `dm_lifecycle` -- the single source of truth for the three-way
+    /// ignore_message detection condition (#628).
     fn should_signal_ignore(
         is_peer_message: bool,
         tool_calls: &[alms_core::ToolCallRecord],
         context_id: &str,
     ) -> bool {
-        let ran_ignore_message = alms_core::ran_ignore_message_successfully(tool_calls);
-        is_peer_message && ran_ignore_message && context_id.starts_with("dm:")
+        dm_lifecycle::should_signal_dm_end(is_peer_message, tool_calls, context_id)
     }
 
     #[test]

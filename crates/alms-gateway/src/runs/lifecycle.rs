@@ -13,7 +13,6 @@ use alms_core::{
     RunStatusResponse, SessionId, classify_session_type,
 };
 use alms_runtime::RuntimeEvent;
-use alms_tools::message_sender::{ConversationEndReason, MessageSender as _};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -1082,102 +1081,23 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 });
             }
 
-            // -- ignore_message detection for DM conversations (#387) --
+            // -- DM post-run lifecycle (consolidated in #628) --
             //
-            // When a peer-message DM run contains an `ignore_message` tool call,
-            // signal the end of the conversation to the MessageBus so the peer
-            // gets notified and the depth counter resets.  See Phase 3 of #384.
-            //
-            // Previously this used `response_is_empty` as a proxy, but after the
-            // Bug 1 fix in PR #412 (`should_terminate_after_dm_send`) the loop
-            // also breaks with an empty response after `send_message`.  We now
-            // inspect the actual tool-call records to distinguish `ignore_message`
-            // from `send_message`.
-            let ran_ignore_message = alms_core::ran_ignore_message_successfully(&output.tool_calls);
-            if is_peer_message && ran_ignore_message && context_id.starts_with("dm:") {
-                if let Some(ref name) = agent_name
-                    && let Some(peer_name) = extract_peer_from_dm_context(&context_id, name)
-                {
-                    // Resolve the peer's AgentId from the agent registry.
-                    let peer_agent_id = state
-                        .session_manager
-                        .store()
-                        .and_then(|store| store.load_agent_by_name(&peer_name).ok())
-                        .flatten()
-                        .map(|record| record.id);
-
-                    if let Some(peer_id) = peer_agent_id {
-                        info!(
-                            agent = %name,
-                            peer = %peer_name,
-                            "DM run ended with ignore_message — signalling conversation end"
-                        );
-                        let end_reason = ConversationEndReason::Ignored;
-                        match state
-                            .message_bus
-                            .end_conversation(name, agent_id, &peer_name, peer_id, end_reason)
-                            .await
-                        {
-                            Ok(()) => {
-                                // Emit dm_conversation_ended SSE event on the
-                                // DM session stream so the web UI can show a
-                                // "conversation ended" indicator. Phase 6 of #384.
-                                //
-                                // NOTE: This code path only fires for the
-                                // ignore_message reason.  The depth-exceeded
-                                // reason emits this event from
-                                // `run_trigger_loop` when processing the
-                                // `ConversationEnded` trigger (#419).
-                                //
-                                // NOTE: If both agents ignore simultaneously,
-                                // end_conversation returns Ok(()) for both
-                                // callers (the second sees "already ended by
-                                // peer" and returns Ok).  This means duplicate
-                                // dm_conversation_ended SSE events may be
-                                // emitted for the same session.  The frontend
-                                // should be prepared to handle duplicates.
-                                state
-                                    .run_manager
-                                    .send_session_event(
-                                        session_id,
-                                        run_id,
-                                        SseEventData::dm_conversation_ended(
-                                            session_id,
-                                            name,
-                                            &peer_name,
-                                            &end_reason.to_string(),
-                                            &context_id,
-                                        ),
-                                    )
-                                    .await;
-
-                                // NOTE: The sender's web-chat SSE marker is
-                                // handled by the sender's self-notification
-                                // run in `run_trigger_loop` (notifications.rs),
-                                // which calls `notify_dm_ended_to_webchat` for
-                                // every ConversationEnded trigger recipient.
-                                // Calling it here as well would cause a
-                                // duplicate marker for the sender. See #556.
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to signal conversation end for {name} -> {peer_name}: {e}"
-                                );
-                            }
-                        }
-                    } else {
-                        warn!(
-                            peer = %peer_name,
-                            "Cannot signal conversation end — peer agent not found in registry"
-                        );
-                    }
-                } else {
-                    debug!(
-                        "DM ignore_message detected but could not extract peer from context_id '{}'",
-                        context_id
-                    );
-                }
-            }
+            // Detect ignore_message, signal conversation end, emit SSE events.
+            // All logic lives in `dm_lifecycle::handle_dm_run_completion()`.
+            super::dm_lifecycle::handle_dm_run_completion(
+                super::dm_lifecycle::DmRunCompletionContext {
+                    state: &state,
+                    run_id,
+                    session_id,
+                    agent_id,
+                    agent_name: agent_name.as_deref(),
+                    context_id: &context_id,
+                    is_peer_message,
+                    tool_calls: &output.tool_calls,
+                },
+            )
+            .await;
 
             info!("Run {} completed successfully", run_id.0);
         }
