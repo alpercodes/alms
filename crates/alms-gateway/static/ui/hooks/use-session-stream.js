@@ -568,19 +568,24 @@ export function openSessionStream(sessionId, opts) {
     // -- dm_message: live DM message from peer agent (#632) --
     on('dm_message', (e) => {
         batch(() => {
+            flushDeltaBuffer();
+            sealLastAgent();
             const data = JSON.parse(e.data);
-            // Insert the message as a user-role DM message with fromAgent
+            // Insert the message as an agent-role DM message with fromAgent
             // metadata so the DM conversation view can render it on the
-            // correct side. These messages were already persisted to the
-            // session by the MessageBus -- this SSE event just ensures the
-            // live viewer sees them immediately.
+            // correct side. Use type 'agent' to match what mapHistoryMessages
+            // produces for DM messages (history.js maps isDm messages to
+            // type 'agent' with fromAgent set). The sealed flag prevents
+            // the delta buffer from appending streamed text onto this
+            // message. (#650)
             appendMessage({
                 id: nextMsgId(),
-                type: 'user',
-                role: 'user',
+                type: 'agent',
+                role: 'assistant',
                 text: data.message,
                 fromAgent: data.from_agent,
                 fromAgentId: data.from_agent_id,
+                sealed: true,
             });
         });
     });
