@@ -1,7 +1,7 @@
 import { html, useEffect, useSignal, batch } from '../../deps.js';
 import { activeAgentId } from '../../state/agents.js';
 import { activeSessionId } from '../../state/sessions.js';
-import { activeRunId, selectedRunId, runs } from '../../state/runs.js';
+import { activeRunId, selectedRunId, runs, runListGeneration } from '../../state/runs.js';
 import { replaceMessages } from '../../state/chat-actions.js';
 import { auditEvents } from '../../state/audit.js';
 import { messageQueue } from '../../state/queue.js';
@@ -131,10 +131,10 @@ export function RunsTab() {
         }
     };
 
-    // Fetch when tab becomes active or agent changes
+    // Fetch when tab becomes active, agent changes, or a run state changes
     useEffect(() => {
         if (activePanelTab.value === 'runs') fetchRuns();
-    }, [activePanelTab.value, activeAgentId.value]);
+    }, [activePanelTab.value, activeAgentId.value, runListGeneration.value]);
 
     if (!activeAgentId.value) {
         return html`<div class="runs-tab-empty">No agent selected</div>`;
