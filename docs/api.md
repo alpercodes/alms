@@ -998,7 +998,100 @@ Updates a single workspace file. `{file}` is one of: `personality.md`, `goals.md
 
 ---
 
-## 12) Auth
+## 12) Timeline (cross-channel unified activity view)
+
+### 12.1 Get agent timeline
+`GET /agents/{id_or_name}/timeline?limit=N&before=TIMESTAMP`
+
+Returns a unified, reverse-chronological stream of events across all sessions for an agent. Aggregates runs, tool calls, and significant messages into a single timeline.
+
+Path parameter `{id_or_name}` accepts either a UUID or a name slug (same as other `/agents/{id_or_name}` endpoints).
+
+**Query parameters:**
+
+| Parameter | Type   | Default | Description |
+|-----------|--------|---------|-------------|
+| `limit`   | int    | 50      | Max events to return (capped at 200) |
+| `before`  | string | —       | RFC3339 timestamp cursor; only events before this time are returned |
+
+**Event types:**
+
+| `event_type`     | Source          | Description |
+|------------------|-----------------|-------------|
+| `run_started`    | `runs` table    | Agent run started executing |
+| `run_completed`  | `runs` table    | Agent run completed successfully |
+| `run_failed`     | `runs` table    | Agent run failed with error |
+| `run_cancelled`  | `runs` table    | Agent run was cancelled |
+| `tool_call`      | `run_tool_calls`| Agent invoked a tool |
+| `message_received` | `messages`   | User sent a message |
+| `marker`         | `messages`      | Synthetic system event (DM ended, job notification, etc.) |
+
+**Response 200:**
+```json
+{
+  "agent_id": "550e8400-e29b-41d4-a716-446655440000",
+  "agent_name": "atlas",
+  "events": [
+    {
+      "timestamp": "2026-04-12T10:46:00Z",
+      "event_type": "run_completed",
+      "session_id": "...",
+      "session_type": "chat",
+      "context_id": "web",
+      "run_id": "...",
+      "summary": "Completed run (2100 tokens)",
+      "metadata": {
+        "status": "completed",
+        "prompt_tokens": 1500,
+        "completion_tokens": 600,
+        "error": null,
+        "job_id": null,
+        "parent_run_id": null
+      }
+    },
+    {
+      "timestamp": "2026-04-12T10:45:00Z",
+      "event_type": "tool_call",
+      "session_id": "...",
+      "session_type": "chat",
+      "context_id": "web",
+      "run_id": "...",
+      "summary": "Called shell_exec",
+      "metadata": {
+        "tool_name": "shell_exec",
+        "tool_id": "call_abc123"
+      }
+    },
+    {
+      "timestamp": "2026-04-12T10:44:00Z",
+      "event_type": "run_started",
+      "session_id": "...",
+      "session_type": "dm",
+      "context_id": "dm:alice:bob",
+      "run_id": "...",
+      "summary": "Started run",
+      "metadata": {
+        "status": "running",
+        "input": "Can you review..."
+      }
+    }
+  ],
+  "pagination": {
+    "limit": 50,
+    "has_more": true,
+    "next_before": "2026-04-12T10:44:00Z"
+  }
+}
+```
+
+**Pagination:** Use the `pagination.next_before` value as the `before` query parameter for the next page. When `has_more` is `false`, there are no more events.
+
+**Response 404** — Agent not found
+**Response 503** — No database configured (agent registry unavailable)
+
+---
+
+## 13) Auth
 
 Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
@@ -1009,4 +1102,4 @@ Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
 ---
 
-*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response, new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`), `dm_conversation_ended` SSE event, and `notification:dm_ended` run source. Updated 2026-04-12 with `GET /sessions/{session_id}/tool-calls` endpoint (section 4.6).*
+*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response, new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`), `dm_conversation_ended` SSE event, and `notification:dm_ended` run source. Updated 2026-04-12 with `GET /sessions/{session_id}/tool-calls` endpoint (section 4.6). Updated 2026-04-12 with `GET /agents/{id_or_name}/timeline` endpoint (section 12) for cross-channel unified activity view (#608).*

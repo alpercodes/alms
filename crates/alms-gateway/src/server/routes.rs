@@ -170,6 +170,11 @@ pub(crate) fn protected_router() -> Router<AppState> {
             "/auth/keys/{provider}",
             axum::routing::delete(auth_keys::remove_key),
         )
+        // Timeline (cross-channel unified activity view)
+        .route(
+            "/agents/{id_or_name}/timeline",
+            get(crate::timeline::get_agent_timeline),
+        )
         .route("/ws", get(websocket_handler))
 }
 

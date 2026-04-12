@@ -33,6 +33,7 @@ pub mod server;
 pub mod session_queue;
 pub mod settings;
 pub mod sse;
+pub mod timeline;
 pub mod workspace;
 
 /// Build a structured API error response.
