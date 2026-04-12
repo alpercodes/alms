@@ -3054,13 +3054,20 @@ select.settings-input-sm {
   font-style: italic;
   padding: var(--space-1) 0;
 }
-.dm-msg-tool {
-  font-size: var(--text-2xs);
-  color: var(--text-disabled);
-  padding: var(--space-1) var(--space-2);
-  background: var(--surface-1);
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-subtle);
+/* Tool calls rendered inside DM view via ToolRow component (#652).
+   The wrapper inherits the dm-msg side positioning while letting the
+   ToolRow card fill the available width. */
+.dm-msg-tool-row {
+  max-width: 90%;
+}
+.dm-msg-tool-row .tc-row {
+  margin: 0;
+}
+.dm-msg-left.dm-msg-tool-row .tc-row {
+  border-left: 3px solid var(--dm-accent);
+}
+.dm-msg-right.dm-msg-tool-row .tc-row {
+  border-right: 3px solid var(--accent);
 }
 
 /* Footer bar — read-only notice */

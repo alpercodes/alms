@@ -13,6 +13,7 @@ import { chatMessages } from '../../state/chat.js';
 import { dmParticipants } from '../../state/sessions.js';
 import { activeAgent } from '../../state/agents.js';
 import { scrollToBottom } from '../../utils/format.js';
+import { ToolRow } from './tool-row.js';
 
 /**
  * Determine which "side" a message belongs to in the DM view.
@@ -157,12 +158,24 @@ export function DmConversationView() {
                     return html`<${DmDivider} key=${m.id} text=${`Job '${m.jobName || 'job'}' ${m.status || 'completed'}`} />`;
                 }
                 if (m.type === 'tool') {
-                    // Tool calls in DMs -- show as a compact note with name
-                    // and status. Params and result are available via expand
-                    // in the non-DM view, but DM view keeps it minimal.
+                    // Tool calls in DMs: render a styled ToolRow on the
+                    // side of the agent that executed them. Tool messages
+                    // don't have fromAgent, so attribute them to the
+                    // perspective agent (whose run produced the tool call).
+                    // This matches the assistant-message side assignment
+                    // logic in messageSide() for messages without fromAgent.
+                    // (#652)
+                    const toolSide = messageSide(
+                        { type: 'agent', role: 'assistant' },
+                        participants,
+                        perspectiveAgent,
+                    );
+                    const toolAgentName = toolSide === 'left'
+                        ? participants[0] : participants[1];
                     return html`
-                        <div key=${m.id} class="dm-msg dm-msg-center">
-                            <div class="dm-msg-tool">${m.tool}(${m.status})</div>
+                        <div key=${m.id} class="dm-msg dm-msg-${toolSide} dm-msg-tool-row">
+                            <div class="dm-msg-name">${toolAgentName || '?'}</div>
+                            <${ToolRow} ...${m} />
                         </div>
                     `;
                 }
