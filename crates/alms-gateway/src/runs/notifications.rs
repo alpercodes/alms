@@ -359,9 +359,6 @@ pub(crate) async fn completion_notification_loop(
 
         // Persist the subagent completion marker to session history so it
         // survives page refreshes and appears in the chat on reload.
-        // Include rich metadata so the frontend can reconstruct the full
-        // SubagentCompletionCard (session_id, task, tool_count, duration,
-        // summary, token_usage) instead of a plain system message.
         {
             let name = completion.subagent_name.as_deref().unwrap_or("subagent");
             let label = match status_str {
@@ -369,36 +366,15 @@ pub(crate) async fn completion_notification_loop(
                 "cancelled" => "cancelled",
                 _ => "completed",
             };
-
-            // Build the metadata object with all fields the frontend needs.
-            let mut meta = serde_json::json!({
-                "subagent_name": name,
-                "status": status_str,
-                "session_id": completion.subagent_session_id.0.to_string(),
-                "summary": &completion.summary,
-            });
-            if let Some(ref task) = completion.task_description {
-                meta["task_description"] = serde_json::json!(task);
-            }
-            if let Some(tc) = completion.tool_count {
-                meta["tool_count"] = serde_json::json!(tc);
-            }
-            if let Some(ms) = completion.duration_ms {
-                meta["duration_ms"] = serde_json::json!(ms);
-            }
-            if let Some(ref usage) = completion.token_usage {
-                meta["token_usage"] = serde_json::json!({
-                    "prompt_tokens": usage.prompt_tokens,
-                    "completion_tokens": usage.completion_tokens,
-                });
-            }
-
             super::markers::persist_lifecycle_marker(
                 &state.session_manager,
                 session_id,
                 "subagent_completion",
                 format!("Subagent '{}' {}.", name, label),
-                meta,
+                serde_json::json!({
+                    "subagent_name": name,
+                    "status": status_str,
+                }),
             );
         }
 
