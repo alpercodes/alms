@@ -1,7 +1,7 @@
 pub mod message_bus;
 
 use alms_core::{
-    AgentId, AlmsResult, Run, RunId, RunRegistrar, SessionId, truncate_to_char_boundary,
+    AgentId, AlmsResult, Run, RunId, RunRegistrar, SessionId, TokenUsage, truncate_to_char_boundary,
 };
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient, RunOutput};
 use alms_session::SessionManager;
@@ -99,14 +99,7 @@ pub struct SubagentCompletion {
     /// Wall-clock duration of the subagent run in milliseconds.
     pub duration_ms: Option<u64>,
     /// Token usage from the subagent run (prompt + completion).
-    pub token_usage: Option<SubagentTokenUsage>,
-}
-
-/// Token usage breakdown for a subagent run, included in completion events.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubagentTokenUsage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
+    pub token_usage: Option<TokenUsage>,
 }
 
 /// Handle to a running subagent
@@ -733,12 +726,23 @@ async fn run_subagent(
         let (tool_count, token_usage) = match &run_output {
             Some(output) => (
                 Some(output.tool_calls.len() as u32),
-                Some(SubagentTokenUsage {
+                Some(TokenUsage {
                     prompt_tokens: output.usage.prompt_tokens,
                     completion_tokens: output.usage.completion_tokens,
                 }),
             ),
             None => (None, None),
+        };
+        // Cap task_description to the same limit as the summary (800 chars)
+        // to prevent unbounded metadata in persisted lifecycle markers.
+        let task_desc = {
+            let raw = &request.task;
+            let truncated = truncate_to_char_boundary(raw, NOTIFICATION_SUMMARY_MAX_CHARS);
+            if truncated.len() == raw.len() {
+                raw.clone()
+            } else {
+                format!("{}…[truncated]", truncated)
+            }
         };
         let completion = SubagentCompletion {
             task_id,
@@ -748,7 +752,7 @@ async fn run_subagent(
             parent_session_id,
             parent_agent_id,
             subagent_session_id,
-            task_description: Some(request.task.clone()),
+            task_description: Some(task_desc),
             tool_count,
             duration_ms: Some(elapsed_ms),
             token_usage,
