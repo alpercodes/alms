@@ -520,6 +520,18 @@ Emitted for non-fatal conditions that the frontend should display distinctly (ye
 { "run_id": "<uuid>", "ts": "..." }
 ```
 
+`dm_message`
+Emitted on the DM session SSE stream whenever a peer message is persisted to a shared DM session. This enables live rendering of DM messages in the web UI without requiring a page reload. See #632.
+```json
+{
+  "session_id": "<uuid>",
+  "from_agent": "agent-a",
+  "from_agent_id": "<uuid>",
+  "message": "Hello, how are you?",
+  "ts": "..."
+}
+```
+
 `dm_conversation_ended`
 Emitted on the DM session SSE stream when a DM conversation between two agents ends (via `ignore_message` or depth limit exceeded). The web UI can use this to show a "conversation ended" indicator.
 ```json

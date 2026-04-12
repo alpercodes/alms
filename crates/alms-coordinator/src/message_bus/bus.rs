@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tracing::{info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 
 // ---------------------------------------------------------------------------
 // MessageBus
@@ -246,14 +246,19 @@ impl MessageSender for MessageBus {
         // session so it can push an SSE event to any web UI client watching
         // this session live.  Without this, DM messages are invisible during
         // live viewing and only appear on reload.
-        if let Some(ref tx) = self.dm_event_tx {
-            let _ = tx.send(DmEvent {
+        if let Some(ref tx) = self.dm_event_tx
+            && let Err(e) = tx.send(DmEvent {
                 session_id,
                 from_agent: sender_name.to_string(),
                 from_agent_id: sender_agent_id,
                 message: message.to_string(),
                 ts: Utc::now(),
-            });
+            })
+        {
+            debug!(
+                error = %e,
+                "Failed to send DmEvent for SSE forwarding (receiver dropped)"
+            );
         }
 
         // --- Update last activity for depth expiry ---

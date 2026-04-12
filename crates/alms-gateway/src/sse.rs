@@ -359,6 +359,7 @@ impl SseEventData {
         from_agent: &str,
         from_agent_id: &str,
         message: &str,
+        ts: DateTime<Utc>,
     ) -> Self {
         Self::new(
             "dm_message",
@@ -367,7 +368,7 @@ impl SseEventData {
                 from_agent: from_agent.to_string(),
                 from_agent_id: from_agent_id.to_string(),
                 message: message.to_string(),
-                ts: Utc::now(),
+                ts,
             },
         )
     }
@@ -937,11 +938,13 @@ mod tests {
     fn test_dm_message_event() {
         let session_id = alms_core::SessionId::new();
         let agent_id = alms_core::AgentId::new();
+        let ts = Utc::now();
         let event = SseEventData::dm_message(
             session_id,
             "alice",
             &agent_id.0.to_string(),
             "Hello Bob!",
+            ts,
         );
 
         assert_eq!(event.event_type, "dm_message");

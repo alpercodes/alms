@@ -925,6 +925,7 @@ pub(crate) async fn dm_event_loop(
                     &event.from_agent,
                     &event.from_agent_id.0.to_string(),
                     &event.message,
+                    event.ts,
                 ),
             )
             .await;
