@@ -155,7 +155,8 @@ impl ToolRegistry {
         enabled: &[String],
     ) {
         use crate::builtin::{
-            DatetimeTool, EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
+            DatetimeTool, EchoTool, FsEditTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool,
+            MathTool,
         };
         use crate::shell::{SHELL_TOOL_ALIAS, SHELL_TOOL_NAME, ShellTool};
 
@@ -164,13 +165,19 @@ impl ToolRegistry {
             sandbox_root.clone(),
             shell_unrestricted,
         ));
-        let (fs_read, fs_write, fs_list) = match sandbox_root {
+        let (fs_read, fs_write, fs_list, fs_edit) = match sandbox_root {
             Some(ref root) => (
                 FsReadTool::sandboxed(root.clone()),
                 FsWriteTool::sandboxed(root.clone()),
                 FsListTool::sandboxed(root.clone()),
+                FsEditTool::sandboxed(root.clone()),
             ),
-            None => (FsReadTool::new(), FsWriteTool::new(), FsListTool::new()),
+            None => (
+                FsReadTool::new(),
+                FsWriteTool::new(),
+                FsListTool::new(),
+                FsEditTool::new(),
+            ),
         };
 
         let all_tools: Vec<Arc<dyn Tool>> = vec![
@@ -182,6 +189,7 @@ impl ToolRegistry {
             Arc::new(fs_read),
             Arc::new(fs_write),
             Arc::new(fs_list),
+            Arc::new(fs_edit),
         ];
 
         let builtin_names: Vec<String> = all_tools.iter().map(|t| t.name().to_string()).collect();
@@ -448,8 +456,9 @@ mod tests {
         assert!(registry.contains("fs_read"));
         assert!(registry.contains("fs_write"));
         assert!(registry.contains("fs_list"));
-        // 8 builtins + 1 alias (shell_exec -> shell) = 9 entries
-        assert_eq!(registry.len(), 9);
+        assert!(registry.contains("fs_edit"));
+        // 9 builtins + 1 alias (shell_exec -> shell) = 10 entries
+        assert_eq!(registry.len(), 10);
     }
 
     #[test]
@@ -486,7 +495,7 @@ mod tests {
             .register_native("invoke_agent", |_| Ok(Value::Null))
             .unwrap();
         assert!(registry.contains("invoke_agent"));
-        assert_eq!(registry.len(), 10); // 8 builtins + 1 alias + 1 dynamic
+        assert_eq!(registry.len(), 11); // 9 builtins + 1 alias + 1 dynamic
     }
 
     #[test]

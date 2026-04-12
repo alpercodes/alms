@@ -50,7 +50,7 @@ Completely different model — tools are compiled binaries, not text instruction
 - `echo`, `math` — safe compute
 - `http_get` — network access
 - `shell_exec` — argv-only (no shell interpolation), env_clear(), cwd restricted to sandbox root, kill_on_drop
-- `fs_read`, `fs_write`, `fs_list` — path canonicalization + prefix checking prevents traversal/symlink escapes
+- `fs_read`, `fs_write`, `fs_list`, `fs_edit` — path canonicalization + prefix checking prevents traversal/symlink escapes
 - `invoke_agent`, `get_task_result`, `read_subagent_session` — multi-agent coordination
 
 ### Current state

@@ -21,6 +21,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let enabled = &agent.enabled_tools;
     let all_builtins: &[&str] = &[
         "echo",
+        "fs_edit",
         "fs_list",
         "fs_read",
         "fs_write",

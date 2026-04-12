@@ -173,7 +173,7 @@ Response fields:
 ### 4.3 Filesystem sandboxing (implemented)
 
 **Config** (`alms.toml` or env vars):
-- `tools.sandbox_root` (default `"."` = cwd) — all `fs_read`/`fs_write`/`fs_list` paths must resolve within this directory after symlink resolution. Set to `""` for unrestricted access. **Fail-closed:** if the configured path cannot be resolved (typo, missing directory), the runtime refuses to start rather than silently widening access.
+- `tools.sandbox_root` (default `"."` = cwd) — all `fs_read`/`fs_write`/`fs_list`/`fs_edit` paths must resolve within this directory after symlink resolution. Set to `""` for unrestricted access. **Fail-closed:** if the configured path cannot be resolved (typo, missing directory), the runtime refuses to start rather than silently widening access.
 - `tools.shell_policy` (default `"sandboxed"`) — controls `shell_exec` cwd restriction:
   - `"sandboxed"`: cwd forced to `sandbox_root`; explicit `cwd` param validated against it.
   - `"unrestricted"`: no cwd restriction (power-user / full root access).
