@@ -19,7 +19,7 @@ export function closeSidebar() {
     sidebarOpen.value = false;
 }
 
-const TABS = ['agents', 'runs', 'jobs', 'audit'];
+const TABS = ['agents', 'runs', 'timeline', 'jobs', 'audit'];
 
 const effectivePosture = computed(() => {
     const local = localSettings.value.posture;

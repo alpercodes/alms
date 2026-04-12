@@ -5,6 +5,7 @@ import { WorkspaceTab } from './workspace-tab.js';
 import { JobsTab } from './jobs-tab.js';
 import { AuditTab } from './audit-tab.js';
 import { RunsTab } from './runs-tab.js';
+import { TimelineTab } from './timeline-tab.js';
 
 function TabBody({ tab }) {
     if (tab === 'agents') return html`<${AgentsTab} />`;
@@ -12,6 +13,7 @@ function TabBody({ tab }) {
     if (tab === 'runs') return html`<${RunsTab} />`;
     if (tab === 'jobs') return html`<${JobsTab} />`;
     if (tab === 'audit') return html`<${AuditTab} />`;
+    if (tab === 'timeline') return html`<${TimelineTab} />`;
     return null;
 }
 
