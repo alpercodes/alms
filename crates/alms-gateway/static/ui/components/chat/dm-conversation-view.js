@@ -149,7 +149,8 @@ export function DmConversationView() {
                     // reduce noise.  Only show failed/cancelled boundaries.
                     if (!m.status || m.status === 'completed') return null;
                     const label = m.status === 'failed' ? 'run failed'
-                        : 'run cancelled';
+                        : m.status === 'cancelled' ? 'run cancelled'
+                        : `run ${m.status}`;
                     return html`<${DmDivider} key=${m.id} text=${label} />`;
                 }
                 if (m.type === 'subagent_completed') {

@@ -126,7 +126,8 @@ export function RunBoundary({ status, error }) {
         : status === 'cancelled' ? 'run-boundary--cancelled'
         : '';
     const label = status === 'failed' ? 'run failed'
-        : 'run cancelled';
+        : status === 'cancelled' ? 'run cancelled'
+        : `run ${status}`;
     return html`
         <div class="run-boundary ${statusCls}">
             <span class="run-boundary-label">${label}</span>

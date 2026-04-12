@@ -2841,12 +2841,8 @@ select.settings-input-sm {
 .run-boundary--completed {
   gap: 0;
   padding: 0 var(--space-4);
-  margin: var(--space-1) 0;
 }
 .run-boundary--completed::before {
-  flex: 1;
-  height: 1px;
-  background: var(--border-subtle);
   opacity: 0.5;
 }
 .run-boundary--completed::after {
