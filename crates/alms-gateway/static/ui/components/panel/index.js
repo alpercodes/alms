@@ -4,10 +4,12 @@ import { AgentsTab } from './agents-tab.js';
 import { WorkspaceTab } from './workspace-tab.js';
 import { JobsTab } from './jobs-tab.js';
 import { AuditTab } from './audit-tab.js';
+import { RunsTab } from './runs-tab.js';
 
 function TabBody({ tab }) {
     if (tab === 'agents') return html`<${AgentsTab} />`;
     if (tab === 'workspace') return html`<${WorkspaceTab} />`;
+    if (tab === 'runs') return html`<${RunsTab} />`;
     if (tab === 'jobs') return html`<${JobsTab} />`;
     if (tab === 'audit') return html`<${AuditTab} />`;
     return null;
