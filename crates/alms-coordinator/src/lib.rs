@@ -987,7 +987,7 @@ async fn run_agent_loop(
     } else {
         // Ephemeral: fresh each invocation.
         // Still attach a workspace scoped to a temporary directory so that
-        // fs_read/fs_write/fs_list are narrowed (preventing project-root access).
+        // fs_read/fs_write/fs_list/fs_edit are narrowed (preventing project-root access).
         let (config, _, _) = agent_config_for_subagent(None, base_agent_config);
         (
             config, None, None, true, // attach an ephemeral workspace to restrict fs_* sandbox
@@ -1051,7 +1051,7 @@ async fn run_agent_loop(
     // Ephemeral subagents: {workspace_dir}/.ephemeral/{task_id}/
     //
     // Ephemeral subagents get a disposable workspace so their fs_read/fs_write/
-    // fs_list tools are sandboxed to a narrow directory instead of inheriting
+    // fs_list/fs_edit tools are sandboxed to a narrow directory instead of inheriting
     // the project-root sandbox (which would expose data/secrets.json, the SQLite
     // database, and other agents' workspace files).
     if attach_workspace {
