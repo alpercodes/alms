@@ -394,7 +394,6 @@ header h1 {
   flex: 1;
   overflow-y: auto;
   min-height: 60px;
-  max-height: 200px;
 }
 
 .session-item {
@@ -478,35 +477,6 @@ header h1 {
 }
 #new-session-btn:hover { color: var(--accent); border-color: var(--accent); }
 
-/* ── Run history ── */
-#run-history-section { flex: 1; min-height: 0; }
-#run-history-section .sidebar-label { display: flex; align-items: center; justify-content: space-between; }
-#session-tokens { font-size: var(--text-2xs); color: var(--text-muted); font-weight: 500; }
-
-#run-list { flex: 1; overflow-y: auto; min-height: 40px; }
-
-.run-item {
-  padding: var(--space-1) var(--space-3);
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-  display: flex;
-  align-items: center;
-  gap: var(--space-1);
-  cursor: pointer;
-  transition: background var(--duration-fast);
-}
-.run-item:hover { background: var(--surface-3); }
-.run-item.selected {
-  background: var(--accent-muted);
-  color: var(--accent-text);
-}
-.run-item .run-status { flex-shrink: 0; font-size: var(--text-sm); }
-.run-item .run-meta { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.run-item .run-tokens { flex-shrink: 0; font-size: var(--text-2xs); color: var(--text-disabled); font-family: var(--font-mono); }
-.run-item.completed .run-status { color: var(--success); }
-.run-item.failed    .run-status { color: var(--error); }
-.run-item.cancelled .run-status { color: var(--text-disabled); }
-.run-item.running   .run-status { color: var(--warning); }
 .run-empty { padding: var(--space-4); font-size: var(--text-sm); color: var(--text-disabled); font-style: italic; text-align: center; }
 
 /* ══════════════════════════════════════════════════════════════════════
