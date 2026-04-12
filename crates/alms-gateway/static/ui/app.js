@@ -15,7 +15,7 @@ import { PanelContainer } from './components/panel/index.js';
 import { SettingsModal } from './components/settings-modal.js';
 import { OnboardingView } from './components/onboarding.js';
 import { agents, activeAgent } from './state/agents.js';
-import { isDmSession } from './state/sessions.js';
+import { isDmSession, isNotificationSession, isInternalSession, activeSession } from './state/sessions.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
 import { parentSessionId, navigateToParentSession } from './state/subagents.js';
 import { AgentHeaderBar } from './components/chat/agent-header-bar.js';
@@ -100,6 +100,18 @@ function ChatView() {
     const grouped = groupMessages(chatMessages.value);
 
     const dmActive = isDmSession.value;
+    const internalActive = isInternalSession.value;
+    const notifActive = isNotificationSession.value;
+    const session = activeSession.value;
+
+    // Label for the internal session header
+    const internalLabel = notifActive
+        ? (session?.agent_name ? session.agent_name + ' notifications' : 'Notification session')
+        : session?.session_type === 'job' ? 'Job session'
+        : session?.session_type === 'subagent' ? 'Subagent session'
+        : 'Internal session';
+    const internalIcon = notifActive ? '\u26A1' : session?.session_type === 'job' ? '\u23F0' : '\u2699';
+    const internalTypeCls = session?.session_type ? 'internal-session-' + session.session_type : '';
 
     return html`
         <div id="chat">
@@ -116,6 +128,13 @@ function ChatView() {
                 <${DmConversationView} />
             `}
             ${!agentSwitchLoading.value && !sessionSwitchLoading.value && !dmActive && html`
+            ${internalActive && html`
+                <div class="internal-session-header ${internalTypeCls}">
+                    <span class="internal-session-header-icon" aria-hidden="true">${internalIcon}</span>
+                    <span class="internal-session-header-label">${internalLabel}</span>
+                    <span class="internal-session-header-badge">read-only</span>
+                </div>
+            `}
             <div id="messages" role="log" aria-live="polite" ref=${messagesRef}>
                 ${parentSessionId.value && html`
                     <div class="sa-breadcrumb">
@@ -126,7 +145,10 @@ function ChatView() {
                 `}
                 ${chatMessages.value.length === 0 && html`
                     <div class="empty-state">
-                        No messages yet. Send a message to start.
+                        ${internalActive
+                            ? 'No activity recorded in this session yet.'
+                            : 'No messages yet. Send a message to start.'
+                        }
                     </div>
                 `}
                 ${grouped.map((item) => {
@@ -234,7 +256,14 @@ function ChatView() {
             </div>
             <${MessageQueue} />
             <${SubagentBar} />
-            <${InputArea} />
+            ${internalActive
+                ? html`
+                    <div class="internal-session-footer">
+                        <span class="internal-session-footer-text">This is a read-only view of internal agent activity.</span>
+                    </div>
+                `
+                : html`<${InputArea} />`
+            }
             `}
         </div>
     `;

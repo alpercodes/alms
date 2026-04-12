@@ -1,5 +1,5 @@
 import { html, batch, useSignal } from '../../deps.js';
-import { sessions, activeSessionId } from '../../state/sessions.js';
+import { sessions, activeSessionId, showNotifications } from '../../state/sessions.js';
 import { activeAgentId } from '../../state/agents.js';
 import { replaceMessages } from '../../state/chat-actions.js';
 import { activeRunId, selectedRunId, runs } from '../../state/runs.js';
@@ -13,6 +13,22 @@ import { saveActiveSession } from '../../hooks/use-boot.js';
 import { selectGeneration, bumpSelectGeneration } from '../../state/select-generation.js';
 import { loadSession } from '../../utils/load-session.js';
 import { closeSidebar } from '../header.js';
+
+/**
+ * Session type metadata: icon character and CSS class suffix.
+ */
+const SESSION_TYPE_META = {
+    chat:         { icon: '\u25B8', cls: '',              label: 'Chat session' },
+    dm:           { icon: '\u2194', cls: 'dm',            label: 'DM conversation' },
+    notification: { icon: '\u26A1', cls: 'notification',  label: 'Notification session' },
+    job:          { icon: '\u23F0', cls: 'job',           label: 'Job session' },
+    subagent:     { icon: '\u2699', cls: 'subagent',      label: 'Subagent session' },
+    telegram:     { icon: '\u2709', cls: 'telegram',      label: 'Telegram session' },
+};
+
+function getSessionMeta(session) {
+    return SESSION_TYPE_META[session.session_type] || SESSION_TYPE_META.chat;
+}
 
 function hasActiveRun(sessionId) {
     if (sessionId === activeSessionId.value && activeRunId.value) return true;
@@ -68,7 +84,10 @@ async function newSession() {
         const ctx = 'web-chat-' + Date.now();
         const resp = await createSession(activeAgentId.value, ctx);
         // Reload sessions
-        const data = await listSessions(activeAgentId.value, { includeDms: true });
+        const data = await listSessions(activeAgentId.value, {
+            includeDms: true,
+            includeNotifications: showNotifications.value,
+        });
         batch(() => {
             sessions.value = data.sessions || [];
             activeSessionId.value = resp.session_id;
@@ -100,11 +119,31 @@ function dmLabel(session) {
     return session.context_id || session.id.slice(0, 8);
 }
 
+/**
+ * Format a notification session label from agent_name or context_id.
+ */
+function notificationLabel(session) {
+    if (session.agent_name) {
+        return session.agent_name + ' notifications';
+    }
+    return session.context_id || session.id.slice(0, 8);
+}
+
+/**
+ * Derive a human-readable label for any session type.
+ */
+function sessionLabel(session) {
+    if (session.session_type === 'dm') return dmLabel(session);
+    if (session.session_type === 'notification') return notificationLabel(session);
+    return session.context_id || session.id.slice(0, 8);
+}
+
 function SessionItem({ session }) {
     const confirming = useSignal(false);
     const deleteTimer = useSignal(null);
     const isActive = session.id === activeSessionId.value;
-    const isDm = session.session_type === 'dm';
+    const meta = getSessionMeta(session);
+    const typeClass = meta.cls ? ' session-item-' + meta.cls : '';
 
     const onDeleteClick = (e) => {
         e.stopPropagation();
@@ -132,7 +171,10 @@ function SessionItem({ session }) {
                 });
             }
             // Refresh session list
-            const data = await listSessions(activeAgentId.value, { includeDms: true });
+            const data = await listSessions(activeAgentId.value, {
+                includeDms: true,
+                includeNotifications: showNotifications.value,
+            });
             sessions.value = data.sessions || [];
         } catch (err) {
             console.error('[deleteSession] failed:', err);
@@ -145,18 +187,18 @@ function SessionItem({ session }) {
         confirming.value = false;
     };
 
-    const label = isDm ? dmLabel(session) : (session.context_id || session.id.slice(0, 8));
-    const dmClass = isDm ? ' session-item-dm' : '';
+    const label = sessionLabel(session);
+    const typeLabel = session.session_type !== 'chat' ? '\nType: ' + session.session_type : '';
 
     return html`
-        <div class="session-item${dmClass} ${isActive ? 'active' : ''} ${hasActiveRun(session.id) ? 'has-run' : ''}"
+        <div class="session-item${typeClass} ${isActive ? 'active' : ''} ${hasActiveRun(session.id) ? 'has-run' : ''}"
              role="option"
              aria-selected=${isActive}
              tabindex="0"
-             title=${'ID: ' + session.id + '\nContext: ' + session.context_id + (isDm ? '\nType: DM' : '')}
+             title=${'ID: ' + session.id + '\nContext: ' + session.context_id + typeLabel}
              onClick=${() => selectSession(session.id)}
              onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(session.id); } }}>
-            ${isDm && html`<span class="session-dm-icon" aria-hidden="true" title="DM conversation">\u2194</span>`}
+            ${session.session_type !== 'chat' && html`<span class="session-type-icon session-type-icon-${meta.cls || 'default'}" aria-hidden="true" title=${meta.label}>${meta.icon}</span>`}
             <span class="session-label">${label}</span>
             ${confirming.value
                 ? html`
@@ -180,16 +222,102 @@ function SessionItem({ session }) {
     `;
 }
 
+/**
+ * Internal session types that are hidden when notifications are toggled off.
+ */
+const INTERNAL_SESSION_TYPES = new Set(['notification', 'job', 'subagent']);
+
+/**
+ * Toggle notification session visibility.  Persists the choice to
+ * localStorage and reloads the session list from the API.
+ *
+ * When toggling OFF, if the currently active session is an internal
+ * type (notification/job/subagent), we navigate away to the first
+ * available chat session to avoid leaving a hidden session active
+ * (which would render InputArea instead of the read-only footer).
+ */
+async function toggleNotifications() {
+    const next = !showNotifications.value;
+    showNotifications.value = next;
+    localStorage.setItem('alms_show_notifications', String(next));
+
+    if (!activeAgentId.value) return;
+
+    try {
+        const data = await listSessions(activeAgentId.value, {
+            includeDms: true,
+            includeNotifications: next,
+        });
+        const newSessions = data.sessions || [];
+
+        // If toggling OFF and the active session is internal, navigate away.
+        if (!next && activeSessionId.value) {
+            const activeSess = sessions.value.find(s => s.id === activeSessionId.value);
+            if (activeSess && INTERNAL_SESSION_TYPES.has(activeSess.session_type)) {
+                closeSessionStream();
+                const fallback = newSessions.find(s => !INTERNAL_SESSION_TYPES.has(s.session_type));
+                batch(() => {
+                    sessions.value = newSessions;
+                    activeSessionId.value = fallback ? fallback.id : null;
+                    activeRunId.value = null;
+                    selectedRunId.value = null;
+                    replaceMessages([]);
+                    messageQueue.value = [];
+                    auditEvents.value = null;
+                    clearAllSubagents();
+                    parentSessionId.value = null;
+                });
+                if (fallback) {
+                    saveActiveSession(activeAgentId.value, fallback.id);
+                    sessionSwitchLoading.value = true;
+                    try {
+                        await loadSession(fallback.id, {
+                            isStale: () => false,
+                            logPrefix: 'toggleNotifications',
+                        });
+                    } finally {
+                        sessionSwitchLoading.value = false;
+                    }
+                }
+                return;
+            }
+        }
+
+        sessions.value = newSessions;
+    } catch (err) {
+        console.error('[toggleNotifications] reload failed:', err);
+    }
+}
+
+/**
+ * Section divider with label and optional line, matching the DM divider style.
+ */
+function SectionDivider({ label, cls }) {
+    return html`
+        <div class="session-section-divider ${cls || ''}">
+            <span class="session-section-divider-label">${label}</span>
+        </div>
+    `;
+}
+
 export function SessionList() {
     const allSessions = sessions.value;
-    const chatSessions = allSessions.filter(s => s.session_type !== 'dm');
+    const chatSessions = allSessions.filter(s => s.session_type !== 'dm' && s.session_type !== 'notification');
     const dmSessions = allSessions.filter(s => s.session_type === 'dm');
+    const notifSessions = allSessions.filter(s => s.session_type === 'notification');
+    const showNotif = showNotifications.value;
 
     return html`
         <div class="sidebar-section" style="flex:0 0 auto">
-            <div class="sidebar-label">Sessions</div>
+            <div class="sidebar-label">
+                Sessions
+                <button class="notif-toggle ${showNotif ? 'active' : ''}"
+                        title=${showNotif ? 'Hide notification sessions' : 'Show notification sessions'}
+                        aria-pressed=${showNotif}
+                        onClick=${toggleNotifications}>\u26A1</button>
+            </div>
             <div id="session-list" role="listbox" aria-label="Sessions">
-                ${chatSessions.length === 0 && dmSessions.length === 0
+                ${chatSessions.length === 0 && dmSessions.length === 0 && notifSessions.length === 0
                     ? html`<div class="run-empty">No sessions</div>`
                     : null
                 }
@@ -197,10 +325,14 @@ export function SessionList() {
                     <${SessionItem} key=${s.id} session=${s} />
                 `)}
                 ${dmSessions.length > 0 && html`
-                    <div class="session-dm-divider">
-                        <span class="session-dm-divider-label">DM conversations</span>
-                    </div>
+                    <${SectionDivider} label="DM conversations" cls="session-divider-dm" />
                     ${dmSessions.map(s => html`
+                        <${SessionItem} key=${s.id} session=${s} />
+                    `)}
+                `}
+                ${showNotif && notifSessions.length > 0 && html`
+                    <${SectionDivider} label="Notifications" cls="session-divider-notification" />
+                    ${notifSessions.map(s => html`
                         <${SessionItem} key=${s.id} session=${s} />
                     `)}
                 `}
