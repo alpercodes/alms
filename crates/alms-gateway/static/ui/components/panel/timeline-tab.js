@@ -23,8 +23,10 @@ const EVENT_ICONS = {
     run_completed:    '\u2713',   // checkmark
     run_failed:       '\u2717',   // X mark
     run_cancelled:    '\u2298',   // circled slash
+    run_ended:        '\u25A0',   // filled square (generic terminal)
     tool_call:        '\u2699',   // gear
     message_received: '\u25CF',   // filled circle
+    message_sent:     '\u25CB',   // empty circle
     marker:           '\u2691',   // flag
 };
 
@@ -33,8 +35,10 @@ const EVENT_LABELS = {
     run_completed:    'completed',
     run_failed:       'failed',
     run_cancelled:    'cancelled',
+    run_ended:        'ended',
     tool_call:        'tool',
     message_received: 'message',
+    message_sent:     'sent',
     marker:           'marker',
 };
 
@@ -45,6 +49,7 @@ const SESSION_TYPE_LABELS = {
     job:          'job',
     notification: 'notif',
     telegram:     'tg',
+    episodic:     'epis',
 };
 
 /** Format an ISO timestamp as a relative time string. */
@@ -180,8 +185,15 @@ export function TimelineTab() {
         return html`<div class="tl-empty">No activity yet</div>`;
     }
 
-    // Group events by date
-    let lastGroup = '';
+    // Pre-compute which events start a new date group (avoids mutable state in render)
+    const groupStarts = new Set();
+    {
+        let prev = '';
+        for (const ev of events.value) {
+            const g = dateGroup(ev.timestamp);
+            if (g !== prev) { groupStarts.add(ev); prev = g; }
+        }
+    }
 
     return html`
         <div class="tl-tab">
@@ -193,19 +205,22 @@ export function TimelineTab() {
                 </button>
             </div>
             <div class="tl-list">
-                ${events.value.map(ev => {
+                ${events.value.map((ev, idx) => {
                     const group = dateGroup(ev.timestamp);
-                    const showGroup = group !== lastGroup;
-                    lastGroup = group;
+                    const showGroup = groupStarts.has(ev);
                     const isToolCall = ev.event_type === 'tool_call';
                     const isRun = ev.event_type === 'run_started' || ev.event_type === 'run_completed'
-                        || ev.event_type === 'run_failed' || ev.event_type === 'run_cancelled';
+                        || ev.event_type === 'run_failed' || ev.event_type === 'run_cancelled'
+                        || ev.event_type === 'run_ended';
+                    const toolName = ev.metadata?.tool_name;
+                    const evKey = ev.event_type + '-' + ev.timestamp + '-' + (ev.run_id || '') + '-' + idx
+                        + (toolName ? '-' + toolName : '');
                     return html`
                         ${showGroup && html`
                             <div class="tl-date-group" key=${'g-' + group}>${group}</div>
                         `}
                         <div class="tl-event tl-event--${ev.event_type}${isToolCall ? ' tl-event--indent' : ''}${isRun ? ' tl-event--run' : ''}"
-                             key=${ev.timestamp + '-' + (ev.run_id || '') + '-' + ev.event_type}
+                             key=${evKey}
                              onClick=${() => navigateToSession(ev.session_id)}
                              title=${'Session ' + (ev.session_id || '').slice(0, 8) + (ev.run_id ? ' | Run ' + ev.run_id.slice(0, 8) : '')}>
                             <span class="tl-time">${fmtTime(ev.timestamp)}</span>

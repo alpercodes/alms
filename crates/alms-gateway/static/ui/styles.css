@@ -3480,7 +3480,9 @@ select.settings-input-sm {
 .tl-icon--run_failed       { color: var(--error); }
 .tl-icon--run_cancelled    { color: var(--text-disabled); }
 .tl-icon--tool_call        { color: var(--warning); }
+.tl-icon--run_ended        { color: var(--text-muted); }
 .tl-icon--message_received { color: var(--accent); }
+.tl-icon--message_sent     { color: var(--success); }
 .tl-icon--marker           { color: var(--dm-accent); }
 
 /* ── Session type badge ── */
@@ -3500,6 +3502,7 @@ select.settings-input-sm {
 .tl-session-badge--job          { color: var(--info);        background: var(--info-muted); }
 .tl-session-badge--notification { color: var(--text-muted);  background: var(--surface-3); }
 .tl-session-badge--telegram     { color: var(--info);        background: var(--info-muted); }
+.tl-session-badge--episodic     { color: var(--dm-accent);   background: var(--dm-accent-muted); }
 
 /* ── Event label ── */
 .tl-event-label {
