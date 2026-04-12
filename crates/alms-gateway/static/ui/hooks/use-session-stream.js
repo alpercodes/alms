@@ -604,6 +604,29 @@ export function openSessionStream(sessionId, opts) {
         });
     });
 
+    // -- dm_activity_started: DM run started on behalf of this agent (#659) --
+    // Forwarded from the DM session to the webchat session so the UI can
+    // show "Chatting with {peer}..." even when viewing the main session.
+    on('dm_activity_started', (e) => {
+        const data = JSON.parse(e.data);
+        if (data.peer) {
+            setDmContext(data.peer);
+        }
+    });
+
+    // -- dm_activity_status: DM run phase update forwarded to webchat (#659) --
+    // Maps DM phases to the agent status bar. For executing_tools with a
+    // tool name, use tool_active for per-tool granularity. Other phases
+    // update as-is via setAgentPhase.
+    on('dm_activity_status', (e) => {
+        const data = JSON.parse(e.data);
+        if (data.phase === 'executing_tools' && data.detail) {
+            setAgentPhase('tool_active', data.detail);
+        } else {
+            setAgentPhase(data.phase, data.detail || null);
+        }
+    });
+
     // -- approval_resolved --
     on('approval_resolved', (e) => {
         const data = JSON.parse(e.data);
