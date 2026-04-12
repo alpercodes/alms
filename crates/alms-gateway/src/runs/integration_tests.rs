@@ -324,13 +324,14 @@ async fn dm_conversation_ended_trigger_creates_notification_and_marker() {
 }
 
 /// Test that a `ConversationEnded` trigger with `DepthExceeded` reason
-/// also emits a `dm_conversation_ended` SSE event on the DM session itself,
-/// not just the web-chat session.
+/// handles a missing agent registry gracefully (no panic) and still creates
+/// the notification run.
 ///
-/// This exercises the depth-exceeded SSE emission path in `run_trigger_loop`
-/// that was added in #419.
+/// Without a SQLite agent registry, peer name resolution fails and the
+/// depth-exceeded SSE emission path is skipped. This verifies the code
+/// degrades gracefully rather than panicking.
 #[tokio::test]
-async fn dm_depth_exceeded_emits_sse_on_dm_session() {
+async fn dm_depth_exceeded_graceful_without_agent_registry() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
 
     let agent_id = AgentId::new();
@@ -604,10 +605,15 @@ async fn partial_tool_call_failure_preserves_error_in_run_record() {
     shutdown_token.cancel();
 }
 
-/// Test that the cancel_run endpoint correctly rejects cancellation
-/// of already-finished runs.
+/// Test that a completed run is not cancellable via the real
+/// `RunManager::cancel_run` path.
+///
+/// Mirrors the lifecycle that `execute_run` follows: register a cancel
+/// token, complete the run, remove the token. Afterwards, `cancel_run`
+/// must return `false` (no token to cancel) and the run status must
+/// remain `Completed`.
 #[tokio::test]
-async fn cancel_already_finished_run_returns_conflict() {
+async fn completed_run_is_not_cancellable() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
     let agent_id = AgentId::new();
     let session = state
@@ -619,7 +625,13 @@ async fn cancel_already_finished_run_returns_conflict() {
     let run_id = run.run_id;
     state.run_manager.insert_run(run);
 
-    // Mark it as completed first.
+    // Register a cancel token (as execute_run does on start).
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token);
+
+    // Mark the run as completed.
     state.run_manager.mark_run_as_completed(
         run_id,
         "done".to_string(),
@@ -629,14 +641,24 @@ async fn cancel_already_finished_run_returns_conflict() {
         },
     );
 
-    // Attempt to cancel -- should fail.
-    let run = state.run_manager.get_run(run_id).unwrap();
-    assert_eq!(run.status, RunStatus::Completed);
+    // Remove the cancel token (as execute_run does after completion).
+    state.run_manager.remove_cancel_token(run_id);
 
-    // The cancel_run handler checks status before calling cancel_run on the
-    // manager. Verify the status check would reject it.
-    let is_cancellable = matches!(run.status, RunStatus::Queued | RunStatus::Running);
-    assert!(!is_cancellable, "completed runs should not be cancellable");
+    // Exercise the real RunManager::cancel_run path -- it should return
+    // false because the cancel token was cleaned up after completion.
+    let cancelled = state.run_manager.cancel_run(run_id);
+    assert!(
+        !cancelled,
+        "cancel_run should return false for a completed run whose token was removed"
+    );
+
+    // Verify the run status is still Completed (not mutated).
+    let run = state.run_manager.get_run(run_id).unwrap();
+    assert_eq!(
+        run.status,
+        RunStatus::Completed,
+        "completed run status must not change after a cancel attempt"
+    );
 
     shutdown_token.cancel();
 }
