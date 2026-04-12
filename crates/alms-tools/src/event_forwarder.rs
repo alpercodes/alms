@@ -27,6 +27,7 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
         tool: String,
         params: Value,
         source_agent: Option<String>,
+        task_id: Option<String>,
     );
 
     /// A tool execution completed (ok=true) or failed (ok=false).
@@ -36,6 +37,7 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
         ok: bool,
         result: Value,
         source_agent: Option<String>,
+        task_id: Option<String>,
     );
 
     /// A chunk of text from the LLM response stream.
