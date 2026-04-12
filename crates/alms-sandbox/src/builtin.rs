@@ -225,13 +225,14 @@ impl Tool for DatetimeTool {
         let utc_now = Utc::now();
         let local_now = Local::now();
         let utc_offset = local_now.format("%:z").to_string();
+        let local_timezone = iana_time_zone::get_timezone().unwrap_or_else(|_| "Unknown".into());
         Ok(serde_json::json!({
             "iso": utc_now.to_rfc3339(),
             "human": utc_now.format("%A, %B %-d, %Y %-I:%M %p").to_string(),
             "timezone": "UTC",
             "local_iso": local_now.to_rfc3339(),
             "local_human": local_now.format("%A, %B %-d, %Y %-I:%M %p").to_string(),
-            "local_timezone": utc_offset,
+            "local_timezone": local_timezone,
             "utc_offset": utc_offset,
         }))
     }
@@ -887,12 +888,27 @@ mod tests {
             "missing 'local_human' field"
         );
         assert!(
-            result.get("local_timezone").is_some(),
-            "missing 'local_timezone' field"
-        );
-        assert!(
             result.get("utc_offset").is_some(),
             "missing 'utc_offset' field"
+        );
+
+        // local_timezone should be an IANA name (e.g. "Europe/Istanbul"), not a numeric offset
+        let tz = result["local_timezone"]
+            .as_str()
+            .expect("local_timezone must be a string");
+        assert!(!tz.is_empty(), "local_timezone must not be empty");
+        assert!(
+            tz.contains('/') || tz == "Unknown",
+            "local_timezone should be an IANA name like 'Region/City', got: {tz}"
+        );
+
+        // utc_offset should look like a numeric offset (e.g. "+03:00")
+        let offset = result["utc_offset"]
+            .as_str()
+            .expect("utc_offset must be a string");
+        assert!(
+            offset.starts_with('+') || offset.starts_with('-'),
+            "utc_offset should start with +/-, got: {offset}"
         );
 
         // UTC ISO string must parse back into a valid DateTime
@@ -904,9 +920,6 @@ mod tests {
         let local_iso_str = result["local_iso"].as_str().unwrap();
         chrono::DateTime::parse_from_rfc3339(local_iso_str)
             .unwrap_or_else(|_| panic!("invalid local ISO 8601: {}", local_iso_str));
-
-        // utc_offset and local_timezone must match
-        assert_eq!(result["utc_offset"], result["local_timezone"]);
     }
 
     #[test]
