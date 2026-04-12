@@ -49,7 +49,7 @@ pub async fn get_agent_timeline(
 
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
 
-    let events = store
+    let page = store
         .load_timeline_events(agent.id, params.before.as_deref(), limit)
         .map_err(|e| {
             api_error(
@@ -60,16 +60,15 @@ pub async fn get_agent_timeline(
         })?;
 
     // Build pagination cursor from the last event's timestamp.
-    let next_before = events.last().map(|e| e.timestamp.clone());
-    let has_more = events.len() == limit;
+    let next_before = page.events.last().map(|e| e.timestamp.clone());
 
     Ok(Json(serde_json::json!({
         "agent_id": agent.id.0.to_string(),
         "agent_name": agent.name,
-        "events": events,
+        "events": page.events,
         "pagination": {
             "limit": limit,
-            "has_more": has_more,
+            "has_more": page.has_more,
             "next_before": next_before,
         }
     })))

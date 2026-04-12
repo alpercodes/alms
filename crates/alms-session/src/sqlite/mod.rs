@@ -27,7 +27,7 @@ mod test_helpers;
 mod timeline;
 mod tool_calls;
 
-pub use timeline::TimelineEvent;
+pub use timeline::{TimelineEvent, TimelinePage};
 pub use tool_calls::SessionToolCall;
 
 use crate::types::{
@@ -136,6 +136,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id);
+CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id);
 
 CREATE TABLE IF NOT EXISTS run_tool_calls (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,6 +243,9 @@ impl SqliteStore {
         let _ = conn.execute_batch("ALTER TABLE session_summaries ADD COLUMN source_label TEXT;");
         // Auto-migrate: add parent_run_id column to runs for subagent run visibility.
         let _ = conn.execute_batch("ALTER TABLE runs ADD COLUMN parent_run_id TEXT;");
+        // Auto-migrate: add index on runs(agent_id) for timeline queries.
+        let _ =
+            conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id);");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
