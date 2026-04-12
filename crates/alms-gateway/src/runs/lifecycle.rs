@@ -785,6 +785,17 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // We keep the handle so we can await it after the runtime finishes, ensuring
     // all tool events are flushed before we send run_finished.
     let forwarder_state = state.clone();
+
+    // Build cross-session DM info when the run is on a DM session so that
+    // key status phases are echoed to the agent's webchat stream (#651).
+    let dm_cross_session = agent_name
+        .as_deref()
+        .and_then(|name| extract_peer_from_dm_context(&context_id, name))
+        .map(|peer_name| super::tools::DmCrossSessionInfo {
+            agent_id,
+            peer_name,
+        });
+
     let forwarder_handle = tokio::spawn(forward_runtime_events(
         runtime_rx,
         run_id,
@@ -793,6 +804,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         forwarder_state.approval_store.clone(),
         forwarder_state.session_manager.clone(),
         context_id.clone(),
+        dm_cross_session,
     ));
 
     // Save input for episodic summary generation (input is consumed by run()).

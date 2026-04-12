@@ -87,10 +87,21 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
 // Runtime event forwarding
 // ---------------------------------------------------------------------------
 
+/// Info needed to cross-forward DM status events to the webchat session.
+///
+/// When present, key status phases (`calling_llm`, `executing_tools`) are
+/// echoed to the agent's user-facing session as `dm_activity_status` events
+/// so the status bar can show real-time DM activity.  See #651.
+pub(super) struct DmCrossSessionInfo {
+    pub agent_id: alms_core::AgentId,
+    pub peer_name: String,
+}
+
 /// Reads RuntimeEvents from the runtime and forwards them as SSE events.
 /// Also stores ApprovalRequired events in the approval store so clients can resolve them.
 /// Warning events are persisted as lifecycle markers when `session_manager`
 /// and `context_id` are provided and the session is user-facing.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn forward_runtime_events(
     mut rx: mpsc::UnboundedReceiver<RuntimeEvent>,
     run_id: RunId,
@@ -99,7 +110,13 @@ pub(super) async fn forward_runtime_events(
     approval_store: ApprovalStore,
     session_manager: std::sync::Arc<alms_session::SessionManager>,
     context_id: String,
+    dm_cross_session: Option<DmCrossSessionInfo>,
 ) {
+    // Cache the webchat session ID for DM cross-session forwarding so we
+    // don't call `find_user_facing_session` (which does `list_all()` + sort)
+    // on every status event.  Resolved lazily on first use.
+    let mut cached_webchat_session: Option<Option<SessionId>> = None;
+
     while let Some(event) = rx.recv().await {
         match event {
             RuntimeEvent::TokenDelta {
@@ -159,6 +176,34 @@ pub(super) async fn forward_runtime_events(
                     .await;
             }
             RuntimeEvent::Status { phase, detail } => {
+                // Cross-forward key DM status phases to the webchat session
+                // so the status bar stays up to date (#651).
+                if let Some(ref dm_info) = dm_cross_session
+                    && matches!(phase.as_str(), "calling_llm" | "executing_tools")
+                {
+                    // Resolve the webchat session once and cache the result.
+                    let webchat_sid = *cached_webchat_session.get_or_insert_with(|| {
+                        super::find_user_facing_session(&session_manager, dm_info.agent_id)
+                            .map(|s| s.id)
+                    });
+
+                    if let Some(target_session_id) = webchat_sid {
+                        let dummy_run_id = RunId::new();
+                        run_manager
+                            .send_session_event(
+                                target_session_id,
+                                dummy_run_id,
+                                SseEventData::dm_activity_status(
+                                    target_session_id,
+                                    &dm_info.peer_name,
+                                    &phase,
+                                    detail.clone(),
+                                ),
+                            )
+                            .await;
+                    }
+                }
+
                 run_manager
                     .send_event(
                         run_id,

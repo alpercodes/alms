@@ -549,6 +549,31 @@ Emitted on the DM session SSE stream when a DM conversation between two agents e
 
 Note: If both agents call `ignore_message` simultaneously, duplicate `dm_conversation_ended` events may be emitted for the same session. Clients should handle duplicates gracefully.
 
+`dm_activity_started`
+Cross-session event forwarded to the agent's user-facing webchat session when a DM run starts. Enables the status bar to show "Chatting with {peer}" while a DM conversation is active. This is a lightweight echo -- no marker message is persisted because DM activity is transient. See #651.
+```json
+{
+  "session_id": "<uuid>",
+  "peer": "researcher",
+  "ts": "..."
+}
+```
+
+`dm_activity_status`
+Cross-session event forwarded to the agent's user-facing webchat session during an active DM run. Only key status phases (`calling_llm`, `executing_tools`) are forwarded to avoid noise. Enables the status bar to show real-time DM activity details (e.g. which tools are being executed). See #651.
+```json
+{
+  "session_id": "<uuid>",
+  "peer": "researcher",
+  "phase": "executing_tools",
+  "detail": "shell_exec, fs_read",
+  "ts": "..."
+}
+```
+
+`phase` values (subset of `status` phases): `calling_llm`, `executing_tools`.
+`detail` is present only for `executing_tools` (comma-separated tool names being executed); `null` otherwise.
+
 `job_completed`
 Emitted on the agent's user-facing session when a scheduled job run finishes. The event is informational only (no new LLM run is triggered).
 ```json
