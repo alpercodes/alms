@@ -1026,6 +1026,47 @@ mod tests {
     }
 
     #[test]
+    fn test_dm_activity_started_event() {
+        let session_id = alms_core::SessionId::new();
+        let event = SseEventData::dm_activity_started(session_id, "researcher");
+
+        assert_eq!(event.event_type, "dm_activity_started");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["peer"], "researcher");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+
+        // Verify ts is RFC3339 format
+        let ts_str = event.data["ts"].as_str().unwrap();
+        assert!(ts_str.contains("T"), "ts should be ISO8601/RFC3339");
+    }
+
+    #[test]
+    fn test_dm_activity_status_event() {
+        let session_id = alms_core::SessionId::new();
+
+        // Without detail
+        let event = SseEventData::dm_activity_status(session_id, "researcher", "calling_llm", None);
+        assert_eq!(event.event_type, "dm_activity_status");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["peer"], "researcher");
+        assert_eq!(event.data["phase"], "calling_llm");
+        assert!(event.data["detail"].is_null());
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+
+        // With detail
+        let event_with_detail = SseEventData::dm_activity_status(
+            session_id,
+            "analyst",
+            "executing_tools",
+            Some("shell_exec, fs_read".into()),
+        );
+        assert_eq!(event_with_detail.event_type, "dm_activity_status");
+        assert_eq!(event_with_detail.data["peer"], "analyst");
+        assert_eq!(event_with_detail.data["phase"], "executing_tools");
+        assert_eq!(event_with_detail.data["detail"], "shell_exec, fs_read");
+    }
+
+    #[test]
     fn test_context_debug_event() {
         let run_id = RunId::new();
         let messages = serde_json::json!([

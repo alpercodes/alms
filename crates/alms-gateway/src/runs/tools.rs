@@ -112,6 +112,11 @@ pub(super) async fn forward_runtime_events(
     context_id: String,
     dm_cross_session: Option<DmCrossSessionInfo>,
 ) {
+    // Cache the webchat session ID for DM cross-session forwarding so we
+    // don't call `find_user_facing_session` (which does `list_all()` + sort)
+    // on every status event.  Resolved lazily on first use.
+    let mut cached_webchat_session: Option<Option<SessionId>> = None;
+
     while let Some(event) = rx.recv().await {
         match event {
             RuntimeEvent::TokenDelta {
@@ -176,15 +181,27 @@ pub(super) async fn forward_runtime_events(
                 if let Some(ref dm_info) = dm_cross_session
                     && matches!(phase.as_str(), "calling_llm" | "executing_tools")
                 {
-                    super::notifications::notify_dm_status_to_webchat(
-                        &session_manager,
-                        &run_manager,
-                        dm_info.agent_id,
-                        &dm_info.peer_name,
-                        &phase,
-                        detail.clone(),
-                    )
-                    .await;
+                    // Resolve the webchat session once and cache the result.
+                    let webchat_sid = *cached_webchat_session.get_or_insert_with(|| {
+                        super::find_user_facing_session(&session_manager, dm_info.agent_id)
+                            .map(|s| s.id)
+                    });
+
+                    if let Some(target_session_id) = webchat_sid {
+                        let dummy_run_id = RunId::new();
+                        run_manager
+                            .send_session_event(
+                                target_session_id,
+                                dummy_run_id,
+                                SseEventData::dm_activity_status(
+                                    target_session_id,
+                                    &dm_info.peer_name,
+                                    &phase,
+                                    detail.clone(),
+                                ),
+                            )
+                            .await;
+                    }
                 }
 
                 run_manager

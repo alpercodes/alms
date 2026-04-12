@@ -347,12 +347,15 @@ async fn notify_dm_started_to_webchat(
 /// session as a `dm_activity_status` event.
 ///
 /// Only key phases (`executing_tools`, `calling_llm`) are forwarded to
-/// avoid flooding the webchat stream with noise.  This is called from
-/// [`forward_runtime_events`](super::tools::forward_runtime_events)
-/// when the run is on a DM session.
+/// avoid flooding the webchat stream with noise.
+///
+/// **Note**: `forward_runtime_events` in `tools.rs` now caches the webchat
+/// session lookup and emits `dm_activity_status` events directly, so this
+/// function is no longer called. Kept for potential future use.
 ///
 /// See #651.
-pub(super) async fn notify_dm_status_to_webchat(
+#[allow(dead_code)]
+async fn notify_dm_status_to_webchat(
     session_manager: &alms_session::SessionManager,
     run_manager: &crate::server::RunManager,
     agent_id: alms_core::AgentId,
