@@ -26,6 +26,8 @@ mod summaries;
 mod test_helpers;
 mod tool_calls;
 
+pub use tool_calls::SessionToolCall;
+
 use crate::types::{
     Content, ContextSummary, Message, Role, Session, SessionStatus, SessionSummary,
 };

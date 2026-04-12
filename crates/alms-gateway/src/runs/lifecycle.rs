@@ -792,6 +792,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         session_id,
         forwarder_state.run_manager.clone(),
         forwarder_state.approval_store.clone(),
+        forwarder_state.session_manager.clone(),
+        context_id.clone(),
     ));
 
     // Save input for episodic summary generation (input is consumed by run()).
@@ -969,6 +971,41 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     SseEventData::run_finished(run_id, true, output.usage),
                 )
                 .await;
+
+            // Persist a run-boundary marker so page reloads show "(run
+            // completed)" separators. Only for user-facing sessions to
+            // avoid cluttering internal sessions (jobs, subagents, DMs,
+            // notifications).
+            if !is_internal_context_id(&context_id) {
+                super::markers::persist_lifecycle_marker(
+                    &state.session_manager,
+                    session_id,
+                    "run_boundary",
+                    "(run completed)".to_string(),
+                    serde_json::json!({
+                        "run_id": run_id.0.to_string(),
+                        "status": "completed",
+                    }),
+                );
+            }
+
+            // Persist warning marker when MAX_ITERATIONS was hit, so it
+            // survives page reloads.
+            if output.response == alms_core::MAX_ITERATIONS_SENTINEL
+                && !is_internal_context_id(&context_id)
+            {
+                super::markers::persist_lifecycle_marker(
+                    &state.session_manager,
+                    session_id,
+                    "run_warning",
+                    "Max iterations reached — the agent hit its iteration limit before finishing."
+                        .to_string(),
+                    serde_json::json!({
+                        "run_id": run_id.0.to_string(),
+                        "code": "MAX_ITERATIONS",
+                    }),
+                );
+            }
 
             // Clone the response before mark_run_as_completed consumes it.
             //
@@ -1152,6 +1189,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
             state.run_manager.mark_run_as_cancelled(run_id);
 
+            if !is_internal_context_id(&context_id) {
+                super::markers::persist_lifecycle_marker(
+                    &state.session_manager,
+                    session_id,
+                    "run_boundary",
+                    "(run cancelled)".to_string(),
+                    serde_json::json!({
+                        "run_id": run_id.0.to_string(),
+                        "status": "cancelled",
+                    }),
+                );
+            }
+
             info!("Run {} cancelled", run_id.0);
         }
         Err(alms_core::AlmsError::CancelledWithToolCalls { tool_calls }) => {
@@ -1164,6 +1214,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 .await;
 
             state.run_manager.mark_run_as_cancelled(run_id);
+
+            if !is_internal_context_id(&context_id) {
+                super::markers::persist_lifecycle_marker(
+                    &state.session_manager,
+                    session_id,
+                    "run_boundary",
+                    "(run cancelled)".to_string(),
+                    serde_json::json!({
+                        "run_id": run_id.0.to_string(),
+                        "status": "cancelled",
+                    }),
+                );
+            }
 
             info!(
                 "Run {} cancelled ({} tool calls persisted)",
@@ -1188,6 +1251,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 .run_manager
                 .mark_run_as_failed(run_id, source.to_string());
 
+            if !is_internal_context_id(&context_id) {
+                super::markers::persist_lifecycle_marker(
+                    &state.session_manager,
+                    session_id,
+                    "run_boundary",
+                    format!("(run failed) {source}"),
+                    serde_json::json!({
+                        "run_id": run_id.0.to_string(),
+                        "status": "failed",
+                        "error": source.to_string(),
+                    }),
+                );
+            }
+
             error!(
                 "Run {} failed ({} tool calls persisted): {}",
                 run_id.0,
@@ -1206,6 +1283,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 .await;
 
             state.run_manager.mark_run_as_failed(run_id, e.to_string());
+
+            if !is_internal_context_id(&context_id) {
+                super::markers::persist_lifecycle_marker(
+                    &state.session_manager,
+                    session_id,
+                    "run_boundary",
+                    format!("(run failed) {e}"),
+                    serde_json::json!({
+                        "run_id": run_id.0.to_string(),
+                        "status": "failed",
+                        "error": e.to_string(),
+                    }),
+                );
+            }
 
             error!("Run {} failed: {}", run_id.0, e);
         }

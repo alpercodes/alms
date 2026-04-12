@@ -4,7 +4,7 @@ pub mod types;
 
 pub use alms_core::AuditEvent;
 pub use job_store::JobStore;
-pub use sqlite::SqliteStore;
+pub use sqlite::{SessionToolCall, SqliteStore};
 pub use types::{Content, ContextSummary, Message, Role, Session, SessionConfig, SessionSummary};
 
 use alms_core::{AgentId, AlmsResult, RunId, SessionId};

@@ -89,12 +89,16 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
 
 /// Reads RuntimeEvents from the runtime and forwards them as SSE events.
 /// Also stores ApprovalRequired events in the approval store so clients can resolve them.
+/// Warning events are persisted as lifecycle markers when `session_manager`
+/// and `context_id` are provided and the session is user-facing.
 pub(super) async fn forward_runtime_events(
     mut rx: mpsc::UnboundedReceiver<RuntimeEvent>,
     run_id: RunId,
     session_id: SessionId,
     run_manager: crate::server::RunManager,
     approval_store: ApprovalStore,
+    session_manager: std::sync::Arc<alms_session::SessionManager>,
+    context_id: String,
 ) {
     while let Some(event) = rx.recv().await {
         match event {
@@ -202,9 +206,24 @@ pub(super) async fn forward_runtime_events(
                     .send_event(
                         run_id,
                         session_id,
-                        SseEventData::run_warning(run_id, &code, &message, source_agent),
+                        SseEventData::run_warning(run_id, &code, &message, source_agent.clone()),
                     )
                     .await;
+
+                // Persist warning marker so it survives page reloads.
+                if !super::is_internal_context_id(&context_id) {
+                    super::markers::persist_lifecycle_marker(
+                        &session_manager,
+                        session_id,
+                        "run_warning",
+                        message.clone(),
+                        serde_json::json!({
+                            "run_id": run_id.0.to_string(),
+                            "code": code,
+                            "source_agent": source_agent,
+                        }),
+                    );
+                }
             }
             RuntimeEvent::ContextDebug {
                 messages,
