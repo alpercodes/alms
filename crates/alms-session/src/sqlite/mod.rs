@@ -24,8 +24,10 @@ mod sessions;
 mod summaries;
 #[cfg(test)]
 mod test_helpers;
+mod timeline;
 mod tool_calls;
 
+pub use timeline::TimelineEvent;
 pub use tool_calls::SessionToolCall;
 
 use crate::types::{

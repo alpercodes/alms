@@ -36,7 +36,7 @@ fn validate_posture(posture: &str) -> Result<(), String> {
 }
 
 /// Helper: get the SqliteStore from app state, or return 503.
-fn get_store(
+pub(crate) fn get_store(
     state: &AppState,
 ) -> Result<&std::sync::Arc<SqliteStore>, (StatusCode, Json<serde_json::Value>)> {
     state.session_manager.store().ok_or_else(|| {
