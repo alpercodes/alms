@@ -199,14 +199,26 @@ impl MessageSender for MessageBus {
         // not overwrite the original source. We use `or_insert` to preserve
         // the first entry.
         //
-        // IMPORTANT: Skip recording when the sender_session_id IS the DM
-        // session itself. This happens when an agent is triggered by a DM
-        // (runs on the DM session) and calls send_message to reply -- its
-        // session_id is the DM session, which is not user-facing. Recording
-        // it would defeat the `notifications:` fallback. See PR #433 review.
+        // IMPORTANT: Only record a source session when the sender is running
+        // on a user-facing session (chat or telegram). An agent triggered by
+        // one DM may call send_message to a *different* peer, in which case
+        // sender_session_id is the first DM session — recording that would
+        // route the notification to the wrong DM instead of the agent's
+        // web-chat. The original guard only rejected the *same* DM session
+        // (`sid != dm_session_id`), which missed cross-DM scenarios. See #656.
         if let Some(sid) = sender_session_id {
-            let dm_session_id = SessionId::deterministic_dm(sender_name, recipient_name);
-            if sid != dm_session_id {
+            let is_user_facing = self
+                .session_manager
+                .get(sid)
+                .ok()
+                .map(|s| {
+                    matches!(
+                        alms_core::classify_session_type(&s.context_id),
+                        "chat" | "telegram"
+                    )
+                })
+                .unwrap_or(false);
+            if is_user_facing {
                 let key = (dm_context.clone(), sender_name.to_string());
                 // or_insert preserves the first entry. This matters when an
                 // agent's initial send_message is from a web-chat session, but
