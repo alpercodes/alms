@@ -269,6 +269,76 @@ Deletes a session by UUID. The session must not have any active (queued or runni
 **Response 404** — session not found
 **Response 409 ACTIVE_RUNS** — cannot delete a session that has queued or running runs. Cancel or wait for active runs to finish before retrying.
 
+### 4.6 Get session tool calls
+`GET /sessions/{session_id}/tool-calls`
+
+Returns all tool call records across every run in a session, ordered by run creation time (`runs.created_at`) then tool call sequence number (`run_tool_calls.seq`). Each entry includes the originating `run_id` so clients can group or correlate calls with their run.
+
+This endpoint supplements the per-run `GET /runs/{run_id}/tool-calls` (section 5.4) by providing a session-level view. It is especially important for **DM sessions**, where tool calls are stored only in the per-run `run_tool_calls` table (not in `session_messages`) and would otherwise be lost across page reloads or session switches.
+
+**Response 200**
+```json
+{
+  "session_id": "<uuid>",
+  "tool_calls": [
+    {
+      "run_id": "<uuid>",
+      "seq": 0,
+      "role": "assistant",
+      "tool_name": "shell",
+      "tool_id": "call_abc123",
+      "params": "{\"command\":\"ls\"}",
+      "timestamp": "2026-03-22T10:00:00Z"
+    },
+    {
+      "run_id": "<uuid>",
+      "seq": 1,
+      "role": "tool",
+      "tool_name": "shell",
+      "tool_id": "call_abc123",
+      "result": "\"file1.txt\\nfile2.txt\"",
+      "timestamp": "2026-03-22T10:00:01Z"
+    },
+    {
+      "run_id": "<uuid>",
+      "seq": 0,
+      "role": "assistant",
+      "tool_name": "math",
+      "tool_id": "call_def456",
+      "params": "{\"expr\":\"2+2\"}",
+      "timestamp": "2026-03-22T10:01:00Z"
+    }
+  ]
+}
+```
+
+**Response 404** — session not found.
+
+**Response fields**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | string (UUID) | The session these tool calls belong to. |
+| `tool_calls` | array | Ordered list of `SessionToolCall` objects (see below). |
+
+**SessionToolCall object**
+
+| Field | Type | Presence | Description |
+|-------|------|----------|-------------|
+| `run_id` | string (UUID) | always | The run that produced this tool call. |
+| `seq` | integer | always | Sequence number within the run (monotonically increasing). |
+| `role` | string | always | `"assistant"` for tool call requests, `"tool"` for tool results. |
+| `tool_name` | string | optional | Name of the tool (e.g. `"shell"`, `"math"`). Always set in practice; absent fields use `skip_serializing_if`. |
+| `tool_id` | string | optional | Provider-assigned tool call ID that correlates a call to its result. |
+| `params` | string | optional | JSON-encoded tool parameters. Present on `"assistant"` role records. |
+| `result` | string | optional | JSON-encoded tool result. Present on `"tool"` role records. |
+| `timestamp` | string (RFC 3339) | always | When the record was created (UTC). |
+
+Notes:
+- Ordering: records are sorted by `runs.created_at` ascending (oldest run first), then by `seq` ascending within each run. This produces a chronological view of all tool activity across the session.
+- When SQLite persistence is not enabled, the endpoint returns an empty `tool_calls` array.
+- For non-DM sessions, this data is also available as structured messages via `GET /sessions/{session_id}/messages` (section 4.4). The session-level tool-calls endpoint is primarily useful for DM sessions where tool calls are excluded from `session_messages`.
+
 ---
 
 ## 5) Runs (agent executions)
@@ -939,4 +1009,4 @@ Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
 ---
 
-*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response, new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`), `dm_conversation_ended` SSE event, and `notification:dm_ended` run source.*
+*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response, new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`), `dm_conversation_ended` SSE event, and `notification:dm_ended` run source. Updated 2026-04-12 with `GET /sessions/{session_id}/tool-calls` endpoint (section 4.6).*
