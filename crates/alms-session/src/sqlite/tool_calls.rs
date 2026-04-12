@@ -135,6 +135,106 @@ impl SqliteStore {
             .map_err(|e| AlmsError::Runtime(format!("SQLite count_tool_calls: {e}")))?;
         Ok(count.max(0) as u32)
     }
+
+    /// Load all tool call records for a session by joining through the `runs`
+    /// table, ordered by run creation time then sequence number.
+    ///
+    /// Each returned [`SessionToolCall`] includes the `run_id` so the frontend
+    /// can group or correlate calls with their originating run.
+    pub fn load_tool_calls_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> AlmsResult<Vec<SessionToolCall>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT tc.run_id, tc.seq, tc.role, tc.tool_name, tc.tool_id, \
+                        tc.params, tc.result, tc.timestamp \
+                 FROM run_tool_calls tc \
+                 INNER JOIN runs r ON tc.run_id = r.run_id \
+                 WHERE r.session_id = ?1 \
+                 ORDER BY r.created_at, tc.seq",
+            )
+            .map_err(|e| {
+                AlmsError::Runtime(format!("SQLite prepare load_tool_calls_for_session: {e}"))
+            })?;
+
+        let rows = stmt
+            .query_map([session_id.0.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .map_err(|e| {
+                AlmsError::Runtime(format!("SQLite query load_tool_calls_for_session: {e}"))
+            })?
+            .filter_map(|r| match r {
+                Ok((run_id_str, seq, role_str, tool_name, tool_id, params, result, ts_str)) => {
+                    let run_id: RunId = uuid::Uuid::parse_str(&run_id_str)
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                "Skipping tool call record: bad run_id: {e}"
+                            );
+                        })
+                        .ok()
+                        .map(RunId)?;
+                    let role: ToolCallRole = role_str
+                        .parse()
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                "Skipping tool call record: bad role: {e}"
+                            );
+                        })
+                        .ok()?;
+                    let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                session_id = %session_id.0,
+                                "Skipping tool call record: bad timestamp: {e}"
+                            );
+                        })
+                        .ok()?
+                        .with_timezone(&chrono::Utc);
+                    Some(SessionToolCall {
+                        run_id,
+                        record: ToolCallRecord {
+                            seq: seq.max(0) as u32,
+                            role,
+                            tool_name,
+                            tool_id,
+                            params,
+                            result,
+                            timestamp,
+                        },
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable tool call row: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        Ok(rows)
+    }
+}
+
+/// A tool call record enriched with its originating `run_id`, returned by
+/// [`SqliteStore::load_tool_calls_for_session`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionToolCall {
+    pub run_id: RunId,
+    #[serde(flatten)]
+    pub record: ToolCallRecord,
 }
 
 #[cfg(test)]
@@ -279,5 +379,95 @@ mod tests {
         assert_eq!(loaded[1].role, ToolCallRole::Tool);
         assert!(loaded[1].params.is_none());
         assert!(loaded[1].result.is_none());
+    }
+
+    #[test]
+    fn test_load_tool_calls_for_session_basic() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session_id = SessionId::new();
+        let agent_id = alms_core::AgentId::new();
+
+        // Create two runs on the same session.
+        let run1 = alms_core::Run::new(session_id, agent_id, "prompt1".to_string());
+        let run2 = alms_core::Run::new(session_id, agent_id, "prompt2".to_string());
+        store.save_run(&run1).unwrap();
+        store.save_run(&run2).unwrap();
+
+        // Save tool calls for each run.
+        store
+            .save_tool_calls(
+                run1.run_id,
+                &[
+                    new_tool_call_record(0, ToolCallRole::Assistant, "echo"),
+                    new_tool_call_record(1, ToolCallRole::Tool, "echo"),
+                ],
+            )
+            .unwrap();
+        store
+            .save_tool_calls(
+                run2.run_id,
+                &[new_tool_call_record(0, ToolCallRole::Assistant, "math")],
+            )
+            .unwrap();
+
+        let session_calls = store.load_tool_calls_for_session(session_id).unwrap();
+        assert_eq!(
+            session_calls.len(),
+            3,
+            "should load all tool calls across both runs"
+        );
+
+        // First two should be from run1.
+        assert_eq!(session_calls[0].run_id, run1.run_id);
+        assert_eq!(session_calls[0].record.tool_name.as_deref(), Some("echo"));
+        assert_eq!(session_calls[1].run_id, run1.run_id);
+        // Third from run2.
+        assert_eq!(session_calls[2].run_id, run2.run_id);
+        assert_eq!(session_calls[2].record.tool_name.as_deref(), Some("math"));
+    }
+
+    #[test]
+    fn test_load_tool_calls_for_session_empty() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session_id = SessionId::new();
+
+        // No runs exist for this session.
+        let session_calls = store.load_tool_calls_for_session(session_id).unwrap();
+        assert!(session_calls.is_empty());
+    }
+
+    #[test]
+    fn test_load_tool_calls_for_session_isolates_sessions() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent_id = alms_core::AgentId::new();
+
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+
+        let run_a = alms_core::Run::new(session_a, agent_id, "prompt_a".to_string());
+        let run_b = alms_core::Run::new(session_b, agent_id, "prompt_b".to_string());
+        store.save_run(&run_a).unwrap();
+        store.save_run(&run_b).unwrap();
+
+        store
+            .save_tool_call(
+                run_a.run_id,
+                &new_tool_call_record(0, ToolCallRole::Assistant, "fs_read"),
+            )
+            .unwrap();
+        store
+            .save_tool_call(
+                run_b.run_id,
+                &new_tool_call_record(0, ToolCallRole::Assistant, "shell"),
+            )
+            .unwrap();
+
+        let calls_a = store.load_tool_calls_for_session(session_a).unwrap();
+        assert_eq!(calls_a.len(), 1);
+        assert_eq!(calls_a[0].record.tool_name.as_deref(), Some("fs_read"));
+
+        let calls_b = store.load_tool_calls_for_session(session_b).unwrap();
+        assert_eq!(calls_b.len(), 1);
+        assert_eq!(calls_b[0].record.tool_name.as_deref(), Some("shell"));
     }
 }

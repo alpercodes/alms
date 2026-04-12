@@ -119,6 +119,10 @@ pub(crate) fn protected_router() -> Router<AppState> {
         .route("/sessions/{session_id}", delete(delete_session_by_id))
         .route("/sessions/{session_id}/messages", get(get_session_messages))
         .route(
+            "/sessions/{session_id}/tool-calls",
+            get(get_session_tool_calls),
+        )
+        .route(
             "/sessions/{session_id}/events",
             get(crate::runs::stream_session_events),
         )
@@ -496,6 +500,53 @@ async fn get_session_messages(
         Err(_) => {
             api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response()
         }
+    }
+}
+
+/// GET /sessions/{session_id}/tool-calls — return all tool call records across
+/// all runs for a session, ordered by run creation time then sequence number.
+///
+/// This endpoint supplements the per-run `GET /runs/{run_id}/tool-calls` by
+/// providing a session-level view.  It is especially important for DM sessions
+/// where tool calls are stored only in `run_tool_calls` (not in
+/// `session_messages`) and would otherwise be lost on page reload.
+async fn get_session_tool_calls(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> impl IntoResponse {
+    tracing::debug!("GET /sessions/{}/tool-calls", session_id.0);
+
+    // Verify the session exists.
+    if state.session_manager.get(session_id).is_err() {
+        return api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found").into_response();
+    }
+
+    let records = state
+        .session_manager
+        .store()
+        .map(|store| store.load_tool_calls_for_session(session_id))
+        .transpose();
+
+    match records {
+        Ok(Some(tool_calls)) => Json(serde_json::json!({
+            "session_id": session_id.0.to_string(),
+            "tool_calls": tool_calls,
+        }))
+        .into_response(),
+        Ok(None) => {
+            // No SQLite store — return empty list.
+            Json(serde_json::json!({
+                "session_id": session_id.0.to_string(),
+                "tool_calls": [],
+            }))
+            .into_response()
+        }
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            format!("Failed to load tool calls: {e}"),
+        )
+        .into_response(),
     }
 }
 
