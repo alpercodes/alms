@@ -30,6 +30,9 @@ html[data-theme='light'] {
   --dm-accent: #7c3aed;
   --dm-accent-muted: rgba(124, 58, 237, 0.12);
 
+  --notif-accent: #d97706;
+  --notif-accent-muted: rgba(217, 119, 6, 0.1);
+
   --border-subtle: #e4e4e7;
   --border-default: #d4d4d8;
   --border-strong: #a1a1aa;
@@ -83,6 +86,10 @@ html[data-theme='light'] {
   /* ── DM / peer messaging accent (purple) ── */
   --dm-accent: #a78bfa;
   --dm-accent-muted: rgba(167, 139, 250, 0.15);
+
+  /* ── Notification accent (amber) ── */
+  --notif-accent: #fbbf24;
+  --notif-accent-muted: rgba(251, 191, 36, 0.12);
 
   /* ── Borders ── */
   --border-subtle: #27272a;
@@ -371,6 +378,9 @@ header h1 {
 }
 
 .sidebar-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   font-size: var(--text-2xs);
   font-weight: 600;
   color: var(--text-muted);
@@ -2885,37 +2895,7 @@ select.settings-input-sm {
    DM Session — Sidebar Styling (#604)
    ══════════════════════════════════════════════════════════════════════ */
 
-/* Divider between regular sessions and DM sessions in the sidebar */
-.session-dm-divider {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3) var(--space-1);
-  margin-top: var(--space-1);
-}
-.session-dm-divider-label {
-  font-size: var(--text-2xs);
-  font-weight: 600;
-  color: var(--dm-accent);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  white-space: nowrap;
-}
-.session-dm-divider::after {
-  content: '';
-  flex: 1;
-  height: 1px;
-  background: var(--dm-accent-muted);
-}
-
 /* DM session items — purple accent instead of green */
-.session-item-dm .session-dm-icon {
-  flex-shrink: 0;
-  font-size: var(--text-xs);
-  color: var(--dm-accent);
-  margin-right: var(--space-1);
-  opacity: 0.7;
-}
 .session-item-dm .session-label {
   color: var(--text-muted);
 }
@@ -2929,9 +2909,6 @@ select.settings-input-sm {
 }
 .session-item-dm.active .session-label {
   color: var(--dm-accent);
-}
-.session-item-dm.active .session-dm-icon {
-  opacity: 1;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -3584,4 +3561,158 @@ select.settings-input-sm {
 }
 .tl-load-more:hover { color: var(--accent); border-color: var(--accent); }
 .tl-load-more:disabled { opacity: 0.5; cursor: wait; }
+
+/* ══════════════════════════════════════════════════════════════════════
+   Session Type Icons & Classification (#606)
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Type icon in session items — small, left of the label */
+.session-type-icon {
+  flex-shrink: 0;
+  font-size: var(--text-xs);
+  margin-right: var(--space-1);
+  opacity: 0.7;
+}
+.session-type-icon-dm { color: var(--dm-accent); }
+.session-type-icon-notification { color: var(--notif-accent); }
+.session-type-icon-job { color: var(--info); }
+.session-type-icon-subagent { color: var(--text-muted); }
+.session-type-icon-telegram { color: var(--info); }
+
+/* ── Notification session items — amber accent ── */
+.session-item-notification .session-label {
+  color: var(--text-muted);
+}
+.session-item-notification:hover .session-label {
+  color: var(--text-primary);
+}
+.session-item-notification.active {
+  color: var(--notif-accent);
+  border-left-color: var(--notif-accent);
+  background: var(--notif-accent-muted);
+}
+.session-item-notification.active .session-label {
+  color: var(--notif-accent);
+}
+.session-item-notification.active .session-type-icon {
+  opacity: 1;
+}
+
+/* ── Generic section divider (replaces session-dm-divider) ── */
+.session-section-divider {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3) var(--space-1);
+  margin-top: var(--space-1);
+}
+.session-section-divider-label {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+.session-section-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-subtle);
+}
+
+/* DM divider — purple accent */
+.session-divider-dm .session-section-divider-label {
+  color: var(--dm-accent);
+}
+.session-divider-dm::after {
+  background: var(--dm-accent-muted);
+}
+
+/* Notification divider — amber accent */
+.session-divider-notification .session-section-divider-label {
+  color: var(--notif-accent);
+}
+.session-divider-notification::after {
+  background: var(--notif-accent-muted);
+}
+
+/* ── Notification toggle button in sidebar header ── */
+.notif-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  font-size: var(--text-xs);
+  background: none;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-disabled);
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+  transition: all var(--duration-normal);
+}
+.notif-toggle:hover {
+  color: var(--notif-accent);
+  border-color: var(--notif-accent);
+}
+.notif-toggle.active {
+  color: var(--notif-accent);
+  border-color: var(--notif-accent);
+  background: var(--notif-accent-muted);
+}
+
+/* ── Internal session header bar (notification, job, subagent) ── */
+.internal-session-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-6);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  flex-shrink: 0;
+}
+.internal-session-header-icon {
+  font-size: var(--text-lg);
+  color: var(--text-muted);
+}
+.internal-session-header-label {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+.internal-session-header-badge {
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--surface-2);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-left: auto;
+}
+/* Per-type accent colors for internal session header */
+.internal-session-notification .internal-session-header-icon { color: var(--notif-accent); }
+.internal-session-notification .internal-session-header-badge { color: var(--notif-accent); background: var(--notif-accent-muted); }
+.internal-session-job .internal-session-header-icon { color: var(--info); }
+.internal-session-job .internal-session-header-badge { color: var(--info); background: rgba(59, 130, 246, 0.1); }
+.internal-session-subagent .internal-session-header-icon { color: var(--warning); }
+.internal-session-subagent .internal-session-header-badge { color: var(--warning); background: rgba(234, 179, 8, 0.1); }
+
+/* ── Internal session footer (read-only notice) ── */
+.internal-session-footer {
+  flex-shrink: 0;
+  padding: var(--space-2) var(--space-6);
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+}
+.internal-session-footer-text {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  font-style: italic;
+}
 

@@ -4,6 +4,7 @@ export const listSessions = (agentId, opts) => {
     const params = new URLSearchParams();
     if (agentId) params.set('agent_id', agentId);
     if (opts && opts.includeDms) params.set('include_dms', 'true');
+    if (opts && opts.includeNotifications) params.set('include_notifications', 'true');
     const qs = params.toString();
     return get(`/sessions${qs ? '?' + qs : ''}`);
 };
