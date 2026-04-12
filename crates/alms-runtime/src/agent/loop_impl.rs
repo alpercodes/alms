@@ -835,6 +835,7 @@ impl AgentRuntime {
                 tool: name.to_string(),
                 params: args.clone(),
                 source_agent: None,
+                task_id: None,
             });
         }
 
@@ -885,6 +886,7 @@ impl AgentRuntime {
                     ok: false,
                     result: serde_json::json!({"error": "denied by user"}),
                     source_agent: None,
+                    task_id: None,
                 });
                 return Err(alms_core::AlmsError::ToolExecution(format!(
                     "Tool '{}' denied by user",
@@ -928,6 +930,7 @@ impl AgentRuntime {
                         ok,
                         result: value.clone(),
                         source_agent: None,
+                        task_id: None,
                     });
                 }
             }
@@ -962,6 +965,7 @@ impl AgentRuntime {
                         ok: false,
                         result: serde_json::json!({"error": e.to_string()}),
                         source_agent: None,
+                        task_id: None,
                     });
                 }
             }

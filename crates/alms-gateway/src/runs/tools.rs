@@ -35,12 +35,14 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
         tool: String,
         params: serde_json::Value,
         source_agent: Option<String>,
+        task_id: Option<String>,
     ) {
         let _ = self.tx.send(RuntimeEvent::ToolStart {
             invocation_id,
             tool,
             params,
             source_agent,
+            task_id,
         });
     }
 
@@ -50,12 +52,14 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
         ok: bool,
         result: serde_json::Value,
         source_agent: Option<String>,
+        task_id: Option<String>,
     ) {
         let _ = self.tx.send(RuntimeEvent::ToolEnd {
             invocation_id,
             ok,
             result,
             source_agent,
+            task_id,
         });
     }
 
@@ -111,6 +115,7 @@ pub(super) async fn forward_runtime_events(
                 tool,
                 params,
                 source_agent,
+                task_id,
             } => {
                 run_manager
                     .send_event(
@@ -122,6 +127,7 @@ pub(super) async fn forward_runtime_events(
                             &tool,
                             params,
                             source_agent,
+                            task_id,
                         ),
                     )
                     .await;
@@ -131,6 +137,7 @@ pub(super) async fn forward_runtime_events(
                 ok,
                 result,
                 source_agent,
+                task_id,
             } => {
                 run_manager
                     .send_event(
@@ -142,6 +149,7 @@ pub(super) async fn forward_runtime_events(
                             ok,
                             result,
                             source_agent,
+                            task_id,
                         ),
                     )
                     .await;

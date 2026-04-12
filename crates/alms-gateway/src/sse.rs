@@ -103,6 +103,7 @@ impl SseEventData {
         tool: &str,
         params: serde_json::Value,
         source_agent: Option<String>,
+        task_id: Option<String>,
     ) -> Self {
         Self::new(
             "tool_start",
@@ -112,6 +113,7 @@ impl SseEventData {
                 tool: tool.to_string(),
                 params,
                 source_agent,
+                task_id,
             },
         )
     }
@@ -122,6 +124,7 @@ impl SseEventData {
         ok: bool,
         result: serde_json::Value,
         source_agent: Option<String>,
+        task_id: Option<String>,
     ) -> Self {
         Self::new(
             "tool_end",
@@ -131,6 +134,7 @@ impl SseEventData {
                 ok,
                 result,
                 source_agent,
+                task_id,
             },
         )
     }
@@ -502,6 +506,9 @@ struct ToolStartData {
     params: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_agent: Option<String>,
+    /// Subagent task identifier for frontend correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -512,6 +519,9 @@ struct ToolEndData {
     result: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_agent: Option<String>,
+    /// Subagent task identifier for frontend correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -696,6 +706,7 @@ mod tests {
             tool_id,
             true,
             serde_json::json!({"output": "test"}),
+            None,
             None,
         );
 

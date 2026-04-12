@@ -31,6 +31,8 @@ pub enum RuntimeEvent {
         params: Value,
         /// When set, this event originated from a subagent (not the parent).
         source_agent: Option<String>,
+        /// When set, identifies the subagent task that produced this event.
+        task_id: Option<String>,
     },
     /// A tool execution completed (ok=true) or failed (ok=false).
     ToolEnd {
@@ -39,6 +41,8 @@ pub enum RuntimeEvent {
         result: Value,
         /// When set, this event originated from a subagent (not the parent).
         source_agent: Option<String>,
+        /// When set, identifies the subagent task that produced this event.
+        task_id: Option<String>,
     },
     /// A chunk of text from the LLM response, for real-time streaming to the UI.
     TokenDelta {
@@ -121,6 +125,7 @@ mod tests {
             tool: "echo".to_string(),
             params: serde_json::json!({"text": "hi"}),
             source_agent: None,
+            task_id: None,
         })
         .unwrap();
 
@@ -129,6 +134,7 @@ mod tests {
             ok: true,
             result: serde_json::json!({"output": "hi"}),
             source_agent: None,
+            task_id: None,
         })
         .unwrap();
 

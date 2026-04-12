@@ -1048,11 +1048,13 @@ async fn run_agent_loop(
             .subagent_name
             .clone()
             .unwrap_or_else(|| format!("subagent-{}", &task_id.0.to_string()[..8]));
+        let task_id_str = task_id.0.to_string();
         tokio::spawn(async move {
             use alms_runtime::RuntimeEvent;
             let mut rx = sub_rx;
             while let Some(event) = rx.recv().await {
                 let agent_label = Some(label.clone());
+                let tid = Some(task_id_str.clone());
                 match event {
                     RuntimeEvent::ToolStart {
                         invocation_id,
@@ -1060,7 +1062,13 @@ async fn run_agent_loop(
                         params,
                         ..
                     } => {
-                        parent_fwd.forward_tool_start(invocation_id, tool, params, agent_label);
+                        parent_fwd.forward_tool_start(
+                            invocation_id,
+                            tool,
+                            params,
+                            agent_label,
+                            tid,
+                        );
                     }
                     RuntimeEvent::ToolEnd {
                         invocation_id,
@@ -1068,7 +1076,7 @@ async fn run_agent_loop(
                         result,
                         ..
                     } => {
-                        parent_fwd.forward_tool_end(invocation_id, ok, result, agent_label);
+                        parent_fwd.forward_tool_end(invocation_id, ok, result, agent_label, tid);
                     }
                     RuntimeEvent::TokenDelta { delta, .. } => {
                         parent_fwd.forward_token_delta(delta, agent_label);

@@ -672,24 +672,28 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                         tool,
                         params,
                         source_agent,
+                        task_id,
                     } => SseEventData::tool_start(
                         bg_run_id,
                         crate::sse::ToolInvocationId(invocation_id),
                         &tool,
                         params,
                         source_agent,
+                        task_id,
                     ),
                     alms_runtime::RuntimeEvent::ToolEnd {
                         invocation_id,
                         ok,
                         result,
                         source_agent,
+                        task_id,
                     } => SseEventData::tool_end(
                         bg_run_id,
                         crate::sse::ToolInvocationId(invocation_id),
                         ok,
                         result,
                         source_agent,
+                        task_id,
                     ),
                     alms_runtime::RuntimeEvent::ApprovalRequired {
                         tool, decision_tx, ..
