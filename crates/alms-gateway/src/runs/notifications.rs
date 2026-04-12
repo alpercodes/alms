@@ -303,6 +303,78 @@ pub(super) async fn notify_dm_ended_to_webchat(
     );
 }
 
+/// Forward a `dm_activity_started` event to the agent's user-facing
+/// web-chat session so the status bar can show "Chatting with {peer}".
+///
+/// This mirrors [`notify_dm_ended_to_webchat`]: find the most recent
+/// user-facing session and emit a lightweight SSE event.  No marker
+/// message is persisted because DM activity is transient — the status
+/// bar resets when the DM run ends.
+///
+/// See #651.
+async fn notify_dm_started_to_webchat(
+    state: &AppState,
+    agent_id: alms_core::AgentId,
+    peer_name: &str,
+    context_id: &str,
+) {
+    let Some(target) = find_user_facing_session(&state.session_manager, agent_id) else {
+        debug!(
+            agent_id = %agent_id,
+            "No user-facing session for agent — skipping DM started notification"
+        );
+        return;
+    };
+    let target_session_id = target.id;
+
+    let dummy_run_id = RunId::new();
+    state
+        .run_manager
+        .send_session_event(
+            target_session_id,
+            dummy_run_id,
+            SseEventData::dm_activity_started(target_session_id, peer_name),
+        )
+        .await;
+
+    debug!(
+        "DM activity started forwarded to web-chat session {} (peer={peer_name}, context={context_id})",
+        target_session_id.0
+    );
+}
+
+/// Forward a DM `status` event to the agent's user-facing web-chat
+/// session as a `dm_activity_status` event.
+///
+/// Only key phases (`executing_tools`, `calling_llm`) are forwarded to
+/// avoid flooding the webchat stream with noise.  This is called from
+/// [`forward_runtime_events`](super::tools::forward_runtime_events)
+/// when the run is on a DM session.
+///
+/// See #651.
+pub(super) async fn notify_dm_status_to_webchat(
+    session_manager: &alms_session::SessionManager,
+    run_manager: &crate::server::RunManager,
+    agent_id: alms_core::AgentId,
+    peer_name: &str,
+    phase: &str,
+    detail: Option<String>,
+) {
+    let Some(target) = find_user_facing_session(session_manager, agent_id) else {
+        return;
+    };
+    let target_session_id = target.id;
+
+    let dummy_run_id = RunId::new();
+    run_manager
+        .send_session_event(
+            target_session_id,
+            dummy_run_id,
+            SseEventData::dm_activity_status(target_session_id, peer_name, phase, detail),
+        )
+        .await;
+}
+
 // ---------------------------------------------------------------------------
 // Subagent completion notifications
 // ---------------------------------------------------------------------------
@@ -693,15 +765,20 @@ pub(crate) async fn run_trigger_loop(
         // Build a source label for SSE `run_created` events and determine
         // whether this is a peer DM run (which needs the DM addendum) or
         // a notification run (which must NOT get the DM addendum).
-        let (source_label, is_peer, input) = match &trigger.source {
+        // `dm_peer_name` is captured for DM runs so we can forward a
+        // lightweight activity event to the agent's webchat session (#651).
+        let (source_label, is_peer, input, dm_peer_name) = match &trigger.source {
             MessageSource::Agent { from_name, .. } => (
                 format!("peer:{from_name}"),
                 true,
                 // Peer DM: input already persisted by MessageBus — pass it
                 // through so the Run record has a copy.
                 trigger.input,
+                Some(from_name.clone()),
             ),
-            MessageSource::SubagentCompletion => ("subagent".to_string(), false, trigger.input),
+            MessageSource::SubagentCompletion => {
+                ("subagent".to_string(), false, trigger.input, None)
+            }
             MessageSource::ConversationEnded {
                 from_name,
                 reason,
@@ -868,6 +945,7 @@ pub(crate) async fn run_trigger_loop(
                         *reason,
                         conversation_history.as_deref(),
                     ),
+                    None,
                 )
             }
         };
@@ -884,11 +962,18 @@ pub(crate) async fn run_trigger_loop(
             agent_id,
             session_id,
             input,
-            context_id,
+            context_id.clone(),
             source_label,
             is_peer,
         )
         .await;
+
+        // Forward a lightweight "DM activity started" event to the agent's
+        // webchat session so the status bar can show "Chatting with {peer}".
+        // This mirrors the `notify_dm_ended_to_webchat` pattern (#651).
+        if let Some(peer_name) = dm_peer_name {
+            notify_dm_started_to_webchat(&state, agent_id, &peer_name, &context_id).await;
+        }
     }
 }
 

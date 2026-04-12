@@ -396,6 +396,45 @@ impl SseEventData {
             },
         )
     }
+
+    /// Cross-session: a DM run has started, forwarded to the agent's
+    /// webchat session so the status bar can show "Chatting with {peer}".
+    ///
+    /// This is a lightweight echo of the `run_created` event that lands on
+    /// the DM session — only the peer name is included.
+    pub fn dm_activity_started(session_id: alms_core::SessionId, peer: &str) -> Self {
+        Self::new(
+            "dm_activity_started",
+            DmActivityStartedData {
+                session_id: session_id.0.to_string(),
+                peer: peer.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
+
+    /// Cross-session: a DM run status update, forwarded to the agent's
+    /// webchat session so the status bar can show tool execution details.
+    ///
+    /// Only key phases (`executing_tools`, `calling_llm`) are forwarded
+    /// to avoid noise.
+    pub fn dm_activity_status(
+        session_id: alms_core::SessionId,
+        peer: &str,
+        phase: &str,
+        detail: Option<String>,
+    ) -> Self {
+        Self::new(
+            "dm_activity_status",
+            DmActivityStatusData {
+                session_id: session_id.0.to_string(),
+                peer: peer.to_string(),
+                phase: phase.to_string(),
+                detail,
+                ts: Utc::now(),
+            },
+        )
+    }
 }
 
 /// SSE event stream wrapper
@@ -679,6 +718,23 @@ struct DmConversationEndedData {
     peer: String,
     reason: String,
     context_id: String,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct DmActivityStartedData {
+    session_id: String,
+    peer: String,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct DmActivityStatusData {
+    session_id: String,
+    peer: String,
+    phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     ts: DateTime<Utc>,
 }
 
