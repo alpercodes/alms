@@ -33,7 +33,7 @@ import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
 import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
-import { agentPhase, setAgentPhase, clearAgentPhase } from '../state/agent-status.js';
+import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
 import { normalizeApproval } from '../utils/approvals.js';
@@ -278,10 +278,11 @@ export function openSessionStream(sessionId, opts) {
 
         // Cross-channel DM awareness: when the run source starts with
         // "peer:", the agent is responding to a DM from another agent.
-        // Set the header bar phase to 'dm' with the peer name so the
-        // user sees "Chatting with {peer}..." while this run executes.
+        // Set the DM context so the header bar shows "Chatting with
+        // {peer}..." as the fallback phase.  More specific phases (tool
+        // execution) will temporarily override it, reverting when done.
         if (data.source && data.source.startsWith('peer:')) {
-            setAgentPhase('dm', data.source.slice(5));
+            setDmContext(data.source.slice(5));
         }
 
         if (data.is_notification) {
@@ -327,12 +328,22 @@ export function openSessionStream(sessionId, opts) {
     on('status', (e) => {
         const data = JSON.parse(e.data);
         console.debug('[status]', data.phase, data.detail || '');
-        // When the agent is in a DM conversation (phase 'dm', set by
-        // run_created for peer: sources), don't let subsequent status
-        // events (building_context, calling_llm, etc.) overwrite the
-        // "Chatting with ..." label.  The DM phase persists until the
-        // run ends and clearAgentPhase() is called.
-        if (agentPhase.value.phase === 'dm') return;
+
+        // During DM runs, replace generic phases (building_context,
+        // calling_llm, summarizing) with the DM fallback so the user
+        // sees "Chatting with {peer}..." instead of "Thinking...".
+        // Tool execution phases are allowed through -- the user needs
+        // to see which tool is running even during DM conversations.
+        if (dmPeer.value) {
+            if (data.phase === 'executing_tools') {
+                // Show tool names during DM tool execution
+                setAgentPhase(data.phase, data.detail || null);
+            } else {
+                // For non-tool phases in DM, keep showing "Chatting with..."
+                setAgentPhase('dm', dmPeer.value);
+            }
+            return;
+        }
         setAgentPhase(data.phase, data.detail || null);
     });
 
@@ -377,6 +388,11 @@ export function openSessionStream(sessionId, opts) {
                     id: toolId, type: 'tool', tool: data.tool, params: data.params,
                     status: 'running', startedAt,
                 });
+
+                // Update the header bar to show which specific tool is running.
+                // This provides per-tool granularity beyond the batch-level
+                // "executing_tools" status event from the backend.
+                setAgentPhase('tool_active', data.tool);
             }
         });
     });
@@ -454,6 +470,19 @@ export function openSessionStream(sessionId, opts) {
             // When no matching tool message was found for subagent-only tool
             // events, skip the chatMessages write to avoid an unnecessary
             // re-render with a new array reference.
+
+            // Revert the header bar phase after tool completion.
+            // For non-subagent tools: if other tools are still running,
+            // the next tool_start will immediately set tool_active again.
+            // If no more tools are running, the backend will emit a
+            // calling_llm status event shortly.  Revert to DM fallback
+            // (if in a DM run) or calling_llm as a reasonable default.
+            if (!data.source_agent) {
+                const { phase } = agentPhase.value;
+                if (phase === 'tool_active' || phase === 'executing_tools') {
+                    revertPhase('calling_llm');
+                }
+            }
         });
     });
 
