@@ -3243,3 +3243,138 @@ select.settings-input-sm {
   background: var(--info-muted);
 }
 
+/* ── Runs tab (agent run log panel) ── */
+.runs-tab {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.runs-tab-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.runs-tab-count {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+.runs-tab-refresh {
+  background: none;
+  border: 1px solid var(--border-default);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  line-height: 1;
+  transition: all var(--duration-fast);
+}
+.runs-tab-refresh:hover { color: var(--accent); border-color: var(--accent); }
+.runs-tab-refresh:disabled { opacity: 0.5; cursor: wait; }
+.runs-tab-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.runs-tab-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: background var(--duration-fast);
+  border-radius: var(--radius-xs);
+}
+.runs-tab-row:last-child { border-bottom: none; }
+.runs-tab-row:hover { background: var(--surface-3); }
+.runs-tab-row-top {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.runs-tab-row-bottom {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding-left: calc(var(--text-sm) + var(--space-2));
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+.runs-tab-status {
+  flex-shrink: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  width: 1em;
+  text-align: center;
+}
+.runs-tab-row--completed .runs-tab-status { color: var(--success); }
+.runs-tab-row--failed    .runs-tab-status { color: var(--error); }
+.runs-tab-row--cancelled .runs-tab-status { color: var(--text-disabled); }
+.runs-tab-row--running   .runs-tab-status { color: var(--warning); }
+.runs-tab-trigger {
+  font-size: var(--text-2xs);
+  font-family: var(--font-mono);
+  font-weight: 600;
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.runs-tab-trigger--user         { color: var(--accent-text); background: var(--accent-muted); }
+.runs-tab-trigger--scheduled    { color: var(--info);        background: var(--info-muted); }
+.runs-tab-trigger--subagent     { color: var(--warning);     background: var(--warning-muted); }
+.runs-tab-trigger--dm           { color: var(--dm-accent);   background: var(--dm-accent-muted); }
+.runs-tab-trigger--notification { color: var(--text-muted);  background: var(--surface-3); }
+.runs-tab-trigger--telegram     { color: var(--info);        background: var(--info-muted); }
+.runs-tab-session-type {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  font-family: var(--font-mono);
+}
+.runs-tab-time {
+  margin-left: auto;
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.runs-tab-duration { white-space: nowrap; }
+.runs-tab-tools { white-space: nowrap; }
+.runs-tab-tokens {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.runs-tab-empty {
+  padding: var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-disabled);
+  font-style: italic;
+  text-align: center;
+}
+.runs-tab-error {
+  font-size: var(--text-xs);
+  color: var(--error);
+  padding: var(--space-2);
+  text-align: center;
+}
+.runs-tab-retry {
+  display: block;
+  width: 100%;
+  margin-top: var(--space-2);
+  padding: var(--space-2);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  background: none;
+  color: var(--text-muted);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--duration-normal);
+}
+.runs-tab-retry:hover { color: var(--accent); border-color: var(--accent); }
+

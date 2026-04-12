@@ -11,3 +11,6 @@ export const cancelRun = (runId) => post(`/runs/${runId}/cancel`);
 
 export const listApprovals = (sessionId) =>
     get(`/approvals?session_id=${sessionId}`);
+
+export const listAgentRuns = (agentId, limit = 50) =>
+    get(`/runs?agent_id=${agentId}&limit=${limit}`);
