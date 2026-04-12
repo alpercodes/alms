@@ -31,7 +31,7 @@
 import { batch } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
-import { activeRunId } from '../state/runs.js';
+import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { setAgentPhase, clearAgentPhase } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
@@ -274,6 +274,7 @@ export function openSessionStream(sessionId, opts) {
         const data = JSON.parse(e.data);
         const queuedBehind = data.queued_behind || 0;
         sawTokenDelta = false;
+        bumpRunListGeneration();
 
         // Cross-channel DM awareness: when the run source starts with
         // "peer:", the agent is responding to a DM from another agent.
@@ -315,6 +316,7 @@ export function openSessionStream(sessionId, opts) {
             m => m.type === 'thinking' && m.queuedBehind > 0,
             m => ({ ...m, queuedBehind: 0 }),
         );
+        bumpRunListGeneration();
     });
 
     // -- status: agent phase update (live indicator in header bar) --
@@ -585,6 +587,7 @@ export function openSessionStream(sessionId, opts) {
 
     // -- run_finished / run_error / run_cancelled --
     const handleRunEnd = (status) => (e) => {
+        bumpRunListGeneration();
         batch(() => {
             flushDeltaBuffer();
             sealLastAgent();
