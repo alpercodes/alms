@@ -128,7 +128,16 @@ export function mapHistoryMessages(msgs, opts) {
     // Second pass: build the chat entries. Tool results are consumed via
     // the map lookup -- any that remain unmatched are skipped (same as the
     // old "standalone tool_result" behavior).
+    // entryTimestamps tracks the ISO timestamp parallel to each entry so
+    // that reconstructed tool calls from session-level records can be
+    // interleaved chronologically instead of appended to the end.
     const entries = [];
+    const entryTimestamps = [];
+    /** Push an entry and its corresponding source timestamp. */
+    const pushEntry = (entry, ts) => {
+        entries.push(entry);
+        entryTimestamps.push(ts || null);
+    };
     for (const m of msgs) {
         if (m.type === 'text' || !m.type) {
             // DM-ended markers are persisted by MessageBus::end_conversation
@@ -144,12 +153,12 @@ export function mapHistoryMessages(msgs, opts) {
                     'depth_exceeded': 'message limit reached',
                 };
                 const rawReason = m.metadata.reason || '';
-                entries.push({
+                pushEntry({
                     id: nextMsgId(),
                     type: 'dm_ended',
                     peer: m.metadata.ended_by || 'unknown',
                     reason: reasonLabels[rawReason] || rawReason || 'conversation ended',
-                });
+                }, m.timestamp);
                 continue;
             }
 
@@ -175,7 +184,7 @@ export function mapHistoryMessages(msgs, opts) {
             if (isSynthetic && m.metadata.type === 'job_notification') {
                 const content = m.content || '';
                 const parsed = parseJobNotification(content, m.metadata);
-                entries.push({
+                pushEntry({
                     id: nextMsgId(),
                     type: 'job_completed',
                     jobName: parsed.jobName,
@@ -183,21 +192,21 @@ export function mapHistoryMessages(msgs, opts) {
                     summary: parsed.summary,
                     ts: m.timestamp || null,
                     metadata: m.metadata || null,
-                });
+                }, m.timestamp);
                 continue;
             }
 
             // Run boundary markers -> run_boundary dividers between runs.
             if (isSynthetic && m.metadata.type === 'run_boundary') {
                 const runStatus = m.metadata.status || 'completed';
-                entries.push({
+                pushEntry({
                     id: nextMsgId(),
                     type: 'run_boundary',
                     status: runStatus,
                     runId: m.metadata.run_id || null,
                     error: m.metadata.error || null,
                     text: m.content || '',
-                });
+                }, m.timestamp);
                 continue;
             }
 
@@ -206,18 +215,18 @@ export function mapHistoryMessages(msgs, opts) {
                 // Suppress subagent warnings in the parent chat (same as
                 // the SSE handler in use-session-stream.js).
                 if (m.metadata.source_agent) continue;
-                entries.push({
+                pushEntry({
                     id: nextMsgId(),
                     type: 'warning',
                     code: m.metadata.code || 'UNKNOWN',
                     text: m.content || 'Warning',
-                });
+                }, m.timestamp);
                 continue;
             }
 
             // Subagent completion markers -> subagent_completed cards.
             if (isSynthetic && m.metadata.type === 'subagent_completion') {
-                entries.push({
+                pushEntry({
                     id: nextMsgId(),
                     type: 'subagent_completed',
                     name: m.metadata.subagent_name || 'subagent',
@@ -227,21 +236,21 @@ export function mapHistoryMessages(msgs, opts) {
                     durationMs: null,
                     sessionId: m.metadata.session_id || null,
                     summary: '',
-                });
+                }, m.timestamp);
                 continue;
             }
 
             // DM-ended notification markers (persisted on the webchat
             // session, not the DM session itself).
             if (isSynthetic && m.metadata.type === 'dm_ended_notification') {
-                entries.push({
+                pushEntry({
                     id: nextMsgId(),
                     type: 'notification',
                     role: 'system',
                     text: m.content || '',
                     metadata: m.metadata,
                     sealed: true,
-                });
+                }, m.timestamp);
                 continue;
             }
 
@@ -250,7 +259,7 @@ export function mapHistoryMessages(msgs, opts) {
                 : isDm ? 'agent'
                 : (m.role === 'user' ? 'user' : 'agent');
 
-            entries.push({
+            pushEntry({
                 id: nextMsgId(),
                 type,
                 role: m.role,
@@ -259,7 +268,7 @@ export function mapHistoryMessages(msgs, opts) {
                 sealed: true,
                 // Carry the sender name so Message can show it as the label.
                 fromAgent: isDm ? m.metadata.from_agent : undefined,
-            });
+            }, m.timestamp);
         } else if (m.type === 'tool_call') {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;
             // Prefer tool_invocation_id as the message ID so that history-
@@ -297,7 +306,7 @@ export function mapHistoryMessages(msgs, opts) {
                 }
             }
 
-            entries.push({
+            pushEntry({
                 id: invocationId || callId || nextMsgId(),
                 type: 'tool',
                 tool: toolName,
@@ -310,13 +319,13 @@ export function mapHistoryMessages(msgs, opts) {
                 status: resultOk != null ? (resultOk ? 'done' : 'fail')
                     : (hasActiveRun ? 'running' : 'done'),
                 result: result,
-            });
+            }, m.timestamp);
         } else if (m.type === 'image') {
             // DM image messages use the same metadata pattern as text. (#546)
             const isDmImg = m.role === 'user'
                 && m.metadata && m.metadata.message_type === 'dm'
                 && m.metadata.from_agent;
-            entries.push({
+            pushEntry({
                 id: nextMsgId(),
                 type: 'image',
                 role: isDmImg ? 'assistant' : m.role,
@@ -324,7 +333,7 @@ export function mapHistoryMessages(msgs, opts) {
                 alt: m.alt || '',
                 sealed: true,
                 fromAgent: isDmImg ? m.metadata.from_agent : undefined,
-            });
+            }, m.timestamp);
         }
         // tool_result entries are consumed via resultMap -- skip them here
     }
@@ -350,6 +359,10 @@ export function mapHistoryMessages(msgs, opts) {
         }
 
         // Group session tool calls by tool_id, pairing calls with results.
+        // Collect new entries with their timestamps so we can interleave
+        // them chronologically with the existing entries instead of
+        // appending them at the end.
+        const newToolEntries = [];
         for (const [toolId, pair] of toolCallIndex) {
             if (existingToolIds.has(toolId)) continue;
             if (!pair.call) continue; // skip orphan results
@@ -367,15 +380,55 @@ export function mapHistoryMessages(msgs, opts) {
                 ok = true;
             }
 
-            entries.push({
-                id: toolId || nextMsgId(),
-                type: 'tool',
-                tool: pair.call.tool_name || 'unknown',
-                params: params,
-                status: ok != null ? (ok ? 'done' : 'fail')
-                    : (hasActiveRun ? 'running' : 'done'),
-                result: result,
+            newToolEntries.push({
+                entry: {
+                    id: toolId || nextMsgId(),
+                    type: 'tool',
+                    tool: pair.call.tool_name || 'unknown',
+                    params: params,
+                    status: ok != null ? (ok ? 'done' : 'fail')
+                        : (hasActiveRun ? 'running' : 'done'),
+                    result: result,
+                },
+                ts: pair.call.timestamp || null,
             });
+        }
+
+        // Interleave new tool entries into the existing array by timestamp.
+        // Both the existing entries (via entryTimestamps) and the new tool
+        // entries are roughly chronological, so we walk forward through
+        // the existing array once for each new entry (pointer never rewinds).
+        if (newToolEntries.length > 0) {
+            // Sort new entries by timestamp so we can merge in one pass.
+            newToolEntries.sort((a, b) => {
+                if (!a.ts && !b.ts) return 0;
+                if (!a.ts) return 1;
+                if (!b.ts) return -1;
+                return a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0;
+            });
+            let insertOffset = 0;
+            for (const { entry, ts } of newToolEntries) {
+                if (!ts) {
+                    // No timestamp — append at the end.
+                    entries.push(entry);
+                    entryTimestamps.push(null);
+                    continue;
+                }
+                // Find the first existing entry whose timestamp is after
+                // this tool call's timestamp.
+                let pos = entries.length;
+                for (let i = insertOffset; i < entryTimestamps.length; i++) {
+                    if (entryTimestamps[i] && entryTimestamps[i] > ts) {
+                        pos = i;
+                        break;
+                    }
+                }
+                entries.splice(pos, 0, entry);
+                entryTimestamps.splice(pos, 0, ts);
+                // Advance the offset past the just-inserted position so the
+                // next new entry starts scanning from after it.
+                insertOffset = pos + 1;
+            }
         }
     }
 

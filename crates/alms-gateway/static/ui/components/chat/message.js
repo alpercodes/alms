@@ -124,6 +124,9 @@ export function RunBoundary({ status, error }) {
         <div class="run-boundary ${statusCls}">
             <span class="run-boundary-label">${label}</span>
         </div>
+        ${status === 'failed' && error && html`
+            <div class="run-boundary-error">${error}</div>
+        `}
     `;
 }
 

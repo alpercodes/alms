@@ -2871,6 +2871,15 @@ select.settings-input-sm {
 .run-boundary--cancelled::after {
   background: var(--warning-muted);
 }
+.run-boundary-error {
+  text-align: center;
+  font-size: var(--text-2xs);
+  color: var(--error);
+  padding: 0 var(--space-4);
+  margin-top: calc(-1 * var(--space-1));
+  margin-bottom: var(--space-1);
+  word-break: break-word;
+}
 
 /* ══════════════════════════════════════════════════════════════════════
    DM Session — Sidebar Styling (#604)
