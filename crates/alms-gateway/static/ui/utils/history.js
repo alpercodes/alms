@@ -225,23 +225,17 @@ export function mapHistoryMessages(msgs, opts) {
             }
 
             // Subagent completion markers -> subagent_completed cards.
-            // Rich metadata fields (task_description, tool_count,
-            // duration_ms, summary, token_usage) are persisted by the
-            // backend since PR #640.  Read them so the card renders the
-            // same detail after a page reload as it does on the live SSE
-            // event.
             if (isSynthetic && m.metadata.type === 'subagent_completion') {
-                const md = m.metadata;
                 pushEntry({
                     id: nextMsgId(),
                     type: 'subagent_completed',
-                    name: md.subagent_name || 'subagent',
-                    task: md.task_description || '',
-                    status: md.status || 'done',
-                    toolCount: md.tool_count || 0,
-                    durationMs: md.duration_ms != null ? md.duration_ms : null,
-                    sessionId: md.session_id || null,
-                    summary: md.summary || '',
+                    name: m.metadata.subagent_name || 'subagent',
+                    task: '',
+                    status: m.metadata.status || 'done',
+                    toolCount: 0,
+                    durationMs: null,
+                    sessionId: m.metadata.session_id || null,
+                    summary: '',
                 }, m.timestamp);
                 continue;
             }
