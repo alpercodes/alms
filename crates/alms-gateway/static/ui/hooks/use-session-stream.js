@@ -602,6 +602,10 @@ export function openSessionStream(sessionId, opts) {
         appendMessage({
             id: nextMsgId(), type: 'dm_ended', peer, reason,
         });
+        // Reset the status bar -- the DM conversation is over, so the
+        // "Chatting with {peer}..." phase and dmPeer context must be
+        // cleared to return to idle state.
+        clearAgentPhase();
     });
 
     // -- dm_activity_started: DM run started on behalf of this agent (#659) --
@@ -615,15 +619,25 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // -- dm_activity_status: DM run phase update forwarded to webchat (#659) --
-    // Maps DM phases to the agent status bar. For executing_tools with a
-    // tool name, use tool_active for per-tool granularity. Other phases
-    // update as-is via setAgentPhase.
+    // Maps DM phases to the agent status bar.  Replicates the DM-fallback
+    // logic from the main `status` handler: tool phases get per-tool
+    // granularity, non-tool phases (calling_llm, building_context, etc.)
+    // are replaced with "Chatting with {peer}..." so the user does not
+    // see generic "Thinking..." during a DM conversation.
     on('dm_activity_status', (e) => {
         const data = JSON.parse(e.data);
         if (data.phase === 'executing_tools' && data.detail) {
             setAgentPhase('tool_active', data.detail);
         } else {
-            setAgentPhase(data.phase, data.detail || null);
+            // Non-tool phase during DM: show "Chatting with {peer}..."
+            // Prefer dmPeer (set by dm_activity_started), fall back to
+            // data.peer from the event payload.
+            const peer = dmPeer.value || data.peer;
+            if (peer) {
+                setAgentPhase('dm', peer);
+            } else {
+                setAgentPhase(data.phase, data.detail || null);
+            }
         }
     });
 
