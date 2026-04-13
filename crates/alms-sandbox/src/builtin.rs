@@ -671,6 +671,7 @@ impl Tool for FsReadTool {
         let end = offset.saturating_add(limit);
         let mut output_bytes: usize = 0;
         let mut byte_budget_exceeded = false;
+        let mut read_past_end = false;
 
         // Phase 1: skip lines before offset, collect lines in [offset, end), stop
         // collecting once we've passed the requested range.
@@ -694,17 +695,22 @@ impl Tool for FsReadTool {
             }
 
             // Once we've passed the requested range, stop storing lines.
-            // We peek one line ahead so we know if has_more_after is true.
+            // The line at `end` was consumed but not collected, so we already
+            // know there is at least one unreturned line after the range.
             if line_idx >= end {
+                read_past_end = true;
                 break;
             }
         }
 
         // If we broke out early (due to limit or byte budget), we may not know total_lines.
         // Efficiently count remaining lines without storing them.
-        let hit_eof = !byte_budget_exceeded && {
-            // If we broke out of the loop because line_idx >= end, there may be more lines.
-            // Check if there's at least one more line.
+        // Skip the peek when `read_past_end` is set — the loop already consumed a
+        // line beyond the requested range, proving more content exists.
+        let hit_eof = !byte_budget_exceeded && !read_past_end && {
+            // If we naturally exhausted the range without reading past it
+            // (i.e. file had exactly `offset + limit` lines), peek one more
+            // line to see whether the file continues.
             let peeked = lines_stream
                 .next_line()
                 .await
@@ -1943,6 +1949,49 @@ mod tests {
         assert!(content.contains("     2\tline2"));
         assert_eq!(result["has_more_before"], false);
         assert_eq!(result["has_more_after"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_has_more_after_exactly_one_past_end() {
+        // Regression: when a file has exactly offset + limit + 1 lines, the
+        // in-loop peek at `line_idx == end` consumed the extra line without
+        // recording it, then the post-loop peek found nothing and incorrectly
+        // set has_more_after = false.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.txt");
+        let path_str = path.to_str().unwrap();
+
+        // 6 lines total — offset=0, limit=5 → should return lines 1-5,
+        // has_more_after = true because line 6 exists.
+        let content: String = (1..=6).map(|i| format!("line-{i}\n")).collect();
+        FsWriteTool::new()
+            .execute(serde_json::json!({"path": path_str, "content": content}))
+            .await
+            .unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path_str, "offset": 0, "limit": 5}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["lines_returned"], 5);
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(
+            result["has_more_after"], true,
+            "file has 6 lines but only 5 returned — has_more_after must be true"
+        );
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("     1\tline-1"));
+        assert!(text.contains("     5\tline-5"));
+        assert!(
+            !text.contains("line-6"),
+            "line-6 should not appear in output"
+        );
+        // total_lines should NOT be present since we didn't read to EOF
+        assert!(
+            result.get("total_lines").is_none(),
+            "total_lines should be absent when not at EOF"
+        );
     }
 
     // ── FsListTool ────────────────────────────────────────────────────────────
