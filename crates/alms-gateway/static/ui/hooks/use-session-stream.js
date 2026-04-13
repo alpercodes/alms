@@ -35,7 +35,7 @@ import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
-import { activeSessionId } from '../state/sessions.js';
+import { activeSessionId, isDmSession } from '../state/sessions.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
 import { clearPendingMessage } from '../state/pending-messages.js';
@@ -352,6 +352,13 @@ export function openSessionStream(sessionId, opts) {
     on('token_delta', (e) => {
         const data = JSON.parse(e.data);
         if (data.source_agent) return; // suppress subagent interleaving
+        // Suppress token deltas for DM sessions.  The LLM's text response
+        // is internal processing -- it is never persisted to the shared DM
+        // session (finish_run skips persistence for DM).  Displaying it
+        // creates ghost messages that vanish on reload, pushing the real
+        // DM messages (delivered via dm_message SSE from send_message) out
+        // of view and making prior-round messages appear missing.
+        if (isDmSession.value) return;
         sawTokenDelta = true;
         deltaBuffer += data.delta;
         scheduleFlush();
@@ -742,10 +749,14 @@ export function openSessionStream(sessionId, opts) {
                 if (status === 'cancelled') {
                     msgs = [...msgs, { id: nextMsgId(), type: 'system', text: '(run cancelled)' }];
                 }
-                if (status === 'finished' && !sawTokenDelta) {
+                if (status === 'finished' && !sawTokenDelta && !isDmSession.value) {
                     // Only show "(run completed)" for runs that had no streamed
-                    // response (e.g. DM runs using send_message, tool-only runs).
+                    // response (e.g. tool-only runs on non-DM sessions).
                     // Normal chat runs already display the streamed text.
+                    // DM sessions suppress this because runs complete
+                    // frequently (each agent reply is a separate run) and
+                    // these transient system messages are never persisted,
+                    // creating visual noise that vanishes on reload.
                     msgs = [...msgs, { id: nextMsgId(), type: 'system', text: '(run completed)' }];
                 }
 
