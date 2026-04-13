@@ -161,6 +161,12 @@ export function DmConversationView() {
                     return html`<${DmDivider} key=${m.id} text=${`Job '${m.jobName || 'job'}' ${m.status || 'completed'}`} />`;
                 }
                 if (m.type === 'tool') {
+                    if (m.tool === 'send_message') {
+                        // Successful send_message content already rendered as DmMessage
+                        // via dm_message SSE (live) / persisted session messages (reload).
+                        // Only show the tool row if it errored so the user sees the failure.
+                        if (m.status === 'done' && !m.error) return null;
+                    }
                     // Tool calls in DMs: render a styled ToolRow on the
                     // side of the agent that executed them. Tool messages
                     // don't have fromAgent, so attribute them to the
