@@ -17,9 +17,9 @@
  *   2. Session switch away -> chatMessages wiped, pending survives
  *   3. Session switch back -> loadSession() fetches history
  *   4. loadSession() calls reconcilePendingMessage() which checks if the
- *      message text appears in the loaded history:
+ *      run ID appears in the loaded history (via run_created events):
  *      - If yes: the backend persisted it, clear the pending entry
- *      - If no: re-inject it at the front of the message list
+ *      - If no: re-inject it at the end of the message list
  *   5. run_finished/error/cancelled -> clearPendingMessage(sessionId)
  *      (the run is done -- the message was either persisted or the run
  *      failed before persisting it; either way, the history is now the
@@ -27,23 +27,47 @@
  */
 
 /**
- * Map of session ID -> { text: string }
+ * Map of session ID -> { text: string, runId: string | null }
  *
  * Only one pending message per session is tracked because the UI queues
  * additional messages behind an active run (messageQueue), so at most one
  * un-persisted user message can exist per session at any time.
+ *
+ * The runId field enables definitive deduplication: when loadSession()
+ * reconciles pending messages against the loaded history, it matches by
+ * run ID (not by text content), avoiding false positives when the user
+ * sends identical text twice.  The runId is null initially (set by
+ * savePendingMessage before the HTTP response returns) and upgraded to
+ * the real value once createRun() resolves or run_created arrives.
  */
 const pendingMessages = new Map();
 
 /**
  * Save a pending user message for a session.
  * Called by startRun() after optimistically appending the message.
+ * The runId is initially null and should be set via setPendingRunId()
+ * once the createRun() response returns the run ID.
  *
  * @param {string} sessionId
  * @param {string} text - the user's message text
  */
 export function savePendingMessage(sessionId, text) {
-    pendingMessages.set(sessionId, { text });
+    pendingMessages.set(sessionId, { text, runId: null });
+}
+
+/**
+ * Attach the run ID to an existing pending message.
+ * Called after createRun() returns successfully so the pending entry
+ * can be matched definitively by run ID during reconciliation.
+ *
+ * @param {string} sessionId
+ * @param {string} runId
+ */
+export function setPendingRunId(sessionId, runId) {
+    const entry = pendingMessages.get(sessionId);
+    if (entry) {
+        entry.runId = runId;
+    }
 }
 
 /**
@@ -61,18 +85,9 @@ export function clearPendingMessage(sessionId) {
  * Get the pending message for a session (if any).
  *
  * @param {string} sessionId
- * @returns {{ text: string } | undefined}
+ * @returns {{ text: string, runId: string | null } | undefined}
  */
 export function getPendingMessage(sessionId) {
     return pendingMessages.get(sessionId);
 }
 
-/**
- * Check if a session has a pending message.
- *
- * @param {string} sessionId
- * @returns {boolean}
- */
-export function hasPendingMessage(sessionId) {
-    return pendingMessages.has(sessionId);
-}

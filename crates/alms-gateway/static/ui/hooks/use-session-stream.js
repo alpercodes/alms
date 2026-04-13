@@ -771,8 +771,11 @@ export function openSessionStream(sessionId, opts) {
             // (finished/error after execution started) or was never
             // persisted (cancelled before execution).  Either way, the
             // session history is now the source of truth.
-            const sid = activeSessionId.value;
-            if (sid) clearPendingMessage(sid);
+            //
+            // Use the stream's closure-captured sessionId (not
+            // activeSessionId.value) because the user may have switched
+            // to a different session before this run ended.
+            clearPendingMessage(sessionId);
         });
 
         // Process queued user messages via dynamic import

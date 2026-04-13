@@ -7,7 +7,7 @@ import { appendMessage, transformMessages } from '../../state/chat-actions.js';
 import { messageQueue } from '../../state/queue.js';
 import { localSettings } from '../../state/settings.js';
 import { createRun, cancelRun as apiCancelRun } from '../../api/runs.js';
-import { savePendingMessage, clearPendingMessage } from '../../state/pending-messages.js';
+import { savePendingMessage, setPendingRunId, clearPendingMessage } from '../../state/pending-messages.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
 
 /**
@@ -48,7 +48,13 @@ export async function startRun(text, opts) {
         if (settings.posture) runBody.posture = settings.posture;
         if (settings.debug_mode) runBody.debug_mode = true;
 
-        await createRun(runBody);
+        const runResp = await createRun(runBody);
+        // Attach the run ID to the pending message so reconciliation can
+        // match by run ID instead of text content (avoids false-positive
+        // deduplication when the user sends identical text twice).
+        if (sessionId && runResp?.run_id) {
+            setPendingRunId(sessionId, runResp.run_id);
+        }
         // No need to open a per-run SSE stream — the session stream
         // (opened by use-boot.js) receives all events automatically.
         // run_created → token_delta → run_finished all arrive there.

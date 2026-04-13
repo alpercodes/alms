@@ -100,14 +100,36 @@ export async function loadSession(sessionId, opts) {
         // session switch.)
         const pending = getPendingMessage(sessionId);
         if (pending) {
-            // Check whether the pending message's text matches the LAST
-            // user message in the history.  Using findLast (not .some)
-            // handles the edge case where the user sends the same text
-            // twice -- the pending entry always corresponds to the most
-            // recent message.
-            const lastUserMsg = mapped.findLast(m => m.type === 'user');
-            const alreadyInHistory = lastUserMsg && lastUserMsg.text === pending.text;
-            if (alreadyInHistory) {
+            // Determine whether the backend has persisted the pending
+            // message by checking the run's status.  The runs list was
+            // fetched in step 1 and is available in runs.value.
+            //
+            // If the pending entry has a runId, look up that run.  A run
+            // that has progressed past "queued" means the agent loop has
+            // started and will have persisted the user message to the
+            // session history -- so the loaded history is trustworthy.
+            //
+            // This avoids false-positive deduplication via text matching:
+            // if the user sends identical text twice and switches away
+            // before the second is persisted, text comparison would
+            // incorrectly match the first occurrence and drop the second.
+            let alreadyPersisted = false;
+            if (pending.runId) {
+                const run = runs.value.find(r => r.run_id === pending.runId);
+                // "running", "finished", "error", "cancelled" all mean the
+                // agent loop started (or completed) and the user message
+                // was persisted to the session DB.  Only "queued" means
+                // the message may not yet be in the history.
+                alreadyPersisted = run && run.status !== 'queued';
+            } else {
+                // runId not yet available (createRun response has not
+                // returned).  Fall back to text matching as a best-effort
+                // check -- this window is very short (HTTP round-trip).
+                const lastUserMsg = mapped.findLast(m => m.type === 'user');
+                alreadyPersisted = lastUserMsg && lastUserMsg.text === pending.text;
+            }
+
+            if (alreadyPersisted) {
                 // Backend has persisted it -- no longer pending.
                 clearPendingMessage(sessionId);
             } else {
