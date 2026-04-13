@@ -35,7 +35,7 @@ import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
-import { activeSessionId, activeSession } from '../state/sessions.js';
+import { activeSessionId, activeSession, dmParticipants } from '../state/sessions.js';
 import { activeAgent } from '../state/agents.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
@@ -48,6 +48,36 @@ import { clearPendingMessage } from '../state/pending-messages.js';
  * re-render when new thinking text arrives.
  */
 export const dmThinkingBuffers = signal(new Map());
+
+/**
+ * Derive the correct agent name for a DM reasoning block from the
+ * run's source field and the DM participants list.
+ *
+ * In a DM between Alice and Bob:
+ *   - source "peer:Alice" means Alice sent a message, so BOB is reasoning
+ *   - source "peer:Bob"   means Bob sent a message, so ALICE is reasoning
+ *
+ * Falls back to the active agent's name for non-peer sources (e.g. user-
+ * initiated runs) or when participants are not available.
+ *
+ * Fixes #692 — previously used `activeAgent.value?.name` which is the
+ * agent selected in the UI dropdown, not necessarily the one reasoning.
+ *
+ * @param {string|null} source - the run's source field (e.g. "peer:Alice")
+ * @returns {string|null} the name of the agent doing the reasoning
+ */
+function dmReasoningAgentName(source) {
+    if (source && source.startsWith('peer:')) {
+        const peerName = source.slice(5);
+        const participants = dmParticipants.value;
+        if (participants.length >= 2) {
+            // The peer triggered the run — the OTHER participant is reasoning.
+            return participants[0] === peerName ? participants[1] : participants[0];
+        }
+    }
+    // Fallback: best effort from the active agent selector.
+    return activeAgent.value?.name || null;
+}
 
 /**
  * Map error codes to user-friendly messages.
@@ -315,9 +345,13 @@ export function openSessionStream(sessionId, opts) {
                 // DM sessions: insert a live reasoning block entry instead of
                 // a thinking indicator. The block collects tool calls and
                 // thinking text as they arrive, then is sealed on run end.
-                // Use the active agent's name (the one doing the reasoning),
-                // not data.source (which is the peer that triggered the run).
-                const agentName = activeAgent.value?.name || null;
+                // Derive the reasoning agent's name from the source field:
+                // "peer:<name>" means <name> sent a message and the OTHER
+                // participant is doing the reasoning.  Fall back to the
+                // active agent for non-peer sources (e.g. user-initiated).
+                // Fixes #692 — was using activeAgent which is always the
+                // UI-selected agent, not necessarily the one reasoning.
+                const agentName = dmReasoningAgentName(data.source);
                 batch(() => {
                     activeRunId.value = data.run_id;
                     appendMessage({
@@ -369,7 +403,14 @@ export function openSessionStream(sessionId, opts) {
         if (isDm && data.run_id) {
             // DM session: replace the queued thinking indicator with a
             // live reasoning block now that the run is actually executing.
-            const agentName = activeAgent.value?.name || null;
+            // Extract the source from the queued thinking indicator (set
+            // by run_created) so we can derive the correct agent name.
+            // Fixes #692 — was using activeAgent which is always the
+            // UI-selected agent, not necessarily the one reasoning.
+            const thinkingMsg = chatMessages.value.find(
+                m => m.type === 'thinking' && m.queuedBehind > 0
+            );
+            const agentName = dmReasoningAgentName(thinkingMsg?.source);
             transformMessages(msgs => {
                 const filtered = msgs.filter(m => !(m.type === 'thinking' && m.queuedBehind > 0));
                 // Only add reasoning block if one does not already exist

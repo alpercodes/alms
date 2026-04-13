@@ -344,6 +344,13 @@ export function mapHistoryMessages(msgs, opts) {
                 if (!enrichedRunId && enriched.runId) enrichedRunId = enriched.runId;
             }
 
+            // Propagate from_agent from reasoning metadata so that
+            // groupDmReasoningBlocks() can attribute tool-only groups
+            // to the correct agent.  Fixes #692 — tool entries lacked
+            // fromAgent, so groups with only tools had agentName: null.
+            const fromAgent = isReasoning && m.metadata && m.metadata.from_agent
+                ? m.metadata.from_agent : undefined;
+
             pushEntry({
                 id: invocationId || callId || nextMsgId(),
                 type: 'tool',
@@ -359,6 +366,7 @@ export function mapHistoryMessages(msgs, opts) {
                 result: result,
                 runId: enrichedRunId || undefined,
                 isReasoning: isReasoning || undefined,
+                fromAgent,
             }, m.timestamp);
         } else if (m.type === 'image') {
             // DM image messages use the same metadata pattern as text. (#546)
@@ -523,6 +531,11 @@ export function groupDmReasoningBlocks(entries) {
                 agentName: null, thinkingText: '', tools: [], firstIdx: i,
             };
             group.tools.push(e);
+            // Propagate fromAgent from tool entries so groups with only
+            // tools (no thinking text) still get the correct agent name.
+            // Fixes #692 — tool entries now carry fromAgent from reasoning
+            // metadata (see mapHistoryMessages).
+            group.agentName = group.agentName || e.fromAgent;
             if (!groups.has(e.runId)) groups.set(e.runId, group);
             continue;
         }
