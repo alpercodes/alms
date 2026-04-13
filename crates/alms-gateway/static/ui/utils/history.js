@@ -108,6 +108,7 @@ function buildToolCallIndex(toolCalls) {
  */
 export function mapHistoryMessages(msgs, opts) {
     const hasActiveRun = opts && opts.hasActiveRun;
+    const isDm = opts && opts.isDm;
     const sessionToolCalls = (opts && opts.sessionToolCalls) || [];
     const toolCallIndex = sessionToolCalls.length > 0
         ? buildToolCallIndex(sessionToolCalls)
@@ -429,6 +430,12 @@ export function mapHistoryMessages(msgs, opts) {
                         : (hasActiveRun ? 'running' : 'done'),
                     result: result,
                     runId: pair.runId || undefined,
+                    // For DM sessions: mark merged tool entries as reasoning
+                    // so groupDmReasoningBlocks() can collect them even when
+                    // session history persistence failed (fire-and-forget).
+                    // Fixes #687 -- tool calls missing from reasoning blocks
+                    // after reload when session-level persistence was lost.
+                    isReasoning: isDm || undefined,
                 },
                 ts: pair.call.timestamp || null,
             });

@@ -82,10 +82,15 @@ export async function loadSession(sessionId, opts) {
 
         const rawMsgs = historyData.messages || [];
         const sessionToolCalls = toolCallData.tool_calls || [];
+        // Resolve DM flag early so mapHistoryMessages can annotate
+        // merged tool entries with isReasoning for DM sessions.
+        const sessionObj = sessions.value.find(s => s.id === sessionId);
+        const isDmSession = sessionObj?.session_type === 'dm';
 
         const mapped = mapHistoryMessages(rawMsgs, {
             hasActiveRun: !!activeRunId.value,
             sessionToolCalls,
+            isDm: isDmSession,
         });
 
         // Diagnostic: log tool call counts for #501 investigation.
@@ -152,8 +157,6 @@ export async function loadSession(sessionId, opts) {
         }
 
         // For DM sessions, group reasoning entries into collapsible blocks.
-        const sessionObj = sessions.value.find(s => s.id === sessionId);
-        const isDmSession = sessionObj?.session_type === 'dm';
         const grouped = isDmSession ? groupDmReasoningBlocks(mapped) : mapped;
         replaceMessages(grouped);
         lastEventId = historyData.last_event_id ?? null;

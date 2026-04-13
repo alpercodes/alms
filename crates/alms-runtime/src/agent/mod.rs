@@ -506,7 +506,19 @@ impl AgentRuntime {
                 // reasoning (Role::User with message_type="reasoning") so
                 // the UI can display it in a collapsible reasoning block
                 // after page reload.
-                if !response.is_empty() && response != alms_core::MAX_ITERATIONS_SENTINEL {
+                //
+                // However, when the agent loop executed tool calls, the
+                // thinking text was already persisted by
+                // `persist_assistant_tool_calls` as part of the tool call
+                // batch.  Persisting it again here would produce duplicate
+                // reasoning text entries that `groupDmReasoningBlocks()`
+                // concatenates, resulting in doubled text on page reload.
+                // Skip persistence when tool calls were present.  (Fixes #687)
+                let dm_text_already_persisted = is_dm && !tool_calls.is_empty();
+                if !response.is_empty()
+                    && response != alms_core::MAX_ITERATIONS_SENTINEL
+                    && !dm_text_already_persisted
+                {
                     let (role, metadata) = if is_dm {
                         if let Some(meta) = self.dm_reasoning_metadata(is_dm) {
                             (SessionRole::User, Some(meta))
