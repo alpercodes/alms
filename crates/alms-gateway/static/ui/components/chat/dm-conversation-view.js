@@ -8,12 +8,13 @@
  * Relates to #604.
  */
 
-import { html, useEffect, useRef, effect, renderMarkdown } from '../../deps.js';
+import { html, useEffect, useRef, useState, effect, renderMarkdown } from '../../deps.js';
 import { chatMessages } from '../../state/chat.js';
 import { dmParticipants } from '../../state/sessions.js';
 import { activeAgent } from '../../state/agents.js';
 import { scrollToBottom } from '../../utils/format.js';
 import { ToolRow } from './tool-row.js';
+import { dmThinkingBuffers } from '../../hooks/use-session-stream.js';
 
 /**
  * Determine which "side" a message belongs to in the DM view.
@@ -71,6 +72,59 @@ function DmDivider({ text }) {
     return html`
         <div class="dm-ended-banner">
             <span class="dm-ended-label">${text}</span>
+        </div>
+    `;
+}
+
+/**
+ * Collapsible reasoning block for DM conversations.
+ * Groups the agent's thinking text and tool calls for a single run.
+ * Collapsed by default; expanding reveals thinking text and ToolRow components.
+ */
+function DmReasoningBlock({ runId, agentName, thinkingText, tools, status, isLive }) {
+    const [expanded, setExpanded] = useState(false);
+
+    // For live blocks, read accumulated thinking text from the signal buffer.
+    const liveThinking = isLive ? (dmThinkingBuffers.value.get(runId) || '') : '';
+    const displayThinking = thinkingText || liveThinking;
+
+    // Visible tools: hide successful send_message (the DM bubble is already shown).
+    // Show send_message while running (with spinner) or on failure.
+    const visibleTools = (tools || []).filter(
+        t => !(t.tool === 'send_message' && t.status === 'done')
+    );
+    const toolCount = visibleTools.length;
+
+    // Empty + sealed blocks are hidden entirely.
+    if (!isLive && toolCount === 0 && (!displayThinking || !displayThinking.trim())) {
+        return null;
+    }
+
+    const blockClass = 'dm-reasoning-block'
+        + (status === 'failed' ? ' dm-reasoning-block--failed' : '')
+        + (isLive ? ' dm-reasoning-block--live' : '');
+    const toggle = expanded ? '\u25BC' : '\u25B6';
+    const label = agentName
+        ? `${agentName} reasoning -- ${toolCount} tool call${toolCount !== 1 ? 's' : ''}`
+        : `Agent reasoning -- ${toolCount} tool call${toolCount !== 1 ? 's' : ''}`;
+
+    return html`
+        <div class=${blockClass}>
+            <div class="dm-reasoning-header" onClick=${() => setExpanded(!expanded)}>
+                <span class="dm-reasoning-toggle">${toggle}</span>
+                <span class="dm-reasoning-summary">${label}</span>
+                ${isLive && html`<span class="dm-reasoning-spinner" />`}
+            </div>
+            ${expanded && html`
+                <div class="dm-reasoning-body">
+                    ${displayThinking && displayThinking.trim() && html`
+                        <pre class="dm-reasoning-thinking">${displayThinking}</pre>
+                    `}
+                    ${visibleTools.map(t => html`
+                        <${ToolRow} key=${t.id} ...${t} />
+                    `)}
+                </div>
+            `}
         </div>
     `;
 }
@@ -159,6 +213,9 @@ export function DmConversationView() {
                 }
                 if (m.type === 'job_completed') {
                     return html`<${DmDivider} key=${m.id} text=${`Job '${m.jobName || 'job'}' ${m.status || 'completed'}`} />`;
+                }
+                if (m.type === 'dm_reasoning') {
+                    return html`<${DmReasoningBlock} key=${m.id} ...${m} />`;
                 }
                 if (m.type === 'tool') {
                     if (m.tool === 'send_message') {

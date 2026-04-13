@@ -35,6 +35,17 @@ pub fn is_synthetic_marker(msg: &Message) -> bool {
         return true;
     }
 
+    // Reasoning messages (agent's internal thinking/tool calls persisted
+    // for UI display) should not appear in DM conversation output.
+    // These are persisted with message_type="reasoning" and are only
+    // intended for the web UI's collapsible reasoning blocks, not for
+    // peer agents to see via read_messages/read_session tools.
+    if let Some(ref meta) = msg.metadata
+        && meta.get("message_type").and_then(|v| v.as_str()) == Some("reasoning")
+    {
+        return true;
+    }
+
     // Single canonical check: all lifecycle markers set "synthetic": true.
     if let Some(ref meta) = msg.metadata
         && meta.get("synthetic").and_then(|v| v.as_bool()) == Some(true)
@@ -155,6 +166,41 @@ mod tests {
             timestamp: alms_core::Timestamp::now(),
             metadata: None,
         };
+        assert!(is_synthetic_marker(&msg));
+    }
+
+    #[test]
+    fn reasoning_text_is_filtered() {
+        let msg = msg_with_meta(
+            "Let me think about how to respond...",
+            Some(serde_json::json!({
+                "message_type": "reasoning",
+                "from_agent": "alice",
+                "from_agent_id": "00000000-0000-0000-0000-000000000001",
+                "run_id": "00000000-0000-0000-0000-000000000099",
+            })),
+        );
+        assert!(
+            is_synthetic_marker(&msg),
+            "Reasoning text with message_type=reasoning must be filtered"
+        );
+    }
+
+    #[test]
+    fn reasoning_does_not_leak_to_peers() {
+        // Verify that a reasoning message is always treated as synthetic,
+        // regardless of other metadata fields. This is the load-bearing
+        // invariant that prevents reasoning text from leaking to peer
+        // agents via read_messages/read_session tools.
+        let msg = msg_with_meta(
+            "I should call read_session first",
+            Some(serde_json::json!({
+                "message_type": "reasoning",
+                "from_agent": "bob",
+                "from_agent_id": "00000000-0000-0000-0000-000000000002",
+                "run_id": "00000000-0000-0000-0000-000000000100",
+            })),
+        );
         assert!(is_synthetic_marker(&msg));
     }
 
