@@ -11,6 +11,8 @@
  *   3. Merge tool call data into history -> mapHistoryMessages -> set chatMessages
  *   4. If active run: append thinking indicator + reconstruct approvals
  *   5. Open SSE stream with lastEventId to skip event replay
+ *   6. Restore agent phase (MUST be after step 5 — openSessionStream
+ *      calls clearAgentPhase() internally during teardown)
  */
 
 import { getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
@@ -21,6 +23,9 @@ import { chatMessages, nextMsgId } from '../state/chat.js';
 import { replaceMessages, appendMessage } from '../state/chat-actions.js';
 import { activeRunId, runs } from '../state/runs.js';
 import { openSessionStream } from '../hooks/use-session-stream.js';
+import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-status.js';
+import { sessions } from '../state/sessions.js';
+import { activeAgent } from '../state/agents.js';
 import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
 
 /**
@@ -160,6 +165,7 @@ export async function loadSession(sessionId, opts) {
         if (!chatMessages.value.some(m => m.type === 'thinking')) {
             appendMessage({ id: nextMsgId(), type: 'thinking' });
         }
+
         try {
             const approvalData = await listApprovals(sessionId);
             if (isStale()) return;
@@ -186,6 +192,52 @@ export async function loadSession(sessionId, opts) {
 
     // Step 4: Open persistent session stream, skipping replay of events
     // already reflected in the loaded message history.
+    //
+    // IMPORTANT: openSessionStream() calls closeSessionStream() internally,
+    // which calls clearAgentPhase(). Any phase restoration must happen
+    // AFTER this call, not before — otherwise it gets wiped immediately.
     if (isStale()) return;
     openSessionStream(sessionId, { lastEventId });
+
+    // Step 5: Restore agent phase for in-progress runs.
+    //
+    // Status events are ephemeral (not persisted to the session event
+    // log), so when the user switches away from a session and then
+    // switches back, the SSE stream replay contains no status event and
+    // the header bar stays blank until the backend emits the next phase
+    // update.  Setting a reasonable default here bridges the gap.
+    //
+    // This MUST happen after openSessionStream() because that function
+    // calls closeSessionStream() -> clearAgentPhase() as part of its
+    // teardown-then-open sequence.
+    //
+    // The placeholder phase set here is temporary — the next real
+    // run_finished, run_error, or run_cancelled SSE event will clear it
+    // via clearAgentPhase(), and any status event will override it with
+    // the actual phase.
+    if (activeRunId.value) {
+        const session = sessions.value.find(s => s.id === sessionId);
+        if (session && session.session_type === 'dm' && Array.isArray(session.participants)) {
+            // DM session: derive the peer name by finding the participant
+            // that is NOT the active agent, then set the DM context so
+            // the status bar shows "Chatting with {peer}...".
+            const agentName = activeAgent.value?.name;
+            const peer = agentName
+                ? session.participants.find(p => p !== agentName)
+                : session.participants[0];
+            if (peer) {
+                setDmContext(peer);
+            } else {
+                setAgentPhase('calling_llm', null);
+            }
+        } else {
+            setAgentPhase('calling_llm', null);
+        }
+    } else {
+        // No active run — explicitly clear the phase so stale state from
+        // a previous session cannot leak through.  (This is also handled
+        // by closeSessionStream() above, but the explicit clear here
+        // serves as self-documentation of the invariant.)
+        clearAgentPhase();
+    }
 }
