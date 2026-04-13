@@ -19,6 +19,65 @@ fn is_denied_path(path: &Path) -> bool {
         })
 }
 
+/// Blocked Unix device paths that produce infinite output or hang.
+#[cfg(unix)]
+const BLOCKED_DEVICE_PATHS: &[&str] = &[
+    "/dev/zero",
+    "/dev/random",
+    "/dev/urandom",
+    "/dev/stdin",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/tty",
+    "/dev/console",
+    "/proc/self/fd/0",
+    "/proc/self/fd/1",
+    "/proc/self/fd/2",
+];
+
+/// Blocked Windows reserved device names (case-insensitive).
+///
+/// These are special device names on Windows that can appear anywhere in a
+/// path (e.g. `C:\whatever\CON` still opens the console device).
+#[cfg(windows)]
+const BLOCKED_DEVICE_NAMES: &[&str] = &[
+    "CON", "NUL", "PRN", "AUX", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Check whether a path references a blocked device that could hang or
+/// produce infinite output.
+///
+/// On Unix: exact-match against known `/dev/*` and `/proc/self/fd/*` paths.
+/// On Windows: case-insensitive match against reserved device names (the
+/// file-stem portion, ignoring extension — Windows treats `NUL.txt` the
+/// same as `NUL`).
+fn is_blocked_device_path(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        let s = path.to_str().unwrap_or("");
+        if BLOCKED_DEVICE_PATHS.iter().any(|&d| d == s) {
+            return true;
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // On Windows, reserved names are matched by file stem (the part
+        // before the first dot), case-insensitively, regardless of where
+        // they appear in the directory tree.
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && BLOCKED_DEVICE_NAMES
+                .iter()
+                .any(|&d| d.eq_ignore_ascii_case(stem))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Resolve a path and verify it falls within the sandbox root.
 ///
 /// Relative paths are joined to `sandbox_root`. Absolute paths are checked
@@ -562,7 +621,7 @@ impl Tool for FsReadTool {
     fn description(&self) -> &str {
         "Read a file with line numbers (cat -n format). Supports partial reads via offset/limit. \
          Returns content with 1-based line numbers, has_more_before/has_more_after indicators, \
-         and total_lines when known (file read to EOF). Max file size: 2 MiB."
+         and total_lines when known (file read to EOF). Max file size: 256 KB."
     }
 
     fn is_builtin(&self) -> bool {
@@ -593,8 +652,8 @@ impl Tool for FsReadTool {
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
-        /// Maximum file size we will attempt to read (2 MiB).
-        const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+        /// Maximum file size we will attempt to read (256 KiB).
+        const MAX_READ_BYTES: u64 = 256 * 1024;
         /// Maximum accumulated bytes in the formatted output (512 KiB).
         const MAX_OUTPUT_BYTES: usize = 512 * 1024;
 
@@ -625,6 +684,14 @@ impl Tool for FsReadTool {
             None => 2000,
         };
 
+        // Block device paths that would hang or produce infinite output.
+        if is_blocked_device_path(Path::new(path)) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Cannot read device path '{}' — this is a system device, not a regular file",
+                path
+            )));
+        }
+
         // Deny-list check: block access to sensitive files regardless of sandbox scope.
         if is_denied_path(Path::new(path)) {
             return Err(SandboxError::SandboxViolation(format!(
@@ -640,6 +707,12 @@ impl Tool for FsReadTool {
         };
 
         // Also check the resolved path (handles relative traversals like ../data/secrets.json).
+        if is_blocked_device_path(&resolved) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Cannot read device path '{}' — this is a system device, not a regular file",
+                path
+            )));
+        }
         if is_denied_path(&resolved) {
             return Err(SandboxError::SandboxViolation(format!(
                 "Access to '{}' is denied",
@@ -647,15 +720,25 @@ impl Tool for FsReadTool {
             )));
         }
 
-        // File size guard — reject files larger than 2 MiB.
+        // Retrieve metadata and verify the path is a regular file.
         let meta = tokio::fs::metadata(&resolved)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+
+        if !meta.is_file() {
+            return Err(SandboxError::InvalidParameters(format!(
+                "Path '{}' is not a regular file",
+                path
+            )));
+        }
+
+        // File size guard — reject files larger than 256 KiB.
         if meta.len() > MAX_READ_BYTES {
             return Err(SandboxError::InvalidParameters(format!(
-                "File too large for fs_read ({} bytes, max {}). Use shell 'head'/'tail' for large files.",
-                meta.len(),
-                MAX_READ_BYTES
+                "File '{}' is {} bytes, which exceeds the maximum read size of 256 KB. \
+                 Use offset and limit parameters to read a portion of the file.",
+                path,
+                meta.len()
             )));
         }
 
@@ -1773,8 +1856,8 @@ mod tests {
     async fn test_fs_read_file_too_large() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("huge.txt");
-        // Create a file slightly over 2 MiB
-        let content = "x".repeat(2 * 1024 * 1024 + 1);
+        // Create a file slightly over 256 KB
+        let content = "x".repeat(256 * 1024 + 1);
         std::fs::write(&path, &content).unwrap();
 
         let result = FsReadTool::new()
@@ -1782,31 +1865,48 @@ mod tests {
             .await;
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("too large"), "got: {err_msg}");
+        assert!(
+            err_msg.contains("exceeds the maximum read size"),
+            "got: {err_msg}"
+        );
+        // Error message should suggest using offset/limit
+        assert!(
+            err_msg.contains("offset and limit"),
+            "error should suggest offset/limit, got: {err_msg}"
+        );
     }
 
     #[tokio::test]
     async fn test_fs_read_byte_budget_truncation() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wide.txt");
-        // Each line is ~1KB, 600 lines = ~600KB which exceeds 512KB budget
-        let long_line = "A".repeat(1000);
-        let content: String = (1..=600).map(|_| format!("{}\n", long_line)).collect();
+        let path = dir.path().join("many_lines.txt");
+        // Many very short lines: each line is 2 bytes on disk ("x\n") but
+        // ~10 bytes formatted ("     1\tx\n"). 40k lines = 80KB on disk
+        // (under 256KB limit) but ~400KB formatted, which eventually
+        // exceeds the 512KB output budget when requesting all lines.
+        // To reliably hit the budget: use slightly longer lines.
+        // 10-char lines: 12 bytes on disk, ~20 bytes formatted.
+        // 30k lines = ~360KB on disk (over 256KB). Let's use 20k lines
+        // of 10-char each = ~220KB on disk (under 256KB), ~400KB formatted.
+        // That's still under 512KB. Use 1-char lines instead:
+        // 40k lines * 2 bytes = 80KB on disk. 40k * ~10 bytes = 400KB formatted.
+        // Need more: 60k lines * 2 bytes = 120KB on disk. 60k * 10 = 600KB formatted.
+        let content: String = (0..60_000).map(|_| "x\n").collect();
         std::fs::write(&path, &content).unwrap();
 
         let result = FsReadTool::new()
             .execute(serde_json::json!({
                 "path": path.to_str().unwrap(),
-                "limit": 600
+                "limit": 60000
             }))
             .await
             .unwrap();
 
-        // Should have returned fewer than 600 lines due to byte budget
+        // Should have returned fewer than 60k lines due to byte budget
         let lines_returned = result["lines_returned"].as_u64().unwrap();
         assert!(
-            lines_returned < 600,
-            "expected fewer than 600 lines due to byte budget, got {lines_returned}"
+            lines_returned < 60_000,
+            "expected fewer than 60000 lines due to byte budget, got {lines_returned}"
         );
         assert_eq!(result["has_more_after"], true);
         assert_eq!(result["byte_budget_exceeded"], true);
@@ -1875,6 +1975,122 @@ mod tests {
         let text = result["content"].as_str().unwrap();
         assert!(text.contains("     6\tline-6"));
         assert!(text.contains("    10\tline-10"));
+    }
+
+    // ── FsReadTool safety limits (#666) ─────────────────────────────────────
+
+    #[test]
+    fn test_is_blocked_device_path_unix_devices() {
+        // On Unix these are exact-path matches; on Windows this function
+        // checks reserved device names — we verify whichever platform we're on.
+        #[cfg(unix)]
+        {
+            assert!(is_blocked_device_path(Path::new("/dev/zero")));
+            assert!(is_blocked_device_path(Path::new("/dev/random")));
+            assert!(is_blocked_device_path(Path::new("/dev/urandom")));
+            assert!(is_blocked_device_path(Path::new("/dev/stdin")));
+            assert!(is_blocked_device_path(Path::new("/dev/stdout")));
+            assert!(is_blocked_device_path(Path::new("/dev/stderr")));
+            assert!(is_blocked_device_path(Path::new("/dev/tty")));
+            assert!(is_blocked_device_path(Path::new("/dev/console")));
+            assert!(is_blocked_device_path(Path::new("/proc/self/fd/0")));
+            assert!(is_blocked_device_path(Path::new("/proc/self/fd/1")));
+            assert!(is_blocked_device_path(Path::new("/proc/self/fd/2")));
+        }
+    }
+
+    #[test]
+    fn test_is_blocked_device_path_windows_devices() {
+        #[cfg(windows)]
+        {
+            assert!(is_blocked_device_path(Path::new("CON")));
+            assert!(is_blocked_device_path(Path::new("NUL")));
+            assert!(is_blocked_device_path(Path::new("PRN")));
+            assert!(is_blocked_device_path(Path::new("AUX")));
+            assert!(is_blocked_device_path(Path::new("COM1")));
+            assert!(is_blocked_device_path(Path::new("LPT1")));
+            // Case-insensitive on Windows
+            assert!(is_blocked_device_path(Path::new("con")));
+            assert!(is_blocked_device_path(Path::new("nul")));
+            assert!(is_blocked_device_path(Path::new("Nul.txt")));
+        }
+    }
+
+    #[test]
+    fn test_is_blocked_device_path_regular_files() {
+        // Normal file paths should never be blocked.
+        assert!(!is_blocked_device_path(Path::new("hello.txt")));
+        assert!(!is_blocked_device_path(Path::new("/home/user/data.json")));
+        assert!(!is_blocked_device_path(Path::new("src/main.rs")));
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_blocked_device_path() {
+        // Attempt to read a device path — should be rejected before any I/O.
+        let device = if cfg!(unix) { "/dev/zero" } else { "NUL" };
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": device}))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Cannot read device path"),
+            "expected device path error, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("system device"),
+            "expected 'system device' in error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_directory_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": dir.path().to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not a regular file"),
+            "expected 'not a regular file', got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_size_error_includes_actual_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let size = 256 * 1024 + 100;
+        let content = "x".repeat(size);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        // Error must contain the actual file size
+        assert!(
+            err_msg.contains(&size.to_string()),
+            "error should contain actual file size {size}, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_under_limit_reads_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "hello\nworld\n").unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert_eq!(result["lines_returned"], 2);
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("hello"));
+        assert!(text.contains("world"));
     }
 
     // ── FsWriteTool ───────────────────────────────────────────────────────────
