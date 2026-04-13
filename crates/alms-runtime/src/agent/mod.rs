@@ -21,7 +21,7 @@ use alms_session::{
     Content as SessionContent, Message as SessionMessage, Role as SessionRole, SessionManager,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Span, debug, info, instrument, warn};
+use tracing::{Span, info, instrument, warn};
 
 use helpers::sanitize_error_for_session;
 
@@ -502,27 +502,28 @@ impl AgentRuntime {
                 // surfaced as a `run_warning` SSE event by the gateway and
                 // should not appear as a normal assistant bubble on reload.
                 //
-                // For DM sessions: do NOT persist the agent's final text
-                // response. The only messages in the shared DM session should
-                // be those written via `send_message` (through MessageBus) and
-                // error/cancellation markers. The agent's text response is
-                // internal processing noise — the agent was told to use
-                // `send_message` to reply.
-                if !response.is_empty() && response != alms_core::MAX_ITERATIONS_SENTINEL && !is_dm
-                {
+                // For DM sessions: persist the final text response as
+                // reasoning (Role::User with message_type="reasoning") so
+                // the UI can display it in a collapsible reasoning block
+                // after page reload.
+                if !response.is_empty() && response != alms_core::MAX_ITERATIONS_SENTINEL {
+                    let (role, metadata) = if is_dm {
+                        if let Some(meta) = self.dm_reasoning_metadata(is_dm) {
+                            (SessionRole::User, Some(meta))
+                        } else {
+                            (SessionRole::Assistant, None)
+                        }
+                    } else {
+                        (SessionRole::Assistant, None)
+                    };
                     let reply_msg = SessionMessage {
                         id: uuid::Uuid::new_v4().to_string(),
-                        role: SessionRole::Assistant,
+                        role,
                         content: SessionContent::Text(response.clone()),
                         timestamp: alms_core::Timestamp::now(),
-                        metadata: None,
+                        metadata,
                     };
                     session_manager.append_message(session_id, reply_msg)?;
-                } else if !response.is_empty() && is_dm {
-                    debug!(
-                        context_id = %context_id,
-                        "DM session — skipping text response storage (agent should use send_message)"
-                    );
                 }
 
                 info!(

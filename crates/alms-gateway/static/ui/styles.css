@@ -3051,6 +3051,73 @@ select.settings-input-sm {
   border-right: 3px solid var(--accent);
 }
 
+/* ── DM Reasoning Blocks (#685) ── */
+.dm-reasoning-block {
+  align-self: center;
+  max-width: 90%;
+  width: 100%;
+  margin: var(--space-2) auto;
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  overflow: hidden;
+}
+.dm-reasoning-block--failed {
+  border-left: 3px solid var(--error);
+}
+.dm-reasoning-block--live {
+  border-color: var(--accent);
+  border-style: solid;
+}
+.dm-reasoning-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  user-select: none;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.dm-reasoning-header:hover {
+  background: var(--surface-2);
+}
+.dm-reasoning-toggle {
+  font-size: 10px;
+  width: 1em;
+  text-align: center;
+  flex-shrink: 0;
+}
+.dm-reasoning-summary {
+  flex-grow: 1;
+}
+.dm-reasoning-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-subtle);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+.dm-reasoning-body {
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px dashed var(--border-subtle);
+}
+.dm-reasoning-thinking {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+  margin: 0 0 var(--space-2) 0;
+  padding: var(--space-2);
+  background: var(--surface-0);
+  border-radius: var(--radius-sm);
+}
+
 /* Footer bar — read-only notice */
 .dm-view-footer {
   flex-shrink: 0;

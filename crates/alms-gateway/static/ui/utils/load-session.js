@@ -17,7 +17,7 @@
 
 import { getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
 import { listRuns, listApprovals } from '../api/runs.js';
-import { mapHistoryMessages } from './history.js';
+import { mapHistoryMessages, groupDmReasoningBlocks } from './history.js';
 import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { replaceMessages, appendMessage } from '../state/chat-actions.js';
@@ -151,7 +151,11 @@ export async function loadSession(sessionId, opts) {
             }
         }
 
-        replaceMessages(mapped);
+        // For DM sessions, group reasoning entries into collapsible blocks.
+        const sessionObj = sessions.value.find(s => s.id === sessionId);
+        const isDmSession = sessionObj?.session_type === 'dm';
+        const grouped = isDmSession ? groupDmReasoningBlocks(mapped) : mapped;
+        replaceMessages(grouped);
         lastEventId = historyData.last_event_id ?? null;
     } catch (err) {
         if (isStale()) return;

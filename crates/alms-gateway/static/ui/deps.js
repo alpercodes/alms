@@ -2,7 +2,7 @@
 // Actual CDN URLs are pinned in index.html's importmap — this file
 // just re-exports so components import from one place.
 import { h, render } from 'preact';
-import { useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'preact/hooks';
 import { signal, computed, effect, batch, useSignal } from '@preact/signals';
 import htm from 'htm';
 import { marked } from 'marked';
@@ -33,4 +33,4 @@ export function renderMarkdown(src) {
     return DOMPurify.sanitize(raw);
 }
 
-export { h, render, signal, computed, effect, batch, useSignal, html, useRef, useEffect, useCallback, useMemo };
+export { h, render, signal, computed, effect, batch, useSignal, html, useState, useRef, useEffect, useCallback, useMemo };

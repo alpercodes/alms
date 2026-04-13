@@ -71,11 +71,15 @@ function buildToolCallIndex(toolCalls) {
     for (const tc of toolCalls) {
         const key = tc.tool_id;
         if (!key) continue;
-        const entry = index.get(key) || { call: null, result: null };
+        const entry = index.get(key) || { call: null, result: null, runId: null };
         if (tc.role === 'assistant' || tc.role === 'Assistant') {
             entry.call = tc;
+            // Preserve run_id from the tool call record for reasoning
+            // block grouping in DM sessions.
+            if (tc.run_id) entry.runId = tc.run_id;
         } else if (tc.role === 'tool' || tc.role === 'Tool') {
             entry.result = tc;
+            if (tc.run_id && !entry.runId) entry.runId = tc.run_id;
         }
         index.set(key, entry);
     }
@@ -158,6 +162,23 @@ export function mapHistoryMessages(msgs, opts) {
                     type: 'dm_ended',
                     peer: m.metadata.ended_by || 'unknown',
                     reason: reasonLabels[rawReason] || rawReason || 'conversation ended',
+                }, m.timestamp);
+                continue;
+            }
+
+            // Reasoning text persisted from DM sessions (#685).
+            // These are the agent's internal thinking text, stored as
+            // Role::User with message_type="reasoning". Map them to a
+            // special type that groupDmReasoningBlocks() can collect.
+            const isReasoningText = m.metadata
+                && m.metadata.message_type === 'reasoning';
+            if (isReasoningText) {
+                pushEntry({
+                    id: nextMsgId(),
+                    type: 'dm_reasoning_text',
+                    text: m.content || '',
+                    fromAgent: m.metadata.from_agent || null,
+                    runId: m.metadata.run_id || null,
                 }, m.timestamp);
                 continue;
             }
@@ -286,6 +307,13 @@ export function mapHistoryMessages(msgs, opts) {
             const matched = (callId ? resultMap.get(callId) : null)
                 || (invocationId ? resultByInvocationId.get(invocationId) : null);
 
+            // Extract run_id from reasoning metadata for DM block grouping.
+            const runId = (m.metadata && m.metadata.run_id) || null;
+            // If the tool call has reasoning metadata, it belongs to a
+            // DM reasoning block (persisted by the runtime for DM sessions).
+            const isReasoning = m.metadata
+                && m.metadata.message_type === 'reasoning';
+
             // Enrich from session-level tool call records when the message
             // history lacks params or the matched result is empty.  This is
             // critical for DM sessions where tool calls live only in
@@ -294,6 +322,7 @@ export function mapHistoryMessages(msgs, opts) {
             let params = m.params;
             let result = matched ? matched.result : null;
             let resultOk = matched ? matched.ok : null;
+            let enrichedRunId = runId;
 
             if (callId && toolCallIndex.has(callId)) {
                 const enriched = toolCallIndex.get(callId);
@@ -310,6 +339,8 @@ export function mapHistoryMessages(msgs, opts) {
                     // If we got a result from the tool call index, it completed.
                     if (resultOk == null) resultOk = true;
                 }
+                // Propagate run_id from the session tool call index.
+                if (!enrichedRunId && enriched.runId) enrichedRunId = enriched.runId;
             }
 
             pushEntry({
@@ -325,6 +356,8 @@ export function mapHistoryMessages(msgs, opts) {
                 status: resultOk != null ? (resultOk ? 'done' : 'fail')
                     : (hasActiveRun ? 'running' : 'done'),
                 result: result,
+                runId: enrichedRunId || undefined,
+                isReasoning: isReasoning || undefined,
             }, m.timestamp);
         } else if (m.type === 'image') {
             // DM image messages use the same metadata pattern as text. (#546)
@@ -395,6 +428,7 @@ export function mapHistoryMessages(msgs, opts) {
                     status: ok != null ? (ok ? 'done' : 'fail')
                         : (hasActiveRun ? 'running' : 'done'),
                     result: result,
+                    runId: pair.runId || undefined,
                 },
                 ts: pair.call.timestamp || null,
             });
@@ -439,4 +473,91 @@ export function mapHistoryMessages(msgs, opts) {
     }
 
     return entries;
+}
+
+/**
+ * Group reasoning-related entries by runId into collapsible dm_reasoning
+ * blocks for DM sessions.
+ *
+ * Scans the flat entry list produced by mapHistoryMessages and collects
+ * `dm_reasoning_text` entries and `tool` entries that share the same
+ * `runId` (and have `isReasoning` set). Each group is replaced with a
+ * single `dm_reasoning` block entry at the position of the earliest
+ * member. Non-reasoning entries pass through unchanged.
+ *
+ * Empty blocks (no tools, no thinking text) are omitted.
+ *
+ * @param {Array} entries - flat chat message entries from mapHistoryMessages
+ * @returns {Array} entries with reasoning groups collapsed into dm_reasoning blocks
+ */
+export function groupDmReasoningBlocks(entries) {
+    // Accumulator: runId -> { agentName, thinkingText, tools[], firstIdx }
+    const groups = new Map();
+    // Track which indices belong to a reasoning group.
+    const reasoningIndices = new Set();
+
+    for (let i = 0; i < entries.length; i++) {
+        const e = entries[i];
+
+        if (e.type === 'dm_reasoning_text' && e.runId) {
+            reasoningIndices.add(i);
+            const group = groups.get(e.runId) || {
+                agentName: null, thinkingText: '', tools: [], firstIdx: i,
+            };
+            group.agentName = group.agentName || e.fromAgent;
+            group.thinkingText = (group.thinkingText || '') + (e.text || '');
+            if (!groups.has(e.runId)) groups.set(e.runId, group);
+            continue;
+        }
+
+        if (e.type === 'tool' && e.runId && e.isReasoning) {
+            reasoningIndices.add(i);
+            const group = groups.get(e.runId) || {
+                agentName: null, thinkingText: '', tools: [], firstIdx: i,
+            };
+            group.tools.push(e);
+            if (!groups.has(e.runId)) groups.set(e.runId, group);
+            continue;
+        }
+    }
+
+    if (groups.size === 0) return entries;
+
+    // Build result: replace groups at their firstIdx position,
+    // skip individual reasoning entries.
+    const result = [];
+    // Track which runIds have been inserted.
+    const inserted = new Set();
+
+    for (let i = 0; i < entries.length; i++) {
+        if (reasoningIndices.has(i)) {
+            const e = entries[i];
+            const runId = e.runId;
+            if (runId && groups.has(runId) && !inserted.has(runId)) {
+                const group = groups.get(runId);
+                // Skip empty blocks (no visible tools, no thinking text).
+                const visibleTools = group.tools.filter(
+                    t => !(t.tool === 'send_message' && t.status === 'done')
+                );
+                if (visibleTools.length > 0 || (group.thinkingText && group.thinkingText.trim())) {
+                    result.push({
+                        id: nextMsgId(),
+                        type: 'dm_reasoning',
+                        runId: runId,
+                        agentName: group.agentName,
+                        thinkingText: group.thinkingText || '',
+                        tools: group.tools,
+                        status: 'done',
+                        isLive: false,
+                    });
+                }
+                inserted.add(runId);
+            }
+            // Skip -- entry consumed into a group.
+            continue;
+        }
+        result.push(entries[i]);
+    }
+
+    return result;
 }
