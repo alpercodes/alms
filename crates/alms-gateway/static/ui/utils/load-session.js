@@ -21,6 +21,7 @@ import { chatMessages, nextMsgId } from '../state/chat.js';
 import { replaceMessages, appendMessage } from '../state/chat-actions.js';
 import { activeRunId, runs } from '../state/runs.js';
 import { openSessionStream } from '../hooks/use-session-stream.js';
+import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
 
 /**
  * Load a session's runs, chat history, pending approvals, and open SSE stream.
@@ -92,6 +93,37 @@ export async function loadSession(sessionId, opts) {
                 mappedTools, 'tool rows,',
                 sessionToolCalls.length, 'session tool call records');
         }
+        // Reconcile pending user messages: if the user sent a message and
+        // switched sessions before the backend persisted it, the history
+        // fetch will not contain it.  Re-inject it so the user sees their
+        // own message when switching back.  (Fixes message-loss on rapid
+        // session switch.)
+        const pending = getPendingMessage(sessionId);
+        if (pending) {
+            // Check whether the pending message's text matches the LAST
+            // user message in the history.  Using findLast (not .some)
+            // handles the edge case where the user sends the same text
+            // twice -- the pending entry always corresponds to the most
+            // recent message.
+            const lastUserMsg = mapped.findLast(m => m.type === 'user');
+            const alreadyInHistory = lastUserMsg && lastUserMsg.text === pending.text;
+            if (alreadyInHistory) {
+                // Backend has persisted it -- no longer pending.
+                clearPendingMessage(sessionId);
+            } else {
+                // Re-inject the user message at the end of the mapped
+                // history (before any thinking indicator added in step 3).
+                mapped.push({
+                    id: nextMsgId(),
+                    type: 'user',
+                    role: 'user',
+                    text: pending.text,
+                    sealed: true,
+                });
+                console.debug(`[${logPrefix}] re-injected pending user message for session`, sessionId);
+            }
+        }
+
         replaceMessages(mapped);
         lastEventId = historyData.last_event_id ?? null;
     } catch (err) {

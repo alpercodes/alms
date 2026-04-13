@@ -38,6 +38,7 @@ import { messageQueue } from '../state/queue.js';
 import { activeSessionId } from '../state/sessions.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
+import { clearPendingMessage } from '../state/pending-messages.js';
 
 /**
  * Map error codes to user-friendly messages.
@@ -765,6 +766,13 @@ export function openSessionStream(sessionId, opts) {
             });
             activeRunId.value = null;
             clearAgentPhase();
+
+            // The run has ended -- the user message is either persisted
+            // (finished/error after execution started) or was never
+            // persisted (cancelled before execution).  Either way, the
+            // session history is now the source of truth.
+            const sid = activeSessionId.value;
+            if (sid) clearPendingMessage(sid);
         });
 
         // Process queued user messages via dynamic import
