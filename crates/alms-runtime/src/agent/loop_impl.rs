@@ -574,7 +574,7 @@ impl AgentRuntime {
     }
 
     /// Process tool execution results: push tool result messages into the
-    /// conversation, persist to session (non-DM), and collect per-run records.
+    /// conversation, persist to session, and collect per-run records.
     #[allow(clippy::too_many_arguments)] // Private helper; the parameters are clear and grouping them into a struct would add indirection without real benefit.
     fn process_tool_results(
         &self,
