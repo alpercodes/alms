@@ -283,6 +283,7 @@ pub(super) async fn notify_dm_ended_to_webchat(
     let reason_text = match reason {
         "ignored" => "no further replies".to_string(),
         "depth_exceeded" => "message limit reached".to_string(),
+        "max_iterations" => "agent iteration limit reached".to_string(),
         other => other.to_string(),
     };
     super::markers::persist_lifecycle_marker(
@@ -635,6 +636,12 @@ pub(super) fn format_dm_ended_notification(
             format!(
                 "The conversation with agent \"{from_name}\" was terminated \
                  because the maximum message depth was reached."
+            )
+        }
+        ConversationEndReason::MaxIterations => {
+            format!(
+                "The conversation with agent \"{from_name}\" was terminated \
+                 because the agent hit its iteration limit while processing the DM."
             )
         }
     };
