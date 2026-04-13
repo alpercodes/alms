@@ -160,7 +160,13 @@ impl AgentRuntime {
         if !is_dm {
             return None;
         }
-        let name = self.agent_name.as_ref()?;
+        // Always return reasoning metadata for DM sessions, even when
+        // agent_name is None.  DM sessions require Role::User for all
+        // persisted messages (the DM invariant), so falling back to
+        // Role::Assistant when agent_name is missing would be wrong.
+        // Use "unknown" as the from_agent fallback to preserve the
+        // message_type marker that dm_filter relies on.
+        let name = self.agent_name.as_deref().unwrap_or("unknown");
         let run_id_str = self
             .run_id
             .as_ref()

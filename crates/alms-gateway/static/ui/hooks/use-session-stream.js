@@ -36,6 +36,7 @@ import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentBy
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
 import { activeSessionId, activeSession } from '../state/sessions.js';
+import { activeAgent } from '../state/agents.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
 import { clearPendingMessage } from '../state/pending-messages.js';
@@ -299,9 +300,9 @@ export function openSessionStream(sessionId, opts) {
             // DM sessions: insert a live reasoning block entry instead of
             // a thinking indicator. The block collects tool calls and
             // thinking text as they arrive, then is sealed on run end.
-            const agentName = data.source
-                ? (data.source.startsWith('peer:') ? data.source.slice(5) : data.source)
-                : null;
+            // Use the active agent's name (the one doing the reasoning),
+            // not data.source (which is the peer that triggered the run).
+            const agentName = activeAgent.value?.name || null;
             batch(() => {
                 activeRunId.value = data.run_id;
                 appendMessage({
@@ -817,11 +818,14 @@ export function openSessionStream(sessionId, opts) {
             const decision = status === 'cancelled' ? 'cancelled'
                 : status === 'error' ? 'cancelled' : 'expired';
 
-            // Flush accumulated thinking text into the reasoning block
-            // before sealing it, so the text is visible on expand.
+            // Read and save thinking text BEFORE deleting from buffer,
+            // so the transformMessages callback below can use it.
+            // (C1 fix: previously the delete happened first, then the
+            // callback read the updated signal and got empty string.)
+            let savedThinkingText = '';
             if (isDm && endingRunId) {
-                const thinkBuf = dmThinkingBuffers.value.get(endingRunId) || '';
-                if (thinkBuf) {
+                savedThinkingText = dmThinkingBuffers.value.get(endingRunId) || '';
+                if (savedThinkingText) {
                     const next = new Map(dmThinkingBuffers.value);
                     next.delete(endingRunId);
                     dmThinkingBuffers.value = next;
@@ -859,7 +863,7 @@ export function openSessionStream(sessionId, opts) {
                     }
                     // Seal live DM reasoning blocks for this run.
                     if (m.type === 'dm_reasoning' && m.runId === endingRunId && m.isLive) {
-                        const finalThinking = dmThinkingBuffers.value.get(endingRunId) || m.thinkingText || '';
+                        const finalThinking = savedThinkingText || m.thinkingText || '';
                         const blockStatus = status === 'error' ? 'failed'
                             : status === 'cancelled' ? 'cancelled' : 'done';
                         // Also cancel any still-running tools inside the block.
