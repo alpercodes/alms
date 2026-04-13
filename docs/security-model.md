@@ -278,7 +278,7 @@ Default posture recommendations:
 - Shell command denylist (best-effort) — **implemented**: substring-based denylist blocks `rm -rf /`, `mkfs.`, fork bombs, etc.; bypassable, defense-in-depth only
 - Shell env cleared — **implemented**: `env_clear()` prevents secret leakage to child processes
 - Shell cwd restricted — **implemented**: `shell_policy = "sandboxed"` restricts cwd to sandbox_root; persistent cwd validated against sandbox on each invocation
-- Strict output truncation — **implemented**: 30KB stdout/stderr cap with head+tail line preservation, fs_read line-based limits (default 2000 lines, 512KB output budget, 2MiB file size guard), UTF-8 safe truncation
+- Strict output truncation — **implemented**: 30KB stdout/stderr cap with head+tail line preservation, fs_read line-based limits (default 2000 lines, 512KB output budget, 256KB file size guard), UTF-8 safe truncation
 - No `sudo` — not yet enforced (command denylist not implemented; use OS-level restrictions)
 - Network allowlist empty by default — not yet implemented
 - Auto-approved tools skip approval in Guarded posture — **implemented**: `datetime`, `echo`, `list_agents`, `list_my_sessions`, `read_session`, `read_messages`, `read_subagent_session` return `is_auto_approved() = true`; all other tools still require user approval
