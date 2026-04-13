@@ -21,6 +21,9 @@ import { chatMessages, nextMsgId } from '../state/chat.js';
 import { replaceMessages, appendMessage } from '../state/chat-actions.js';
 import { activeRunId, runs } from '../state/runs.js';
 import { openSessionStream } from '../hooks/use-session-stream.js';
+import { setAgentPhase, setDmContext } from '../state/agent-status.js';
+import { sessions } from '../state/sessions.js';
+import { activeAgent } from '../state/agents.js';
 
 /**
  * Load a session's runs, chat history, pending approvals, and open SSE stream.
@@ -99,12 +102,40 @@ export async function loadSession(sessionId, opts) {
         replaceMessages([{ id: nextMsgId(), type: 'error', text: `Failed to load message history: ${err.error?.message || err.message || 'unknown error'}` }]);
     }
 
-    // Step 3: If a run is in-progress, append a thinking indicator and
-    // reconstruct pending approval prompts from the server so the user
-    // can still approve/deny waiting tool calls. (Fixes #487 Bug 2)
+    // Step 3: If a run is in-progress, append a thinking indicator,
+    // restore the agent phase signal, and reconstruct pending approval
+    // prompts from the server so the user can still approve/deny
+    // waiting tool calls. (Fixes #487 Bug 2)
+    //
+    // Phase restoration: status events are ephemeral (not persisted to
+    // the session event log), so when the user switches away from a
+    // session and then switches back, the SSE stream replay contains no
+    // status event and the header bar stays blank until the backend
+    // happens to emit the next phase update.  Setting a reasonable
+    // default here bridges the gap — the next real status event from
+    // the SSE stream will override it with the actual phase.
     if (activeRunId.value) {
         if (!chatMessages.value.some(m => m.type === 'thinking')) {
             appendMessage({ id: nextMsgId(), type: 'thinking' });
+        }
+
+        // Restore agent phase based on session type.
+        const session = sessions.value.find(s => s.id === sessionId);
+        if (session && session.session_type === 'dm' && Array.isArray(session.participants)) {
+            // DM session: derive the peer name by finding the participant
+            // that is NOT the active agent, then set the DM context so
+            // the status bar shows "Chatting with {peer}...".
+            const agentName = activeAgent.value?.name;
+            const peer = agentName
+                ? session.participants.find(p => p !== agentName)
+                : session.participants[0];
+            if (peer) {
+                setDmContext(peer);
+            } else {
+                setAgentPhase('calling_llm', null);
+            }
+        } else {
+            setAgentPhase('calling_llm', null);
         }
         try {
             const approvalData = await listApprovals(sessionId);
