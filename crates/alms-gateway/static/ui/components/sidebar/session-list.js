@@ -303,28 +303,31 @@ function SectionDivider({ label, cls }) {
 /**
  * Deduplicate and filter DM sessions for the sidebar.
  *
- * 1. **Participant filter**: Only include DM sessions where the active
- *    agent is a participant. Without this, all DM sessions appear for
- *    every agent (the backend does not filter by participant).
+ * 1. **Participant filter**: Only include DM sessions that have a
+ *    well-formed participants array (>= 2 entries). When an active
+ *    agent is known, further restrict to DMs where that agent is a
+ *    participant. Sessions with missing or malformed participants are
+ *    excluded -- the backend should always populate this field for
+ *    well-formed DM sessions.
  *
  * 2. **context_id dedup**: If the backend returns multiple entries with
  *    the same context_id (possible from legacy data where a DM session
  *    was stored under both the sentinel and the real agent_id), keep
- *    only the first occurrence.
+ *    only the first occurrence. Runs after the participant filter so
+ *    a malformed duplicate cannot shadow a valid entry.
  */
 function filteredDmSessions(allSessions, agentName) {
     const seen = new Set();
     const result = [];
     for (const s of allSessions) {
         if (s.session_type !== 'dm') continue;
+        // Participant filter: exclude DMs with missing/malformed participants
+        if (!Array.isArray(s.participants) || s.participants.length < 2) continue;
+        if (agentName && !s.participants.includes(agentName)) continue;
         // Deduplicate by context_id (same DM pair = same context)
         const key = s.context_id || s.id;
         if (seen.has(key)) continue;
         seen.add(key);
-        // Participant filter: only show DMs involving the active agent
-        if (agentName && Array.isArray(s.participants) && s.participants.length >= 2) {
-            if (!s.participants.includes(agentName)) continue;
-        }
         result.push(s);
     }
     return result;
