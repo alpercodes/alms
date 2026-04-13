@@ -186,10 +186,14 @@ export function DmConversationView() {
                     return null; // suppress token badges in DM view
                 }
                 if (m.type === 'thinking') {
-                    // Show which agent is thinking when source info is available.
-                    // DM thinking messages carry source like "peer:AgentName".
+                    // Queued runs show a distinct message so the user knows
+                    // the agent hasn't started processing yet. (#691)
                     let thinkLabel = 'Thinking\u2026';
-                    if (m.source) {
+                    if (m.queuedBehind > 0) {
+                        thinkLabel = 'Queued \u2014 waiting for agent\u2026';
+                    } else if (m.source) {
+                        // Show which agent is thinking when source info is available.
+                        // DM thinking messages carry source like "peer:AgentName".
                         const name = m.source.startsWith('peer:') ? m.source.slice(5) : m.source;
                         if (name) thinkLabel = `${name} is thinking\u2026`;
                     }

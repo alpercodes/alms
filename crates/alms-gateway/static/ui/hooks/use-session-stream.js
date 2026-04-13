@@ -297,28 +297,46 @@ export function openSessionStream(sessionId, opts) {
         }
 
         if (isDm && data.run_id) {
-            // DM sessions: insert a live reasoning block entry instead of
-            // a thinking indicator. The block collects tool calls and
-            // thinking text as they arrive, then is sealed on run end.
-            // Use the active agent's name (the one doing the reasoning),
-            // not data.source (which is the peer that triggered the run).
-            const agentName = activeAgent.value?.name || null;
-            batch(() => {
-                activeRunId.value = data.run_id;
-                appendMessage({
-                    id: nextMsgId(),
-                    type: 'dm_reasoning',
-                    runId: data.run_id,
-                    agentName: agentName,
-                    thinkingText: '',
-                    tools: [],
-                    status: 'running',
-                    isLive: true,
+            // DM sessions with queued runs: show a thinking indicator with
+            // queue state instead of a live reasoning block. The reasoning
+            // block will be created when run_started fires. (#691)
+            if (queuedBehind > 0) {
+                batch(() => {
+                    activeRunId.value = data.run_id;
+                    // Header bar is NOT updated here -- it should keep
+                    // showing the agent's current activity (e.g. a DM with
+                    // another peer).  The inline thinking indicator handles
+                    // the queued state via queuedBehind. (#693)
+                    appendMessage({
+                        id: nextMsgId(), type: 'thinking', source: data.source, queuedBehind,
+                    });
                 });
-            });
+            } else {
+                // DM sessions: insert a live reasoning block entry instead of
+                // a thinking indicator. The block collects tool calls and
+                // thinking text as they arrive, then is sealed on run end.
+                // Use the active agent's name (the one doing the reasoning),
+                // not data.source (which is the peer that triggered the run).
+                const agentName = activeAgent.value?.name || null;
+                batch(() => {
+                    activeRunId.value = data.run_id;
+                    appendMessage({
+                        id: nextMsgId(),
+                        type: 'dm_reasoning',
+                        runId: data.run_id,
+                        agentName: agentName,
+                        thinkingText: '',
+                        tools: [],
+                        status: 'running',
+                        isLive: true,
+                    });
+                });
+            }
         } else if (data.is_notification) {
             // Notification run from subagent completion or peer message --
-            // show thinking indicator with source context
+            // show thinking indicator with source context. The inline
+            // indicator handles queue state via queuedBehind; the header
+            // bar keeps showing the agent's current activity. (#693)
             batch(() => {
                 activeRunId.value = data.run_id;
                 appendMessage({
@@ -327,7 +345,9 @@ export function openSessionStream(sessionId, opts) {
             });
         } else if (queuedBehind > 0) {
             // User-initiated run but agent is busy -- update the existing
-            // thinking indicator (added by startRun) with queue position
+            // thinking indicator (added by startRun) with queue position.
+            // Header bar keeps its current state (the agent's real
+            // activity); the inline indicator shows queue status. (#693)
             batch(() => {
                 activeRunId.value = data.run_id;
                 updateMessage(
@@ -342,12 +362,50 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // -- run_started: the run has been dequeued and is now executing --
-    on('run_started', (_e) => {
-        // Transition thinking indicator from "queued" to active "Thinking..."
-        updateMessage(
-            m => m.type === 'thinking' && m.queuedBehind > 0,
-            m => ({ ...m, queuedBehind: 0 }),
-        );
+    on('run_started', (e) => {
+        const data = JSON.parse(e.data);
+        const isDm = activeSession.value?.session_type === 'dm';
+
+        if (isDm && data.run_id) {
+            // DM session: replace the queued thinking indicator with a
+            // live reasoning block now that the run is actually executing.
+            const agentName = activeAgent.value?.name || null;
+            transformMessages(msgs => {
+                const filtered = msgs.filter(m => !(m.type === 'thinking' && m.queuedBehind > 0));
+                // Only add reasoning block if one does not already exist
+                // for this run (it may already exist if run was not queued).
+                if (!filtered.some(m => m.type === 'dm_reasoning' && m.runId === data.run_id)) {
+                    filtered.push({
+                        id: nextMsgId(),
+                        type: 'dm_reasoning',
+                        runId: data.run_id,
+                        agentName: agentName,
+                        thinkingText: '',
+                        tools: [],
+                        status: 'running',
+                        isLive: true,
+                    });
+                }
+                return filtered;
+            });
+        } else {
+            // Non-DM: transition thinking indicator from "queued" to
+            // active "Thinking..."
+            updateMessage(
+                m => m.type === 'thinking' && m.queuedBehind > 0,
+                m => ({ ...m, queuedBehind: 0 }),
+            );
+        }
+
+        // Set header bar to the appropriate active phase now that the
+        // run is executing. DM runs with a peer get "Chatting with...",
+        // others get "Thinking..." until the first real status event
+        // arrives. (#691)
+        if (dmPeer.value) {
+            setAgentPhase('dm', dmPeer.value);
+        } else {
+            setAgentPhase('calling_llm', null);
+        }
         bumpRunListGeneration();
     });
 

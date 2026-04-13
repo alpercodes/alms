@@ -168,9 +168,18 @@ export async function loadSession(sessionId, opts) {
     // Step 3: If a run is in-progress, append a thinking indicator and
     // reconstruct pending approval prompts from the server so the user
     // can still approve/deny waiting tool calls. (Fixes #487 Bug 2)
+    //
+    // Distinguish queued vs running: queued runs show "Agent is busy"
+    // instead of "Thinking..." so the user knows the agent hasn't
+    // started processing yet. (#691)
     if (activeRunId.value) {
         if (!chatMessages.value.some(m => m.type === 'thinking')) {
-            appendMessage({ id: nextMsgId(), type: 'thinking' });
+            const activeRun = runs.value.find(r => r.run_id === activeRunId.value);
+            const isQueued = activeRun && activeRun.status === 'queued';
+            // For queued runs, set queuedBehind to at least 1 so the
+            // indicator shows the queued state. The exact count is not
+            // available from the runs list, but >0 triggers the label.
+            appendMessage({ id: nextMsgId(), type: 'thinking', queuedBehind: isQueued ? 1 : 0 });
         }
 
         try {
@@ -222,24 +231,40 @@ export async function loadSession(sessionId, opts) {
     // run_finished, run_error, or run_cancelled SSE event will clear it
     // via clearAgentPhase(), and any status event will override it with
     // the actual phase.
+    //
+    // Queued runs: the header bar should NOT show a "queued" phase.
+    // The agent may be busy with another task (e.g. a DM with another
+    // peer) and the header reflects the agent's CURRENT activity, not
+    // this run's queue position.  The inline thinking indicator already
+    // shows queue status via queuedBehind. (#693)
+    //
+    // Running runs: set a reasonable placeholder phase so the header
+    // is not blank until the next real status SSE event arrives.
     if (activeRunId.value) {
-        const session = sessions.value.find(s => s.id === sessionId);
-        if (session && session.session_type === 'dm' && Array.isArray(session.participants)) {
-            // DM session: derive the peer name by finding the participant
-            // that is NOT the active agent, then set the DM context so
-            // the status bar shows "Chatting with {peer}...".
-            const agentName = activeAgent.value?.name;
-            const peer = agentName
-                ? session.participants.find(p => p !== agentName)
-                : session.participants[0];
-            if (peer) {
-                setDmContext(peer);
+        const activeRun = runs.value.find(r => r.run_id === activeRunId.value);
+        const isQueued = activeRun && activeRun.status === 'queued';
+
+        if (!isQueued) {
+            const session = sessions.value.find(s => s.id === sessionId);
+            if (session && session.session_type === 'dm' && Array.isArray(session.participants)) {
+                // DM session: derive the peer name by finding the participant
+                // that is NOT the active agent, then set the DM context so
+                // the status bar shows "Chatting with {peer}...".
+                const agentName = activeAgent.value?.name;
+                const peer = agentName
+                    ? session.participants.find(p => p !== agentName)
+                    : session.participants[0];
+                if (peer) {
+                    setDmContext(peer);
+                } else {
+                    setAgentPhase('calling_llm', null);
+                }
             } else {
                 setAgentPhase('calling_llm', null);
             }
-        } else {
-            setAgentPhase('calling_llm', null);
         }
+        // else: queued -- leave header idle, SSE stream will provide
+        // real status if/when the run starts on this session.
     } else {
         // No active run — explicitly clear the phase so stale state from
         // a previous session cannot leak through.  (This is also handled

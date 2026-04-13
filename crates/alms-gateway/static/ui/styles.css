@@ -2397,6 +2397,17 @@ select.settings-input-sm {
   animation: thinking-dots 1.5s steps(1) infinite;
 }
 
+/* ── Queued indicator ── */
+@keyframes queued-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
+}
+.queued-indicator {
+  color: var(--text-muted) !important;
+  font-style: italic;
+  animation: queued-pulse 2s ease-in-out infinite;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
    Reduced Motion
    ══════════════════════════════════════════════════════════════════════ */
