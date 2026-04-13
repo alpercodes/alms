@@ -376,6 +376,66 @@ fn test_env_override_stream_chunk_timeout() {
 }
 
 #[test]
+fn test_env_override_alms_llm_model() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "claude-sonnet-4-6");
+    // Ensure legacy var is not set
+    let _legacy_guard = SingleEnvGuard::remove("DEFAULT_MODEL");
+
+    let mut config = AlmsConfig::default();
+    config.apply_env_overrides();
+    assert_eq!(config.llm.model, "claude-sonnet-4-6");
+}
+
+#[test]
+fn test_env_override_legacy_default_model_still_works() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("DEFAULT_MODEL", "gpt-4o");
+    // Ensure new var is not set so legacy is used
+    let _new_guard = SingleEnvGuard::remove("ALMS_LLM_MODEL");
+
+    let mut config = AlmsConfig::default();
+    config.apply_env_overrides();
+    assert_eq!(config.llm.model, "gpt-4o");
+}
+
+#[test]
+fn test_env_override_alms_llm_model_takes_precedence_over_legacy() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _new_guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "new-model");
+    let _legacy_guard = SingleEnvGuard::set("DEFAULT_MODEL", "legacy-model");
+
+    let mut config = AlmsConfig::default();
+    config.apply_env_overrides();
+    assert_eq!(
+        config.llm.model, "new-model",
+        "ALMS_LLM_MODEL should take precedence over DEFAULT_MODEL"
+    );
+}
+
+#[test]
+fn test_env_override_alms_llm_base_url() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "https://custom.api.com/v1");
+    let _legacy_guard = SingleEnvGuard::remove("LLM_BASE_URL");
+
+    let mut config = AlmsConfig::default();
+    config.apply_env_overrides();
+    assert_eq!(config.llm.base_url, "https://custom.api.com/v1");
+}
+
+#[test]
+fn test_env_override_legacy_llm_base_url_still_works() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("LLM_BASE_URL", "https://legacy.api.com/v1");
+    let _new_guard = SingleEnvGuard::remove("ALMS_LLM_BASE_URL");
+
+    let mut config = AlmsConfig::default();
+    config.apply_env_overrides();
+    assert_eq!(config.llm.base_url, "https://legacy.api.com/v1");
+}
+
+#[test]
 fn test_toml_stream_chunk_timeout() {
     let toml = r#"
 [llm]
