@@ -1,6 +1,6 @@
 import { html, batch, useSignal } from '../../deps.js';
 import { sessions, activeSessionId, showNotifications } from '../../state/sessions.js';
-import { activeAgentId } from '../../state/agents.js';
+import { activeAgentId, activeAgent } from '../../state/agents.js';
 import { replaceMessages } from '../../state/chat-actions.js';
 import { activeRunId, selectedRunId, runs } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
@@ -300,10 +300,41 @@ function SectionDivider({ label, cls }) {
     `;
 }
 
+/**
+ * Deduplicate and filter DM sessions for the sidebar.
+ *
+ * 1. **Participant filter**: Only include DM sessions where the active
+ *    agent is a participant. Without this, all DM sessions appear for
+ *    every agent (the backend does not filter by participant).
+ *
+ * 2. **context_id dedup**: If the backend returns multiple entries with
+ *    the same context_id (possible from legacy data where a DM session
+ *    was stored under both the sentinel and the real agent_id), keep
+ *    only the first occurrence.
+ */
+function filteredDmSessions(allSessions, agentName) {
+    const seen = new Set();
+    const result = [];
+    for (const s of allSessions) {
+        if (s.session_type !== 'dm') continue;
+        // Deduplicate by context_id (same DM pair = same context)
+        const key = s.context_id || s.id;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        // Participant filter: only show DMs involving the active agent
+        if (agentName && Array.isArray(s.participants) && s.participants.length >= 2) {
+            if (!s.participants.includes(agentName)) continue;
+        }
+        result.push(s);
+    }
+    return result;
+}
+
 export function SessionList() {
     const allSessions = sessions.value;
+    const agentName = activeAgent.value ? activeAgent.value.name : null;
     const chatSessions = allSessions.filter(s => s.session_type !== 'dm' && s.session_type !== 'notification');
-    const dmSessions = allSessions.filter(s => s.session_type === 'dm');
+    const dmSessions = filteredDmSessions(allSessions, agentName);
     const notifSessions = allSessions.filter(s => s.session_type === 'notification');
     const showNotif = showNotifications.value;
 
