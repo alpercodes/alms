@@ -2,7 +2,8 @@
 //!
 //! When a peer-triggered DM run completes, several steps must happen:
 //!
-//! 1. Detect whether `ignore_message` was successfully called
+//! 1. Detect whether `ignore_message` was called or the agent hit its
+//!    max-iterations limit without replying
 //! 2. Resolve the peer agent from the `dm:` context ID
 //! 3. Call `end_conversation` on the `MessageBus` to reset depth counters
 //!    and emit `ConversationEnded` triggers to both agents
@@ -10,7 +11,8 @@
 //!
 //! Previously this logic was inlined in `execute_run()` (lifecycle.rs lines
 //! 1085-1180). This module consolidates it into a single entry point so there
-//! is exactly one code path for ignore-message-driven conversation endings.
+//! is exactly one code path for ignore-message-driven and
+//! max-iterations-driven conversation endings.
 //!
 //! The `ConversationEnded` trigger handling (depth-exceeded SSE events,
 //! web-chat forwarding, notification formatting) remains in `notifications.rs`

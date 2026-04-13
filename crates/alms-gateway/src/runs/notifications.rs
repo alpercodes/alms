@@ -1125,4 +1125,45 @@ mod tests {
         // Clean up: cancel the shutdown token so background tasks (if any) stop.
         shutdown_token.cancel();
     }
+
+    #[test]
+    fn test_format_dm_ended_notification_max_iterations_with_history() {
+        let result = format_dm_ended_notification(
+            "bob",
+            ConversationEndReason::MaxIterations,
+            Some("[12:00] alice: hello\n[12:01] bob: working on it..."),
+        );
+        assert!(
+            result.contains("iteration limit"),
+            "MaxIterations reason text should mention iteration limit, got: {result}"
+        );
+        assert!(
+            result.contains("bob"),
+            "notification should mention the peer agent name, got: {result}"
+        );
+        assert!(
+            result.contains("[12:00] alice: hello"),
+            "notification should include conversation history, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_format_dm_ended_notification_max_iterations_without_history() {
+        let result =
+            format_dm_ended_notification("bob", ConversationEndReason::MaxIterations, None);
+        assert!(
+            result.contains("iteration limit"),
+            "MaxIterations reason text should mention iteration limit, got: {result}"
+        );
+        assert!(
+            result.contains("bob"),
+            "notification should mention the peer agent name, got: {result}"
+        );
+        // Without history, should fall back to the no-history template which
+        // directs the agent to use read_messages.
+        assert!(
+            result.contains("read_messages"),
+            "no-history fallback should reference read_messages tool, got: {result}"
+        );
+    }
 }
