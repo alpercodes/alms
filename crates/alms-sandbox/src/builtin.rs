@@ -1,9 +1,9 @@
 use crate::shell::security::DENIED_FILENAMES;
 use crate::{SandboxError, Tool, error::SandboxResult};
-use alms_core::truncate_to_char_boundary;
 use chrono::{Local, Utc};
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// Check whether a resolved path references a denied filename.
 ///
@@ -115,13 +115,17 @@ fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
 
 /// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
 /// Appends a truncation note when the string is shortened.
+///
+/// Kept for tests only -- production `fs_read` now uses line-based reading.
+#[cfg(test)]
 fn safe_truncate(s: &str, max_bytes: usize) -> String {
+    use alms_core::truncate_to_char_boundary;
     let truncated = truncate_to_char_boundary(s, max_bytes);
     if truncated.len() == s.len() {
         s.to_owned()
     } else {
         format!(
-            "{}…[truncated, {} bytes omitted]",
+            "{}\u{2026}[truncated, {} bytes omitted]",
             truncated,
             s.len() - truncated.len()
         )
@@ -556,7 +560,9 @@ impl Tool for FsReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read the text content of a file. Returns the file's content as a string."
+        "Read a file with line numbers (cat -n format). Supports partial reads via offset/limit. \
+         Returns content with 1-based line numbers, has_more_before/has_more_after indicators, \
+         and total_lines when known (file read to EOF). Max file size: 2 MiB."
     }
 
     fn is_builtin(&self) -> bool {
@@ -570,6 +576,16 @@ impl Tool for FsReadTool {
                 "path": {
                     "type": "string",
                     "description": "Path to the file to read."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "0-based line index to start reading from. Default: 0 (beginning of file)."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum number of lines to return. Default: 2000."
                 }
             },
             "required": ["path"]
@@ -577,10 +593,37 @@ impl Tool for FsReadTool {
     }
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
+        /// Maximum file size we will attempt to read (2 MiB).
+        const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
+        /// Maximum accumulated bytes in the formatted output (512 KiB).
+        const MAX_OUTPUT_BYTES: usize = 512 * 1024;
+
         let path = params
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
+
+        let offset = match params.get("offset") {
+            Some(v) => v.as_u64().ok_or_else(|| {
+                SandboxError::InvalidParameters("'offset' must be a non-negative integer".into())
+            })? as usize,
+            None => 0,
+        };
+
+        let limit = match params.get("limit") {
+            Some(v) => {
+                let l = v.as_u64().ok_or_else(|| {
+                    SandboxError::InvalidParameters("'limit' must be a positive integer".into())
+                })? as usize;
+                if l == 0 {
+                    return Err(SandboxError::InvalidParameters(
+                        "'limit' must be greater than 0".into(),
+                    ));
+                }
+                l
+            }
+            None => 2000,
+        };
 
         // Deny-list check: block access to sensitive files regardless of sandbox scope.
         if is_denied_path(Path::new(path)) {
@@ -604,14 +647,131 @@ impl Tool for FsReadTool {
             )));
         }
 
-        let content = tokio::fs::read_to_string(&resolved)
+        // File size guard — reject files larger than 2 MiB.
+        let meta = tokio::fs::metadata(&resolved)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+        if meta.len() > MAX_READ_BYTES {
+            return Err(SandboxError::InvalidParameters(format!(
+                "File too large for fs_read ({} bytes, max {}). Use shell 'head'/'tail' for large files.",
+                meta.len(),
+                MAX_READ_BYTES
+            )));
+        }
 
-        const MAX_CONTENT: usize = 32000;
-        let result = safe_truncate(&content, MAX_CONTENT);
+        // Open file and read lines using BufReader for memory efficiency.
+        let file = tokio::fs::File::open(&resolved)
+            .await
+            .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+        let reader = BufReader::new(file);
+        let mut lines_stream = reader.lines();
 
-        Ok(serde_json::json!({ "content": result }))
+        let mut lines_read: usize = 0;
+        let mut selected_lines: Vec<(usize, String)> = Vec::new();
+        let end = offset.saturating_add(limit);
+        let mut output_bytes: usize = 0;
+        let mut byte_budget_exceeded = false;
+        let mut read_past_end = false;
+
+        // Phase 1: skip lines before offset, collect lines in [offset, end), stop
+        // collecting once we've passed the requested range.
+        while let Some(line) = lines_stream
+            .next_line()
+            .await
+            .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?
+        {
+            let line_idx = lines_read; // 0-based index
+            lines_read += 1;
+
+            if line_idx >= offset && line_idx < end {
+                // Byte budget: estimate formatted line size (6-digit number + tab + content + newline).
+                let line_cost = 7 + line.len() + 1;
+                if output_bytes.saturating_add(line_cost) > MAX_OUTPUT_BYTES {
+                    byte_budget_exceeded = true;
+                    break;
+                }
+                output_bytes += line_cost;
+                selected_lines.push((line_idx + 1, line)); // 1-based line number
+            }
+
+            // Once we've passed the requested range, stop storing lines.
+            // The line at `end` was consumed but not collected, so we already
+            // know there is at least one unreturned line after the range.
+            if line_idx >= end {
+                read_past_end = true;
+                break;
+            }
+        }
+
+        // If we broke out early (due to limit or byte budget), we may not know total_lines.
+        // Efficiently count remaining lines without storing them.
+        // Skip the peek when `read_past_end` is set — the loop already consumed a
+        // line beyond the requested range, proving more content exists.
+        let hit_eof = !byte_budget_exceeded && !read_past_end && {
+            // If we naturally exhausted the range without reading past it
+            // (i.e. file had exactly `offset + limit` lines), peek one more
+            // line to see whether the file continues.
+            let peeked = lines_stream
+                .next_line()
+                .await
+                .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+            if peeked.is_some() {
+                lines_read += 1;
+                // There are more lines — don't count them all, just note we didn't hit EOF.
+                false
+            } else {
+                true
+            }
+        };
+
+        // Handle empty file.
+        if lines_read == 0 && selected_lines.is_empty() {
+            return Ok(serde_json::json!({
+                "content": "",
+                "lines_returned": 0,
+                "has_more_before": false,
+                "has_more_after": false,
+                "note": "File exists but is empty."
+            }));
+        }
+
+        // Format output in cat -n style: right-justified 6-char line number + tab.
+        let content = selected_lines
+            .iter()
+            .map(|(num, line)| format!("{num:>6}\t{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let lines_returned = selected_lines.len();
+        let has_more_before = offset > 0;
+        let has_more_after = !hit_eof || byte_budget_exceeded;
+
+        let mut result = serde_json::json!({
+            "content": content,
+            "lines_returned": lines_returned,
+            "has_more_before": has_more_before,
+            "has_more_after": has_more_after,
+        });
+
+        // Only include total_lines when we actually read to EOF (no extra pass needed).
+        if hit_eof && !byte_budget_exceeded {
+            result["total_lines"] = serde_json::json!(lines_read);
+        }
+
+        if has_more_before || has_more_after {
+            result["offset"] = serde_json::json!(offset);
+            result["limit"] = serde_json::json!(limit);
+        }
+
+        if byte_budget_exceeded {
+            result["byte_budget_exceeded"] = serde_json::json!(true);
+            result["note"] = serde_json::json!(format!(
+                "Output truncated at {} bytes (max {}). Use smaller limit or narrower offset.",
+                output_bytes, MAX_OUTPUT_BYTES
+            ));
+        }
+
+        Ok(result)
     }
 }
 
@@ -1366,6 +1526,357 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn test_fs_read_small_file_with_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains("     1\talpha"));
+        assert!(content.contains("     2\tbeta"));
+        assert!(content.contains("     3\tgamma"));
+        // Read entire file to EOF => total_lines is present
+        assert_eq!(result["total_lines"], 3);
+        assert_eq!(result["lines_returned"], 3);
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(result["has_more_after"], false);
+        // When no more lines exist in either direction, offset/limit absent
+        assert!(result.get("offset").is_none());
+        assert!(result.get("limit").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_large_file_default_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        // Create a file with 2500 lines
+        let content: String = (1..=2500).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        // Stopped early due to limit => total_lines not available
+        assert!(result.get("total_lines").is_none());
+        assert_eq!(result["lines_returned"], 2000);
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(result["has_more_after"], true);
+        assert_eq!(result["offset"], 0);
+        assert_eq!(result["limit"], 2000);
+        // First line should be present
+        let text = result["content"].as_str().unwrap();
+        assert!(text.starts_with("     1\tline 1\n"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_offset_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("numbered.txt");
+        let content: String = (1..=100).map(|i| format!("line-{i}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        // Read lines 51-60 (offset 50, limit 10)
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 50,
+                "limit": 10
+            }))
+            .await
+            .unwrap();
+
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("    51\tline-51"));
+        assert!(text.contains("    60\tline-60"));
+        assert!(!text.contains("    50\t")); // line 50 not included
+        assert!(!text.contains("    61\t")); // line 61 not included
+        assert_eq!(result["lines_returned"], 10);
+        assert_eq!(result["has_more_before"], true);
+        assert_eq!(result["has_more_after"], true);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_offset_beyond_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 9999
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["content"], "");
+        // Read to EOF (past all lines) => total_lines known
+        assert_eq!(result["total_lines"], 3);
+        assert_eq!(result["lines_returned"], 0);
+        assert_eq!(result["has_more_before"], true);
+        assert_eq!(result["has_more_after"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["content"], "");
+        assert_eq!(result["lines_returned"], 0);
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(result["has_more_after"], false);
+        assert_eq!(result["note"], "File exists but is empty.");
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_only_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limited.txt");
+        let content: String = (1..=50).map(|i| format!("row-{i}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "limit": 5
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["lines_returned"], 5);
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(result["has_more_after"], true);
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("     1\trow-1"));
+        assert!(text.contains("     5\trow-5"));
+        assert!(!text.contains("     6\t"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_only_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("offset_only.txt");
+        let content: String = (1..=10).map(|i| format!("item-{i}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 5
+            }))
+            .await
+            .unwrap();
+
+        // Lines 6-10 (0-based index 5 onwards); 5 of 10 returned
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("     6\titem-6"));
+        assert!(text.contains("    10\titem-10"));
+        assert!(!text.contains("     5\titem-5"));
+        assert_eq!(result["lines_returned"], 5);
+        // has_more_before=true because lines 1-5 are not included
+        assert_eq!(result["has_more_before"], true);
+        // Read to EOF => total_lines known
+        assert_eq!(result["total_lines"], 10);
+        assert_eq!(result["has_more_after"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_line_number_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fmt.txt");
+        std::fs::write(&path, "a\nb\nc").unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        let content = result["content"].as_str().unwrap();
+        let lines: Vec<&str> = content.split('\n').collect();
+        // cat -n format: 6-char right-justified number + tab + content
+        assert_eq!(lines[0], "     1\ta");
+        assert_eq!(lines[1], "     2\tb");
+        assert_eq!(lines[2], "     3\tc");
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_invalid_limit_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "content").unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "limit": 0
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_invalid_offset_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "content").unwrap();
+
+        // String offset should error, not silently fall back to 0
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": "abc"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-negative integer")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_invalid_limit_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "content").unwrap();
+
+        // String limit should error
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "limit": "abc"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("positive integer"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_file_too_large() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        // Create a file slightly over 2 MiB
+        let content = "x".repeat(2 * 1024 * 1024 + 1);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("too large"), "got: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_byte_budget_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.txt");
+        // Each line is ~1KB, 600 lines = ~600KB which exceeds 512KB budget
+        let long_line = "A".repeat(1000);
+        let content: String = (1..=600).map(|_| format!("{}\n", long_line)).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "limit": 600
+            }))
+            .await
+            .unwrap();
+
+        // Should have returned fewer than 600 lines due to byte budget
+        let lines_returned = result["lines_returned"].as_u64().unwrap();
+        assert!(
+            lines_returned < 600,
+            "expected fewer than 600 lines due to byte budget, got {lines_returned}"
+        );
+        assert_eq!(result["has_more_after"], true);
+        assert_eq!(result["byte_budget_exceeded"], true);
+        assert!(result["note"].as_str().unwrap().contains("truncated"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_total_lines_present_when_eof() {
+        // When we read the entire file, total_lines should be present
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("complete.txt");
+        std::fs::write(&path, "a\nb\nc\nd\ne\n").unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["total_lines"], 5);
+        assert_eq!(result["lines_returned"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_total_lines_absent_when_stopped_early() {
+        // When we stop early due to limit, total_lines should be absent
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("partial.txt");
+        let content: String = (1..=100).map(|i| format!("line-{i}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "limit": 10
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.get("total_lines").is_none(),
+            "total_lines should not be present when stopped early"
+        );
+        assert_eq!(result["lines_returned"], 10);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_has_more_both_directions() {
+        // offset>0 and more lines after => both indicators true
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("middle.txt");
+        let content: String = (1..=20).map(|i| format!("line-{i}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 5,
+                "limit": 5
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["has_more_before"], true);
+        assert_eq!(result["has_more_after"], true);
+        assert_eq!(result["lines_returned"], 5);
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("     6\tline-6"));
+        assert!(text.contains("    10\tline-10"));
+    }
+
     // ── FsWriteTool ───────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1402,12 +1913,15 @@ mod tests {
             .unwrap();
         assert_eq!(result["ok"], true);
 
-        // Read back
+        // Read back — content now has cat -n line numbers
         let result = FsReadTool::new()
             .execute(serde_json::json!({"path": path_str}))
             .await
             .unwrap();
-        assert_eq!(result["content"], "world");
+        assert_eq!(result["content"], "     1\tworld");
+        assert_eq!(result["total_lines"], 1);
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(result["has_more_after"], false);
     }
 
     #[tokio::test]
@@ -1429,7 +1943,55 @@ mod tests {
             .execute(serde_json::json!({"path": path_str}))
             .await
             .unwrap();
-        assert_eq!(result["content"], "line1\nline2\n");
+        // "line1\nline2\n" yields 2 lines via BufReader::lines()
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains("     1\tline1"));
+        assert!(content.contains("     2\tline2"));
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(result["has_more_after"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_has_more_after_exactly_one_past_end() {
+        // Regression: when a file has exactly offset + limit + 1 lines, the
+        // in-loop peek at `line_idx == end` consumed the extra line without
+        // recording it, then the post-loop peek found nothing and incorrectly
+        // set has_more_after = false.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exact.txt");
+        let path_str = path.to_str().unwrap();
+
+        // 6 lines total — offset=0, limit=5 → should return lines 1-5,
+        // has_more_after = true because line 6 exists.
+        let content: String = (1..=6).map(|i| format!("line-{i}\n")).collect();
+        FsWriteTool::new()
+            .execute(serde_json::json!({"path": path_str, "content": content}))
+            .await
+            .unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path_str, "offset": 0, "limit": 5}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["lines_returned"], 5);
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(
+            result["has_more_after"], true,
+            "file has 6 lines but only 5 returned — has_more_after must be true"
+        );
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("     1\tline-1"));
+        assert!(text.contains("     5\tline-5"));
+        assert!(
+            !text.contains("line-6"),
+            "line-6 should not appear in output"
+        );
+        // total_lines should NOT be present since we didn't read to EOF
+        assert!(
+            result.get("total_lines").is_none(),
+            "total_lines should be absent when not at EOF"
+        );
     }
 
     // ── FsListTool ────────────────────────────────────────────────────────────
