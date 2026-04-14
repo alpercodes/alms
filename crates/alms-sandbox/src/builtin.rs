@@ -85,6 +85,53 @@ fn is_blocked_device_path(path: &Path) -> bool {
     false
 }
 
+/// Check whether a path is a UNC (Universal Naming Convention) path.
+///
+/// UNC paths (`\\server\share` or `//server/share`) trigger automatic SMB
+/// authentication on Windows, which can leak NTLM credentials to
+/// attacker-controlled servers. We block them on all platforms to prevent
+/// a malicious agent prompt from exploiting this.
+///
+/// The Windows extended-length prefix (`\\?\`) is NOT a UNC path — it is a
+/// mechanism for paths longer than 260 characters — and is therefore allowed.
+/// However, `\\?\UNC\server\share` is the extended-length *UNC* form and
+/// still triggers SMB authentication, so it must be blocked.
+///
+/// The device namespace prefix (`\\.\`) also starts with `\\` and is caught
+/// by the general `\\` check. This is intentional: `\\.\UNC\server\share`
+/// can access remote shares, and `\\.\pipe\name` can access named pipes.
+fn is_unc_path(path: &str) -> bool {
+    // \\server\share (Windows UNC)
+    if path.starts_with("\\\\") {
+        // Allow \\?\ (extended-length path prefix, not UNC) …
+        if let Some(rest) = path.strip_prefix("\\\\?\\") {
+            // … but block \\?\UNC\ — extended-length UNC still triggers SMB.
+            // Case-insensitive: NTFS treats \\?\unc\ the same as \\?\UNC\.
+            let upper = rest.to_ascii_uppercase();
+            return upper.starts_with("UNC\\") || upper.starts_with("UNC/");
+        }
+        // Everything else starting with \\ is standard UNC (including \\.\).
+        return true;
+    }
+    // //server/share (URI-style UNC, common in cross-platform code)
+    path.starts_with("//")
+}
+
+/// Reject UNC paths with a consistent error.
+///
+/// Returns `Ok(())` for safe paths, or a `SandboxViolation` error for any
+/// path that would trigger SMB authentication.
+fn reject_unc_path(path: &str) -> SandboxResult<()> {
+    if is_unc_path(path) {
+        return Err(SandboxError::SandboxViolation(
+            "UNC paths (\\\\server\\share or //server/share) are not allowed \
+             — they can leak credentials via SMB authentication."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolve a path and verify it falls within the sandbox root.
 ///
 /// Relative paths are joined to `sandbox_root`. Absolute paths are checked
@@ -699,6 +746,9 @@ impl Tool for FsReadTool {
             None => 2000,
         };
 
+        // Block UNC paths that could leak NTLM credentials via SMB.
+        reject_unc_path(path)?;
+
         // Block device paths that would hang or produce infinite output.
         if is_blocked_device_path(Path::new(path)) {
             return Err(SandboxError::SandboxViolation(format!(
@@ -958,6 +1008,9 @@ impl Tool for FsWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
 
+        // Block UNC paths that could leak NTLM credentials via SMB.
+        reject_unc_path(path)?;
+
         // Deny-list check: block writes to sensitive files.
         if is_denied_path(Path::new(path)) {
             return Err(SandboxError::SandboxViolation(format!(
@@ -1103,6 +1156,9 @@ impl Tool for FsListTool {
 
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
         let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+        // Block UNC paths that could leak NTLM credentials via SMB.
+        reject_unc_path(path)?;
 
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
             check_sandbox_path_async(path, root).await?
@@ -1255,6 +1311,12 @@ impl Tool for FsEditTool {
             .get("replace_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // Block UNC paths that could leak NTLM credentials via SMB.
+        // (Checked before parameter validation so UNC paths always get the
+        // security error, not a misleading "old_string and new_string must
+        // differ" response.)
+        reject_unc_path(path)?;
 
         // No-op rejection: old_string == new_string
         if old_string == new_string {
@@ -1646,6 +1708,9 @@ impl Tool for FsGrepTool {
         // ── Resolve search root ────────────────────────────────────────
 
         let search_root: PathBuf = if let Some(path) = path_param {
+            // Block UNC paths that could leak NTLM credentials via SMB.
+            reject_unc_path(path)?;
+
             // Block device paths that would hang or produce infinite output.
             if is_blocked_device_path(Path::new(path)) {
                 return Err(SandboxError::SandboxViolation(format!(
@@ -2248,6 +2313,9 @@ impl Tool for FsGlobTool {
         // ── Resolve search root ────────────────────────────────────────
 
         let search_root: PathBuf = if let Some(path) = path_param {
+            // Block UNC paths that could leak NTLM credentials via SMB.
+            reject_unc_path(path)?;
+
             // Block device paths.
             if is_blocked_device_path(Path::new(path)) {
                 return Err(SandboxError::SandboxViolation(format!(
@@ -3049,6 +3117,178 @@ mod tests {
         assert!(!is_blocked_device_path(Path::new("hello.txt")));
         assert!(!is_blocked_device_path(Path::new("/home/user/data.json")));
         assert!(!is_blocked_device_path(Path::new("src/main.rs")));
+    }
+
+    // ── UNC path blocking (#670) ───────────────────────────────────────────
+
+    #[test]
+    fn test_is_unc_path_windows_backslash() {
+        // Standard Windows UNC paths must be blocked.
+        assert!(is_unc_path("\\\\server\\share"));
+        assert!(is_unc_path("\\\\server\\share\\file.txt"));
+        assert!(is_unc_path("\\\\attacker.com\\evil"));
+        assert!(is_unc_path("\\\\192.168.1.1\\share"));
+    }
+
+    #[test]
+    fn test_is_unc_path_uri_style_forward_slash() {
+        // URI-style UNC paths (common in cross-platform code) must be blocked.
+        assert!(is_unc_path("//server/share"));
+        assert!(is_unc_path("//server/share/file.txt"));
+        assert!(is_unc_path("//attacker.com/evil"));
+    }
+
+    #[test]
+    fn test_is_unc_path_extended_length_allowed() {
+        // \\?\ is Windows extended-length prefix, NOT a UNC path — must be allowed.
+        assert!(!is_unc_path("\\\\?\\C:\\long\\path"));
+        assert!(!is_unc_path("\\\\?\\D:\\some\\deeply\\nested\\directory"));
+    }
+
+    #[test]
+    fn test_is_unc_path_extended_length_unc_blocked() {
+        // \\?\UNC\ is extended-length UNC — still triggers SMB, MUST be blocked.
+        assert!(is_unc_path("\\\\?\\UNC\\server\\share"));
+        assert!(is_unc_path("\\\\?\\UNC\\attacker.com\\evil"));
+        // Forward-slash variant after the \\?\ prefix.
+        assert!(is_unc_path("\\\\?\\UNC/server/share"));
+        // Lowercase — NTFS is case-insensitive, so \\?\unc\ still resolves as UNC.
+        assert!(is_unc_path("\\\\?\\unc\\server\\share"));
+        assert!(is_unc_path("\\\\?\\Unc\\server\\share"));
+        assert!(is_unc_path("\\\\?\\uNc/server/share"));
+    }
+
+    #[test]
+    fn test_is_unc_path_normal_paths_allowed() {
+        // Regular paths must not be blocked.
+        assert!(!is_unc_path("C:\\normal\\path"));
+        assert!(!is_unc_path("C:\\Users\\test\\file.txt"));
+        assert!(!is_unc_path("/normal/unix/path"));
+        assert!(!is_unc_path("/home/user/file.txt"));
+        assert!(!is_unc_path("./relative/path"));
+        assert!(!is_unc_path("relative/path"));
+        assert!(!is_unc_path("file.txt"));
+        assert!(!is_unc_path("."));
+    }
+
+    #[test]
+    fn test_is_unc_path_edge_cases() {
+        // Empty string and single-separator paths must not be flagged.
+        assert!(!is_unc_path(""));
+        assert!(!is_unc_path("\\"));
+        assert!(!is_unc_path("/"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_rejects_unc_path() {
+        let tool = FsReadTool::new();
+        let result = tool
+            .execute(serde_json::json!({"path": "\\\\server\\share\\file.txt"}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UNC paths"), "error should mention UNC: {err}");
+        assert!(err.contains("SMB"), "error should mention SMB: {err}");
+
+        // URI-style
+        let result = tool
+            .execute(serde_json::json!({"path": "//server/share/file.txt"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("UNC paths"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_rejects_unc_path() {
+        let tool = FsWriteTool::new();
+        let result = tool
+            .execute(serde_json::json!({"path": "\\\\server\\share\\file.txt", "content": "x"}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UNC paths"), "error should mention UNC: {err}");
+
+        let result = tool
+            .execute(serde_json::json!({"path": "//server/share/file.txt", "content": "x"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("UNC paths"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_list_rejects_unc_path() {
+        let tool = FsListTool::new();
+        let result = tool
+            .execute(serde_json::json!({"path": "\\\\server\\share"}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UNC paths"), "error should mention UNC: {err}");
+
+        let result = tool
+            .execute(serde_json::json!({"path": "//server/share"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("UNC paths"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_rejects_unc_path() {
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "\\\\server\\share\\file.txt",
+                "old_string": "a",
+                "new_string": "b"
+            }))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UNC paths"), "error should mention UNC: {err}");
+
+        let result = tool
+            .execute(serde_json::json!({
+                "path": "//server/share/file.txt",
+                "old_string": "a",
+                "new_string": "b"
+            }))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("UNC paths"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_rejects_unc_path() {
+        let tool = FsGrepTool::new();
+        let result = tool
+            .execute(serde_json::json!({"pattern": "test", "path": "\\\\server\\share"}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UNC paths"), "error should mention UNC: {err}");
+
+        let result = tool
+            .execute(serde_json::json!({"pattern": "test", "path": "//server/share"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("UNC paths"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_glob_rejects_unc_path() {
+        let tool = FsGlobTool::new();
+        let result = tool
+            .execute(serde_json::json!({"pattern": "*.rs", "path": "\\\\server\\share"}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("UNC paths"), "error should mention UNC: {err}");
+
+        let result = tool
+            .execute(serde_json::json!({"pattern": "*.rs", "path": "//server/share"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("UNC paths"));
     }
 
     #[tokio::test]
