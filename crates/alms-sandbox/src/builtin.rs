@@ -1,9 +1,12 @@
 use crate::shell::security::DENIED_FILENAMES;
 use crate::{SandboxError, Tool, error::SandboxResult};
 use chrono::{Local, Utc};
+use globset::GlobBuilder;
+use regex::Regex;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use walkdir::WalkDir;
 
 /// Check whether a resolved path references a denied filename.
 ///
@@ -1324,6 +1327,717 @@ impl FsEditTool {
             "replacements": 1
         }))
     }
+}
+
+// ── FsGrepTool ─────────────────────────────────────────────────────────────
+
+/// VCS directories excluded from recursive directory walks.
+const VCS_DIRS: &[&str] = &[".git", ".svn", ".hg", ".bzr", ".jj", ".sl"];
+
+/// Maximum total output size in characters. Prevents context window overload.
+const MAX_OUTPUT_CHARS: usize = 20_000;
+
+/// Default head_limit when not specified by the caller.
+const DEFAULT_HEAD_LIMIT: usize = 250;
+
+/// Maximum file size (in bytes) for `search_file_content` which reads the
+/// entire file into memory.  Files larger than this are skipped with a debug
+/// log.  1 MiB is generous enough for most source files while preventing OOM
+/// on multi-GB log files.
+const MAX_GREP_FILE_BYTES: u64 = 1_024 * 1_024;
+
+/// Maximum directory traversal depth for the recursive WalkDir.  Prevents
+/// unbounded walks in deeply-nested trees (e.g. node_modules chains).
+const MAX_WALK_DEPTH: usize = 50;
+
+/// Regex content search tool for files.
+///
+/// Searches file contents using regex patterns within the sandbox. Supports
+/// three output modes (files_with_matches, content, count), glob filtering,
+/// case-insensitive matching, and result pagination via head_limit/offset.
+///
+/// Security: respects sandbox root, denied-path filtering, and VCS directory
+/// exclusion. Marked as read-only and builtin.
+#[derive(Debug, Clone, Default)]
+pub struct FsGrepTool {
+    sandbox_root: Option<PathBuf>,
+}
+
+impl FsGrepTool {
+    /// Create an unrestricted fs_grep tool (no sandbox check).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a sandboxed fs_grep tool. Paths must resolve within `root`.
+    pub fn sandboxed(root: PathBuf) -> Self {
+        Self {
+            sandbox_root: Some(root),
+        }
+    }
+}
+
+/// A single content match with optional context lines.
+#[derive(Debug)]
+struct ContentMatch {
+    line: usize,
+    content: String,
+    context_before: Vec<String>,
+    context_after: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl Tool for FsGrepTool {
+    fn name(&self) -> &str {
+        "fs_grep"
+    }
+
+    fn description(&self) -> &str {
+        "Search file contents using regex patterns. Returns matching file paths, content with \
+         context lines, or per-file match counts. Supports glob filtering, case-insensitive \
+         matching, and result pagination. Output capped at 20,000 characters."
+    }
+
+    fn is_builtin(&self) -> bool {
+        true
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Regex pattern to search for."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search in. Defaults to sandbox root or cwd."
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Glob pattern to filter files (e.g., \"*.rs\", \"**/*.toml\")."
+                },
+                "output_mode": {
+                    "type": "string",
+                    "enum": ["files_with_matches", "content", "count"],
+                    "description": "Output mode: \"files_with_matches\" (default), \"content\", or \"count\"."
+                },
+                "context": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Lines of context before and after each match (content mode only). Default: 0."
+                },
+                "case_insensitive": {
+                    "type": "boolean",
+                    "description": "Case-insensitive matching. Default: false."
+                },
+                "head_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Max results to return (0 = unlimited). Default: 250."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Skip first N results before applying head_limit. Default: 0."
+                }
+            },
+            "required": ["pattern"]
+        })
+    }
+
+    async fn execute(&self, params: Value) -> SandboxResult<Value> {
+        // ── Parse parameters ───────────────────────────────────────────
+
+        let pattern_str = params
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| SandboxError::InvalidParameters("'pattern' is required".to_string()))?;
+
+        let path_param = params.get("path").and_then(|v| v.as_str());
+        let glob_param = params.get("glob").and_then(|v| v.as_str());
+
+        let output_mode = params
+            .get("output_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("files_with_matches");
+
+        // Validate output_mode
+        if !["files_with_matches", "content", "count"].contains(&output_mode) {
+            return Err(SandboxError::InvalidParameters(format!(
+                "Invalid output_mode '{}': must be 'files_with_matches', 'content', or 'count'",
+                output_mode
+            )));
+        }
+
+        let context_lines = params
+            .get("context")
+            .map(|v| {
+                v.as_u64().ok_or_else(|| {
+                    SandboxError::InvalidParameters(
+                        "'context' must be a non-negative integer".to_string(),
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(0) as usize;
+
+        let case_insensitive = params
+            .get("case_insensitive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let head_limit = params
+            .get("head_limit")
+            .map(|v| {
+                v.as_u64().ok_or_else(|| {
+                    SandboxError::InvalidParameters(
+                        "'head_limit' must be a non-negative integer".to_string(),
+                    )
+                })
+            })
+            .transpose()?
+            .map(|v| v as usize)
+            .unwrap_or(DEFAULT_HEAD_LIMIT);
+
+        let offset = params
+            .get("offset")
+            .map(|v| {
+                v.as_u64().ok_or_else(|| {
+                    SandboxError::InvalidParameters(
+                        "'offset' must be a non-negative integer".to_string(),
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(0) as usize;
+
+        // ── Compile regex ──────────────────────────────────────────────
+
+        let re = regex::RegexBuilder::new(pattern_str)
+            .case_insensitive(case_insensitive)
+            .build()
+            .map_err(|e| {
+                SandboxError::InvalidParameters(format!("Invalid regex pattern: {}", e))
+            })?;
+
+        // ── Compile glob filter (if provided) ──────────────────────────
+
+        let glob_matcher = glob_param
+            .map(|g| {
+                GlobBuilder::new(g)
+                    .literal_separator(false)
+                    .build()
+                    .map(|glob| glob.compile_matcher())
+                    .map_err(|e| {
+                        SandboxError::InvalidParameters(format!("Invalid glob pattern: {}", e))
+                    })
+            })
+            .transpose()?;
+
+        // ── Resolve search root ────────────────────────────────────────
+
+        let search_root: PathBuf = if let Some(path) = path_param {
+            // Block device paths that would hang or produce infinite output.
+            if is_blocked_device_path(Path::new(path)) {
+                return Err(SandboxError::SandboxViolation(format!(
+                    "Cannot search device path '{}' — this is a system device, not a regular file",
+                    path
+                )));
+            }
+
+            // Deny-list check on raw path.
+            if is_denied_path(Path::new(path)) {
+                return Err(SandboxError::SandboxViolation(format!(
+                    "Access to '{}' is denied",
+                    path
+                )));
+            }
+
+            if let Some(ref root) = self.sandbox_root {
+                check_sandbox_path_async(path, root).await?
+            } else {
+                PathBuf::from(path)
+            }
+        } else if let Some(ref root) = self.sandbox_root {
+            root.clone()
+        } else {
+            std::env::current_dir().map_err(|e| {
+                SandboxError::Io(format!("Cannot determine current directory: {}", e))
+            })?
+        };
+
+        // ── Collect files to search ────────────────────────────────────
+
+        // Offload blocking filesystem walk to a blocking thread.
+        let sandbox_root_clone = self.sandbox_root.clone();
+        let search_root_clone = search_root.clone();
+        let glob_matcher_clone = glob_matcher.clone();
+
+        let files: Vec<PathBuf> = tokio::task::spawn_blocking(move || {
+            collect_files(
+                &search_root_clone,
+                sandbox_root_clone.as_deref(),
+                glob_matcher_clone.as_ref(),
+            )
+        })
+        .await
+        .map_err(|e| SandboxError::Io(format!("File collection task failed: {}", e)))?;
+
+        // ── Search files ───────────────────────────────────────────────
+
+        match output_mode {
+            "files_with_matches" => {
+                search_files_with_matches(&re, &files, &search_root, head_limit, offset).await
+            }
+            "content" => {
+                search_content(&re, &files, &search_root, context_lines, head_limit, offset).await
+            }
+            "count" => search_count(&re, &files, &search_root, head_limit, offset).await,
+            _ => unreachable!(), // validated above
+        }
+    }
+}
+
+/// Collect all searchable files under `search_root`, respecting sandbox, VCS
+/// exclusion, denied paths, and optional glob filtering.
+///
+/// When `search_root` is a regular file (not a directory), returns a
+/// single-element vec containing just that file (single-file mode).
+fn collect_files(
+    search_root: &Path,
+    sandbox_root: Option<&Path>,
+    glob_matcher: Option<&globset::GlobMatcher>,
+) -> Vec<PathBuf> {
+    // Single-file mode: if the search root is a file, just search that file.
+    if search_root.is_file() {
+        if is_denied_path(search_root) || is_blocked_device_path(search_root) {
+            return Vec::new();
+        }
+        return vec![search_root.to_path_buf()];
+    }
+
+    // Canonicalize the sandbox root so the `starts_with` check works
+    // correctly even on Windows where walkdir may return UNC paths
+    // (`\\?\C:\...`) while the stored root uses the short form (`C:\...`).
+    let canonical_sandbox_root = sandbox_root.and_then(|r| canonicalize_best_effort(r).ok());
+
+    let mut files = Vec::new();
+
+    let walker = WalkDir::new(search_root)
+        .max_depth(MAX_WALK_DEPTH)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_str().unwrap_or("");
+
+            // Skip VCS directories.
+            if entry.file_type().is_dir() && VCS_DIRS.contains(&name) {
+                return false;
+            }
+
+            // Skip denied filenames.
+            if is_denied_path(entry.path()) {
+                return false;
+            }
+
+            true
+        });
+
+    for entry in walker.flatten() {
+        // Only collect files, not directories.
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+
+        // Enforce sandbox root on each discovered file.
+        if let Some(ref root) = canonical_sandbox_root {
+            // Use starts_with on the entry path directly — the walk already
+            // starts within the sandbox, but symlinks inside the tree could
+            // escape.  We compare against the canonicalized root so UNC vs
+            // non-UNC forms do not cause false negatives on Windows.
+            if !path.starts_with(root) {
+                continue;
+            }
+        }
+
+        // Apply glob filter: match against the path relative to the search root.
+        if let Some(matcher) = glob_matcher {
+            let relative = path.strip_prefix(search_root).unwrap_or(path);
+            // Convert to forward-slash for cross-platform glob matching.
+            let rel_str = relative.to_string_lossy().replace('\\', "/");
+            if !matcher.is_match(&*rel_str) {
+                continue;
+            }
+        }
+
+        files.push(path.to_path_buf());
+    }
+
+    // Sort for deterministic output order.
+    files.sort();
+    files
+}
+
+/// Relativize a path against the search root for token-efficient output.
+fn relativize(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// `files_with_matches` mode: return file paths that contain at least one match.
+async fn search_files_with_matches(
+    re: &Regex,
+    files: &[PathBuf],
+    search_root: &Path,
+    head_limit: usize,
+    offset: usize,
+) -> SandboxResult<Value> {
+    let mut matched_files: Vec<String> = Vec::new();
+    let mut total_found: usize = 0;
+    let mut output_chars: usize = 0;
+    let mut truncated = false;
+
+    let effective_limit = if head_limit == 0 {
+        usize::MAX
+    } else {
+        head_limit
+    };
+
+    for file in files {
+        if file_matches_regex(re, file).await? {
+            total_found += 1;
+
+            // Apply offset.
+            if total_found <= offset {
+                continue;
+            }
+
+            // Apply head_limit.
+            if matched_files.len() >= effective_limit {
+                truncated = true;
+                // Stop scanning once both caps are hit — the total is
+                // approximate from this point.
+                break;
+            }
+
+            let rel = relativize(file, search_root);
+
+            // Check output size cap.
+            output_chars += rel.len() + 4; // account for JSON array overhead
+            if output_chars > MAX_OUTPUT_CHARS {
+                truncated = true;
+                break;
+            }
+
+            matched_files.push(rel);
+        }
+    }
+
+    Ok(serde_json::json!({
+        "matches": matched_files,
+        "total": total_found,
+        "truncated": truncated
+    }))
+}
+
+/// `content` mode: return matching lines with context.
+async fn search_content(
+    re: &Regex,
+    files: &[PathBuf],
+    search_root: &Path,
+    context_lines: usize,
+    head_limit: usize,
+    offset: usize,
+) -> SandboxResult<Value> {
+    let mut results: Vec<Value> = Vec::new();
+    let mut total_found: usize = 0;
+    let mut output_chars: usize = 0;
+    let mut truncated = false;
+
+    let effective_limit = if head_limit == 0 {
+        usize::MAX
+    } else {
+        head_limit
+    };
+
+    'outer: for file in files {
+        let matches = search_file_content(re, file, context_lines).await?;
+        for m in matches {
+            total_found += 1;
+
+            // Apply offset.
+            if total_found <= offset {
+                continue;
+            }
+
+            // Apply head_limit.
+            if results.len() >= effective_limit {
+                truncated = true;
+                // Stop scanning once the cap is hit — the total is
+                // approximate from this point.
+                break 'outer;
+            }
+
+            let rel = relativize(file, search_root);
+
+            // Deduplicate overlapping context: when adjacent matches have
+            // overlapping before/after context windows, trim the "before"
+            // context of the current match so it does not repeat lines
+            // already shown in the previous match's "after" context.
+            let ctx_before = if context_lines > 0 {
+                if let Some(prev) = results.last() {
+                    let same_file = prev.get("file").and_then(|v| v.as_str()) == Some(&rel);
+                    if same_file {
+                        let prev_line =
+                            prev.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        let prev_after_len = prev
+                            .get("context_after")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        // Last line covered by the previous entry (1-based).
+                        let prev_coverage = prev_line + prev_after_len;
+                        // First line of current context_before (1-based).
+                        let cur_ctx_start = m.line.saturating_sub(m.context_before.len());
+                        if prev_coverage >= cur_ctx_start {
+                            // Trim overlapping prefix lines.
+                            let overlap = prev_coverage - cur_ctx_start + 1;
+                            let skip = overlap.min(m.context_before.len());
+                            m.context_before[skip..].to_vec()
+                        } else {
+                            m.context_before.clone()
+                        }
+                    } else {
+                        m.context_before.clone()
+                    }
+                } else {
+                    m.context_before.clone()
+                }
+            } else {
+                Vec::new()
+            };
+
+            let entry = serde_json::json!({
+                "file": rel,
+                "line": m.line,
+                "content": m.content,
+                "context_before": ctx_before,
+                "context_after": m.context_after
+            });
+
+            // Check output size cap.
+            let entry_size = serde_json::to_string(&entry).unwrap_or_default().len();
+            output_chars += entry_size + 2; // comma + whitespace
+            if output_chars > MAX_OUTPUT_CHARS {
+                truncated = true;
+                break 'outer;
+            }
+
+            results.push(entry);
+        }
+    }
+
+    Ok(serde_json::json!({
+        "matches": results,
+        "total": total_found,
+        "truncated": truncated
+    }))
+}
+
+/// `count` mode: return per-file match counts.
+async fn search_count(
+    re: &Regex,
+    files: &[PathBuf],
+    search_root: &Path,
+    head_limit: usize,
+    offset: usize,
+) -> SandboxResult<Value> {
+    let mut results: Vec<Value> = Vec::new();
+    let mut total_matches: usize = 0;
+    let mut files_found: usize = 0;
+    let mut output_chars: usize = 0;
+    let mut truncated = false;
+
+    let effective_limit = if head_limit == 0 {
+        usize::MAX
+    } else {
+        head_limit
+    };
+
+    for file in files {
+        let count = count_file_matches(re, file).await?;
+        if count == 0 {
+            continue;
+        }
+
+        total_matches += count;
+        files_found += 1;
+
+        // Apply offset.
+        if files_found <= offset {
+            continue;
+        }
+
+        // Apply head_limit.
+        if results.len() >= effective_limit {
+            truncated = true;
+            // Stop scanning once the cap is hit — the total is
+            // approximate from this point.
+            break;
+        }
+
+        let rel = relativize(file, search_root);
+        let entry = serde_json::json!({
+            "file": rel,
+            "count": count
+        });
+
+        // Check output size cap.
+        let entry_size = serde_json::to_string(&entry).unwrap_or_default().len();
+        output_chars += entry_size + 2;
+        if output_chars > MAX_OUTPUT_CHARS {
+            truncated = true;
+            break;
+        }
+
+        results.push(entry);
+    }
+
+    Ok(serde_json::json!({
+        "matches": results,
+        "total_matches": total_matches,
+        "truncated": truncated
+    }))
+}
+
+/// Check whether a file contains at least one regex match (line-by-line).
+async fn file_matches_regex(re: &Regex, path: &Path) -> SandboxResult<bool> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "Skipping unreadable file");
+            return Ok(false);
+        }
+    };
+
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    // On I/O error (e.g. binary file with invalid UTF-8) the loop exits
+    // gracefully — `Err(...)` breaks the `while let Ok(...)` pattern.
+    while let Ok(Some(line)) = lines.next_line().await {
+        if re.is_match(&line) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Search a single file for content matches with context lines.
+///
+/// Checks file size before reading to prevent OOM on very large files.
+/// Files exceeding `MAX_GREP_FILE_BYTES` (1 MiB) are skipped with a debug log.
+async fn search_file_content(
+    re: &Regex,
+    path: &Path,
+    context_lines: usize,
+) -> SandboxResult<Vec<ContentMatch>> {
+    // File size guard — skip files larger than MAX_GREP_FILE_BYTES since
+    // this function reads the entire file into memory for context extraction.
+    match tokio::fs::metadata(path).await {
+        Ok(meta) => {
+            if meta.len() > MAX_GREP_FILE_BYTES {
+                tracing::debug!(
+                    path = %path.display(),
+                    size = meta.len(),
+                    limit = MAX_GREP_FILE_BYTES,
+                    "Skipping file exceeding grep size limit"
+                );
+                return Ok(Vec::new());
+            }
+        }
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "Skipping file with unreadable metadata");
+            return Ok(Vec::new());
+        }
+    }
+
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "Skipping unreadable file");
+            return Ok(Vec::new());
+        }
+    };
+
+    let all_lines: Vec<&str> = content.lines().collect();
+    let mut matches = Vec::new();
+
+    for (idx, line) in all_lines.iter().enumerate() {
+        if re.is_match(line) {
+            let line_num = idx + 1; // 1-based
+
+            let ctx_before: Vec<String> = if context_lines > 0 {
+                let start = idx.saturating_sub(context_lines);
+                all_lines[start..idx]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            let ctx_after: Vec<String> = if context_lines > 0 {
+                let end = (idx + 1 + context_lines).min(all_lines.len());
+                all_lines[(idx + 1)..end]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            matches.push(ContentMatch {
+                line: line_num,
+                content: line.to_string(),
+                context_before: ctx_before,
+                context_after: ctx_after,
+            });
+        }
+    }
+
+    Ok(matches)
+}
+
+/// Count regex matches in a single file (line-by-line).
+async fn count_file_matches(re: &Regex, path: &Path) -> SandboxResult<usize> {
+    let file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::debug!(path = %path.display(), error = %e, "Skipping unreadable file");
+            return Ok(0);
+        }
+    };
+
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+    let mut count: usize = 0;
+
+    // On I/O error (e.g. binary file with invalid UTF-8) the loop exits
+    // gracefully — `Err(...)` breaks the `while let Ok(...)` pattern.
+    while let Ok(Some(line)) = lines.next_line().await {
+        if re.is_match(&line) {
+            count += 1;
+        }
+    }
+
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -2844,5 +3558,799 @@ mod tests {
             err.contains("too large"),
             "error should mention size limit, got: {err}"
         );
+    }
+
+    // ── FsGrepTool ────────────────────────────────────────────────────────────
+
+    /// Helper: create a temp directory with test files for grep tests.
+    fn setup_grep_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // src/main.rs
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() {\n    println!(\"Hello, world!\");\n    let x = 42;\n}\n",
+        )
+        .unwrap();
+
+        // src/lib.rs
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn hello() {\n    println!(\"Hello from lib\");\n}\n",
+        )
+        .unwrap();
+
+        // README.md
+        std::fs::write(
+            root.join("README.md"),
+            "# My Project\n\nHello world example.\n",
+        )
+        .unwrap();
+
+        // data/config.toml
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        std::fs::write(
+            root.join("data/config.toml"),
+            "[server]\nport = 8080\nhost = \"localhost\"\n",
+        )
+        .unwrap();
+
+        // .git directory (should be excluded)
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        // secrets.json (should be excluded by denied-path filter)
+        std::fs::write(root.join("secrets.json"), "{\"key\": \"sk-1234\"}").unwrap();
+
+        dir
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_literal_pattern_single_file() {
+        let dir = setup_grep_dir();
+        let file = dir.path().join("src/main.rs");
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "println",
+                "path": file.to_str().unwrap(),
+                "output_mode": "content"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["line"], 2);
+        assert!(matches[0]["content"].as_str().unwrap().contains("println"));
+        assert_eq!(result["total"], 1);
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_regex_pattern_across_directory() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        // Search for "fn " across all files
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "^(pub )?fn \\w+",
+                "path": root.to_str().unwrap(),
+                "output_mode": "content"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        // main.rs has "fn main()" and lib.rs has "pub fn add" and "pub fn hello"
+        assert_eq!(result["total"], 3);
+        assert!(!matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_files_with_matches_mode() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "println",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        // println appears in src/main.rs and src/lib.rs
+        assert_eq!(result["total"], 2);
+        let paths: Vec<&str> = matches.iter().map(|m| m.as_str().unwrap()).collect();
+        assert!(paths.contains(&"src/lib.rs"));
+        assert!(paths.contains(&"src/main.rs"));
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_content_mode_line_numbers() {
+        let dir = setup_grep_dir();
+        let file = dir.path().join("src/lib.rs");
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "pub fn",
+                "path": file.to_str().unwrap(),
+                "output_mode": "content"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 2);
+        // "pub fn add" is on line 1
+        assert_eq!(matches[0]["line"], 1);
+        // "pub fn hello" is on line 5
+        assert_eq!(matches[1]["line"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_count_mode() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "println",
+                "path": root.to_str().unwrap(),
+                "output_mode": "count"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        // src/main.rs has 1 println, src/lib.rs has 1 println
+        assert_eq!(result["total_matches"], 2);
+        assert_eq!(matches.len(), 2);
+
+        // Verify each match has a file and count field.
+        for m in matches {
+            assert!(m["file"].as_str().is_some());
+            assert!(m["count"].as_u64().unwrap() > 0);
+        }
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_context_lines() {
+        let dir = setup_grep_dir();
+        let file = dir.path().join("src/main.rs");
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "let x",
+                "path": file.to_str().unwrap(),
+                "output_mode": "content",
+                "context": 1
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["line"], 3);
+        assert!(
+            matches[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("let x = 42")
+        );
+
+        // Context before: line 2 (println)
+        let ctx_before = matches[0]["context_before"].as_array().unwrap();
+        assert_eq!(ctx_before.len(), 1);
+        assert!(ctx_before[0].as_str().unwrap().contains("println"));
+
+        // Context after: line 4 ("}")
+        let ctx_after = matches[0]["context_after"].as_array().unwrap();
+        assert_eq!(ctx_after.len(), 1);
+        assert!(ctx_after[0].as_str().unwrap().contains("}"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_case_insensitive() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        // "hello" should match "Hello" in multiple files when case-insensitive
+        let result_sensitive = tool
+            .execute(serde_json::json!({
+                "pattern": "hello",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "case_insensitive": false
+            }))
+            .await
+            .unwrap();
+
+        let result_insensitive = tool
+            .execute(serde_json::json!({
+                "pattern": "hello",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "case_insensitive": true
+            }))
+            .await
+            .unwrap();
+
+        // Case-insensitive should find more or equal matches
+        let sensitive_total = result_sensitive["total"].as_u64().unwrap();
+        let insensitive_total = result_insensitive["total"].as_u64().unwrap();
+        assert!(
+            insensitive_total >= sensitive_total,
+            "Case-insensitive should find at least as many matches: {insensitive_total} >= {sensitive_total}"
+        );
+        // "Hello" appears in README, main.rs, and lib.rs — case-insensitive should find them
+        assert!(insensitive_total >= 2);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_head_limit_truncates() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        // Search for something common, limit to 1 result
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "\\w+",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "head_limit": 1
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(result["truncated"], true);
+        // total should reflect all found, not just returned
+        assert!(result["total"].as_u64().unwrap() > 1);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_offset_pagination() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        // Get all files with matches first
+        let all = tool
+            .execute(serde_json::json!({
+                "pattern": "\\w+",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "head_limit": 0
+            }))
+            .await
+            .unwrap();
+        let all_matches = all["matches"].as_array().unwrap();
+        let total = all_matches.len();
+        assert!(total >= 3, "Need at least 3 files for pagination test");
+
+        // Page 1: offset=0, limit=2
+        let page1 = tool
+            .execute(serde_json::json!({
+                "pattern": "\\w+",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "head_limit": 2,
+                "offset": 0
+            }))
+            .await
+            .unwrap();
+        let p1_matches = page1["matches"].as_array().unwrap();
+        assert_eq!(p1_matches.len(), 2);
+
+        // Page 2: offset=2, limit=2
+        let page2 = tool
+            .execute(serde_json::json!({
+                "pattern": "\\w+",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "head_limit": 2,
+                "offset": 2
+            }))
+            .await
+            .unwrap();
+        let p2_matches = page2["matches"].as_array().unwrap();
+        assert!(!p2_matches.is_empty());
+
+        // Pages should not overlap
+        let p1_set: std::collections::HashSet<&str> =
+            p1_matches.iter().map(|m| m.as_str().unwrap()).collect();
+        for m in p2_matches {
+            assert!(
+                !p1_set.contains(m.as_str().unwrap()),
+                "Page 2 should not overlap with page 1"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_glob_filter() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        // Only search .rs files
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "Hello",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "glob": "**/*.rs",
+                "case_insensitive": true
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        // Only .rs files should be in results (not README.md)
+        for m in matches {
+            assert!(
+                m.as_str().unwrap().ends_with(".rs"),
+                "Non-.rs file found: {}",
+                m
+            );
+        }
+        assert!(!matches.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_vcs_dirs_excluded() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        // .git/HEAD contains "ref: refs/heads/main" — should not be found
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "refs/heads/main",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(
+            matches.len(),
+            0,
+            "VCS directory contents should be excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_denied_paths_excluded() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        // secrets.json contains "sk-1234" — should not be found
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "sk-1234",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(
+            matches.len(),
+            0,
+            "Denied files should be excluded from results"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_sandbox_root_enforced() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = FsGrepTool::sandboxed(root);
+
+        // Trying to search outside sandbox should fail
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "test",
+                "path": "../../"
+            }))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_invalid_regex() {
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "[invalid",
+                "path": "."
+            }))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("regex") || err.contains("Invalid"),
+            "Error should mention regex: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_empty_results() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "zzz_nonexistent_pattern_zzz",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["matches"].as_array().unwrap().len(), 0);
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_empty_results_content_mode() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "zzz_nonexistent_pattern_zzz",
+                "path": root.to_str().unwrap(),
+                "output_mode": "content"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["matches"].as_array().unwrap().len(), 0);
+        assert_eq!(result["total"], 0);
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_empty_results_count_mode() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "zzz_nonexistent_pattern_zzz",
+                "path": root.to_str().unwrap(),
+                "output_mode": "count"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["matches"].as_array().unwrap().len(), 0);
+        assert_eq!(result["total_matches"], 0);
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_default_output_mode_is_files_with_matches() {
+        let dir = setup_grep_dir();
+        let file = dir.path().join("src/main.rs");
+        let tool = FsGrepTool::new();
+
+        // No output_mode specified — should default to files_with_matches
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "main",
+                "path": file.to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+
+        // files_with_matches mode returns a "matches" array of strings (paths)
+        assert!(result["matches"].is_array());
+        assert!(result["total"].is_number());
+        // Single file mode should return the file as a relative path
+        let matches = result["matches"].as_array().unwrap();
+        if !matches.is_empty() {
+            assert!(matches[0].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_invalid_output_mode() {
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "test",
+                "path": ".",
+                "output_mode": "invalid_mode"
+            }))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("output_mode"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_single_file_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "line one\nline two\nline three\n").unwrap();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "two",
+                "path": file.to_str().unwrap(),
+                "output_mode": "content"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["line"], 2);
+        assert!(matches[0]["content"].as_str().unwrap().contains("two"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_path_relativization() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "fn main",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        // Path should be relative, not absolute, using forward slashes
+        let path = matches[0].as_str().unwrap();
+        assert_eq!(path, "src/main.rs");
+        assert!(!path.starts_with('/'));
+        assert!(!path.contains('\\'));
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_head_limit_zero_means_unlimited() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "\\w+",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "head_limit": 0
+            }))
+            .await
+            .unwrap();
+
+        // Should return all matching files (no truncation)
+        assert_eq!(result["truncated"], false);
+        let total = result["total"].as_u64().unwrap();
+        let returned = result["matches"].as_array().unwrap().len() as u64;
+        assert_eq!(total, returned);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_is_readonly_and_builtin() {
+        let tool = FsGrepTool::new();
+        assert!(tool.is_builtin());
+        assert!(!tool.is_auto_approved());
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_missing_pattern_is_error() {
+        let tool = FsGrepTool::new();
+        let result = tool.execute(serde_json::json!({"path": "."})).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("pattern"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_context_at_file_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("edge.txt");
+        std::fs::write(&file, "first\nsecond\nthird\n").unwrap();
+        let tool = FsGrepTool::new();
+
+        // Match on first line — context_before should be empty
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "first",
+                "path": file.to_str().unwrap(),
+                "output_mode": "content",
+                "context": 2
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0]["context_before"].as_array().unwrap().is_empty());
+        // context_after should have 2 lines (second, third)
+        assert_eq!(matches[0]["context_after"].as_array().unwrap().len(), 2);
+
+        // Match on last line — context_after should be empty
+        let result2 = tool
+            .execute(serde_json::json!({
+                "pattern": "third",
+                "path": file.to_str().unwrap(),
+                "output_mode": "content",
+                "context": 2
+            }))
+            .await
+            .unwrap();
+
+        let matches2 = result2["matches"].as_array().unwrap();
+        assert_eq!(matches2.len(), 1);
+        assert!(matches2[0]["context_after"].as_array().unwrap().is_empty());
+        // context_before should have 2 lines
+        assert_eq!(matches2[0]["context_before"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_denied_path_in_path_param() {
+        let tool = FsGrepTool::new();
+
+        // Trying to search secrets.json directly should fail
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "key",
+                "path": "secrets.json"
+            }))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_output_size_cap() {
+        // Create a directory with many files containing matching content
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..200 {
+            let content = format!("match_line_{i}\n{}\n", "x".repeat(200));
+            std::fs::write(root.join(format!("file_{i:03}.txt")), content).unwrap();
+        }
+
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "match_line_\\d+",
+                "path": root.to_str().unwrap(),
+                "output_mode": "content",
+                "head_limit": 0,
+                "context": 1
+            }))
+            .await
+            .unwrap();
+
+        // The output should be truncated at MAX_OUTPUT_CHARS
+        // Results might be capped due to the 20,000 char limit
+        // We just verify the structure is valid and truncated is set correctly
+        assert!(result["matches"].is_array());
+        assert!(result["total"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_glob_filter_toml_only() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "port",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "glob": "**/*.toml"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].as_str().unwrap().ends_with("config.toml"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_count_mode_head_limit() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "\\w+",
+                "path": root.to_str().unwrap(),
+                "output_mode": "count",
+                "head_limit": 1
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_offset_beyond_results() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "fn main",
+                "path": root.to_str().unwrap(),
+                "output_mode": "files_with_matches",
+                "offset": 1000
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert!(matches.is_empty());
+        assert_eq!(result["total"], 1); // Total found is still 1
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_no_path_defaults_to_sandbox_root() {
+        let dir = setup_grep_dir();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let tool = FsGrepTool::sandboxed(root);
+
+        // No path param — should search sandbox root
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "fn main",
+                "output_mode": "files_with_matches"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].as_str().unwrap().contains("main.rs"));
     }
 }

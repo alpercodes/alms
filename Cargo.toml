@@ -87,6 +87,13 @@ rand = "0.8"
 # Embedded static assets
 rust-embed = { version = "8", features = ["mime-guess"] }
 
+# Regex
+regex = "1"
+
+# File system utilities
+walkdir = "2"
+globset = "0.4"
+
 # Testing
 tokio-test = "0.4"
 

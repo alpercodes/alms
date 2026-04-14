@@ -21,6 +21,9 @@ dashmap.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
 iana-time-zone = "0.1"
+regex.workspace = true
+walkdir.workspace = true
+globset.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

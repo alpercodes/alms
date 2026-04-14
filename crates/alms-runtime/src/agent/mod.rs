@@ -194,6 +194,12 @@ impl AgentRuntime {
                     ws_root.clone(),
                 )));
         }
+        if tool_enabled("fs_grep") {
+            self.tools
+                .register(std::sync::Arc::new(alms_sandbox::FsGrepTool::sandboxed(
+                    ws_root.clone(),
+                )));
+        }
 
         // Re-register shell tool with workspace dir as default cwd and
         // gateway-provided default env vars (ALMS_DATA_DIR, etc.).
