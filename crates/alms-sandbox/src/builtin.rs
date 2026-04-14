@@ -1393,15 +1393,29 @@ impl Tool for FsEditTool {
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
 
-        // Count occurrences.
+        // Strip trailing whitespace from new_string (except for Markdown).
+        let is_md = is_markdown_file(path);
+        let new_string_clean = strip_trailing_whitespace(new_string, is_md);
+        let new_string = new_string_clean.as_str();
+
+        // Count occurrences of the exact old_string.
         let count = content.matches(old_string).count();
 
-        if count == 0 {
-            return Err(SandboxError::InvalidParameters(format!(
-                "old_string not found in '{}'",
-                path
-            )));
-        }
+        // If the direct match fails, try normalizing curly/smart quotes as a
+        // fallback.  This handles the common case where an LLM emits curly
+        // quotes while the file uses straight quotes (or vice versa).
+        let (actual_old, count, quote_adapted) = if count == 0 {
+            if let Some((original_match, norm_count)) = try_normalized_match(&content, old_string) {
+                (original_match.to_string(), norm_count, true)
+            } else {
+                return Err(SandboxError::InvalidParameters(format!(
+                    "old_string not found in '{}'",
+                    path
+                )));
+            }
+        } else {
+            (old_string.to_string(), count, false)
+        };
 
         if !replace_all && count > 1 {
             return Err(SandboxError::InvalidParameters(format!(
@@ -1410,12 +1424,28 @@ impl Tool for FsEditTool {
             )));
         }
 
+        // When using the quote-normalization fallback, adapt the new_string to
+        // use the same quote style as the original matched text.
+        let effective_new = if quote_adapted {
+            adapt_quotes_to_original(new_string, &actual_old)
+        } else {
+            new_string.to_string()
+        };
+
         // Perform the replacement.
+        //
+        // Note: when the quote-normalization path is active with replace_all,
+        // `actual_old` is the exact original text from the *first* normalized
+        // match. This assumes all occurrences share the same original quote
+        // style (e.g. all use U+201C/U+201D). If a file mixed left and right
+        // curly quotes inconsistently (e.g. U+201D used as an opening quote),
+        // the reported replacement count could exceed the actual replacements.
+        // This is effectively impossible in well-formed text.
         let new_content = if replace_all {
-            content.replace(old_string, new_string)
+            content.replace(&actual_old, &effective_new)
         } else {
             // Replace only the first (and only) occurrence.
-            content.replacen(old_string, new_string, 1)
+            content.replacen(&actual_old, &effective_new, 1)
         };
 
         // Write back.
@@ -1478,7 +1508,12 @@ impl FsEditTool {
             })?;
         }
 
-        tokio::fs::write(resolved, new_string)
+        // Apply the same trailing-whitespace stripping as the normal edit path
+        // so file creation and file editing have consistent whitespace behavior.
+        let is_md = is_markdown_file(display_path);
+        let cleaned = strip_trailing_whitespace(new_string, is_md);
+
+        tokio::fs::write(resolved, &cleaned)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", display_path, e)))?;
 
@@ -1494,6 +1529,162 @@ impl FsEditTool {
             "replacements": 1
         }))
     }
+}
+
+// ── fs_edit helpers ────────────────────────────────────────────────────────
+
+/// Normalize curly/smart quotes to straight ASCII equivalents.
+///
+/// Replaces:
+/// - U+2018 (left single) and U+2019 (right single / apostrophe) -> `'`
+/// - U+201C (left double) and U+201D (right double) -> `"`
+fn normalize_quotes(s: &str) -> String {
+    s.replace(['\u{2018}', '\u{2019}'], "'")
+        .replace(['\u{201C}', '\u{201D}'], "\"")
+}
+
+/// Return the byte length a character occupies after quote normalization,
+/// without allocating a String.  Curly quotes (3 bytes in UTF-8) normalize
+/// to their straight equivalents (1 byte); all other characters are unchanged.
+fn normalized_char_len(ch: char) -> usize {
+    match ch {
+        '\u{2018}' | '\u{2019}' | '\u{201C}' | '\u{201D}' => 1,
+        _ => ch.len_utf8(),
+    }
+}
+
+/// Strip trailing whitespace (spaces and tabs) from each line.
+///
+/// Markdown files (`.md`, `.markdown`) are exempt because trailing spaces
+/// are semantically meaningful as hard line breaks per CommonMark.
+fn strip_trailing_whitespace(s: &str, is_markdown: bool) -> String {
+    if is_markdown {
+        return s.to_string();
+    }
+    let mut result = s
+        .lines()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // str::lines() does not yield a trailing empty element for strings ending
+    // with '\n', so .join("\n") silently drops the final newline.  Re-append
+    // it so code files keep their POSIX-compliant trailing newline.
+    if s.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Returns `true` if `path` refers to a Markdown file (`.md` or `.markdown`).
+fn is_markdown_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown")
+}
+
+/// Attempt a quote-normalized match when the exact `old_string` is not found.
+///
+/// Returns `Some((original_match_text, normalized_match_count))` if a match is
+/// found after normalizing both the content and the search string.  The returned
+/// `original_match_text` is the **un-normalized** text from the file that
+/// corresponds to the first normalized match, so the replacement preserves the
+/// file's existing quote style.
+fn try_normalized_match<'a>(content: &'a str, old_string: &str) -> Option<(&'a str, usize)> {
+    let norm_content = normalize_quotes(content);
+    let norm_old = normalize_quotes(old_string);
+
+    // If normalization didn't change anything, skip (direct match already
+    // failed, so the normalized version would fail too).
+    if norm_content == content && norm_old == old_string {
+        return None;
+    }
+
+    let count = norm_content.matches(&norm_old).count();
+    if count == 0 {
+        return None;
+    }
+
+    // Find the byte offset of the first match in the *normalized* content, then
+    // map that back to the original content.  Because curly quotes are multi-byte
+    // (3 bytes in UTF-8) while straight quotes are single-byte, we need to walk
+    // both strings in parallel to compute the correct original offset.
+    let norm_offset = norm_content.find(&norm_old)?;
+
+    // Map normalized byte offset -> original byte offset.
+    // Walk char-by-char through the original and normalized simultaneously.
+    let mut orig_byte = 0;
+    let mut norm_byte = 0;
+    for ch in content.chars() {
+        if norm_byte >= norm_offset {
+            break;
+        }
+        let norm_ch_len = normalized_char_len(ch);
+        orig_byte += ch.len_utf8();
+        norm_byte += norm_ch_len;
+    }
+
+    // Now compute the length of the original text that corresponds to the
+    // normalized match.  Walk from orig_byte forward while consuming
+    // norm_old.len() normalized bytes.
+    let mut orig_end = orig_byte;
+    let mut consumed_norm = 0;
+    let target_norm_len = norm_old.len();
+    for ch in content[orig_byte..].chars() {
+        if consumed_norm >= target_norm_len {
+            break;
+        }
+        let norm_ch_len = normalized_char_len(ch);
+        orig_end += ch.len_utf8();
+        consumed_norm += norm_ch_len;
+    }
+
+    let original_match = &content[orig_byte..orig_end];
+    Some((original_match, count))
+}
+
+/// Adapt `new_string` to use the same quote style as the matched original text.
+///
+/// For each straight quote in `new_string`, if the original matched text
+/// contained curly quotes in corresponding positions, convert straight quotes
+/// in `new_string` to the curly style found in the original.
+///
+/// This is best-effort: when the original used curly quotes, we convert all
+/// straight single quotes to right-single-quote (U+2019, the most common for
+/// apostrophes and single-quoted text) and all straight double quotes to
+/// left-double-quote (U+201C) / right-double-quote (U+201D) alternating.
+fn adapt_quotes_to_original(new_string: &str, original_match: &str) -> String {
+    // If the original contains no curly quotes, return new_string unchanged.
+    let has_curly_single =
+        original_match.contains('\u{2018}') || original_match.contains('\u{2019}');
+    let has_curly_double =
+        original_match.contains('\u{201C}') || original_match.contains('\u{201D}');
+
+    if !has_curly_single && !has_curly_double {
+        return new_string.to_string();
+    }
+
+    let mut result = String::with_capacity(new_string.len() * 2);
+    let mut double_quote_open = true; // toggle for left/right double quotes
+
+    for ch in new_string.chars() {
+        match ch {
+            '\'' if has_curly_single => {
+                // Use right single quote (U+2019) — works for apostrophes and
+                // closing single quotes, which are the overwhelmingly common case.
+                result.push('\u{2019}');
+            }
+            '"' if has_curly_double => {
+                if double_quote_open {
+                    result.push('\u{201C}');
+                } else {
+                    result.push('\u{201D}');
+                }
+                double_quote_open = !double_quote_open;
+            }
+            _ => result.push(ch),
+        }
+    }
+
+    result
 }
 
 // ── FsGrepTool ─────────────────────────────────────────────────────────────
@@ -4111,6 +4302,411 @@ mod tests {
             err.contains("too large"),
             "error should mention size limit, got: {err}"
         );
+    }
+
+    // ── FsEditTool — quote normalization ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_fs_edit_curly_old_matches_straight_file() {
+        // old_string uses curly quotes, file has straight quotes -> succeeds
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.rs");
+        std::fs::write(&path, r#"let msg = "hello world";"#).unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "let msg = \u{201C}hello world\u{201D};",
+                "new_string": "let msg = \"goodbye world\";"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["replacements"], 1);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"let msg = "goodbye world";"#
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_straight_old_matches_curly_file() {
+        // old_string uses straight quotes, file has curly quotes -> succeeds
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prose.txt");
+        std::fs::write(&path, "She said \u{201C}hello\u{201D} to him.").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "She said \"hello\" to him.",
+                "new_string": "She said \"goodbye\" to him."
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        // The replacement should preserve the file's curly quote style.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "She said \u{201C}goodbye\u{201D} to him."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_quote_normalization_preserves_original_style() {
+        // File uses curly single quotes; old_string uses straight single quotes.
+        // The replacement should use curly single quotes to match the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "It\u{2019}s a fine day.").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "It's a fine day.",
+                "new_string": "It's a great day."
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "It\u{2019}s a great day."
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_quote_normalization_enforces_uniqueness() {
+        // Two matches after normalization -> must fail uniqueness check.
+        // Content has two identical curly-quoted phrases; old_string uses
+        // straight quotes.  Normalized match count should be 2.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(
+            &path,
+            "said \u{201C}hello\u{201D} and said \u{201C}hello\u{201D}",
+        )
+        .unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "said \"hello\"",
+                "new_string": "said \"goodbye\""
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("2 times"),
+            "should mention 2 matches, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_direct_match_takes_priority() {
+        // File has both straight and curly; direct match should be used.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "say \"hello\" and \u{201C}hello\u{201D}").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "say \"hello\"",
+                "new_string": "say \"bye\""
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "say \"bye\" and \u{201C}hello\u{201D}"
+        );
+    }
+
+    // ── FsEditTool — trailing whitespace stripping ────────────────────────────
+
+    #[tokio::test]
+    async fn test_fs_edit_strips_trailing_whitespace_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "fn main() {}",
+                "new_string": "fn main() {  \n    println!(\"hi\");  \n}  "
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn main() {\n    println!(\"hi\");\n}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_preserves_trailing_whitespace_md() {
+        // Markdown files must preserve trailing whitespace (hard line breaks).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, "# Title").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "# Title",
+                "new_string": "# Title  \nSome text  "
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# Title  \nSome text  "
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_strips_trailing_whitespace_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[package]").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "[package]",
+                "new_string": "[package]  \nname = \"test\"  "
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[package]\nname = \"test\""
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_replace_all_with_quote_normalization() {
+        // File has 3 curly-quoted occurrences; old_string uses straight quotes;
+        // replace_all=true should replace all 3.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(
+            &path,
+            "say \u{201C}hi\u{201D} then \u{201C}hi\u{201D} then \u{201C}hi\u{201D}",
+        )
+        .unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "\"hi\"",
+                "new_string": "\"bye\"",
+                "replace_all": true
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["replacements"], 3);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "say \u{201C}bye\u{201D} then \u{201C}bye\u{201D} then \u{201C}bye\u{201D}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_strips_trailing_whitespace_preserves_trailing_newline() {
+        // new_string ends with \n — the trailing newline must survive stripping.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.rs");
+        std::fs::write(&path, "fn main() {}").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "fn main() {}",
+                "new_string": "fn main() {  \n    println!(\"hi\");  \n}  \n"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn main() {\n    println!(\"hi\");\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_normalization_and_stripping_combined() {
+        // File uses curly quotes; old_string and new_string use straight quotes
+        // with trailing whitespace.  Both normalization (straight -> curly
+        // adaptation) and whitespace stripping must apply.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "let msg = \u{201C}hello\u{201D};").unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "let msg = \"hello\";",
+                "new_string": "let msg = \"world\";  "
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        // adapt_quotes_to_original converts the straight quotes in new_string
+        // to curly quotes to match the file style, and trailing whitespace is
+        // stripped.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "let msg = \u{201C}world\u{201D};"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_empty_old_string_strips_trailing_whitespace() {
+        // File creation via empty old_string should also strip trailing
+        // whitespace, matching the behavior of normal edits.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new_file.rs");
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "",
+                "new_string": "fn main() {  \n    println!(\"hi\");  \n}  \n"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn main() {\n    println!(\"hi\");\n}\n"
+        );
+    }
+
+    // ── FsEditTool — helper unit tests ────────────────────────────────────────
+
+    #[test]
+    fn test_normalize_quotes() {
+        assert_eq!(normalize_quotes("\u{201C}hi\u{201D}"), "\"hi\"");
+        assert_eq!(normalize_quotes("it\u{2019}s"), "it's");
+        assert_eq!(normalize_quotes("\u{2018}a\u{2019}"), "'a'");
+        assert_eq!(normalize_quotes("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_strip_trailing_whitespace_non_markdown() {
+        assert_eq!(
+            strip_trailing_whitespace("hello  \nworld\t\n  ok  ", false),
+            "hello\nworld\n  ok"
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_whitespace_markdown_preserved() {
+        let input = "hello  \nworld\t\n  ok  ";
+        assert_eq!(strip_trailing_whitespace(input, true), input);
+    }
+
+    #[test]
+    fn test_strip_trailing_whitespace_preserves_trailing_newline() {
+        // A trailing newline must survive stripping — code files need it for
+        // POSIX compliance, and cargo fmt / linters enforce it.
+        assert_eq!(
+            strip_trailing_whitespace("hello  \nworld\n", false),
+            "hello\nworld\n"
+        );
+        // Also verify CRLF trailing newline.
+        assert_eq!(
+            strip_trailing_whitespace("hello  \r\nworld\r\n", false),
+            "hello\nworld\n"
+        );
+        // No trailing newline — must not add one.
+        assert_eq!(
+            strip_trailing_whitespace("hello  \nworld", false),
+            "hello\nworld"
+        );
+    }
+
+    #[test]
+    fn test_is_markdown_file() {
+        assert!(is_markdown_file("notes.md"));
+        assert!(is_markdown_file("README.MD"));
+        assert!(is_markdown_file("docs/file.markdown"));
+        assert!(!is_markdown_file("code.rs"));
+        assert!(!is_markdown_file("data.toml"));
+    }
+
+    #[test]
+    fn test_try_normalized_match_curly_to_straight() {
+        let content = r#"She said "hello" to him."#;
+        let old_string = "She said \u{201C}hello\u{201D} to him.";
+        let result = try_normalized_match(content, old_string);
+        assert!(result.is_some());
+        let (matched, count) = result.unwrap();
+        assert_eq!(matched, r#"She said "hello" to him."#);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_try_normalized_match_straight_to_curly() {
+        let content = "She said \u{201C}hello\u{201D} to him.";
+        let old_string = r#"She said "hello" to him."#;
+        let result = try_normalized_match(content, old_string);
+        assert!(result.is_some());
+        let (matched, count) = result.unwrap();
+        assert_eq!(matched, "She said \u{201C}hello\u{201D} to him.");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_try_normalized_match_no_match() {
+        let content = "no quotes here";
+        let old_string = "missing text";
+        assert!(try_normalized_match(content, old_string).is_none());
+    }
+
+    #[test]
+    fn test_adapt_quotes_preserves_straight_when_original_is_straight() {
+        let result = adapt_quotes_to_original("say \"hi\"", "say \"hi\"");
+        assert_eq!(result, "say \"hi\"");
+    }
+
+    #[test]
+    fn test_adapt_quotes_converts_to_curly_when_original_is_curly() {
+        let result = adapt_quotes_to_original("say \"goodbye\"", "say \u{201C}hello\u{201D}");
+        assert_eq!(result, "say \u{201C}goodbye\u{201D}");
     }
 
     // ── FsGrepTool ────────────────────────────────────────────────────────────
