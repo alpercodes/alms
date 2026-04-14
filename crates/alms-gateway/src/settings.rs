@@ -22,6 +22,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let all_builtins: &[&str] = &[
         "echo",
         "fs_edit",
+        "fs_glob",
         "fs_grep",
         "fs_list",
         "fs_read",
