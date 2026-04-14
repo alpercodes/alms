@@ -170,17 +170,17 @@ impl AgentRuntime {
         // Re-register fs_read/fs_write/fs_list/fs_edit sandboxed to the
         // workspace directory so file operations default to the agent's
         // workspace instead of the project root.
+        // fs_read/fs_write/fs_edit get the file state cache for read-before-write guard.
+        let cache = self.tools.file_state_cache().clone();
         if tool_enabled("fs_read") {
-            self.tools
-                .register(std::sync::Arc::new(alms_sandbox::FsReadTool::sandboxed(
-                    ws_root.clone(),
-                )));
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsReadTool::sandboxed(ws_root.clone()).with_cache(cache.clone()),
+            ));
         }
         if tool_enabled("fs_write") {
-            self.tools
-                .register(std::sync::Arc::new(alms_sandbox::FsWriteTool::sandboxed(
-                    ws_root.clone(),
-                )));
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsWriteTool::sandboxed(ws_root.clone()).with_cache(cache.clone()),
+            ));
         }
         if tool_enabled("fs_list") {
             self.tools
@@ -189,10 +189,9 @@ impl AgentRuntime {
                 )));
         }
         if tool_enabled("fs_edit") {
-            self.tools
-                .register(std::sync::Arc::new(alms_sandbox::FsEditTool::sandboxed(
-                    ws_root.clone(),
-                )));
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsEditTool::sandboxed(ws_root.clone()).with_cache(cache.clone()),
+            ));
         }
         if tool_enabled("fs_grep") {
             self.tools

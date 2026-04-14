@@ -1,13 +1,16 @@
 use alms_core::{AlmsError, AlmsResult};
-use alms_sandbox::{SandboxError, ToolRegistry as SandboxRegistry};
+use alms_sandbox::{FileStateCache, SandboxError, ToolRegistry as SandboxRegistry};
 use serde_json::Value;
 use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 /// Runtime tool registry wraps the sandbox registry
 #[derive(Debug, Clone)]
 pub struct ToolRegistry {
     registry: SandboxRegistry,
+    /// Per-run file state cache shared by fs_read, fs_write, and fs_edit.
+    file_state_cache: Arc<FileStateCache>,
 }
 
 impl Default for ToolRegistry {
@@ -21,13 +24,24 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             registry: SandboxRegistry::new(),
+            file_state_cache: Arc::new(FileStateCache::default()),
         }
     }
 
     /// Create registry with sandbox built-in tools (unrestricted).
+    ///
+    /// The file state cache is created and attached to `fs_read`, `fs_write`,
+    /// and `fs_edit` tools so that writes/edits are guarded by a prior read.
     pub fn with_builtins() -> Self {
+        let cache = Arc::new(FileStateCache::default());
+        let registry = SandboxRegistry::with_builtin_tools();
+
+        // Wire the file state cache into fs tools (same as the sandboxed path).
+        Self::attach_fs_cache_to_registry(&registry, None, &cache, &[]);
+
         Self {
-            registry: SandboxRegistry::with_builtin_tools(),
+            registry,
+            file_state_cache: cache,
         }
     }
 
@@ -35,17 +49,72 @@ impl ToolRegistry {
     ///
     /// `enabled` — when non-empty, only builtins whose name appears in the
     /// list are registered. Empty slice = all builtins enabled.
+    ///
+    /// The file state cache is created and attached to `fs_read`, `fs_write`,
+    /// and `fs_edit` tools so that writes/edits are guarded by a prior read.
     pub fn with_builtins_sandboxed(
         sandbox_root: Option<std::path::PathBuf>,
         shell_unrestricted: bool,
         enabled: &[String],
     ) -> Self {
+        let cache = Arc::new(FileStateCache::default());
+        let registry = SandboxRegistry::with_builtin_tools_sandboxed(
+            sandbox_root.clone(),
+            shell_unrestricted,
+            enabled,
+        );
+
+        // Re-register fs_read/fs_write/fs_edit with the file state cache.
+        // The initial registration created them without a cache; now we
+        // replace them with cache-aware versions.
+        Self::attach_fs_cache_to_registry(&registry, sandbox_root.as_ref(), &cache, enabled);
+
         Self {
-            registry: SandboxRegistry::with_builtin_tools_sandboxed(
-                sandbox_root,
-                shell_unrestricted,
-                enabled,
-            ),
+            registry,
+            file_state_cache: cache,
+        }
+    }
+
+    /// Get a reference to the file state cache shared by filesystem tools.
+    pub fn file_state_cache(&self) -> &Arc<FileStateCache> {
+        &self.file_state_cache
+    }
+
+    /// Re-register `fs_read`, `fs_write`, and `fs_edit` with the given cache.
+    ///
+    /// Used both during initial construction and after `with_workspace()`
+    /// re-creates tools sandboxed to the workspace directory.
+    fn attach_fs_cache_to_registry(
+        registry: &SandboxRegistry,
+        sandbox_root: Option<&std::path::PathBuf>,
+        cache: &Arc<FileStateCache>,
+        enabled: &[String],
+    ) {
+        let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
+
+        if tool_enabled("fs_read") {
+            let fs_read = match sandbox_root {
+                Some(root) => alms_sandbox::FsReadTool::sandboxed(root.clone()),
+                None => alms_sandbox::FsReadTool::new(),
+            }
+            .with_cache(Arc::clone(cache));
+            let _ = registry.register(Arc::new(fs_read));
+        }
+        if tool_enabled("fs_write") {
+            let fs_write = match sandbox_root {
+                Some(root) => alms_sandbox::FsWriteTool::sandboxed(root.clone()),
+                None => alms_sandbox::FsWriteTool::new(),
+            }
+            .with_cache(Arc::clone(cache));
+            let _ = registry.register(Arc::new(fs_write));
+        }
+        if tool_enabled("fs_edit") {
+            let fs_edit = match sandbox_root {
+                Some(root) => alms_sandbox::FsEditTool::sandboxed(root.clone()),
+                None => alms_sandbox::FsEditTool::new(),
+            }
+            .with_cache(Arc::clone(cache));
+            let _ = registry.register(Arc::new(fs_edit));
         }
     }
 

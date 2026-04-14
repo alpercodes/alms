@@ -223,6 +223,7 @@ dependencies = [
  "globset",
  "iana-time-zone",
  "landlock",
+ "parking_lot",
  "regex",
  "reqwest",
  "serde",

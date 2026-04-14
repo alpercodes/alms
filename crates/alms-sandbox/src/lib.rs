@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub mod builtin;
 pub mod error;
+pub mod file_state_cache;
 pub mod registry;
 pub mod sandbox;
 pub mod shell;
@@ -13,6 +14,7 @@ pub use builtin::{
     FsWriteTool, HttpGetTool, MathTool,
 };
 pub use error::{SandboxError, SandboxResult};
+pub use file_state_cache::FileStateCache;
 pub use registry::ToolRegistry;
 pub use sandbox::{Sandbox, SandboxConfig};
 pub use shell::ShellTool;

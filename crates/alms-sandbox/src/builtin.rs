@@ -1,3 +1,6 @@
+use crate::file_state_cache::{
+    FileStateCache, GuardOutcome, check_guard, content_hash, update_cache_after_write,
+};
 use crate::shell::security::DENIED_FILENAMES;
 use crate::{SandboxError, Tool, error::SandboxResult};
 use chrono::{Local, Utc};
@@ -5,6 +8,7 @@ use globset::GlobBuilder;
 use regex::Regex;
 use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use walkdir::WalkDir;
 
@@ -599,6 +603,7 @@ impl Tool for HttpGetTool {
 #[derive(Debug, Clone, Default)]
 pub struct FsReadTool {
     sandbox_root: Option<PathBuf>,
+    file_state_cache: Option<Arc<FileStateCache>>,
 }
 
 impl FsReadTool {
@@ -611,7 +616,14 @@ impl FsReadTool {
     pub fn sandboxed(root: PathBuf) -> Self {
         Self {
             sandbox_root: Some(root),
+            file_state_cache: None,
         }
+    }
+
+    /// Attach a file state cache for read-before-write tracking.
+    pub fn with_cache(mut self, cache: Arc<FileStateCache>) -> Self {
+        self.file_state_cache = Some(cache);
+        self
     }
 }
 
@@ -812,6 +824,11 @@ impl Tool for FsReadTool {
 
         // Handle empty file.
         if lines_read == 0 && selected_lines.is_empty() {
+            // Populate file state cache for empty files too.
+            if let Some(ref cache) = self.file_state_cache {
+                let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                cache.record_read(resolved, content_hash(b""), mtime, false);
+            }
             return Ok(serde_json::json!({
                 "content": "",
                 "lines_returned": 0,
@@ -857,6 +874,18 @@ impl Tool for FsReadTool {
             ));
         }
 
+        // Populate the file state cache so subsequent fs_write/fs_edit calls
+        // can verify the file was read first.
+        if let Some(ref cache) = self.file_state_cache {
+            // Re-read raw bytes for hashing. The file is already verified to
+            // be <= 256KB so this is cheap.
+            if let Ok(raw_bytes) = tokio::fs::read(&resolved).await {
+                let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                let is_partial = offset > 0 || has_more_after;
+                cache.record_read(resolved, content_hash(&raw_bytes), mtime, is_partial);
+            }
+        }
+
         Ok(result)
     }
 }
@@ -865,6 +894,7 @@ impl Tool for FsReadTool {
 #[derive(Debug, Clone, Default)]
 pub struct FsWriteTool {
     sandbox_root: Option<PathBuf>,
+    file_state_cache: Option<Arc<FileStateCache>>,
 }
 
 impl FsWriteTool {
@@ -875,7 +905,14 @@ impl FsWriteTool {
     pub fn sandboxed(root: PathBuf) -> Self {
         Self {
             sandbox_root: Some(root),
+            file_state_cache: None,
         }
+    }
+
+    /// Attach a file state cache for read-before-write tracking.
+    pub fn with_cache(mut self, cache: Arc<FileStateCache>) -> Self {
+        self.file_state_cache = Some(cache);
+        self
     }
 }
 
@@ -943,6 +980,28 @@ impl Tool for FsWriteTool {
             )));
         }
 
+        // Read-before-write guard: if the file exists on disk and a cache is
+        // present, verify the agent has read the file first.
+        // New file creation (file does not exist) bypasses the guard.
+        if let Some(ref cache) = self.file_state_cache {
+            let file_exists = tokio::fs::metadata(&resolved).await.is_ok();
+            if file_exists {
+                match check_guard(cache, &resolved).await {
+                    GuardOutcome::Allowed => {}
+                    GuardOutcome::NotRead => {
+                        return Err(SandboxError::InvalidParameters(
+                            "File has not been read yet. Use fs_read to read the file \
+                             before writing to it."
+                                .to_string(),
+                        ));
+                    }
+                    GuardOutcome::StaleRead { reason } => {
+                        return Err(SandboxError::InvalidParameters(reason));
+                    }
+                }
+            }
+        }
+
         let content = params
             .get("content")
             .and_then(|v| v.as_str())
@@ -986,6 +1045,12 @@ impl Tool for FsWriteTool {
                     other
                 )));
             }
+        }
+
+        // Update the cache so subsequent writes/edits to the same file
+        // pass the guard without requiring a re-read.
+        if let Some(ref cache) = self.file_state_cache {
+            update_cache_after_write(cache, &resolved).await;
         }
 
         Ok(serde_json::json!({ "ok": true, "path": path }))
@@ -1100,6 +1165,7 @@ impl Tool for FsListTool {
 #[derive(Debug, Clone, Default)]
 pub struct FsEditTool {
     sandbox_root: Option<PathBuf>,
+    file_state_cache: Option<Arc<FileStateCache>>,
 }
 
 impl FsEditTool {
@@ -1112,7 +1178,14 @@ impl FsEditTool {
     pub fn sandboxed(root: PathBuf) -> Self {
         Self {
             sandbox_root: Some(root),
+            file_state_cache: None,
         }
+    }
+
+    /// Attach a file state cache for read-before-edit tracking.
+    pub fn with_cache(mut self, cache: Arc<FileStateCache>) -> Self {
+        self.file_state_cache = Some(cache);
+        self
     }
 }
 
@@ -1213,11 +1286,31 @@ impl Tool for FsEditTool {
             )));
         }
 
-        // Special case: empty old_string means "create file".
+        // Special case: empty old_string means "create file" — bypasses the
+        // read-before-edit guard since there is no existing content to protect.
         if old_string.is_empty() {
             return self
                 .handle_empty_old_string(&resolved, path, new_string)
                 .await;
+        }
+
+        // Read-before-edit guard: the file must have been read via fs_read
+        // before it can be edited. This prevents agents from blindly modifying
+        // files they have not inspected.
+        if let Some(ref cache) = self.file_state_cache {
+            match check_guard(cache, &resolved).await {
+                GuardOutcome::Allowed => {}
+                GuardOutcome::NotRead => {
+                    return Err(SandboxError::InvalidParameters(
+                        "File has not been read yet. Use fs_read to read the file \
+                         before editing it."
+                            .to_string(),
+                    ));
+                }
+                GuardOutcome::StaleRead { reason } => {
+                    return Err(SandboxError::InvalidParameters(reason));
+                }
+            }
         }
 
         // File size guard — reject files larger than 2 MiB.
@@ -1267,6 +1360,12 @@ impl Tool for FsEditTool {
         tokio::fs::write(&resolved, &new_content)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", path, e)))?;
+
+        // Update the cache so subsequent edits/writes to the same file
+        // pass the guard without requiring a re-read.
+        if let Some(ref cache) = self.file_state_cache {
+            update_cache_after_write(cache, &resolved).await;
+        }
 
         let replacements = if replace_all { count } else { 1 };
         Ok(serde_json::json!({
@@ -1320,6 +1419,12 @@ impl FsEditTool {
         tokio::fs::write(resolved, new_string)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to write '{}': {}", display_path, e)))?;
+
+        // Update the cache so subsequent writes/edits to the newly created file
+        // pass the guard without requiring an fs_read.
+        if let Some(ref cache) = self.file_state_cache {
+            update_cache_after_write(cache, resolved).await;
+        }
 
         Ok(serde_json::json!({
             "ok": true,
@@ -5001,5 +5106,502 @@ mod tests {
             }))
             .await;
         assert!(result.is_err());
+    }
+
+    // ── FileStateCache integration tests ──────────────────────────────────
+
+    use crate::file_state_cache::FileStateCache;
+
+    /// Helper: create a cache-enabled fs_read tool.
+    fn fs_read_with_cache(cache: Arc<FileStateCache>) -> FsReadTool {
+        FsReadTool::new().with_cache(cache)
+    }
+
+    /// Helper: create a cache-enabled fs_write tool.
+    fn fs_write_with_cache(cache: Arc<FileStateCache>) -> FsWriteTool {
+        FsWriteTool::new().with_cache(cache)
+    }
+
+    /// Helper: create a cache-enabled fs_edit tool.
+    fn fs_edit_with_cache(cache: Arc<FileStateCache>) -> FsEditTool {
+        FsEditTool::new().with_cache(cache)
+    }
+
+    #[tokio::test]
+    async fn test_write_without_prior_read_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("existing.txt");
+        std::fs::write(&file, "hello").unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let write_tool = fs_write_with_cache(cache);
+
+        let result = write_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "overwrite"
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not been read yet"),
+            "expected 'not been read' error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_without_prior_read_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("existing.txt");
+        std::fs::write(&file, "hello world").unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let edit_tool = fs_edit_with_cache(cache);
+
+        let result = edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not been read yet"),
+            "expected 'not been read' error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_then_write_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let read_tool = fs_read_with_cache(cache.clone());
+        let write_tool = fs_write_with_cache(cache);
+
+        // Read first.
+        read_tool
+            .execute(serde_json::json!({ "path": file.to_str().unwrap() }))
+            .await
+            .unwrap();
+
+        // Write should succeed.
+        let result = write_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "updated"
+            }))
+            .await;
+        assert!(result.is_ok(), "write after read should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_read_then_edit_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "hello world").unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let read_tool = fs_read_with_cache(cache.clone());
+        let edit_tool = fs_edit_with_cache(cache);
+
+        // Read first.
+        read_tool
+            .execute(serde_json::json!({ "path": file.to_str().unwrap() }))
+            .await
+            .unwrap();
+
+        // Edit should succeed.
+        let result = edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await;
+        assert!(result.is_ok(), "edit after read should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_read_external_modification_then_edit_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("test.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let read_tool = fs_read_with_cache(cache.clone());
+        let edit_tool = fs_edit_with_cache(cache);
+
+        // Read first.
+        read_tool
+            .execute(serde_json::json!({ "path": file.to_str().unwrap() }))
+            .await
+            .unwrap();
+
+        // Externally modify the file (different content + new mtime).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&file, "externally modified").unwrap();
+
+        // Edit should fail due to staleness.
+        let result = edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "externally",
+                "new_string": "agent"
+            }))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("modified since"),
+            "expected staleness error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_file_creation_via_fs_write_bypasses_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("brand_new.txt");
+        assert!(!file.exists());
+
+        let cache = Arc::new(FileStateCache::default());
+        let write_tool = fs_write_with_cache(cache);
+
+        // Write to a non-existent file should succeed without prior read.
+        let result = write_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "new content"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "new file creation should bypass guard: {:?}",
+            result.err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new content");
+    }
+
+    #[tokio::test]
+    async fn test_new_file_creation_via_fs_edit_empty_old_string_bypasses_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("brand_new.txt");
+        assert!(!file.exists());
+
+        let cache = Arc::new(FileStateCache::default());
+        let edit_tool = fs_edit_with_cache(cache);
+
+        // fs_edit with empty old_string on non-existent file should succeed.
+        let result = edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "",
+                "new_string": "new content"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "new file via empty old_string should bypass guard: {:?}",
+            result.err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "new content");
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_empty_old_string_updates_cache_for_subsequent_ops() {
+        // Regression: handle_empty_old_string must update the cache after
+        // creating a new file so that a follow-up fs_edit or fs_write does
+        // not fail with "must read the file first".
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("created_then_edited.txt");
+        assert!(!file.exists());
+
+        let cache = Arc::new(FileStateCache::default());
+        let edit_tool = fs_edit_with_cache(cache.clone());
+        let write_tool = fs_write_with_cache(cache);
+
+        // Step 1: create the file via fs_edit with empty old_string.
+        edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "",
+                "new_string": "initial content"
+            }))
+            .await
+            .expect("new file creation via empty old_string should succeed");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "initial content");
+
+        // Step 2: edit the newly created file — must succeed without fs_read.
+        let edit_result = edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "initial",
+                "new_string": "updated"
+            }))
+            .await;
+        assert!(
+            edit_result.is_ok(),
+            "edit after empty-old_string creation should succeed: {:?}",
+            edit_result.err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "updated content");
+
+        // Step 3: overwrite via fs_write — must also succeed without fs_read.
+        let write_result = write_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "final content"
+            }))
+            .await;
+        assert!(
+            write_result.is_ok(),
+            "write after edit-after-creation should succeed: {:?}",
+            write_result.err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "final content");
+    }
+
+    #[tokio::test]
+    async fn test_partial_read_allows_subsequent_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("long.txt");
+        let content: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let read_tool = fs_read_with_cache(cache.clone());
+        let write_tool = fs_write_with_cache(cache);
+
+        // Partial read (only first 5 lines).
+        read_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "offset": 0,
+                "limit": 5
+            }))
+            .await
+            .unwrap();
+
+        // Write should still succeed (partial reads are allowed per issue spec).
+        let result = write_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "replaced"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "write after partial read should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_read_allows_subsequent_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("long.txt");
+        let content: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&file, &content).unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let read_tool = fs_read_with_cache(cache.clone());
+        let edit_tool = fs_edit_with_cache(cache);
+
+        // Partial read.
+        read_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "offset": 0,
+                "limit": 5
+            }))
+            .await
+            .unwrap();
+
+        // Edit should succeed (use a unique string so uniqueness guard passes).
+        let result = edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "line 42\n",
+                "new_string": "LINE 42\n"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "edit after partial read should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tools_work_without_cache() {
+        // When no cache is attached, tools should function normally
+        // (backward compatibility).
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("no_cache.txt");
+        std::fs::write(&file, "content").unwrap();
+
+        let write_tool = FsWriteTool::new(); // No cache
+        let result = write_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "overwritten"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "write without cache should succeed: {:?}",
+            result.err()
+        );
+
+        let edit_tool = FsEditTool::new(); // No cache
+        let result = edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "overwritten",
+                "new_string": "edited"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "edit without cache should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_write_write_consecutive() {
+        // read -> write -> write: the second write should succeed because
+        // the cache is updated after the first write.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("consecutive.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let read_tool = fs_read_with_cache(cache.clone());
+        let write_tool = fs_write_with_cache(cache);
+
+        // Step 1: read.
+        read_tool
+            .execute(serde_json::json!({ "path": file.to_str().unwrap() }))
+            .await
+            .unwrap();
+
+        // Step 2: first write.
+        write_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "first write"
+            }))
+            .await
+            .expect("first write after read should succeed");
+
+        // Step 3: second write — must succeed (cache updated by first write).
+        let result = write_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "second write"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "second consecutive write should succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second write");
+    }
+
+    #[tokio::test]
+    async fn test_read_edit_edit_consecutive() {
+        // read -> edit -> edit: the second edit should succeed because
+        // the cache is updated after the first edit.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("consecutive.txt");
+        std::fs::write(&file, "alpha beta gamma").unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let read_tool = fs_read_with_cache(cache.clone());
+        let edit_tool = fs_edit_with_cache(cache);
+
+        // Step 1: read.
+        read_tool
+            .execute(serde_json::json!({ "path": file.to_str().unwrap() }))
+            .await
+            .unwrap();
+
+        // Step 2: first edit.
+        edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "alpha",
+                "new_string": "ALPHA"
+            }))
+            .await
+            .expect("first edit after read should succeed");
+
+        // Step 3: second edit — must succeed (cache updated by first edit).
+        let result = edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "beta",
+                "new_string": "BETA"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "second consecutive edit should succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ALPHA BETA gamma");
+    }
+
+    #[tokio::test]
+    async fn test_read_write_edit_consecutive() {
+        // read -> write -> edit: mixed workflow should also succeed because
+        // both write and edit update the cache.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mixed.txt");
+        std::fs::write(&file, "original").unwrap();
+
+        let cache = Arc::new(FileStateCache::default());
+        let read_tool = fs_read_with_cache(cache.clone());
+        let write_tool = fs_write_with_cache(cache.clone());
+        let edit_tool = fs_edit_with_cache(cache);
+
+        // Step 1: read.
+        read_tool
+            .execute(serde_json::json!({ "path": file.to_str().unwrap() }))
+            .await
+            .unwrap();
+
+        // Step 2: write (replaces content entirely).
+        write_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "hello world"
+            }))
+            .await
+            .expect("write after read should succeed");
+
+        // Step 3: edit the written content — must succeed.
+        let result = edit_tool
+            .execute(serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "edit after write should succeed: {:?}",
+            result.err()
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "goodbye world");
     }
 }
