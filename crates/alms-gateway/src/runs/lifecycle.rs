@@ -954,10 +954,13 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         Ok(output) => {
             persist_tool_calls(&output.tool_calls);
 
+            // Capture this flag before mark_run_as_completed moves the response.
+            let hit_max_iterations = output.response == alms_core::MAX_ITERATIONS_SENTINEL;
+
             // Detect max-iterations sentinel and emit a warning event so the
             // frontend can style it distinctly (yellow) instead of as a normal
             // agent message.
-            if output.response == alms_core::MAX_ITERATIONS_SENTINEL {
+            if hit_max_iterations {
                 state
                     .run_manager
                     .send_event(
@@ -1002,9 +1005,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
             // Persist warning marker when MAX_ITERATIONS was hit, so it
             // survives page reloads.
-            if output.response == alms_core::MAX_ITERATIONS_SENTINEL
-                && !is_internal_context_id(&context_id)
-            {
+            if hit_max_iterations && !is_internal_context_id(&context_id) {
                 super::markers::persist_lifecycle_marker(
                     &state.session_manager,
                     session_id,
@@ -1095,7 +1096,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
             // -- DM post-run lifecycle (consolidated in #628) --
             //
-            // Detect ignore_message, signal conversation end, emit SSE events.
+            // Detect ignore_message or max-iterations, signal conversation
+            // end, emit SSE events.
             // All logic lives in `dm_lifecycle::handle_dm_run_completion()`.
             super::dm_lifecycle::handle_dm_run_completion(
                 super::dm_lifecycle::DmRunCompletionContext {
@@ -1107,6 +1109,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     context_id: &context_id,
                     is_peer_message,
                     tool_calls: &output.tool_calls,
+                    hit_max_iterations,
                 },
             )
             .await;

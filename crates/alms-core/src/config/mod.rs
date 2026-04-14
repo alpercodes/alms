@@ -150,10 +150,14 @@ impl AlmsConfig {
             self.llm.provider = provider.to_lowercase();
         }
         // NOTE: API key is NOT loaded from env vars. Use `alms auth set`.
-        if let Ok(url) = std::env::var("LLM_BASE_URL") {
+        if let Ok(url) =
+            std::env::var("ALMS_LLM_BASE_URL").or_else(|_| std::env::var("LLM_BASE_URL"))
+        {
             self.llm.base_url = url;
         }
-        if let Ok(model) = std::env::var("DEFAULT_MODEL") {
+        if let Ok(model) =
+            std::env::var("ALMS_LLM_MODEL").or_else(|_| std::env::var("DEFAULT_MODEL"))
+        {
             self.llm.model = model;
         }
         if let Ok(val) = std::env::var("ALMS_LLM_MOCK") {

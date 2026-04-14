@@ -362,11 +362,15 @@ impl LlmConfig {
         }
         // NOTE: API key is NOT loaded from env vars. Use `alms auth set`.
 
-        if let Ok(base_url) = std::env::var("LLM_BASE_URL") {
+        if let Ok(base_url) =
+            std::env::var("ALMS_LLM_BASE_URL").or_else(|_| std::env::var("LLM_BASE_URL"))
+        {
             config.base_url = base_url;
         }
 
-        if let Ok(model) = std::env::var("DEFAULT_MODEL") {
+        if let Ok(model) =
+            std::env::var("ALMS_LLM_MODEL").or_else(|_| std::env::var("DEFAULT_MODEL"))
+        {
             config.default_model = model;
         }
 

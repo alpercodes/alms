@@ -122,15 +122,14 @@ impl AgentRuntime {
                 // `messages` vec is the authoritative state for the current
                 // run. If persistence is critical for your deployment, monitor
                 // these warnings and consider promoting them to errors.
-                if !is_dm {
-                    self.persist_assistant_tool_calls(
-                        session_manager,
-                        session_id,
-                        content.as_deref(),
-                        &tool_calls,
-                        &invocation_ids,
-                    );
-                }
+                self.persist_assistant_tool_calls(
+                    session_manager,
+                    session_id,
+                    content.as_deref(),
+                    &tool_calls,
+                    &invocation_ids,
+                    is_dm,
+                );
 
                 // Collect tool call records for per-run storage (all sessions).
                 for tc in &tool_calls {
@@ -496,6 +495,12 @@ impl AgentRuntime {
     /// best-effort durability layer so that conversation history survives
     /// across runs. If this becomes a reliability concern, these warnings
     /// should be monitored and potentially escalated.
+    ///
+    /// For DM sessions (`is_dm = true`), messages are persisted as
+    /// `Role::User` with `message_type: "reasoning"` metadata so they can be
+    /// reconstructed into collapsible reasoning blocks in the UI. This
+    /// preserves the DM invariant that all shared-session messages are
+    /// `Role::User` (see `apply_perspective()` in context.rs).
     fn persist_assistant_tool_calls(
         &self,
         session_manager: &SessionManager,
@@ -503,31 +508,56 @@ impl AgentRuntime {
         content: Option<&str>,
         tool_calls: &[ToolCall],
         invocation_ids: &[Uuid],
+        is_dm: bool,
     ) {
+        let reasoning_meta = self.dm_reasoning_metadata(is_dm);
+
         // Persist assistant text content (if any) before tool calls.
+        // For DM sessions: store as Role::User with reasoning metadata
+        // to preserve the DM invariant.
         if let Some(text) = content
             && !text.is_empty()
-            && let Err(e) = session_manager.append_message(
-                session_id,
-                SessionMessage {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    role: SessionRole::Assistant,
-                    content: SessionContent::Text(text.to_string()),
-                    timestamp: alms_core::Timestamp::now(),
-                    metadata: None,
-                },
-            )
         {
-            warn!("Failed to persist assistant text to session: {}", e);
-        }
-
-        // Persist tool calls to session history.
-        for (tc, invocation_id) in tool_calls.iter().zip(invocation_ids) {
+            let (role, metadata) = if reasoning_meta.is_some() {
+                (SessionRole::User, reasoning_meta.clone())
+            } else {
+                (SessionRole::Assistant, None)
+            };
             if let Err(e) = session_manager.append_message(
                 session_id,
                 SessionMessage {
                     id: uuid::Uuid::new_v4().to_string(),
-                    role: SessionRole::Assistant,
+                    role,
+                    content: SessionContent::Text(text.to_string()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata,
+                },
+            ) {
+                warn!("Failed to persist assistant text to session: {}", e);
+            }
+        }
+
+        // Persist tool calls to session history.
+        // For DM sessions: store as Role::User with reasoning metadata
+        // merged with the existing tool_call_id/tool_invocation_id fields.
+        for (tc, invocation_id) in tool_calls.iter().zip(invocation_ids) {
+            let base_meta = serde_json::json!({
+                "tool_call_id": tc.id,
+                "tool_invocation_id": invocation_id.to_string(),
+            });
+            let (role, metadata) = if reasoning_meta.is_some() {
+                (
+                    SessionRole::User,
+                    Some(self.merge_reasoning_metadata(base_meta, is_dm)),
+                )
+            } else {
+                (SessionRole::Assistant, Some(base_meta))
+            };
+            if let Err(e) = session_manager.append_message(
+                session_id,
+                SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role,
                     content: SessionContent::ToolCall {
                         name: tc.function.name.clone(),
                         params: serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| {
@@ -535,10 +565,7 @@ impl AgentRuntime {
                         }),
                     },
                     timestamp: alms_core::Timestamp::now(),
-                    metadata: Some(serde_json::json!({
-                        "tool_call_id": tc.id,
-                        "tool_invocation_id": invocation_id.to_string(),
-                    })),
+                    metadata,
                 },
             ) {
                 warn!("Failed to persist tool call to session: {}", e);
@@ -547,7 +574,7 @@ impl AgentRuntime {
     }
 
     /// Process tool execution results: push tool result messages into the
-    /// conversation, persist to session (non-DM), and collect per-run records.
+    /// conversation, persist to session, and collect per-run records.
     #[allow(clippy::too_many_arguments)] // Private helper; the parameters are clear and grouping them into a struct would add indirection without real benefit.
     fn process_tool_results(
         &self,
@@ -573,7 +600,7 @@ impl AgentRuntime {
             };
             messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
 
-            // Persist tool result to session history (skip for DM sessions).
+            // Persist tool result to session history.
             // Intentionally fire-and-forget -- see persist_assistant_tool_calls
             // for the rationale.
             //
@@ -581,26 +608,40 @@ impl AgentRuntime {
             // reconstruction can correlate tool results back to the same
             // invocation ID used by live SSE tool_start/tool_end events.
             // (Fixes #509)
-            if !is_dm
-                && let Err(e) = session_manager.append_message(
+            //
+            // For DM sessions: store as Role::User with reasoning metadata
+            // merged with the existing ok/tool_invocation_id fields. This
+            // preserves the DM invariant (all shared-session messages are
+            // Role::User) and enables UI reasoning block reconstruction.
+            {
+                let base_meta = serde_json::json!({
+                    "ok": ok,
+                    "tool_invocation_id": invocation_id.to_string(),
+                });
+                let (role, metadata) = if is_dm {
+                    (
+                        SessionRole::User,
+                        Some(self.merge_reasoning_metadata(base_meta, is_dm)),
+                    )
+                } else {
+                    (SessionRole::Tool, Some(base_meta))
+                };
+                if let Err(e) = session_manager.append_message(
                     session_id,
                     SessionMessage {
                         id: uuid::Uuid::new_v4().to_string(),
-                        role: SessionRole::Tool,
+                        role,
                         content: SessionContent::ToolResult {
                             tool_id: tool_call.id.clone(),
                             result: serde_json::from_str(&content)
                                 .unwrap_or(serde_json::Value::String(content.clone())),
                         },
                         timestamp: alms_core::Timestamp::now(),
-                        metadata: Some(serde_json::json!({
-                            "ok": ok,
-                            "tool_invocation_id": invocation_id.to_string(),
-                        })),
+                        metadata,
                     },
-                )
-            {
-                warn!("Failed to persist tool result to session: {}", e);
+                ) {
+                    warn!("Failed to persist tool result to session: {}", e);
+                }
             }
 
             // Collect tool result record for per-run storage (all sessions).

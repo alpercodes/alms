@@ -148,6 +148,64 @@ impl AgentRuntime {
         }
     }
 
+    /// Build reasoning metadata for DM sessions.
+    ///
+    /// Returns a JSON object with `message_type: "reasoning"` plus agent
+    /// identity and run ID.  Used when persisting assistant text, tool calls,
+    /// and tool results to a DM session so the UI can reconstruct collapsible
+    /// reasoning blocks after a page reload.
+    ///
+    /// Returns `None` for non-DM sessions or when `agent_name` is not set.
+    pub(crate) fn dm_reasoning_metadata(&self, is_dm: bool) -> Option<serde_json::Value> {
+        if !is_dm {
+            return None;
+        }
+        // Always return reasoning metadata for DM sessions, even when
+        // agent_name is None.  DM sessions require Role::User for all
+        // persisted messages (the DM invariant), so falling back to
+        // Role::Assistant when agent_name is missing would be wrong.
+        // Use "unknown" as the from_agent fallback to preserve the
+        // message_type marker that dm_filter relies on.
+        let name = self.agent_name.as_deref().unwrap_or("unknown");
+        let run_id_str = self
+            .run_id
+            .as_ref()
+            .map(|r| r.0.to_string())
+            .unwrap_or_default();
+        Some(serde_json::json!({
+            "message_type": "reasoning",
+            "from_agent": name,
+            "from_agent_id": self.agent_id.0.to_string(),
+            "run_id": run_id_str,
+        }))
+    }
+
+    /// Merge reasoning metadata into an existing metadata object.
+    ///
+    /// Used when tool call/result entries already carry their own metadata
+    /// fields (e.g. `tool_call_id`, `tool_invocation_id`) and the reasoning
+    /// fields need to be added alongside them.
+    pub(crate) fn merge_reasoning_metadata(
+        &self,
+        base: serde_json::Value,
+        is_dm: bool,
+    ) -> serde_json::Value {
+        if let Some(reasoning) = self.dm_reasoning_metadata(is_dm) {
+            if let (serde_json::Value::Object(mut base_map), serde_json::Value::Object(r_map)) =
+                (base, reasoning)
+            {
+                for (k, v) in r_map {
+                    base_map.insert(k, v);
+                }
+                serde_json::Value::Object(base_map)
+            } else {
+                serde_json::Value::Null
+            }
+        } else {
+            base
+        }
+    }
+
     /// Rebuild the system prompt for tool-loop continuation or DM retry.
     ///
     /// Combines the agent's initial prompt with the `tool_loop` continuation

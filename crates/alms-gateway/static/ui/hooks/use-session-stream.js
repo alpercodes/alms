@@ -28,16 +28,56 @@
  *      has the same guard to cover the token_delta→rAF async gap.
  */
 
-import { batch } from '../deps.js';
+import { batch, signal } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
 import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
 import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
 import { messageQueue } from '../state/queue.js';
-import { activeSessionId } from '../state/sessions.js';
+import { activeSessionId, activeSession, dmParticipants } from '../state/sessions.js';
+import { activeAgent } from '../state/agents.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
+import { clearPendingMessage } from '../state/pending-messages.js';
+
+/**
+ * Per-run DM thinking text accumulation buffer.
+ * Keyed by run_id, values are accumulated token_delta text.
+ * Uses a Preact signal so that DmReasoningBlock components
+ * re-render when new thinking text arrives.
+ */
+export const dmThinkingBuffers = signal(new Map());
+
+/**
+ * Derive the correct agent name for a DM reasoning block from the
+ * run's source field and the DM participants list.
+ *
+ * In a DM between Alice and Bob:
+ *   - source "peer:Alice" means Alice sent a message, so BOB is reasoning
+ *   - source "peer:Bob"   means Bob sent a message, so ALICE is reasoning
+ *
+ * Falls back to the active agent's name for non-peer sources (e.g. user-
+ * initiated runs) or when participants are not available.
+ *
+ * Fixes #692 — previously used `activeAgent.value?.name` which is the
+ * agent selected in the UI dropdown, not necessarily the one reasoning.
+ *
+ * @param {string|null} source - the run's source field (e.g. "peer:Alice")
+ * @returns {string|null} the name of the agent doing the reasoning
+ */
+function dmReasoningAgentName(source) {
+    if (source && source.startsWith('peer:')) {
+        const peerName = source.slice(5);
+        const participants = dmParticipants.value;
+        if (participants.length >= 2) {
+            // The peer triggered the run — the OTHER participant is reasoning.
+            return participants[0] === peerName ? participants[1] : participants[0];
+        }
+    }
+    // Fallback: best effort from the active agent selector.
+    return activeAgent.value?.name || null;
+}
 
 /**
  * Map error codes to user-friendly messages.
@@ -281,13 +321,56 @@ export function openSessionStream(sessionId, opts) {
         // Set the DM context so the header bar shows "Chatting with
         // {peer}..." as the fallback phase.  More specific phases (tool
         // execution) will temporarily override it, reverting when done.
+        const isDm = activeSession.value?.session_type === 'dm';
         if (data.source && data.source.startsWith('peer:')) {
             setDmContext(data.source.slice(5));
         }
 
-        if (data.is_notification) {
+        if (isDm && data.run_id) {
+            // DM sessions with queued runs: show a thinking indicator with
+            // queue state instead of a live reasoning block. The reasoning
+            // block will be created when run_started fires. (#691)
+            if (queuedBehind > 0) {
+                batch(() => {
+                    activeRunId.value = data.run_id;
+                    // Header bar is NOT updated here -- it should keep
+                    // showing the agent's current activity (e.g. a DM with
+                    // another peer).  The inline thinking indicator handles
+                    // the queued state via queuedBehind. (#693)
+                    appendMessage({
+                        id: nextMsgId(), type: 'thinking', source: data.source, queuedBehind,
+                    });
+                });
+            } else {
+                // DM sessions: insert a live reasoning block entry instead of
+                // a thinking indicator. The block collects tool calls and
+                // thinking text as they arrive, then is sealed on run end.
+                // Derive the reasoning agent's name from the source field:
+                // "peer:<name>" means <name> sent a message and the OTHER
+                // participant is doing the reasoning.  Fall back to the
+                // active agent for non-peer sources (e.g. user-initiated).
+                // Fixes #692 — was using activeAgent which is always the
+                // UI-selected agent, not necessarily the one reasoning.
+                const agentName = dmReasoningAgentName(data.source);
+                batch(() => {
+                    activeRunId.value = data.run_id;
+                    appendMessage({
+                        id: nextMsgId(),
+                        type: 'dm_reasoning',
+                        runId: data.run_id,
+                        agentName: agentName,
+                        thinkingText: '',
+                        tools: [],
+                        status: 'running',
+                        isLive: true,
+                    });
+                });
+            }
+        } else if (data.is_notification) {
             // Notification run from subagent completion or peer message --
-            // show thinking indicator with source context
+            // show thinking indicator with source context. The inline
+            // indicator handles queue state via queuedBehind; the header
+            // bar keeps showing the agent's current activity. (#693)
             batch(() => {
                 activeRunId.value = data.run_id;
                 appendMessage({
@@ -296,7 +379,9 @@ export function openSessionStream(sessionId, opts) {
             });
         } else if (queuedBehind > 0) {
             // User-initiated run but agent is busy -- update the existing
-            // thinking indicator (added by startRun) with queue position
+            // thinking indicator (added by startRun) with queue position.
+            // Header bar keeps its current state (the agent's real
+            // activity); the inline indicator shows queue status. (#693)
             batch(() => {
                 activeRunId.value = data.run_id;
                 updateMessage(
@@ -311,12 +396,57 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // -- run_started: the run has been dequeued and is now executing --
-    on('run_started', (_e) => {
-        // Transition thinking indicator from "queued" to active "Thinking..."
-        updateMessage(
-            m => m.type === 'thinking' && m.queuedBehind > 0,
-            m => ({ ...m, queuedBehind: 0 }),
-        );
+    on('run_started', (e) => {
+        const data = JSON.parse(e.data);
+        const isDm = activeSession.value?.session_type === 'dm';
+
+        if (isDm && data.run_id) {
+            // DM session: replace the queued thinking indicator with a
+            // live reasoning block now that the run is actually executing.
+            // Extract the source from the queued thinking indicator (set
+            // by run_created) so we can derive the correct agent name.
+            // Fixes #692 — was using activeAgent which is always the
+            // UI-selected agent, not necessarily the one reasoning.
+            const thinkingMsg = chatMessages.value.find(
+                m => m.type === 'thinking' && m.queuedBehind > 0
+            );
+            const agentName = dmReasoningAgentName(thinkingMsg?.source);
+            transformMessages(msgs => {
+                const filtered = msgs.filter(m => !(m.type === 'thinking' && m.queuedBehind > 0));
+                // Only add reasoning block if one does not already exist
+                // for this run (it may already exist if run was not queued).
+                if (!filtered.some(m => m.type === 'dm_reasoning' && m.runId === data.run_id)) {
+                    filtered.push({
+                        id: nextMsgId(),
+                        type: 'dm_reasoning',
+                        runId: data.run_id,
+                        agentName: agentName,
+                        thinkingText: '',
+                        tools: [],
+                        status: 'running',
+                        isLive: true,
+                    });
+                }
+                return filtered;
+            });
+        } else {
+            // Non-DM: transition thinking indicator from "queued" to
+            // active "Thinking..."
+            updateMessage(
+                m => m.type === 'thinking' && m.queuedBehind > 0,
+                m => ({ ...m, queuedBehind: 0 }),
+            );
+        }
+
+        // Set header bar to the appropriate active phase now that the
+        // run is executing. DM runs with a peer get "Chatting with...",
+        // others get "Thinking..." until the first real status event
+        // arrives. (#691)
+        if (dmPeer.value) {
+            setAgentPhase('dm', dmPeer.value);
+        } else {
+            setAgentPhase('calling_llm', null);
+        }
         bumpRunListGeneration();
     });
 
@@ -351,6 +481,22 @@ export function openSessionStream(sessionId, opts) {
     on('token_delta', (e) => {
         const data = JSON.parse(e.data);
         if (data.source_agent) return; // suppress subagent interleaving
+        const isDm = activeSession.value?.session_type === 'dm';
+        if (isDm) {
+            // For DM sessions: accumulate thinking text into the per-run
+            // buffer instead of the main chat delta buffer. The reasoning
+            // text is displayed inside collapsible DmReasoningBlock
+            // components, not as standalone agent messages. This prevents
+            // ghost messages that vanish on reload. (#685)
+            const runId = activeRunId.value;
+            if (runId) {
+                const prev = dmThinkingBuffers.value;
+                const next = new Map(prev);
+                next.set(runId, (next.get(runId) || '') + data.delta);
+                dmThinkingBuffers.value = next;
+            }
+            return;
+        }
         sawTokenDelta = true;
         deltaBuffer += data.delta;
         scheduleFlush();
@@ -362,20 +508,56 @@ export function openSessionStream(sessionId, opts) {
             flushDeltaBuffer();
             const data = JSON.parse(e.data);
             const toolId = data.tool_invocation_id || data.call_id || nextMsgId();
+            const runId = data.run_id || activeRunId.value || null;
             // Diagnostic: log tool count before insertion for #501 investigation.
             const toolCountBefore = chatMessages.value.filter(m => m.type === 'tool').length;
             console.debug('[tool_start]', data.tool, 'id=' + toolId,
                 'tool count before insertion:', toolCountBefore);
 
             const startedAt = Date.now();
+            const isDm = activeSession.value?.session_type === 'dm';
 
-            if (data.tool === 'invoke_agent') {
+            if (isDm && !data.source_agent) {
+                // DM sessions: add the tool to the live reasoning block
+                // for this run instead of inserting a standalone tool row.
+                const toolEntry = {
+                    id: toolId, type: 'tool', tool: data.tool, params: data.params,
+                    status: 'running', startedAt, runId,
+                };
+                transformMessages(prev => {
+                    const idx = prev.findIndex(
+                        m => m.type === 'dm_reasoning' && m.runId === runId
+                    );
+                    if (idx >= 0) {
+                        const block = prev[idx];
+                        const updated = [...prev];
+                        updated[idx] = {
+                            ...block,
+                            tools: [...block.tools, toolEntry],
+                        };
+                        return updated;
+                    }
+                    // Race defense: tool_start arrived before run_created
+                    // for this runId -- lazily create a reasoning block.
+                    return [...prev, {
+                        id: nextMsgId(),
+                        type: 'dm_reasoning',
+                        runId: runId,
+                        agentName: null,
+                        thinkingText: '',
+                        tools: [toolEntry],
+                        status: 'running',
+                        isLive: true,
+                    }];
+                });
+                setAgentPhase('tool_active', data.tool);
+            } else if (data.tool === 'invoke_agent') {
                 sealLastAgent();
                 const name = data.params?.name || data.params?.subagent_name || 'subagent';
                 const task = data.params?.task || '';
                 appendMessage({
                     id: toolId, type: 'tool', tool: 'invoke_agent', params: data.params,
-                    status: 'running', startedAt,
+                    status: 'running', startedAt, runId,
                 });
                 trackSubagentStart(name, task, toolId);
             } else if (data.source_agent) {
@@ -386,7 +568,7 @@ export function openSessionStream(sessionId, opts) {
                 sealLastAgent();
                 appendMessage({
                     id: toolId, type: 'tool', tool: data.tool, params: data.params,
-                    status: 'running', startedAt,
+                    status: 'running', startedAt, runId,
                 });
 
                 // Update the header bar to show which specific tool is running.
@@ -414,6 +596,40 @@ export function openSessionStream(sessionId, opts) {
                 const durationMs = m.startedAt ? endedAt - m.startedAt : null;
                 return { ...m, status, result: data.result, durationMs };
             };
+
+            // DM reasoning blocks: update the matching tool inside the
+            // block's tools array rather than updating a standalone message.
+            const isDm = activeSession.value?.session_type === 'dm';
+            if (isDm && matchId && !data.source_agent) {
+                let dmFound = false;
+                transformMessages(prev => {
+                    const copy = [...prev];
+                    for (let i = 0; i < copy.length; i++) {
+                        const m = copy[i];
+                        if (m.type !== 'dm_reasoning') continue;
+                        const toolIdx = m.tools.findIndex(t => t.id === matchId);
+                        if (toolIdx >= 0) {
+                            const updatedTools = [...m.tools];
+                            updatedTools[toolIdx] = applyToolEnd(updatedTools[toolIdx]);
+                            copy[i] = { ...m, tools: updatedTools };
+                            dmFound = true;
+                            break;
+                        }
+                    }
+                    return copy;
+                });
+                if (dmFound) {
+                    if (!data.source_agent) {
+                        const { phase } = agentPhase.value;
+                        if (phase === 'tool_active' || phase === 'executing_tools') {
+                            revertPhase('calling_llm');
+                        }
+                    }
+                    return;
+                }
+                // Fall through to standard matching if not found in any
+                // reasoning block (defensive -- should not happen normally).
+            }
 
             // Primary match: by tool_invocation_id (exact ID correlation).
             // Fallback: if the primary match fails (e.g. tool message was
@@ -689,6 +905,7 @@ export function openSessionStream(sessionId, opts) {
             flushDeltaBuffer();
             sealLastAgent();
             const data = e.data ? JSON.parse(e.data) : {};
+            const isDm = activeSession.value?.session_type === 'dm';
 
             // Build the approval-resolution-and-append phase via
             // transformMessages so it results in a single signal write.
@@ -699,6 +916,21 @@ export function openSessionStream(sessionId, opts) {
             const endingRunId = data.run_id || null;
             const decision = status === 'cancelled' ? 'cancelled'
                 : status === 'error' ? 'cancelled' : 'expired';
+
+            // Read and save thinking text BEFORE deleting from buffer,
+            // so the transformMessages callback below can use it.
+            // (C1 fix: previously the delete happened first, then the
+            // callback read the updated signal and got empty string.)
+            let savedThinkingText = '';
+            if (isDm && endingRunId) {
+                savedThinkingText = dmThinkingBuffers.value.get(endingRunId) || '';
+                if (savedThinkingText) {
+                    const next = new Map(dmThinkingBuffers.value);
+                    next.delete(endingRunId);
+                    dmThinkingBuffers.value = next;
+                }
+            }
+
             transformMessages(prev => {
                 const toolCountBefore = prev.filter(m => m.type === 'tool').length;
 
@@ -728,6 +960,24 @@ export function openSessionStream(sessionId, opts) {
                     if (isStuckTool(m)) {
                         return { ...m, status: 'cancelled' };
                     }
+                    // Seal live DM reasoning blocks for this run.
+                    if (m.type === 'dm_reasoning' && m.runId === endingRunId && m.isLive) {
+                        const finalThinking = savedThinkingText || m.thinkingText || '';
+                        const blockStatus = status === 'error' ? 'failed'
+                            : status === 'cancelled' ? 'cancelled' : 'done';
+                        // Also cancel any still-running tools inside the block.
+                        const sealedTools = m.tools.map(t =>
+                            t.status === 'running' && blockStatus !== 'done'
+                                ? { ...t, status: 'cancelled' } : t
+                        );
+                        return {
+                            ...m,
+                            status: blockStatus,
+                            isLive: false,
+                            thinkingText: finalThinking,
+                            tools: sealedTools,
+                        };
+                    }
                     return m;
                 });
 
@@ -741,10 +991,14 @@ export function openSessionStream(sessionId, opts) {
                 if (status === 'cancelled') {
                     msgs = [...msgs, { id: nextMsgId(), type: 'system', text: '(run cancelled)' }];
                 }
-                if (status === 'finished' && !sawTokenDelta) {
+                if (status === 'finished' && !sawTokenDelta && !isDm) {
                     // Only show "(run completed)" for runs that had no streamed
-                    // response (e.g. DM runs using send_message, tool-only runs).
+                    // response (e.g. tool-only runs on non-DM sessions).
                     // Normal chat runs already display the streamed text.
+                    // DM sessions suppress this because runs complete
+                    // frequently (each agent reply is a separate run) and
+                    // these transient system messages are never persisted,
+                    // creating visual noise that vanishes on reload.
                     msgs = [...msgs, { id: nextMsgId(), type: 'system', text: '(run completed)' }];
                 }
 
@@ -765,6 +1019,16 @@ export function openSessionStream(sessionId, opts) {
             });
             activeRunId.value = null;
             clearAgentPhase();
+
+            // The run has ended -- the user message is either persisted
+            // (finished/error after execution started) or was never
+            // persisted (cancelled before execution).  Either way, the
+            // session history is now the source of truth.
+            //
+            // Use the stream's closure-captured sessionId (not
+            // activeSessionId.value) because the user may have switched
+            // to a different session before this run ended.
+            clearPendingMessage(sessionId);
         });
 
         // Process queued user messages via dynamic import

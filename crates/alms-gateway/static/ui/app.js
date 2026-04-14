@@ -234,8 +234,10 @@ function ChatView() {
                     }
                     if (m.type === 'thinking') {
                         let label = 'Thinking';
+                        let indicatorClass = 'thinking-indicator';
                         if (m.queuedBehind > 0) {
-                            label = 'Agent is busy -- your message is queued';
+                            label = 'Queued \u2014 waiting for agent\u2026';
+                            indicatorClass = 'queued-indicator';
                         } else if (m.source && m.source.startsWith('peer:')) {
                             label = 'Replying to message from ' + m.source.slice(5);
                         } else if (m.source === 'job') {
@@ -247,7 +249,7 @@ function ChatView() {
                         return html`
                             <div key=${m.id} class="msg agent">
                                 <div class="msg-label">${thinkingName} $</div>
-                                <div class="msg-body thinking-indicator">${label}</div>
+                                <div class="msg-body ${indicatorClass}">${label}</div>
                             </div>
                         `;
                     }
