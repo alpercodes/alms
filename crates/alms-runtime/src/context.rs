@@ -99,17 +99,44 @@ impl ContextBuilder {
         let reserved = system_tokens + input_tokens + episodic_tokens + 1000;
         let history_budget = self.config.max_input_tokens.saturating_sub(reserved);
 
+        // Filter out reasoning messages (message_type="reasoning") from
+        // DM sessions before building context.  These are internal agent
+        // reasoning (thinking text, tool calls, tool results) persisted as
+        // Role::User to preserve the DM invariant.  They should not appear
+        // in either agent's LLM context:
+        //   - The reasoning agent already has them from the current run
+        //   - The peer agent should never see them (token waste + malformed
+        //     messages when perspective-mapped ToolResult hits the catch-all
+        //     in session_msg_to_llm — fixes C2)
+        let filtered_history: Vec<Message>;
+        let effective_history =
+            if perspective_agent.is_some() && history.iter().any(Self::is_reasoning_message) {
+                let before = history.len();
+                filtered_history = history
+                    .iter()
+                    .filter(|m| !Self::is_reasoning_message(m))
+                    .cloned()
+                    .collect();
+                debug!(
+                    filtered = before - filtered_history.len(),
+                    "Filtered reasoning messages from DM context"
+                );
+                filtered_history.as_slice()
+            } else {
+                history
+            };
+
         // Pre-map the history if perspective is set, then pass the mapped
         // messages through the standard strategies.
         let mapped_history: Vec<Message>;
         let history_ref = if let Some(agent) = perspective_agent {
-            mapped_history = history
+            mapped_history = effective_history
                 .iter()
                 .map(|msg| self.apply_perspective(msg, agent))
                 .collect();
             &mapped_history
         } else {
-            history
+            effective_history
         };
 
         match self.config.strategy.as_str() {
@@ -153,6 +180,22 @@ impl ContextBuilder {
         );
 
         messages
+    }
+
+    /// Returns `true` if the message is an internal reasoning message
+    /// (persisted during DM agent loops with `message_type: "reasoning"`).
+    ///
+    /// These messages contain the agent's thinking text, tool calls, and tool
+    /// results stored as `Role::User` to preserve the DM invariant. They
+    /// should be filtered from LLM context to avoid token waste and malformed
+    /// messages (tool results stored as `Role::User` cannot be correctly
+    /// mapped by `session_msg_to_llm`).
+    fn is_reasoning_message(msg: &Message) -> bool {
+        msg.metadata
+            .as_ref()
+            .and_then(|m| m.get("message_type"))
+            .and_then(|v| v.as_str())
+            == Some("reasoning")
     }
 
     /// Apply perspective mapping to a message.
@@ -1460,6 +1503,149 @@ mod tests {
             messages.last().unwrap().role,
             "system",
             "old Role::System approach ends with system, not user"
+        );
+    }
+
+    /// Helper: create a message with metadata.
+    fn make_msg_with_meta(role: Role, content: Content, metadata: serde_json::Value) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role,
+            content,
+            timestamp: Timestamp::now(),
+            metadata: Some(metadata),
+        }
+    }
+
+    /// Reasoning messages (message_type="reasoning") persisted in DM sessions
+    /// should be filtered from the LLM context when perspective mapping is
+    /// active. This prevents malformed messages (C2) and token waste (S4).
+    #[test]
+    fn test_reasoning_messages_filtered_from_dm_context() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            // Alice sends a normal DM message
+            make_msg_with_meta(
+                Role::User,
+                Content::Text("Hello Bob!".to_string()),
+                serde_json::json!({ "from_agent": "alice", "message_type": "dm" }),
+            ),
+            // Bob's reasoning text (persisted as Role::User with message_type="reasoning")
+            make_msg_with_meta(
+                Role::User,
+                Content::Text("Let me think about this...".to_string()),
+                serde_json::json!({
+                    "from_agent": "bob",
+                    "message_type": "reasoning",
+                    "run_id": "run-123",
+                }),
+            ),
+            // Bob's reasoning tool call (persisted as Role::User with message_type="reasoning")
+            make_msg_with_meta(
+                Role::User,
+                Content::ToolCall {
+                    name: "send_message".to_string(),
+                    params: serde_json::json!({ "to": "alice", "text": "Hi!" }),
+                },
+                serde_json::json!({
+                    "from_agent": "bob",
+                    "message_type": "reasoning",
+                    "tool_call_id": "tc-1",
+                }),
+            ),
+            // Bob's reasoning tool result (persisted as Role::User with message_type="reasoning")
+            make_msg_with_meta(
+                Role::User,
+                Content::ToolResult {
+                    tool_id: "tc-1".to_string(),
+                    result: serde_json::json!("Message sent"),
+                },
+                serde_json::json!({
+                    "from_agent": "bob",
+                    "message_type": "reasoning",
+                    "ok": true,
+                }),
+            ),
+            // Bob's actual DM reply (from send_message — this is the real message)
+            make_msg_with_meta(
+                Role::User,
+                Content::Text("Hi Alice!".to_string()),
+                serde_json::json!({ "from_agent": "bob", "message_type": "dm" }),
+            ),
+        ];
+
+        // Build context with perspective mapping (as Bob would see it)
+        let messages = builder.build_with_perspective(
+            "System prompt.",
+            &history,
+            "What's up?",
+            None,
+            Some("bob"),
+            None,
+        );
+
+        // system + alice's msg (user) + bob's reply (assistant) + input = 4
+        // The 3 reasoning messages should be filtered out.
+        assert_eq!(
+            messages.len(),
+            4,
+            "Expected 4 messages (system + 2 DM + input), got {}. Reasoning should be filtered.",
+            messages.len()
+        );
+        assert_eq!(messages[0].role, "system");
+        // Alice's message stays user (from Bob's perspective)
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content_str(), "Hello Bob!");
+        // Bob's DM reply becomes assistant (from Bob's perspective)
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].content_str(), "Hi Alice!");
+        // Current input
+        assert_eq!(messages[3].role, "user");
+        assert_eq!(messages[3].content_str(), "What's up?");
+    }
+
+    /// Without perspective mapping (non-DM sessions), reasoning messages
+    /// are not filtered — they should not appear in non-DM sessions in
+    /// practice, but if they do, they pass through unchanged.
+    #[test]
+    fn test_reasoning_messages_not_filtered_without_perspective() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "Hello"),
+            make_msg_with_meta(
+                Role::User,
+                Content::Text("Reasoning text".to_string()),
+                serde_json::json!({ "message_type": "reasoning" }),
+            ),
+            make_msg(Role::Assistant, "Response"),
+        ];
+
+        // No perspective mapping
+        let messages = builder.build("System.", &history, "Input", None);
+
+        // system + 3 history + input = 5
+        assert_eq!(
+            messages.len(),
+            5,
+            "Without perspective, all messages pass through"
         );
     }
 }

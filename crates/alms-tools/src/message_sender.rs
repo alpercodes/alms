@@ -26,6 +26,9 @@ pub enum ConversationEndReason {
     Ignored,
     /// The DM depth limit (`MAX_DM_DEPTH`) was reached.
     DepthExceeded,
+    /// The agent's runtime iteration limit was reached during a DM run
+    /// without the agent calling `send_message` or `ignore_message`.
+    MaxIterations,
 }
 
 impl std::fmt::Display for ConversationEndReason {
@@ -33,6 +36,7 @@ impl std::fmt::Display for ConversationEndReason {
         match self {
             Self::Ignored => write!(f, "ignored"),
             Self::DepthExceeded => write!(f, "depth_exceeded"),
+            Self::MaxIterations => write!(f, "max_iterations"),
         }
     }
 }

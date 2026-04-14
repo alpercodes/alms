@@ -500,7 +500,7 @@ fn test_empty_sandbox_root_means_unrestricted() {
 /// the shared DM session directly and does NOT persist its text response
 /// (only `send_message`-written messages belong in the shared DM session).
 #[tokio::test]
-async fn test_run_on_session_skips_text_response_for_dm() {
+async fn test_run_on_session_persists_reasoning_for_dm() {
     let config = LlmConfig {
         mock: true,
         ..LlmConfig::default()
@@ -514,9 +514,11 @@ async fn test_run_on_session_skips_text_response_for_dm() {
         sandbox_root: "".into(),
         ..AgentConfig::default()
     };
+    let run_id = alms_core::RunId::new();
     let runtime = AgentRuntime::new(bob_id, agent_config, llm)
         .unwrap()
-        .with_agent_name("bob".to_string());
+        .with_agent_name("bob".to_string())
+        .with_run_id(run_id);
 
     // Simulate what MessageBus does: create a shared DM session and
     // write the sender's message into it.
@@ -558,21 +560,32 @@ async fn test_run_on_session_skips_text_response_for_dm() {
         "Mock LLM should produce a non-empty response"
     );
 
-    // After run: the session should still have only 1 message.
-    // The agent's text response is NOT persisted to the DM session —
-    // only send_message-written messages belong there.
+    // After run: the session should have 2 messages -- alice's input plus
+    // bob's reasoning text (the final text response persisted as reasoning).
     let history_after = session_manager.get_history(session_id).unwrap();
     assert_eq!(
         history_after.len(),
-        1,
-        "DM text response should NOT be stored. Expected 1 (alice's input only). Found: {}",
+        2,
+        "DM text response should be stored as reasoning. Expected 2. Found: {}",
         history_after.len()
     );
 
-    // The one message is alice's original input.
+    // The first message is alice's original input.
     assert_eq!(history_after[0].role, alms_session::Role::User);
     let alice_meta = history_after[0].metadata.as_ref().unwrap();
     assert_eq!(alice_meta["from_agent"], "alice");
+    assert_eq!(alice_meta["message_type"], "dm");
+
+    // The second message is bob's reasoning text (stored as Role::User
+    // with message_type="reasoning" to preserve the DM invariant).
+    assert_eq!(history_after[1].role, alms_session::Role::User);
+    let bob_meta = history_after[1].metadata.as_ref().unwrap();
+    assert_eq!(bob_meta["message_type"], "reasoning");
+    assert_eq!(bob_meta["from_agent"], "bob");
+    assert!(
+        bob_meta.get("run_id").is_some(),
+        "Reasoning metadata should include run_id"
+    );
 }
 
 /// Verify that non-DM runs still persist the agent's text response normally.

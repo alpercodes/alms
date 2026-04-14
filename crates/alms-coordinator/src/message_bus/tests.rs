@@ -2145,3 +2145,138 @@ async fn test_cross_dm_source_session_not_recorded() {
         "alice should not get a self-notification when source was a DM session"
     );
 }
+
+/// **MANDATORY safety test (issue #685)**:
+///
+/// Persisted reasoning messages (`message_type: "reasoning"`) in a DM
+/// session must NOT leak to the peer agent via `MessageBus::send()`.
+///
+/// The MessageBus writes its OWN `SessionMessage` with `message_type: "dm"`
+/// and does NOT read back or forward existing session content.  This test
+/// verifies that invariant: after manually writing a reasoning message to
+/// the shared DM session, a subsequent `send()` from the peer does NOT
+/// include the reasoning text -- only the new DM message appears.
+#[tokio::test]
+async fn test_reasoning_messages_not_forwarded_by_message_bus() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    // Step 1: Alice sends a DM to Bob (creates the shared session).
+    let receipt = bus
+        .send("alice", alice_id, "bob", bob_id, "Hello Bob!", None)
+        .await
+        .unwrap();
+    let dm_session_id = receipt.session_id;
+    // Drain the RunTrigger.
+    let _ = rx.try_recv().unwrap();
+
+    // Step 2: Manually persist a reasoning message to the DM session,
+    // simulating what the runtime does when it lifts the !is_dm guard.
+    let reasoning_msg = alms_session::Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: alms_session::Role::User,
+        content: alms_session::Content::Text(
+            "Let me think about how to respond to Alice...".to_string(),
+        ),
+        timestamp: alms_core::Timestamp::now(),
+        metadata: Some(serde_json::json!({
+            "message_type": "reasoning",
+            "from_agent": "bob",
+            "from_agent_id": bob_id.0.to_string(),
+            "run_id": "00000000-0000-0000-0000-000000000099",
+        })),
+    };
+    bus.session_manager
+        .append_message(dm_session_id, reasoning_msg)
+        .unwrap();
+
+    // Also persist a reasoning tool call entry.
+    let reasoning_tool = alms_session::Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: alms_session::Role::User,
+        content: alms_session::Content::ToolCall {
+            name: "read_session".to_string(),
+            params: serde_json::json!({"session_id": "test"}),
+        },
+        timestamp: alms_core::Timestamp::now(),
+        metadata: Some(serde_json::json!({
+            "message_type": "reasoning",
+            "from_agent": "bob",
+            "from_agent_id": bob_id.0.to_string(),
+            "run_id": "00000000-0000-0000-0000-000000000099",
+            "tool_call_id": "tc_test",
+            "tool_invocation_id": "inv_test",
+        })),
+    };
+    bus.session_manager
+        .append_message(dm_session_id, reasoning_tool)
+        .unwrap();
+
+    // Step 3: Bob sends a reply via MessageBus.
+    let receipt2 = bus
+        .send("bob", bob_id, "alice", alice_id, "Hi Alice!", None)
+        .await
+        .unwrap();
+    assert_eq!(receipt2.session_id, dm_session_id);
+
+    // Step 4: Verify the RunTrigger only contains Bob's reply text,
+    // NOT any reasoning content from the session.
+    let trigger = rx.try_recv().unwrap();
+    assert_eq!(trigger.input, "Hi Alice!");
+    assert_eq!(trigger.agent_id, alice_id);
+
+    // Step 5: Verify the session history contains the reasoning
+    // messages (they are persisted) but they have the "reasoning"
+    // message_type marker that dm_filter will catch.
+    let history = bus.session_manager.get_history(dm_session_id).unwrap();
+
+    // Should have: alice's DM, bob's reasoning text, bob's reasoning
+    // tool call, bob's DM reply = 4 messages.
+    assert_eq!(history.len(), 4, "Expected 4 messages in DM session");
+
+    // Verify reasoning messages are present with correct metadata.
+    let reasoning_msgs: Vec<_> = history
+        .iter()
+        .filter(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("message_type"))
+                .and_then(|v| v.as_str())
+                == Some("reasoning")
+        })
+        .collect();
+    assert_eq!(
+        reasoning_msgs.len(),
+        2,
+        "Expected 2 reasoning messages in session"
+    );
+
+    // Verify that dm_filter correctly identifies reasoning messages
+    // as synthetic markers (the load-bearing invariant).
+    for msg in &reasoning_msgs {
+        assert!(
+            alms_tools::dm_filter::is_synthetic_marker(msg),
+            "Reasoning message must be filtered by dm_filter::is_synthetic_marker"
+        );
+    }
+
+    // Verify that DM messages are NOT filtered.
+    let dm_msgs: Vec<_> = history
+        .iter()
+        .filter(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("message_type"))
+                .and_then(|v| v.as_str())
+                == Some("dm")
+        })
+        .collect();
+    assert_eq!(dm_msgs.len(), 2, "Expected 2 DM messages in session");
+    for msg in &dm_msgs {
+        assert!(
+            !alms_tools::dm_filter::is_synthetic_marker(msg),
+            "Real DM messages must NOT be filtered by dm_filter"
+        );
+    }
+}

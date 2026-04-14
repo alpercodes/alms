@@ -283,6 +283,7 @@ pub(super) async fn notify_dm_ended_to_webchat(
     let reason_text = match reason {
         "ignored" => "no further replies".to_string(),
         "depth_exceeded" => "message limit reached".to_string(),
+        "max_iterations" => "agent iteration limit reached".to_string(),
         other => other.to_string(),
     };
     super::markers::persist_lifecycle_marker(
@@ -635,6 +636,12 @@ pub(super) fn format_dm_ended_notification(
             format!(
                 "The conversation with agent \"{from_name}\" was terminated \
                  because the maximum message depth was reached."
+            )
+        }
+        ConversationEndReason::MaxIterations => {
+            format!(
+                "The conversation with agent \"{from_name}\" was terminated \
+                 because the agent hit its iteration limit while processing the DM."
             )
         }
     };
@@ -1023,5 +1030,52 @@ pub(crate) async fn dm_event_loop(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-// Tests for notifications.rs have been consolidated into integration_tests.rs.
+// Reroute-prevention tests have been consolidated into integration_tests.rs.
 // See `notification_stays_on_invisible_session_when_no_source` and siblings.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alms_tools::message_sender::ConversationEndReason;
+
+    #[test]
+    fn test_format_dm_ended_notification_max_iterations_with_history() {
+        let result = format_dm_ended_notification(
+            "bob",
+            ConversationEndReason::MaxIterations,
+            Some("[12:00] alice: hello\n[12:01] bob: working on it..."),
+        );
+        assert!(
+            result.contains("iteration limit"),
+            "MaxIterations reason text should mention iteration limit, got: {result}"
+        );
+        assert!(
+            result.contains("bob"),
+            "notification should mention the peer agent name, got: {result}"
+        );
+        assert!(
+            result.contains("[12:00] alice: hello"),
+            "notification should include conversation history, got: {result}"
+        );
+    }
+
+    #[test]
+    fn test_format_dm_ended_notification_max_iterations_without_history() {
+        let result =
+            format_dm_ended_notification("bob", ConversationEndReason::MaxIterations, None);
+        assert!(
+            result.contains("iteration limit"),
+            "MaxIterations reason text should mention iteration limit, got: {result}"
+        );
+        assert!(
+            result.contains("bob"),
+            "notification should mention the peer agent name, got: {result}"
+        );
+        // Without history, should fall back to the no-history template which
+        // directs the agent to use read_messages.
+        assert!(
+            result.contains("read_messages"),
+            "no-history fallback should reference read_messages tool, got: {result}"
+        );
+    }
+}

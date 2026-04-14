@@ -1,6 +1,6 @@
 import { html, batch, useSignal } from '../../deps.js';
 import { sessions, activeSessionId, showNotifications } from '../../state/sessions.js';
-import { activeAgentId } from '../../state/agents.js';
+import { activeAgentId, activeAgent } from '../../state/agents.js';
 import { replaceMessages } from '../../state/chat-actions.js';
 import { activeRunId, selectedRunId, runs } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
@@ -300,10 +300,44 @@ function SectionDivider({ label, cls }) {
     `;
 }
 
+/**
+ * Deduplicate and filter DM sessions for the sidebar.
+ *
+ * 1. **Participant filter**: Only include DM sessions that have a
+ *    well-formed participants array (>= 2 entries). When an active
+ *    agent is known, further restrict to DMs where that agent is a
+ *    participant. Sessions with missing or malformed participants are
+ *    excluded -- the backend should always populate this field for
+ *    well-formed DM sessions.
+ *
+ * 2. **context_id dedup**: If the backend returns multiple entries with
+ *    the same context_id (possible from legacy data where a DM session
+ *    was stored under both the sentinel and the real agent_id), keep
+ *    only the first occurrence. Runs after the participant filter so
+ *    a malformed duplicate cannot shadow a valid entry.
+ */
+function filteredDmSessions(allSessions, agentName) {
+    const seen = new Set();
+    const result = [];
+    for (const s of allSessions) {
+        if (s.session_type !== 'dm') continue;
+        // Participant filter: exclude DMs with missing/malformed participants
+        if (!Array.isArray(s.participants) || s.participants.length < 2) continue;
+        if (agentName && !s.participants.includes(agentName)) continue;
+        // Deduplicate by context_id (same DM pair = same context)
+        const key = s.context_id || s.id;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        result.push(s);
+    }
+    return result;
+}
+
 export function SessionList() {
     const allSessions = sessions.value;
+    const agentName = activeAgent.value ? activeAgent.value.name : null;
     const chatSessions = allSessions.filter(s => s.session_type !== 'dm' && s.session_type !== 'notification');
-    const dmSessions = allSessions.filter(s => s.session_type === 'dm');
+    const dmSessions = filteredDmSessions(allSessions, agentName);
     const notifSessions = allSessions.filter(s => s.session_type === 'notification');
     const showNotif = showNotifications.value;
 

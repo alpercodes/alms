@@ -35,16 +35,16 @@ alms/
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) for detailed design.
+A single Rust binary runs the entire platform — HTTP gateway, agent runtime, tool sandbox, and session store.
 
-| Feature | OpenClaw | ALMS |
-|---------|----------|------|
-| Language | Node.js | Rust (single binary) |
-| Session Keys | Complex scope rules | Simple explicit context_id |
-| Concurrency | Promise-based, locks | tokio async, lock-free maps |
-| Storage | JSON files | SQLite (WAL mode) |
-| Tools | In-process, no isolation | WASM sandbox + capability gating |
-| Transport | WebSocket only | SSE streaming + HTTP API |
+- **Gateway** — Axum HTTP server with SSE streaming, web UI, and REST API for agents, sessions, and runs
+- **Runtime** — Agent loop: builds context, calls LLM, executes tool results, manages workspace files (personality, goals, memories)
+- **Coordinator** — Multi-agent orchestration: hierarchy (subagents), peer messaging (DM), and message bus
+- **Sandbox** — WASM-based tool isolation with capability gating; builtin tools (shell, file I/O, datetime) run sandboxed per-agent
+- **Session** — SQLite persistence (WAL mode) for sessions, messages, tool calls, episodic summaries, and agent registry
+- **Channel** — Adapter layer for external transports (Telegram polling implemented)
+
+See [docs/architecture.md](docs/architecture.md) for the full design.
 
 ## Development
 
