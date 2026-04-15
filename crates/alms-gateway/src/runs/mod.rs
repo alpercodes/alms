@@ -22,6 +22,7 @@ mod tools;
 // Re-exports — preserve the public API surface of the former single-file module
 // ---------------------------------------------------------------------------
 
+pub use dm_lifecycle::cancel_dm;
 pub use lifecycle::{
     ListRunsQuery, cancel_run, create_run, get_run_status, get_run_tool_calls, list_runs,
 };

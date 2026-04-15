@@ -314,6 +314,39 @@ impl RunManager {
         cancelled
     }
 
+    /// Cancel any active (queued/running) runs on a given session.
+    ///
+    /// Returns the number of runs cancelled. Used by the DM cancel endpoint
+    /// to stop in-progress DM runs before signalling conversation end.
+    pub fn cancel_runs_for_session(&self, target: SessionId) -> usize {
+        let active_run_ids: Vec<RunId> = self
+            .runs
+            .iter()
+            .filter(|entry| {
+                let run = entry.value();
+                run.session_id == target
+                    && matches!(
+                        run.status,
+                        alms_core::RunStatus::Queued | alms_core::RunStatus::Running
+                    )
+            })
+            .map(|entry| entry.key().to_owned())
+            .collect();
+
+        let mut cancelled = 0;
+        for run_id in active_run_ids {
+            if self.cancel_run(run_id) {
+                tracing::info!(
+                    run_id = %run_id.0,
+                    session_id = %target.0,
+                    "Cancelled in-progress run for DM cancellation"
+                );
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
     /// Returns `true` if any queued or running runs exist for the given session.
     pub fn has_active_runs(&self, session_id: SessionId) -> bool {
         self.runs.iter().any(|e| {

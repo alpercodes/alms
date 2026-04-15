@@ -20,10 +20,16 @@
 //!
 //! See #628 and Tim's stability audit (#613) for background.
 
+use crate::api_error;
 use crate::server::AppState;
 use crate::sse::SseEventData;
-use alms_core::{AgentId, RunId, SessionId, ToolCallRecord};
+use alms_core::{AgentId, RunId, SessionId, ToolCallRecord, dm_participants};
 use alms_tools::message_sender::{ConversationEndReason, MessageSender as _};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
 use tracing::{debug, info, warn};
 
 use super::lifecycle::extract_peer_from_dm_context;
@@ -96,7 +102,8 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
     let reason_label = match end_reason {
         ConversationEndReason::Ignored => "ignore_message",
         ConversationEndReason::MaxIterations => "max_iterations",
-        _ => "unknown",
+        ConversationEndReason::DepthExceeded => "depth_exceeded",
+        ConversationEndReason::UserCancelled => "user_cancelled",
     };
 
     let Some(agent_name) = ctx.agent_name else {
@@ -232,6 +239,148 @@ pub(super) fn should_signal_dm_end_max_iterations(
     hit_max_iterations: bool,
 ) -> bool {
     is_peer_message && context_id.starts_with("dm:") && hit_max_iterations
+}
+
+/// POST /sessions/{session_id}/cancel-dm — cancel an active DM conversation.
+///
+/// This endpoint gives the user direct control over ending a DM conversation
+/// between two agents. It performs these steps:
+///
+/// 1. Validates the session exists and is a DM session (`dm:` prefix)
+/// 2. Resolves both participant agent IDs from the registry
+/// 3. Cancels any active (queued/running) runs on the DM session
+/// 4. Calls `end_conversation` on the `MessageBus` with `UserCancelled` reason
+/// 5. Emits `dm_conversation_ended` SSE event so the frontend knows the DM ended
+///
+/// Returns 200 with cancellation details, or an error if the session is not a DM
+/// or agents cannot be resolved.
+///
+/// See issue #705.
+#[tracing::instrument(level = "info", skip(state), fields(session_id = %session_id.0))]
+pub async fn cancel_dm(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // 1. Look up the session.
+    let session = state
+        .session_manager
+        .get(session_id)
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found"))?;
+
+    // 2. Verify it is a DM session.
+    let (name_a, name_b) = dm_participants(&session.context_id).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "NOT_DM_SESSION",
+            "Session is not a DM conversation",
+        )
+    })?;
+
+    // 3. Resolve both agent IDs from the registry.
+    let store = state.session_manager.store().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "NO_STORE",
+            "No agent registry available",
+        )
+    })?;
+
+    let agent_a = store
+        .load_agent_by_name(name_a)
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "REGISTRY_ERROR",
+                format!("Failed to look up agent '{name_a}': {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "AGENT_NOT_FOUND",
+                format!("Agent '{name_a}' not found in registry"),
+            )
+        })?;
+
+    let agent_b = store
+        .load_agent_by_name(name_b)
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "REGISTRY_ERROR",
+                format!("Failed to look up agent '{name_b}': {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "AGENT_NOT_FOUND",
+                format!("Agent '{name_b}' not found in registry"),
+            )
+        })?;
+
+    // 4. Cancel any active runs on this DM session.
+    let runs_cancelled = state.run_manager.cancel_runs_for_session(session_id);
+
+    info!(
+        runs_cancelled = runs_cancelled,
+        agent_a = %name_a,
+        agent_b = %name_b,
+        "Cancelling DM conversation by user request"
+    );
+
+    // 5. Signal conversation end via the MessageBus.
+    //
+    // Use agent_a as the "sender" — the direction does not matter for
+    // UserCancelled since the user (not an agent) initiated the cancellation.
+    // Both agents will receive notifications.
+    let end_result = state
+        .message_bus
+        .end_conversation(
+            name_a,
+            agent_a.id,
+            name_b,
+            agent_b.id,
+            ConversationEndReason::UserCancelled,
+        )
+        .await;
+
+    if let Err(ref e) = end_result {
+        warn!(
+            error = %e,
+            "end_conversation returned error during user cancellation — \
+             continuing (runs already cancelled)"
+        );
+    }
+
+    // 6. Emit dm_conversation_ended SSE event on the DM session stream.
+    //
+    // Use a synthetic RunId since this cancellation is not associated with
+    // any particular run — it is a user-initiated action.
+    let synthetic_run_id = RunId::new();
+    state
+        .run_manager
+        .send_session_event(
+            session_id,
+            synthetic_run_id,
+            SseEventData::dm_conversation_ended(
+                session_id,
+                "user",
+                &format!("{name_a}, {name_b}"),
+                &ConversationEndReason::UserCancelled.to_string(),
+                &session.context_id,
+            ),
+        )
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "session_id": session_id.0.to_string(),
+        "context_id": session.context_id,
+        "participants": [name_a, name_b],
+        "runs_cancelled": runs_cancelled,
+        "reason": "user_cancelled",
+    })))
 }
 
 #[cfg(test)]

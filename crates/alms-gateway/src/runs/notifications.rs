@@ -644,6 +644,9 @@ pub(super) fn format_dm_ended_notification(
                  because the agent hit its iteration limit while processing the DM."
             )
         }
+        ConversationEndReason::UserCancelled => {
+            "The DM conversation was cancelled by the user.".to_string()
+        }
     };
 
     match conversation_history {
