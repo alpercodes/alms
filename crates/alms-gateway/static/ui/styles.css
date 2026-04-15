@@ -2408,6 +2408,16 @@ select.settings-input-sm {
   animation: queued-pulse 2s ease-in-out infinite;
 }
 
+/* ── Pending indicator (pre-SSE, optimistic placeholder) ── */
+.pending-indicator {
+  color: var(--text-muted) !important;
+  font-style: italic;
+}
+.pending-indicator::after {
+  content: '';
+  animation: thinking-dots 1.5s steps(1) infinite;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
    Reduced Motion
    ══════════════════════════════════════════════════════════════════════ */

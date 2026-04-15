@@ -25,7 +25,7 @@ export async function startRun(text, opts) {
 
     appendMessage(
         { id: nextMsgId(), type: 'user', role: 'user', text },
-        { id: nextMsgId(), type: 'thinking' },
+        { id: nextMsgId(), type: 'thinking', pending: true },
     );
 
     // Track the optimistically-appended user message so it can be

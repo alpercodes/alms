@@ -189,7 +189,9 @@ export function DmConversationView() {
                     // Queued runs show a distinct message so the user knows
                     // the agent hasn't started processing yet. (#691)
                     let thinkLabel = 'Thinking\u2026';
-                    if (m.queuedBehind > 0) {
+                    if (m.pending) {
+                        thinkLabel = 'Sending\u2026';
+                    } else if (m.queuedBehind > 0) {
                         thinkLabel = 'Queued \u2014 waiting for agent\u2026';
                     } else if (m.source) {
                         // Show which agent is thinking when source info is available.

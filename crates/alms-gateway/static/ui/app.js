@@ -235,7 +235,10 @@ function ChatView() {
                     if (m.type === 'thinking') {
                         let label = 'Thinking';
                         let indicatorClass = 'thinking-indicator';
-                        if (m.queuedBehind > 0) {
+                        if (m.pending) {
+                            label = 'Sending';
+                            indicatorClass = 'pending-indicator';
+                        } else if (m.queuedBehind > 0) {
                             label = 'Queued \u2014 waiting for agent\u2026';
                             indicatorClass = 'queued-indicator';
                         } else if (m.source && m.source.startsWith('peer:')) {

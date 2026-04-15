@@ -382,17 +382,27 @@ export function openSessionStream(sessionId, opts) {
             // thinking indicator (added by startRun) with queue position.
             // Header bar keeps its current state (the agent's real
             // activity); the inline indicator shows queue status. (#693)
+            // Clear `pending` so it transitions from "Sending..." to
+            // "Queued..." immediately. (#704)
             batch(() => {
                 activeRunId.value = data.run_id;
                 updateMessage(
-                    m => m.type === 'thinking',
-                    m => ({ ...m, queuedBehind }),
+                    m => m.type === 'thinking' && m.pending,
+                    m => ({ ...m, queuedBehind, pending: false }),
                 );
             });
         } else {
-            activeRunId.value = data.run_id;
+            // User-initiated, queue empty -- clear `pending` so the
+            // indicator transitions from "Sending..." to "Thinking...".
+            // (#704)
+            batch(() => {
+                activeRunId.value = data.run_id;
+                updateMessage(
+                    m => m.type === 'thinking' && m.pending,
+                    m => ({ ...m, pending: false }),
+                );
+            });
         }
-        // else: user-initiated, queue empty -- thinking indicator from startRun is fine
     });
 
     // -- run_started: the run has been dequeued and is now executing --
