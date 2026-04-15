@@ -2058,14 +2058,14 @@ async fn test_depth_fully_replenished_after_end_conversation() {
 
 /// Regression test for #656: when agent A is running on DM session X
 /// (dm:A:B) and calls send_message to agent C, the source session for
-/// the A-C DM pair must NOT be recorded as the A-B DM session.
+/// the A-C DM pair IS recorded as the A-B DM session (#680).
 ///
-/// Before the fix, the guard only rejected `sid == dm_session_id` (the
-/// specific DM for the current pair), so a *different* DM session would
-/// slip through and be recorded as the source. When the A-C DM ended,
-/// the notification run would be routed to the A-B DM session.
+/// Cross-DM source sessions are valid: Alice is in a conversation with
+/// Bob and decides to message Charlie — when the Alice-Charlie DM ends,
+/// the notification should route back to Alice's DM-with-Bob session
+/// (where she is actively working), not fall through to notifications.
 #[tokio::test]
-async fn test_cross_dm_source_session_not_recorded() {
+async fn test_cross_dm_source_session_recorded() {
     let (bus, mut rx) = setup();
     let alice_id = AgentId::new();
     let bob_id = AgentId::new();
@@ -2107,13 +2107,18 @@ async fn test_cross_dm_source_session_not_recorded() {
     .unwrap();
     let _ = rx.try_recv(); // drain charlie's trigger
 
-    // The source session for the alice-charlie DM should NOT have been
-    // recorded (dm:alice:bob is not user-facing).
+    // The source session for the alice-charlie DM SHOULD be recorded as
+    // the dm:alice:bob session (cross-DM source is valid, #680).
     let ac_context = dm_context_id("alice", "charlie");
     let key = (ac_context.clone(), "alice".to_string());
     assert!(
-        !bus.source_sessions.contains_key(&key),
-        "DM session should not be recorded as source session for a different DM pair"
+        bus.source_sessions.contains_key(&key),
+        "Cross-DM session should be recorded as source session"
+    );
+    assert_eq!(
+        *bus.source_sessions.get(&key).unwrap().value(),
+        dm_ab_session,
+        "Source session should be Alice's DM-with-Bob session"
     );
 
     // End the alice-charlie conversation.
@@ -2127,23 +2132,75 @@ async fn test_cross_dm_source_session_not_recorded() {
     .await
     .unwrap();
 
-    // The notification for charlie should go to notifications:charlie
-    // (no source session), NOT to dm:alice:bob.
+    // Charlie has no source session — notification goes to notifications:charlie.
     let trigger = rx
         .try_recv()
         .expect("should receive charlie's notification");
     assert_eq!(trigger.agent_id, charlie_id);
     assert!(
         trigger.context_id.starts_with("notifications:"),
-        "notification should go to notifications: session, got: {}",
+        "charlie's notification should go to notifications: session, got: {}",
         trigger.context_id,
     );
 
-    // Alice should NOT get a self-notification (no user-facing source session).
-    assert!(
-        rx.try_recv().is_err(),
-        "alice should not get a self-notification when source was a DM session"
+    // Alice SHOULD get a self-notification routed to her DM-with-Bob session
+    // (her source for the alice-charlie DM).
+    let alice_trigger = rx
+        .try_recv()
+        .expect("alice should get a self-notification routed to dm:alice:bob");
+    assert_eq!(alice_trigger.agent_id, alice_id);
+    assert_eq!(
+        alice_trigger.session_id, dm_ab_session,
+        "alice's notification should route to dm:alice:bob session"
     );
+    assert_eq!(
+        alice_trigger.context_id, dm_ab_context,
+        "alice's notification context should be dm:alice:bob"
+    );
+}
+
+/// Internal session types (notification, subagent, episodic, job) must NOT
+/// be recorded as source sessions, even after #680 relaxed the whitelist
+/// to a denylist.
+#[tokio::test]
+async fn test_internal_session_types_not_recorded_as_source() {
+    let (bus, mut rx) = setup();
+    let alice_id = AgentId::new();
+    let bob_id = AgentId::new();
+
+    let internal_contexts = [
+        "notifications:alice",
+        "subagent_research",
+        "episodic:main",
+        "job_550e8400-e29b-41d4-a716-446655440000",
+    ];
+
+    for ctx in &internal_contexts {
+        let internal_session = SessionId::new();
+        bus.session_manager
+            .get_or_create_shared(internal_session, *ctx);
+        bus.send(
+            "alice",
+            alice_id,
+            "bob",
+            bob_id,
+            "hello from internal",
+            Some(internal_session),
+        )
+        .await
+        .unwrap();
+        let _ = rx.try_recv(); // drain trigger
+
+        let key = (dm_context_id("alice", "bob"), "alice".to_string());
+        assert!(
+            !bus.source_sessions.contains_key(&key),
+            "Internal session type '{ctx}' should not be recorded as source session"
+        );
+
+        // Clean up for next iteration: remove depth/activity entries.
+        bus.depths.remove(&dm_context_id("alice", "bob"));
+        bus.last_activity.remove(&dm_context_id("alice", "bob"));
+    }
 }
 
 /// **MANDATORY safety test (issue #685)**:
