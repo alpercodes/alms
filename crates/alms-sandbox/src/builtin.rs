@@ -1011,6 +1011,14 @@ impl Tool for FsWriteTool {
         // Block UNC paths that could leak NTLM credentials via SMB.
         reject_unc_path(path)?;
 
+        // Block device paths that could cause system damage.
+        if is_blocked_device_path(Path::new(path)) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Cannot write to device path '{}' — this is a system device, not a regular file",
+                path
+            )));
+        }
+
         // Deny-list check: block writes to sensitive files.
         if is_denied_path(Path::new(path)) {
             return Err(SandboxError::SandboxViolation(format!(
@@ -1025,7 +1033,13 @@ impl Tool for FsWriteTool {
             PathBuf::from(path)
         };
 
-        // Also check the resolved path for denied filenames.
+        // Also check the resolved path for device paths and denied filenames.
+        if is_blocked_device_path(&resolved) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Cannot write to device path '{}' — this is a system device, not a regular file",
+                path
+            )));
+        }
         if is_denied_path(&resolved) {
             return Err(SandboxError::SandboxViolation(format!(
                 "Access to '{}' is denied",
@@ -1033,24 +1047,37 @@ impl Tool for FsWriteTool {
             )));
         }
 
+        // Non-regular-file and read-before-write guards.
+        // New file creation (file does not exist) bypasses both checks.
+        let file_exists = match tokio::fs::metadata(&resolved).await {
+            Ok(meta) => {
+                if !meta.is_file() {
+                    return Err(SandboxError::InvalidParameters(format!(
+                        "Path '{}' is not a regular file",
+                        path
+                    )));
+                }
+                true
+            }
+            Err(_) => false,
+        };
+
         // Read-before-write guard: if the file exists on disk and a cache is
         // present, verify the agent has read the file first.
-        // New file creation (file does not exist) bypasses the guard.
-        if let Some(ref cache) = self.file_state_cache {
-            let file_exists = tokio::fs::metadata(&resolved).await.is_ok();
-            if file_exists {
-                match check_guard(cache, &resolved).await {
-                    GuardOutcome::Allowed => {}
-                    GuardOutcome::NotRead => {
-                        return Err(SandboxError::InvalidParameters(
-                            "File has not been read yet. Use fs_read to read the file \
-                             before writing to it."
-                                .to_string(),
-                        ));
-                    }
-                    GuardOutcome::StaleRead { reason } => {
-                        return Err(SandboxError::InvalidParameters(reason));
-                    }
+        if let Some(ref cache) = self.file_state_cache
+            && file_exists
+        {
+            match check_guard(cache, &resolved).await {
+                GuardOutcome::Allowed => {}
+                GuardOutcome::NotRead => {
+                    return Err(SandboxError::InvalidParameters(
+                        "File has not been read yet. Use fs_read to read the file \
+                         before writing to it."
+                            .to_string(),
+                    ));
+                }
+                GuardOutcome::StaleRead { reason } => {
+                    return Err(SandboxError::InvalidParameters(reason));
                 }
             }
         }
@@ -1318,6 +1345,14 @@ impl Tool for FsEditTool {
         // differ" response.)
         reject_unc_path(path)?;
 
+        // Block device paths that could cause system damage.
+        if is_blocked_device_path(Path::new(path)) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Cannot edit device path '{}' — this is a system device, not a regular file",
+                path
+            )));
+        }
+
         // No-op rejection: old_string == new_string
         if old_string == new_string {
             return Err(SandboxError::InvalidParameters(
@@ -1339,6 +1374,14 @@ impl Tool for FsEditTool {
         } else {
             PathBuf::from(path)
         };
+
+        // Also check the resolved path for device paths.
+        if is_blocked_device_path(&resolved) {
+            return Err(SandboxError::SandboxViolation(format!(
+                "Cannot edit device path '{}' — this is a system device, not a regular file",
+                path
+            )));
+        }
 
         // Deny-list check on resolved path.
         if is_denied_path(&resolved) {
@@ -1375,11 +1418,18 @@ impl Tool for FsEditTool {
             }
         }
 
+        // Verify the path is a regular file (reject directories, symlinks, etc.).
         // File size guard — reject files larger than 2 MiB.
         const MAX_EDIT_BYTES: u64 = 2 * 1024 * 1024;
         let meta = tokio::fs::metadata(&resolved)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+        if !meta.is_file() {
+            return Err(SandboxError::InvalidParameters(format!(
+                "Path '{}' is not a regular file",
+                path
+            )));
+        }
         if meta.len() > MAX_EDIT_BYTES {
             return Err(SandboxError::InvalidParameters(format!(
                 "File too large for fs_edit ({} bytes, max {}). Use fs_write for full file replacement.",
@@ -1483,6 +1533,19 @@ impl FsEditTool {
         let file_exists = tokio::fs::metadata(resolved).await.is_ok();
 
         if file_exists {
+            // Reject directories (and other non-regular files) early with a
+            // clear message instead of letting read_to_string surface an
+            // OS-level I/O error.
+            let meta = tokio::fs::metadata(resolved).await.map_err(|e| {
+                SandboxError::Io(format!("Failed to read '{}': {}", display_path, e))
+            })?;
+            if !meta.is_file() {
+                return Err(SandboxError::InvalidParameters(format!(
+                    "Path '{}' is not a regular file",
+                    display_path
+                )));
+            }
+
             let content = tokio::fs::read_to_string(resolved).await.map_err(|e| {
                 SandboxError::Io(format!("Failed to read '{}': {}", display_path, e))
             })?;
@@ -3998,6 +4061,38 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_fs_write_blocked_device_path() {
+        let device = if cfg!(unix) { "/dev/zero" } else { "NUL" };
+        let result = FsWriteTool::new()
+            .execute(serde_json::json!({"path": device, "content": "data"}))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Cannot write to device path"),
+            "expected device path error, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("system device"),
+            "expected 'system device' in error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_write_directory_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = FsWriteTool::new()
+            .execute(serde_json::json!({"path": dir.path().to_str().unwrap(), "content": "data"}))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not a regular file"),
+            "expected 'not a regular file', got: {err_msg}"
+        );
+    }
+
     // ── FsEditTool ────────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -4707,6 +4802,64 @@ mod tests {
     fn test_adapt_quotes_converts_to_curly_when_original_is_curly() {
         let result = adapt_quotes_to_original("say \"goodbye\"", "say \u{201C}hello\u{201D}");
         assert_eq!(result, "say \u{201C}goodbye\u{201D}");
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_blocked_device_path() {
+        let device = if cfg!(unix) { "/dev/zero" } else { "NUL" };
+        let result = FsEditTool::new()
+            .execute(serde_json::json!({
+                "path": device,
+                "old_string": "foo",
+                "new_string": "bar"
+            }))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Cannot edit device path"),
+            "expected device path error, got: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("system device"),
+            "expected 'system device' in error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_directory_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = FsEditTool::new()
+            .execute(serde_json::json!({
+                "path": dir.path().to_str().unwrap(),
+                "old_string": "foo",
+                "new_string": "bar"
+            }))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not a regular file"),
+            "expected 'not a regular file', got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_empty_old_string_directory_returns_not_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = FsEditTool::new()
+            .execute(serde_json::json!({
+                "path": dir.path().to_str().unwrap(),
+                "old_string": "",
+                "new_string": "content"
+            }))
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not a regular file"),
+            "expected 'not a regular file', got: {err_msg}"
+        );
     }
 
     // ── FsGrepTool ────────────────────────────────────────────────────────────

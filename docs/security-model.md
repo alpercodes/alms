@@ -186,6 +186,8 @@ Response fields:
 
 **UNC path blocking**: All file tools (`fs_read`, `fs_write`, `fs_list`, `fs_edit`, `fs_grep`, `fs_glob`) reject Windows UNC paths (`\\server\share`), extended-length UNC paths (`\\?\UNC\server\share`), and URI-style equivalents (`//server/share`) before any filesystem I/O. This prevents NTLM credential theft via SMB auto-authentication. The check runs on all platforms (not just Windows) because the daemon may be accessed from a Windows client, and forward-slash UNC paths are valid on some Linux SMB configurations. Device namespace paths (`\\.\`) are also blocked by the same check.
 
+**Device path blocking**: All file I/O tools (`fs_read`, `fs_write`, `fs_edit`) block known system device paths (`/dev/zero`, `/dev/random`, `/dev/urandom`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr`, `/dev/tty`, `/dev/console`, `/proc/self/fd/0-2` on Unix; `CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9` on Windows) and reject non-regular files via `is_file()` check. Both raw and canonicalized paths are checked to prevent symlink-based bypasses.
+
 **Known limitation (non-Linux):** On platforms without Landlock support (Windows, macOS, older Linux kernels), shell sandboxing only restricts the cwd. The executed command itself (e.g. `cat /etc/passwd`) can still access any file the process user can read. Application-level command denylists are fundamentally bypassable. On Linux 5.13+, Landlock filesystem restrictions are applied to child processes (see section 4.4).
 
 ### 4.4 Isolation roadmap
