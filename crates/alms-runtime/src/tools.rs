@@ -88,34 +88,30 @@ impl ToolRegistry {
         registry: &SandboxRegistry,
         sandbox_root: Option<&std::path::PathBuf>,
         cache: &Arc<FileStateCache>,
-        enabled: &[String],
+        _enabled: &[String],
     ) {
-        let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
+        // No pre-filtering by `enabled` here — `registry.register()` already
+        // checks its internal `enabled_filter` and skips disabled tools.
+        let fs_read = match sandbox_root {
+            Some(root) => alms_sandbox::FsReadTool::sandboxed(root.clone()),
+            None => alms_sandbox::FsReadTool::new(),
+        }
+        .with_cache(Arc::clone(cache));
+        let _ = registry.register(Arc::new(fs_read));
 
-        if tool_enabled("fs_read") {
-            let fs_read = match sandbox_root {
-                Some(root) => alms_sandbox::FsReadTool::sandboxed(root.clone()),
-                None => alms_sandbox::FsReadTool::new(),
-            }
-            .with_cache(Arc::clone(cache));
-            let _ = registry.register(Arc::new(fs_read));
+        let fs_write = match sandbox_root {
+            Some(root) => alms_sandbox::FsWriteTool::sandboxed(root.clone()),
+            None => alms_sandbox::FsWriteTool::new(),
         }
-        if tool_enabled("fs_write") {
-            let fs_write = match sandbox_root {
-                Some(root) => alms_sandbox::FsWriteTool::sandboxed(root.clone()),
-                None => alms_sandbox::FsWriteTool::new(),
-            }
-            .with_cache(Arc::clone(cache));
-            let _ = registry.register(Arc::new(fs_write));
+        .with_cache(Arc::clone(cache));
+        let _ = registry.register(Arc::new(fs_write));
+
+        let fs_edit = match sandbox_root {
+            Some(root) => alms_sandbox::FsEditTool::sandboxed(root.clone()),
+            None => alms_sandbox::FsEditTool::new(),
         }
-        if tool_enabled("fs_edit") {
-            let fs_edit = match sandbox_root {
-                Some(root) => alms_sandbox::FsEditTool::sandboxed(root.clone()),
-                None => alms_sandbox::FsEditTool::new(),
-            }
-            .with_cache(Arc::clone(cache));
-            let _ = registry.register(Arc::new(fs_edit));
-        }
+        .with_cache(Arc::clone(cache));
+        let _ = registry.register(Arc::new(fs_edit));
     }
 
     /// Register a custom tool implementation (e.g. WorkspaceWriteTool).

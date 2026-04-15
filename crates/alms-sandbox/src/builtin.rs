@@ -1,5 +1,5 @@
 use crate::file_state_cache::{
-    FileStateCache, GuardOutcome, check_guard, content_hash, update_cache_after_write,
+    FileStateCache, GuardOutcome, check_guard_with_mtime, content_hash, update_cache_after_write,
 };
 use crate::shell::security::DENIED_FILENAMES;
 use crate::{SandboxError, Tool, error::SandboxResult};
@@ -224,6 +224,21 @@ fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
         }
     }
     Ok(resolved)
+}
+
+/// Normalize a path when no sandbox root is configured.
+///
+/// Uses `canonicalize_best_effort` so that `./foo.txt` and `foo.txt` resolve to
+/// the same cache key. Falls back to `PathBuf::from(path)` if canonicalization
+/// fails (e.g. the drive root is inaccessible).
+async fn normalize_unsandboxed_path(path: &str) -> PathBuf {
+    let path_owned = path.to_owned();
+    match tokio::task::spawn_blocking(move || canonicalize_best_effort(Path::new(&path_owned)))
+        .await
+    {
+        Ok(Ok(p)) => p,
+        _ => PathBuf::from(path),
+    }
 }
 
 /// Truncate a string to at most `max_bytes` bytes, respecting UTF-8 char boundaries.
@@ -768,7 +783,7 @@ impl Tool for FsReadTool {
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
             check_sandbox_path_async(path, root).await?
         } else {
-            PathBuf::from(path)
+            normalize_unsandboxed_path(path).await
         };
 
         // Also check the resolved path (handles relative traversals like ../data/secrets.json).
@@ -1030,7 +1045,7 @@ impl Tool for FsWriteTool {
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
             check_sandbox_path_async(path, root).await?
         } else {
-            PathBuf::from(path)
+            normalize_unsandboxed_path(path).await
         };
 
         // Also check the resolved path for device paths and denied filenames.
@@ -1049,7 +1064,8 @@ impl Tool for FsWriteTool {
 
         // Non-regular-file and read-before-write guards.
         // New file creation (file does not exist) bypasses both checks.
-        let file_exists = match tokio::fs::metadata(&resolved).await {
+        // We capture the mtime here to avoid a redundant stat in the guard.
+        let file_mtime = match tokio::fs::metadata(&resolved).await {
             Ok(meta) => {
                 if !meta.is_file() {
                     return Err(SandboxError::InvalidParameters(format!(
@@ -1057,17 +1073,17 @@ impl Tool for FsWriteTool {
                         path
                     )));
                 }
-                true
+                meta.modified().ok()
             }
-            Err(_) => false,
+            Err(_) => None,
         };
 
         // Read-before-write guard: if the file exists on disk and a cache is
         // present, verify the agent has read the file first.
         if let Some(ref cache) = self.file_state_cache
-            && file_exists
+            && let Some(mtime) = file_mtime
         {
-            match check_guard(cache, &resolved).await {
+            match check_guard_with_mtime(cache, &resolved, mtime).await {
                 GuardOutcome::Allowed => {}
                 GuardOutcome::NotRead => {
                     return Err(SandboxError::InvalidParameters(
@@ -1368,11 +1384,11 @@ impl Tool for FsEditTool {
             )));
         }
 
-        // Resolve path within sandbox (or use as-is when unsandboxed).
+        // Resolve path within sandbox (or normalize when unsandboxed).
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
             check_sandbox_path_async(path, root).await?
         } else {
-            PathBuf::from(path)
+            normalize_unsandboxed_path(path).await
         };
 
         // Also check the resolved path for device paths.
@@ -1399,27 +1415,8 @@ impl Tool for FsEditTool {
                 .await;
         }
 
-        // Read-before-edit guard: the file must have been read via fs_read
-        // before it can be edited. This prevents agents from blindly modifying
-        // files they have not inspected.
-        if let Some(ref cache) = self.file_state_cache {
-            match check_guard(cache, &resolved).await {
-                GuardOutcome::Allowed => {}
-                GuardOutcome::NotRead => {
-                    return Err(SandboxError::InvalidParameters(
-                        "File has not been read yet. Use fs_read to read the file \
-                         before editing it."
-                            .to_string(),
-                    ));
-                }
-                GuardOutcome::StaleRead { reason } => {
-                    return Err(SandboxError::InvalidParameters(reason));
-                }
-            }
-        }
-
-        // Verify the path is a regular file (reject directories, symlinks, etc.).
-        // File size guard — reject files larger than 2 MiB.
+        // Non-regular-file, size, and read-before-edit guards.
+        // We capture the mtime here to avoid a redundant stat in the guard.
         const MAX_EDIT_BYTES: u64 = 2 * 1024 * 1024;
         let meta = tokio::fs::metadata(&resolved)
             .await
@@ -1436,6 +1433,27 @@ impl Tool for FsEditTool {
                 meta.len(),
                 MAX_EDIT_BYTES
             )));
+        }
+
+        // Read-before-edit guard: the file must have been read via fs_read
+        // before it can be edited. This prevents agents from blindly modifying
+        // files they have not inspected.
+        if let Some(ref cache) = self.file_state_cache
+            && let Some(mtime) = meta.modified().ok()
+        {
+            match check_guard_with_mtime(cache, &resolved, mtime).await {
+                GuardOutcome::Allowed => {}
+                GuardOutcome::NotRead => {
+                    return Err(SandboxError::InvalidParameters(
+                        "File has not been read yet. Use fs_read to read the file \
+                         before editing it."
+                            .to_string(),
+                    ));
+                }
+                GuardOutcome::StaleRead { reason } => {
+                    return Err(SandboxError::InvalidParameters(reason));
+                }
+            }
         }
 
         // Read existing file content.
@@ -4059,6 +4077,63 @@ mod tests {
                 resolved.display()
             );
         }
+    }
+
+    // ── normalize_unsandboxed_path tests ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_normalize_unsandboxed_path_dot_prefix() {
+        // `./foo.txt` and `foo.txt` should resolve to the same PathBuf so
+        // that the file state cache matches regardless of how the agent
+        // specifies the path.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("foo.txt");
+        std::fs::write(&file, b"content").unwrap();
+
+        // Change cwd into the temp dir so relative paths resolve there.
+        let _prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let a = normalize_unsandboxed_path("./foo.txt").await;
+        let b = normalize_unsandboxed_path("foo.txt").await;
+        assert_eq!(
+            a, b,
+            "./foo.txt and foo.txt should normalize to the same path"
+        );
+
+        // Restore cwd (best-effort — tests may be parallel).
+        let _ = std::env::set_current_dir(_prev);
+    }
+
+    #[tokio::test]
+    async fn test_normalize_unsandboxed_path_absolute() {
+        // An absolute path to an existing file should come back canonicalized.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("abs.txt");
+        std::fs::write(&file, b"data").unwrap();
+
+        let result = normalize_unsandboxed_path(file.to_str().unwrap()).await;
+        // On Windows, canonicalize adds the extended-length prefix; just check
+        // that the result ends with the expected file name and is absolute.
+        assert!(result.is_absolute());
+        assert!(
+            result.ends_with("abs.txt"),
+            "expected path ending in abs.txt, got {}",
+            result.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_normalize_unsandboxed_path_nonexistent_fallback() {
+        // When the path does not exist, normalize should still return a
+        // usable PathBuf (fallback to raw PathBuf::from).
+        let result = normalize_unsandboxed_path("/unlikely/path/qwerty12345.txt").await;
+        // The result should at least preserve the filename.
+        assert!(
+            result.to_str().unwrap().contains("qwerty12345.txt"),
+            "expected filename preserved, got {}",
+            result.display()
+        );
     }
 
     #[tokio::test]

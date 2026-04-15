@@ -139,8 +139,11 @@ pub async fn check_guard(cache: &FileStateCache, resolved_path: &Path) -> GuardO
     };
 
     // Stat the file to detect external modifications.
-    let meta = match tokio::fs::metadata(resolved_path).await {
-        Ok(m) => m,
+    let current_mtime = match tokio::fs::metadata(resolved_path).await {
+        Ok(m) => match m.modified() {
+            Ok(t) => t,
+            Err(_) => return GuardOutcome::Allowed,
+        },
         Err(_) => {
             // File was deleted since the read — still allow the write so
             // the agent can re-create it.
@@ -148,14 +151,31 @@ pub async fn check_guard(cache: &FileStateCache, resolved_path: &Path) -> GuardO
         }
     };
 
-    let current_mtime = match meta.modified() {
-        Ok(t) => t,
-        Err(_) => {
-            // Platform does not support mtime — allow (best effort).
-            return GuardOutcome::Allowed;
-        }
+    check_guard_mtime(cache, resolved_path, &entry, current_mtime).await
+}
+
+/// Like [`check_guard`], but accepts a pre-fetched `current_mtime` to avoid a
+/// redundant `metadata()` call when the caller already stat-ed the file.
+pub async fn check_guard_with_mtime(
+    cache: &FileStateCache,
+    resolved_path: &Path,
+    current_mtime: std::time::SystemTime,
+) -> GuardOutcome {
+    let entry = match cache.get(resolved_path) {
+        Some(e) => e,
+        None => return GuardOutcome::NotRead,
     };
 
+    check_guard_mtime(cache, resolved_path, &entry, current_mtime).await
+}
+
+/// Shared mtime comparison + content-hash fallback logic.
+async fn check_guard_mtime(
+    _cache: &FileStateCache,
+    resolved_path: &Path,
+    entry: &FileStateEntry,
+    current_mtime: std::time::SystemTime,
+) -> GuardOutcome {
     if current_mtime == entry.mtime {
         return GuardOutcome::Allowed;
     }
@@ -378,5 +398,102 @@ mod tests {
 
         let entry = cache.get(&path).unwrap();
         assert!(entry.is_partial);
+    }
+
+    // ── check_guard_with_mtime tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_guard_with_mtime_not_read() {
+        // File has no cache entry — should return NotRead.
+        let cache = FileStateCache::new(10);
+        let mtime = SystemTime::now();
+        let outcome =
+            check_guard_with_mtime(&cache, Path::new("/some/nonexistent/path"), mtime).await;
+        assert!(
+            matches!(outcome, GuardOutcome::NotRead),
+            "expected NotRead for uncached path, got {:?}",
+            outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn test_guard_with_mtime_allowed_when_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, b"hello").unwrap();
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mtime = meta.modified().unwrap();
+        let hash = content_hash(b"hello");
+
+        let cache = FileStateCache::new(10);
+        cache.record_read(file_path.clone(), hash, mtime, false);
+
+        // Pass the same mtime the file was recorded with.
+        let outcome = check_guard_with_mtime(&cache, &file_path, mtime).await;
+        assert!(
+            matches!(outcome, GuardOutcome::Allowed),
+            "expected Allowed when mtime matches, got {:?}",
+            outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn test_guard_with_mtime_stale_when_content_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, b"original").unwrap();
+
+        let meta = std::fs::metadata(&file_path).unwrap();
+        let mtime = meta.modified().unwrap();
+        let hash = content_hash(b"original");
+
+        let cache = FileStateCache::new(10);
+        cache.record_read(file_path.clone(), hash, mtime, false);
+
+        // Modify the file, then pass the new mtime.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&file_path)
+                .unwrap();
+            f.write_all(b"modified").unwrap();
+        }
+        let new_meta = std::fs::metadata(&file_path).unwrap();
+        let new_mtime = new_meta.modified().unwrap();
+
+        let outcome = check_guard_with_mtime(&cache, &file_path, new_mtime).await;
+        assert!(
+            matches!(outcome, GuardOutcome::StaleRead { .. }),
+            "expected StaleRead when content differs, got {:?}",
+            outcome
+        );
+    }
+
+    #[tokio::test]
+    async fn test_guard_with_mtime_allowed_when_mtime_differs_but_content_same() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, b"same content").unwrap();
+
+        // Record with an artificially old mtime.
+        let old_mtime = SystemTime::UNIX_EPOCH;
+        let hash = content_hash(b"same content");
+
+        let cache = FileStateCache::new(10);
+        cache.record_read(file_path.clone(), hash, old_mtime, false);
+
+        // Pass the real (different) mtime — content-hash fallback should allow.
+        let real_meta = std::fs::metadata(&file_path).unwrap();
+        let real_mtime = real_meta.modified().unwrap();
+
+        let outcome = check_guard_with_mtime(&cache, &file_path, real_mtime).await;
+        assert!(
+            matches!(outcome, GuardOutcome::Allowed),
+            "expected Allowed (content hash match), got {:?}",
+            outcome
+        );
     }
 }

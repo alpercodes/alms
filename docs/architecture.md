@@ -151,6 +151,8 @@ Isolated tool execution used by every agent regardless of hierarchy level.
 
 **Built-in tools:** `echo`, `math`, `http_get`, `shell` (primary, `bash -c` command strings with persistent cwd, background execution, and 30KB output truncation; aliased as `shell_exec` for backward compatibility), `fs_read`, `fs_write`, `fs_list`, `fs_edit`, `fs_grep`, `fs_glob` (in alms-sandbox), `workspace_write` (in alms-runtime), `invoke_agent`, `read_subagent_session`, `send_message`, `list_agents`, `read_messages`, `ignore_message`, `list_my_sessions`, `read_session` (in alms-tools)
 
+**Read-before-write guard:** `fs_write` and `fs_edit` enforce a read-before-write policy via `FileStateCache` (per-run, shared across all fs tools). Existing files must be read via `fs_read` before they can be written or edited. The guard also detects external modifications (mtime + content-hash fallback) and rejects stale writes. New file creation bypasses the guard. See `crates/alms-sandbox/src/file_state_cache.rs`.
+
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 
 ### LLM Client (`alms-runtime`)
