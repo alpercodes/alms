@@ -5,8 +5,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use super::{
-    check_sandbox_path_async, is_blocked_device_path, is_denied_path, reject_unc_path, relativize,
-    walk_filtered_files,
+    check_sandbox_path_async, check_sandbox_path_with_extras_async, is_blocked_device_path,
+    is_denied_path, reject_unc_path, relativize, walk_filtered_files_with_extras,
 };
 
 /// Maximum number of files returned by `fs_glob`.
@@ -23,6 +23,8 @@ const MAX_GLOB_RESULTS: usize = 200;
 #[derive(Debug, Clone, Default)]
 pub struct FsGlobTool {
     sandbox_root: Option<PathBuf>,
+    /// Additional read-only roots (see #242).
+    extra_read_roots: Vec<PathBuf>,
 }
 
 impl FsGlobTool {
@@ -35,7 +37,16 @@ impl FsGlobTool {
     pub fn sandboxed(root: PathBuf) -> Self {
         Self {
             sandbox_root: Some(root),
+            extra_read_roots: Vec::new(),
         }
+    }
+
+    /// Attach additional read-only roots.  Absolute paths that resolve inside
+    /// any of these roots will be searchable in addition to the primary
+    /// sandbox root.
+    pub fn with_extra_read_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.extra_read_roots = roots;
+        self
     }
 }
 
@@ -115,7 +126,11 @@ impl Tool for FsGlobTool {
             }
 
             if let Some(ref root) = self.sandbox_root {
-                check_sandbox_path_async(path, root).await?
+                if self.extra_read_roots.is_empty() {
+                    check_sandbox_path_async(path, root).await?
+                } else {
+                    check_sandbox_path_with_extras_async(path, root, &self.extra_read_roots).await?
+                }
             } else {
                 PathBuf::from(path)
             }
@@ -145,6 +160,7 @@ impl Tool for FsGlobTool {
         // ── Collect matching files ─────────────────────────────────────
 
         let sandbox_root_clone = self.sandbox_root.clone();
+        let extra_read_roots_clone = self.extra_read_roots.clone();
         let search_root_clone = search_root.clone();
 
         let mut files: Vec<(PathBuf, std::time::SystemTime)> =
@@ -152,6 +168,7 @@ impl Tool for FsGlobTool {
                 collect_glob_files(
                     &search_root_clone,
                     sandbox_root_clone.as_deref(),
+                    &extra_read_roots_clone,
                     &glob_matcher,
                 )
             })
@@ -187,19 +204,26 @@ impl Tool for FsGlobTool {
 fn collect_glob_files(
     search_root: &Path,
     sandbox_root: Option<&Path>,
+    extra_read_roots: &[PathBuf],
     glob_matcher: &globset::GlobMatcher,
 ) -> Vec<(PathBuf, std::time::SystemTime)> {
     let mut files = Vec::new();
-    walk_filtered_files(search_root, sandbox_root, Some(glob_matcher), |entry| {
-        // Use DirEntry::metadata() — already cached from the directory walk,
-        // avoids an extra syscall per matched file vs std::fs::metadata().
-        let mtime = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        files.push((entry.path().to_path_buf(), mtime));
-    });
+    walk_filtered_files_with_extras(
+        search_root,
+        sandbox_root,
+        extra_read_roots,
+        Some(glob_matcher),
+        |entry| {
+            // Use DirEntry::metadata() — already cached from the directory walk,
+            // avoids an extra syscall per matched file vs std::fs::metadata().
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            files.push((entry.path().to_path_buf(), mtime));
+        },
+    );
     files
 }
 
@@ -636,5 +660,58 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("UNC paths"));
+    }
+
+    // ── extra_read_roots (sibling workspace access, #242) ─────────────────
+
+    #[tokio::test]
+    async fn test_fs_glob_extra_root_allows_sibling_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let parent_ws = workspace_dir.join("parent");
+        let child_ws = workspace_dir.join("child");
+        std::fs::create_dir_all(&parent_ws).unwrap();
+        std::fs::create_dir_all(&child_ws).unwrap();
+        std::fs::write(child_ws.join("memories.md"), "m").unwrap();
+        std::fs::write(child_ws.join("goals.md"), "g").unwrap();
+        std::fs::write(child_ws.join("personality.md"), "p").unwrap();
+
+        let tool =
+            FsGlobTool::sandboxed(parent_ws).with_extra_read_roots(vec![workspace_dir.clone()]);
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "*.md",
+                "path": child_ws.to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+
+        let files = result["files"].as_array().unwrap();
+        assert_eq!(
+            files.len(),
+            3,
+            "expected exactly the 3 .md files written above, got {}",
+            files.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_glob_extra_root_does_not_widen_to_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let parent_ws = workspace_dir.join("parent");
+        std::fs::create_dir_all(&parent_ws).unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("leak.md"), "x").unwrap();
+
+        let tool = FsGlobTool::sandboxed(parent_ws).with_extra_read_roots(vec![workspace_dir]);
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "*.md",
+                "path": outside.path().to_str().unwrap()
+            }))
+            .await;
+        assert!(result.is_err());
     }
 }

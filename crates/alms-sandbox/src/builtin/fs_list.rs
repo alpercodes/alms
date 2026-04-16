@@ -3,12 +3,16 @@ use crate::{SandboxError, Tool};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-use super::{check_sandbox_path_async, is_denied_path, reject_unc_path};
+use super::{
+    check_sandbox_path_async, check_sandbox_path_with_extras_async, is_denied_path, reject_unc_path,
+};
 
 /// List directory contents.
 #[derive(Debug, Clone, Default)]
 pub struct FsListTool {
     sandbox_root: Option<PathBuf>,
+    /// Additional read-only roots (see #242).
+    extra_read_roots: Vec<PathBuf>,
 }
 
 impl FsListTool {
@@ -19,7 +23,16 @@ impl FsListTool {
     pub fn sandboxed(root: PathBuf) -> Self {
         Self {
             sandbox_root: Some(root),
+            extra_read_roots: Vec::new(),
         }
+    }
+
+    /// Attach additional read-only roots.  Absolute paths that resolve inside
+    /// any of these roots will be listable in addition to the primary sandbox
+    /// root.
+    pub fn with_extra_read_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.extra_read_roots = roots;
+        self
     }
 }
 
@@ -56,7 +69,11 @@ impl Tool for FsListTool {
         reject_unc_path(path)?;
 
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
-            check_sandbox_path_async(path, root).await?
+            if self.extra_read_roots.is_empty() {
+                check_sandbox_path_async(path, root).await?
+            } else {
+                check_sandbox_path_with_extras_async(path, root, &self.extra_read_roots).await?
+            }
         } else {
             PathBuf::from(path)
         };
@@ -162,6 +179,47 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("UNC paths"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_list_extra_root_allows_sibling_workspace() {
+        // {workspace_dir}/parent is the primary sandbox; {workspace_dir} is
+        // the extra read root, so the parent agent can list {workspace_dir}/child.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let parent_ws = workspace_dir.join("parent");
+        let child_ws = workspace_dir.join("child");
+        std::fs::create_dir_all(&parent_ws).unwrap();
+        std::fs::create_dir_all(&child_ws).unwrap();
+        std::fs::write(child_ws.join("memories.md"), "hi").unwrap();
+        std::fs::write(child_ws.join("goals.md"), "go").unwrap();
+
+        let tool =
+            FsListTool::sandboxed(parent_ws).with_extra_read_roots(vec![workspace_dir.clone()]);
+        let result = tool
+            .execute(serde_json::json!({"path": child_ws.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        let entries = result["entries"].as_array().unwrap();
+        let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
+        assert!(names.contains(&"memories.md"));
+        assert!(names.contains(&"goals.md"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_list_extra_root_does_not_widen_to_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let parent_ws = workspace_dir.join("parent");
+        std::fs::create_dir_all(&parent_ws).unwrap();
+
+        let outside_dir = tempfile::tempdir().unwrap();
+        let tool = FsListTool::sandboxed(parent_ws).with_extra_read_roots(vec![workspace_dir]);
+        let result = tool
+            .execute(serde_json::json!({"path": outside_dir.path().to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]

@@ -189,14 +189,37 @@ impl AgentRuntime {
         let enabled = &self.config.enabled_tools;
         let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
 
+        // Parent directory of the workspace (e.g. `{workspace_dir}/`), which
+        // contains every named agent's workspace as a sibling subdirectory.
+        // Granting read-only access here lets a parent agent read a
+        // subagent's `memories.md`/`personality.md`/etc. without being able
+        // to modify them (see #242).  Writes remain gated by the primary
+        // sandbox root (`ws_root`) so agents still can't touch another
+        // agent's files.
+        //
+        // `ws_root` was canonicalized above, so `ws_root.parent()` is also
+        // canonical on all supported platforms — no further canonicalize
+        // call is needed.  If the parent can't be taken (workspace sits at
+        // a filesystem root), we fall back to an empty extras list so
+        // behaviour is unchanged.
+        let sibling_workspaces_root: Vec<std::path::PathBuf> = match ws_root.parent() {
+            Some(parent) => vec![parent.to_path_buf()],
+            None => Vec::new(),
+        };
+
         // Re-register fs_read/fs_write/fs_list/fs_edit sandboxed to the
         // workspace directory so file operations default to the agent's
         // workspace instead of the project root.
         // fs_read/fs_write/fs_edit get the file state cache for read-before-write guard.
+        // Read-family tools (fs_read/fs_list/fs_grep/fs_glob) also get the
+        // sibling-workspaces root as an extra read-only root so a parent
+        // agent can peek at a subagent's workspace files (#242).
         let cache = self.tools.file_state_cache().clone();
         if tool_enabled("fs_read") {
             self.tools.register(std::sync::Arc::new(
-                alms_sandbox::FsReadTool::sandboxed(ws_root.clone()).with_cache(cache.clone()),
+                alms_sandbox::FsReadTool::sandboxed(ws_root.clone())
+                    .with_cache(cache.clone())
+                    .with_extra_read_roots(sibling_workspaces_root.clone()),
             ));
         }
         if tool_enabled("fs_write") {
@@ -205,10 +228,10 @@ impl AgentRuntime {
             ));
         }
         if tool_enabled("fs_list") {
-            self.tools
-                .register(std::sync::Arc::new(alms_sandbox::FsListTool::sandboxed(
-                    ws_root.clone(),
-                )));
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsListTool::sandboxed(ws_root.clone())
+                    .with_extra_read_roots(sibling_workspaces_root.clone()),
+            ));
         }
         if tool_enabled("fs_edit") {
             self.tools.register(std::sync::Arc::new(
@@ -216,16 +239,16 @@ impl AgentRuntime {
             ));
         }
         if tool_enabled("fs_grep") {
-            self.tools
-                .register(std::sync::Arc::new(alms_sandbox::FsGrepTool::sandboxed(
-                    ws_root.clone(),
-                )));
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsGrepTool::sandboxed(ws_root.clone())
+                    .with_extra_read_roots(sibling_workspaces_root.clone()),
+            ));
         }
         if tool_enabled("fs_glob") {
-            self.tools
-                .register(std::sync::Arc::new(alms_sandbox::FsGlobTool::sandboxed(
-                    ws_root.clone(),
-                )));
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsGlobTool::sandboxed(ws_root.clone())
+                    .with_extra_read_roots(sibling_workspaces_root.clone()),
+            ));
         }
 
         // Re-register shell tool with workspace dir as default cwd and

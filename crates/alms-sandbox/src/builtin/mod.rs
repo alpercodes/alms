@@ -207,6 +207,82 @@ pub(crate) async fn check_sandbox_path_async(
         })?
 }
 
+/// Resolve a path and verify it falls within the primary sandbox root OR any
+/// of the additional read-only roots.
+///
+/// Used by read-family filesystem tools (`fs_read`, `fs_list`, `fs_grep`,
+/// `fs_glob`) to allow read-only access to directories outside the primary
+/// sandbox root — for example, sibling agent workspace directories so that a
+/// parent agent can read a subagent's `memories.md` without being able to
+/// modify it (#242).
+///
+/// Relative paths are resolved against the primary sandbox root (preserving
+/// current behaviour). Absolute paths are allowed if they resolve inside
+/// either the primary root or any extra read-only root. Symlinks are followed
+/// via `canonicalize()` to prevent escapes.
+pub(crate) fn check_sandbox_path_with_extras(
+    path: &str,
+    sandbox_root: &Path,
+    extra_read_roots: &[PathBuf],
+) -> SandboxResult<PathBuf> {
+    let p = Path::new(path);
+
+    let canonical_root = canonicalize_best_effort(sandbox_root).map_err(|e| {
+        SandboxError::SandboxViolation(format!(
+            "Cannot resolve sandbox root '{}': {}",
+            sandbox_root.display(),
+            e
+        ))
+    })?;
+
+    // Resolve: relative paths join to the primary sandbox root so tool UX is
+    // unchanged — extras only expand the allowed *absolute* path set.
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        canonical_root.join(p)
+    };
+
+    let canonical = canonicalize_best_effort(&resolved)
+        .map_err(|e| SandboxError::SandboxViolation(format!("Cannot resolve '{}': {}", path, e)))?;
+
+    if canonical.starts_with(&canonical_root) {
+        return Ok(canonical);
+    }
+
+    // Fall back to checking each extra read-only root. Each root is
+    // canonicalized independently so mismatched UNC prefixes on Windows
+    // don't cause spurious rejections.
+    for extra in extra_read_roots {
+        if let Ok(canon_extra) = canonicalize_best_effort(extra)
+            && canonical.starts_with(&canon_extra)
+        {
+            return Ok(canonical);
+        }
+    }
+
+    Err(SandboxError::SandboxViolation(format!(
+        "Path '{}' is outside sandbox root",
+        path
+    )))
+}
+
+/// Async version of [`check_sandbox_path_with_extras`].
+pub(crate) async fn check_sandbox_path_with_extras_async(
+    path: &str,
+    sandbox_root: &Path,
+    extra_read_roots: &[PathBuf],
+) -> SandboxResult<PathBuf> {
+    let path_owned = path.to_owned();
+    let root_owned = sandbox_root.to_owned();
+    let extras_owned = extra_read_roots.to_vec();
+    tokio::task::spawn_blocking(move || {
+        check_sandbox_path_with_extras(&path_owned, &root_owned, &extras_owned)
+    })
+    .await
+    .map_err(|e| SandboxError::SandboxViolation(format!("Sandbox path check task failed: {}", e)))?
+}
+
 /// Canonicalize a path, walking up to the nearest existing ancestor if the
 /// full path does not yet exist (handles fs_write for new files/dirs).
 pub(crate) fn canonicalize_best_effort(path: &Path) -> std::io::Result<PathBuf> {
@@ -299,9 +375,15 @@ pub(crate) const MAX_WALK_DEPTH: usize = 50;
 /// This is the single place where the walker, VCS/denied/sandbox filtering, and
 /// glob matching live — both `collect_files` (fs_grep) and `collect_glob_files`
 /// (fs_glob) delegate to it, so a future security fix only needs one patch site.
-pub(crate) fn walk_filtered_files(
+///
+/// A file is allowed through if it resolves inside the primary `sandbox_root`
+/// OR any of the `extra_read_roots` — the latter is how parent agents get
+/// read-only access to sibling agent workspaces (#242).  Pass an empty slice
+/// for `extra_read_roots` to get the traditional sandbox-only behaviour.
+pub(crate) fn walk_filtered_files_with_extras(
     search_root: &Path,
     sandbox_root: Option<&Path>,
+    extra_read_roots: &[PathBuf],
     glob_matcher: Option<&globset::GlobMatcher>,
     mut visitor: impl FnMut(&walkdir::DirEntry),
 ) {
@@ -309,6 +391,10 @@ pub(crate) fn walk_filtered_files(
     // correctly even on Windows where walkdir may return UNC paths
     // (`\\?\C:\...`) while the stored root uses the short form (`C:\...`).
     let canonical_sandbox_root = sandbox_root.and_then(|r| canonicalize_best_effort(r).ok());
+    let canonical_extras: Vec<PathBuf> = extra_read_roots
+        .iter()
+        .filter_map(|r| canonicalize_best_effort(r).ok())
+        .collect();
 
     let walker = WalkDir::new(search_root)
         .max_depth(MAX_WALK_DEPTH)
@@ -338,11 +424,14 @@ pub(crate) fn walk_filtered_files(
 
         let path = entry.path();
 
-        // Enforce sandbox root on each discovered file.
-        if let Some(ref root) = canonical_sandbox_root
-            && !path.starts_with(root)
-        {
-            continue;
+        // Enforce sandbox root on each discovered file.  When extras are
+        // configured, the file may live inside any of them too (read-only).
+        if let Some(ref root) = canonical_sandbox_root {
+            let in_primary = path.starts_with(root);
+            let in_extras = canonical_extras.iter().any(|e| path.starts_with(e));
+            if !in_primary && !in_extras {
+                continue;
+            }
         }
 
         // Apply glob filter: match against the path relative to the search root.

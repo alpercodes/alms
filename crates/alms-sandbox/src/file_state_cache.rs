@@ -86,6 +86,7 @@ impl FileStateCache {
 
     /// Return the number of entries currently in the cache.
     #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)] // test-only helper; no matching is_empty needed
     pub fn len(&self) -> usize {
         self.entries.lock().len()
     }

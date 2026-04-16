@@ -1610,3 +1610,185 @@ fn test_streaming_usage_accumulation() {
     );
     assert_eq!(u.total_tokens, 225, "total should be sum of both");
 }
+
+/// Verify that after `with_workspace()` the parent agent's fs_read tool can
+/// reach into a sibling subagent's workspace directory (#242 — parents
+/// reading subagent memories/goals/personality).
+#[tokio::test]
+async fn test_with_workspace_grants_sibling_workspace_read_access() {
+    use crate::workspace::AgentWorkspace;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace_dir = dir.path().to_path_buf();
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    // Parent and child (subagent) workspaces live as siblings under
+    // workspace_dir, matching the real on-disk layout.
+    let parent_ws_dir = workspace_dir.join("parent");
+    let child_ws_dir = workspace_dir.join("child");
+    std::fs::create_dir_all(&parent_ws_dir).unwrap();
+    std::fs::create_dir_all(&child_ws_dir).unwrap();
+
+    // Write a memories.md file in the child's workspace.
+    let child_memories = child_ws_dir.join("memories.md");
+    std::fs::write(&child_memories, "learned: answer is 42\n").unwrap();
+
+    // Build an AgentRuntime for the parent agent and attach its workspace.
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: parent_ws_dir.to_string_lossy().to_string(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(config).unwrap(),
+    )
+    .expect("runtime")
+    .with_workspace(AgentWorkspace::new(&workspace_dir, "parent"));
+
+    // fs_read should succeed for the child's memories.md because
+    // with_workspace() attached the parent of ws_root as an extra read root.
+    let child_memories_canonical = std::fs::canonicalize(&child_memories).unwrap();
+    let result = runtime
+        .tools()
+        .execute(
+            "fs_read",
+            serde_json::json!({ "path": child_memories_canonical.to_str().unwrap() }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "parent should be able to read child's memories.md: {:?}",
+        result.err()
+    );
+    let value = result.unwrap();
+    assert!(
+        value["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("answer is 42"),
+        "expected child's memories content, got {}",
+        value
+    );
+}
+
+/// Verify the parent agent CANNOT write to a sibling subagent workspace via
+/// fs_write — the extra_read_roots widening is read-only (#242).
+#[tokio::test]
+async fn test_with_workspace_does_not_grant_sibling_write_access() {
+    use crate::workspace::AgentWorkspace;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace_dir = dir.path().to_path_buf();
+    let parent_ws_dir = workspace_dir.join("parent");
+    let child_ws_dir = workspace_dir.join("child");
+    std::fs::create_dir_all(&parent_ws_dir).unwrap();
+    std::fs::create_dir_all(&child_ws_dir).unwrap();
+
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: parent_ws_dir.to_string_lossy().to_string(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(config).unwrap(),
+    )
+    .expect("runtime")
+    .with_workspace(AgentWorkspace::new(&workspace_dir, "parent"));
+
+    // fs_write must fail: child_ws_dir is not inside the primary sandbox
+    // (parent/) and fs_write was not granted extra_read_roots.
+    let child_memories_canonical = std::fs::canonicalize(&child_ws_dir)
+        .unwrap()
+        .join("memories.md");
+    let result = runtime
+        .tools()
+        .execute(
+            "fs_write",
+            serde_json::json!({
+                "path": child_memories_canonical.to_str().unwrap(),
+                "content": "tampered",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "parent should NOT be able to write into child's workspace"
+    );
+}
+
+/// Verify an ephemeral subagent CANNOT read a named agent's workspace (#242).
+///
+/// Ephemeral subagents live at `{workspace_dir}/.ephemeral/{task_id}/`.
+/// `with_workspace()` canonicalizes `ws_root` and takes its parent as the
+/// extra read-only root — which for an ephemeral agent is
+/// `{workspace_dir}/.ephemeral/`, NOT `{workspace_dir}/`.  That means an
+/// ephemeral subagent must not be able to reach into a sibling named
+/// agent's workspace (e.g. `{workspace_dir}/researcher/memories.md`), and
+/// this test pins that invariant so a future refactor of the parent-dir
+/// derivation can't silently widen the ephemeral allow-set.
+#[tokio::test]
+async fn test_ephemeral_subagent_cannot_read_named_agent_workspace() {
+    use crate::workspace::AgentWorkspace;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace_dir = dir.path().to_path_buf();
+
+    // Named agent lives at `{workspace_dir}/researcher/`.
+    let named_ws_dir = workspace_dir.join("researcher");
+    std::fs::create_dir_all(&named_ws_dir).unwrap();
+    let named_memories = named_ws_dir.join("memories.md");
+    std::fs::write(&named_memories, "researcher private notes\n").unwrap();
+
+    // Ephemeral subagent lives at `{workspace_dir}/.ephemeral/<task_id>/`.
+    let task_id = "test-task-00000000";
+    let ephemeral_ws_dir = workspace_dir.join(".ephemeral").join(task_id);
+    std::fs::create_dir_all(&ephemeral_ws_dir).unwrap();
+
+    // Build the ephemeral runtime and attach its workspace via `with_dir`
+    // (mirrors how the coordinator constructs ephemeral subagent workspaces).
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: ephemeral_ws_dir.to_string_lossy().to_string(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(config).unwrap(),
+    )
+    .expect("runtime")
+    .with_workspace(AgentWorkspace::with_dir(ephemeral_ws_dir.clone()));
+
+    // The ephemeral agent must NOT be able to read the named agent's
+    // memories.md — `ws_root.parent()` is `{workspace_dir}/.ephemeral/`,
+    // which does not contain `{workspace_dir}/researcher/`.
+    let named_memories_canonical = std::fs::canonicalize(&named_memories).unwrap();
+    let result = runtime
+        .tools()
+        .execute(
+            "fs_read",
+            serde_json::json!({ "path": named_memories_canonical.to_str().unwrap() }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "ephemeral subagent should NOT be able to read a named agent's workspace: {:?}",
+        result.ok()
+    );
+}

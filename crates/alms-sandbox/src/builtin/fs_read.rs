@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::{
-    check_sandbox_path_async, is_blocked_device_path, is_denied_path, normalize_unsandboxed_path,
-    reject_unc_path,
+    check_sandbox_path_async, check_sandbox_path_with_extras_async, is_blocked_device_path,
+    is_denied_path, normalize_unsandboxed_path, reject_unc_path,
 };
 
 /// Read a file from the filesystem.
@@ -16,6 +16,10 @@ use super::{
 pub struct FsReadTool {
     sandbox_root: Option<PathBuf>,
     file_state_cache: Option<Arc<FileStateCache>>,
+    /// Additional read-only roots that extend the set of paths allowed by
+    /// this tool (see #242 — parent agents reading subagent workspaces).
+    /// Writes continue to be gated by the primary sandbox root only.
+    extra_read_roots: Vec<PathBuf>,
 }
 
 impl FsReadTool {
@@ -29,12 +33,21 @@ impl FsReadTool {
         Self {
             sandbox_root: Some(root),
             file_state_cache: None,
+            extra_read_roots: Vec::new(),
         }
     }
 
     /// Attach a file state cache for read-before-write tracking.
     pub fn with_cache(mut self, cache: Arc<FileStateCache>) -> Self {
         self.file_state_cache = Some(cache);
+        self
+    }
+
+    /// Attach additional read-only roots.  Absolute paths that resolve inside
+    /// any of these roots will be allowed in addition to the primary sandbox
+    /// root.  Relative paths still resolve against the primary root.
+    pub fn with_extra_read_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.extra_read_roots = roots;
         self
     }
 }
@@ -131,7 +144,11 @@ impl Tool for FsReadTool {
         }
 
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
-            check_sandbox_path_async(path, root).await?
+            if self.extra_read_roots.is_empty() {
+                check_sandbox_path_async(path, root).await?
+            } else {
+                check_sandbox_path_with_extras_async(path, root, &self.extra_read_roots).await?
+            }
         } else {
             normalize_unsandboxed_path(path).await
         };
@@ -848,5 +865,76 @@ mod tests {
             result.get("total_lines").is_none(),
             "total_lines should be absent when not at EOF"
         );
+    }
+
+    // ── extra_read_roots (sibling workspace access, #242) ─────────────────
+
+    #[tokio::test]
+    async fn test_fs_read_extra_root_allows_sibling_workspace() {
+        // Simulate layout: {workspace_dir}/parent/   and {workspace_dir}/child/
+        // Parent agent's fs_read is sandboxed to parent/ but granted extra read
+        // on {workspace_dir}, which lets it read child/memories.md.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let parent_ws = workspace_dir.join("parent");
+        let child_ws = workspace_dir.join("child");
+        std::fs::create_dir_all(&parent_ws).unwrap();
+        std::fs::create_dir_all(&child_ws).unwrap();
+        let memories = child_ws.join("memories.md");
+        std::fs::write(&memories, "alpha\nbeta\n").unwrap();
+
+        let tool =
+            FsReadTool::sandboxed(parent_ws).with_extra_read_roots(vec![workspace_dir.clone()]);
+        let result = tool
+            .execute(serde_json::json!({"path": memories.to_str().unwrap()}))
+            .await
+            .unwrap();
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains("alpha"));
+        assert!(content.contains("beta"));
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_extra_root_does_not_widen_to_project() {
+        // Extra read roots must not allow arbitrary absolute paths outside
+        // both the primary sandbox root AND the extras.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let parent_ws = workspace_dir.join("parent");
+        std::fs::create_dir_all(&parent_ws).unwrap();
+
+        // Create an "outside" file in a completely different tempdir.
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside_file = outside_dir.path().join("leak.txt");
+        std::fs::write(&outside_file, "secret").unwrap();
+
+        let tool =
+            FsReadTool::sandboxed(parent_ws).with_extra_read_roots(vec![workspace_dir.clone()]);
+        let result = tool
+            .execute(serde_json::json!({"path": outside_file.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err(), "outside path must still be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_extra_root_still_blocks_denied_filenames() {
+        // `secrets.json` in a sibling workspace must still be blocked by the
+        // deny-list regardless of the extra read root.
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let parent_ws = workspace_dir.join("parent");
+        let child_ws = workspace_dir.join("child");
+        std::fs::create_dir_all(&parent_ws).unwrap();
+        std::fs::create_dir_all(&child_ws).unwrap();
+        let denied = child_ws.join("secrets.json");
+        std::fs::write(&denied, r#"{"k": "v"}"#).unwrap();
+
+        let tool =
+            FsReadTool::sandboxed(parent_ws).with_extra_read_roots(vec![workspace_dir.clone()]);
+        let result = tool
+            .execute(serde_json::json!({"path": denied.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("denied"));
     }
 }
