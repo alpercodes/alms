@@ -176,11 +176,12 @@ pub(super) async fn forward_runtime_events(
                     .await;
             }
             RuntimeEvent::Status { phase, detail } => {
-                // Cross-forward key DM status phases to the webchat session
-                // so the status bar stays up to date (#651).
-                if let Some(ref dm_info) = dm_cross_session
-                    && matches!(phase.as_str(), "calling_llm" | "executing_tools")
-                {
+                // Cross-forward ALL DM status phases to the webchat session
+                // so the status bar stays up to date (#651, #688).
+                // Previously only `calling_llm` and `executing_tools` were
+                // forwarded, causing the status bar to go blank during
+                // `building_context` and `summarizing` phases.
+                if let Some(ref dm_info) = dm_cross_session {
                     // Resolve the webchat session once and cache the result.
                     let webchat_sid = *cached_webchat_session.get_or_insert_with(|| {
                         super::find_user_facing_session(&session_manager, dm_info.agent_id)

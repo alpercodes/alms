@@ -414,10 +414,10 @@ impl SseEventData {
     }
 
     /// Cross-session: a DM run status update, forwarded to the agent's
-    /// webchat session so the status bar can show tool execution details.
+    /// webchat session so the status bar can show DM activity.
     ///
-    /// Only key phases (`executing_tools`, `calling_llm`) are forwarded
-    /// to avoid noise.
+    /// All agent-loop phases are forwarded so the webchat session never
+    /// has a stale or blank status bar during a DM conversation.
     pub fn dm_activity_status(
         session_id: alms_core::SessionId,
         peer: &str,
@@ -431,6 +431,25 @@ impl SseEventData {
                 peer: peer.to_string(),
                 phase: phase.to_string(),
                 detail,
+                ts: Utc::now(),
+            },
+        )
+    }
+
+    /// Cross-session: a DM run has ended, forwarded to the agent's
+    /// webchat session so the status bar can update accordingly.
+    ///
+    /// Unlike `dm_conversation_ended` (which signals the entire DM
+    /// conversation is over), this signals that a single DM run has
+    /// finished.  The frontend uses this to decide whether to keep
+    /// showing "Chatting with {peer}..." (if more DM runs are expected)
+    /// or clear the status (if the conversation ended).
+    pub fn dm_activity_ended(session_id: alms_core::SessionId, peer: &str) -> Self {
+        Self::new(
+            "dm_activity_ended",
+            DmActivityEndedData {
+                session_id: session_id.0.to_string(),
+                peer: peer.to_string(),
                 ts: Utc::now(),
             },
         )
@@ -735,6 +754,13 @@ struct DmActivityStatusData {
     phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct DmActivityEndedData {
+    session_id: String,
+    peer: String,
     ts: DateTime<Utc>,
 }
 
@@ -1064,6 +1090,17 @@ mod tests {
         assert_eq!(event_with_detail.data["peer"], "analyst");
         assert_eq!(event_with_detail.data["phase"], "executing_tools");
         assert_eq!(event_with_detail.data["detail"], "shell_exec, fs_read");
+    }
+
+    #[test]
+    fn test_dm_activity_ended_event() {
+        let session_id = alms_core::SessionId::new();
+        let event = SseEventData::dm_activity_ended(session_id, "researcher");
+
+        assert_eq!(event.event_type, "dm_activity_ended");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["peer"], "researcher");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
     }
 
     #[test]

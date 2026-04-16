@@ -12,11 +12,14 @@
  *   4. If active run: append thinking indicator + reconstruct approvals
  *   5. Open SSE stream with lastEventId to skip event replay
  *   6. Restore agent phase (MUST be after step 5 — openSessionStream
- *      calls clearAgentPhase() internally during teardown)
+ *      calls clearAgentPhase() internally during teardown).
+ *      Includes cross-session DM visibility (#688): when viewing a non-DM
+ *      session and the agent is in a DM on another session, the status
+ *      bar shows "Chatting with {peer}..." via an async agent-runs check.
  */
 
 import { getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
-import { listRuns, listApprovals } from '../api/runs.js';
+import { listRuns, listApprovals, listAgentRuns } from '../api/runs.js';
 import { mapHistoryMessages, groupDmReasoningBlocks } from './history.js';
 import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
@@ -266,10 +269,71 @@ export async function loadSession(sessionId, opts) {
         // else: queued -- leave header idle, SSE stream will provide
         // real status if/when the run starts on this session.
     } else {
-        // No active run — explicitly clear the phase so stale state from
-        // a previous session cannot leak through.  (This is also handled
-        // by closeSessionStream() above, but the explicit clear here
-        // serves as self-documentation of the invariant.)
+        // No active run on this session -- check if the agent is busy
+        // with a DM on a different session (cross-session visibility,
+        // #688 / #703).  This makes the "Chatting with..." status
+        // appear even when viewing the webchat session.
+        //
+        // The query is best-effort and async -- if it fails, the
+        // status bar stays idle until the next dm_activity_started
+        // SSE event arrives from the backend.
+        const agentId = activeAgent.value?.id;
+        if (agentId) {
+            restoreGlobalAgentPhase(agentId, sessionId, isStale, logPrefix)
+                .catch(err => console.warn(`[${logPrefix}] restoreGlobalAgentPhase uncaught:`, err));
+        } else {
+            clearAgentPhase();
+        }
+    }
+}
+
+/**
+ * Check if the agent has any active DM runs across all sessions and
+ * restore the "Chatting with..." status if so.
+ *
+ * This is a best-effort async call: if it fails or the session becomes
+ * stale, the status bar simply stays idle until the next live SSE event.
+ *
+ * @param {string} agentId - The agent to check
+ * @param {string} sessionId - The session being loaded (for DM peer derivation)
+ * @param {function} isStale - Staleness checker
+ * @param {string} logPrefix - Log label
+ */
+async function restoreGlobalAgentPhase(agentId, sessionId, isStale, logPrefix) {
+    try {
+        const data = await listAgentRuns(agentId, 10);
+        if (isStale()) return;
+        const agentRuns = data.runs || [];
+
+        // Look for a running DM run (not queued) to derive the peer name.
+        const activeDmRun = agentRuns.find(
+            r => r.session_type === 'dm' && r.status === 'running'
+        );
+        if (activeDmRun && activeDmRun.context_id) {
+            // context_id is "dm:<name1>:<name2>" -- derive the peer name
+            // by finding the participant that is NOT the active agent.
+            const agentName = activeAgent.value?.name;
+            const parts = activeDmRun.context_id.split(':');
+            if (parts.length >= 3 && parts[0] === 'dm' && agentName) {
+                const peer = parts[1] === agentName ? parts[2] : parts[1];
+                if (peer) {
+                    setDmContext(peer);
+                    console.debug(`[${logPrefix}] restored cross-session DM status: Chatting with ${peer}`);
+                    return;
+                }
+            }
+        }
+
+        // No active DM run -- check for any non-DM running run.
+        const activeRun = agentRuns.find(r => r.status === 'running');
+        if (activeRun) {
+            setAgentPhase('calling_llm', null);
+        } else {
+            clearAgentPhase();
+        }
+    } catch (err) {
+        console.warn(`[${logPrefix}] Failed to check agent global status:`, err);
+        // Fall back to idle -- next SSE event will update it.
         clearAgentPhase();
     }
 }

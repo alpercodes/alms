@@ -787,14 +787,18 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     let forwarder_state = state.clone();
 
     // Build cross-session DM info when the run is on a DM session so that
-    // key status phases are echoed to the agent's webchat stream (#651).
-    let dm_cross_session = agent_name
+    // status phases are echoed to the agent's webchat stream (#651, #688).
+    let dm_peer_for_webchat = agent_name
         .as_deref()
-        .and_then(|name| extract_peer_from_dm_context(&context_id, name))
-        .map(|peer_name| super::tools::DmCrossSessionInfo {
-            agent_id,
-            peer_name,
-        });
+        .and_then(|name| extract_peer_from_dm_context(&context_id, name));
+
+    let dm_cross_session =
+        dm_peer_for_webchat
+            .as_deref()
+            .map(|peer_name| super::tools::DmCrossSessionInfo {
+                agent_id,
+                peer_name: peer_name.to_string(),
+            });
 
     let forwarder_handle = tokio::spawn(forward_runtime_events(
         runtime_rx,
@@ -1235,6 +1239,26 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
             error!("Run {} failed: {}", run_id.0, e);
         }
+    }
+
+    // Forward a `dm_activity_ended` event to the agent's webchat session
+    // so the frontend can update the status bar (#688).  This is distinct
+    // from `dm_conversation_ended` (which signals the entire DM conversation
+    // is over) — `dm_activity_ended` signals that a single DM run finished,
+    // allowing the frontend to keep "Chatting with..." visible if more DM
+    // runs are expected.
+    if let Some(ref peer_name) = dm_peer_for_webchat
+        && let Some(target) = super::find_user_facing_session(&state.session_manager, agent_id)
+    {
+        let dummy_run_id = RunId::new();
+        state
+            .run_manager
+            .send_session_event(
+                target.id,
+                dummy_run_id,
+                SseEventData::dm_activity_ended(target.id, peer_name),
+            )
+            .await;
     }
 
     // Update last_active on the agent record (non-fatal).

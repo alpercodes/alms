@@ -560,7 +560,7 @@ Cross-session event forwarded to the agent's user-facing webchat session when a 
 ```
 
 `dm_activity_status`
-Cross-session event forwarded to the agent's user-facing webchat session during an active DM run. Only key status phases (`calling_llm`, `executing_tools`) are forwarded to avoid noise. Enables the status bar to show real-time DM activity details (e.g. which tools are being executed). See #651.
+Cross-session event forwarded to the agent's user-facing webchat session during an active DM run. All status phases are forwarded (including `building_context`, `calling_llm`, `executing_tools`, `summarizing`, etc.) so the frontend can show real-time DM activity details. See #651, #688.
 ```json
 {
   "session_id": "<uuid>",
@@ -571,8 +571,18 @@ Cross-session event forwarded to the agent's user-facing webchat session during 
 }
 ```
 
-`phase` values (subset of `status` phases): `calling_llm`, `executing_tools`.
+`phase` values: any `status` event phase (e.g. `building_context`, `calling_llm`, `executing_tools`, `summarizing`).
 `detail` is present only for `executing_tools` (comma-separated tool names being executed); `null` otherwise.
+
+`dm_activity_ended`
+Cross-session event forwarded to the agent's user-facing webchat session when a single DM run completes. Distinct from `dm_conversation_ended` (which signals the entire DM conversation is over) -- this signals that one turn finished. The frontend uses this to keep "Chatting with {peer}..." visible between DM turns. See #688.
+```json
+{
+  "session_id": "<uuid>",
+  "peer": "researcher",
+  "ts": "..."
+}
+```
 
 `job_completed`
 Emitted on the agent's user-facing session when a scheduled job run finishes. The event is informational only (no new LLM run is triggered).
