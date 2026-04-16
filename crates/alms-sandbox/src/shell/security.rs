@@ -10,7 +10,7 @@
 
 /// Filenames that must never be accessed by agent tools.
 ///
-/// Single source of truth — imported by `builtin.rs` for fs_read/fs_write
+/// Single source of truth — imported by `builtin/` tools for fs_read/fs_write
 /// path validation and used here for shell command string checks.
 ///
 /// These are checked against the final component of resolved paths in fs_read,
