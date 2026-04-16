@@ -1,4 +1,5 @@
 import { nextMsgId } from '../state/chat.js';
+import { DM_END_REASON_LABELS } from './constants.js';
 
 /**
  * Parse a persisted job notification marker into structured fields.
@@ -153,16 +154,12 @@ export function mapHistoryMessages(msgs, opts) {
             const isDmEndedMarker = m.metadata
                 && m.metadata.message_type === 'dm_ended';
             if (isDmEndedMarker) {
-                const reasonLabels = {
-                    'ignored': 'no further replies',
-                    'depth_exceeded': 'message limit reached',
-                };
                 const rawReason = m.metadata.reason || '';
                 pushEntry({
                     id: nextMsgId(),
                     type: 'dm_ended',
                     peer: m.metadata.ended_by || 'unknown',
-                    reason: reasonLabels[rawReason] || rawReason || 'conversation ended',
+                    reason: DM_END_REASON_LABELS[rawReason] || rawReason || 'conversation ended',
                 }, m.timestamp);
                 continue;
             }

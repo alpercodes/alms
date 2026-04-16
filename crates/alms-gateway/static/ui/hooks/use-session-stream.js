@@ -40,6 +40,7 @@ import { activeAgent } from '../state/agents.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
 import { clearPendingMessage } from '../state/pending-messages.js';
+import { DM_END_REASON_LABELS } from '../utils/constants.js';
 
 /**
  * Per-run DM thinking text accumulation buffer.
@@ -820,11 +821,7 @@ export function openSessionStream(sessionId, opts) {
     on('dm_conversation_ended', (e) => {
         const data = JSON.parse(e.data);
         const peer = data.peer || 'unknown';
-        const reasonLabels = {
-            'ignored': 'no further replies',
-            'depth_exceeded': 'message limit reached',
-        };
-        const reason = reasonLabels[data.reason] || data.reason || 'conversation ended';
+        const reason = DM_END_REASON_LABELS[data.reason] || data.reason || 'conversation ended';
         appendMessage({
             id: nextMsgId(), type: 'dm_ended', peer, reason,
         });

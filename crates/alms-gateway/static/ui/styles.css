@@ -3145,11 +3145,44 @@ select.settings-input-sm {
   padding: var(--space-2) var(--space-6);
   border-top: 1px solid var(--border-subtle);
   background: var(--surface-1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .dm-view-footer-text {
   font-size: var(--text-2xs);
   color: var(--text-disabled);
   font-style: italic;
+}
+
+/* DM cancel conversation button */
+.dm-cancel-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-4);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-full);
+  background: var(--error-muted);
+  color: var(--error);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--duration-fast);
+  white-space: nowrap;
+}
+.dm-cancel-btn:hover:not(:disabled) {
+  background: var(--error);
+  color: #fff;
+}
+.dm-cancel-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.dm-cancel-btn-icon {
+  font-size: 10px;
+  line-height: 1;
 }
 
 /* ── Subagent completion card ── */

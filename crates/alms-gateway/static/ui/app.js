@@ -18,6 +18,7 @@ import { agents, activeAgent } from './state/agents.js';
 import { isDmSession, isNotificationSession, isInternalSession, activeSession } from './state/sessions.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
 import { parentSessionId, navigateToParentSession } from './state/subagents.js';
+import { DM_END_REASON_LABELS } from './utils/constants.js';
 import { AgentHeaderBar } from './components/chat/agent-header-bar.js';
 import { DmConversationView } from './components/chat/dm-conversation-view.js';
 import { scrollToBottom } from './utils/format.js';
@@ -223,8 +224,7 @@ function ChatView() {
                         // Route to the correct visual component based on metadata.type.
                         const md = m.metadata || {};
                         if (md.type === 'dm_ended_notification') {
-                            const reasonLabels = { 'ignored': 'no further replies', 'depth_exceeded': 'message limit reached' };
-                            return html`<${DmEndedMessage} key=${m.id} peer=${md.peer || 'unknown'} reason=${reasonLabels[md.reason] || md.reason || 'conversation ended'} />`;
+                            return html`<${DmEndedMessage} key=${m.id} peer=${md.peer || 'unknown'} reason=${DM_END_REASON_LABELS[md.reason] || md.reason || 'conversation ended'} />`;
                         }
                         // Other synthetic markers: render as system message
                         return html`<${SystemMessage} key=${m.id} text=${m.text} />`;
