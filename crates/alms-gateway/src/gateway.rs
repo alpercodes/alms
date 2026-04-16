@@ -85,6 +85,7 @@ impl GatewayConfig {
                 context_config: config.context.clone(),
                 sandbox_root: config.tools.sandbox_root.clone(),
                 shell_policy: config.tools.shell_policy.clone(),
+                shell_permissions: config.tools.shell_permissions.clone(),
                 enabled_tools: config.tools.enabled.clone(),
                 ..AgentConfig::default()
             },

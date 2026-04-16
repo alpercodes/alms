@@ -47,6 +47,9 @@ pub struct AgentRuntime {
     /// Default env vars injected into shell processes (e.g. ALMS_DATA_DIR).
     /// Retained so `with_workspace()` can pass them to the re-registered shell tool.
     pub(crate) shell_default_env: std::collections::HashMap<String, String>,
+    /// Permission-based allow/deny patterns for shell commands.
+    /// Retained so re-registrations of the shell tool preserve the policy.
+    pub(crate) shell_permissions: alms_core::config::ShellPermissions,
     /// Agent name for perspective mapping in DM sessions.
     /// When set and the context_id starts with "dm:", the context builder
     /// maps messages from this agent to `Role::Assistant` so the LLM sees
@@ -103,7 +106,9 @@ impl AgentRuntime {
             &config.enabled_tools,
         );
 
-        Ok(Self {
+        let shell_permissions = config.shell_permissions.clone();
+
+        let mut runtime = Self {
             agent_id,
             config,
             llm,
@@ -115,8 +120,19 @@ impl AgentRuntime {
             resolved_sandbox_root: sandbox_root,
             shell_unrestricted,
             shell_default_env: std::collections::HashMap::new(),
+            shell_permissions: shell_permissions.clone(),
             agent_name: None,
-        })
+        };
+
+        // Apply shell permissions to the initially registered shell tool.
+        // The shell tool is re-registered (with permissions) whenever
+        // with_workspace() or with_shell_default_env() is called, but we
+        // also need it on the initial tool so unnamed agents get the policy.
+        if !shell_permissions.is_empty() {
+            runtime.apply_shell_permissions();
+        }
+
+        Ok(runtime)
     }
 
     /// Attach an agent workspace for persistent identity files.
@@ -215,7 +231,8 @@ impl AgentRuntime {
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
-            .with_default_cwd(ws_root);
+            .with_default_cwd(ws_root)
+            .with_permissions(&self.shell_permissions);
             if !self.shell_default_env.is_empty() {
                 shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
             }
@@ -273,6 +290,7 @@ impl AgentRuntime {
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
+            .with_permissions(&self.shell_permissions)
             .with_default_env(self.shell_default_env.clone());
             let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
             self.tools.register(std::sync::Arc::clone(&tool_arc));
@@ -292,6 +310,28 @@ impl AgentRuntime {
     pub fn with_agent_name(mut self, name: String) -> Self {
         self.agent_name = Some(name);
         self
+    }
+
+    /// Re-register the shell tool with the current `shell_permissions`.
+    ///
+    /// Used at construction time to apply permissions to the initial shell
+    /// tool registration. Later registrations (via `with_workspace()`,
+    /// `with_shell_default_env()`) also apply permissions explicitly.
+    fn apply_shell_permissions(&mut self) {
+        let enabled = &self.config.enabled_tools;
+        let shell_enabled =
+            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
+        if shell_enabled && (self.tools.contains("shell") || self.tools.contains("shell_exec")) {
+            let shell_tool = alms_sandbox::ShellTool::with_policy(
+                self.resolved_sandbox_root.clone(),
+                self.shell_unrestricted,
+            )
+            .with_permissions(&self.shell_permissions);
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
+        }
     }
 
     /// Emit a status event to the gateway layer (best-effort, never fails).

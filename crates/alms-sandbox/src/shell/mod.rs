@@ -15,10 +15,13 @@
 pub mod background;
 pub mod exec;
 pub mod output;
+pub mod permissions;
 pub mod security;
 pub mod types;
 
 use crate::{SandboxError, Tool, error::SandboxResult};
+use alms_core::config::ShellPermissions;
+use permissions::CompiledPermissions;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -46,6 +49,8 @@ pub struct ShellTool {
     default_env: HashMap<String, String>,
     /// Persistent shell state (cwd tracking, background tasks).
     state: ShellState,
+    /// Compiled permission rules (allow/deny patterns for commands).
+    permissions: CompiledPermissions,
 }
 
 impl Clone for ShellTool {
@@ -56,6 +61,7 @@ impl Clone for ShellTool {
             unrestricted: self.unrestricted,
             default_env: self.default_env.clone(),
             state: self.state.clone(),
+            permissions: self.permissions.clone(),
         }
     }
 }
@@ -67,6 +73,7 @@ impl Default for ShellTool {
             unrestricted: true,
             default_env: HashMap::new(),
             state: ShellState::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            permissions: CompiledPermissions::compile(&ShellPermissions::default()),
         }
     }
 }
@@ -85,6 +92,7 @@ impl ShellTool {
             unrestricted: false,
             default_env: HashMap::new(),
             state,
+            permissions: CompiledPermissions::compile(&ShellPermissions::default()),
         }
     }
 
@@ -99,7 +107,17 @@ impl ShellTool {
             unrestricted,
             default_env: HashMap::new(),
             state,
+            permissions: CompiledPermissions::compile(&ShellPermissions::default()),
         }
+    }
+
+    /// Set shell command permissions (allow/deny patterns).
+    ///
+    /// The [`ShellPermissions`] are compiled into regex patterns once and
+    /// reused for every command. Invalid patterns are logged and skipped.
+    pub fn with_permissions(mut self, permissions: &ShellPermissions) -> Self {
+        self.permissions = CompiledPermissions::compile(permissions);
+        self
     }
 
     /// Set the default working directory for commands.
@@ -276,6 +294,12 @@ impl Tool for ShellTool {
         }
 
         let input = self.parse_input(&params)?;
+
+        // Permission check: evaluate allow/deny patterns before any execution.
+        // This runs before the hardcoded denylist in exec.rs (which catches
+        // destructive commands like `rm -rf /`) and acts as a user-configurable
+        // policy gate.
+        self.permissions.check_command(&input.command)?;
 
         // Merge tool-call env params into default_env (tool-call overrides defaults)
         let mut merged_env = self.default_env.clone();
@@ -671,5 +695,60 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["status"], "not_found_or_still_running");
+    }
+
+    // ── Integration: permission check wired into execute() ───────────────
+
+    /// Verify that `check_command()` is actually called from `ShellTool::execute()`.
+    ///
+    /// This catches regressions if someone accidentally removes or reorders
+    /// the permission check in the execute path. The test does not require a
+    /// real shell because the permission deny fires before any OS-level
+    /// command execution.
+    #[tokio::test]
+    async fn test_shell_tool_respects_deny_permission() {
+        let perms = ShellPermissions {
+            allowed_commands: vec![],
+            denied_commands: vec![r"^forbidden\b".to_string()],
+        };
+        let tool = ShellTool::new().with_permissions(&perms);
+
+        // A denied command must fail through the full execute() path.
+        let result = tool
+            .execute(serde_json::json!({"command": "forbidden --do-evil"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "denied command should be blocked by execute()"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Command blocked by security policy"),
+            "error should come from the permission check, got: {err_msg}"
+        );
+    }
+
+    /// Verify that allowlist-only mode is enforced through `execute()`.
+    #[tokio::test]
+    async fn test_shell_tool_respects_allow_permission() {
+        let perms = ShellPermissions {
+            allowed_commands: vec![r"^echo\b".to_string()],
+            denied_commands: vec![],
+        };
+        let tool = ShellTool::new().with_permissions(&perms);
+
+        // A command not in the allowlist must fail through the full execute() path.
+        let result = tool
+            .execute(serde_json::json!({"command": "curl http://evil.com"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "command not in allowlist should be blocked by execute()"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("does not match any allowed command pattern"),
+            "error should come from the allowlist check, got: {err_msg}"
+        );
     }
 }

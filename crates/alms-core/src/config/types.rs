@@ -320,6 +320,13 @@ pub struct ToolsConfig {
     /// system paths like /usr, /bin, /lib). On Windows/macOS, sandboxed mode
     /// restricts cwd only -- the command can still access files outside the sandbox.
     pub shell_policy: String,
+    /// Permission-based allow/deny list for shell commands.
+    ///
+    /// Regex patterns matched against command strings before execution.
+    /// Can be configured globally here and/or per-agent (per-agent rules
+    /// merge with global rules, with per-agent deny taking precedence).
+    #[serde(default)]
+    pub shell_permissions: ShellPermissions,
 }
 
 impl Default for ToolsConfig {
@@ -330,6 +337,82 @@ impl Default for ToolsConfig {
             max_output_bytes: 65536,
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
+            shell_permissions: ShellPermissions::default(),
+        }
+    }
+}
+
+/// Permission-based allow/deny list for shell commands.
+///
+/// Patterns are regex strings matched against the full command string.
+/// Evaluation order:
+/// 1. If any `denied_commands` pattern matches, the command is blocked.
+/// 2. If `allowed_commands` is non-empty, only commands matching at least
+///    one pattern are permitted (allowlist mode).
+/// 3. If `allowed_commands` is empty, all non-denied commands are allowed
+///    (denylist-only mode).
+///
+/// **Startup-only**: Shell permissions are compiled from config at process
+/// startup (or agent creation) and are not dynamically changeable via
+/// `PATCH /settings`. This is intentional -- regex patterns are compiled
+/// once into [`alms_sandbox::shell::permissions::CompiledPermissions`] and
+/// baked into the `ShellTool` instance. Changing them at runtime would
+/// require reconstructing the shell tool and re-registering it in the tool
+/// registry, which is not currently supported.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellPermissions {
+    /// Regex patterns for commands that are always allowed.
+    ///
+    /// When non-empty, acts as an allowlist: only commands matching at least
+    /// one pattern are permitted. Empty means "allow everything not denied".
+    pub allowed_commands: Vec<String>,
+
+    /// Regex patterns for commands that are always denied.
+    ///
+    /// Deny takes precedence over allow. A command matching any deny pattern
+    /// is blocked regardless of whether it also matches an allow pattern.
+    pub denied_commands: Vec<String>,
+}
+
+impl ShellPermissions {
+    /// Returns true if no patterns are configured (no-op mode).
+    pub fn is_empty(&self) -> bool {
+        self.allowed_commands.is_empty() && self.denied_commands.is_empty()
+    }
+
+    /// Merge two permission sets. The `other` set (per-agent) extends the
+    /// base set (global): denied patterns from both are combined, and
+    /// per-agent allow patterns replace global allow patterns if non-empty.
+    ///
+    /// # SECURITY NOTE
+    ///
+    /// Deny patterns use union semantics (agents can only add restrictions),
+    /// but allow patterns use **replace** semantics: a per-agent allowlist
+    /// replaces the global allowlist entirely rather than intersecting with
+    /// it. This means a per-agent config can widen access beyond the global
+    /// policy (e.g. replacing `["^git\\b"]` with `[".*"]`).
+    ///
+    /// This is intentional for the current design where only operators set
+    /// per-agent config via TOML. When per-agent permissions are exposed to
+    /// less-trusted sources (e.g. an API), consider switching to intersection
+    /// semantics for the allowlist to prevent privilege escalation.
+    pub fn merge_with(&self, other: &ShellPermissions) -> ShellPermissions {
+        // Denied: union of both sets (per-agent deny extends global deny)
+        let mut denied = self.denied_commands.clone();
+        denied.extend(other.denied_commands.iter().cloned());
+
+        // Allowed: per-agent replaces global if non-empty, otherwise inherit global.
+        // See SECURITY NOTE above regarding the replace semantics.
+        let allowed = if other.allowed_commands.is_empty() {
+            self.allowed_commands.clone()
+        } else {
+            other.allowed_commands.clone()
+        };
+
+        ShellPermissions {
+            allowed_commands: allowed,
+            denied_commands: denied,
         }
     }
 }

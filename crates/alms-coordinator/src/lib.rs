@@ -860,6 +860,7 @@ fn agent_config_for_subagent(
         posture,
         sandbox_root: base.sandbox_root.clone(),
         shell_policy: base.shell_policy.clone(),
+        shell_permissions: base.shell_permissions.clone(),
         enabled_tools: base.enabled_tools.clone(),
         max_iterations: base.max_iterations,
         max_tokens: base.max_tokens,

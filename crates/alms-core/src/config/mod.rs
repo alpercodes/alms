@@ -16,7 +16,7 @@ mod tests;
 
 pub use types::{
     ChannelsConfig, ContextConfig, LlmConfig, LoggingConfig, RunSummaryMode, ServerConfig,
-    SessionConfig, ToolsConfig,
+    SessionConfig, ShellPermissions, ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};

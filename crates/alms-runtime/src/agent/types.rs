@@ -1,4 +1,4 @@
-use alms_core::config::ContextConfig;
+use alms_core::config::{ContextConfig, ShellPermissions};
 
 /// Execution posture: controls whether tools require approval before running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -88,6 +88,9 @@ pub struct AgentConfig {
     pub sandbox_root: String,
     /// Shell execution policy: "sandboxed" or "unrestricted".
     pub shell_policy: String,
+    /// Permission-based allow/deny list for shell commands.
+    /// Regex patterns matched against commands before execution.
+    pub shell_permissions: ShellPermissions,
     /// Enabled builtin tools. Empty = all enabled (backward compatible).
     pub enabled_tools: Vec<String>,
     /// When true, the runtime emits a `ContextDebug` event after building
@@ -107,6 +110,7 @@ impl Default for AgentConfig {
             posture: Posture::default(),
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
+            shell_permissions: ShellPermissions::default(),
             enabled_tools: Vec::new(),
             debug_mode: false,
         }
