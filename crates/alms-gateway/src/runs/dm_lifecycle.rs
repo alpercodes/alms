@@ -403,6 +403,7 @@ mod tests {
             params: None,
             result: result.map(String::from),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         }
     }
 

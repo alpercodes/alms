@@ -1314,6 +1314,7 @@ fn test_dm_tool_was_called_only_non_dm_tools() {
             params: Some(r#"{"message":"hi"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1323,6 +1324,7 @@ fn test_dm_tool_was_called_only_non_dm_tools() {
             params: None,
             result: Some(r#"{"output":"hi"}"#.to_string()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(
@@ -1343,6 +1345,7 @@ fn test_dm_tool_was_called_send_message() {
             params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1352,6 +1355,7 @@ fn test_dm_tool_was_called_send_message() {
             params: None,
             result: Some(r#"{"ok":true}"#.to_string()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(
@@ -1372,6 +1376,7 @@ fn test_dm_tool_was_called_ignore_message() {
             params: Some(r#"{"reason":"not relevant"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1381,6 +1386,7 @@ fn test_dm_tool_was_called_ignore_message() {
             params: None,
             result: Some(r#"{"ok":true}"#.to_string()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(
@@ -1401,6 +1407,7 @@ fn test_dm_tool_was_called_ignores_tool_role_only() {
         params: None,
         result: Some(r#"{"ok":true}"#.to_string()),
         timestamp: chrono::Utc::now(),
+        from_agent: None,
     }];
     assert!(
         !dm::dm_tool_was_called(&records),
@@ -1420,6 +1427,7 @@ fn test_dm_tool_was_called_no_tool_result() {
         params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
         result: None,
         timestamp: chrono::Utc::now(),
+        from_agent: None,
     }];
     assert!(
         !dm::dm_tool_was_called(&records),
@@ -1444,6 +1452,7 @@ fn test_dm_tool_was_called_conflict_batch_false_positive() {
             params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1453,6 +1462,7 @@ fn test_dm_tool_was_called_conflict_batch_false_positive() {
             params: Some(r#"{"reason":"spam"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         // Tool results for both — both contain the conflict error
         alms_core::ToolCallRecord {
@@ -1463,6 +1473,7 @@ fn test_dm_tool_was_called_conflict_batch_false_positive() {
             params: None,
             result: Some(conflict_error.clone()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 3,
@@ -1472,6 +1483,7 @@ fn test_dm_tool_was_called_conflict_batch_false_positive() {
             params: None,
             result: Some(conflict_error),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(
@@ -1496,6 +1508,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1505,6 +1518,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: Some(r#"{"reason":"spam"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 2,
@@ -1514,6 +1528,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: None,
             result: Some(conflict_error.clone()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 3,
@@ -1523,6 +1538,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: None,
             result: Some(conflict_error),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         // Second batch: LLM picked just send_message — succeeds
         alms_core::ToolCallRecord {
@@ -1533,6 +1549,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: Some(r#"{"to":"alice","message":"hello"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 5,
@@ -1542,6 +1559,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: None,
             result: Some(r#"{"ok":true}"#.to_string()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(

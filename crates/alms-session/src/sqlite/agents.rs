@@ -714,6 +714,7 @@ mod tests {
                         params: Some(r#"{"text":"hello"}"#.to_string()),
                         result: None,
                         timestamp: chrono::Utc::now(),
+                        from_agent: None,
                     },
                     ToolCallRecord {
                         seq: 1,
@@ -723,6 +724,7 @@ mod tests {
                         params: None,
                         result: Some(r#""result_ok""#.to_string()),
                         timestamp: chrono::Utc::now(),
+                        from_agent: None,
                     },
                 ],
             )
@@ -742,6 +744,7 @@ mod tests {
                     params: Some(r#"{"text":"hello"}"#.to_string()),
                     result: None,
                     timestamp: chrono::Utc::now(),
+                    from_agent: None,
                 },
             )
             .unwrap();

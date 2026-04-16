@@ -147,7 +147,8 @@ CREATE TABLE IF NOT EXISTS run_tool_calls (
     tool_id    TEXT,
     params     TEXT,
     result     TEXT,
-    timestamp  TEXT NOT NULL
+    timestamp  TEXT NOT NULL,
+    from_agent TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run ON run_tool_calls(run_id, seq);
@@ -220,11 +221,16 @@ impl SqliteStore {
                  tool_id    TEXT, \
                  params     TEXT, \
                  result     TEXT, \
-                 timestamp  TEXT NOT NULL\
+                 timestamp  TEXT NOT NULL, \
+                 from_agent TEXT\
              ); \
              CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run \
                  ON run_tool_calls(run_id, seq);",
         );
+        // Auto-migrate: add from_agent column to run_tool_calls for existing
+        // DBs so the frontend fallback merge path can attribute DM reasoning
+        // blocks to the correct agent (see #696).
+        let _ = conn.execute_batch("ALTER TABLE run_tool_calls ADD COLUMN from_agent TEXT;");
         // Auto-migrate: add session_summaries table for cross-session episodic memory.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_summaries (\

@@ -380,6 +380,7 @@ mod tests {
             params: Some(r#"{"cmd":"ls"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         };
         store.save_tool_call(run.run_id, &tc).unwrap();
 

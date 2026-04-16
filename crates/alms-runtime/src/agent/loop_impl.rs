@@ -132,6 +132,10 @@ impl AgentRuntime {
                 );
 
                 // Collect tool call records for per-run storage (all sessions).
+                // `from_agent` mirrors the DM message metadata so the
+                // frontend fallback merge path can attribute reasoning
+                // blocks to the correct agent when session-level
+                // persistence is missing. (#696)
                 for tc in &tool_calls {
                     tool_call_records.push(alms_core::ToolCallRecord {
                         seq: tool_seq,
@@ -141,6 +145,7 @@ impl AgentRuntime {
                         params: Some(tc.function.arguments.clone()),
                         result: None,
                         timestamp: chrono::Utc::now(),
+                        from_agent: self.agent_name.clone(),
                     });
                     tool_seq += 1;
                 }
@@ -653,6 +658,7 @@ impl AgentRuntime {
                 params: None,
                 result: Some(content.clone()),
                 timestamp: chrono::Utc::now(),
+                from_agent: self.agent_name.clone(),
             });
             *tool_seq += 1;
         }

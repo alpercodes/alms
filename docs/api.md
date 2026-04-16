@@ -333,6 +333,7 @@ This endpoint supplements the per-run `GET /runs/{run_id}/tool-calls` (section 5
 | `params` | string | optional | JSON-encoded tool parameters. Present on `"assistant"` role records. |
 | `result` | string | optional | JSON-encoded tool result. Present on `"tool"` role records. |
 | `timestamp` | string (RFC 3339) | always | When the record was created (UTC). |
+| `from_agent` | string | optional | Name of the agent that issued this tool call. Mirrors the `from_agent` metadata on DM session messages so the frontend fallback merge path can attribute reasoning blocks to the correct agent when session-level persistence is missing. |
 
 Notes:
 - Ordering: records are sorted by `runs.created_at` ascending (oldest run first), then by `seq` ascending within each run. This produces a chronological view of all tool activity across the session.
@@ -640,6 +641,7 @@ Returns the full list of tool call and result records for a run, ordered by sequ
 Notes:
 - `role` is `"assistant"` for tool call requests and `"tool"` for tool results.
 - `params` and `result` are JSON-encoded strings (may be absent depending on the role).
+- `from_agent` (optional string) mirrors the `from_agent` metadata on DM session messages. It is only set for records written by named agents in DM contexts; non-DM and unnamed-agent records omit the field.
 - For DM sessions, tool calls are stored per-run only (not in the session history).
 
 ### 5.5 Cancel a run

@@ -345,8 +345,18 @@ export function mapHistoryMessages(msgs, opts) {
             // groupDmReasoningBlocks() can attribute tool-only groups
             // to the correct agent.  Fixes #692 — tool entries lacked
             // fromAgent, so groups with only tools had agentName: null.
-            const fromAgent = isReasoning && m.metadata && m.metadata.from_agent
+            //
+            // Fall back to the run_tool_calls record's from_agent column
+            // when session-level metadata is missing (fixes #696 — the
+            // fire-and-forget session-persistence path may drop metadata).
+            let fromAgent = isReasoning && m.metadata && m.metadata.from_agent
                 ? m.metadata.from_agent : undefined;
+            if (!fromAgent && callId && toolCallIndex.has(callId)) {
+                const enriched = toolCallIndex.get(callId);
+                fromAgent = (enriched.call && enriched.call.from_agent)
+                    || (enriched.result && enriched.result.from_agent)
+                    || undefined;
+            }
 
             pushEntry({
                 id: invocationId || callId || nextMsgId(),
@@ -425,6 +435,14 @@ export function mapHistoryMessages(msgs, opts) {
                 ok = true;
             }
 
+            // Propagate from_agent from the run_tool_calls record so that
+            // groupDmReasoningBlocks() can attribute reasoning blocks to
+            // the correct agent even when session-level message persistence
+            // was lost (fire-and-forget write failure). Fixes #696.
+            const fromAgent = pair.call.from_agent
+                || (pair.result && pair.result.from_agent)
+                || undefined;
+
             newToolEntries.push({
                 entry: {
                     id: toolId || nextMsgId(),
@@ -441,6 +459,7 @@ export function mapHistoryMessages(msgs, opts) {
                     // Fixes #687 -- tool calls missing from reasoning blocks
                     // after reload when session-level persistence was lost.
                     isReasoning: isDm || undefined,
+                    fromAgent,
                 },
                 ts: pair.call.timestamp || null,
             });

@@ -68,6 +68,14 @@ pub struct ToolCallRecord {
     pub result: Option<String>,
     /// When this record was created.
     pub timestamp: DateTime<Utc>,
+    /// Name of the agent that issued this tool call (or returned this result).
+    ///
+    /// Mirrors the `from_agent` metadata stored on DM session messages so
+    /// that the frontend fallback merge path (which reconstructs tool rows
+    /// from `run_tool_calls` when session-level persistence is missing) can
+    /// attribute each reasoning block to the correct agent. Fixes #696.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_agent: Option<String>,
 }
 
 /// Unique identifier for runs
@@ -340,6 +348,7 @@ mod tests {
             params: None,
             result: result.map(String::from),
             timestamp: Utc::now(),
+            from_agent: None,
         }
     }
 
