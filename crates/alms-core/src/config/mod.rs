@@ -16,7 +16,7 @@ mod tests;
 
 pub use types::{
     ChannelsConfig, ContextConfig, LlmConfig, LoggingConfig, RunSummaryMode, ServerConfig,
-    SessionConfig, ShellPermissions, ToolsConfig,
+    SessionConfig, ShellClassificationMode, ShellPermissions, ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};
@@ -188,6 +188,25 @@ impl AlmsConfig {
         }
         if let Ok(val) = std::env::var("ALMS_SHELL_POLICY") {
             self.tools.shell_policy = val;
+        }
+        if let Ok(val) = std::env::var("ALMS_SHELL_CLASSIFICATION_MODE") {
+            match val.to_ascii_lowercase().as_str() {
+                "off" => self.tools.shell_classification_mode = types::ShellClassificationMode::Off,
+                "warn" => {
+                    self.tools.shell_classification_mode = types::ShellClassificationMode::Warn
+                }
+                "block_destructive" => {
+                    self.tools.shell_classification_mode =
+                        types::ShellClassificationMode::BlockDestructive
+                }
+                "strict" => {
+                    self.tools.shell_classification_mode = types::ShellClassificationMode::Strict
+                }
+                other => warn!(
+                    value = %other,
+                    "Ignoring ALMS_SHELL_CLASSIFICATION_MODE: expected off|warn|block_destructive|strict"
+                ),
+            }
         }
 
         // Context settings

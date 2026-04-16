@@ -50,6 +50,9 @@ pub struct AgentRuntime {
     /// Permission-based allow/deny patterns for shell commands.
     /// Retained so re-registrations of the shell tool preserve the policy.
     pub(crate) shell_permissions: alms_core::config::ShellPermissions,
+    /// Built-in risk classification mode for shell commands.
+    /// Retained so re-registrations of the shell tool preserve the mode.
+    pub(crate) shell_classification_mode: alms_core::config::ShellClassificationMode,
     /// Agent name for perspective mapping in DM sessions.
     /// When set and the context_id starts with "dm:", the context builder
     /// maps messages from this agent to `Role::Assistant` so the LLM sees
@@ -107,6 +110,7 @@ impl AgentRuntime {
         );
 
         let shell_permissions = config.shell_permissions.clone();
+        let shell_classification_mode = config.shell_classification_mode;
 
         let mut runtime = Self {
             agent_id,
@@ -121,16 +125,18 @@ impl AgentRuntime {
             shell_unrestricted,
             shell_default_env: std::collections::HashMap::new(),
             shell_permissions: shell_permissions.clone(),
+            shell_classification_mode,
             agent_name: None,
         };
 
-        // Apply shell permissions to the initially registered shell tool.
-        // The shell tool is re-registered (with permissions) whenever
-        // with_workspace() or with_shell_default_env() is called, but we
-        // also need it on the initial tool so unnamed agents get the policy.
-        if !shell_permissions.is_empty() {
-            runtime.apply_shell_permissions();
-        }
+        // Apply shell permissions / classification to the initially registered
+        // shell tool. The shell tool is re-registered whenever
+        // with_workspace() or with_shell_default_env() is called, but we also
+        // need it on the initial tool so unnamed agents get the policy.
+        //
+        // Always re-register so that a non-default classification mode
+        // (e.g. Strict) takes effect even when no permission patterns are set.
+        runtime.apply_shell_permissions();
 
         Ok(runtime)
     }
@@ -232,7 +238,8 @@ impl AgentRuntime {
                 self.shell_unrestricted,
             )
             .with_default_cwd(ws_root)
-            .with_permissions(&self.shell_permissions);
+            .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode);
             if !self.shell_default_env.is_empty() {
                 shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
             }
@@ -291,6 +298,7 @@ impl AgentRuntime {
                 self.shell_unrestricted,
             )
             .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode)
             .with_default_env(self.shell_default_env.clone());
             let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
             self.tools.register(std::sync::Arc::clone(&tool_arc));
@@ -326,7 +334,8 @@ impl AgentRuntime {
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
-            .with_permissions(&self.shell_permissions);
+            .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode);
             let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
             self.tools.register(std::sync::Arc::clone(&tool_arc));
             self.tools

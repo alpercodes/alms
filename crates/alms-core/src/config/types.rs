@@ -327,6 +327,19 @@ pub struct ToolsConfig {
     /// merge with global rules, with per-agent deny taking precedence).
     #[serde(default)]
     pub shell_permissions: ShellPermissions,
+
+    /// Built-in risk classification mode for shell commands.
+    ///
+    /// Layers on top of [`shell_permissions`]: permissions = user policy,
+    /// classification = built-in risk detection. Both must pass before a
+    /// command is executed. See
+    /// [`alms_sandbox::shell::classification`] for the full set of
+    /// heuristics.
+    ///
+    /// Default: `block_destructive` (safe default that blocks `rm -rf /`,
+    /// `sudo`, `mkfs`, reverse shells, etc. but allows normal dev workflows).
+    #[serde(default)]
+    pub shell_classification_mode: ShellClassificationMode,
 }
 
 impl Default for ToolsConfig {
@@ -338,8 +351,28 @@ impl Default for ToolsConfig {
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
             shell_permissions: ShellPermissions::default(),
+            shell_classification_mode: ShellClassificationMode::default(),
         }
     }
+}
+
+/// Built-in risk classification policy for the shell tool.
+///
+/// Mirrors `alms_sandbox::shell::classification::ClassificationMode`. Kept
+/// here so that `alms-core` (which has no sandbox dependency) can own the
+/// serde wire format; `alms-sandbox` converts this into its internal enum.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellClassificationMode {
+    /// Classifier is disabled entirely.
+    Off,
+    /// Classifier runs and logs findings but never blocks.
+    Warn,
+    /// Block destructive commands, log moderate. Default.
+    #[default]
+    BlockDestructive,
+    /// Block both moderate and destructive commands.
+    Strict,
 }
 
 /// Permission-based allow/deny list for shell commands.

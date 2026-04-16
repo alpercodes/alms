@@ -34,6 +34,7 @@ async fn test_stream_llm_call_emits_token_deltas() {
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         agent_name: None,
     };
 
@@ -74,6 +75,7 @@ async fn test_build_context() {
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         agent_name: None,
     };
 
@@ -106,6 +108,7 @@ async fn test_build_context_dm_perspective_mapping() {
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         agent_name: Some("bob".to_string()),
     };
 
@@ -186,6 +189,7 @@ async fn test_build_context_non_dm_no_perspective() {
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         agent_name: Some("bob".to_string()),
     };
 
@@ -334,6 +338,7 @@ async fn test_guarded_posture_sequential_approvals() {
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         agent_name: None,
     };
 
@@ -427,6 +432,7 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         agent_name: None,
     };
 

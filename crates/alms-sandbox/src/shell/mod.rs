@@ -13,6 +13,7 @@
 //! which ensures the denylist and security checks apply uniformly.
 
 pub mod background;
+pub mod classification;
 pub mod exec;
 pub mod output;
 pub mod permissions;
@@ -20,7 +21,8 @@ pub mod security;
 pub mod types;
 
 use crate::{SandboxError, Tool, error::SandboxResult};
-use alms_core::config::ShellPermissions;
+use alms_core::config::{ShellClassificationMode as CoreClassificationMode, ShellPermissions};
+use classification::ClassificationMode;
 use permissions::CompiledPermissions;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -51,6 +53,20 @@ pub struct ShellTool {
     state: ShellState,
     /// Compiled permission rules (allow/deny patterns for commands).
     permissions: CompiledPermissions,
+    /// Built-in classifier policy (enforced after the permission check).
+    classification_mode: ClassificationMode,
+}
+
+/// Convert the serde-owned enum in `alms-core` into the internal sandbox
+/// enum. Keeping two types avoids pulling `serde` into the hot path and lets
+/// the sandbox crate extend its modes without breaking the config wire format.
+fn map_classification_mode(m: CoreClassificationMode) -> ClassificationMode {
+    match m {
+        CoreClassificationMode::Off => ClassificationMode::Off,
+        CoreClassificationMode::Warn => ClassificationMode::Warn,
+        CoreClassificationMode::BlockDestructive => ClassificationMode::BlockDestructive,
+        CoreClassificationMode::Strict => ClassificationMode::Strict,
+    }
 }
 
 impl Clone for ShellTool {
@@ -62,6 +78,7 @@ impl Clone for ShellTool {
             default_env: self.default_env.clone(),
             state: self.state.clone(),
             permissions: self.permissions.clone(),
+            classification_mode: self.classification_mode,
         }
     }
 }
@@ -74,6 +91,7 @@ impl Default for ShellTool {
             default_env: HashMap::new(),
             state: ShellState::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
             permissions: CompiledPermissions::compile(&ShellPermissions::default()),
+            classification_mode: ClassificationMode::default(),
         }
     }
 }
@@ -93,6 +111,7 @@ impl ShellTool {
             default_env: HashMap::new(),
             state,
             permissions: CompiledPermissions::compile(&ShellPermissions::default()),
+            classification_mode: ClassificationMode::default(),
         }
     }
 
@@ -108,6 +127,7 @@ impl ShellTool {
             default_env: HashMap::new(),
             state,
             permissions: CompiledPermissions::compile(&ShellPermissions::default()),
+            classification_mode: ClassificationMode::default(),
         }
     }
 
@@ -117,6 +137,17 @@ impl ShellTool {
     /// reused for every command. Invalid patterns are logged and skipped.
     pub fn with_permissions(mut self, permissions: &ShellPermissions) -> Self {
         self.permissions = CompiledPermissions::compile(permissions);
+        self
+    }
+
+    /// Set the built-in risk classification mode (block/warn/off).
+    ///
+    /// Layers **on top of** [`Self::with_permissions`]: the permission list
+    /// is the user-configurable policy (regex allow/deny), while the
+    /// classifier is built-in defense-in-depth for known-destructive patterns
+    /// (`rm -rf /`, `sudo`, `mkfs`, `curl|sh`, etc.).
+    pub fn with_classification_mode(mut self, mode: CoreClassificationMode) -> Self {
+        self.classification_mode = map_classification_mode(mode);
         self
     }
 
@@ -300,6 +331,12 @@ impl Tool for ShellTool {
         // destructive commands like `rm -rf /`) and acts as a user-configurable
         // policy gate.
         self.permissions.check_command(&input.command)?;
+
+        // Classification check: built-in risk detection for known destructive
+        // patterns (`rm -rf /`, `sudo`, `mkfs`, `curl|sh`, reverse shells,
+        // etc.). Layers with the permission system — permissions are user
+        // policy, classification is built-in defense-in-depth.
+        classification::enforce(&input.command, self.classification_mode)?;
 
         // Merge tool-call env params into default_env (tool-call overrides defaults)
         let mut merged_env = self.default_env.clone();
@@ -579,12 +616,19 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_shell_tool_denied_pattern() {
+        // With the classifier in place, `rm -rf /` is now blocked by the
+        // built-in risk classifier before the legacy denylist ever fires.
+        // The user-facing error reveals only the level, not the heuristic.
         let tool = ShellTool::new();
         let result = tool
             .execute(serde_json::json!({"command": "rm -rf /"}))
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("blocked") || err.contains("denied"),
+            "expected blocked-or-denied message, got: {err}"
+        );
     }
 
     #[tokio::test]
