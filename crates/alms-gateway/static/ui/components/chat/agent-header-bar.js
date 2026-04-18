@@ -2,7 +2,7 @@ import { html, useSignal, useCallback, useEffect, useRef } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
 import { agentPhase, phaseToLabel } from '../../state/agent-status.js';
 import { activePanel, togglePanel } from '../../state/panel.js';
-import { IconFolder } from '../../utils/icons.js';
+import { IconFolder, IconClock, IconPlay } from '../../utils/icons.js';
 import { AgentEditModal } from '../panel/agents-tab.js';
 
 /**
@@ -61,6 +61,20 @@ export function AgentHeaderBar() {
                         onClick=${() => togglePanel('workspace')}>
                     <${IconFolder} />
                     <span class="agent-bar-btn-label">Workspace</span>
+                </button>
+                <button class="hbtn agent-bar-btn ${activePanel.value === 'timeline' ? 'active' : ''}"
+                        title="Agent timeline"
+                        aria-label="Open timeline panel"
+                        onClick=${() => togglePanel('timeline')}>
+                    <${IconClock} />
+                    <span class="agent-bar-btn-label">Timeline</span>
+                </button>
+                <button class="hbtn agent-bar-btn ${activePanel.value === 'runs' ? 'active' : ''}"
+                        title="Agent runs"
+                        aria-label="Open runs panel"
+                        onClick=${() => togglePanel('runs')}>
+                    <${IconPlay} />
+                    <span class="agent-bar-btn-label">Runs</span>
                 </button>
                 <div class="agent-menu-anchor" ref=${menuRef}>
                     <button class="hbtn agent-bar-btn"

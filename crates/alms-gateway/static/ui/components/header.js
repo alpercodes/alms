@@ -19,7 +19,10 @@ export function closeSidebar() {
     sidebarOpen.value = false;
 }
 
-const TABS = ['agents', 'runs', 'timeline', 'jobs', 'audit'];
+// Timeline/Runs live in the per-agent header bar since they're agent-scoped.
+// Workspace also lives in the agent header bar.
+// Audit remains here — it's session-scoped, not agent-scoped.
+const TABS = ['agents', 'jobs', 'audit'];
 
 const effectivePosture = computed(() => {
     const local = localSettings.value.posture;
