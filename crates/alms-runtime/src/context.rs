@@ -167,6 +167,22 @@ impl ContextBuilder {
         // with multiple tool_calls entries (required by OpenAI/Anthropic APIs).
         Self::group_tool_calls(&mut messages);
 
+        // 5a. Strip orphaned tool_result messages.
+        //
+        // Truncation (and other selection strategies) can slice the history
+        // between an assistant tool_use and its matching tool_result, leaving
+        // a tool_result in the selected window whose paired assistant
+        // tool_call has been dropped.  When such an orphan ends up at the
+        // head of the message array, Anthropic rejects the request with
+        // 400 "unexpected `tool_use_id` found in `tool_result` blocks" — and
+        // OpenRouter-to-Claude proxying inherits the same failure mode.
+        //
+        // Sweep through the array and remove any tool_result whose
+        // `tool_call_id` does not appear in a preceding assistant message's
+        // `tool_calls`.  This is a minimal, targeted fix for the specific
+        // 400; #586 tracks the full invariant-enforcement design.
+        Self::strip_orphaned_tool_results(&mut messages);
+
         // 6. Current input (skip if empty — avoids sending a blank user message to the LLM)
         if !current_input.is_empty() {
             messages.push(LlmMessage::user(current_input));
@@ -363,6 +379,65 @@ impl ContextBuilder {
             (Role::Tool, _) => {
                 LlmMessage::tool_result(msg.id.clone(), msg.content.to_display_string())
             }
+        }
+    }
+
+    /// Remove tool-result messages whose `tool_call_id` is not introduced by
+    /// a preceding assistant message's `tool_calls`.
+    ///
+    /// Walks the message list once, building a running set of tool-call IDs
+    /// emitted by assistant messages.  Any `role="tool"` message whose
+    /// `tool_call_id` is absent from that set is an orphan — a tool result
+    /// whose matching tool_use was truncated out of the context window — and
+    /// is dropped.
+    ///
+    /// This is a targeted fix for the Anthropic 400:
+    /// `unexpected tool_use_id found in tool_result blocks: <id>. Each
+    /// tool_result block must have a corresponding tool_use block in the
+    /// previous message.`  The failure surfaces when a `truncate`/`full`
+    /// cut leaves a tool_result at the head of the selected history (post-
+    /// system-extraction, that becomes `messages.0.content.0`).  OpenRouter-
+    /// to-Claude proxying hits the same rejection.
+    ///
+    /// Scope is intentionally narrow — the broader invariant-enforcement
+    /// work (#586) covers additional failure modes (non-empty array, leading
+    /// system prefix, trailing user turn, alternating roles after merge,
+    /// pending-tool-call tails) in a dedicated follow-up.
+    fn strip_orphaned_tool_results(messages: &mut Vec<LlmMessage>) {
+        use std::collections::HashSet;
+
+        let mut known_ids: HashSet<String> = HashSet::new();
+        let mut dropped = 0usize;
+
+        // Single forward pass so a tool_result is only considered paired
+        // with a tool_use that PRECEDES it in the final array.
+        messages.retain(|msg| {
+            if msg.role == "assistant"
+                && let Some(ref calls) = msg.tool_calls
+            {
+                for call in calls {
+                    known_ids.insert(call.id.clone());
+                }
+            }
+            if msg.role == "tool" {
+                let paired = msg
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| known_ids.contains(id));
+                if !paired {
+                    dropped += 1;
+                    return false;
+                }
+            }
+            true
+        });
+
+        if dropped > 0 {
+            warn!(
+                dropped,
+                "Stripped {dropped} orphaned tool_result message(s) with no matching tool_use in \
+                 the selected context window (truncation cut across a tool-call group)"
+            );
         }
     }
 
@@ -1646,6 +1721,174 @@ mod tests {
             messages.len(),
             5,
             "Without perspective, all messages pass through"
+        );
+    }
+
+    // -- Orphaned tool_result stripping tests ------------------------------
+    //
+    // These pin the fix for the Anthropic 400 "unexpected tool_use_id found
+    // in tool_result blocks" rejection that fires when truncation leaves a
+    // tool_result at the head of the selected context window with no
+    // matching tool_use in front of it.
+
+    /// Directly exercises `strip_orphaned_tool_results`: a leading
+    /// tool_result with no preceding assistant tool_use must be dropped.
+    #[test]
+    fn test_strip_orphaned_tool_results_drops_leading_orphan() {
+        let mut messages = vec![
+            LlmMessage::tool_result("functions_fs_write_4", "orphan result"),
+            LlmMessage::user("follow-up question"),
+        ];
+
+        ContextBuilder::strip_orphaned_tool_results(&mut messages);
+
+        assert_eq!(messages.len(), 1, "orphan tool_result must be dropped");
+        assert_eq!(messages[0].role, "user");
+    }
+
+    /// Paired tool_use/tool_result survive untouched.
+    #[test]
+    fn test_strip_orphaned_tool_results_keeps_paired_pair() {
+        let mut messages = vec![
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall::new("call_A", "echo", "{}")]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("call_A", "result A"),
+            LlmMessage::user("thanks"),
+        ];
+
+        ContextBuilder::strip_orphaned_tool_results(&mut messages);
+
+        assert_eq!(
+            messages.len(),
+            3,
+            "paired tool_use/tool_result must stay intact"
+        );
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[1].role, "tool");
+        assert_eq!(messages[2].role, "user");
+    }
+
+    /// Middle-of-array orphan (never emitted by a preceding assistant) is
+    /// also dropped — the Anthropic rejection fires after system extraction
+    /// too, which could promote a mid-history orphan to `messages.0`.
+    #[test]
+    fn test_strip_orphaned_tool_results_drops_mid_array_orphan() {
+        let mut messages = vec![
+            LlmMessage::user("hello"),
+            LlmMessage::tool_result("never_called_123", "orphan"),
+            LlmMessage::assistant("some reply"),
+        ];
+
+        ContextBuilder::strip_orphaned_tool_results(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+    }
+
+    /// Partial parallel tool-call coverage — if assistant emits tool_calls
+    /// [A, B] and only tool_result B was truncated in, tool_result B is
+    /// kept (A was introduced by the preceding assistant).  tool_result A
+    /// would also be kept here because A is known.  Orphan-only if the
+    /// introducer is missing.
+    #[test]
+    fn test_strip_orphaned_tool_results_parallel_group_kept_when_introduced() {
+        let mut messages = vec![
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![
+                    ToolCall::new("call_A", "echo", "{}"),
+                    ToolCall::new("call_B", "echo", "{}"),
+                ]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("call_B", "result B only"),
+        ];
+
+        ContextBuilder::strip_orphaned_tool_results(&mut messages);
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "tool_result whose tool_use was introduced must be preserved"
+        );
+    }
+
+    /// End-to-end regression for the reported 400:
+    ///
+    /// A session long enough to trigger `truncate` eviction of the
+    /// paired assistant tool_use, leaving a leading `functions_fs_write_4`
+    /// tool_result in the selected window.  After `build_with_perspective`
+    /// the assembled context must NOT begin with a tool-role message —
+    /// that is what Anthropic (direct or via OpenRouter→Claude) rejects as
+    /// `messages.0.content.0: unexpected tool_use_id found in tool_result
+    /// blocks`.
+    #[test]
+    fn test_build_never_leaves_tool_result_at_head_after_truncation() {
+        // recent_window = 2 forces the truncate strategy to keep only the
+        // two newest messages from a long history.  Arrange those last two
+        // to be (tool_result, assistant-text) so the orphan would sit at
+        // the front of the selected slice without the fix.
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32_000,
+            recent_window: 2,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            // --- truncated out by recent_window=2 ---
+            make_msg(Role::User, "please write the file"),
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                content: Content::ToolCall {
+                    name: "fs_write".to_string(),
+                    params: serde_json::json!({"path": "/tmp/x"}),
+                },
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"tool_call_id": "functions_fs_write_4"})),
+            },
+            // --- kept by recent_window=2 ---
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Tool,
+                content: Content::ToolResult {
+                    tool_id: "functions_fs_write_4".to_string(),
+                    result: serde_json::json!("ok"),
+                },
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"ok": true})),
+            },
+            make_msg(Role::Assistant, "Done — file written."),
+        ];
+
+        let messages = builder.build("You are helpful.", &history, "thanks!", None);
+
+        // Head of the array must be a system message, and the first non-
+        // system entry must NOT be a tool_result — Anthropic rejects that
+        // shape after its system extraction step.
+        assert_eq!(
+            messages[0].role, "system",
+            "context must start with the system prompt"
+        );
+        let first_non_system = messages
+            .iter()
+            .find(|m| m.role != "system")
+            .expect("should have at least one non-system message");
+        assert_ne!(
+            first_non_system.role, "tool",
+            "context must not lead with a tool_result (Anthropic 400 trigger)"
         );
     }
 }
