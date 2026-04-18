@@ -86,6 +86,34 @@ function DmDivider({ text }) {
 }
 
 /**
+ * Return true when `thinkingText` is exactly equal (after trimming) to the
+ * `message` argument of any `send_message` tool call in `tools`. Used to
+ * suppress the thinking-text pane when the model emitted the reply text as
+ * a standalone text block immediately before calling `send_message` with
+ * the same content -- we do not want to render the same string both as the
+ * thinking pane and as the delivered DM bubble. (Fixes #738)
+ *
+ * Conservative: exact equality only, so legitimate reasoning that happens
+ * to echo the message as a substring is preserved.
+ *
+ * @param {string} thinkingText
+ * @param {Array<object>} tools
+ * @returns {boolean}
+ */
+function thinkingMatchesSendMessageContent(thinkingText, tools) {
+    if (!thinkingText) return false;
+    const trimmed = thinkingText.trim();
+    if (!trimmed) return false;
+    for (const t of tools || []) {
+        if (t.tool !== 'send_message') continue;
+        const msg = t.params && typeof t.params.message === 'string'
+            ? t.params.message.trim() : '';
+        if (msg && msg === trimmed) return true;
+    }
+    return false;
+}
+
+/**
  * Collapsible reasoning block for DM conversations.
  * Groups the agent's thinking text and tool calls for a single run.
  * Collapsed by default; expanding reveals thinking text and ToolRow components.
@@ -95,7 +123,15 @@ function DmReasoningBlock({ runId, agentName, thinkingText, tools, status, isLiv
 
     // For live blocks, read accumulated thinking text from the signal buffer.
     const liveThinking = isLive ? (dmThinkingBuffers.value.get(runId) || '') : '';
-    const displayThinking = thinkingText || liveThinking;
+    const rawThinking = thinkingText || liveThinking;
+
+    // Some models emit their reply as a plain text block AND then call
+    // `send_message` with the exact same string -- duplicating the content
+    // once as "thinking" and once as the delivered message. Detect that
+    // case and suppress the thinking display so the UI shows the message
+    // only once (as the DM bubble). Fixes #738.
+    const thinkingIsDuplicate = thinkingMatchesSendMessageContent(rawThinking, tools);
+    const displayThinking = thinkingIsDuplicate ? '' : rawThinking;
 
     // Visible tools: hide successful send_message (the DM bubble is already shown).
     // Show send_message while running (with spinner) or on failure.
