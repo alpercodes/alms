@@ -56,6 +56,20 @@ timeout_secs = 30
 # Max output size from a tool (bytes)
 max_output_bytes = 65536
 
+# Permission-based allow/deny list for the `shell` tool.
+# Patterns are regex strings matched against the full command string.
+# Evaluation order: deny wins; then, if `allowed_commands` is non-empty,
+# only matching commands pass (allowlist mode); otherwise all non-denied
+# commands pass (denylist-only mode).
+#
+# Applied in addition to the hardcoded destructive-command denylist in
+# `alms-sandbox` (defense-in-depth). Compiled once at startup — changing
+# these values at runtime via `PATCH /settings` is not supported; restart
+# the gateway to pick up new patterns.
+[tools.shell_permissions]
+allowed_commands = ["^(git|cargo|npm)\\b"]
+denied_commands  = ["git\\s+push\\s+.*--force", "^rm\\s+-rf\\s+/"]
+
 [channels.telegram]
 # token loaded from secrets store via `alms auth set telegram <token>`
 poll_interval_secs = 5

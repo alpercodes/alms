@@ -641,7 +641,7 @@ Returns the full list of tool call and result records for a run, ordered by sequ
 Notes:
 - `role` is `"assistant"` for tool call requests and `"tool"` for tool results.
 - `params` and `result` are JSON-encoded strings (may be absent depending on the role).
-- `from_agent` (optional string) mirrors the `from_agent` metadata on DM session messages. It is only set for records written by named agents in DM contexts; non-DM and unnamed-agent records omit the field.
+- `from_agent` (optional string) is set whenever the runtime has a resolved agent name — that is, for any named agent (resolved via the agent registry). Unnamed-agent records omit the field. The DM UI fallback merge path uses this value to attribute reasoning blocks to the correct agent; non-DM clients can ignore the field.
 - For DM sessions, tool calls are stored per-run only (not in the session history).
 
 ### 5.5 Cancel a run
@@ -970,6 +970,8 @@ Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved fo
 `PATCH /settings`
 
 Partially update server-level configuration at runtime. Only `context`, `session`, and `tools` sections are mutable. Changes take effect on the next run; in-flight runs are unaffected. Logging requires a restart and is not accepted here.
+
+Within `tools`, only `shell_policy`, `sandbox_root`, `timeout_secs`, and `max_output_bytes` are dynamically mutable. **`tools.shell_permissions` is configured in `alms.toml` only** — its allow/deny regex patterns are compiled once at startup and baked into each `ShellTool` instance (see `docs/agent-runtime-design.md` for the config schema and `docs/security-model.md` § 4.3 for the policy semantics). Sending `shell_permissions` in a `PATCH /settings` body is ignored; restart the gateway to pick up new patterns.
 
 **Request body** (all fields optional):
 ```json

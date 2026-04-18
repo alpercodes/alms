@@ -170,7 +170,68 @@ Response fields:
 - `stdout` (truncated to 30KB with head+tail line preservation)
 - `stderr` (truncated to 30KB with head+tail line preservation)
 
-### 4.3 Filesystem sandboxing (implemented)
+### 4.3 Configurable shell permissions (`shell_permissions`)
+
+Operators can attach a configurable policy gate in front of every shell
+invocation via `[tools.shell_permissions]` in `alms.toml`:
+
+```toml
+[tools.shell_permissions]
+allowed_commands = ["^(git|cargo|npm)\\b"]
+denied_commands  = ["git\\s+push\\s+.*--force", "^rm\\s+-rf\\s+/"]
+```
+
+Patterns are regex strings matched against the full command string (no
+anchoring unless the pattern includes `^`/`$`). Invalid regex patterns
+are logged as warnings and skipped; empty/whitespace patterns are
+silently skipped. An empty `ShellPermissions` (the default) is a no-op
+and preserves backward compatibility.
+
+**Evaluation order (inside `CompiledPermissions::check_command`):**
+1. **Deny wins.** If any `denied_commands` pattern matches, the command
+   is blocked with a generic `"Command blocked by security policy"`
+   error (the specific pattern is only logged server-side, to avoid
+   leaking regex hints to a potentially adversarial LLM).
+2. **Allowlist mode.** If `allowed_commands` is non-empty, the command
+   must also match at least one allow pattern; otherwise it is rejected
+   with `"does not match any allowed command pattern"`.
+3. **Denylist-only mode.** If `allowed_commands` is empty, any command
+   that did not match a deny pattern is permitted.
+
+**Relationship to the hardcoded denylist.** The `shell_permissions`
+check runs inside `ShellTool::execute()` *before* the hardcoded
+destructive-command denylist in `alms-sandbox/src/shell/security.rs`.
+That hardcoded list (blocking `rm -rf /`, `mkfs.`, fork bombs, etc.)
+is unconditional and always applied — it remains as defense-in-depth
+behind the configurable policy. Operators who supply `denied_commands`
+extend the built-in list; they cannot weaken it.
+
+**Scope and lifetime.** Permissions are compiled once (at gateway
+startup, agent creation, and the `with_workspace` / `with_shell_default_env`
+re-registration paths) into a `CompiledPermissions` struct baked into
+the `ShellTool` instance. They are **not** mutable via `PATCH /settings`
+— restart the gateway to pick up new patterns. See `docs/api.md`
+§ 10.2 for the API contract.
+
+**Scope today: global only.** `[tools.shell_permissions]` is configured
+once in `alms.toml` and inherited unchanged by every agent. There is no
+per-agent or per-subagent override surface at the moment — `AgentRecord`,
+`CreateAgentRequest`, `UpdateAgentRequest`, and `SubagentRecordConfig`
+do not carry a `shell_permissions` field, and no TOML or registry path
+feeds per-agent permissions into the runtime. A merge helper
+(`ShellPermissions::merge_with` in `alms-core/src/config/types.rs`)
+exists for future use but is not reachable from production code paths
+today.
+
+**Subagent inheritance.** When the coordinator builds a subagent
+config, it clones the parent's raw `ShellPermissions` config into the
+child's `AgentConfig` (see `crates/alms-coordinator/src/lib.rs`). The
+child then re-compiles those patterns into its own
+`CompiledPermissions` during tool registration. The net effect is that
+subagents run under the same policy as their parent; recursive
+invocations cannot escape it.
+
+### 4.4 Filesystem sandboxing (implemented)
 
 **Config** (`alms.toml` or env vars):
 - `tools.sandbox_root` (default `"."` = cwd) — all `fs_read`/`fs_write`/`fs_list`/`fs_edit`/`fs_grep`/`fs_glob` paths must resolve within this directory after symlink resolution. Set to `""` for unrestricted access. **Fail-closed:** if the configured path cannot be resolved (typo, missing directory), the runtime refuses to start rather than silently widening access.
@@ -196,9 +257,9 @@ The current implementation does not track parent/child invocation relationships,
 
 **Ephemeral subagent isolation:** Ephemeral subagents live at `{workspace_dir}/.ephemeral/{task_id}/` and receive `{workspace_dir}/.ephemeral/` as their extra read root (the parent of their own workspace), so they cannot see top-level named-agent workspaces. Note the asymmetry: named agents' extra root is `{workspace_dir}/`, which includes `{workspace_dir}/.ephemeral/`, so a named agent *can* read into the ephemeral tree of an in-flight subagent. Task-ids are UUIDs, so enumeration is not a practical exfiltration path, and ephemeral workspaces are cleaned up when the subagent completes, but operators should be aware that the boundary is asymmetric: ephemeral cannot see named, but named can see ephemeral.
 
-**Known limitation (non-Linux):** On platforms without Landlock support (Windows, macOS, older Linux kernels), shell sandboxing only restricts the cwd. The executed command itself (e.g. `cat /etc/passwd`) can still access any file the process user can read. Application-level command denylists are fundamentally bypassable. On Linux 5.13+, Landlock filesystem restrictions are applied to child processes (see section 4.4).
+**Known limitation (non-Linux):** On platforms without Landlock support (Windows, macOS, older Linux kernels), shell sandboxing only restricts the cwd. The executed command itself (e.g. `cat /etc/passwd`) can still access any file the process user can read. Application-level command denylists are fundamentally bypassable. On Linux 5.13+, Landlock filesystem restrictions are applied to child processes (see section 4.5).
 
-### 4.4 Isolation roadmap
+### 4.5 Isolation roadmap
 
 **Current:** `bash -c` command strings + `env_clear()` + best-effort command denylist + `sandbox_root` path prefix enforcement for fs tools + persistent cwd restriction for shell (validated against sandbox root on each invocation) + **Landlock filesystem sandboxing on Linux 5.13+** (fail-closed: if Landlock is supported but enforcement fails, the command is aborted; only gracefully degrades on kernels without Landlock support).
 
@@ -288,6 +349,7 @@ Default posture recommendations:
 - Workspace-only file access — **implemented**: `sandbox_root = "."` confines fs tools to cwd
 - Shell interface is `bash -c` command strings — **implemented**: `shell` tool wraps commands with `bash -c`; Landlock filesystem restrictions applied on Linux 5.13+
 - Shell command denylist (best-effort) — **implemented**: substring-based denylist blocks `rm -rf /`, `mkfs.`, fork bombs, etc.; bypassable, defense-in-depth only
+- Configurable shell allow/deny permissions — **implemented**: `tools.shell_permissions` in `alms.toml` provides regex-based `allowed_commands` / `denied_commands` gates evaluated before the hardcoded denylist (deny wins; empty allowlist = denylist-only mode); startup-only, not mutable via `PATCH /settings`. See § 4.3.
 - Shell env cleared — **implemented**: `env_clear()` prevents secret leakage to child processes
 - Shell cwd restricted — **implemented**: `shell_policy = "sandboxed"` restricts cwd to sandbox_root; persistent cwd validated against sandbox on each invocation
 - Strict output truncation — **implemented**: 30KB stdout/stderr cap with head+tail line preservation, fs_read line-based limits (default 2000 lines, 512KB output budget, 256KB file size guard), UTF-8 safe truncation
