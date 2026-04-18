@@ -332,10 +332,67 @@ pub async fn create_run(
 
     state.run_manager.insert_run(run.clone());
 
+    // Pre-persist the user's input message to the session BEFORE enqueueing
+    // the run.  Previously the input was only persisted inside
+    // `runtime.run()` (when the agent loop actually starts), which meant a
+    // page reload during the queued-wait window would find no trace of the
+    // user's message -- the UI had optimistically rendered it but the
+    // backend had never stored it.
+    //
+    // The stored message carries `pending_input: true` metadata so
+    // `execute_run` knows to skip re-persistence (via the new
+    // `input_pre_persisted` RunParams flag, which routes the run through
+    // `run_on_session` instead of `run`).  The metadata is informational
+    // only -- the frontend does NOT filter these out, because the user's
+    // message should be visible in the chat immediately after sending
+    // regardless of run status (queued, running, or completed).
+    let user_msg = alms_session::Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: alms_session::Role::User,
+        content: alms_session::Content::Text(run.input.clone()),
+        timestamp: alms_core::Timestamp::now(),
+        metadata: Some(serde_json::json!({ "pending_input": true })),
+    };
+    let input_pre_persisted = match state.session_manager.append_message(session_id, user_msg) {
+        Ok(()) => true,
+        Err(e) => {
+            // Non-fatal: fall back to the runtime's legacy persistence path
+            // so the input is not lost entirely.  The page-reload window is
+            // the only scenario where this matters, so the fallback is
+            // acceptable.
+            warn!(
+                "Failed to pre-persist user input for run {}: {}",
+                run_id.0, e
+            );
+            false
+        }
+    };
+
     // Notify session-level SSE subscribers that a new run was created.
-    // Check how many items are already queued for this agent so the UI
-    // can show "queued (N ahead)" instead of a misleading "Thinking...".
-    let queued_behind = state.agent_queue.pending_count(&agent_id);
+    //
+    // `queued_behind` tells the UI how many runs are ahead of this one so
+    // it can show "Queued -- waiting for agent..." instead of a misleading
+    // "Thinking...".
+    //
+    // `SessionQueue::pending_count` counts items still *waiting* to be
+    // picked up by the handler -- the currently-executing work item has
+    // already been dequeued and its counter decremented.  So we also add 1
+    // if the agent has a `Running` run, to catch the common case of a busy
+    // agent with nothing else queued behind it yet.
+    //
+    // Known residual race: there is a narrow sub-millisecond TOCTOU window
+    // between `pending.fetch_sub(1)` inside the queue handler and
+    // `mark_run_as_running` in `execute_run` (lifecycle.rs:~495). During
+    // that window both `pending_count` and `agent_has_running_run` read
+    // false, so a concurrent `create_run` can report `queued_behind = 0`
+    // and render "Thinking" instead of "Queued". The window is bounded by
+    // executor dispatch latency. Closing it would require a separate
+    // in-flight counter inside `SessionQueue` that is incremented on
+    // dequeue (before `work.await`) and decremented after the work
+    // future resolves; considered low priority.
+    let agent_running = state.run_manager.agent_has_running_run(agent_id);
+    let queued_behind =
+        state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
     state
         .run_manager
         .send_session_event(
@@ -374,6 +431,7 @@ pub async fn create_run(
                     cancel_token,
                     is_peer_message: false,
                     is_system_triggered: false,
+                    input_pre_persisted,
                 },
             )
             .await;
@@ -442,6 +500,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         cancel_token,
         is_peer_message,
         is_system_triggered,
+        input_pre_persisted,
     } = params;
     // Track this run for graceful shutdown drain.  The guard ensures the
     // counter is decremented even if this function panics.
@@ -873,6 +932,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         // session (written by MessageBus with from_agent metadata).
         // Use run_on_session to look up the session by ID directly and
         // skip re-persisting the input (fixes C1 session split + C2 double-write).
+        runtime
+            .run_on_session(&state.session_manager, session_id, &context_id, &input)
+            .await
+    } else if input_pre_persisted {
+        // User-initiated run where `create_run` already pre-persisted the
+        // input to the session (so it survives a page reload during the
+        // queued-wait window). Use `run_on_session` to skip the default
+        // Role::User persistence in `runtime.run()` and avoid duplicating
+        // the message.
         runtime
             .run_on_session(&state.session_manager, session_id, &context_id, &input)
             .await

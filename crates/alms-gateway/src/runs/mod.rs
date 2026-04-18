@@ -98,6 +98,14 @@ struct RunParams {
     /// have no human watching, so Guarded posture would hang forever waiting
     /// for approval -- the posture is overridden to Autonomous.
     is_system_triggered: bool,
+    /// When true, the input message has already been persisted to the session
+    /// by the HTTP handler (before enqueue). The agent loop uses
+    /// `run_on_session` so it does not duplicate the message.
+    ///
+    /// Set by `create_run` to ensure the user's message is visible after a
+    /// page reload even when the run is still queued (a reload during the
+    /// queued-wait would otherwise find the session history empty).
+    input_pre_persisted: bool,
 }
 
 /// Prefixes that identify internal (non-user-facing) sessions.

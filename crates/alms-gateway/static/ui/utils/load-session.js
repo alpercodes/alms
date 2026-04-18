@@ -117,10 +117,13 @@ export async function loadSession(sessionId, opts) {
             // message by checking the run's status.  The runs list was
             // fetched in step 1 and is available in runs.value.
             //
-            // If the pending entry has a runId, look up that run.  A run
-            // that has progressed past "queued" means the agent loop has
-            // started and will have persisted the user message to the
-            // session history -- so the loaded history is trustworthy.
+            // If the pending entry has a runId, look up that run.  The
+            // backend pre-persists the user's message to the session
+            // synchronously in `create_run`, BEFORE the run is enqueued,
+            // so the loaded history is already the source of truth for
+            // any run that exists in `runs.value` (queued, running, or
+            // terminal).  If the runId is present and the run is found,
+            // the message is guaranteed to be in the history.
             //
             // This avoids false-positive deduplication via text matching:
             // if the user sends identical text twice and switches away
@@ -129,11 +132,9 @@ export async function loadSession(sessionId, opts) {
             let alreadyPersisted = false;
             if (pending.runId) {
                 const run = runs.value.find(r => r.run_id === pending.runId);
-                // "running", "finished", "error", "cancelled" all mean the
-                // agent loop started (or completed) and the user message
-                // was persisted to the session DB.  Only "queued" means
-                // the message may not yet be in the history.
-                alreadyPersisted = run && run.status !== 'queued';
+                // Any known run means the backend received the request and
+                // pre-persisted the input -- the history reflects it.
+                alreadyPersisted = !!run;
             } else {
                 // runId not yet available (createRun response has not
                 // returned).  Fall back to text matching as a best-effort

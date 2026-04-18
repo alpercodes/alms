@@ -96,6 +96,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
             cancel_token,
             is_peer_message: false,
             is_system_triggered: true,
+            input_pre_persisted: false,
         },
     )
     .await;
@@ -525,7 +526,22 @@ async fn enqueue_triggered_run(
     let run_id = run.run_id;
     state.run_manager.insert_run(run);
 
-    let queued_behind = state.agent_queue.pending_count(&agent_id);
+    // Mirror the `create_run` reconstruction: `SessionQueue::pending_count`
+    // only counts items still *waiting* in the queue -- the currently-
+    // executing work item has already been dequeued and its counter
+    // decremented. Add 1 if the agent has a `Running` run so the UI gets
+    // an accurate `queued_behind` for notification/trigger runs too.
+    //
+    // Note: there is a narrow sub-millisecond TOCTOU window between
+    // `pending.fetch_sub(1)` inside the queue handler and
+    // `mark_run_as_running` in `execute_run`. During that window both
+    // signals read false and `queued_behind` may undercount by 1. The
+    // window is bounded by executor dispatch latency and is considered
+    // acceptable; closing it would require a separate in-flight counter
+    // inside `SessionQueue`.
+    let agent_running = state.run_manager.agent_has_running_run(agent_id);
+    let queued_behind =
+        state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
     state
         .run_manager
         .send_session_event(
@@ -558,6 +574,10 @@ async fn enqueue_triggered_run(
                     // All runs via enqueue_triggered_run are system-triggered
                     // (no human watching), so Guarded posture is overridden.
                     is_system_triggered: true,
+                    // System-triggered runs persist their own input through
+                    // the notification or peer-message paths, so no gateway-
+                    // side pre-persistence is needed here.
+                    input_pre_persisted: false,
                 },
             )
             .await;

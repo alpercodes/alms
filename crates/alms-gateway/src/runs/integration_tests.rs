@@ -135,6 +135,7 @@ async fn cancelled_before_execution_emits_cancelled_event() {
             cancel_token,
             is_peer_message: false,
             is_system_triggered: false,
+            input_pre_persisted: false,
         },
     )
     .await;
@@ -197,6 +198,7 @@ async fn cancelled_during_shutdown_emits_cancelled_event() {
             cancel_token,
             is_peer_message: false,
             is_system_triggered: false,
+            input_pre_persisted: false,
         },
     )
     .await;
@@ -1447,4 +1449,156 @@ async fn run_manager_wait_drain_timeout() {
 
     // Clean up.
     rm.untrack_in_flight();
+}
+
+// ---------------------------------------------------------------------------
+// 8. create_run: pre-persist user message + accurate queued_behind
+// ---------------------------------------------------------------------------
+
+/// When a user posts a message to an agent, the message must be persisted to
+/// the session immediately -- not lazily inside the agent loop. Otherwise a
+/// page reload while the run is still queued finds an empty session history
+/// and the user's message appears lost.
+#[tokio::test]
+async fn create_run_pre_persists_user_input_to_session() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::extract::State;
+    use axum::Json;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let session_id = session.id;
+
+    let req = CreateRunRequest {
+        session_id,
+        input: RunInput::Text {
+            text: "hello from the user".into(),
+        },
+        model: None,
+        max_tokens: None,
+        posture: None,
+        provider: None,
+        debug_mode: None,
+    };
+
+    // Call the handler directly. We do NOT await the spawned execute_run -- we
+    // just want to verify that the synchronous create_run call persists the
+    // input BEFORE enqueueing.
+    let (status, _resp) = match super::lifecycle::create_run(State(state.clone()), Json(req)).await
+    {
+        Ok(ok) => ok,
+        Err((code, body)) => panic!("create_run failed: status={code:?} body={:?}", body.0),
+    };
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+
+    // Cancel shutdown so the enqueued execute_run task (spawned by create_run)
+    // early-exits without trying to call a real LLM.  This keeps the test
+    // deterministic and fast.
+    shutdown_token.cancel();
+
+    // The user message must be in the session history immediately.
+    let history = state
+        .session_manager
+        .get_history(session_id)
+        .expect("session history should be readable");
+    let user_msgs: Vec<_> = history
+        .iter()
+        .filter(|m| matches!(m.role, alms_session::Role::User))
+        .collect();
+    assert_eq!(
+        user_msgs.len(),
+        1,
+        "exactly one user message should be pre-persisted",
+    );
+    match &user_msgs[0].content {
+        alms_session::Content::Text(t) => {
+            assert_eq!(t, "hello from the user");
+        }
+        other => panic!("expected Text content, got {:?}", other),
+    }
+
+    // The pre-persist marker must be present so the executor knows not to
+    // re-persist.
+    let marker = user_msgs[0]
+        .metadata
+        .as_ref()
+        .and_then(|md| md.get("pending_input"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(
+        marker,
+        "pre-persisted user message should carry pending_input: true metadata",
+    );
+}
+
+/// When the user sends a message to an agent that is already *running* another
+/// task (but nothing is queued behind it), `queued_behind` in the run_created
+/// SSE event must be >= 1 so the UI shows "Queued -- waiting for agent..."
+/// rather than a misleading "Thinking...".
+///
+/// Reproduces the bug where `SessionQueue::pending_count` returns 0 because
+/// the currently-running item has already been dequeued, leaving no visible
+/// signal that the new run is actually queued.
+#[tokio::test]
+async fn create_run_reports_queued_behind_when_agent_is_running() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::extract::State;
+    use axum::Json;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let session_id = session.id;
+
+    // Simulate an already-running run on this agent.
+    let running_run = Run::new(session_id, agent_id, "prior task".into());
+    let running_run_id = running_run.run_id;
+    state.run_manager.insert_run(running_run);
+    state.run_manager.mark_run_as_running(running_run_id);
+
+    // Subscribe to session events so we can inspect the run_created payload.
+    let mut rx = subscribe_session(&state, session_id);
+
+    let req = CreateRunRequest {
+        session_id,
+        input: RunInput::Text {
+            text: "second message".into(),
+        },
+        model: None,
+        max_tokens: None,
+        posture: None,
+        provider: None,
+        debug_mode: None,
+    };
+
+    match super::lifecycle::create_run(State(state.clone()), Json(req)).await {
+        Ok(_) => {}
+        Err((code, body)) => panic!("create_run failed: status={code:?} body={:?}", body.0),
+    }
+
+    // Cancel shutdown so the enqueued execute_run task (spawned by create_run)
+    // early-exits without trying to call a real LLM.  Run-level events emitted
+    // after cancellation are irrelevant -- we only inspect the run_created
+    // event emitted synchronously during create_run.
+    shutdown_token.cancel();
+
+    // Give the SSE fan-out a moment to land.
+    tokio::task::yield_now().await;
+
+    let events = drain_events(&mut rx);
+    let run_created = events
+        .iter()
+        .find(|e| e.event_type == "run_created")
+        .expect("run_created event should be emitted");
+
+    let queued_behind = run_created
+        .data
+        .get("queued_behind")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        queued_behind >= 1,
+        "queued_behind should be >= 1 when the agent is already running another run; got {queued_behind}",
+    );
 }

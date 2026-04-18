@@ -359,6 +359,22 @@ impl RunManager {
         })
     }
 
+    /// Returns `true` if any `Running` run exists for the given agent.
+    ///
+    /// Used by `create_run` to compute `queued_behind` accurately: the per-agent
+    /// `SessionQueue::pending_count` only counts items still waiting in the
+    /// queue (a currently-executing item has already been dequeued and its
+    /// pending counter decremented). Without this check, a user who sends a
+    /// message while the agent is running another task would see
+    /// `queued_behind == 0` and the UI would show "Thinking..." even though
+    /// the run is in fact queued behind the running one.
+    pub fn agent_has_running_run(&self, agent_id: alms_core::AgentId) -> bool {
+        self.runs.iter().any(|e| {
+            let r = e.value();
+            r.agent_id == agent_id && matches!(r.status, alms_core::RunStatus::Running)
+        })
+    }
+
     /// List runs for a session, newest first, up to `limit`.
     pub fn list_by_session(&self, session_id: SessionId, limit: usize) -> Vec<Run> {
         let mut runs: Vec<Run> = self
@@ -699,6 +715,48 @@ mod tests {
         rm.remove_cancel_token(run_id);
         // After removal, cancel_run should return false
         assert!(!rm.cancel_run(run_id));
+    }
+
+    #[tokio::test]
+    async fn test_agent_has_running_run_returns_true_for_running() {
+        let rm = RunManager::new();
+        let agent_id = AgentId::new();
+
+        // No runs at all — false.
+        assert!(!rm.agent_has_running_run(agent_id));
+
+        // Insert a Queued run — still false (only Running counts).
+        let queued = Run::new(SessionId::new(), agent_id, "queued".into());
+        let queued_id = queued.run_id;
+        rm.insert_run(queued);
+        assert!(
+            !rm.agent_has_running_run(agent_id),
+            "Queued run should not count"
+        );
+
+        // Mark it Running — now true.
+        rm.mark_run_as_running(queued_id);
+        assert!(rm.agent_has_running_run(agent_id));
+
+        // Mark it Completed — back to false.
+        rm.mark_run_as_completed(queued_id, "output".into(), Default::default());
+        assert!(!rm.agent_has_running_run(agent_id));
+    }
+
+    #[tokio::test]
+    async fn test_agent_has_running_run_isolates_by_agent() {
+        let rm = RunManager::new();
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+
+        let run_a = Run::new(SessionId::new(), agent_a, "a".into());
+        let run_a_id = run_a.run_id;
+        rm.insert_run(run_a);
+        rm.mark_run_as_running(run_a_id);
+
+        // Agent A is running, agent B is not.
+        assert!(rm.agent_has_running_run(agent_a));
+        assert!(!rm.agent_has_running_run(agent_b));
     }
 
     #[tokio::test]
