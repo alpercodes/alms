@@ -2,31 +2,14 @@ import { html, useSignal, useEffect, computed } from '../deps.js';
 import { serverDefaults, localSettings, saveSettings, refreshServerDefaults } from '../state/settings.js';
 import { patchSettings } from '../api/settings.js';
 import { listKeys, setKey, removeKey } from '../api/auth.js';
+import {
+    MODEL_SUGGESTIONS,
+    ModelDisplay,
+    ProviderDisplay,
+    formatProviderLabel,
+} from '../utils/model-display.js';
 
 const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
-
-/** Common models for datalist suggestions, grouped by provider. */
-const MODEL_SUGGESTIONS = [
-    // OpenAI
-    'gpt-4o',
-    'gpt-4o-mini',
-    'gpt-4.1',
-    'gpt-4.1-mini',
-    'gpt-4.1-nano',
-    'o3',
-    'o3-mini',
-    'o4-mini',
-    // Anthropic
-    'claude-sonnet-4-20250514',
-    'claude-opus-4-20250514',
-    'claude-3-7-sonnet-20250219',
-    'claude-3-5-haiku-20241022',
-    // OpenRouter (popular picks)
-    'google/gemini-2.5-pro-preview',
-    'google/gemini-2.5-flash-preview',
-    'deepseek/deepseek-r1',
-    'deepseek/deepseek-chat-v3-0324',
-];
 
 /** Format large numbers with commas for readability. */
 function fmt(n) {
@@ -400,8 +383,8 @@ export function SettingsModal({ open, onClose }) {
     const enabledTools = tools.enabled || defaults.enabled_tools || [];
 
     // Effective values: what the next run will actually use.
-    const effProvider = provider.value || defaults.provider || 'openai';
-    const effModel = model.value.trim() || defaults.model || 'unknown';
+    // (Provider and model Effective lines use <ProviderDisplay> / <ModelDisplay>
+    // which derive the effective value internally.)
     const effMaxTokens = maxTokens.value ? parseInt(maxTokens.value, 10) : (defaults.max_tokens || 100000);
     const effPosture = posture.value || defaults.posture || 'guarded';
 
@@ -429,13 +412,13 @@ export function SettingsModal({ open, onClose }) {
                         <select class="settings-select"
                                 value=${provider.value}
                                 onChange=${e => { provider.value = e.target.value; }}>
-                            <option value="">Default (${defaults.provider || 'openai'})</option>
+                            <option value="">Default (${formatProviderLabel(defaults.provider || 'openai')})</option>
                             <option value="openai">OpenAI</option>
                             <option value="anthropic">Anthropic</option>
                             <option value="openrouter">OpenRouter</option>
                         </select>
                         <span class="settings-effective">
-                            Effective: ${effProvider}
+                            Effective: <${ProviderDisplay} value=${provider.value} defaultValue=${defaults.provider || 'openai'} />
                         </span>
                     </div>
 
@@ -450,7 +433,7 @@ export function SettingsModal({ open, onClose }) {
                             ${MODEL_SUGGESTIONS.map(m => html`<option value=${m} />`)}
                         </datalist>
                         <span class="settings-effective">
-                            Effective: ${effModel}
+                            Effective: <${ModelDisplay} value=${model.value.trim()} defaultValue=${defaults.model} />
                         </span>
                     </div>
                 </div>
@@ -540,6 +523,9 @@ export function SettingsModal({ open, onClose }) {
                                list="model-suggestions"
                                value=${ctxSummaryModel.value}
                                onInput=${e => { ctxSummaryModel.value = e.target.value; }} />
+                        <span class="settings-effective">
+                            <${ModelDisplay} value=${ctxSummaryModel.value.trim()} defaultValue=${defaults.model} />
+                        </span>
                     <//>
                 <//>
 

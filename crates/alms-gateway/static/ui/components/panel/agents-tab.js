@@ -4,6 +4,12 @@ import { serverDefaults } from '../../state/settings.js';
 import { activePanelTab } from '../../state/panel.js';
 import { listAgents, createAgent, updateAgent, deleteAgent, setDefaultAgent } from '../../api/agents.js';
 import { switchAgent } from '../../hooks/use-boot.js';
+import {
+    MODEL_SUGGESTIONS,
+    ModelDisplay,
+    ProviderDisplay,
+    formatProviderLabel,
+} from '../../utils/model-display.js';
 
 async function refreshAgents() {
     try {
@@ -22,7 +28,8 @@ export function AgentEditModal({ agent, onClose }) {
     const saving = useSignal(false);
     const error = useSignal('');
 
-    const serverModel = serverDefaults.value.model || 'default';
+    const serverModelId = serverDefaults.value.model || '';
+    const serverProvider = serverDefaults.value.provider || '';
 
     const onSave = async () => {
         saving.value = true;
@@ -54,9 +61,16 @@ export function AgentEditModal({ agent, onClose }) {
                 <div class="settings-row">
                     <label class="settings-label">Model</label>
                     <input class="settings-input" type="text"
-                           placeholder=${serverModel + ' (server default)'}
+                           list="agent-model-suggestions"
+                           placeholder=${serverModelId || 'server default'}
                            value=${model.value}
                            onInput=${e => { model.value = e.target.value; }} />
+                    <datalist id="agent-model-suggestions">
+                        ${MODEL_SUGGESTIONS.map(m => html`<option value=${m} />`)}
+                    </datalist>
+                    <span class="settings-effective">
+                        Effective: <${ModelDisplay} value=${model.value.trim()} defaultValue=${serverModelId} />
+                    </span>
                     <span class="settings-hint">Leave empty to use server default.</span>
                 </div>
 
@@ -65,11 +79,14 @@ export function AgentEditModal({ agent, onClose }) {
                     <select class="settings-select"
                             value=${provider.value}
                             onChange=${e => { provider.value = e.target.value; }}>
-                        <option value="">Server default</option>
+                        <option value="">Default (${formatProviderLabel(serverProvider || 'openai')})</option>
                         <option value="openai">OpenAI</option>
                         <option value="anthropic">Anthropic</option>
                         <option value="openrouter">OpenRouter</option>
                     </select>
+                    <span class="settings-effective">
+                        Effective: <${ProviderDisplay} value=${provider.value} defaultValue=${serverProvider || 'openai'} />
+                    </span>
                 </div>
 
                 <div class="settings-row">
@@ -101,7 +118,8 @@ function AgentCard({ agent, isActive, onEdit }) {
     const error = useSignal('');
     const confirming = useSignal(false);
     const deleteTimer = useSignal(null);
-    const serverModel = serverDefaults.value.model || 'default';
+    const serverModelId = serverDefaults.value.model || '';
+    const serverProvider = serverDefaults.value.provider || '';
 
     const onDeleteClick = () => {
         confirming.value = true;
@@ -146,14 +164,21 @@ function AgentCard({ agent, isActive, onEdit }) {
                 <span class="agent-card-name">${agent.name}</span>
                 ${agent.is_default && html`<span class="agent-badge">default</span>`}
             </div>
-            <div class="agent-card-meta">
-                model: ${agent.model || serverModel}${!agent.model ? ' (default)' : ''}
+            <div class="agent-card-meta agent-card-meta--model">
+                <span class="agent-card-meta-label">model:</span>
+                <${ModelDisplay} value=${agent.model} defaultValue=${serverModelId} />
             </div>
             ${agent.provider && html`
-                <div class="agent-card-meta">provider: ${agent.provider}</div>
+                <div class="agent-card-meta agent-card-meta--provider">
+                    <span class="agent-card-meta-label">provider:</span>
+                    <${ProviderDisplay} value=${agent.provider} defaultValue=${serverProvider} />
+                </div>
             `}
             ${agent.posture && html`
-                <div class="agent-card-meta">posture: ${agent.posture}</div>
+                <div class="agent-card-meta agent-card-meta--posture">
+                    <span class="agent-card-meta-label">posture:</span>
+                    <span>${agent.posture}</span>
+                </div>
             `}
             ${error.value && html`<div class="agent-error">${error.value}</div>`}
             <div class="agent-card-actions">
