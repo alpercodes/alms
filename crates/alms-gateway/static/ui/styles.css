@@ -3112,6 +3112,30 @@ select.settings-input-sm {
   background: none;
   padding: 0;
 }
+/*
+ * Lists inside DM bubbles.  The global `* { padding: 0 }` reset strips the
+ * browser's default list padding-left, which made bullet and number markers
+ * render outside the bubble (to the left of the background).  Restore a
+ * padding-left large enough to keep the markers inside the bubble for both
+ * ordered and unordered (including nested) lists.
+ */
+.dm-msg-bubble.markdown-body ul,
+.dm-msg-bubble.markdown-body ol {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-5);
+}
+.dm-msg-bubble.markdown-body li {
+  margin-bottom: var(--space-1);
+}
+.dm-msg-bubble.markdown-body li:last-child {
+  margin-bottom: 0;
+}
+.dm-msg-bubble.markdown-body ul ul,
+.dm-msg-bubble.markdown-body ul ol,
+.dm-msg-bubble.markdown-body ol ul,
+.dm-msg-bubble.markdown-body ol ol {
+  margin: var(--space-1) 0 var(--space-1) 0;
+}
 
 /* Image messages inside DM bubbles */
 .dm-msg-image {
