@@ -220,19 +220,47 @@ impl Tool for FsEditTool {
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
 
+        // Detect the dominant line ending in the existing content so that a
+        // CRLF-authored file keeps CRLF endings even if the agent supplies an
+        // LF-only `new_string`.  Without this, splicing an LF replacement into
+        // a CRLF file would produce mixed line endings — a common foot-gun on
+        // Windows repos.
+        let line_ending = detect_line_ending(&content);
+
         // Strip trailing whitespace from new_string (except for Markdown).
         let is_md = is_markdown_file(path);
-        let new_string_clean = strip_trailing_whitespace(new_string, is_md);
+        let new_string_clean = strip_trailing_whitespace(new_string, is_md, line_ending);
         let new_string = new_string_clean.as_str();
 
         // Count occurrences of the exact old_string.
         let count = content.matches(old_string).count();
 
-        // If the direct match fails, try normalizing curly/smart quotes as a
-        // fallback.  This handles the common case where an LLM emits curly
-        // quotes while the file uses straight quotes (or vice versa).
+        // If the direct match fails, try a line-ending-aware fallback: when the
+        // agent supplies an LF-only `old_string` but the file is CRLF-authored,
+        // rewrite the search string to use CRLF so the match succeeds.  The
+        // resulting `actual_old` is still a substring of `content`, so
+        // `content.replace` works unchanged.  See issue #733.
         let (actual_old, count, quote_adapted) = if count == 0 {
-            if let Some((original_match, norm_count)) = try_normalized_match(&content, old_string) {
+            if let Some(crlf_old) = line_ending_adapted_old(&content, old_string) {
+                let crlf_count = content.matches(&crlf_old).count();
+                if crlf_count > 0 {
+                    (crlf_old, crlf_count, false)
+                } else if let Some((original_match, norm_count)) =
+                    try_normalized_match(&content, old_string)
+                {
+                    (original_match.to_string(), norm_count, true)
+                } else {
+                    return Err(SandboxError::InvalidParameters(format!(
+                        "old_string not found in '{}'",
+                        path
+                    )));
+                }
+            } else if let Some((original_match, norm_count)) =
+                try_normalized_match(&content, old_string)
+            {
+                // Fall through to the curly-quote-normalization fallback, which
+                // handles the common case where an LLM emits curly quotes while
+                // the file uses straight quotes (or vice versa).
                 (original_match.to_string(), norm_count, true)
             } else {
                 return Err(SandboxError::InvalidParameters(format!(
@@ -348,10 +376,14 @@ impl FsEditTool {
             })?;
         }
 
-        // Apply the same trailing-whitespace stripping as the normal edit path
-        // so file creation and file editing have consistent whitespace behavior.
+        // New files have no existing content to sniff for a line-ending
+        // convention, so default to LF.  `strip_trailing_whitespace` still
+        // trims-and-rejoins with LF (and on Markdown paths normalizes line
+        // endings only, preserving trailing whitespace), matching the
+        // pre-existing file-creation behavior: any CRLF in `new_string` gets
+        // converted to LF on new-file creation.
         let is_md = is_markdown_file(display_path);
-        let cleaned = strip_trailing_whitespace(new_string, is_md);
+        let cleaned = strip_trailing_whitespace(new_string, is_md, "\n");
 
         tokio::fs::write(resolved, &cleaned)
             .await
@@ -393,24 +425,106 @@ fn normalized_char_len(ch: char) -> usize {
     }
 }
 
-/// Strip trailing whitespace (spaces and tabs) from each line.
+/// Detect the dominant line ending in `content`.
 ///
-/// Markdown files (`.md`, `.markdown`) are exempt because trailing spaces
-/// are semantically meaningful as hard line breaks per CommonMark.
-fn strip_trailing_whitespace(s: &str, is_markdown: bool) -> String {
-    if is_markdown {
-        return s.to_string();
+/// Returns `"\r\n"` if CRLF occurrences outnumber or equal bare-LF occurrences
+/// among all newlines, otherwise `"\n"`.  For files with no newlines at all
+/// (or pure-LF content) the result is `"\n"`.
+///
+/// The goal is to preserve the file's existing line-ending convention when
+/// writing back — splicing an LF replacement into a CRLF file produces mixed
+/// line endings, which is a foot-gun on Windows.
+fn detect_line_ending(content: &str) -> &'static str {
+    let crlf_count = content.matches("\r\n").count();
+    // Every "\r\n" also matches "\n", so subtract to get bare-LF-only count.
+    let lf_count = content.matches('\n').count().saturating_sub(crlf_count);
+    if crlf_count > 0 && crlf_count >= lf_count {
+        "\r\n"
+    } else {
+        "\n"
     }
-    let mut result = s
-        .lines()
-        .map(|line| line.trim_end())
-        .collect::<Vec<_>>()
-        .join("\n");
-    // str::lines() does not yield a trailing empty element for strings ending
-    // with '\n', so .join("\n") silently drops the final newline.  Re-append
-    // it so code files keep their POSIX-compliant trailing newline.
+}
+
+/// If `content` uses CRLF line endings and `old_string` contains bare LFs (no
+/// CRLF), return a copy of `old_string` with every bare `\n` rewritten to
+/// `\r\n` so it can match the file's actual bytes.
+///
+/// Returns `None` when the rewrite would be a no-op (e.g. the file is pure-LF,
+/// or `old_string` already contains `\r\n`, or `old_string` has no newlines
+/// at all).  Callers should fall back to other matching strategies in that
+/// case.
+///
+/// Motivation: `fs_read` strips `\r` when buffering for the LLM, so models
+/// tend to emit LF-only `old_string` arguments even when the file on disk is
+/// CRLF — without this fallback, a perfectly reasonable edit request fails
+/// with "old_string not found".  See issue #733.
+fn line_ending_adapted_old(content: &str, old_string: &str) -> Option<String> {
+    if detect_line_ending(content) != "\r\n" {
+        return None;
+    }
+    if !old_string.contains('\n') {
+        return None;
+    }
+    if old_string.contains("\r\n") {
+        // Already using CRLF — nothing to rewrite.  (A mixed LF/CRLF
+        // `old_string` is effectively user error; we don't try to massage it.)
+        return None;
+    }
+    Some(old_string.replace('\n', "\r\n"))
+}
+
+/// Rejoin every logical line of `s` with `line_ending`, normalizing any
+/// pre-existing CRLF or bare-LF separators to the target convention.
+///
+/// This is the line-ending half of the replacement pipeline, factored out so
+/// it can run for *every* file type — including Markdown, where the
+/// trailing-whitespace strip is deliberately skipped but line-ending
+/// normalization is still required (otherwise an LF `new_string` spliced into
+/// a CRLF `.md` file would produce mixed endings; see issue #733).
+///
+/// `str::lines()` consumes both `\r\n` and `\n` separators and does not yield
+/// a trailing empty element for strings ending in a newline, so we re-append
+/// `line_ending` when the input had a trailing newline.  Embedded bare `\r`
+/// (e.g. within a line, not as a separator) is preserved because `lines()`
+/// does not treat bare `\r` as a line break on its own.
+fn normalize_line_endings(s: &str, line_ending: &str) -> String {
+    let mut result = s.lines().collect::<Vec<_>>().join(line_ending);
     if s.ends_with('\n') {
-        result.push('\n');
+        result.push_str(line_ending);
+    }
+    result
+}
+
+/// Strip trailing whitespace (spaces and tabs) from each line, rejoining with
+/// `line_ending` so the replacement preserves the surrounding file's
+/// line-ending convention.
+///
+/// Markdown files (`.md`, `.markdown`) are exempt from the *trailing-whitespace*
+/// strip because trailing spaces are semantically meaningful as hard line
+/// breaks per CommonMark.  They are **not** exempt from line-ending
+/// normalization — see `normalize_line_endings` above — so a CRLF-authored
+/// `.md` file edited with an LF `new_string` still ends up uniformly CRLF.
+///
+/// We deliberately use `trim_end_matches([' ', '\t'])` instead of
+/// `trim_end()` so that any intentional `\r` embedded in a line survives —
+/// `trim_end()` classifies `\r` as whitespace and would drop it.
+fn strip_trailing_whitespace(s: &str, is_markdown: bool, line_ending: &str) -> String {
+    // Line-ending normalization runs for every file type, including Markdown.
+    // Only the per-line trailing-whitespace strip is skipped for Markdown.
+    if is_markdown {
+        return normalize_line_endings(s, line_ending);
+    }
+    let trimmed_lines: Vec<&str> = s
+        .lines()
+        .map(|line| line.trim_end_matches([' ', '\t']))
+        .collect();
+    let mut result = trimmed_lines.join(line_ending);
+    // str::lines() does not yield a trailing empty element for strings ending
+    // with '\n' (or "\r\n"), so the join silently drops the final newline.
+    // Re-append it (using the detected line ending) so code files keep their
+    // trailing newline in the file's native convention.
+    if s.ends_with('\n') {
+        result.push_str(line_ending);
     }
     result
 }
@@ -1220,7 +1334,7 @@ mod tests {
     #[test]
     fn test_strip_trailing_whitespace_non_markdown() {
         assert_eq!(
-            strip_trailing_whitespace("hello  \nworld\t\n  ok  ", false),
+            strip_trailing_whitespace("hello  \nworld\t\n  ok  ", false, "\n"),
             "hello\nworld\n  ok"
         );
     }
@@ -1228,22 +1342,245 @@ mod tests {
     #[test]
     fn test_strip_trailing_whitespace_markdown_preserved() {
         let input = "hello  \nworld\t\n  ok  ";
-        assert_eq!(strip_trailing_whitespace(input, true), input);
+        assert_eq!(strip_trailing_whitespace(input, true, "\n"), input);
     }
 
     #[test]
     fn test_strip_trailing_whitespace_preserves_trailing_newline() {
         assert_eq!(
-            strip_trailing_whitespace("hello  \nworld\n", false),
+            strip_trailing_whitespace("hello  \nworld\n", false, "\n"),
             "hello\nworld\n"
         );
+        // CRLF input with CRLF line_ending: trailing whitespace stripped, CRLF preserved.
         assert_eq!(
-            strip_trailing_whitespace("hello  \r\nworld\r\n", false),
-            "hello\nworld\n"
+            strip_trailing_whitespace("hello  \r\nworld\r\n", false, "\r\n"),
+            "hello\r\nworld\r\n"
         );
         assert_eq!(
-            strip_trailing_whitespace("hello  \nworld", false),
+            strip_trailing_whitespace("hello  \nworld", false, "\n"),
             "hello\nworld"
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_whitespace_crlf_normalizes_lf_input() {
+        // LF-authored replacement + CRLF target file ⇒ output should be CRLF so
+        // splicing into the CRLF file does not produce mixed endings.
+        assert_eq!(
+            strip_trailing_whitespace("ALPHA\nBETA\n", false, "\r\n"),
+            "ALPHA\r\nBETA\r\n"
+        );
+    }
+
+    #[test]
+    fn test_detect_line_ending_pure_lf() {
+        assert_eq!(detect_line_ending("alpha\nbeta\ngamma\n"), "\n");
+    }
+
+    #[test]
+    fn test_detect_line_ending_pure_crlf() {
+        assert_eq!(detect_line_ending("alpha\r\nbeta\r\ngamma\r\n"), "\r\n");
+    }
+
+    #[test]
+    fn test_detect_line_ending_no_newlines() {
+        assert_eq!(detect_line_ending("no newlines here"), "\n");
+        assert_eq!(detect_line_ending(""), "\n");
+    }
+
+    #[test]
+    fn test_detect_line_ending_mixed_crlf_dominant() {
+        // 2 CRLF vs 1 bare LF ⇒ CRLF wins.
+        assert_eq!(detect_line_ending("a\r\nb\r\nc\nd"), "\r\n");
+    }
+
+    #[test]
+    fn test_detect_line_ending_mixed_lf_dominant() {
+        // 1 CRLF vs 2 bare LF ⇒ LF wins.
+        assert_eq!(detect_line_ending("a\r\nb\nc\nd"), "\n");
+    }
+
+    #[test]
+    fn test_line_ending_adapted_old_rewrites_lf_to_crlf() {
+        let content = "alpha\r\nbeta\r\ngamma\r\n";
+        let rewritten = line_ending_adapted_old(content, "alpha\nbeta").unwrap();
+        assert_eq!(rewritten, "alpha\r\nbeta");
+    }
+
+    #[test]
+    fn test_line_ending_adapted_old_skips_pure_lf_content() {
+        // LF-authored content ⇒ nothing to rewrite; direct match already works.
+        assert!(line_ending_adapted_old("alpha\nbeta\n", "alpha\nbeta").is_none());
+    }
+
+    #[test]
+    fn test_line_ending_adapted_old_skips_when_old_string_has_no_newlines() {
+        assert!(line_ending_adapted_old("alpha\r\nbeta\r\n", "alpha").is_none());
+    }
+
+    #[test]
+    fn test_line_ending_adapted_old_skips_when_old_string_already_crlf() {
+        // If the agent already supplied CRLF, direct match would have worked —
+        // rewriting again would double-CRLF it.  Bail out.
+        assert!(line_ending_adapted_old("alpha\r\nbeta\r\n", "alpha\r\nbeta").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_preserves_crlf_line_endings() {
+        // Regression test for issue #733: fs_edit must preserve the file's
+        // existing line-ending convention when the agent supplies an LF-only
+        // new_string against a CRLF-authored file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crlf.txt");
+        let initial = "alpha\r\nbeta\r\ngamma\r\n";
+        std::fs::write(&path, initial).unwrap();
+
+        let tool = FsEditTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "alpha\nbeta",
+                "new_string": "ALPHA\nBETA"
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["replacements"], 1);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written, "ALPHA\r\nBETA\r\ngamma\r\n",
+            "expected uniformly-CRLF output, got: {:?}",
+            written
+        );
+        // Explicitly assert no mixed endings — every LF must be preceded by CR.
+        assert!(
+            !written
+                .char_indices()
+                .any(|(i, c)| c == '\n' && !written[..i].ends_with('\r')),
+            "file contains mixed line endings: {:?}",
+            written
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_preserves_lf_line_endings() {
+        // Inverse regression: pure-LF file stays pure-LF even if the agent's
+        // new_string contains no newlines.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lf.txt");
+        std::fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        let tool = FsEditTool::new();
+        tool.execute(serde_json::json!({
+            "path": path.to_str().unwrap(),
+            "old_string": "beta",
+            "new_string": "BETA"
+        }))
+        .await
+        .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "alpha\nBETA\ngamma\n");
+        assert!(!written.contains('\r'));
+    }
+
+    #[tokio::test]
+    async fn test_fs_edit_markdown_crlf_preserves_endings_and_trailing_whitespace() {
+        // Regression for Tim's review on PR #737: Markdown files used to bypass
+        // line-ending normalization entirely, so a CRLF-authored `.md` file
+        // edited with an LF `new_string` would produce mixed line endings —
+        // the exact failure mode #733 was filed to fix, just hitting the
+        // Markdown path instead.  Now Markdown skips only the per-line
+        // trailing-whitespace strip and still normalizes line endings to the
+        // file's detected convention.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        // "# Heading  " has two trailing spaces (CommonMark hard line break).
+        let initial = "# Heading  \r\nparagraph with trailing  \r\nlast\r\n";
+        std::fs::write(&path, initial).unwrap();
+
+        let tool = FsEditTool::new();
+        let new_string_lf = "para\nupdated"; // LF-only, as a model would emit
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "paragraph with trailing",
+                "new_string": new_string_lf
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["replacements"], 1);
+        let written = std::fs::read_to_string(&path).unwrap();
+
+        // (a) Output must be uniformly CRLF — no mixed endings.
+        assert!(
+            !written
+                .char_indices()
+                .any(|(i, c)| c == '\n' && !written[..i].ends_with('\r')),
+            "file contains mixed line endings: {:?}",
+            written
+        );
+        // The LF separator inside new_string must have been normalized to CRLF.
+        assert!(
+            written.contains("para\r\nupdated"),
+            "expected replacement rejoined with CRLF, got: {:?}",
+            written
+        );
+
+        // (b) Trailing whitespace on the heading must be preserved (the
+        // per-line strip is skipped for Markdown).
+        assert!(
+            written.contains("# Heading  \r\n"),
+            "expected Markdown hard-break trailing spaces preserved, got: {:?}",
+            written
+        );
+        // Concretely, the exact expected file content:
+        assert_eq!(written, "# Heading  \r\npara\r\nupdated  \r\nlast\r\n");
+    }
+
+    #[test]
+    fn test_normalize_line_endings_lf_to_crlf() {
+        assert_eq!(
+            normalize_line_endings("alpha\nbeta\n", "\r\n"),
+            "alpha\r\nbeta\r\n"
+        );
+    }
+
+    #[test]
+    fn test_normalize_line_endings_crlf_to_lf() {
+        assert_eq!(
+            normalize_line_endings("alpha\r\nbeta\r\n", "\n"),
+            "alpha\nbeta\n"
+        );
+    }
+
+    #[test]
+    fn test_normalize_line_endings_preserves_trailing_whitespace() {
+        // `normalize_line_endings` must only touch separators, not per-line content.
+        assert_eq!(
+            normalize_line_endings("a  \nb\t\n", "\r\n"),
+            "a  \r\nb\t\r\n"
+        );
+    }
+
+    #[test]
+    fn test_normalize_line_endings_no_trailing_newline() {
+        assert_eq!(
+            normalize_line_endings("alpha\nbeta", "\r\n"),
+            "alpha\r\nbeta"
+        );
+    }
+
+    #[test]
+    fn test_strip_trailing_whitespace_markdown_normalizes_endings() {
+        // Markdown path still normalizes CRLF ↔ LF even though trailing
+        // whitespace is preserved (regression test for PR #737 review).
+        assert_eq!(
+            strip_trailing_whitespace("a  \nb  \n", true, "\r\n"),
+            "a  \r\nb  \r\n"
         );
     }
 
