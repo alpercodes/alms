@@ -1,6 +1,8 @@
 # WASM Sandbox vs OpenClaw Skills — Competitive Analysis
 
-A comparison of ALMS's WASM tool sandbox against OpenClaw's skill ecosystem, and the path forward.
+> **Historical note (2026-04):** The wasmtime-based scaffolding this doc describes as "current ALMS infrastructure" has since been removed from the codebase because no production code path ever called it. The native builtin tools (shell, fs_*, http_get, etc.) described under "Built-in tools" remain. The strategic analysis below is preserved as competitive-positioning reference in case a plugin substrate is revived.
+
+A comparison of ALMS's (historical) WASM tool sandbox against OpenClaw's skill ecosystem, and the path forward.
 
 ---
 

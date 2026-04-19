@@ -239,7 +239,7 @@ Token cost is a first-class constraint:
 ## Implementation Status
 
 ### Completed ✅
-- Core types, session manager, agent runtime, WASM sandbox
+- Core types, session manager, agent runtime, native tool registry
 - HTTP gateway with SSE streaming, approval workflow, audit log
 - Built-in tools: echo, math, http_get, shell (primary name; bash -c, persistent cwd, background execution, 30KB truncation; shell_exec alias preserved), fs_read, fs_write, fs_list, fs_edit, fs_grep, fs_glob, workspace_write, invoke_agent, read_subagent_session, send_message, list_agents, read_messages, ignore_message, list_my_sessions, read_session
 - Cron/scheduler, SQLite persistence, web UI with agent selector
@@ -277,7 +277,7 @@ crates/
                       #   SubagentDispatcher, MessageSender traits
                       #   EventForwarder trait for type-erased runtime event forwarding
   alms-session/       # Session state, SQLite persistence
-  alms-sandbox/       # Tool execution, WASM sandbox, builtin tools
+  alms-sandbox/       # Tool execution, native builtin tools, registry
   alms-channel/       # User-facing adapters (Telegram, web)
   alms-gateway/       # HTTP/SSE control plane
   alms-cli/           # CLI entrypoint

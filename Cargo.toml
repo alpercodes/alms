@@ -45,9 +45,6 @@ prost = "0.13"
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"] }
 
-# WASM runtime
-wasmtime = "28.0"
-
 # Concurrency
 dashmap = "6.1"
 parking_lot = "0.12"

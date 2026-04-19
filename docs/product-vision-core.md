@@ -90,4 +90,4 @@ Build in order: Layer 1 (done) → Layer 2 (peer DMs first, then group chats) �
 
 ---
 
-*This is the product. Everything else — the Rust binary, the WASM sandbox, the SSE streaming, the multi-agent hierarchy — is infrastructure in service of this idea.*
+*This is the product. Everything else — the Rust binary, the native tool registry, the SSE streaming, the multi-agent hierarchy — is infrastructure in service of this idea.*

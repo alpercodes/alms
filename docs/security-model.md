@@ -274,27 +274,7 @@ The current implementation does not track parent/child invocation relationships,
 
 ---
 
-## 5) WASM tool security
-
-### 5.1 Why WASM
-- reduces risk of arbitrary native code execution
-- enforces memory safety and offers deterministic metering
-
-### 5.2 Still not a complete sandbox
-If WASM tools can call host functions, the host must enforce:
-- capability checks on every host call
-- bounds checks and rate limits
-
-### 5.3 ABI requirements
-Define one stable ABI:
-- how params are passed
-- how results are returned
-- how tools allocate memory
-- error semantics
-
----
-
-## 6) Cronjobs / autonomy safety
+## 5) Cronjobs / autonomy safety
 
 Cron = persistence. Treat it as privileged.
 
@@ -312,7 +292,7 @@ Job safety:
 
 ---
 
-## 7) Session state + secrets
+## 6) Session state + secrets
 
 ### Secrets handling
 - Never store secrets in plain text transcripts.
@@ -325,7 +305,7 @@ Job safety:
 
 ---
 
-## 8) Audit logging (non-negotiable)
+## 7) Audit logging (non-negotiable)
 
 Every sensitive action must be append-only logged:
 - who requested it (principal)
@@ -343,7 +323,7 @@ Suggested table/event fields:
 
 ---
 
-## 9) Secure defaults (v1)
+## 8) Secure defaults (v1)
 
 Default posture recommendations:
 - Workspace-only file access — **implemented**: `sandbox_root = "."` confines fs tools to cwd
@@ -361,7 +341,7 @@ Default posture recommendations:
 
 ---
 
-## 10) Implementation checklist
+## 9) Implementation checklist
 
 P0 (before public use):
 - [ ] Single capability model, used everywhere

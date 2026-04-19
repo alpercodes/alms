@@ -10,7 +10,7 @@ This is the entrypoint to ALMS documentation.
 ## Core design
 
 - `architecture.md` — system architecture (multi-agent hierarchy, components, dependency graph)
-- `tech-stack.md` — recommended stack + rationale (Rust, SQLite, WASM, SSE)
+- `tech-stack.md` — recommended stack + rationale (Rust, SQLite, SSE)
 - `api.md` — HTTP/SSE API contract
 - `security-model.md` — capabilities, approvals, guardrails
 - `events-and-audit.md` — event streams, approvals, audit invariants
@@ -30,8 +30,8 @@ This is the entrypoint to ALMS documentation.
 
 ## Tools & sandbox
 
-- `tool-sandbox-abi.md` — WASM tool ABI specification (v0)
-- `wasm-sandbox-vs-openclaw-skills.md` — ALMS WASM sandbox vs OpenClaw skill ecosystem
+- `tool-sandbox-abi.md` — WASM tool ABI specification (v0) — *design-only; WASM substrate removed from the codebase, see doc header*
+- `wasm-sandbox-vs-openclaw-skills.md` — WASM sandbox vs OpenClaw skills competitive analysis — *design-only; WASM substrate removed from the codebase, see doc header*
 
 ## Planning & future
 

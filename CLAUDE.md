@@ -2,7 +2,7 @@
 
 ## What is this project?
 
-ALMS (Agent Loop Management System) is a Rust-based multi-agent coordination platform. A single daemon exposes an HTTP/SSE API, runs agent loops against LLM providers, executes tools in a WASM sandbox, and manages sessions with snapshot persistence.
+ALMS (Agent Loop Management System) is a Rust-based multi-agent coordination platform. A single daemon exposes an HTTP/SSE API, runs agent loops against LLM providers, executes native tools with per-tool sandboxing (path canonicalization, shell permissions, Landlock on Linux), and manages sessions with snapshot persistence.
 
 ## Build & Run
 
@@ -44,7 +44,7 @@ crates/
   alms-coordinator/  # Multi-agent orchestration — pure hierarchy, real AgentRuntime loops
   alms-session/      # Session management, SQLite persistence, episodic summary storage
                      #   sqlite/session_summaries.rs — per-session episodic summary persistence
-  alms-sandbox/      # WASM tool sandbox, builtin tools (echo, math, http_get, shell), registry
+  alms-sandbox/      # Builtin native tools (echo, math, http_get, shell, fs_*, etc.) + tool registry
   alms-channel/      # Channel adapters (Telegram polling implemented)
   alms-cli/          # CLI entrypoint (clap) — gateway, health, agent/session/run/job management
 docs/                # Design docs — api.md, architecture.md, security-model.md, etc.
