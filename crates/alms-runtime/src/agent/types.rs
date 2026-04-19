@@ -96,6 +96,10 @@ pub struct AgentConfig {
     pub shell_classification_mode: ShellClassificationMode,
     /// Enabled builtin tools. Empty = all enabled (backward compatible).
     pub enabled_tools: Vec<String>,
+    /// Enable the multi-stage fuzzy-match replacer cascade in `fs_edit`.
+    /// Off by default — opt-in per agent via `tools.fs_edit.fuzzy_match`
+    /// in `alms.toml`. See issue #755.
+    pub fs_edit_fuzzy_match: bool,
     /// When true, the runtime emits a `ContextDebug` event after building
     /// the context window, allowing the web UI to display exactly what the
     /// LLM sees (system prompt, history, tools, token counts).
@@ -116,6 +120,7 @@ impl Default for AgentConfig {
             shell_permissions: ShellPermissions::default(),
             shell_classification_mode: ShellClassificationMode::default(),
             enabled_tools: Vec::new(),
+            fs_edit_fuzzy_match: false,
             debug_mode: false,
         }
     }

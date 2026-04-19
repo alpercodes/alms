@@ -15,8 +15,8 @@ mod types;
 mod tests;
 
 pub use types::{
-    ChannelsConfig, ContextConfig, LlmConfig, LoggingConfig, RunSummaryMode, ServerConfig,
-    SessionConfig, ShellClassificationMode, ShellPermissions, ToolsConfig,
+    ChannelsConfig, ContextConfig, FsEditConfig, LlmConfig, LoggingConfig, RunSummaryMode,
+    ServerConfig, SessionConfig, ShellClassificationMode, ShellPermissions, ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};

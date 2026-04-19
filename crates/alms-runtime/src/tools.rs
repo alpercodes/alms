@@ -37,7 +37,9 @@ impl ToolRegistry {
         let registry = SandboxRegistry::with_builtin_tools();
 
         // Wire the file state cache into fs tools (same as the sandboxed path).
-        Self::attach_fs_cache_to_registry(&registry, None, &cache, &[]);
+        // fuzzy_match defaults to off at this layer; callers that want it on
+        // use `with_builtins_sandboxed_ex`.
+        Self::attach_fs_cache_to_registry(&registry, None, &cache, &[], false);
 
         Self {
             registry,
@@ -57,6 +59,22 @@ impl ToolRegistry {
         shell_unrestricted: bool,
         enabled: &[String],
     ) -> Self {
+        // Back-compat shim: forward to the extended variant with
+        // fs_edit_fuzzy_match=false (the issue #755 default).
+        Self::with_builtins_sandboxed_ex(sandbox_root, shell_unrestricted, enabled, false)
+    }
+
+    /// Like [`Self::with_builtins_sandboxed`], but also takes the per-agent
+    /// `fs_edit.fuzzy_match` flag (issue #755). When `true`, the
+    /// `FsEditTool` registered here runs the additional line-trimmed +
+    /// indentation-flexible replacer stages before the curly-quote /
+    /// CRLF fallback. Default (`false`) preserves the exact-string contract.
+    pub fn with_builtins_sandboxed_ex(
+        sandbox_root: Option<std::path::PathBuf>,
+        shell_unrestricted: bool,
+        enabled: &[String],
+        fs_edit_fuzzy_match: bool,
+    ) -> Self {
         let cache = Arc::new(FileStateCache::default());
         let registry = SandboxRegistry::with_builtin_tools_sandboxed(
             sandbox_root.clone(),
@@ -67,7 +85,13 @@ impl ToolRegistry {
         // Re-register fs_read/fs_write/fs_edit with the file state cache.
         // The initial registration created them without a cache; now we
         // replace them with cache-aware versions.
-        Self::attach_fs_cache_to_registry(&registry, sandbox_root.as_ref(), &cache, enabled);
+        Self::attach_fs_cache_to_registry(
+            &registry,
+            sandbox_root.as_ref(),
+            &cache,
+            enabled,
+            fs_edit_fuzzy_match,
+        );
 
         Self {
             registry,
@@ -84,11 +108,15 @@ impl ToolRegistry {
     ///
     /// Used both during initial construction and after `with_workspace()`
     /// re-creates tools sandboxed to the workspace directory.
+    ///
+    /// `fs_edit_fuzzy_match` is baked into the `FsEditTool` at construction
+    /// time (config-file-only per issue #755).
     fn attach_fs_cache_to_registry(
         registry: &SandboxRegistry,
         sandbox_root: Option<&std::path::PathBuf>,
         cache: &Arc<FileStateCache>,
         _enabled: &[String],
+        fs_edit_fuzzy_match: bool,
     ) {
         // No pre-filtering by `enabled` here — `registry.register()` already
         // checks its internal `enabled_filter` and skips disabled tools.
@@ -110,7 +138,8 @@ impl ToolRegistry {
             Some(root) => alms_sandbox::FsEditTool::sandboxed(root.clone()),
             None => alms_sandbox::FsEditTool::new(),
         }
-        .with_cache(Arc::clone(cache));
+        .with_cache(Arc::clone(cache))
+        .with_fuzzy_match(fs_edit_fuzzy_match);
         let _ = registry.register(Arc::new(fs_edit));
     }
 

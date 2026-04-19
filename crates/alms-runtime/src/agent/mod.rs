@@ -103,10 +103,11 @@ impl AgentRuntime {
             Some(canonical)
         };
         let shell_unrestricted = config.shell_policy == "unrestricted";
-        let tools = ToolRegistry::with_builtins_sandboxed(
+        let tools = ToolRegistry::with_builtins_sandboxed_ex(
             sandbox_root.clone(),
             shell_unrestricted,
             &config.enabled_tools,
+            config.fs_edit_fuzzy_match,
         );
 
         let shell_permissions = config.shell_permissions.clone();
@@ -235,7 +236,9 @@ impl AgentRuntime {
         }
         if tool_enabled("fs_edit") {
             self.tools.register(std::sync::Arc::new(
-                alms_sandbox::FsEditTool::sandboxed(ws_root.clone()).with_cache(cache.clone()),
+                alms_sandbox::FsEditTool::sandboxed(ws_root.clone())
+                    .with_cache(cache.clone())
+                    .with_fuzzy_match(self.config.fs_edit_fuzzy_match),
             ));
         }
         if tool_enabled("fs_grep") {

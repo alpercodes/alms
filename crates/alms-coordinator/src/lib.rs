@@ -863,6 +863,7 @@ fn agent_config_for_subagent(
         shell_permissions: base.shell_permissions.clone(),
         shell_classification_mode: base.shell_classification_mode,
         enabled_tools: base.enabled_tools.clone(),
+        fs_edit_fuzzy_match: base.fs_edit_fuzzy_match,
         max_iterations: base.max_iterations,
         max_tokens: base.max_tokens,
         context_config: base.context_config.clone(),

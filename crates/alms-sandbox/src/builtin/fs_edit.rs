@@ -23,6 +23,12 @@ use super::{
 pub struct FsEditTool {
     sandbox_root: Option<PathBuf>,
     file_state_cache: Option<Arc<FileStateCache>>,
+    /// When `true`, an additional multi-stage fuzzy-match cascade
+    /// (line-trimmed + indentation-flexible) runs before the existing
+    /// curly-quote / CRLF fallback. Opt-in per agent — default `false`
+    /// preserves the historical "exact string, uniqueness-enforced"
+    /// contract. See issue #755.
+    fuzzy_match: bool,
 }
 
 impl FsEditTool {
@@ -36,12 +42,25 @@ impl FsEditTool {
         Self {
             sandbox_root: Some(root),
             file_state_cache: None,
+            fuzzy_match: false,
         }
     }
 
     /// Attach a file state cache for read-before-edit tracking.
     pub fn with_cache(mut self, cache: Arc<FileStateCache>) -> Self {
         self.file_state_cache = Some(cache);
+        self
+    }
+
+    /// Enable or disable the fuzzy-match replacer cascade (issue #755).
+    ///
+    /// When `true`, the tool retries failed exact matches through a
+    /// two-stage cascade (line-trimmed, then indentation-flexible)
+    /// before falling back to the existing curly-quote / CRLF
+    /// normalization. The uniqueness guard is preserved at every
+    /// stage.
+    pub fn with_fuzzy_match(mut self, enabled: bool) -> Self {
+        self.fuzzy_match = enabled;
         self
     }
 }
@@ -218,33 +237,54 @@ impl Tool for FsEditTool {
         // Count occurrences of the exact old_string.
         let count = content.matches(old_string).count();
 
-        // If the direct match fails, try a line-ending-aware fallback: when the
-        // agent supplies an LF-only `old_string` but the file is CRLF-authored,
-        // rewrite the search string to use CRLF so the match succeeds.  The
-        // resulting `actual_old` is still a substring of `content`, so
-        // `content.replace` works unchanged.  See issue #733.
-        let (actual_old, count, quote_adapted) = if count == 0 {
-            if let Some(crlf_old) = line_ending_adapted_old(&content, old_string) {
-                let crlf_count = content.matches(&crlf_old).count();
-                if crlf_count > 0 {
-                    (crlf_old, crlf_count, false)
-                } else if let Some((original_match, norm_count)) =
-                    try_normalized_match(&content, old_string)
-                {
-                    (original_match.to_string(), norm_count, true)
-                } else {
-                    return Err(SandboxError::InvalidParameters(format!(
-                        "old_string not found in '{}'",
-                        path
-                    )));
-                }
+        // If the direct match fails, walk the cascade in cheapest-first order.
+        // The fuzzy-match cascade (line-trimmed, indentation-flexible) runs
+        // only when the per-agent `fuzzy_match` flag is on (issue #755) — off
+        // by default so existing agents keep the exact-string-only contract.
+        //
+        // Stage order:
+        //   1. line-ending CRLF adaptation  (issue #733)
+        //   2. line-trimmed match            (#755, fuzzy_match only)
+        //   3. indentation-flexible match    (#755, fuzzy_match only)
+        //   4. curly-quote / smart-quote normalization
+        //
+        // The resulting `actual_old` is always a real substring of `content`
+        // so `content.replace` / `content.replacen` can splice the
+        // replacement in without further translation.
+        //
+        // `fuzzy_hit` records whether stage 2 or 3 produced the match. The
+        // fuzzy stages return a *count* of normalized-equivalent windows but
+        // the returned `actual_old` is the byte slice of only the first
+        // window. `content.replace(&actual_old, ...)` would then only match
+        // byte-for-byte against that first window (the others typically have
+        // different trailing whitespace / different indent and do not match
+        // literally), so honoring `replace_all` here would silently lie about
+        // the replacement count. We reject `replace_all=true` for fuzzy hits
+        // when `count > 1` below.
+        let (actual_old, count, quote_adapted, fuzzy_hit) = if count == 0 {
+            let crlf_hit = line_ending_adapted_old(&content, old_string).and_then(|crlf_old| {
+                let c = content.matches(&crlf_old).count();
+                if c > 0 { Some((crlf_old, c)) } else { None }
+            });
+
+            if let Some((crlf_old, crlf_count)) = crlf_hit {
+                (crlf_old, crlf_count, false, false)
+            } else if self.fuzzy_match
+                && let Some((matched, trimmed_count)) = try_line_trimmed_match(&content, old_string)
+            {
+                (matched.to_string(), trimmed_count, false, true)
+            } else if self.fuzzy_match
+                && let Some((matched, indent_count)) =
+                    try_indentation_flexible_match(&content, old_string)
+            {
+                (matched.to_string(), indent_count, false, true)
             } else if let Some((original_match, norm_count)) =
                 try_normalized_match(&content, old_string)
             {
-                // Fall through to the curly-quote-normalization fallback, which
-                // handles the common case where an LLM emits curly quotes while
-                // the file uses straight quotes (or vice versa).
-                (original_match.to_string(), norm_count, true)
+                // Curly-quote-normalization fallback — handles the common case
+                // where an LLM emits curly quotes while the file uses straight
+                // quotes (or vice versa).
+                (original_match.to_string(), norm_count, true, false)
             } else {
                 return Err(SandboxError::InvalidParameters(format!(
                     "old_string not found in '{}'",
@@ -252,12 +292,26 @@ impl Tool for FsEditTool {
                 )));
             }
         } else {
-            (old_string.to_string(), count, false)
+            (old_string.to_string(), count, false, false)
         };
 
         if !replace_all && count > 1 {
             return Err(SandboxError::InvalidParameters(format!(
                 "old_string appears {} times in '{}'; set replace_all to true or provide a more unique string",
+                count, path
+            )));
+        }
+
+        // Fuzzy stages (line-trimmed, indentation-flexible) return a count of
+        // normalized-equivalent windows but only the first window's raw byte
+        // slice. A downstream `content.replace(&actual_old, ...)` would match
+        // only that slice byte-for-byte, so honoring `replace_all=true` here
+        // with `count > 1` would over-report the number of replacements. The
+        // simple, honest rule: fuzzy stages are unique-or-fail, regardless of
+        // `replace_all`. Exact / CRLF / curly-quote stages are unaffected.
+        if fuzzy_hit && replace_all && count > 1 {
+            return Err(SandboxError::InvalidParameters(format!(
+                "fuzzy match found {} candidates in '{}'; replace_all is not supported for fuzzy stages — tighten the old_string for a unique match",
                 count, path
             )));
         }
@@ -622,6 +676,259 @@ fn adapt_quotes_to_original(new_string: &str, original_match: &str) -> String {
     }
 
     result
+}
+
+// ── Fuzzy-match replacer cascade (issue #755) ──────────────────────────────
+//
+// These helpers implement the two stages of the fuzzy replacer cascade
+// that we deemed the highest-value ports (see the issue body). They are
+// invoked only when the per-agent `fuzzy_match` flag is on — when it is off
+// they are never called and `fs_edit` retains its exact-string-only behavior.
+//
+// Each stage returns `Some((matched_slice, count))` where `matched_slice` is
+// a &str pointing back into the original `content` so the caller can splice
+// via `content.replace` / `content.replacen` unchanged. `count` is the total
+// number of distinct candidate matches; the outer uniqueness guard in
+// `execute()` enforces `count == 1` (unless `replace_all` is true).
+
+/// Stage 2: line-trimmed match.
+///
+/// Split both `content` and `old_string` into lines, right-trim each line
+/// (spaces + tabs), then walk `content`'s lines looking for a contiguous
+/// window whose right-trimmed sequence equals the needle's right-trimmed
+/// sequence. Returns the exact original slice of `content` spanning the
+/// first such match, plus the total number of non-overlapping candidate
+/// windows (used by the outer uniqueness guard).
+///
+/// Catches the extremely common LLM foot-gun where the model's `old_string`
+/// includes or omits trailing whitespace that the file does not match.
+fn try_line_trimmed_match<'a>(content: &'a str, old_string: &str) -> Option<(&'a str, usize)> {
+    // Byte offsets of each line start + its trailing line-terminator length
+    // (0 for the final line if the file has no trailing newline). Using byte
+    // offsets lets us return a `&str` into `content` at the end.
+    let content_lines = split_lines_with_offsets(content);
+    let needle_lines = split_lines_with_offsets(old_string);
+
+    if needle_lines.is_empty() {
+        return None;
+    }
+
+    // Trim right of each line for comparison.
+    let content_trimmed: Vec<&str> = content_lines
+        .iter()
+        .map(|(_, line, _)| line.trim_end_matches([' ', '\t']))
+        .collect();
+    let needle_trimmed: Vec<&str> = needle_lines
+        .iter()
+        .map(|(_, line, _)| line.trim_end_matches([' ', '\t']))
+        .collect();
+
+    // If the trimmed sequences would be a no-op (identical to un-trimmed on
+    // both sides), the exact match would already have succeeded, so skip.
+    let content_unchanged = content_lines
+        .iter()
+        .zip(content_trimmed.iter())
+        .all(|((_, orig, _), trimmed)| orig == trimmed);
+    let needle_unchanged = needle_lines
+        .iter()
+        .zip(needle_trimmed.iter())
+        .all(|((_, orig, _), trimmed)| orig == trimmed);
+    if content_unchanged && needle_unchanged {
+        return None;
+    }
+
+    // Slide the needle across content, recording every matching window.
+    let n = needle_trimmed.len();
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    if content_trimmed.len() < n {
+        return None;
+    }
+    for start_line in 0..=content_trimmed.len().saturating_sub(n) {
+        if content_trimmed[start_line..start_line + n] == needle_trimmed[..] {
+            // Compute the original byte range for this window:
+            // start = byte offset of line `start_line`
+            // end   = byte offset of line `start_line + n - 1` + its raw line length
+            //         (without its trailing line terminator — we want to match
+            //          the span that corresponds to the needle's lines, not
+            //          include the separator after the final line of the
+            //          window).
+            let (start_byte, _, _) = content_lines[start_line];
+            let (last_line_start, last_line, _term_len) = content_lines[start_line + n - 1];
+            let end_byte = last_line_start + last_line.len();
+            matches.push((start_byte, end_byte));
+        }
+    }
+
+    if matches.is_empty() {
+        return None;
+    }
+
+    let (first_start, first_end) = matches[0];
+    Some((&content[first_start..first_end], matches.len()))
+}
+
+/// Stage 3: indentation-flexible match.
+///
+/// Strips the common leading indent (shared by every non-blank line) from the
+/// needle, then for each candidate window in `content` strips the window's
+/// own common leading indent and compares the two normalized sequences. This
+/// catches "LLM emitted 2-space indent while the file uses 4" without
+/// disturbing relative indentation inside the block.
+///
+/// Returns the exact original slice of `content` so the caller can splice the
+/// replacement while leaving the surrounding file byte-identical outside the
+/// matched range.
+fn try_indentation_flexible_match<'a>(
+    content: &'a str,
+    old_string: &str,
+) -> Option<(&'a str, usize)> {
+    let content_lines = split_lines_with_offsets(content);
+    let needle_lines = split_lines_with_offsets(old_string);
+
+    if needle_lines.is_empty() {
+        return None;
+    }
+
+    // Strip common leading indent from the needle's non-blank lines.
+    let needle_raw: Vec<&str> = needle_lines.iter().map(|(_, line, _)| *line).collect();
+    let needle_indent = common_leading_indent(&needle_raw);
+    let needle_stripped: Vec<String> = needle_raw
+        .iter()
+        .map(|line| strip_prefix_if_present(line, &needle_indent).to_string())
+        .collect();
+
+    // Note: even when `needle_indent` is empty, this stage is still useful —
+    // the *content* may have more indent than the needle (e.g. needle has 0
+    // leading spaces, content block has 4). We always continue past this
+    // point and let the per-window stripping below catch that case.
+
+    let n = needle_stripped.len();
+    if content_lines.len() < n {
+        return None;
+    }
+
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    for start_line in 0..=content_lines.len().saturating_sub(n) {
+        let window_raw: Vec<&str> = content_lines[start_line..start_line + n]
+            .iter()
+            .map(|(_, line, _)| *line)
+            .collect();
+        let window_indent = common_leading_indent(&window_raw);
+        let window_stripped: Vec<String> = window_raw
+            .iter()
+            .map(|line| strip_prefix_if_present(line, &window_indent).to_string())
+            .collect();
+
+        if window_stripped == needle_stripped {
+            let (start_byte, _, _) = content_lines[start_line];
+            let (last_line_start, last_line, _term_len) = content_lines[start_line + n - 1];
+            let end_byte = last_line_start + last_line.len();
+            matches.push((start_byte, end_byte));
+        }
+    }
+
+    if matches.is_empty() {
+        return None;
+    }
+
+    let (first_start, first_end) = matches[0];
+    Some((&content[first_start..first_end], matches.len()))
+}
+
+/// Split `s` into `(line_start_byte, line_content_without_terminator, terminator_len)`
+/// tuples. Recognizes both `\n` and `\r\n` as line terminators. The final
+/// line is emitted even when `s` does not end with a newline (terminator_len
+/// is zero in that case). An empty input yields an empty vec — callers that
+/// need "at least one line" semantics must handle that explicitly.
+fn split_lines_with_offsets(s: &str) -> Vec<(usize, &str, usize)> {
+    let mut out: Vec<(usize, &str, usize)> = Vec::new();
+    if s.is_empty() {
+        return out;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut line_start = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            // Detect CRLF vs bare LF by peeking behind.
+            let (content_end, term_len) = if i > 0 && bytes[i - 1] == b'\r' {
+                (i - 1, 2)
+            } else {
+                (i, 1)
+            };
+            // SAFETY: byte slice boundaries align with UTF-8 code points
+            // because `\r` and `\n` are single-byte ASCII and we slice only
+            // at those markers.
+            let line = &s[line_start..content_end];
+            out.push((line_start, line, term_len));
+            line_start = i + 1;
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    // Trailing line without a terminator.
+    if line_start < bytes.len() {
+        out.push((line_start, &s[line_start..], 0));
+    }
+    out
+}
+
+/// Common leading indent across all **non-blank** lines (spaces + tabs).
+///
+/// Blank lines are ignored because they typically contain no indent and
+/// would otherwise force the common indent to the empty string. When every
+/// line is blank the returned indent is `""`.
+fn common_leading_indent(lines: &[&str]) -> String {
+    let non_blank: Vec<&str> = lines
+        .iter()
+        .filter(|l| !l.chars().all(|c| c == ' ' || c == '\t' || c == '\r'))
+        .copied()
+        .collect();
+    if non_blank.is_empty() {
+        return String::new();
+    }
+
+    // Start the candidate from the first non-blank line's leading indent,
+    // then shrink it down to the common prefix with every other non-blank
+    // line's leading indent.
+    let mut prefix: String = leading_indent(non_blank[0]).to_string();
+    for line in &non_blank[1..] {
+        let other = leading_indent(line);
+        // Truncate `prefix` to the longest shared prefix with `other`.
+        let shared_len = prefix
+            .bytes()
+            .zip(other.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix.truncate(shared_len);
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix
+}
+
+/// Return the leading run of space+tab characters at the start of `line`.
+fn leading_indent(line: &str) -> &str {
+    let end = line
+        .bytes()
+        .position(|b| b != b' ' && b != b'\t')
+        .unwrap_or(line.len());
+    &line[..end]
+}
+
+/// Return `line` with `prefix` stripped from its front if present; otherwise
+/// return `line` unchanged. Blank lines that don't contain `prefix` are
+/// passed through as-is so they normalize to `""`-ish representation.
+fn strip_prefix_if_present<'a>(line: &'a str, prefix: &str) -> &'a str {
+    if prefix.is_empty() {
+        line
+    } else if let Some(rest) = line.strip_prefix(prefix) {
+        rest
+    } else {
+        line
+    }
 }
 
 #[cfg(test)]
@@ -1626,5 +1933,435 @@ mod tests {
     fn test_adapt_quotes_converts_to_curly_when_original_is_curly() {
         let result = adapt_quotes_to_original("say \"goodbye\"", "say \u{201C}hello\u{201D}");
         assert_eq!(result, "say \u{201C}goodbye\u{201D}");
+    }
+
+    // ── Fuzzy-match cascade (issue #755) ──────────────────────────────────
+
+    /// Acceptance criterion #1: indent-drift match HIT.
+    ///
+    /// File uses 4-space indent; the agent supplies an `old_string` with
+    /// 2-space indent.  With `fuzzy_match = true`, the indentation-flexible
+    /// stage detects the common-leading-indent delta and succeeds with a
+    /// unique match.  Replacement preserves the file's original 4-space
+    /// indentation for surrounding context (we splice only the matched byte
+    /// range).
+    #[tokio::test]
+    async fn test_fs_edit_fuzzy_indent_drift_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.py");
+        // File uses 4-space indentation.
+        let original = "def greet():\n    print(\"hi\")\n    return 1\n";
+        std::fs::write(&path, original).unwrap();
+
+        // Agent emits the same block with 2-space indent — classic LLM drift.
+        let old_2sp = "  print(\"hi\")\n  return 1";
+        let new_2sp = "  print(\"hello\")\n  return 2";
+
+        let tool = FsEditTool::new().with_fuzzy_match(true);
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": old_2sp,
+                "new_string": new_2sp,
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "indent-drift match should succeed with fuzzy_match on, got: {:?}",
+            result.err()
+        );
+        let result = result.unwrap();
+        assert_eq!(result["replacements"], 1);
+
+        // The matched byte-range is the file's 4-space-indented block, so
+        // splicing the 2-space new_string replaces exactly that range. The
+        // file's surrounding lines are untouched.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "def greet():\n  print(\"hello\")\n  return 2\n");
+    }
+
+    /// Acceptance criterion #2: indent-drift match MISS / AMBIGUOUS.
+    ///
+    /// The normalized needle matches two distinct blocks in the file after
+    /// indent-stripping; the uniqueness guard must still fire and return the
+    /// "ambiguous match" error.
+    #[tokio::test]
+    async fn test_fs_edit_fuzzy_indent_drift_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.py");
+        // Two distinct blocks that both normalize to the same stripped form.
+        let content = concat!(
+            "if cond:\n",
+            "    print(\"hi\")\n",
+            "    return 1\n",
+            "else:\n",
+            "        print(\"hi\")\n",
+            "        return 1\n",
+        );
+        std::fs::write(&path, content).unwrap();
+
+        let tool = FsEditTool::new().with_fuzzy_match(true);
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                // 2-space-indented form that matches both 4-space and 8-space blocks
+                "old_string": "  print(\"hi\")\n  return 1",
+                "new_string": "  print(\"bye\")\n  return 2",
+            }))
+            .await;
+
+        assert!(result.is_err(), "ambiguous fuzzy match must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("appears 2 times"),
+            "expected uniqueness-guard error, got: {err}"
+        );
+    }
+
+    /// Acceptance criterion #3: trailing-whitespace HIT.
+    ///
+    /// File's line has trailing whitespace that the agent's `old_string`
+    /// lacks (or vice versa). Exact match fails; the line-trimmed stage
+    /// succeeds.
+    #[tokio::test]
+    async fn test_fs_edit_fuzzy_trailing_whitespace_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.txt");
+        // Trailing whitespace on the *interior* line makes the exact
+        // substring match impossible: "key = value\nnext" is NOT a
+        // substring of "key = value  \nnext" because the two spaces sit
+        // between "value" and "\n".
+        let content = "alpha\nkey = value  \nnext = thing\ngamma\n";
+        std::fs::write(&path, content).unwrap();
+
+        // Confirm exact match *fails* here (fuzzy off) so we are actually
+        // exercising the line-trimmed stage below, not the existing pipeline.
+        let off_tool = FsEditTool::new().with_fuzzy_match(false);
+        let off_result = off_tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "key = value\nnext = thing",
+                "new_string": "key = new\nnext = thang",
+            }))
+            .await;
+        assert!(
+            off_result.is_err(),
+            "sanity: exact substring match must fail when file has \
+             trailing spaces on the interior line (fuzzy off); got: {:?}",
+            off_result.ok()
+        );
+
+        let tool = FsEditTool::new().with_fuzzy_match(true);
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "key = value\nnext = thing",
+                "new_string": "key = new\nnext = thang",
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "trailing-whitespace line-trimmed match should succeed with fuzzy_match on, got: {:?}",
+            result.err()
+        );
+        let result = result.unwrap();
+        assert_eq!(result["replacements"], 1);
+
+        // The matched slice spans the file's original two lines (including
+        // the `  ` trailing on the first line), which `content.replacen`
+        // splices out wholesale. Our non-Markdown trailing-whitespace
+        // strip leaves the replacement without any trailing whitespace.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "alpha\nkey = new\nnext = thang\ngamma\n");
+    }
+
+    /// Acceptance criterion #4: fuzzy OFF — exact match still works AND
+    /// a fuzzy-needed match still FAILS with the original error (no silent
+    /// cascade when fuzzy is disabled).
+    #[tokio::test]
+    async fn test_fs_edit_fuzzy_off_exact_works_and_fuzzy_silently_fails() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // (a) Exact match still works with fuzzy off.
+        let exact_path = dir.path().join("exact.txt");
+        std::fs::write(&exact_path, "hello world").unwrap();
+        let tool_off = FsEditTool::new().with_fuzzy_match(false);
+        let result = tool_off
+            .execute(serde_json::json!({
+                "path": exact_path.to_str().unwrap(),
+                "old_string": "hello world",
+                "new_string": "goodbye world",
+            }))
+            .await
+            .expect("exact match must still work with fuzzy off");
+        assert_eq!(result["replacements"], 1);
+        assert_eq!(
+            std::fs::read_to_string(&exact_path).unwrap(),
+            "goodbye world"
+        );
+
+        // (b) A fuzzy-needed match (indent drift) must FAIL when fuzzy is
+        // off — no silent cascade.
+        let fuzzy_path = dir.path().join("main.py");
+        std::fs::write(
+            &fuzzy_path,
+            "def greet():\n    print(\"hi\")\n    return 1\n",
+        )
+        .unwrap();
+        let result = tool_off
+            .execute(serde_json::json!({
+                "path": fuzzy_path.to_str().unwrap(),
+                // 2-space indent against 4-space file — only a fuzzy match would work.
+                "old_string": "  print(\"hi\")\n  return 1",
+                "new_string": "  print(\"hello\")\n  return 2",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "fuzzy-needed match MUST NOT silently succeed when fuzzy_match=false"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found"),
+            "expected original 'not found' error, got: {err}"
+        );
+    }
+
+    /// Tim review follow-up (#760): `replace_all=true` combined with a fuzzy
+    /// cascade hit that reports `count > 1` must fail explicitly rather than
+    /// silently over-report replacements.
+    ///
+    /// The line-trimmed stage returns a count of normalized-equivalent
+    /// windows but only the first window's raw byte slice; a downstream
+    /// `content.replace(&actual_old, ...)` only matches byte-for-byte, so the
+    /// second window (with different trailing whitespace) would *not* be
+    /// replaced even though the tool previously claimed `replacements: 2`.
+    /// The simple contract: fuzzy stages are unique-or-fail, regardless of
+    /// `replace_all`.
+    #[tokio::test]
+    async fn test_fs_edit_fuzzy_replace_all_multiple_windows_fails_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cfg.txt");
+        // Two multi-line windows that match the needle `key = val\nother`
+        // after `trim_end` but have *different* interior trailing whitespace
+        // on the "key = val" line: window 1 has two trailing spaces, window
+        // 2 has a trailing tab. This forces the exact match to fail (the
+        // needle is not a literal substring anywhere because of the
+        // in-the-middle trailing whitespace) and drives the line-trimmed
+        // stage to return count=2. The subsequent `content.replace` would
+        // only literally match window 1; honoring `replace_all=true` would
+        // over-report replacements and leave window 2 untouched.
+        let original = "key = val  \nother\nfiller\nkey = val\t\nother\n";
+        std::fs::write(&path, original).unwrap();
+
+        let tool = FsEditTool::new().with_fuzzy_match(true);
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "key = val\nother",
+                "new_string": "key = new\nother",
+                "replace_all": true,
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "fuzzy match with replace_all and count>1 must fail explicitly, got: {:?}",
+            result.ok()
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("fuzzy match found 2 candidates"),
+            "expected explicit fuzzy+replace_all rejection, got: {err}"
+        );
+
+        // File must be unchanged — no silent partial edit.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original, "file must be unchanged on rejection");
+    }
+
+    /// Tim review follow-up (#760): two distinct lines that are identical
+    /// after `trim_end` must be rejected by the uniqueness guard. The
+    /// helper-level `test_line_trimmed_match_ambiguous_returns_count` asserts
+    /// the internal count but this test exercises the full tool surface
+    /// (error message shape + file left untouched).
+    #[tokio::test]
+    async fn test_fs_edit_fuzzy_trailing_whitespace_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ambig.txt");
+        // Two windows that both match "alpha\nbeta" after trimming trailing
+        // whitespace. Exact match fails (interior trailing whitespace);
+        // line-trimmed stage reports count=2.
+        let original = "alpha  \nbeta\t\ngap\nalpha\t\nbeta  \n";
+        std::fs::write(&path, original).unwrap();
+
+        let tool = FsEditTool::new().with_fuzzy_match(true);
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "alpha\nbeta",
+                "new_string": "A\nB",
+                // replace_all defaults to false — uniqueness guard must fire.
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "ambiguous trailing-whitespace fuzzy match must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("appears 2 times"),
+            "expected uniqueness-guard error, got: {err}"
+        );
+
+        // File must be unchanged.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original, "file must be unchanged on rejection");
+    }
+
+    /// Tim review follow-up (#760): an all-whitespace `old_string` (e.g. a
+    /// bare `"   "`) against a file with multiple blank / whitespace-only
+    /// lines must surface the ambiguity error cleanly — not panic, not
+    /// silently edit. This test locks the contract rather than fixing a
+    /// bug: the existing uniqueness guard already handles this case, but
+    /// asserting it prevents future regressions.
+    #[tokio::test]
+    async fn test_fs_edit_fuzzy_all_whitespace_old_string_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blank.txt");
+        // Multiple lines with three trailing spaces that also appear as
+        // standalone whitespace-only content. The exact string "   " is
+        // a three-space substring that appears many times in this file.
+        let original = "a   \nb   \nc   \n";
+        std::fs::write(&path, original).unwrap();
+
+        let tool = FsEditTool::new().with_fuzzy_match(true);
+        let result = tool
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "   ",
+                "new_string": "X",
+            }))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "all-whitespace needle with many matches must be rejected by uniqueness guard"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("appears") && err.contains("times"),
+            "expected uniqueness-guard 'appears N times' error, got: {err}"
+        );
+
+        // File must be unchanged — guard-only, no silent edit.
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original, "file must be unchanged on rejection");
+    }
+
+    // ── Additional helper-level unit tests for the cascade ──────────────
+
+    #[test]
+    fn test_line_trimmed_match_basic_hit() {
+        let content = "alpha  \nbeta\t\ngamma\n";
+        // Needle without the trailing whitespace.
+        let (matched, count) = try_line_trimmed_match(content, "beta").unwrap();
+        assert_eq!(matched, "beta\t");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_line_trimmed_match_multiline() {
+        let content = "line1\nalpha  \nbeta\t\nline4\n";
+        let (matched, count) = try_line_trimmed_match(content, "alpha\nbeta").unwrap();
+        assert_eq!(matched, "alpha  \nbeta\t");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_line_trimmed_match_ambiguous_returns_count() {
+        // Two independent windows both match after trimming.
+        let content = "key\t\nval  \nother\nkey\nval\n";
+        let result = try_line_trimmed_match(content, "key\nval");
+        let (_, count) = result.unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_line_trimmed_match_no_op_skips() {
+        // Nothing to trim on either side → would be a duplicate of exact
+        // match; helper should return None to leave the existing exact /
+        // CRLF pipeline in charge.
+        let content = "alpha\nbeta\ngamma\n";
+        assert!(try_line_trimmed_match(content, "beta").is_none());
+    }
+
+    #[test]
+    fn test_indentation_flexible_match_needle_less_indented() {
+        let content = "    foo\n    bar\n    baz\n";
+        let (matched, count) = try_indentation_flexible_match(content, "  foo\n  bar").unwrap();
+        assert_eq!(matched, "    foo\n    bar");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_indentation_flexible_match_needle_no_indent_content_indented() {
+        let content = "        foo\n        bar\n";
+        let (matched, count) = try_indentation_flexible_match(content, "foo\nbar").unwrap();
+        assert_eq!(matched, "        foo\n        bar");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_indentation_flexible_match_preserves_relative_indent() {
+        // The needle's inner indent should be preserved after stripping
+        // the common leading indent.  Here the needle's two lines have
+        // indent "  " and "    " respectively — common prefix is "  ",
+        // stripped form is "foo\n  bar".  The content's matching block
+        // has "    foo\n      bar" → common "    ", stripped
+        // "foo\n  bar" — equal.  Unique match.
+        let content = "    foo\n      bar\n";
+        let (matched, count) = try_indentation_flexible_match(content, "  foo\n    bar").unwrap();
+        assert_eq!(matched, "    foo\n      bar");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_common_leading_indent_basic() {
+        assert_eq!(common_leading_indent(&["    a", "    b"]), "    ");
+        assert_eq!(common_leading_indent(&["  a", "    b"]), "  ");
+        assert_eq!(common_leading_indent(&["a", "  b"]), "");
+    }
+
+    #[test]
+    fn test_common_leading_indent_ignores_blank_lines() {
+        // Blank lines should not drag the indent down to "".
+        assert_eq!(common_leading_indent(&["    a", "", "    b"]), "    ");
+        assert_eq!(common_leading_indent(&["", ""]), "");
+    }
+
+    #[test]
+    fn test_split_lines_with_offsets_lf() {
+        let lines = split_lines_with_offsets("alpha\nbeta\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], (0, "alpha", 1));
+        assert_eq!(lines[1], (6, "beta", 1));
+    }
+
+    #[test]
+    fn test_split_lines_with_offsets_crlf() {
+        let lines = split_lines_with_offsets("alpha\r\nbeta\r\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], (0, "alpha", 2));
+        assert_eq!(lines[1], (7, "beta", 2));
+    }
+
+    #[test]
+    fn test_split_lines_with_offsets_no_trailing_newline() {
+        let lines = split_lines_with_offsets("alpha\nbeta");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], (0, "alpha", 1));
+        assert_eq!(lines[1], (6, "beta", 0));
     }
 }

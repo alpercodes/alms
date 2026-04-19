@@ -340,6 +340,14 @@ pub struct ToolsConfig {
     /// `sudo`, `mkfs`, reverse shells, etc. but allows normal dev workflows).
     #[serde(default)]
     pub shell_classification_mode: ShellClassificationMode,
+
+    /// Per-tool settings for `fs_edit`.
+    ///
+    /// See [`FsEditConfig`] for the full set of knobs. Mirrors the
+    /// `shell_permissions` shape: config-file-only, compiled once at
+    /// process / agent startup, never mutable via `PATCH /settings`.
+    #[serde(default)]
+    pub fs_edit: FsEditConfig,
 }
 
 impl Default for ToolsConfig {
@@ -352,8 +360,37 @@ impl Default for ToolsConfig {
             shell_policy: "sandboxed".into(),
             shell_permissions: ShellPermissions::default(),
             shell_classification_mode: ShellClassificationMode::default(),
+            fs_edit: FsEditConfig::default(),
         }
     }
+}
+
+/// Configuration for the `fs_edit` tool.
+///
+/// **Startup-only**: Like [`ShellPermissions`], `FsEditConfig` is compiled
+/// into each `FsEditTool` instance at agent-construction time and is never
+/// mutable via runtime APIs (`PATCH /settings`). To change the policy for
+/// an agent, restart the process with a new `alms.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FsEditConfig {
+    /// Enable the multi-stage fuzzy-match replacer cascade.
+    ///
+    /// When `false` (the default), `fs_edit` performs only its existing
+    /// exact-match + uniqueness guard plus the curly-quote / CRLF
+    /// normalization fallback. This preserves the "exact-string-only"
+    /// contract that existing agents rely on.
+    ///
+    /// When `true`, two additional cascade stages run before the
+    /// curly-quote / CRLF fallback (cheapest-first), catching common LLM
+    /// foot-guns: trailing-whitespace drift on each line and
+    /// leading-indent drift (e.g. the model emits 2-space indent while
+    /// the file uses 4). The uniqueness guard still fires — if more
+    /// than one candidate matches after any stage, `fs_edit` returns
+    /// the same "ambiguous match" error as the exact path.
+    ///
+    /// Opt-in per agent; never silently on. See issue #755.
+    pub fuzzy_match: bool,
 }
 
 /// Built-in risk classification policy for the shell tool.

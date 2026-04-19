@@ -88,6 +88,7 @@ impl GatewayConfig {
                 shell_permissions: config.tools.shell_permissions.clone(),
                 shell_classification_mode: config.tools.shell_classification_mode,
                 enabled_tools: config.tools.enabled.clone(),
+                fs_edit_fuzzy_match: config.tools.fs_edit.fuzzy_match,
                 ..AgentConfig::default()
             },
             session_config: SessionConfig {
