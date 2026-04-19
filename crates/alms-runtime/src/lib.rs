@@ -30,3 +30,8 @@ pub use workspace::{AgentWorkspace, WorkspaceFile};
 
 // Re-export core types for convenience
 pub use alms_core::{AlmsError, AlmsResult};
+
+// Re-export the shell output spill helpers (issue #756) so downstream
+// callers (gateway startup sweep, subagent plumbing) don't need a direct
+// dependency on `alms-sandbox`.
+pub use alms_sandbox::shell::spill;

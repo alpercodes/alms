@@ -697,6 +697,22 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         }
     }
 
+    // Wire the shell-output spill policy (issue #756) before `with_workspace`
+    // so the per-run spill directory is included in the agent's
+    // `fs_read`/`fs_list`/`fs_grep`/`fs_glob` extra_read_roots at run start.
+    // The directory itself is created lazily on first spill. Reads use the
+    // live `tools_config.shell_spill` so operators can tweak the TOML and
+    // restart, but values are NOT PATCH-mutable (consistent with
+    // shell_permissions).
+    {
+        let spill_cfg = state.tools_config.read().shell_spill.clone();
+        let run_dir = state
+            .data_dir
+            .join(alms_runtime::spill::SPILL_DIR_NAME)
+            .join(run_id.0.to_string());
+        runtime = runtime.with_shell_spill(run_dir, spill_cfg.enabled);
+    }
+
     // Attach workspace if configured — registers the workspace_write tool for this run
     if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
         let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);

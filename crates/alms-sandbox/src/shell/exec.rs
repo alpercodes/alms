@@ -5,7 +5,8 @@
 
 use super::output::truncate_output_bytes;
 use super::security::{command_matches_denylist, is_secret_env_var, platform_critical_env_vars};
-use super::types::{ShellInput, ShellOutput, ShellState};
+use super::spill::{ShellSpillPolicy, write_spill};
+use super::types::{MAX_OUTPUT_BYTES, ShellInput, ShellOutput, ShellState};
 use crate::{SandboxError, error::SandboxResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,7 +40,18 @@ pub(crate) fn command_excerpt(command: &str) -> String {
 /// 4. Detects the new cwd from the `pwd` marker in output
 /// 5. Truncates output if needed
 /// 6. Updates the shell state's cwd
-#[instrument(level = "debug", skip(state, sandbox_root, default_env, pwd_marker), fields(timeout_ms = input.timeout_ms))]
+///
+/// When `spill_policy.is_active()` and the captured stdout or stderr exceeds
+/// `MAX_OUTPUT_BYTES`, the full pre-truncation bytes are written to
+/// `{run_dir}/shell_{tool_call_id}.log` (issue #756). The returned
+/// [`ShellOutput::spill_path`] carries the absolute path so the caller can
+/// surface it to the agent.
+// The per-execution argument shape intentionally kept flat for readability:
+// bundling these into a struct obscures the call path from `ShellTool::execute`
+// and `background::submit_background_task` without removing any real
+// complexity (every field has a distinct lifetime / ownership story).
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip(state, sandbox_root, default_env, pwd_marker, spill_policy, tool_call_id), fields(timeout_ms = input.timeout_ms))]
 pub(crate) async fn execute_command(
     input: &ShellInput,
     state: &ShellState,
@@ -47,6 +59,8 @@ pub(crate) async fn execute_command(
     unrestricted: bool,
     default_env: &HashMap<String, String>,
     pwd_marker: &str,
+    spill_policy: &ShellSpillPolicy,
+    tool_call_id: &str,
 ) -> SandboxResult<ShellOutput> {
     let command = &input.command;
 
@@ -149,6 +163,36 @@ pub(crate) async fn execute_command(
     // and cwd line don't count toward the byte budget. Operates on raw bytes.
     let clean_stdout_bytes = strip_pwd_marker_bytes(&raw_stdout, pwd_marker);
 
+    // Spill decision (issue #756): made *before* truncation so we have the
+    // full bytes the agent might want to recover. The pre-truncation sizes
+    // are what truncate_output_bytes will react to, so checking `> MAX_OUTPUT_BYTES`
+    // here matches truncation's own entry condition exactly.
+    let stdout_needs_spill = clean_stdout_bytes.len() > MAX_OUTPUT_BYTES;
+    let stderr_needs_spill = raw_stderr.len() > MAX_OUTPUT_BYTES;
+    let spill_path = if spill_policy.is_active() && (stdout_needs_spill || stderr_needs_spill) {
+        // Unwrap is safe: is_active() guarantees run_dir is Some.
+        let run_dir = spill_policy
+            .run_dir
+            .as_deref()
+            .expect("is_active() implies run_dir");
+        match write_spill(run_dir, tool_call_id, &clean_stdout_bytes, &raw_stderr) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                // Spill failure is non-fatal — the agent still gets the
+                // truncated output, just without the recovery file.
+                warn!(
+                    error = %e,
+                    run_dir = %run_dir.display(),
+                    tool_call_id = %tool_call_id,
+                    "Failed to write shell output spill file; falling back to truncated output only"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Truncate raw bytes, then decode at the boundary.
     let stdout_truncated = truncate_output_bytes(&clean_stdout_bytes);
     let stderr_truncated = truncate_output_bytes(&raw_stderr);
@@ -162,6 +206,7 @@ pub(crate) async fn execute_command(
         exit_code,
         stdout,
         stderr,
+        spill_path,
     })
 }
 

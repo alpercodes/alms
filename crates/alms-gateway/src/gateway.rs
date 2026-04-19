@@ -87,6 +87,7 @@ impl GatewayConfig {
                 shell_policy: config.tools.shell_policy.clone(),
                 shell_permissions: config.tools.shell_permissions.clone(),
                 shell_classification_mode: config.tools.shell_classification_mode,
+                shell_spill: config.tools.shell_spill.clone(),
                 enabled_tools: config.tools.enabled.clone(),
                 fs_edit_fuzzy_match: config.tools.fs_edit.fuzzy_match,
                 ..AgentConfig::default()
@@ -395,6 +396,32 @@ impl Gateway {
     /// Start the gateway
     pub async fn start(&mut self) -> AlmsResult<()> {
         info!("Starting ALMS Gateway");
+
+        // Shell output spill retention sweep (issue #756). Runs once at
+        // startup — no background ticker — so expired `.alms/shell_output/*`
+        // files are cleaned up the next time the gateway restarts rather
+        // than growing unbounded. Failures are non-fatal and logged.
+        if let Some(ref data_dir) = self.config.data_dir {
+            let retention_days = self.config.tools_config.shell_spill.retention_days;
+            match alms_runtime::spill::sweep_expired(data_dir, retention_days) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        info!(
+                            deleted,
+                            retention_days,
+                            "Cleaned up expired shell output spill files at startup"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        data_dir = %data_dir.display(),
+                        "Shell output spill retention sweep failed at startup"
+                    );
+                }
+            }
+        }
 
         // Start all Telegram channels (non-fatal per bot — log and continue)
         for bot in &self.telegram_bots {

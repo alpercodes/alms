@@ -5,6 +5,7 @@
 //! query the result by task ID.
 
 use super::exec::execute_command;
+use super::spill::ShellSpillPolicy;
 use super::types::{BackgroundTaskResult, ShellInput, ShellState};
 use crate::error::SandboxResult;
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ pub(crate) async fn submit_background_task(
     unrestricted: bool,
     default_env: HashMap<String, String>,
     pwd_marker: String,
+    spill_policy: ShellSpillPolicy,
 ) -> SandboxResult<String> {
     let task_id = state.next_id().await;
     let command_display = input.command.clone();
@@ -36,6 +38,9 @@ pub(crate) async fn submit_background_task(
     let task_id_clone = task_id.clone();
     let command_clone = command_display.clone();
     let sandbox_root_ref = sandbox_root.clone();
+    // Use the generated background task id as the spill tool_call_id so
+    // spill files are grep-able against the ShellTool's task_id response.
+    let spill_tool_call_id = task_id.clone();
 
     tokio::spawn(async move {
         let result = execute_command(
@@ -45,6 +50,8 @@ pub(crate) async fn submit_background_task(
             unrestricted,
             &default_env,
             &pwd_marker,
+            &spill_policy,
+            &spill_tool_call_id,
         )
         .await;
 
@@ -136,6 +143,7 @@ mod tests {
             true,
             HashMap::new(),
             "__ALMS_PWD_TEST__".to_string(),
+            ShellSpillPolicy::disabled(),
         )
         .await
         .unwrap();

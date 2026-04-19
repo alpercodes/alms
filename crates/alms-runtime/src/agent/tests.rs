@@ -35,6 +35,7 @@ async fn test_stream_llm_call_emits_token_deltas() {
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: None,
     };
 
@@ -76,6 +77,7 @@ async fn test_build_context() {
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: None,
     };
 
@@ -109,6 +111,7 @@ async fn test_build_context_dm_perspective_mapping() {
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: Some("bob".to_string()),
     };
 
@@ -190,6 +193,7 @@ async fn test_build_context_non_dm_no_perspective() {
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: Some("bob".to_string()),
     };
 
@@ -339,6 +343,7 @@ async fn test_guarded_posture_sequential_approvals() {
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: None,
     };
 
@@ -433,6 +438,7 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: None,
     };
 

@@ -862,6 +862,12 @@ fn agent_config_for_subagent(
         shell_policy: base.shell_policy.clone(),
         shell_permissions: base.shell_permissions.clone(),
         shell_classification_mode: base.shell_classification_mode,
+        // Subagents inherit the parent's spill policy so >30 KB shell output
+        // spills to disk for them too (issue #756). The actual spill directory
+        // is wired in at `run_agent_loop` via `with_shell_spill` using a
+        // per-subagent subdir (`{data_dir}/shell_output/sub-{task_id}/`), which
+        // keeps the retention sweep's directory walk well-defined.
+        shell_spill: base.shell_spill.clone(),
         enabled_tools: base.enabled_tools.clone(),
         fs_edit_fuzzy_match: base.fs_edit_fuzzy_match,
         max_iterations: base.max_iterations,
@@ -1030,6 +1036,11 @@ async fn run_agent_loop(
         subagent_llm = subagent_llm.with_model(model);
     }
 
+    // Snapshot the subagent's spill policy before `config` is moved into the
+    // runtime — we need it below to wire `with_shell_spill` with the
+    // per-subagent run directory.
+    let subagent_spill_cfg = config.shell_spill.clone();
+
     let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?
         .with_event_sender(sub_tx)
         .with_cancel_token(cancel_token);
@@ -1046,6 +1057,22 @@ async fn run_agent_loop(
         if !shell_env.is_empty() {
             runtime = runtime.with_shell_default_env(shell_env);
         }
+    }
+
+    // Inherit the parent's shell-output spill policy (issue #756). Subagents
+    // that produce >30 KB of shell output would otherwise get silently
+    // truncated with no spill file — a regression from the parent's
+    // behaviour. Each subagent gets its own per-subagent spill subdirectory
+    // (`{data_dir}/shell_output/sub-{task_id}/`) which is still walked by
+    // `sweep_expired` at gateway startup because that routine iterates every
+    // child of `{data_dir}/shell_output/`. Must be called *before*
+    // `with_workspace` so that workspace's re-registration of the fs_*
+    // read-extras includes the subagent's spill dir.
+    if let Some(dir) = data_dir {
+        let sub_run_dir = dir
+            .join(alms_runtime::spill::SPILL_DIR_NAME)
+            .join(format!("sub-{}", task_id.0));
+        runtime = runtime.with_shell_spill(sub_run_dir, subagent_spill_cfg.enabled);
     }
 
     // Attach workspace to scope the fs_* sandbox.
@@ -1435,6 +1462,10 @@ mod tests {
             posture: alms_runtime::Posture::Guarded,
             sandbox_root: "/sandbox".into(),
             shell_policy: "unrestricted".into(),
+            shell_spill: alms_core::config::ShellSpillConfig {
+                enabled: false,
+                retention_days: 42,
+            },
             enabled_tools: vec!["echo".into(), "math".into()],
             ..AgentConfig::default()
         };
@@ -1452,6 +1483,9 @@ mod tests {
         assert_eq!(config.sandbox_root, "/sandbox");
         assert_eq!(config.shell_policy, "unrestricted");
         assert_eq!(config.enabled_tools, vec!["echo", "math"]);
+        // Should inherit the shell spill policy (issue #756 subagent inheritance)
+        assert!(!config.shell_spill.enabled);
+        assert_eq!(config.shell_spill.retention_days, 42);
         // system_prompt should be the default subagent prompt, not the parent's
         assert_eq!(config.system_prompt, DEFAULT_SUBAGENT_PROMPT);
 
@@ -1470,6 +1504,60 @@ mod tests {
         assert_eq!(config2.max_iterations, 42);
         assert_eq!(config2.max_tokens, 9999);
         assert_eq!(config2.context_config.max_input_tokens, 50_000);
+        // Shell spill policy still inherited through the registry-override path
+        assert!(!config2.shell_spill.enabled);
+        assert_eq!(config2.shell_spill.retention_days, 42);
+    }
+
+    // -- (j-pre-2) subagent inherits shell spill policy (issue #756) ------------
+    //
+    // Regression guard for Tim's `[important]` finding on PR #761: subagents
+    // built via `agent_config_for_subagent` must carry the parent's
+    // `shell_spill` state so the coordinator's subagent spawn path can wire
+    // a spill directory into the subagent's ShellTool. Without this, a
+    // subagent whose shell command produces >30 KB of output gets silent
+    // truncation with no spill file — a regression from the parent's
+    // behaviour.
+    #[test]
+    fn test_subagent_inherits_shell_spill_policy() {
+        // Non-default spill config on the parent: flipped `enabled`, custom
+        // retention.  Both fields must copy through verbatim.
+        let parent = AgentConfig {
+            shell_spill: alms_core::config::ShellSpillConfig {
+                enabled: true,
+                retention_days: 14,
+            },
+            ..AgentConfig::default()
+        };
+
+        // Ephemeral subagent path
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert!(ephemeral.shell_spill.enabled);
+        assert_eq!(ephemeral.shell_spill.retention_days, 14);
+
+        // Named subagent path — registry overrides must not wipe the
+        // inherited spill config.
+        let record = SubagentRecordConfig {
+            model: Some("gpt-5".into()),
+            posture: None,
+            provider: None,
+        };
+        let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert!(named.shell_spill.enabled);
+        assert_eq!(named.shell_spill.retention_days, 14);
+
+        // Opt-out must also propagate — an operator who disabled spill in
+        // `alms.toml` should see their subagents honour that too.
+        let disabled_parent = AgentConfig {
+            shell_spill: alms_core::config::ShellSpillConfig {
+                enabled: false,
+                retention_days: 1,
+            },
+            ..AgentConfig::default()
+        };
+        let (sub, _, _) = agent_config_for_subagent(None, &disabled_parent);
+        assert!(!sub.shell_spill.enabled);
+        assert_eq!(sub.shell_spill.retention_days, 1);
     }
 
     // -- (j) get_completed_result on unknown task → None ------------------------

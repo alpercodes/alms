@@ -1,4 +1,6 @@
-use alms_core::config::{ContextConfig, ShellClassificationMode, ShellPermissions};
+use alms_core::config::{
+    ContextConfig, ShellClassificationMode, ShellPermissions, ShellSpillConfig,
+};
 
 /// Execution posture: controls whether tools require approval before running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -94,6 +96,14 @@ pub struct AgentConfig {
     /// Built-in risk classification mode for shell commands.
     /// Layers with `shell_permissions` — both must pass before execution.
     pub shell_classification_mode: ShellClassificationMode,
+    /// Large-output spill-to-disk policy for the shell tool (issue #756).
+    ///
+    /// Mirrors the plumbing of [`shell_permissions`]/[`shell_classification_mode`]:
+    /// populated from `[tools.shell_spill]` in the gateway's config assembly
+    /// and propagated to subagents in the coordinator so their shell tools
+    /// inherit the same spill policy as the parent. Config-file-only — not
+    /// mutable via `PATCH /settings`.
+    pub shell_spill: ShellSpillConfig,
     /// Enabled builtin tools. Empty = all enabled (backward compatible).
     pub enabled_tools: Vec<String>,
     /// Enable the multi-stage fuzzy-match replacer cascade in `fs_edit`.
@@ -119,6 +129,7 @@ impl Default for AgentConfig {
             shell_policy: "sandboxed".into(),
             shell_permissions: ShellPermissions::default(),
             shell_classification_mode: ShellClassificationMode::default(),
+            shell_spill: ShellSpillConfig::default(),
             enabled_tools: Vec::new(),
             fs_edit_fuzzy_match: false,
             debug_mode: false,

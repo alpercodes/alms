@@ -348,6 +348,21 @@ pub struct ToolsConfig {
     /// process / agent startup, never mutable via `PATCH /settings`.
     #[serde(default)]
     pub fs_edit: FsEditConfig,
+
+    /// Full-output spill-to-disk policy for the shell tool.
+    ///
+    /// When a shell command's stdout or stderr exceeds the head+tail
+    /// truncation threshold, the full captured bytes are written to
+    /// `{data_dir}/shell_output/{run_id}/shell_{tool_call_id}.log` and a
+    /// `[full output spilled to: ...]` marker is appended to the tool result.
+    /// The agent can then `fs_read` the spill path with offset/limit to
+    /// inspect the middle of the output that truncation dropped.
+    ///
+    /// Like [`shell_permissions`], this is **config-file-only** and not
+    /// mutable via `PATCH /settings` — the spill directory and retention
+    /// window affect disk usage and are considered operator-level policy.
+    #[serde(default)]
+    pub shell_spill: ShellSpillConfig,
 }
 
 impl Default for ToolsConfig {
@@ -361,6 +376,7 @@ impl Default for ToolsConfig {
             shell_permissions: ShellPermissions::default(),
             shell_classification_mode: ShellClassificationMode::default(),
             fs_edit: FsEditConfig::default(),
+            shell_spill: ShellSpillConfig::default(),
         }
     }
 }
@@ -508,6 +524,48 @@ impl ShellPermissions {
             allowed_commands: allowed,
             denied_commands: denied,
             classifier_overrides,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ShellSpillConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the shell tool's large-output spill-to-disk behaviour.
+///
+/// When a shell command's output would exceed the head+tail truncation
+/// threshold, the full captured bytes are written to a per-run directory
+/// under `{data_dir}/shell_output/{run_id}/` so the agent can recover the
+/// middle of the output via `fs_read`. The retention sweep runs once at
+/// gateway startup (filesystem-mtime check; no SQLite tracking) and deletes
+/// spill files older than [`retention_days`][Self::retention_days].
+///
+/// **Config-file-only**: mirrors the posture of
+/// [`ShellPermissions`] — not exposed via `PATCH /settings`. Operators who
+/// need to tune spill behaviour edit `alms.toml` and restart the gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellSpillConfig {
+    /// Whether spill-to-disk is enabled. Default: `true`.
+    ///
+    /// When disabled, the shell tool behaves exactly as before this feature
+    /// landed: output is head+tail truncated in place, and the middle of the
+    /// stream is gone. Disable only if disk-usage concerns outweigh the
+    /// debuggability benefit.
+    pub enabled: bool,
+
+    /// Number of days a spilled file is retained before the startup sweep
+    /// deletes it. Default: `7`. A value of `0` disables retention (files
+    /// are deleted at the next startup sweep regardless of age).
+    pub retention_days: u32,
+}
+
+impl Default for ShellSpillConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: 7,
         }
     }
 }

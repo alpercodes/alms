@@ -53,6 +53,13 @@ pub struct AgentRuntime {
     /// Built-in risk classification mode for shell commands.
     /// Retained so re-registrations of the shell tool preserve the mode.
     pub(crate) shell_classification_mode: alms_core::config::ShellClassificationMode,
+    /// Large-output spill-to-disk policy for the shell tool (issue #756).
+    /// Defaults to disabled; the gateway wires in an active policy once the
+    /// per-run spill directory (`{data_dir}/shell_output/{run_id}/`) is
+    /// known, via [`Self::with_shell_spill`]. Retained so re-registrations
+    /// of the shell tool (from `with_workspace`, `with_shell_default_env`,
+    /// etc.) preserve the policy.
+    pub(crate) shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy,
     /// Agent name for perspective mapping in DM sessions.
     /// When set and the context_id starts with "dm:", the context builder
     /// maps messages from this agent to `Role::Assistant` so the LLM sees
@@ -127,6 +134,7 @@ impl AgentRuntime {
             shell_default_env: std::collections::HashMap::new(),
             shell_permissions: shell_permissions.clone(),
             shell_classification_mode,
+            shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
             agent_name: None,
         };
 
@@ -203,10 +211,18 @@ impl AgentRuntime {
         // call is needed.  If the parent can't be taken (workspace sits at
         // a filesystem root), we fall back to an empty extras list so
         // behaviour is unchanged.
-        let sibling_workspaces_root: Vec<std::path::PathBuf> = match ws_root.parent() {
+        //
+        // When the shell output spill policy is active (issue #756), the
+        // per-run spill dir is appended so `fs_read`/`fs_list`/`fs_grep`/
+        // `fs_glob` can open the spilled log file without operators having
+        // to grant extra filesystem permissions.
+        let mut sibling_workspaces_root: Vec<std::path::PathBuf> = match ws_root.parent() {
             Some(parent) => vec![parent.to_path_buf()],
             None => Vec::new(),
         };
+        if let Some(spill_dir) = self.shell_spill_policy.run_dir.clone() {
+            sibling_workspaces_root.push(spill_dir);
+        }
 
         // Re-register fs_read/fs_write/fs_list/fs_edit sandboxed to the
         // workspace directory so file operations default to the agent's
@@ -265,7 +281,8 @@ impl AgentRuntime {
             )
             .with_default_cwd(ws_root)
             .with_permissions(&self.shell_permissions)
-            .with_classification_mode(self.shell_classification_mode);
+            .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone());
             if !self.shell_default_env.is_empty() {
                 shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
             }
@@ -325,6 +342,7 @@ impl AgentRuntime {
             )
             .with_permissions(&self.shell_permissions)
             .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone())
             .with_default_env(self.shell_default_env.clone());
             let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
             self.tools.register(std::sync::Arc::clone(&tool_arc));
@@ -346,6 +364,101 @@ impl AgentRuntime {
         self
     }
 
+    /// Activate the shell-output spill policy for this runtime (issue #756).
+    ///
+    /// `run_dir` is the per-run directory
+    /// (`{data_dir}/shell_output/{run_id}/`) where spill files will be
+    /// written when shell output exceeds the truncation threshold. The
+    /// directory is created lazily on first spill.
+    ///
+    /// Re-registers the shell tool immediately so the updated policy takes
+    /// effect, and widens `fs_read`/`fs_list`/`fs_grep`/`fs_glob`'s
+    /// sandbox so the agent can `fs_read` the spilled file without operators
+    /// having to grant extra filesystem permissions.
+    ///
+    /// Must be called *after* `with_run_id()` — otherwise the caller cannot
+    /// compute the per-run directory path. Passing `enabled == false`
+    /// leaves the runtime in the default "spill disabled" state.
+    pub fn with_shell_spill(mut self, run_dir: std::path::PathBuf, enabled: bool) -> Self {
+        use alms_sandbox::shell::spill::ShellSpillPolicy;
+
+        let policy = if enabled {
+            ShellSpillPolicy::with_run_dir(run_dir.clone())
+        } else {
+            ShellSpillPolicy::disabled()
+        };
+        self.shell_spill_policy = policy;
+
+        // Re-register the shell tool under both its primary name and its
+        // legacy alias so the new policy is observed on the next tool call.
+        let enabled_tools = &self.config.enabled_tools;
+        let shell_enabled = enabled_tools.is_empty()
+            || enabled_tools
+                .iter()
+                .any(|t| t == "shell" || t == "shell_exec");
+        if shell_enabled && (self.tools.contains("shell") || self.tools.contains("shell_exec")) {
+            let mut shell_tool = alms_sandbox::ShellTool::with_policy(
+                self.resolved_sandbox_root.clone(),
+                self.shell_unrestricted,
+            )
+            .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone());
+            if !self.shell_default_env.is_empty() {
+                shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
+            }
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
+        }
+
+        // Widen the fs_* read roots so `fs_read` on the spill path resolves
+        // inside an allowed root. We only do this when a sandbox root is set
+        // and spill is active — otherwise there's nothing to widen against,
+        // and agents with unrestricted fs access already reach everywhere.
+        // The extras list intentionally only includes the per-run dir;
+        // sibling-workspace access (#242) is added separately in
+        // `with_workspace()`, so we avoid conflating the two features here.
+        if enabled && self.resolved_sandbox_root.is_some() {
+            let fs_tool_enabled =
+                |name: &str| enabled_tools.is_empty() || enabled_tools.iter().any(|t| t == name);
+            let extras = vec![run_dir];
+            let cache = self.tools.file_state_cache().clone();
+            let root = self
+                .resolved_sandbox_root
+                .clone()
+                .expect("guarded by is_some() above");
+            if fs_tool_enabled("fs_read") && self.tools.contains("fs_read") {
+                self.tools.register(std::sync::Arc::new(
+                    alms_sandbox::FsReadTool::sandboxed(root.clone())
+                        .with_cache(cache.clone())
+                        .with_extra_read_roots(extras.clone()),
+                ));
+            }
+            if fs_tool_enabled("fs_list") && self.tools.contains("fs_list") {
+                self.tools.register(std::sync::Arc::new(
+                    alms_sandbox::FsListTool::sandboxed(root.clone())
+                        .with_extra_read_roots(extras.clone()),
+                ));
+            }
+            if fs_tool_enabled("fs_grep") && self.tools.contains("fs_grep") {
+                self.tools.register(std::sync::Arc::new(
+                    alms_sandbox::FsGrepTool::sandboxed(root.clone())
+                        .with_extra_read_roots(extras.clone()),
+                ));
+            }
+            if fs_tool_enabled("fs_glob") && self.tools.contains("fs_glob") {
+                self.tools.register(std::sync::Arc::new(
+                    alms_sandbox::FsGlobTool::sandboxed(root.clone())
+                        .with_extra_read_roots(extras.clone()),
+                ));
+            }
+        }
+
+        self
+    }
+
     /// Re-register the shell tool with the current `shell_permissions`.
     ///
     /// Used at construction time to apply permissions to the initial shell
@@ -361,7 +474,8 @@ impl AgentRuntime {
                 self.shell_unrestricted,
             )
             .with_permissions(&self.shell_permissions)
-            .with_classification_mode(self.shell_classification_mode);
+            .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone());
             let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
             self.tools.register(std::sync::Arc::clone(&tool_arc));
             self.tools

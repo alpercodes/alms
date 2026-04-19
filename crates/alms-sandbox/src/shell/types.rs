@@ -60,6 +60,14 @@ pub struct ShellOutput {
 
     /// Combined stderr content (possibly truncated).
     pub stderr: String,
+
+    /// Absolute path of the on-disk spill file written by the shell tool
+    /// when stdout or stderr exceeded the head+tail truncation threshold
+    /// (issue #756). `None` when spill was not triggered or was disabled
+    /// via `[tools.shell.spill].enabled = false`. The caller is responsible
+    /// for turning this into an agent-visible relative path (see
+    /// `spill::relative_spill_path`).
+    pub spill_path: Option<PathBuf>,
 }
 
 /// Result of a background task that has completed.
