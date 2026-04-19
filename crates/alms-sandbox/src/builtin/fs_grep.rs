@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::{
     check_sandbox_path_async, check_sandbox_path_with_extras_async, is_blocked_device_path,
-    is_denied_path, reject_unc_path, relativize, walk_filtered_files_with_extras,
+    reject_unc_path, relativize, walk_filtered_files_with_extras,
 };
 
 /// Maximum total output size in characters. Prevents context window overload.
@@ -29,8 +29,8 @@ const MAX_GREP_FILE_BYTES: u64 = 1_024 * 1_024;
 /// three output modes (files_with_matches, content, count), glob filtering,
 /// case-insensitive matching, and result pagination via head_limit/offset.
 ///
-/// Security: respects sandbox root, denied-path filtering, and VCS directory
-/// exclusion. Marked as read-only and builtin.
+/// Security: respects sandbox root and VCS directory exclusion. Marked as
+/// read-only and builtin.
 #[derive(Debug, Clone, Default)]
 pub struct FsGrepTool {
     sandbox_root: Option<PathBuf>,
@@ -232,13 +232,6 @@ impl Tool for FsGrepTool {
                 )));
             }
 
-            if is_denied_path(Path::new(path)) {
-                return Err(SandboxError::SandboxViolation(format!(
-                    "Access to '{}' is denied",
-                    path
-                )));
-            }
-
             if let Some(ref root) = self.sandbox_root {
                 if self.extra_read_roots.is_empty() {
                     check_sandbox_path_async(path, root).await?
@@ -290,7 +283,7 @@ impl Tool for FsGrepTool {
 }
 
 /// Collect all searchable files under `search_root`, respecting sandbox, VCS
-/// exclusion, denied paths, and optional glob filtering.
+/// exclusion, and optional glob filtering.
 ///
 /// When `search_root` is a regular file (not a directory), returns a
 /// single-element vec containing just that file (single-file mode).
@@ -302,7 +295,7 @@ fn collect_files(
 ) -> Vec<PathBuf> {
     // Single-file mode: if the search root is a file, just search that file.
     if search_root.is_file() {
-        if is_denied_path(search_root) || is_blocked_device_path(search_root) {
+        if is_blocked_device_path(search_root) {
             return Vec::new();
         }
         return vec![search_root.to_path_buf()];
@@ -999,8 +992,11 @@ mod tests {
         );
     }
 
+    /// Regression guard for #744: the hardcoded denied-filename filter
+    /// was removed from `fs_grep`'s file walker. Matches inside a file
+    /// whose basename is `secrets.json` are now included in results.
     #[tokio::test]
-    async fn test_fs_grep_denied_paths_excluded() {
+    async fn test_fs_grep_no_hardcoded_basename_exclusion() {
         let dir = setup_grep_dir();
         let root = dir.path();
         let tool = FsGrepTool::new();
@@ -1017,8 +1013,13 @@ mod tests {
         let matches = result["matches"].as_array().unwrap();
         assert_eq!(
             matches.len(),
-            0,
-            "Denied files should be excluded from results"
+            1,
+            "secrets.json must now appear in grep results (hardcoded filter removed)"
+        );
+        assert!(
+            matches[0].as_str().unwrap().ends_with("secrets.json"),
+            "expected secrets.json match, got {:?}",
+            matches[0]
         );
     }
 
@@ -1272,21 +1273,6 @@ mod tests {
         assert_eq!(matches2.len(), 1);
         assert!(matches2[0]["context_after"].as_array().unwrap().is_empty());
         assert_eq!(matches2[0]["context_before"].as_array().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn test_fs_grep_denied_path_in_path_param() {
-        let tool = FsGrepTool::new();
-
-        let result = tool
-            .execute(serde_json::json!({
-                "pattern": "key",
-                "path": "secrets.json"
-            }))
-            .await;
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("denied"));
     }
 
     #[tokio::test]

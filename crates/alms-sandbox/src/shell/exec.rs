@@ -4,10 +4,7 @@
 //! and detecting the post-execution working directory via a `pwd` marker.
 
 use super::output::truncate_output_bytes;
-use super::security::{
-    command_matches_denylist, command_references_denied_file, is_secret_env_var,
-    platform_critical_env_vars,
-};
+use super::security::{command_matches_denylist, is_secret_env_var, platform_critical_env_vars};
 use super::types::{ShellInput, ShellOutput, ShellState};
 use crate::{SandboxError, error::SandboxResult};
 use std::collections::HashMap;
@@ -59,20 +56,7 @@ pub(crate) async fn execute_command(
         ));
     }
 
-    // Security: check for denied files and destructive patterns. These run
-    // before any process spawn so the denial path stays cheap.
-    if let Some(denied) = command_references_denied_file(command) {
-        error!(
-            tool = "shell",
-            reason = "denied_file",
-            denied_file = %denied,
-            command_excerpt = %command_excerpt(command),
-            "Shell command references denied file"
-        );
-        return Err(SandboxError::SandboxViolation(format!(
-            "Command references denied file '{denied}'"
-        )));
-    }
+    // Security: check for destructive command patterns
     if let Some(pattern) = command_matches_denylist(command) {
         error!(
             tool = "shell",

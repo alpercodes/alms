@@ -93,20 +93,6 @@ pub(crate) async fn check_background_task(
     tasks.remove(task_id)
 }
 
-/// List all completed background tasks without removing them.
-// TODO(dead-code): will be wired to a `list_tasks` action in the shell tool
-#[allow(dead_code)]
-pub(crate) async fn list_background_tasks(state: &ShellState) -> Vec<(String, bool)> {
-    let tasks = state.background_tasks.lock().await;
-    tasks
-        .iter()
-        .map(|(id, result)| {
-            let completed = result.output.is_some() || result.error.is_some();
-            (id.clone(), completed)
-        })
-        .collect()
-}
-
 /// Evict the oldest completed task from the map.
 ///
 /// Task IDs are formatted as `bg_N` where N is a monotonically increasing

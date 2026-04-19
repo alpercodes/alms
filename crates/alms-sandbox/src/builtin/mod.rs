@@ -24,23 +24,8 @@ pub use math::MathTool;
 // Shared helpers — used by multiple tool files via `super::`
 // ---------------------------------------------------------------------------
 
-use crate::shell::security::DENIED_FILENAMES;
 use crate::{SandboxError, error::SandboxResult};
 use std::path::{Component, Path, PathBuf};
-
-/// Check whether a resolved path references a denied filename.
-///
-/// Uses case-insensitive comparison so that `Secrets.JSON` and `SECRETS.json`
-/// are caught on case-insensitive filesystems (Windows).
-pub(crate) fn is_denied_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|f| f.to_str())
-        .is_some_and(|name| {
-            DENIED_FILENAMES
-                .iter()
-                .any(|d| d.eq_ignore_ascii_case(name))
-        })
-}
 
 /// Blocked Unix device paths that produce infinite output or hang.
 #[cfg(unix)]
@@ -408,11 +393,6 @@ pub(crate) fn walk_filtered_files_with_extras(
                 return false;
             }
 
-            // Skip denied filenames.
-            if is_denied_path(entry.path()) {
-                return false;
-            }
-
             true
         });
 
@@ -646,31 +626,6 @@ mod tests {
         assert!(!is_unc_path("/"));
     }
 
-    // ── Denylist tests ────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_is_denied_path_secrets_json() {
-        assert!(is_denied_path(Path::new("secrets.json")));
-        assert!(is_denied_path(Path::new("data/secrets.json")));
-        assert!(is_denied_path(Path::new("/abs/path/data/secrets.json")));
-    }
-
-    #[test]
-    fn test_is_denied_path_allowed_files() {
-        assert!(!is_denied_path(Path::new("data.json")));
-        assert!(!is_denied_path(Path::new("my_secrets.json")));
-        assert!(!is_denied_path(Path::new("goals.md")));
-        assert!(!is_denied_path(Path::new("alms.db")));
-    }
-
-    #[test]
-    fn test_is_denied_path_case_insensitive() {
-        assert!(is_denied_path(Path::new("Secrets.JSON")));
-        assert!(is_denied_path(Path::new("SECRETS.json")));
-        assert!(is_denied_path(Path::new("secrets.JSON")));
-        assert!(is_denied_path(Path::new("data/Secrets.Json")));
-    }
-
     // ── canonicalize_best_effort edge cases ────────────────────────────────────
 
     #[test]
@@ -828,18 +783,6 @@ mod tests {
             "expected filename preserved, got {}",
             result.display()
         );
-    }
-
-    // ── Shell denied-path integration test ─────────────────────────────────────
-
-    #[tokio::test]
-    async fn test_shell_denied_secrets_json() {
-        let tool = crate::ShellTool::new();
-        let result = tool
-            .execute(serde_json::json!({"command": "cat data/secrets.json"}))
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
     }
 
     #[tokio::test]

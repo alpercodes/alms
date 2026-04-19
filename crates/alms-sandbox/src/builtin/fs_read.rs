@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 
 use super::{
     check_sandbox_path_async, check_sandbox_path_with_extras_async, is_blocked_device_path,
-    is_denied_path, normalize_unsandboxed_path, reject_unc_path,
+    normalize_unsandboxed_path, reject_unc_path,
 };
 
 /// Read a file from the filesystem.
@@ -135,14 +135,6 @@ impl Tool for FsReadTool {
             )));
         }
 
-        // Deny-list check: block access to sensitive files regardless of sandbox scope.
-        if is_denied_path(Path::new(path)) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Access to '{}' is denied",
-                path
-            )));
-        }
-
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
             if self.extra_read_roots.is_empty() {
                 check_sandbox_path_async(path, root).await?
@@ -153,16 +145,10 @@ impl Tool for FsReadTool {
             normalize_unsandboxed_path(path).await
         };
 
-        // Also check the resolved path (handles relative traversals like ../data/secrets.json).
+        // Also check the resolved path (handles relative traversals).
         if is_blocked_device_path(&resolved) {
             return Err(SandboxError::SandboxViolation(format!(
                 "Cannot read device path '{}' — this is a system device, not a regular file",
-                path
-            )));
-        }
-        if is_denied_path(&resolved) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Access to '{}' is denied",
                 path
             )));
         }
@@ -776,59 +762,35 @@ mod tests {
         assert!(text.contains("world"));
     }
 
+    /// Regression guard for #744: the hardcoded denied-filename list
+    /// (a one-entry `["secrets.json"]`) was removed from `fs_read`.
+    /// Reading a file whose basename is `secrets.json` must no longer
+    /// be rejected for that reason alone — file access is now governed
+    /// only by the sandbox root (and, on Linux 5.13+, by Landlock).
     #[tokio::test]
-    async fn test_fs_read_denied_secrets_json() {
+    async fn test_fs_read_no_hardcoded_secrets_json_deny() {
         let dir = tempfile::tempdir().unwrap();
         let secrets = dir.path().join("secrets.json");
         std::fs::write(&secrets, r#"{"key": "sk-1234"}"#).unwrap();
 
-        let tool = FsReadTool::new();
-        let result = tool
+        // Covers the three access patterns exercised by the removed
+        // tests: absolute path, relative path, dot-slash, and a
+        // relative parent-traversal that still resolves inside root.
+        let tool_abs = FsReadTool::new();
+        let result = tool_abs
             .execute(serde_json::json!({"path": secrets.to_str().unwrap()}))
             .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
-    }
+        assert!(result.is_ok(), "abs path: got {:?}", result.err());
 
-    #[tokio::test]
-    async fn test_fs_read_denied_via_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        let data = dir.path().join("sub").join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(data.join("secrets.json"), "secret").unwrap();
-
-        let tool = FsReadTool::sandboxed(dir.path().to_path_buf());
-        let result = tool
-            .execute(serde_json::json!({"path": "sub/data/secrets.json"}))
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
-    }
-
-    #[tokio::test]
-    async fn test_fs_read_denied_via_dot_slash() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("secrets.json"), "secret").unwrap();
-
-        let tool = FsReadTool::sandboxed(dir.path().to_path_buf());
-        let result = tool
-            .execute(serde_json::json!({"path": "./secrets.json"}))
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
-    }
-
-    #[tokio::test]
-    async fn test_fs_read_denied_via_parent_traversal() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("secrets.json"), "secret").unwrap();
-
-        let tool = FsReadTool::sandboxed(dir.path().to_path_buf());
-        let result = tool
-            .execute(serde_json::json!({"path": "data/../secrets.json"}))
-            .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
+        let tool_rel = FsReadTool::sandboxed(dir.path().to_path_buf());
+        for rel in ["./secrets.json", "data/../secrets.json"] {
+            let result = tool_rel.execute(serde_json::json!({"path": rel})).await;
+            assert!(
+                result.is_ok(),
+                "relative path '{rel}' should no longer be blocked by the hardcoded deny list: {:?}",
+                result.err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -916,25 +878,30 @@ mod tests {
         assert!(result.is_err(), "outside path must still be rejected");
     }
 
+    /// Regression guard for #744: after the hardcoded denied-filename
+    /// list was removed, a file named `secrets.json` in a sibling
+    /// workspace reachable via an extra read root must now be readable
+    /// (nothing distinguishes its basename from any other file).
     #[tokio::test]
-    async fn test_fs_read_extra_root_still_blocks_denied_filenames() {
-        // `secrets.json` in a sibling workspace must still be blocked by the
-        // deny-list regardless of the extra read root.
+    async fn test_fs_read_extra_root_allows_any_basename() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_dir = std::fs::canonicalize(dir.path()).unwrap();
         let parent_ws = workspace_dir.join("parent");
         let child_ws = workspace_dir.join("child");
         std::fs::create_dir_all(&parent_ws).unwrap();
         std::fs::create_dir_all(&child_ws).unwrap();
-        let denied = child_ws.join("secrets.json");
-        std::fs::write(&denied, r#"{"k": "v"}"#).unwrap();
+        let target = child_ws.join("secrets.json");
+        std::fs::write(&target, r#"{"k": "v"}"#).unwrap();
 
         let tool =
             FsReadTool::sandboxed(parent_ws).with_extra_read_roots(vec![workspace_dir.clone()]);
         let result = tool
-            .execute(serde_json::json!({"path": denied.to_str().unwrap()}))
+            .execute(serde_json::json!({"path": target.to_str().unwrap()}))
             .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
+        assert!(
+            result.is_ok(),
+            "with deny list removed, read through extra root should succeed: {:?}",
+            result.err()
+        );
     }
 }

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     check_sandbox_path_async, check_sandbox_path_with_extras_async, is_blocked_device_path,
-    is_denied_path, reject_unc_path, relativize, walk_filtered_files_with_extras,
+    reject_unc_path, relativize, walk_filtered_files_with_extras,
 };
 
 /// Maximum number of files returned by `fs_glob`.
@@ -18,8 +18,8 @@ const MAX_GLOB_RESULTS: usize = 200;
 /// within the sandbox. Returns paths relative to the search base, sorted
 /// by modification time (most recent first).
 ///
-/// Security: respects sandbox root, denied-path filtering, and VCS directory
-/// exclusion. Marked as read-only and builtin.
+/// Security: respects sandbox root and VCS directory exclusion. Marked as
+/// read-only and builtin.
 #[derive(Debug, Clone, Default)]
 pub struct FsGlobTool {
     sandbox_root: Option<PathBuf>,
@@ -117,14 +117,6 @@ impl Tool for FsGlobTool {
                 )));
             }
 
-            // Deny-list check on raw path.
-            if is_denied_path(Path::new(path)) {
-                return Err(SandboxError::SandboxViolation(format!(
-                    "Access to '{}' is denied",
-                    path
-                )));
-            }
-
             if let Some(ref root) = self.sandbox_root {
                 if self.extra_read_roots.is_empty() {
                     check_sandbox_path_async(path, root).await?
@@ -198,7 +190,7 @@ impl Tool for FsGlobTool {
 }
 
 /// Collect all files matching a glob pattern under `search_root`, respecting
-/// sandbox, VCS exclusion, and denied-path filtering.
+/// sandbox and VCS exclusion.
 ///
 /// Returns tuples of (path, modification_time) so the caller can sort by mtime.
 fn collect_glob_files(
@@ -393,8 +385,11 @@ mod tests {
         );
     }
 
+    /// Regression guard for #744: the hardcoded denied-filename filter
+    /// was removed from `fs_glob`'s file walker. `secrets.json` must
+    /// now be visible in glob results alongside `data/input.json`.
     #[tokio::test]
-    async fn test_fs_glob_denied_paths_excluded() {
+    async fn test_fs_glob_no_hardcoded_basename_exclusion() {
         let dir = setup_glob_dir();
         let root = dir.path();
         let tool = FsGlobTool::new();
@@ -411,8 +406,8 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|f| f.as_str().unwrap()).collect();
         assert!(paths.contains(&"data/input.json"));
         assert!(
-            !paths.iter().any(|p| p.contains("secrets")),
-            "Denied files should be excluded from results"
+            paths.iter().any(|p| p.contains("secrets.json")),
+            "secrets.json must now appear in glob results (hardcoded filter removed)"
         );
     }
 
@@ -631,18 +626,6 @@ mod tests {
         assert!(paths.contains(&"test.rs"));
         assert!(paths.contains(&"test.py"));
         assert!(!paths.contains(&"test.js"));
-    }
-
-    #[tokio::test]
-    async fn test_fs_glob_denied_path_in_path_param() {
-        let tool = FsGlobTool::new();
-        let result = tool
-            .execute(serde_json::json!({
-                "pattern": "**/*",
-                "path": "secrets.json"
-            }))
-            .await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 //! - **Output truncation**: 30KB max with head+tail line preservation
 //! - **Background execution**: `run_in_background: true` spawns a task
 //! - **Timeouts**: 120s default, 600s max, configurable via `timeout_ms`
-//! - **Security**: env_clear, denied files, secret env vars, command denylist,
+//! - **Security**: env_clear, secret env vars, command denylist,
 //!   Landlock filesystem sandboxing on Linux 5.13+
 //!
 //! The legacy `argv` mode has been removed. All commands go through `bash -c`
@@ -712,15 +712,30 @@ mod tests {
         assert!(stdout.contains("SAFE_VAR=ok"));
     }
 
+    /// Regression guard for #744: the hardcoded denied-filename substring
+    /// check was removed because a single-entry list (`secrets.json`) was
+    /// not user-configurable, did not scale, and was trivially bypassable.
+    /// Users who need file-level protection should use
+    /// `[tools.shell_permissions]` (configurable regex allow/deny) or
+    /// Landlock (kernel-level path enforcement on Linux).
+    ///
+    /// This test documents that the removed policy no longer fires: a
+    /// shell command mentioning `secrets.json` is no longer blocked at
+    /// the shell-tool layer for that reason alone. (The command itself
+    /// may still fail for unrelated reasons — missing file, permissions,
+    /// etc. — so we only assert that it is *not* blocked with the legacy
+    /// "denied file" message.)
     #[tokio::test]
     #[cfg(unix)]
-    async fn test_shell_tool_denied_file() {
+    async fn test_shell_tool_no_hardcoded_denied_filename() {
         let tool = ShellTool::new();
         let result = tool
-            .execute(serde_json::json!({"command": "cat data/secrets.json"}))
+            .execute(serde_json::json!({"command": "echo secrets.json"}))
             .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
+        // Must succeed now: the hardcoded denied-filename check is gone.
+        // `echo` does not touch the filesystem and has no reason to fail.
+        let ok = result.expect("echo of a string should not be blocked");
+        assert_eq!(ok["exit_code"], 0);
     }
 
     #[tokio::test]

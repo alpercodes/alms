@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    check_sandbox_path_async, is_blocked_device_path, is_denied_path, normalize_unsandboxed_path,
-    reject_unc_path,
+    check_sandbox_path_async, is_blocked_device_path, normalize_unsandboxed_path, reject_unc_path,
 };
 
 /// Search-and-replace editing tool for files.
@@ -135,14 +134,6 @@ impl Tool for FsEditTool {
             ));
         }
 
-        // Deny-list check on raw path.
-        if is_denied_path(Path::new(path)) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Access to '{}' is denied",
-                path
-            )));
-        }
-
         // Resolve path within sandbox (or normalize when unsandboxed).
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
             check_sandbox_path_async(path, root).await?
@@ -154,14 +145,6 @@ impl Tool for FsEditTool {
         if is_blocked_device_path(&resolved) {
             return Err(SandboxError::SandboxViolation(format!(
                 "Cannot edit device path '{}' — this is a system device, not a regular file",
-                path
-            )));
-        }
-
-        // Deny-list check on resolved path.
-        if is_denied_path(&resolved) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Access to '{}' is denied",
                 path
             )));
         }
@@ -828,22 +811,33 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("outside sandbox"));
     }
 
+    /// Regression guard for #744: the hardcoded denied-filename check was
+    /// removed from `fs_edit`. Editing a file whose basename is
+    /// `secrets.json` must no longer be rejected for that reason alone.
+    /// The read-before-edit guard still applies, so this test uses
+    /// `old_string == ""` (the create-file special case) to prove the
+    /// deny check itself is gone without fighting the guard.
     #[tokio::test]
-    async fn test_fs_edit_denied_path() {
+    async fn test_fs_edit_no_hardcoded_secrets_json_deny() {
         let dir = tempfile::tempdir().unwrap();
         let secrets = dir.path().join("secrets.json");
-        std::fs::write(&secrets, r#"{"key": "value"}"#).unwrap();
 
         let tool = FsEditTool::new();
         let result = tool
             .execute(serde_json::json!({
                 "path": secrets.to_str().unwrap(),
-                "old_string": "value",
-                "new_string": "hacked"
+                "old_string": "",
+                "new_string": "{\"k\": \"v\"}"
             }))
             .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
+        // Empty old_string creates the file; must succeed now that
+        // the hardcoded secrets.json deny check is gone.
+        assert!(
+            result.is_ok(),
+            "fs_edit create of 'secrets.json' must no longer be \
+             blocked by a hardcoded deny list (got: {:?})",
+            result.err()
+        );
     }
 
     #[tokio::test]

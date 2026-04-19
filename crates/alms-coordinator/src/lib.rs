@@ -1054,7 +1054,7 @@ async fn run_agent_loop(
     //
     // Ephemeral subagents get a disposable workspace so their fs_read/fs_write/
     // fs_list/fs_edit tools are sandboxed to a narrow directory instead of inheriting
-    // the project-root sandbox (which would expose data/secrets.json, the SQLite
+    // the project-root sandbox (which would expose sensitive state, the SQLite
     // database, and other agents' workspace files).
     if attach_workspace {
         if let Some(ws_dir) = workspace_dir {

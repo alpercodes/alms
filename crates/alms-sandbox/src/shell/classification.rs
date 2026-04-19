@@ -29,8 +29,8 @@
 //! slip through. This is why classification is one layer of defense-in-depth,
 //! sitting alongside the permission list, `env_clear()`, and Landlock.
 
+use crate::SandboxError;
 use crate::error::SandboxResult;
-use crate::{SandboxError, shell::security::DENIED_FILENAMES};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
@@ -96,8 +96,6 @@ pub enum RiskCategory {
     Obfuscation,
     /// Fork bomb or resource exhaustion pattern.
     ForkBomb,
-    /// Access to a denied filename (secrets.json, etc.).
-    DeniedFile,
 }
 
 impl std::fmt::Display for RiskCategory {
@@ -114,7 +112,6 @@ impl std::fmt::Display for RiskCategory {
             Self::PermissionChange => write!(f, "permission_change"),
             Self::Obfuscation => write!(f, "obfuscation"),
             Self::ForkBomb => write!(f, "fork_bomb"),
-            Self::DeniedFile => write!(f, "denied_file"),
         }
     }
 }
@@ -245,22 +242,10 @@ pub fn enforce(command: &str, mode: ClassificationMode) -> SandboxResult<Classif
     };
 
     if blocked {
-        // Flag denied-file findings explicitly so the agent sees a more
-        // actionable message ("denied file") instead of a generic one. The
-        // specific filename is always a member of `DENIED_FILENAMES` so this
-        // leaks nothing beyond the public project policy.
-        let denied_file = classification
-            .findings
-            .iter()
-            .find(|f| f.category == RiskCategory::DeniedFile);
-        let msg = if let Some(f) = denied_file {
-            format!("Command denied: {}", f.reason)
-        } else {
-            format!(
-                "Command blocked by built-in risk classifier (level: {})",
-                classification.level
-            )
-        };
+        let msg = format!(
+            "Command blocked by built-in risk classifier (level: {})",
+            classification.level
+        );
         return Err(SandboxError::SandboxViolation(msg));
     }
 
@@ -712,7 +697,6 @@ fn classify_fragment(frag: &str, out: &mut Classification) {
     check_obfuscation(&head, &args, frag, out);
     check_fork_bomb(frag, out);
     check_redirect_targets(&tokens, frag, out);
-    check_denied_filename_in_fragment(frag, out);
 }
 
 /// A head that starts with `$` (or the whole fragment reduces to just env
@@ -1598,25 +1582,6 @@ fn is_critical_system_file(target: &str) -> bool {
         || target.starts_with("/boot/")
 }
 
-// ─── Denied filename ─────────────────────────────────────────────────────
-
-fn check_denied_filename_in_fragment(frag: &str, out: &mut Classification) {
-    let lower = frag.to_ascii_lowercase();
-    for denied in DENIED_FILENAMES {
-        if lower.contains(denied) {
-            add_finding(
-                out,
-                Finding {
-                    category: RiskCategory::DeniedFile,
-                    level: RiskLevel::Destructive,
-                    reason: format!("command references denied file `{denied}`"),
-                    fragment: frag.to_string(),
-                },
-            );
-        }
-    }
-}
-
 // ─── Full-string checks (across pipes / chains) ──────────────────────────
 
 fn check_full_string(command: &str, out: &mut Classification) {
@@ -2067,12 +2032,6 @@ mod tests {
         let s = format!("r{}m -rf /", '\u{200B}');
         let c = classify(&s);
         assert_eq!(c.level, RiskLevel::Destructive);
-    }
-
-    #[test]
-    fn denied_file_in_substitution_is_flagged() {
-        let c = classify("echo $(cat secrets.json)");
-        assert!(cats(&c).contains(&RiskCategory::DeniedFile));
     }
 
     // ── C2: variable-expansion bypass ────────────────────────────────────

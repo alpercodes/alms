@@ -1,11 +1,9 @@
 use crate::error::SandboxResult;
 use crate::{SandboxError, Tool};
 use serde_json::Value;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use super::{
-    check_sandbox_path_async, check_sandbox_path_with_extras_async, is_denied_path, reject_unc_path,
-};
+use super::{check_sandbox_path_async, check_sandbox_path_with_extras_async, reject_unc_path};
 
 /// List directory contents.
 #[derive(Debug, Clone, Default)]
@@ -97,11 +95,6 @@ impl Tool for FsListTool {
                 break;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            // Filter denied filenames from directory listings to prevent
-            // information disclosure (e.g. revealing that secrets.json exists).
-            if is_denied_path(Path::new(&name)) {
-                continue;
-            }
             let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
             entries.push(serde_json::json!({ "name": name, "is_dir": is_dir }));
         }
@@ -222,8 +215,13 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Regression guard for #744: the hardcoded denied-filename filter
+    /// was removed from `fs_list`. All files in a listable directory
+    /// must now be returned regardless of basename (the filter was a
+    /// one-entry `["secrets.json"]` list that was not user-configurable
+    /// and leaked no more information than the sandbox already exposes).
     #[tokio::test]
-    async fn test_fs_list_hides_denied_files() {
+    async fn test_fs_list_no_hardcoded_basename_filter() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("secrets.json"), "secret").unwrap();
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
@@ -237,8 +235,8 @@ mod tests {
         let entries = result["entries"].as_array().unwrap();
         let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
         assert!(
-            !names.contains(&"secrets.json"),
-            "secrets.json should be filtered from directory listing"
+            names.contains(&"secrets.json"),
+            "secrets.json must now be listed — the hardcoded filter is gone"
         );
         assert!(names.contains(&"config.json"));
         assert!(names.contains(&"data.txt"));

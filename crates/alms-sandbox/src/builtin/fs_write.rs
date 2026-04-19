@@ -8,8 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{
-    check_sandbox_path_async, is_blocked_device_path, is_denied_path, normalize_unsandboxed_path,
-    reject_unc_path,
+    check_sandbox_path_async, is_blocked_device_path, normalize_unsandboxed_path, reject_unc_path,
 };
 
 /// Write (or append to) a file on the filesystem.
@@ -91,30 +90,16 @@ impl Tool for FsWriteTool {
             )));
         }
 
-        // Deny-list check: block writes to sensitive files.
-        if is_denied_path(Path::new(path)) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Access to '{}' is denied",
-                path
-            )));
-        }
-
         let resolved: PathBuf = if let Some(ref root) = self.sandbox_root {
             check_sandbox_path_async(path, root).await?
         } else {
             normalize_unsandboxed_path(path).await
         };
 
-        // Also check the resolved path for device paths and denied filenames.
+        // Also check the resolved path for device paths.
         if is_blocked_device_path(&resolved) {
             return Err(SandboxError::SandboxViolation(format!(
                 "Cannot write to device path '{}' — this is a system device, not a regular file",
-                path
-            )));
-        }
-        if is_denied_path(&resolved) {
-            return Err(SandboxError::SandboxViolation(format!(
-                "Access to '{}' is denied",
                 path
             )));
         }
@@ -301,8 +286,15 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("UNC paths"));
     }
 
+    /// Regression guard for #744: the hardcoded denied-filename
+    /// (`secrets.json`) check was removed from `fs_write`. It was a
+    /// single-entry list that was not user-configurable and was
+    /// trivially bypassable (symlinks, alternate paths, shell tool).
+    /// `fs_write` must no longer reject writes to a file just because
+    /// its basename is `secrets.json` — the write succeeds (or fails
+    /// for some other legitimate reason like sandbox root rules).
     #[tokio::test]
-    async fn test_fs_write_denied_secrets_json() {
+    async fn test_fs_write_no_hardcoded_secrets_json_deny() {
         let dir = tempfile::tempdir().unwrap();
         let secrets = dir.path().join("secrets.json");
 
@@ -310,11 +302,17 @@ mod tests {
         let result = tool
             .execute(serde_json::json!({
                 "path": secrets.to_str().unwrap(),
-                "content": "malicious"
+                "content": "not secret"
             }))
             .await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("denied"));
+        // Must succeed: the hardcoded denied-filename check is gone
+        // and no sandbox root is configured in this test.
+        assert!(
+            result.is_ok(),
+            "fs_write to a file named 'secrets.json' must no longer be \
+             blocked by a hardcoded deny list (got: {:?})",
+            result.err()
+        );
     }
 
     #[tokio::test]
