@@ -209,6 +209,13 @@ impl ToolRegistry {
                 SandboxError::ToolNotFound(tool) => {
                     AlmsError::ToolExecution(format!("Tool '{}' not found", tool))
                 }
+                // Preserve the structured classifier target (#758) so the
+                // runtime can include it in SSE tool_end payloads and audit
+                // events without regexing the error message.
+                SandboxError::ShellBlocked { reason, target } => {
+                    warn!("Tool execution blocked by classifier: {reason} (target={target:?})");
+                    AlmsError::ToolBlocked { reason, target }
+                }
                 other => {
                     warn!("Tool execution failed: {}", other);
                     AlmsError::ToolExecution(other.to_string())

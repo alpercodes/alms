@@ -210,6 +210,15 @@ function ResultSection({ tool, params, result, isFail, showFull }) {
         showFull.value = !showFull.value;
     };
 
+    // Classifier-extracted target on a blocked shell command (#758).
+    // Surfaced as a distinct "Target" row so operators can see *what* was
+    // targeted without string-parsing the error message.
+    const blockedTarget = (isFail
+        && typeof result === 'object' && result !== null
+        && typeof result.target === 'string' && result.target.length > 0)
+        ? result.target
+        : null;
+
     // Shell / shell_exec: render output as a code block
     if ((tool === 'shell' || tool === 'shell_exec') && !isFail) {
         return html`
@@ -305,6 +314,12 @@ function ResultSection({ tool, params, result, isFail, showFull }) {
     // Default: show result with truncation
     const label = isFail ? 'Error' : 'Result';
     return html`
+        ${blockedTarget && html`
+            <div class="tc-detail-section">
+                <div class="tc-detail-label">Target</div>
+                <pre class="tc-detail-content tc-code-block tc-detail-error">${blockedTarget}</pre>
+            </div>
+        `}
         <div class="tc-detail-section">
             <div class="tc-detail-label">${label}</div>
             <pre class="tc-detail-content${expandedCls} ${isFail ? 'tc-detail-error' : ''}">${displayText}</pre>

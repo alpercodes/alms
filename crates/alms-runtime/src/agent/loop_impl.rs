@@ -982,15 +982,30 @@ impl AgentRuntime {
                 }
             }
             Err(e) => {
+                // Surface the classifier-extracted target path (#758) when
+                // the error is a `ToolBlocked`, so operators can see *what*
+                // was targeted in logs, audit entries, and the UI.
+                let blocked_target: Option<String> = match e {
+                    AlmsError::ToolBlocked { target, .. } => target.clone(),
+                    _ => None,
+                };
                 error!(
                     target: "agent::tool::error",
                     agent_id = %self.agent_id.0,
                     tool_name = %name,
                     tool_call_id = %tool_call.id,
                     error = %e,
+                    blocked_target = ?blocked_target,
                     duration_ms = %elapsed.as_millis(),
                     "Tool execution failed"
                 );
+                // Expose the structured classifier target on the AuditEvent
+                // so downstream audit-log queries can filter on it without
+                // regexing the error message. Omit the `result` field entirely
+                // when no target is present (don't emit `{"target": null}`).
+                let audit_result = blocked_target
+                    .as_deref()
+                    .map(|t| serde_json::json!({"target": t}));
                 // Use `Error` (not `Deny`) to distinguish runtime failures
                 // from policy denials in audit log queries.
                 let _ = session_manager.append_audit(
@@ -1001,16 +1016,26 @@ impl AgentRuntime {
                         tool: name.to_string(),
                         decision: AuditDecision::Error,
                         params: args,
-                        result: None,
+                        result: audit_result,
                         error: Some(e.to_string()),
                         timestamp: alms_core::Timestamp::now(),
                     },
                 );
                 if let Some(ref sender) = self.event_sender {
+                    // Include the structured `target` field in the tool_end
+                    // payload so the web UI can render it prominently next
+                    // to the error message without string-parsing.
+                    let result_json = match &blocked_target {
+                        Some(t) => serde_json::json!({
+                            "error": e.to_string(),
+                            "target": t,
+                        }),
+                        None => serde_json::json!({"error": e.to_string()}),
+                    };
                     let _ = sender.send(RuntimeEvent::ToolEnd {
                         invocation_id,
                         ok: false,
-                        result: serde_json::json!({"error": e.to_string()}),
+                        result: result_json,
                         source_agent: None,
                         task_id: None,
                     });

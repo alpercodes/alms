@@ -476,6 +476,93 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
     assert!(saw_tool_end, "Should have emitted ToolEnd");
 }
 
+#[tokio::test]
+async fn test_classifier_blocked_shell_surfaces_target_in_tool_end() {
+    // Integration test for issue #758: verify the full chain
+    //   SandboxError::ShellBlocked  →  AlmsError::ToolBlocked
+    //                               →  RuntimeEvent::ToolEnd { result: {"target": ...} }
+    // actually carries the structured `target` field the UI consumes.
+    // All the unit tests in `classification.rs` cover the lower layers;
+    // this locks in the runtime-level plumbing.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // `with_builtins_sandboxed` registers `ShellTool` with the default
+    // classification mode (`BlockDestructive`), which is exactly the policy
+    // we want to exercise — `rm -rf /etc` is destructive.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["shell".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            // Autonomous — skip the approval gate so we go straight to
+            // tool execution and the classifier fires.
+            posture: Posture::Autonomous,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(config).unwrap(),
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: None,
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::BlockDestructive,
+        agent_name: None,
+    };
+
+    let tc = ToolCall::new("tc-blocked", "shell", r#"{"command":"rm -rf /etc"}"#);
+    let result = runtime
+        .execute_tool_call(&tc, uuid::Uuid::new_v4(), &session_manager, session.id)
+        .await;
+    assert!(
+        result.is_err(),
+        "classifier must block `rm -rf /etc` in BlockDestructive mode"
+    );
+    match result.unwrap_err() {
+        AlmsError::ToolBlocked { target, .. } => {
+            assert_eq!(
+                target.as_deref(),
+                Some("/etc"),
+                "ToolBlocked must carry structured target"
+            );
+        }
+        other => panic!("expected ToolBlocked, got {other:?}"),
+    }
+
+    drop(runtime);
+
+    // Drain events and locate the ToolEnd for our invocation. Assert that its
+    // result JSON carries `target == "/etc"` — this is the field the UI
+    // reads to render the "Target" row on a blocked shell call.
+    let mut saw_tool_end_with_target = false;
+    while let Ok(event) = rx.try_recv() {
+        if let RuntimeEvent::ToolEnd { ok, result, .. } = event {
+            assert!(!ok, "blocked call must report ok=false");
+            assert_eq!(
+                result.get("target").and_then(|v| v.as_str()),
+                Some("/etc"),
+                "ToolEnd.result must carry structured target: {result:?}"
+            );
+            saw_tool_end_with_target = true;
+        }
+    }
+    assert!(
+        saw_tool_end_with_target,
+        "runtime must emit ToolEnd with structured target on classifier block"
+    );
+}
+
 #[test]
 fn test_invalid_sandbox_root_fails_closed() {
     let config = crate::llm_types::LlmConfig {

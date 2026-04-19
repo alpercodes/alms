@@ -27,6 +27,19 @@ pub enum SandboxError {
     #[error("Sandbox violation: {0}")]
     SandboxViolation(String),
 
+    /// A shell command was blocked by the built-in risk classifier.
+    ///
+    /// Carries the structured `target` path (when the parser extracted one
+    /// from the command, e.g. `rm -rf /etc/passwd` → `Some("/etc/passwd")`)
+    /// so the UI / audit log / approval panel can surface *what* was targeted,
+    /// not just that something was blocked. `None` for findings without a
+    /// specific target (fork bombs, `curl | sh`, etc.). Issue #758.
+    #[error("{reason}")]
+    ShellBlocked {
+        reason: String,
+        target: Option<String>,
+    },
+
     #[error("HTTP error: {0}")]
     Http(String),
 

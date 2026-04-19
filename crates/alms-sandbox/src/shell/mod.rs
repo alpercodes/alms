@@ -458,10 +458,18 @@ impl Tool for ShellTool {
                     }
                 }
                 Err(e) => {
+                    // Surface the structured classifier target (#758) as a
+                    // dedicated tracing field so log pipelines can index on it
+                    // rather than regexing the message body.
+                    let classifier_target = match &e {
+                        SandboxError::ShellBlocked { target, .. } => target.as_deref(),
+                        _ => None,
+                    };
                     error!(
                         tool = "shell",
                         reason = "classifier_denied",
                         command_excerpt = %command_excerpt(&input.command),
+                        classifier_target = ?classifier_target,
                         error = %e,
                         "Shell command blocked by built-in risk classifier"
                     );

@@ -127,6 +127,15 @@ pub struct Finding {
     /// The specific sub-command fragment that triggered the finding (useful
     /// for logs — not returned to the agent).
     pub fragment: String,
+    /// The specific file / device / path the command targets, when the parser
+    /// extracted one from the command tokens. `None` for findings that do not
+    /// have a single clear target (fork bombs, `curl | sh`, etc.).
+    ///
+    /// Surfaced in `AuditEvent.result`, SSE `tool_end` payloads, and the UI
+    /// so operators can see *what* was being targeted, not just that
+    /// something was blocked. Issue #758.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// Full classification result for a command string.
@@ -152,6 +161,25 @@ impl Classification {
 
     pub fn is_moderate_or_worse(&self) -> bool {
         self.level >= RiskLevel::Moderate
+    }
+
+    /// Return the target path from the highest-severity finding that carries
+    /// one, preferring destructive over moderate findings. Returns `None`
+    /// when no finding extracted a specific target (fork bombs, generic
+    /// `curl | sh`, etc.). Issue #758.
+    ///
+    /// The returned string is the raw unexpanded token as it appeared in the
+    /// command (e.g. `$HOME`, `~/foo`, `${PREFIX}/bin`). This is deliberate:
+    /// expanding shell variables at classification time would require the
+    /// runtime environment and could leak secrets or hide the agent's
+    /// literal intent. Downstream consumers (UI, audit) should display the
+    /// raw value and leave interpretation to the operator.
+    pub fn primary_target(&self) -> Option<&str> {
+        self.findings
+            .iter()
+            .filter(|f| f.level == self.level && f.target.is_some())
+            .find_map(|f| f.target.as_deref())
+            .or_else(|| self.findings.iter().find_map(|f| f.target.as_deref()))
     }
 }
 
@@ -281,11 +309,18 @@ pub fn enforce(command: &str, mode: ClassificationMode) -> SandboxResult<Classif
     };
 
     if blocked {
-        let msg = format!(
-            "Command blocked by built-in risk classifier (level: {})",
-            classification.level
-        );
-        return Err(SandboxError::SandboxViolation(msg));
+        let target = classification.primary_target().map(|s| s.to_string());
+        let reason = match &target {
+            Some(t) => format!(
+                "Command blocked by built-in risk classifier (level: {}, target: {t})",
+                classification.level
+            ),
+            None => format!(
+                "Command blocked by built-in risk classifier (level: {})",
+                classification.level
+            ),
+        };
+        return Err(SandboxError::ShellBlocked { reason, target });
     }
 
     Ok(classification)
@@ -715,6 +750,7 @@ fn classify_fragment(frag: &str, out: &mut Classification) {
                     level: RiskLevel::Destructive,
                     reason: "ANSI-C quoted head combined with recursive-force flags on a sensitive target".into(),
                     fragment: frag.to_string(),
+                    target: None,
                 },
             );
         }
@@ -811,6 +847,7 @@ fn check_expansion_head(tokens: &[String], args: &[&str], frag: &str, out: &mut 
                 "assignment with RHS that names a dangerous binary".into()
             },
             fragment: frag.to_string(),
+            target: None,
         },
     );
 }
@@ -905,6 +942,7 @@ fn check_ansi_c_quoting(frag: &str, out: &mut Classification) -> bool {
                     level: RiskLevel::Moderate,
                     reason: "ANSI-C quoted string `$'...'` hides bytes from static analysis".into(),
                     fragment: frag.to_string(),
+                    target: None,
                 },
             );
             return true;
@@ -927,6 +965,7 @@ fn check_privilege(head: &str, frag: &str, out: &mut Classification) {
                 level: RiskLevel::Destructive,
                 reason: format!("privilege-escalation binary `{head}`"),
                 fragment: frag.to_string(),
+                target: None,
             },
         );
     }
@@ -945,6 +984,7 @@ fn check_system_control(head: &str, frag: &str, out: &mut Classification) {
                 level: RiskLevel::Destructive,
                 reason: format!("system control binary `{head}`"),
                 fragment: frag.to_string(),
+                target: None,
             },
         );
     }
@@ -966,6 +1006,7 @@ fn check_system_control(head: &str, frag: &str, out: &mut Classification) {
                     level: RiskLevel::Moderate,
                     reason: "systemctl altering service or power state".into(),
                     fragment: frag.to_string(),
+                    target: None,
                 },
             );
         }
@@ -989,6 +1030,7 @@ fn check_process_control(head: &str, args: &[&str], frag: &str, out: &mut Classi
                     level: RiskLevel::Destructive,
                     reason: "`kill -9 -1` targets every process".into(),
                     fragment: frag.to_string(),
+                    target: None,
                 },
             );
         } else if matches!(head, "killall" | "pkill") && has_sigkill {
@@ -999,6 +1041,7 @@ fn check_process_control(head: &str, args: &[&str], frag: &str, out: &mut Classi
                     level: RiskLevel::Moderate,
                     reason: format!("`{head}` with SIGKILL may disrupt services"),
                     fragment: frag.to_string(),
+                    target: None,
                 },
             );
         }
@@ -1027,6 +1070,10 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                 .any(|a| *a == "--force" || is_short_flag(a, 'f'));
             // positional targets (non-flag args, not the value of an option)
             let targets: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
+            // The first positional target is what we surface as the "target"
+            // on the finding. Subsequent targets still trigger the per-target
+            // heuristics below, but we keep the structured field simple.
+            let primary_target = targets.first().map(|t| t.to_string());
 
             if has_r && has_f {
                 // Any root-adjacent target → destructive
@@ -1038,6 +1085,7 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                             level: RiskLevel::Destructive,
                             reason: "`rm -rf` targeting root or system directory".into(),
                             fragment: frag.to_string(),
+                            target: primary_target.clone(),
                         },
                     );
                 } else if targets.iter().any(|t| is_home_like_path(t)) {
@@ -1048,6 +1096,7 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                             level: RiskLevel::Destructive,
                             reason: "`rm -rf` targeting user home directory".into(),
                             fragment: frag.to_string(),
+                            target: primary_target.clone(),
                         },
                     );
                 } else if targets.iter().any(|t| target_is_unresolved_expansion(t)) {
@@ -1062,6 +1111,7 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                             level: RiskLevel::Destructive,
                             reason: "`rm -rf` with unresolved shell expansion as target".into(),
                             fragment: frag.to_string(),
+                            target: primary_target.clone(),
                         },
                     );
                 } else if targets.is_empty() {
@@ -1074,6 +1124,7 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                             level: RiskLevel::Moderate,
                             reason: "`rm -rf` with no literal target (possible expansion)".into(),
                             fragment: frag.to_string(),
+                            target: None,
                         },
                     );
                 } else {
@@ -1085,12 +1136,17 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                             level: RiskLevel::Moderate,
                             reason: "recursive force-remove".into(),
                             fragment: frag.to_string(),
+                            target: primary_target,
                         },
                     );
                 }
             }
         }
         "shred" => {
+            let target = args
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .map(|t| t.to_string());
             add_finding(
                 out,
                 Finding {
@@ -1098,13 +1154,28 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                     level: RiskLevel::Destructive,
                     reason: "`shred` overwrites file contents irrecoverably".into(),
                     fragment: frag.to_string(),
+                    target,
                 },
             );
         }
         "dd" => {
-            let has_block_target = args
+            // Extract the of= target (trimming surrounding quotes if any).
+            // Guard against the empty-operand case (`dd of= bs=1M`) so we don't
+            // produce a finding with `target = Some("")` which would render as
+            // an empty `<pre>` block in the UI.
+            let of_target: Option<String> = args
                 .iter()
-                .any(|a| a.starts_with("of=") && is_block_device_target(&a[3..]));
+                .find(|a| a.starts_with("of="))
+                .map(|a| {
+                    a[3..]
+                        .trim_matches(|c: char| c == '"' || c == '\'')
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty());
+            let has_block_target = of_target
+                .as_deref()
+                .map(is_block_device_target)
+                .unwrap_or(false);
             if has_block_target {
                 add_finding(
                     out,
@@ -1113,9 +1184,10 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                         level: RiskLevel::Destructive,
                         reason: "`dd` writing to a block device".into(),
                         fragment: frag.to_string(),
+                        target: of_target,
                     },
                 );
-            } else if args.iter().any(|a| a.starts_with("of=")) {
+            } else if of_target.is_some() {
                 add_finding(
                     out,
                     Finding {
@@ -1123,11 +1195,13 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                         level: RiskLevel::Moderate,
                         reason: "`dd` writes raw bytes to `of=` target".into(),
                         fragment: frag.to_string(),
+                        target: of_target,
                     },
                 );
             }
         }
         "mkfs" => {
+            let target = first_positional(args);
             add_finding(
                 out,
                 Finding {
@@ -1135,11 +1209,13 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                     level: RiskLevel::Destructive,
                     reason: "`mkfs` formats a filesystem".into(),
                     fragment: frag.to_string(),
+                    target,
                 },
             );
         }
         // Cover mkfs.* variants (mkfs.ext4, mkfs.xfs, mkfs.btrfs, mkfs.vfat…)
         h if h.starts_with("mkfs.") => {
+            let target = first_positional(args);
             add_finding(
                 out,
                 Finding {
@@ -1147,10 +1223,12 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                     level: RiskLevel::Destructive,
                     reason: format!("`{h}` formats a filesystem"),
                     fragment: frag.to_string(),
+                    target,
                 },
             );
         }
         "fdisk" | "parted" | "sfdisk" | "wipefs" | "blkdiscard" => {
+            let target = first_positional(args);
             add_finding(
                 out,
                 Finding {
@@ -1158,12 +1236,16 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                     level: RiskLevel::Destructive,
                     reason: format!("`{head}` alters partition tables / wipes devices"),
                     fragment: frag.to_string(),
+                    target,
                 },
             );
         }
         "truncate" => {
             // truncate -s 0 /etc/* etc.
             if args.iter().any(|a| *a == "-s" || a.starts_with("--size")) {
+                // Skip the -s <size> / --size=N argument pair to find the
+                // actual file target.
+                let target = truncate_target(args);
                 add_finding(
                     out,
                     Finding {
@@ -1171,6 +1253,7 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                         level: RiskLevel::Moderate,
                         reason: "`truncate -s` can zero existing files".into(),
                         fragment: frag.to_string(),
+                        target,
                     },
                 );
             }
@@ -1182,6 +1265,46 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
 fn is_short_flag(arg: &str, flag: char) -> bool {
     // -rf, -fr, -Rf etc.
     arg.starts_with('-') && !arg.starts_with("--") && arg.chars().skip(1).any(|c| c == flag)
+}
+
+/// Return the first non-flag positional argument as an owned string, used to
+/// surface the "target" field on classifier findings (#758).
+fn first_positional(args: &[&str]) -> Option<String> {
+    // Filter out empty tokens as a belt-and-suspenders guard against future
+    // tokenizer changes that might produce them. Keeps the UI from rendering
+    // a "Target" row with an empty `<pre>` block.
+    args.iter()
+        .find(|a| !a.starts_with('-') && !a.is_empty())
+        .map(|t| t.to_string())
+}
+
+/// Extract the file target from a `truncate -s <size> <file>` invocation,
+/// skipping the size value that follows `-s`. `--size=N` fuses the value
+/// into a single token so it is handled by the generic positional skip.
+fn truncate_target(args: &[&str]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "-s" {
+            // Skip -s and its value.
+            i += 2;
+            continue;
+        }
+        if a.starts_with("--size") {
+            // --size=N or --size (followed by N)
+            if a == "--size" {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if !a.starts_with('-') && !a.is_empty() {
+            return Some(a.to_string());
+        }
+        i += 1;
+    }
+    None
 }
 
 fn is_root_like_path(p: &str) -> bool {
@@ -1243,6 +1366,7 @@ fn check_permission_change(head: &str, args: &[&str], frag: &str, out: &mut Clas
                     level: RiskLevel::Destructive,
                     reason: "`chmod 777` on a system directory".into(),
                     fragment: frag.to_string(),
+                    target: None,
                 },
             );
         } else if has_recursive && targets_root {
@@ -1253,6 +1377,7 @@ fn check_permission_change(head: &str, args: &[&str], frag: &str, out: &mut Clas
                     level: RiskLevel::Destructive,
                     reason: format!("recursive `{head}` on a system directory"),
                     fragment: frag.to_string(),
+                    target: None,
                 },
             );
         } else if has_recursive {
@@ -1263,6 +1388,7 @@ fn check_permission_change(head: &str, args: &[&str], frag: &str, out: &mut Clas
                     level: RiskLevel::Moderate,
                     reason: format!("recursive `{head}`"),
                     fragment: frag.to_string(),
+                    target: None,
                 },
             );
         }
@@ -1298,6 +1424,7 @@ fn check_git(head: &str, args: &[&str], frag: &str, out: &mut Classification) {
                         level: RiskLevel::Moderate,
                         reason: "`git push --force` rewrites remote history".into(),
                         fragment: frag.to_string(),
+                        target: None,
                     },
                 );
             }
@@ -1311,6 +1438,7 @@ fn check_git(head: &str, args: &[&str], frag: &str, out: &mut Classification) {
                         level: RiskLevel::Moderate,
                         reason: "`git reset --hard` discards local changes".into(),
                         fragment: frag.to_string(),
+                        target: None,
                     },
                 );
             }
@@ -1328,6 +1456,7 @@ fn check_git(head: &str, args: &[&str], frag: &str, out: &mut Classification) {
                         level: RiskLevel::Moderate,
                         reason: "`git clean -f/-fd/-fdx` deletes untracked files".into(),
                         fragment: frag.to_string(),
+                        target: None,
                     },
                 );
             }
@@ -1342,6 +1471,7 @@ fn check_git(head: &str, args: &[&str], frag: &str, out: &mut Classification) {
                         level: RiskLevel::Moderate,
                         reason: "`git checkout .` discards local changes".into(),
                         fragment: frag.to_string(),
+                        target: None,
                     },
                 );
             }
@@ -1355,6 +1485,7 @@ fn check_git(head: &str, args: &[&str], frag: &str, out: &mut Classification) {
                         level: RiskLevel::Moderate,
                         reason: "`git branch -D` force-deletes a branch".into(),
                         fragment: frag.to_string(),
+                        target: None,
                     },
                 );
             }
@@ -1388,6 +1519,7 @@ fn check_network(head: &str, args: &[&str], frag: &str, out: &mut Classification
                     level: RiskLevel::Moderate,
                     reason: "HTTP request sends local data outbound".into(),
                     fragment: frag.to_string(),
+                    target: None,
                 },
             );
         }
@@ -1402,6 +1534,7 @@ fn check_network(head: &str, args: &[&str], frag: &str, out: &mut Classification
                 level: RiskLevel::Destructive,
                 reason: "`nc -e` gives a remote host a shell".into(),
                 fragment: frag.to_string(),
+                target: None,
             },
         );
     }
@@ -1417,6 +1550,7 @@ fn check_network(head: &str, args: &[&str], frag: &str, out: &mut Classification
                 level: RiskLevel::Destructive,
                 reason: "reverse-shell via /dev/tcp or /dev/udp".into(),
                 fragment: frag.to_string(),
+                target: None,
             },
         );
     }
@@ -1453,6 +1587,7 @@ fn check_package_manager(head: &str, args: &[&str], frag: &str, out: &mut Classi
                         level: RiskLevel::Moderate,
                         reason: format!("`{head} {sub}` changes installed packages"),
                         fragment: frag.to_string(),
+                        target: None,
                     },
                 );
             }
@@ -1470,6 +1605,7 @@ fn check_package_manager(head: &str, args: &[&str], frag: &str, out: &mut Classi
                             level: RiskLevel::Moderate,
                             reason: format!("`{head} {sub} -g` mutates global packages"),
                             fragment: frag.to_string(),
+                            target: None,
                         },
                     );
                 }
@@ -1484,6 +1620,7 @@ fn check_package_manager(head: &str, args: &[&str], frag: &str, out: &mut Classi
                         level: RiskLevel::Moderate,
                         reason: format!("`{head} {sub}` mutates Python packages"),
                         fragment: frag.to_string(),
+                        target: None,
                     },
                 );
             }
@@ -1497,6 +1634,7 @@ fn check_package_manager(head: &str, args: &[&str], frag: &str, out: &mut Classi
                         level: RiskLevel::Moderate,
                         reason: format!("`cargo {sub}` mutates installed binaries"),
                         fragment: frag.to_string(),
+                        target: None,
                     },
                 );
             }
@@ -1517,6 +1655,7 @@ fn check_obfuscation(head: &str, args: &[&str], frag: &str, out: &mut Classifica
                 level: RiskLevel::Moderate,
                 reason: format!("`{head}` of an expanded expression"),
                 fragment: frag.to_string(),
+                target: None,
             },
         );
     }
@@ -1530,6 +1669,7 @@ fn check_obfuscation(head: &str, args: &[&str], frag: &str, out: &mut Classifica
                 level: RiskLevel::Moderate,
                 reason: "`base64 -d` decoding (often feeds an interpreter)".into(),
                 fragment: frag.to_string(),
+                target: None,
             },
         );
     }
@@ -1545,6 +1685,7 @@ fn check_obfuscation(head: &str, args: &[&str], frag: &str, out: &mut Classifica
                 level: RiskLevel::Moderate,
                 reason: "hex-to-binary decoding".into(),
                 fragment: frag.to_string(),
+                target: None,
             },
         );
     }
@@ -1565,6 +1706,7 @@ fn check_fork_bomb(frag: &str, out: &mut Classification) {
                 level: RiskLevel::Destructive,
                 reason: "fork bomb pattern".into(),
                 fragment: frag.to_string(),
+                target: None,
             },
         );
     }
@@ -1588,6 +1730,7 @@ fn check_redirect_targets(tokens: &[String], frag: &str, out: &mut Classificatio
                         level: RiskLevel::Destructive,
                         reason: "redirection to a block device".into(),
                         fragment: frag.to_string(),
+                        target: Some(target.to_string()),
                     },
                 );
             } else if is_critical_system_file(target) {
@@ -1598,6 +1741,7 @@ fn check_redirect_targets(tokens: &[String], frag: &str, out: &mut Classificatio
                         level: RiskLevel::Destructive,
                         reason: "redirection overwrites a critical system file".into(),
                         fragment: frag.to_string(),
+                        target: Some(target.to_string()),
                     },
                 );
             }
@@ -1639,6 +1783,7 @@ fn check_full_string(command: &str, out: &mut Classification) {
                 level: RiskLevel::Destructive,
                 reason: "downloaded payload is piped directly to a shell".into(),
                 fragment: command.to_string(),
+                target: None,
             },
         );
     }
@@ -1655,6 +1800,7 @@ fn check_full_string(command: &str, out: &mut Classification) {
                 level: RiskLevel::Destructive,
                 reason: "base64-decoded payload is piped to a shell".into(),
                 fragment: command.to_string(),
+                target: None,
             },
         );
     }
@@ -1797,6 +1943,37 @@ mod tests {
     fn dd_to_regular_file_is_moderate() {
         let c = classify("dd if=/dev/urandom of=./random.bin bs=1M count=10");
         assert_eq!(c.level, RiskLevel::Moderate);
+    }
+
+    #[test]
+    fn dd_of_empty_operand_has_no_target() {
+        // `dd of= bs=1M` tokenizes with an empty of= operand. Previously this
+        // produced a Moderate finding with `target: Some("")`, which rendered
+        // as an empty `<pre>` block in the UI. Lock in that the empty operand
+        // does not produce a finding with a spurious empty target.
+        let c = classify("dd of= bs=1M");
+        // Whether a finding is produced at all depends on the parser's
+        // `of_target.is_some()` guard — with the empty-string filter the
+        // target becomes None, so no finding is emitted. Either way,
+        // no finding may carry `target == Some("")`.
+        for f in &c.findings {
+            assert_ne!(
+                f.target.as_deref(),
+                Some(""),
+                "finding must not carry an empty-string target: {f:?}"
+            );
+        }
+        // Belt-and-suspenders: with the current implementation the empty
+        // operand short-circuits before the Moderate branch fires, so no
+        // dd finding is emitted at all.
+        assert!(
+            c.findings
+                .iter()
+                .all(|f| f.category != RiskCategory::FilesystemDestructive
+                    || !f.fragment.starts_with("dd")),
+            "unexpected dd finding for empty of= operand: {:?}",
+            c.findings
+        );
     }
 
     #[test]
@@ -2230,6 +2407,123 @@ mod tests {
         // internal pattern.
         assert!(msg.contains("built-in risk classifier"));
         assert!(!msg.contains("rm -rf"), "must not echo the command back");
+    }
+
+    // ── Target surfacing (#758) ──────────────────────────────────────────
+
+    #[test]
+    fn rm_rf_literal_path_carries_target() {
+        // The parser already extracts the positional path from `rm -rf <path>`;
+        // it now flows onto the `Finding.target` field and out through
+        // `Classification::primary_target()` / `SandboxError::ShellBlocked`.
+        //
+        // `/etc` is a system-root prefix, so this classifies as Destructive
+        // and flows through the BlockDestructive path.
+        let c = classify("rm -rf /etc");
+        assert_eq!(c.level, RiskLevel::Destructive);
+        assert_eq!(c.primary_target(), Some("/etc"));
+
+        let err = enforce("rm -rf /etc", ClassificationMode::BlockDestructive).unwrap_err();
+        match &err {
+            SandboxError::ShellBlocked { target, .. } => {
+                assert_eq!(target.as_deref(), Some("/etc"));
+            }
+            other => panic!("expected ShellBlocked, got {other:?}"),
+        }
+        // The message surfaces the target for operators without leaking the
+        // full command fragment.
+        let msg = err.to_string();
+        assert!(msg.contains("target: /etc"), "msg = {msg}");
+        assert!(!msg.contains("rm -rf"), "still must not echo argv");
+    }
+
+    #[test]
+    fn rm_rf_deep_path_is_moderate_but_still_carries_target() {
+        // `rm -rf /some/path` is Moderate (could be a typo), not Destructive,
+        // so BlockDestructive lets it through. The target is still populated
+        // on the finding so operators see it in audit logs when `Warn` /
+        // `Strict` surface these to the UI.
+        let c = classify("rm -rf /some/path");
+        assert_eq!(c.level, RiskLevel::Moderate);
+        assert_eq!(c.primary_target(), Some("/some/path"));
+
+        // In Strict mode, the block does fire and the target rides along.
+        let err = enforce("rm -rf /some/path", ClassificationMode::Strict).unwrap_err();
+        match &err {
+            SandboxError::ShellBlocked { target, .. } => {
+                assert_eq!(target.as_deref(), Some("/some/path"));
+            }
+            other => panic!("expected ShellBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fork_bomb_has_no_target() {
+        // Patterns with no single clear target (fork bombs, generic `curl | sh`)
+        // leave `target = None` so the UI / audit does not fabricate one.
+        let c = classify(":(){ :|:& };:");
+        assert_eq!(c.level, RiskLevel::Destructive);
+        assert_eq!(c.primary_target(), None);
+
+        let err = enforce(":(){ :|:& };:", ClassificationMode::BlockDestructive).unwrap_err();
+        match &err {
+            SandboxError::ShellBlocked { target, .. } => assert!(target.is_none()),
+            other => panic!("expected ShellBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dd_of_block_device_surfaces_target() {
+        let c = classify("dd if=/dev/zero of=/dev/sda bs=1M");
+        assert_eq!(c.level, RiskLevel::Destructive);
+        assert_eq!(c.primary_target(), Some("/dev/sda"));
+    }
+
+    #[test]
+    fn mkfs_variant_surfaces_device_target() {
+        let c = classify("mkfs.ext4 /dev/sdb1");
+        assert_eq!(c.level, RiskLevel::Destructive);
+        assert_eq!(c.primary_target(), Some("/dev/sdb1"));
+
+        let c = classify("mkfs.xfs -f /dev/nvme0n1p2");
+        assert_eq!(c.level, RiskLevel::Destructive);
+        assert_eq!(c.primary_target(), Some("/dev/nvme0n1p2"));
+    }
+
+    #[test]
+    fn dangerous_redirect_surfaces_target() {
+        let c = classify("echo pwned > /etc/passwd");
+        assert_eq!(c.level, RiskLevel::Destructive);
+        assert_eq!(c.primary_target(), Some("/etc/passwd"));
+    }
+
+    #[test]
+    fn finding_target_serializes_to_json() {
+        // Snapshot check: the `target` field must be present in the JSON
+        // shape the audit log / SSE payload is built from when it has a
+        // value, and absent (skipped) when it is None. This is what the
+        // web UI reads to render the "Target" row.
+        let c = classify("rm -rf /etc/passwd");
+        let json = serde_json::to_value(&c).expect("classification is serializable");
+        let findings = json.get("findings").and_then(|v| v.as_array()).unwrap();
+        let with_target = findings
+            .iter()
+            .find(|f| f.get("target").is_some())
+            .expect("at least one finding carries `target`");
+        assert_eq!(
+            with_target.get("target").and_then(|v| v.as_str()),
+            Some("/etc/passwd")
+        );
+
+        // Fork bomb: `target` is skipped entirely in the serialized output
+        // (not `null`) so consumers can check presence rather than null.
+        let c = classify(":(){ :|:& };:");
+        let json = serde_json::to_value(&c).expect("classification is serializable");
+        let findings = json.get("findings").and_then(|v| v.as_array()).unwrap();
+        assert!(
+            findings.iter().all(|f| f.get("target").is_none()),
+            "fork bomb findings must not serialize a target key: {findings:?}"
+        );
     }
 
     // ── Parser unit tests ────────────────────────────────────────────────
