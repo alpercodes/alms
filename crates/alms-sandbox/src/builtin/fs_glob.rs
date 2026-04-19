@@ -339,6 +339,41 @@ mod tests {
         assert_eq!(files[1].as_str().unwrap(), "old.txt");
     }
 
+    /// `fs_glob` must sort strictly by mtime descending across more than
+    /// two entries — a stronger guarantee than the two-entry test above
+    /// and a regression guard for the "newest first" ordering required by
+    /// #754 item 2.
+    #[tokio::test]
+    async fn test_fs_glob_sorted_by_mtime_strict_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Write in a random order — the sort should reorder them by mtime.
+        let names = ["c.log", "a.log", "b.log", "d.log"];
+        for name in &names {
+            std::fs::write(root.join(name), "x\n").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Expected newest-first order is reverse of write order.
+
+        let tool = FsGlobTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "*.log",
+                "path": root.to_str().unwrap()
+            }))
+            .await
+            .unwrap();
+
+        let files: Vec<String> = result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(files, vec!["d.log", "b.log", "a.log", "c.log"]);
+    }
+
     #[tokio::test]
     async fn test_fs_glob_result_limit_and_truncated() {
         let dir = tempfile::tempdir().unwrap();

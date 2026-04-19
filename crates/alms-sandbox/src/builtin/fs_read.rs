@@ -4,12 +4,100 @@ use crate::{SandboxError, Tool};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 
 use super::{
     check_sandbox_path_async, check_sandbox_path_with_extras_async, is_blocked_device_path,
     normalize_unsandboxed_path, reject_unc_path,
 };
+
+/// File extensions that are always treated as binary — we refuse to
+/// read them through `fs_read`.  Kept short on purpose: these are the
+/// file types where returning U+FFFD-littered "text" is strictly worse
+/// than a clean error.  The content sniffer (below) handles everything
+/// else.
+const BINARY_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "pdf", "zip", "gz", "xz", "tar", "exe", "dll", "so",
+    "dylib", "class", "jar", "o", "a", "wasm",
+];
+
+/// Number of bytes sampled from the start of a file for binary detection.
+const BINARY_SNIFF_BYTES: usize = 4096;
+
+/// Ratio (0.0–1.0) of non-printable bytes in the sniffed prefix above
+/// which the file is classified as binary.
+const BINARY_NON_PRINTABLE_RATIO: f64 = 0.30;
+
+/// Maximum number of "did you mean?" suggestions appended to an
+/// ENOENT error for a mistyped path.
+const DID_YOU_MEAN_LIMIT: usize = 3;
+
+/// Return `true` if `path`'s extension is in the static binary denylist.
+/// Case-insensitive.  Returns `false` for extensionless paths.
+///
+/// Note: this check runs *before* [`looks_binary`] in `fs_read`, so when
+/// the extension matches (e.g. `.png`, `.zip`) the file is rejected by
+/// extension alone and the content sniff never fires.  Extensionless
+/// binaries and renamed-as-text binaries still fall through to
+/// [`looks_binary`].
+fn has_binary_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e_lower = e.to_ascii_lowercase();
+            BINARY_EXTENSIONS.iter().any(|b| *b == e_lower)
+        })
+        .unwrap_or(false)
+}
+
+/// Inspect the first `BINARY_SNIFF_BYTES` of a byte slice and decide
+/// whether it looks binary.  Heuristic: any NUL byte, or more than
+/// `BINARY_NON_PRINTABLE_RATIO` non-printable (non-ASCII-printable,
+/// non-whitespace, non-UTF-8-continuation) bytes.
+fn looks_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    if bytes.contains(&0) {
+        return true;
+    }
+    let non_printable = bytes
+        .iter()
+        .filter(|&&b| {
+            // Printable ASCII (0x20..=0x7E) and common whitespace are fine.
+            // Bytes >= 0x80 are treated as printable here: legitimate UTF-8
+            // text is mostly made of them, and the NUL check above already
+            // catches most real binaries.
+            let is_printable_ascii = (0x20..=0x7E).contains(&b);
+            let is_whitespace = matches!(b, b'\t' | b'\n' | b'\r' | 0x0C); // \t \n \r \f
+            let is_high = b >= 0x80;
+            !(is_printable_ascii || is_whitespace || is_high)
+        })
+        .count();
+    (non_printable as f64) / (bytes.len() as f64) > BINARY_NON_PRINTABLE_RATIO
+}
+
+/// Compute up to `DID_YOU_MEAN_LIMIT` fuzzy-closest sibling names for
+/// `missing` inside `parent`.  Returns an empty list if `parent` can't
+/// be read (we never surface the readdir error to the caller — this is
+/// a best-effort UX sugar).
+fn did_you_mean(parent: &Path, missing: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    // (distance, name) — smaller distance is better.
+    let mut scored: Vec<(usize, String)> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .map(|n| (strsim::levenshtein(&n, missing), n))
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(DID_YOU_MEAN_LIMIT)
+        .map(|(_, n)| n)
+        .collect()
+}
 
 /// Read a file from the filesystem.
 #[derive(Debug, Clone, Default)]
@@ -154,13 +242,50 @@ impl Tool for FsReadTool {
         }
 
         // Retrieve metadata and verify the path is a regular file.
-        let meta = tokio::fs::metadata(&resolved)
-            .await
-            .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+        let meta = match tokio::fs::metadata(&resolved).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // "Did you mean?" sugar: if the parent dir exists and we
+                // can read it, suggest the closest sibling names.  The
+                // parent is already known to live inside an allowed root
+                // (the sandbox check above rejected anything else), so
+                // we can readdir it without a second sandbox hop.
+                let missing_name = resolved.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let suggestions = match resolved.parent() {
+                    Some(parent) if !missing_name.is_empty() => did_you_mean(parent, missing_name),
+                    _ => Vec::new(),
+                };
+                let suffix = if suggestions.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — did you mean: {}?", suggestions.join(", "))
+                };
+                return Err(SandboxError::Io(format!(
+                    "Failed to read '{}': {}{}",
+                    path, e, suffix
+                )));
+            }
+            Err(e) => {
+                return Err(SandboxError::Io(format!(
+                    "Failed to read '{}': {}",
+                    path, e
+                )));
+            }
+        };
 
         if !meta.is_file() {
             return Err(SandboxError::InvalidParameters(format!(
                 "Path '{}' is not a regular file",
+                path
+            )));
+        }
+
+        // Reject files whose extension is in the static binary denylist
+        // before we open them.  Cheap check — no syscalls.
+        if has_binary_extension(&resolved) {
+            return Err(SandboxError::InvalidParameters(format!(
+                "File '{}' appears to be binary (extension in denylist); \
+                 fs_read only handles text files",
                 path
             )));
         }
@@ -175,10 +300,34 @@ impl Tool for FsReadTool {
             )));
         }
 
-        // Open file and read lines using BufReader for memory efficiency.
-        let file = tokio::fs::File::open(&resolved)
+        // Content sniff: read the first ~4 KB from the handle and reject
+        // the file if it looks binary (NUL byte or >30% non-printable).
+        // This is independent of the extension-based denylist above —
+        // catches things like renamed or extensionless binaries.  The
+        // same handle is then rewound and reused by the line reader so
+        // we only open the file once.
+        let mut file = tokio::fs::File::open(&resolved)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+        {
+            let mut sniff_buf = vec![0u8; BINARY_SNIFF_BYTES];
+            let n = file
+                .read(&mut sniff_buf)
+                .await
+                .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+            sniff_buf.truncate(n);
+            if looks_binary(&sniff_buf) {
+                return Err(SandboxError::InvalidParameters(format!(
+                    "File '{}' appears to be binary; fs_read only handles text files",
+                    path
+                )));
+            }
+            file.seek(std::io::SeekFrom::Start(0))
+                .await
+                .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
+        }
+
+        // Reuse the same handle for the line reader — one open() total.
         let reader = BufReader::new(file);
         let mut lines_stream = reader.lines();
 
@@ -902,6 +1051,176 @@ mod tests {
             result.is_ok(),
             "with deny list removed, read through extra root should succeed: {:?}",
             result.err()
+        );
+    }
+
+    // ── Binary-file sniff (#754 item 1) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn test_fs_read_binary_extension_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("icon.png");
+        // Legitimate-looking PNG magic bytes — a naive content sniff might
+        // still pass, so this test pins the extension-level denylist.
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nfake-png-body").unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("binary"),
+            "error should mention binary, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_binary_content_sniff_rejected() {
+        // Extensionless file whose content is binary — extension denylist
+        // can't catch this, the content sniffer must.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"header");
+        bytes.push(0u8); // a NUL byte trips the sniffer immediately
+        bytes.extend_from_slice(b"body");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("binary"),
+            "error should mention binary, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_utf8_text_not_flagged_as_binary() {
+        // Unicode text (non-ASCII bytes >= 0x80) must NOT be rejected.
+        // Regression guard against the sniffer being too aggressive.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utf8.txt");
+        std::fs::write(&path, "café — résumé — naïve\nこんにちは\n").unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await
+            .unwrap();
+        let content = result["content"].as_str().unwrap();
+        assert!(content.contains("café"));
+        assert!(content.contains("こんにちは"));
+    }
+
+    // ── "Did you mean?" on ENOENT (#754 item 3) ────────────────────────────
+
+    #[tokio::test]
+    async fn test_fs_read_did_you_mean_suggests_close_match() {
+        // Typo'd extension — classic agent mistake.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo.ts"), "export const x = 1;\n").unwrap();
+        std::fs::write(dir.path().join("bar.ts"), "export const y = 2;\n").unwrap();
+
+        let missing = dir.path().join("foo.tsx");
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": missing.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("did you mean"),
+            "error should include suggestion block, got: {err}"
+        );
+        assert!(
+            err.contains("foo.ts"),
+            "closest sibling `foo.ts` should be in suggestions, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_did_you_mean_caps_at_three() {
+        // Parent dir has many files — suggestion list must be trimmed to 3.
+        let dir = tempfile::tempdir().unwrap();
+        for name in &["alpha", "alphb", "alphc", "alphd", "alphe", "zzz"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let missing = dir.path().join("alphz");
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": missing.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // Count how many of the expected close names appear.
+        let hits = ["alpha", "alphb", "alphc", "alphd", "alphe"]
+            .iter()
+            .filter(|n| err.contains(*n))
+            .count();
+        assert_eq!(
+            hits, 3,
+            "expected exactly 3 suggestions from the close set, got {hits} in: {err}"
+        );
+        assert!(
+            !err.contains("zzz"),
+            "far-away name should not be suggested: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_did_you_mean_silent_when_parent_missing() {
+        // Parent dir doesn't exist — suggestion block must be omitted,
+        // not crash.  The underlying ENOENT must still propagate.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent_dir").join("deep").join("gone.txt");
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": missing.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            !err.contains("did you mean"),
+            "should not suggest when parent can't be read: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fs_read_did_you_mean_distance_ranking() {
+        // Four candidates with strictly distinct Levenshtein distances from
+        // the missing target.  The cap-of-3 means the furthest candidate
+        // must be dropped, and the three that survive must appear in
+        // distance order (smallest first).  Specifically exercises the
+        // ranking logic rather than the cap — `caps_at_three` already
+        // covers close-vs-far cutoff.
+        let dir = tempfile::tempdir().unwrap();
+        // Levenshtein distances from "foobar" (6 chars):
+        //   "foobaz"   = 1 (substitute r→z)
+        //   "foobxy"   = 2 (substitute a→x, r→y)
+        //   "fxxxxx"   = 5 (substitute o,o,b,a,r → x)
+        //   "zzzzzzzz" = 8 (all substitutions + 2 inserts)
+        for name in &["foobaz", "foobxy", "fxxxxx", "zzzzzzzz"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        let missing = dir.path().join("foobar");
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": missing.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        // With cap=3 and these distinct distances, the three closest must
+        // appear in this exact order, and the furthest (zzzzzzzz, dist 8)
+        // must be dropped.
+        assert!(
+            err.contains("did you mean: foobaz, foobxy, fxxxxx?"),
+            "expected suggestions in distance order [foobaz, foobxy, fxxxxx], got: {err}"
+        );
+        assert!(
+            !err.contains("zzzzzzzz"),
+            "furthest candidate should be dropped by cap: {err}"
         );
     }
 }

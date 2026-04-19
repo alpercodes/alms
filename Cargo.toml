@@ -97,6 +97,9 @@ regex = "1"
 walkdir = "2"
 globset = "0.4"
 
+# Fuzzy string matching (used by fs_read "did you mean?" suggestions).
+strsim = "0.11"
+
 # Testing
 tokio-test = "0.4"
 
