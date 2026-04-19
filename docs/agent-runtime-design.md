@@ -62,13 +62,20 @@ max_output_bytes = 65536
 # only matching commands pass (allowlist mode); otherwise all non-denied
 # commands pass (denylist-only mode).
 #
+# `classifier_overrides` is an operator-only escape hatch for the
+# destructive-command classifier (see `tools.shell_classification_mode`):
+# patterns here bypass the classifier floor but still honour
+# `denied_commands` and the OS-level sandbox. Operator intent only —
+# never model-visible and cannot be set via `PATCH /settings`.
+#
 # Applied in addition to the hardcoded destructive-command denylist in
 # `alms-sandbox` (defense-in-depth). Compiled once at startup — changing
 # these values at runtime via `PATCH /settings` is not supported; restart
 # the gateway to pick up new patterns.
 [tools.shell_permissions]
-allowed_commands = ["^(git|cargo|npm)\\b"]
-denied_commands  = ["git\\s+push\\s+.*--force", "^rm\\s+-rf\\s+/"]
+allowed_commands     = ["^(git|cargo|npm)\\b"]
+denied_commands      = ["git\\s+push\\s+.*--force", "^rm\\s+-rf\\s+/"]
+classifier_overrides = ["^rm\\s+-rf\\s+/tmp/alms-test-.*"]
 
 [channels.telegram]
 # token loaded from secrets store via `alms auth set telegram <token>`

@@ -3,12 +3,17 @@
 //! Evaluates regex patterns against command strings before execution.
 //! This acts as a policy gate integrated into the shell execution pipeline.
 //!
-//! Evaluation order:
+//! Evaluation order (inside `check_command`):
 //! 1. If any `denied_commands` pattern matches, the command is blocked.
 //! 2. If `allowed_commands` is non-empty, only commands matching at least
 //!    one pattern are permitted (allowlist mode).
 //! 3. If `allowed_commands` is empty, all non-denied commands are allowed
 //!    (denylist-only mode).
+//!
+//! The `classifier_overrides` list is checked separately via
+//! [`CompiledPermissions::matching_classifier_override`] — operators use
+//! it to exempt specific commands from the built-in risk classifier.
+//! Overrides do **not** bypass the deny list.
 
 use crate::SandboxError;
 use crate::error::SandboxResult;
@@ -28,6 +33,9 @@ pub struct CompiledPermissions {
     allowed: Vec<CompiledPattern>,
     /// Compiled deny patterns.
     denied: Vec<CompiledPattern>,
+    /// Compiled classifier-override patterns. A command matching one of these
+    /// bypasses the built-in risk classifier (but not the deny list).
+    classifier_overrides: Vec<CompiledPattern>,
 }
 
 /// A single compiled regex pattern with its original source for error messages.
@@ -49,24 +57,37 @@ impl CompiledPermissions {
     pub fn compile(permissions: &ShellPermissions) -> Self {
         let allowed = compile_patterns(&permissions.allowed_commands, "allowed");
         let denied = compile_patterns(&permissions.denied_commands, "denied");
+        let classifier_overrides =
+            compile_patterns(&permissions.classifier_overrides, "classifier_overrides");
 
-        if !allowed.is_empty() || !denied.is_empty() {
+        if !allowed.is_empty() || !denied.is_empty() || !classifier_overrides.is_empty() {
             debug!(
                 allowed_count = allowed.len(),
                 denied_count = denied.len(),
+                classifier_override_count = classifier_overrides.len(),
                 "Shell permissions compiled"
             );
         }
 
-        Self { allowed, denied }
+        Self {
+            allowed,
+            denied,
+            classifier_overrides,
+        }
     }
 
     /// Check whether a command is permitted by the configured rules.
     ///
     /// Returns `Ok(())` if the command is allowed, or `Err(SandboxError::SandboxViolation)`
     /// with a descriptive message if the command is blocked.
+    ///
+    /// This does **not** consult `classifier_overrides` — those are applied
+    /// separately by the caller, *between* the allow/deny check and the risk
+    /// classifier (see `ShellTool::execute`).
     pub fn check_command(&self, command: &str) -> SandboxResult<()> {
-        // If no patterns are configured, everything is allowed.
+        // If no allow/deny patterns are configured, everything is allowed.
+        // `classifier_overrides` is intentionally not considered here — it
+        // controls classifier behaviour, not whether the command is admitted.
         if self.allowed.is_empty() && self.denied.is_empty() {
             return Ok(());
         }
@@ -105,9 +126,36 @@ impl CompiledPermissions {
         Ok(())
     }
 
-    /// Returns true if no patterns are configured (no-op mode).
+    /// Returns true if no allow/deny patterns are configured (no-op mode).
+    ///
+    /// Classifier overrides are intentionally excluded — they control
+    /// classifier behaviour, not whether any given command is admitted. A
+    /// `CompiledPermissions` with only overrides is still "empty" from the
+    /// `check_command` perspective (all commands pass the admission gate).
     pub fn is_empty(&self) -> bool {
         self.allowed.is_empty() && self.denied.is_empty()
+    }
+
+    /// Returns `true` if any `classifier_overrides` pattern matches the command.
+    ///
+    /// The override list is opt-in, operator-only, and never model-visible.
+    /// A match means "the operator has explicitly declared this command safe
+    /// enough to skip the built-in risk classifier". The deny list still
+    /// applies to overridden commands; overrides do **not** weaken any other
+    /// part of the defence chain.
+    pub fn classifier_override_matches(&self, command: &str) -> bool {
+        self.classifier_overrides
+            .iter()
+            .any(|p| p.regex.is_match(command))
+    }
+
+    /// Returns the source pattern of the first classifier override that matches.
+    /// Intended for structured logging of override hits.
+    pub fn matching_classifier_override(&self, command: &str) -> Option<&str> {
+        self.classifier_overrides
+            .iter()
+            .find(|p| p.regex.is_match(command))
+            .map(|p| p.source.as_str())
     }
 }
 
@@ -148,6 +196,21 @@ mod tests {
         let config = ShellPermissions {
             allowed_commands: allowed.iter().map(|s| s.to_string()).collect(),
             denied_commands: denied.iter().map(|s| s.to_string()).collect(),
+            classifier_overrides: vec![],
+        };
+        CompiledPermissions::compile(&config)
+    }
+
+    /// Helper to create permissions with classifier overrides included.
+    fn perms_with_overrides(
+        allowed: &[&str],
+        denied: &[&str],
+        overrides: &[&str],
+    ) -> CompiledPermissions {
+        let config = ShellPermissions {
+            allowed_commands: allowed.iter().map(|s| s.to_string()).collect(),
+            denied_commands: denied.iter().map(|s| s.to_string()).collect(),
+            classifier_overrides: overrides.iter().map(|s| s.to_string()).collect(),
         };
         CompiledPermissions::compile(&config)
     }
@@ -321,10 +384,12 @@ mod tests {
         let global = ShellPermissions {
             allowed_commands: vec![],
             denied_commands: vec!["^rm\\b".to_string()],
+            classifier_overrides: vec![],
         };
         let agent = ShellPermissions {
             allowed_commands: vec![],
             denied_commands: vec!["^mkfs".to_string()],
+            classifier_overrides: vec![],
         };
         let merged = global.merge_with(&agent);
         assert_eq!(merged.denied_commands.len(), 2);
@@ -337,10 +402,12 @@ mod tests {
         let global = ShellPermissions {
             allowed_commands: vec!["^ls\\b".to_string(), "^cat\\b".to_string()],
             denied_commands: vec![],
+            classifier_overrides: vec![],
         };
         let agent = ShellPermissions {
             allowed_commands: vec!["^git\\b".to_string()],
             denied_commands: vec![],
+            classifier_overrides: vec![],
         };
         let merged = global.merge_with(&agent);
         assert_eq!(merged.allowed_commands, vec!["^git\\b".to_string()]);
@@ -351,10 +418,12 @@ mod tests {
         let global = ShellPermissions {
             allowed_commands: vec!["^ls\\b".to_string()],
             denied_commands: vec![],
+            classifier_overrides: vec![],
         };
         let agent = ShellPermissions {
             allowed_commands: vec![],
             denied_commands: vec!["^rm\\b".to_string()],
+            classifier_overrides: vec![],
         };
         let merged = global.merge_with(&agent);
         assert_eq!(merged.allowed_commands, vec!["^ls\\b".to_string()]);
@@ -376,5 +445,93 @@ mod tests {
         let p = CompiledPermissions::compile(&ShellPermissions::default());
         assert!(p.is_empty());
         assert!(p.check_command("anything").is_ok());
+        assert!(!p.classifier_override_matches("anything"));
+    }
+
+    // ── Classifier overrides (issue #745) ───────────────────
+
+    #[test]
+    fn classifier_overrides_are_compiled() {
+        let p = perms_with_overrides(&[], &[], &[r"^sudo apt-get update$"]);
+        assert!(p.classifier_override_matches("sudo apt-get update"));
+        assert!(!p.classifier_override_matches("sudo rm -rf /"));
+    }
+
+    #[test]
+    fn classifier_overrides_do_not_affect_check_command() {
+        // An override list must NOT substitute for an allowlist match.
+        // Commands that would otherwise fail the allowlist still fail.
+        let p = perms_with_overrides(&[r"^echo\b"], &[], &[r"^sudo\b"]);
+        assert!(
+            p.check_command("sudo rm -rf /").is_err(),
+            "override must not satisfy the allowlist"
+        );
+        assert!(p.check_command("echo hi").is_ok());
+    }
+
+    #[test]
+    fn classifier_overrides_respect_deny_list() {
+        // An override is not a super-power — the deny list still wins.
+        let p = perms_with_overrides(&[r".*"], &[r"rm\s+-rf"], &[r"rm\s+-rf"]);
+        assert!(p.classifier_override_matches("rm -rf /"));
+        // check_command still rejects it because deny wins.
+        assert!(p.check_command("rm -rf /").is_err());
+    }
+
+    #[test]
+    fn is_empty_ignores_classifier_overrides() {
+        // A permissions set with only overrides is still "empty" from the
+        // admission-gate perspective — check_command allows everything.
+        let p = perms_with_overrides(&[], &[], &[r"^anything$"]);
+        assert!(p.is_empty());
+        assert!(p.check_command("arbitrary").is_ok());
+    }
+
+    #[test]
+    fn matching_classifier_override_returns_source_pattern() {
+        let p = perms_with_overrides(&[], &[], &[r"^sudo apt-get\b", r"^docker\b"]);
+        assert_eq!(
+            p.matching_classifier_override("sudo apt-get update"),
+            Some("^sudo apt-get\\b")
+        );
+        assert_eq!(p.matching_classifier_override("ls"), None);
+    }
+
+    #[test]
+    fn invalid_override_regex_is_skipped() {
+        let p = perms_with_overrides(&[], &[], &[r"(unclosed", r"^echo\b"]);
+        // The valid pattern still works
+        assert!(p.classifier_override_matches("echo hi"));
+        // The invalid pattern was silently dropped — no match on arbitrary input
+        assert!(!p.classifier_override_matches("(unclosed anything"));
+    }
+
+    #[test]
+    fn merge_classifier_overrides_union() {
+        // Overrides are operator-only today; using union semantics matches
+        // `denied_commands`. See `ShellPermissions::merge_with` for the
+        // threat-model caveat if per-agent config ever becomes less trusted.
+        let global = ShellPermissions {
+            allowed_commands: vec![],
+            denied_commands: vec![],
+            classifier_overrides: vec!["^sudo apt-get\\b".to_string()],
+        };
+        let agent = ShellPermissions {
+            allowed_commands: vec![],
+            denied_commands: vec![],
+            classifier_overrides: vec!["^docker\\b".to_string()],
+        };
+        let merged = global.merge_with(&agent);
+        assert_eq!(merged.classifier_overrides.len(), 2);
+        assert!(
+            merged
+                .classifier_overrides
+                .contains(&"^sudo apt-get\\b".to_string())
+        );
+        assert!(
+            merged
+                .classifier_overrides
+                .contains(&"^docker\\b".to_string())
+        );
     }
 }

@@ -179,6 +179,9 @@ invocation via `[tools.shell_permissions]` in `alms.toml`:
 [tools.shell_permissions]
 allowed_commands = ["^(git|cargo|npm)\\b"]
 denied_commands  = ["git\\s+push\\s+.*--force", "^rm\\s+-rf\\s+/"]
+# Operator-only: narrow regex that bypass the built-in risk classifier.
+# Use sparingly — overrides are audited via `classifier_override_hit` logs.
+classifier_overrides = ["^sudo apt-get update$"]
 ```
 
 Patterns are regex strings matched against the full command string (no
@@ -187,31 +190,81 @@ are logged as warnings and skipped; empty/whitespace patterns are
 silently skipped. An empty `ShellPermissions` (the default) is a no-op
 and preserves backward compatibility.
 
-**Evaluation order (inside `CompiledPermissions::check_command`):**
-1. **Deny wins.** If any `denied_commands` pattern matches, the command
-   is blocked with a generic `"Command blocked by security policy"`
-   error (the specific pattern is only logged server-side, to avoid
-   leaking regex hints to a potentially adversarial LLM).
-2. **Allowlist mode.** If `allowed_commands` is non-empty, the command
-   must also match at least one allow pattern; otherwise it is rejected
-   with `"does not match any allowed command pattern"`.
-3. **Denylist-only mode.** If `allowed_commands` is empty, any command
-   that did not match a deny pattern is permitted.
+**Defence chain (issue #745).** Each shell invocation passes through
+four gates, in order. The classifier is a non-bypassable *floor* for
+destructive findings; a permissive allowlist does not silently disable
+it.
 
-**Relationship to the hardcoded denylist.** The `shell_permissions`
-check runs inside `ShellTool::execute()` *before* the hardcoded
-destructive-command denylist in `alms-sandbox/src/shell/security.rs`.
-That hardcoded list (blocking `rm -rf /`, `mkfs.`, fork bombs, etc.)
-is unconditional and always applied — it remains as defense-in-depth
-behind the configurable policy. Operators who supply `denied_commands`
-extend the built-in list; they cannot weaken it.
+1. **Permissions admission gate** — `CompiledPermissions::check_command`:
+   1. **Deny wins.** If any `denied_commands` pattern matches, the
+      command is blocked with a generic
+      `"Command blocked by security policy"` error. The specific pattern
+      is only logged server-side to avoid leaking regex hints to a
+      potentially adversarial LLM.
+   2. **Allowlist mode.** If `allowed_commands` is non-empty, the
+      command must match at least one allow pattern; otherwise it is
+      rejected with `"does not match any allowed command pattern"`.
+   3. **Denylist-only mode.** If `allowed_commands` is empty, any
+      command that did not match a deny pattern is admitted.
+2. **Classifier override check** —
+   `CompiledPermissions::matching_classifier_override`: if the command
+   matches any `classifier_overrides` pattern, step 3 is skipped. Every
+   hit is logged with `reason=classifier_override_hit`. Overrides
+   **cannot** weaken the deny list (step 1) or the OS-level sandbox
+   (step 4).
+3. **Built-in risk classifier** — `classification::enforce`:
+   destructive findings (`rm -rf /`, `mkfs`, `sudo`, `curl | sh`, fork
+   bombs, etc.) block in every mode **except** `ClassificationMode::Off`.
+   Moderate findings are controlled by mode:
+   - `Off` — classifier never blocks. True opt-out (use only when
+     another layer such as Landlock or a restricted OS user provides a
+     hard boundary). `classify()` still runs so findings emit `debug!`
+     lines and the `allowlist_classifier_divergence` `warn!` described
+     below still fires — operators keep visibility into
+     classifier/allowlist disagreement even when the classifier itself
+     is non-blocking.
+   - `Warn` — moderate findings logged, not blocked; destructive
+     findings still blocked. **Behaviour tightened in #745** (prior to
+     v0.2.2, `Warn` blocked nothing; deployments that relied on
+     `Warn` + permissive allowlist to run destructive commands must
+     either switch to `Off` or enumerate the commands in
+     `classifier_overrides`).
+   - `BlockDestructive` (default) — destructive blocked, moderate
+     logged.
+   - `Strict` — both destructive and moderate blocked.
+4. **Hardcoded destructive denylist + Landlock** — `exec.rs`:
+   unconditional substring denylist (`rm -rf /`, `mkfs.`, fork bombs)
+   plus Linux 5.13+ Landlock filesystem sandbox. Operators who supply
+   `denied_commands` extend this built-in list; they cannot weaken it.
 
-**Scope and lifetime.** Permissions are compiled once (at gateway
-startup, agent creation, and the `with_workspace` / `with_shell_default_env`
-re-registration paths) into a `CompiledPermissions` struct baked into
-the `ShellTool` instance. They are **not** mutable via `PATCH /settings`
-— restart the gateway to pick up new patterns. See `docs/api.md`
-§ 10.2 for the API contract.
+**Observability.** When an allowlist accepts a command that the
+classifier flags at moderate-or-worse (i.e. step 1 admits a command
+that step 3 would flag), the tool emits a structured
+`tracing::warn!` with `reason=allowlist_classifier_divergence`,
+`classifier_level`, and `classifier_finding_count`. Operators who see
+repeated divergence warnings may want to tighten their allowlist or
+enumerate specific commands in `classifier_overrides` (making operator
+intent auditable) rather than leaving classification-borderline
+commands to a permissive `.*` pattern.
+
+**What the classifier floor is *not*.** It is not a security boundary
+— the classifier is substring/heuristic-based and can be bypassed by a
+sufficiently motivated attacker (writing a script to disk + `chmod +x`
++ exec in two steps, base64-decoded shell exec, etc.). The floor is
+defence-in-depth that catches the common cases a permissive operator
+config would otherwise miss. Real isolation requires Landlock on Linux,
+a dedicated OS user, or a container boundary — application-level
+denylists are fundamentally bypassable.
+
+**Scope and lifetime.** Permissions (including `classifier_overrides`)
+are compiled once (at gateway startup, agent creation, and the
+`with_workspace` / `with_shell_default_env` re-registration paths) into
+a `CompiledPermissions` struct baked into the `ShellTool` instance.
+They are **not** mutable via `PATCH /settings` — restart the gateway
+to pick up new patterns. The `classifier_overrides` field is
+operator-only (TOML-only) and is never exposed in any request/response
+schema or JSON tool-call parameter. See `docs/api.md` § 10.2 for the
+API contract.
 
 **Scope today: global only.** `[tools.shell_permissions]` is configured
 once in `alms.toml` and inherited unchanged by every agent. There is no
@@ -221,7 +274,8 @@ do not carry a `shell_permissions` field, and no TOML or registry path
 feeds per-agent permissions into the runtime. A merge helper
 (`ShellPermissions::merge_with` in `alms-core/src/config/types.rs`)
 exists for future use but is not reachable from production code paths
-today.
+today; it applies union semantics to `denied_commands` and
+`classifier_overrides` and replace semantics to `allowed_commands`.
 
 **Subagent inheritance.** When the coordinator builds a subagent
 config, it clones the parent's raw `ShellPermissions` config into the
@@ -332,6 +386,7 @@ Default posture recommendations:
 - Shell interface is `bash -c` command strings — **implemented**: `shell` tool wraps commands with `bash -c`; Landlock filesystem restrictions applied on Linux 5.13+
 - Shell command denylist (best-effort) — **implemented**: substring-based denylist blocks `rm -rf /`, `mkfs.`, fork bombs, etc.; bypassable, defense-in-depth only
 - Configurable shell allow/deny permissions — **implemented**: `tools.shell_permissions` in `alms.toml` provides regex-based `allowed_commands` / `denied_commands` gates evaluated before the hardcoded denylist (deny wins; empty allowlist = denylist-only mode); startup-only, not mutable via `PATCH /settings`. See § 4.3.
+- Shell classifier as non-bypassable floor (#745) — **implemented**: destructive classifier findings block in every `ClassificationMode` except `Off`; `ClassificationMode::Warn` now blocks destructive (behavioural break from pre-v0.2.2). Operators may exempt specific commands via operator-only `classifier_overrides` regex. See § 4.3.
 - Shell env cleared — **implemented**: `env_clear()` prevents secret leakage to child processes
 - Shell cwd restricted — **implemented**: `shell_policy = "sandboxed"` restricts cwd to sandbox_root; persistent cwd validated against sandbox on each invocation
 - Strict output truncation — **implemented**: 30KB stdout/stderr cap with head+tail line preservation, fs_read line-based limits (default 2000 lines, 512KB output budget, 256KB file size guard), UTF-8 safe truncation

@@ -361,12 +361,23 @@ impl Tool for ShellTool {
 
         let input = self.parse_input(&params)?;
 
-        // Permission check: evaluate allow/deny patterns before any execution.
-        // This runs before the hardcoded denylist in exec.rs (which catches
-        // destructive commands like `rm -rf /`) and acts as a user-configurable
-        // policy gate. On denial, surface a structured tracing event so
-        // operators can filter and ship denials through the configured log
-        // subscriber rather than searching scattered stderr.
+        // --- Defence chain (issue #745) ------------------------------------
+        //
+        // Order:
+        //   1. Permissions admission gate (allow/deny regex, operator policy).
+        //   2. Classifier-override check (operator opt-out, narrow regex).
+        //   3. Risk classifier (non-bypassable floor for destructive findings).
+        //   4. Hardcoded destructive denylist + Landlock (in `exec.rs`).
+        //
+        // The classifier is a *floor*, not a gate that operators can disable
+        // by loosening their allowlist. With the pre-#745 chain, a permissive
+        // `allowed_commands = [".*"]` combined with `ClassificationMode::Warn`
+        // (or a `ClassificationMode::Off` opt-out) silently degraded the
+        // defence to nothing. Today the classifier's destructive verdicts
+        // always apply unless the operator has **explicitly** enumerated a
+        // command in `[tools.shell_permissions].classifier_overrides`.
+
+        // 1. Permissions admission gate.
         if let Err(e) = self.permissions.check_command(&input.command) {
             warn!(
                 tool = "shell",
@@ -378,21 +389,55 @@ impl Tool for ShellTool {
             return Err(e);
         }
 
-        // Classification check: built-in risk detection for known destructive
-        // patterns (`rm -rf /`, `sudo`, `mkfs`, `curl|sh`, reverse shells,
-        // etc.). Layers with the permission system — permissions are user
-        // policy, classification is built-in defense-in-depth. Hard-block
-        // outcomes are logged at error level: they indicate the command
-        // tripped a known-destructive heuristic.
-        if let Err(e) = classification::enforce(&input.command, self.classification_mode) {
-            error!(
+        // 2. Operator-only classifier override. A match short-circuits the
+        // classifier entirely (step 3). Overrides cannot weaken the deny list
+        // (step 1) or the OS-level sandbox (step 4). Every override hit is
+        // logged so operators can audit which exemption patterns are being
+        // exercised in production.
+        let override_pattern = self
+            .permissions
+            .matching_classifier_override(&input.command);
+        if let Some(pattern) = override_pattern {
+            warn!(
                 tool = "shell",
-                reason = "classifier_denied",
+                reason = "classifier_override_hit",
+                override_pattern = %pattern,
                 command_excerpt = %command_excerpt(&input.command),
-                error = %e,
-                "Shell command blocked by built-in risk classifier"
+                "Shell classifier bypassed by operator override"
             );
-            return Err(e);
+        } else {
+            // 3. Risk classifier — non-bypassable floor for destructive findings.
+            match classification::enforce(&input.command, self.classification_mode) {
+                Ok(classification) => {
+                    // Issue #745 observability: if the allowlist accepted a
+                    // command the classifier flags at moderate-or-worse,
+                    // surface the divergence. Operators who see this warn
+                    // repeatedly may want to tighten their allowlist or add
+                    // an explicit `classifier_overrides` entry (making intent
+                    // auditable) rather than leaving classification-borderline
+                    // commands to a permissive `.*` pattern.
+                    if !self.permissions.is_empty() && classification.is_moderate_or_worse() {
+                        warn!(
+                            tool = "shell",
+                            reason = "allowlist_classifier_divergence",
+                            classifier_level = %classification.level,
+                            classifier_finding_count = classification.findings.len(),
+                            command_excerpt = %command_excerpt(&input.command),
+                            "Shell command admitted by permissions policy but flagged by built-in risk classifier"
+                        );
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        tool = "shell",
+                        reason = "classifier_denied",
+                        command_excerpt = %command_excerpt(&input.command),
+                        error = %e,
+                        "Shell command blocked by built-in risk classifier"
+                    );
+                    return Err(e);
+                }
+            }
         }
 
         // Merge tool-call env params into default_env (tool-call overrides defaults)
@@ -879,6 +924,7 @@ mod tests {
         let perms = ShellPermissions {
             allowed_commands: vec![],
             denied_commands: vec![r"^forbidden\b".to_string()],
+            classifier_overrides: vec![],
         };
         let tool = ShellTool::new().with_permissions(&perms);
 
@@ -903,6 +949,7 @@ mod tests {
         let perms = ShellPermissions {
             allowed_commands: vec![r"^echo\b".to_string()],
             denied_commands: vec![],
+            classifier_overrides: vec![],
         };
         let tool = ShellTool::new().with_permissions(&perms);
 
@@ -919,5 +966,226 @@ mod tests {
             err_msg.contains("does not match any allowed command pattern"),
             "error should come from the allowlist check, got: {err_msg}"
         );
+    }
+
+    // ── Issue #745: classifier as non-bypassable floor ──────────────
+
+    /// Precedence: a permissive allowlist (`.*`) does NOT bypass the
+    /// classifier. `rm -rf /` is admitted by `check_command` but the
+    /// classifier-floor still blocks it. This is the core of #745: the
+    /// classifier is not a gate operators can disable by loosening allowlists.
+    #[tokio::test]
+    async fn test_permissive_allowlist_does_not_bypass_classifier() {
+        let perms = ShellPermissions {
+            allowed_commands: vec![r".*".to_string()],
+            denied_commands: vec![],
+            classifier_overrides: vec![],
+        };
+        // Warn mode: *before* #745 this was "log everything, block nothing".
+        // After #745 it must still block destructive findings.
+        let tool = ShellTool::new()
+            .with_permissions(&perms)
+            .with_classification_mode(CoreClassificationMode::Warn);
+
+        let result = tool
+            .execute(serde_json::json!({"command": "rm -rf /"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "permissive allowlist + warn mode must not bypass classifier"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("risk classifier"),
+            "error should come from the classifier floor, got: {msg}"
+        );
+    }
+
+    /// Precedence: `ClassificationMode::Warn` now blocks destructive (issue
+    /// #745). Previously it logged everything without blocking.
+    #[tokio::test]
+    async fn test_warn_mode_blocks_destructive() {
+        let tool = ShellTool::new().with_classification_mode(CoreClassificationMode::Warn);
+        let result = tool
+            .execute(serde_json::json!({"command": "sudo rm -rf /"}))
+            .await;
+        assert!(result.is_err(), "Warn mode must block destructive findings");
+    }
+
+    /// Precedence: `ClassificationMode::Off` remains the genuine opt-out.
+    /// Operators who explicitly disable the classifier get the pre-#745
+    /// behaviour — no findings, no logs, no enforcement from the classifier
+    /// layer. The hardcoded denylist in `exec.rs` still applies — so we use
+    /// a destructive command (`shutdown -h now`) that the classifier flags
+    /// but that the hardcoded denylist does not cover.
+    #[tokio::test]
+    async fn test_off_mode_is_true_opt_out_at_classifier_layer() {
+        let perms = ShellPermissions {
+            allowed_commands: vec![r".*".to_string()],
+            denied_commands: vec![],
+            classifier_overrides: vec![],
+        };
+        let tool = ShellTool::new()
+            .with_permissions(&perms)
+            .with_classification_mode(CoreClassificationMode::Off);
+
+        let result = tool
+            .execute(serde_json::json!({"command": "shutdown -h now"}))
+            .await;
+        // Command may fail at exec level (no privs, not installed, Windows, etc.)
+        // but the classifier layer must not have been the cause.
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("risk classifier"),
+                "Off mode must not block at classifier layer, got: {msg}"
+            );
+        }
+    }
+
+    /// Precedence: an explicit `classifier_overrides` entry bypasses the
+    /// classifier for the matching command only. Operators use this for
+    /// legitimate exemptions (e.g. a known-safe `sudo apt-get update` in a
+    /// trusted deploy script).
+    #[tokio::test]
+    async fn test_classifier_override_bypasses_classifier() {
+        let perms = ShellPermissions {
+            allowed_commands: vec![],
+            denied_commands: vec![],
+            // Exempt a very specific command.
+            classifier_overrides: vec![r"^sudo echo classifier-test$".to_string()],
+        };
+        let tool = ShellTool::new()
+            .with_permissions(&perms)
+            .with_classification_mode(CoreClassificationMode::BlockDestructive);
+
+        // `sudo echo` without override is Destructive (PrivilegeEscalation).
+        // With the explicit override, it must be permitted past the classifier.
+        // We don't assert success at exec level (sudo may not be installed in CI),
+        // just that the classifier did not fire.
+        let result = tool
+            .execute(serde_json::json!({"command": "sudo echo classifier-test"}))
+            .await;
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("risk classifier"),
+                "override should bypass classifier, got: {msg}"
+            );
+        }
+    }
+
+    /// Security: a classifier override does NOT weaken the deny list. An
+    /// operator who overrides `^sudo\b` but also sets a deny on `sudo rm`
+    /// still blocks `sudo rm`. Overrides are orthogonal to admission.
+    #[tokio::test]
+    async fn test_classifier_override_does_not_weaken_deny() {
+        let perms = ShellPermissions {
+            allowed_commands: vec![],
+            denied_commands: vec![r"sudo\s+rm".to_string()],
+            classifier_overrides: vec![r"^sudo\b".to_string()],
+        };
+        let tool = ShellTool::new().with_permissions(&perms);
+
+        let result = tool
+            .execute(serde_json::json!({"command": "sudo rm -rf /tmp/foo"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "deny list must still apply even when override matches"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("Command blocked by security policy"),
+            "error must come from the deny list, not the classifier, got: {msg}"
+        );
+    }
+
+    /// Security: a classifier override matches the command only — it does
+    /// not silently widen the allowlist. Allowlist gating is orthogonal.
+    #[tokio::test]
+    async fn test_classifier_override_does_not_satisfy_allowlist() {
+        let perms = ShellPermissions {
+            allowed_commands: vec![r"^echo\b".to_string()],
+            denied_commands: vec![],
+            classifier_overrides: vec![r"^sudo\b".to_string()],
+        };
+        let tool = ShellTool::new().with_permissions(&perms);
+
+        // `sudo` matches the override, but NOT the allowlist → must be
+        // rejected at the allowlist layer (before the classifier even runs).
+        let result = tool
+            .execute(serde_json::json!({"command": "sudo whoami"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "override must not substitute for allowlist match"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("does not match any allowed command pattern"),
+            "error must come from the allowlist layer, got: {msg}"
+        );
+    }
+
+    /// Integration: exercise the full `[tools.shell_permissions]` → ShellTool
+    /// → outcome chain with an operator-configured override. End-to-end
+    /// "does the config path actually wire up?" test.
+    #[tokio::test]
+    async fn test_full_config_to_outcome_with_override() {
+        // Simulate operator config: empty allowlist (denylist-only mode),
+        // one deny, one classifier override. A plausible shape for alms.toml.
+        let config = ShellPermissions {
+            allowed_commands: vec![],
+            denied_commands: vec![r"rm\s+-rf\s+/".to_string()],
+            classifier_overrides: vec![r"^sudo apt-get\b".to_string()],
+        };
+        let tool = ShellTool::new()
+            .with_permissions(&config)
+            .with_classification_mode(CoreClassificationMode::BlockDestructive);
+
+        // 1. Deny list wins over everything.
+        let r1 = tool
+            .execute(serde_json::json!({"command": "rm -rf /"}))
+            .await;
+        assert!(r1.is_err(), "deny list must block");
+
+        // 2. Override permits a classifier-flagged command past the classifier.
+        let r2 = tool
+            .execute(serde_json::json!({"command": "sudo apt-get update"}))
+            .await;
+        if let Err(e) = &r2 {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("risk classifier"),
+                "override must bypass classifier, got: {msg}"
+            );
+        }
+
+        // 3. A destructive command NOT covered by the override still blocks.
+        let r3 = tool
+            .execute(serde_json::json!({"command": "sudo rm -rf /etc"}))
+            .await;
+        assert!(
+            r3.is_err(),
+            "non-overridden destructive command must still block"
+        );
+    }
+
+    /// Regression guard: the `ShellTool` parameter schema does not expose any
+    /// classifier-override surface to the model. `classifier_overrides` is
+    /// operator-only (alms.toml) and must never reach the JSON input.
+    #[test]
+    fn test_classifier_override_not_in_tool_schema() {
+        let tool = ShellTool::new();
+        let schema = tool.parameters();
+        let props = schema["properties"].as_object().unwrap();
+        for key in props.keys() {
+            let lower = key.to_ascii_lowercase();
+            assert!(
+                !lower.contains("override") && !lower.contains("classifier"),
+                "tool input schema must not expose classifier-override surface to the model; found '{key}'"
+            );
+        }
     }
 }

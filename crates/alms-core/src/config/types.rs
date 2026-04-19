@@ -406,12 +406,29 @@ pub struct ShellPermissions {
     /// Deny takes precedence over allow. A command matching any deny pattern
     /// is blocked regardless of whether it also matches an allow pattern.
     pub denied_commands: Vec<String>,
+
+    /// Regex patterns for commands that bypass the built-in risk classifier.
+    ///
+    /// The classifier is otherwise a non-bypassable floor: destructive findings
+    /// (`rm -rf /`, `mkfs`, `sudo`, `curl | sh`, etc.) are blocked even when
+    /// the allowlist accepts the command. Operators who have a legitimate need
+    /// to run a flagged command (e.g. a specific `sudo apt-get update` line on
+    /// a trusted host) may enumerate it here.
+    ///
+    /// Overrides bypass **only** the classifier. The `denied_commands` list
+    /// still applies, and so does the OS-level sandbox (Landlock/cwd
+    /// restrictions on Linux). An override pattern is explicit operator
+    /// intent; it is never model-visible and cannot be added via any runtime
+    /// API (including `PATCH /settings`).
+    pub classifier_overrides: Vec<String>,
 }
 
 impl ShellPermissions {
     /// Returns true if no patterns are configured (no-op mode).
     pub fn is_empty(&self) -> bool {
-        self.allowed_commands.is_empty() && self.denied_commands.is_empty()
+        self.allowed_commands.is_empty()
+            && self.denied_commands.is_empty()
+            && self.classifier_overrides.is_empty()
     }
 
     /// Merge two permission sets. The `other` set (per-agent) extends the
@@ -443,9 +460,17 @@ impl ShellPermissions {
             other.allowed_commands.clone()
         };
 
+        // Classifier overrides: union semantics (operator-only surface, same
+        // trust level as denied_commands). If per-agent config is ever exposed
+        // to a less-trusted source, flip to "global-only" to prevent
+        // sub-agents from weakening the classifier floor.
+        let mut classifier_overrides = self.classifier_overrides.clone();
+        classifier_overrides.extend(other.classifier_overrides.iter().cloned());
+
         ShellPermissions {
             allowed_commands: allowed,
             denied_commands: denied,
+            classifier_overrides,
         }
     }
 }

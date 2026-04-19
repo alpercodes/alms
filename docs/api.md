@@ -971,7 +971,7 @@ Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved fo
 
 Partially update server-level configuration at runtime. Only `context`, `session`, and `tools` sections are mutable. Changes take effect on the next run; in-flight runs are unaffected. Logging requires a restart and is not accepted here.
 
-Within `tools`, only `shell_policy`, `sandbox_root`, `timeout_secs`, and `max_output_bytes` are dynamically mutable. **`tools.shell_permissions` is configured in `alms.toml` only** — its allow/deny regex patterns are compiled once at startup and baked into each `ShellTool` instance (see `docs/agent-runtime-design.md` for the config schema and `docs/security-model.md` § 4.3 for the policy semantics). Sending `shell_permissions` in a `PATCH /settings` body is ignored; restart the gateway to pick up new patterns.
+Within `tools`, only `shell_policy`, `sandbox_root`, `timeout_secs`, and `max_output_bytes` are dynamically mutable. **`tools.shell_permissions` is configured in `alms.toml` only** — its allow/deny regex patterns are compiled once at startup and baked into each `ShellTool` instance (see `docs/agent-runtime-design.md` for the config schema and `docs/security-model.md` § 4.3 for the policy semantics). This applies to every field in the block: `allowed_commands`, `denied_commands`, and `classifier_overrides` are all config-file-only and are **not** PATCH-mutable. Sending `shell_permissions` in a `PATCH /settings` body is ignored; restart the gateway to pick up new patterns.
 
 **Request body** (all fields optional):
 ```json

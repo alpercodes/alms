@@ -158,12 +158,41 @@ impl Classification {
 /// Policy governing what the classifier does with its findings.
 ///
 /// Configured globally via `ToolsConfig.shell_classification_mode`.
+///
+/// **Non-bypassable floor (issue #745):** every mode *except* [`Off`] blocks
+/// destructive-level findings. Destructive classifications (`rm -rf /`,
+/// `mkfs`, `sudo`, `curl | sh`, fork bombs, etc.) represent commands that any
+/// reasonable deployment should refuse regardless of how permissive the
+/// allowlist is configured. Operators who have a legitimate exception may
+/// enumerate it in `[tools.shell_permissions].classifier_overrides`, which is
+/// applied *before* this check.
+///
+/// If you truly want the classifier to never block anything, use [`Off`].
+/// [`Off`] disables the classifier entirely — no findings, no logs, no
+/// enforcement. It is the only mode in which the classifier is genuinely
+/// bypassed.
+///
+/// [`Off`]: ClassificationMode::Off
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClassificationMode {
-    /// Classifier runs but never blocks; findings are logged only.
+    /// Classifier never blocks. Operator opt-out of the classifier floor —
+    /// use only on deployments where another layer (e.g. Landlock, restricted
+    /// OS user, dedicated container) provides a hard boundary.
+    ///
+    /// Observability note: `classify()` is still invoked (it is cheap and
+    /// infallible) so findings emit `debug!` lines, and the
+    /// `allowlist_classifier_divergence` `warn!` in `ShellTool::execute`
+    /// still fires when the allowlist accepts a command the classifier
+    /// flags at moderate-or-worse. This is intentional — operators retain
+    /// visibility into classifier/allowlist disagreement even when the
+    /// classifier itself is non-blocking. Only the block decision is
+    /// suppressed.
     Off,
-    /// Log findings, do not block.
+    /// Log moderate findings without blocking; block destructive findings.
+    /// Use this when you want visibility into moderate-risk commands but do
+    /// not want them to fail. Behaviour tightened in #745: prior to v0.2.2,
+    /// `Warn` logged everything and blocked nothing.
     Warn,
     /// Block destructive commands, log moderate. (Default — safe default
     /// that doesn't break normal development workflows.)
@@ -208,6 +237,13 @@ pub fn classify(command: &str) -> Classification {
 ///
 /// Error messages are intentionally generic (do not leak which heuristic
 /// matched) to reduce the usefulness of trial-and-error probing.
+///
+/// **Destructive findings are non-bypassable** except in
+/// [`ClassificationMode::Off`]: even in `Warn` mode, a destructive-level
+/// classification produces a block. Callers who want to grant a specific
+/// command an exception should apply a `classifier_overrides` check *before*
+/// calling this function and short-circuit on a match (see
+/// `ShellTool::execute`).
 pub fn enforce(command: &str, mode: ClassificationMode) -> SandboxResult<Classification> {
     let classification = classify(command);
 
@@ -226,16 +262,19 @@ pub fn enforce(command: &str, mode: ClassificationMode) -> SandboxResult<Classif
 
     let blocked = match mode {
         ClassificationMode::Off => false,
+        // Issue #745: `Warn` still blocks destructive findings. Its purpose
+        // is "visibility into moderate-risk commands without breaking them",
+        // not "defeat the classifier entirely". Use `Off` for that.
         ClassificationMode::Warn => {
-            if classification.is_moderate_or_worse() {
+            if classification.is_moderate_or_worse() && !classification.is_destructive() {
                 warn!(
                     command = %command,
                     level = %classification.level,
                     findings = classification.findings.len(),
-                    "Shell command has risk findings (warn mode, not blocked)"
+                    "Shell command has moderate risk findings (warn mode, not blocked)"
                 );
             }
-            false
+            classification.is_destructive()
         }
         ClassificationMode::BlockDestructive => classification.is_destructive(),
         ClassificationMode::Strict => classification.is_moderate_or_worse(),
@@ -2148,9 +2187,19 @@ mod tests {
     }
 
     #[test]
-    fn enforce_warn_never_blocks() {
-        assert!(enforce("rm -rf /", ClassificationMode::Warn).is_ok());
-        assert!(enforce("sudo shutdown", ClassificationMode::Warn).is_ok());
+    fn enforce_warn_logs_moderate_blocks_destructive() {
+        // Issue #745: `Warn` used to pass everything through. Now destructive
+        // findings block even in `Warn` mode; only moderate-and-below are
+        // logged-only. `Off` remains the total-opt-out.
+        //
+        // Destructive findings → blocked.
+        assert!(enforce("rm -rf /", ClassificationMode::Warn).is_err());
+        assert!(enforce("sudo shutdown", ClassificationMode::Warn).is_err());
+        // Moderate findings → allowed (logged only).
+        assert!(enforce("git push --force", ClassificationMode::Warn).is_ok());
+        assert!(enforce("apt install curl", ClassificationMode::Warn).is_ok());
+        // Safe commands → allowed.
+        assert!(enforce("ls -la", ClassificationMode::Warn).is_ok());
     }
 
     #[test]
