@@ -391,8 +391,7 @@ pub async fn create_run(
     // dequeue (before `work.await`) and decremented after the work
     // future resolves; considered low priority.
     let agent_running = state.run_manager.agent_has_running_run(agent_id);
-    let queued_behind =
-        state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
+    let queued_behind = state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
     state
         .run_manager
         .send_session_event(

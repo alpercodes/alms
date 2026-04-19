@@ -7,7 +7,7 @@ Design for the three UX requirements from `docs/agent-ux-requirements.md`. These
 ## 1) Configuration System
 
 ### Problem
-Config is currently scattered across `GatewayConfig`, `LlmConfig`, `SessionConfig`, `AgentConfig`, and `SandboxConfig` — each with hardcoded defaults, some reading from env vars, some not. No single config file, no validation, no documentation of what each setting does.
+Config is currently scattered across `GatewayConfig`, `LlmConfig`, `SessionConfig`, and `AgentConfig` — each with hardcoded defaults, some reading from env vars, some not. No single config file, no validation, no documentation of what each setting does.
 
 ### Design
 

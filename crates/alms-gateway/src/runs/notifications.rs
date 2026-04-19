@@ -540,8 +540,7 @@ async fn enqueue_triggered_run(
     // acceptable; closing it would require a separate in-flight counter
     // inside `SessionQueue`.
     let agent_running = state.run_manager.agent_has_running_run(agent_id);
-    let queued_behind =
-        state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
+    let queued_behind = state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
     state
         .run_manager
         .send_session_event(
