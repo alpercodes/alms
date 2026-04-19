@@ -32,6 +32,38 @@ import { activeAgent } from '../state/agents.js';
 import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
 
 /**
+ * Maximum number of session runs to fetch when restoring active-run state.
+ *
+ * The backend `list_by_session` returns runs newest-first and truncates to
+ * the requested limit (`crates/alms-gateway/src/server/run_manager.rs:
+ * `list_by_session`). The active-run restore path needs to find a still-
+ * running run even when many newer queued / terminal runs exist in the
+ * same session, otherwise the run drops out of the fetch window and the
+ * UI silently fails to rehydrate the thinking indicator / approvals.
+ *
+ * 200 covers ordinary "agent has been busy for a while" cases without
+ * being unbounded; if a session genuinely accumulates more than 200
+ * newer runs in front of an older still-running one, the user has bigger
+ * problems than UI restoration. The history list itself can paginate
+ * later if/when we add a dedicated UI for it.  (#735)
+ */
+const SESSION_RUNS_RESTORE_LIMIT = 200;
+
+/**
+ * Maximum number of agent-scoped runs to fetch when restoring the global
+ * agent phase across sessions (the "Chatting with {peer}..." cross-session
+ * status, #688). Same truncation concern as `SESSION_RUNS_RESTORE_LIMIT`,
+ * but applied to `list_by_agent` (`crates/alms-gateway/src/server/
+ * run_manager.rs::list_by_agent`).
+ *
+ * Smaller than the per-session window because the cross-session restore
+ * is best-effort — if it misses, the next live SSE event will set the
+ * status correctly. 100 still comfortably exceeds the previous hardcoded
+ * 10 and covers realistic agent run rates. (#735)
+ */
+const AGENT_RUNS_RESTORE_LIMIT = 100;
+
+/**
  * Load a session's runs, chat history, pending approvals, and open SSE stream.
  *
  * Both the boot path and the session-switch path call this function after
@@ -52,13 +84,23 @@ export async function loadSession(sessionId, opts) {
     // Step 1: Fetch runs and restore activeRunId for any in-progress run.
     // This must happen before history loading so that mapHistoryMessages
     // can mark unmatched tool_calls as 'running' instead of 'done'.
+    //
+    // Use a larger fetch window (SESSION_RUNS_RESTORE_LIMIT) for the
+    // active-run restore step so an older still-running run is not hidden
+    // behind a newer queued / terminal backlog. (#735)
     try {
-        const data = await listRuns(sessionId);
+        const data = await listRuns(sessionId, SESSION_RUNS_RESTORE_LIMIT);
         if (isStale()) return;
         const loaded = data.runs || [];
         runs.value = loaded;
 
-        const active = loaded.find(r => r.status === 'queued' || r.status === 'running');
+        // Prefer a `running` run over a `queued` one when both exist for
+        // this session. The backend returns runs newest-first, so without
+        // this preference a newer queued run would mask an older still-
+        // running run, leaving the UI showing queued/idle while work is
+        // already executing. (#735)
+        const active = loaded.find(r => r.status === 'running')
+            || loaded.find(r => r.status === 'queued');
         if (active) {
             activeRunId.value = active.run_id;
         }
@@ -302,7 +344,10 @@ export async function loadSession(sessionId, opts) {
  */
 async function restoreGlobalAgentPhase(agentId, sessionId, isStale, logPrefix) {
     try {
-        const data = await listAgentRuns(agentId, 10);
+        // Use AGENT_RUNS_RESTORE_LIMIT (not the previous hardcoded 10) so
+        // the still-running DM run is not hidden behind a backlog of newer
+        // queued / terminal runs for the same agent. (#735)
+        const data = await listAgentRuns(agentId, AGENT_RUNS_RESTORE_LIMIT);
         if (isStale()) return;
         const agentRuns = data.runs || [];
 
