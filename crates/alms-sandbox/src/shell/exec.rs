@@ -3,7 +3,7 @@
 //! Handles spawning processes, capturing output, enforcing timeouts,
 //! and detecting the post-execution working directory via a `pwd` marker.
 
-use super::output::truncate_output;
+use super::output::truncate_output_bytes;
 use super::security::{
     command_matches_denylist, command_references_denied_file, is_secret_env_var,
     platform_critical_env_vars,
@@ -12,11 +12,26 @@ use super::types::{ShellInput, ShellOutput, ShellState};
 use crate::{SandboxError, error::SandboxResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tracing::{debug, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 
-/// Unique marker used to delimit the `pwd` output appended after each command.
-/// Must be unlikely to appear in normal command output.
-const PWD_MARKER: &str = "__ALMS_PWD_MARKER__";
+/// First ~100 chars of a command, intended for structured log fields.
+///
+/// Kept short so operator-visible logs never accidentally leak the tail of a
+/// long command (which may contain secrets, base64 blobs, etc.).
+pub(crate) fn command_excerpt(command: &str) -> String {
+    const MAX_LEN: usize = 100;
+    if command.len() <= MAX_LEN {
+        command.to_string()
+    } else {
+        // Truncate at a char boundary; appending an ellipsis makes it clear
+        // the log is a summary, not the full command.
+        let mut end = MAX_LEN;
+        while !command.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &command[..end])
+    }
+}
 
 /// Execute a shell command synchronously (foreground).
 ///
@@ -27,13 +42,14 @@ const PWD_MARKER: &str = "__ALMS_PWD_MARKER__";
 /// 4. Detects the new cwd from the `pwd` marker in output
 /// 5. Truncates output if needed
 /// 6. Updates the shell state's cwd
-#[instrument(level = "debug", skip(state, sandbox_root, default_env), fields(timeout_ms = input.timeout_ms))]
+#[instrument(level = "debug", skip(state, sandbox_root, default_env, pwd_marker), fields(timeout_ms = input.timeout_ms))]
 pub(crate) async fn execute_command(
     input: &ShellInput,
     state: &ShellState,
     sandbox_root: Option<&Path>,
     unrestricted: bool,
     default_env: &HashMap<String, String>,
+    pwd_marker: &str,
 ) -> SandboxResult<ShellOutput> {
     let command = &input.command;
 
@@ -43,13 +59,28 @@ pub(crate) async fn execute_command(
         ));
     }
 
-    // Security: check for denied files and destructive patterns
+    // Security: check for denied files and destructive patterns. These run
+    // before any process spawn so the denial path stays cheap.
     if let Some(denied) = command_references_denied_file(command) {
+        error!(
+            tool = "shell",
+            reason = "denied_file",
+            denied_file = %denied,
+            command_excerpt = %command_excerpt(command),
+            "Shell command references denied file"
+        );
         return Err(SandboxError::SandboxViolation(format!(
             "Command references denied file '{denied}'"
         )));
     }
     if let Some(pattern) = command_matches_denylist(command) {
+        error!(
+            tool = "shell",
+            reason = "denylist_match",
+            pattern = %pattern,
+            command_excerpt = %command_excerpt(command),
+            "Shell command matched hardcoded denylist"
+        );
         return Err(SandboxError::SandboxViolation(format!(
             "Command matches denied pattern '{pattern}'"
         )));
@@ -63,7 +94,7 @@ pub(crate) async fn execute_command(
     }
 
     // Build and spawn the command
-    let mut cmd = build_command(command, &cwd, sandbox_root, unrestricted)?;
+    let mut cmd = build_command(command, &cwd, sandbox_root, unrestricted, pwd_marker)?;
 
     // Configure environment
     configure_env(&mut cmd, default_env);
@@ -93,38 +124,55 @@ pub(crate) async fn execute_command(
         .map_err(|e| SandboxError::Io(format!("Process error: {e}")))?;
 
     let exit_code = result.status.code().unwrap_or(-1);
-    let raw_stdout = String::from_utf8_lossy(&result.stdout).to_string();
-    let raw_stderr = String::from_utf8_lossy(&result.stderr).to_string();
 
-    // Extract cwd from pwd marker
-    if let Some(new_cwd) = extract_cwd_from_output(&raw_stdout) {
-        let new_path = PathBuf::from(new_cwd);
-        // Validate the new cwd against sandbox root before storing.
-        // If the command changed directory outside the sandbox (e.g. `cd /etc`),
-        // keep the old cwd to prevent sandbox escape on subsequent calls.
-        if !unrestricted && let Some(root) = sandbox_root {
-            if validate_cwd(&new_path, root).is_ok() {
+    // Keep stdout/stderr as bytes through cwd extraction and truncation.
+    // Lossy UTF-8 decoding happens only at the boundary, so binary-ish output
+    // and Windows `\r` are preserved through the pipeline rather than being
+    // rewritten to U+FFFD replacement chars mid-flight.
+    let raw_stdout = result.stdout;
+    let raw_stderr = result.stderr;
+
+    // Extract cwd from pwd marker. The marker and the pwd output are always
+    // ASCII so decoding just the stdout bytes as UTF-8 (lossy) for the
+    // marker search is safe — replacement chars in user output cannot match
+    // the marker pattern.
+    {
+        let stdout_for_marker = String::from_utf8_lossy(&raw_stdout);
+        if let Some(new_cwd) = extract_cwd_from_output(&stdout_for_marker, pwd_marker) {
+            let new_path = PathBuf::from(new_cwd);
+            // Validate the new cwd against sandbox root before storing.
+            // If the command changed directory outside the sandbox (e.g. `cd /etc`),
+            // keep the old cwd to prevent sandbox escape on subsequent calls.
+            if !unrestricted && let Some(root) = sandbox_root {
+                if validate_cwd(&new_path, root).is_ok() {
+                    let mut cwd_lock = state.cwd.lock().await;
+                    *cwd_lock = new_path;
+                } else {
+                    warn!(
+                        new_cwd = %new_path.display(),
+                        sandbox_root = %root.display(),
+                        "Post-command cwd is outside sandbox root; keeping previous cwd"
+                    );
+                }
+            } else {
                 let mut cwd_lock = state.cwd.lock().await;
                 *cwd_lock = new_path;
-            } else {
-                warn!(
-                    new_cwd = %new_path.display(),
-                    sandbox_root = %root.display(),
-                    "Post-command cwd is outside sandbox root; keeping previous cwd"
-                );
             }
-        } else {
-            let mut cwd_lock = state.cwd.lock().await;
-            *cwd_lock = new_path;
         }
     }
 
-    // Strip the pwd marker from stdout before returning
-    let clean_stdout = strip_pwd_marker(&raw_stdout);
+    // Strip the pwd marker from stdout before truncation so the marker line
+    // and cwd line don't count toward the byte budget. Operates on raw bytes.
+    let clean_stdout_bytes = strip_pwd_marker_bytes(&raw_stdout, pwd_marker);
 
-    // Truncate output
-    let stdout = truncate_output(&clean_stdout);
-    let stderr = truncate_output(&raw_stderr);
+    // Truncate raw bytes, then decode at the boundary.
+    let stdout_truncated = truncate_output_bytes(&clean_stdout_bytes);
+    let stderr_truncated = truncate_output_bytes(&raw_stderr);
+
+    // Final lossy decode at the boundary. This is the only place U+FFFD is
+    // substituted for invalid UTF-8 — everything upstream stays as bytes.
+    let stdout = String::from_utf8_lossy(&stdout_truncated).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_truncated).into_owned();
 
     Ok(ShellOutput {
         exit_code,
@@ -148,8 +196,9 @@ fn build_command(
     cwd: &Path,
     sandbox_root: Option<&Path>,
     unrestricted: bool,
+    pwd_marker: &str,
 ) -> SandboxResult<tokio::process::Command> {
-    let wrapped = wrap_command_with_pwd_marker(command);
+    let wrapped = wrap_command_with_pwd_marker(command, pwd_marker);
 
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c");
@@ -198,6 +247,14 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
     //
     // NOTE: /etc is narrowed to specific entries that bash/coreutils need.
     // /tmp is excluded — commands that need temp space should use the sandbox root.
+    //
+    // /etc/passwd is intentionally NOT granted (issue #743 / #734 item 2):
+    // exposing it enables user enumeration on shared hosts. The trade-off is
+    // that `~user` tilde expansion to *other* users' home directories no
+    // longer works, and `ls -l`/`whoami` may print numeric UIDs instead of
+    // names. `~/path` (current user) still works because bash uses `$HOME`
+    // for that, which doesn't read /etc/passwd. See `docs/security-model.md`
+    // for the full rationale.
     let system_read_paths: Vec<PathBuf> = vec![
         PathBuf::from("/usr"),
         PathBuf::from("/bin"),
@@ -210,7 +267,6 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
         PathBuf::from("/etc/alternatives"),
         PathBuf::from("/etc/nsswitch.conf"),
         PathBuf::from("/etc/resolv.conf"),
-        PathBuf::from("/etc/passwd"),
         PathBuf::from("/etc/localtime"),
         PathBuf::from("/dev/null"),
         PathBuf::from("/dev/urandom"),
@@ -369,10 +425,16 @@ fn apply_landlock_sandbox(cmd: &mut tokio::process::Command, sandbox_root: &Path
 ///
 /// The marker is appended after the command via `; echo <MARKER>; pwd`.
 /// This way, even if the command fails, we still get the working directory.
-fn wrap_command_with_pwd_marker(command: &str) -> String {
+///
+/// The marker is supplied by the caller as a per-`ShellTool` random nonce
+/// (see `ShellTool::new`). Using a per-instance nonce instead of a fixed
+/// constant prevents a user script that intentionally or accidentally prints
+/// the marker string from corrupting cwd tracking on a different agent
+/// instance — each ShellTool only matches its own marker.
+fn wrap_command_with_pwd_marker(command: &str, pwd_marker: &str) -> String {
     // Use a subshell to capture the command's output, then echo the marker
     // and the current working directory.
-    format!("{command}; __alms_ec=$?; echo; echo '{PWD_MARKER}'; pwd; exit $__alms_ec")
+    format!("{command}; __alms_ec=$?; echo; echo '{pwd_marker}'; pwd; exit $__alms_ec")
 }
 
 /// Extract the cwd from command output by looking for the **last** PWD marker.
@@ -382,10 +444,10 @@ fn wrap_command_with_pwd_marker(command: &str) -> String {
 /// `wrap_command_with_pwd_marker`.
 ///
 /// Returns `Some(path_str)` if found, `None` if the marker is not present.
-fn extract_cwd_from_output(stdout: &str) -> Option<&str> {
+fn extract_cwd_from_output<'a>(stdout: &'a str, pwd_marker: &str) -> Option<&'a str> {
     let lines: Vec<&str> = stdout.lines().collect();
     // Search backwards for the last marker line
-    let marker_idx = lines.iter().rposition(|line| line.trim() == PWD_MARKER)?;
+    let marker_idx = lines.iter().rposition(|line| line.trim() == pwd_marker)?;
     // The cwd is the next non-empty line after the marker
     for line in &lines[marker_idx + 1..] {
         let trimmed = line.trim();
@@ -396,29 +458,77 @@ fn extract_cwd_from_output(stdout: &str) -> Option<&str> {
     None
 }
 
-/// Strip the **last** pwd marker and the cwd line from stdout before returning
-/// to the caller.
+/// Byte-level variant of strip_pwd_marker used by the execution path.
 ///
-/// Only the last marker is stripped because earlier occurrences of the marker
-/// string in command output are part of the user's data and should be preserved.
-fn strip_pwd_marker(stdout: &str) -> String {
-    let lines: Vec<&str> = stdout.lines().collect();
-    // Find the last marker line
-    let Some(marker_idx) = lines.iter().rposition(|line| line.trim() == PWD_MARKER) else {
-        return lines.join("\n");
-    };
+/// Operates on the raw process-output bytes so lossy UTF-8 decoding is
+/// deferred to the final boundary. The marker is ASCII so byte-level line
+/// scanning is sufficient. Returns the bytes before the **last** marker
+/// line; earlier occurrences (which could only originate from user output)
+/// are preserved as user data, matching the semantics of the previous
+/// string-level helper.
+fn strip_pwd_marker_bytes(stdout: &[u8], pwd_marker: &str) -> Vec<u8> {
+    let marker_bytes = pwd_marker.as_bytes();
 
-    // Take all lines before the marker
-    let mut result: Vec<&str> = lines[..marker_idx].to_vec();
-
-    // Remove trailing empty line before the marker if present
-    if let Some(last) = result.last()
-        && last.trim().is_empty()
-    {
-        result.pop();
+    // Collect the byte ranges of each line. `end` excludes the trailing
+    // '\n' (and the preceding '\r' if it forms a CRLF pair).
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0;
+    for (i, &b) in stdout.iter().enumerate() {
+        if b == b'\n' {
+            let mut end = i;
+            if end > start && stdout[end - 1] == b'\r' {
+                end -= 1;
+            }
+            lines.push((start, end));
+            start = i + 1;
+        }
+    }
+    if start < stdout.len() {
+        lines.push((start, stdout.len()));
     }
 
-    result.join("\n")
+    // Trim ASCII whitespace from each line before comparing to the marker.
+    let is_marker = |range: &(usize, usize)| -> bool {
+        let (s, e) = *range;
+        let trimmed = trim_ascii_whitespace(&stdout[s..e]);
+        trimmed == marker_bytes
+    };
+
+    let Some(marker_idx) = lines.iter().rposition(is_marker) else {
+        // No marker — return the input bytes as-is.
+        return stdout.to_vec();
+    };
+
+    // Take all bytes up to the beginning of the marker line.
+    let mut end_byte = lines[marker_idx].0;
+
+    // Strip the preceding blank-line separator (wrap_command_with_pwd_marker
+    // emits an explicit `echo` before the marker) plus its CR/LF. We want
+    // the caller's output to end at the last character the user actually
+    // produced. Walk backwards over \n, \r, and additional blank lines.
+    while end_byte > 0 {
+        let prev = stdout[end_byte - 1];
+        if prev == b'\n' || prev == b'\r' {
+            end_byte -= 1;
+        } else {
+            break;
+        }
+    }
+
+    stdout[..end_byte].to_vec()
+}
+
+/// Trim ASCII whitespace from both ends of a byte slice without allocating.
+fn trim_ascii_whitespace(s: &[u8]) -> &[u8] {
+    let mut start = 0;
+    let mut end = s.len();
+    while start < end && (s[start] == b' ' || s[start] == b'\t') {
+        start += 1;
+    }
+    while end > start && (s[end - 1] == b' ' || s[end - 1] == b'\t') {
+        end -= 1;
+    }
+    &s[start..end]
 }
 
 /// Validate that a cwd is within the sandbox root.
@@ -468,76 +578,138 @@ fn configure_env(cmd: &mut tokio::process::Command, default_env: &HashMap<String
 mod tests {
     use super::*;
 
+    /// A canned marker used by the unit tests. Production code uses a
+    /// per-instance random nonce generated in `ShellTool::new`.
+    const TEST_MARKER: &str = "__ALMS_PWD_TEST_MARKER__";
+
     #[test]
     fn test_wrap_command_with_pwd_marker() {
-        let wrapped = wrap_command_with_pwd_marker("ls -la");
+        let wrapped = wrap_command_with_pwd_marker("ls -la", TEST_MARKER);
         assert!(wrapped.contains("ls -la"));
-        assert!(wrapped.contains(PWD_MARKER));
+        assert!(wrapped.contains(TEST_MARKER));
         assert!(wrapped.contains("pwd"));
     }
 
     #[test]
     fn test_extract_cwd_from_output() {
-        let output = format!("file1.txt\nfile2.txt\n\n{PWD_MARKER}\n/home/user/project\n");
-        assert_eq!(extract_cwd_from_output(&output), Some("/home/user/project"));
+        let output = format!("file1.txt\nfile2.txt\n\n{TEST_MARKER}\n/home/user/project\n");
+        assert_eq!(
+            extract_cwd_from_output(&output, TEST_MARKER),
+            Some("/home/user/project")
+        );
     }
 
     #[test]
     fn test_extract_cwd_no_marker() {
         let output = "file1.txt\nfile2.txt\n";
-        assert_eq!(extract_cwd_from_output(output), None);
+        assert_eq!(extract_cwd_from_output(output, TEST_MARKER), None);
     }
 
     #[test]
-    fn test_strip_pwd_marker() {
-        let output = format!("file1.txt\nfile2.txt\n\n{PWD_MARKER}\n/home/user\n");
-        let cleaned = strip_pwd_marker(&output);
-        assert_eq!(cleaned, "file1.txt\nfile2.txt");
-        assert!(!cleaned.contains(PWD_MARKER));
-        assert!(!cleaned.contains("/home/user"));
+    fn test_strip_pwd_marker_bytes() {
+        let output = format!("file1.txt\nfile2.txt\n\n{TEST_MARKER}\n/home/user\n");
+        let cleaned = strip_pwd_marker_bytes(output.as_bytes(), TEST_MARKER);
+        let cleaned_str = String::from_utf8(cleaned).unwrap();
+        assert_eq!(cleaned_str, "file1.txt\nfile2.txt");
+        assert!(!cleaned_str.contains(TEST_MARKER));
+        assert!(!cleaned_str.contains("/home/user"));
     }
 
     #[test]
-    fn test_strip_pwd_marker_no_marker() {
-        let output = "line1\nline2\n";
-        let cleaned = strip_pwd_marker(output);
-        // lines() strips trailing newline, join re-joins without it
-        assert_eq!(cleaned, "line1\nline2");
+    fn test_strip_pwd_marker_bytes_no_marker() {
+        let output = b"line1\nline2\n";
+        let cleaned = strip_pwd_marker_bytes(output, TEST_MARKER);
+        // No marker, bytes are returned unchanged.
+        assert_eq!(cleaned, output.to_vec());
+    }
+
+    #[test]
+    fn test_strip_pwd_marker_bytes_preserves_crlf() {
+        // Windows shells emit \r\n; we must NOT strip \r from user output.
+        let output = b"line1\r\nline2\r\n\r\n__ALMS_PWD_TEST_MARKER__\r\n/home/user\r\n";
+        let cleaned = strip_pwd_marker_bytes(output, TEST_MARKER);
+        let cleaned_str = String::from_utf8(cleaned).unwrap();
+        assert!(
+            cleaned_str.contains("line1\r\n"),
+            "CRLF on user output must survive: {cleaned_str:?}"
+        );
+        assert!(cleaned_str.contains("line2"));
+        assert!(!cleaned_str.contains("__ALMS_PWD_TEST_MARKER__"));
+        assert!(!cleaned_str.contains("/home/user"));
+    }
+
+    #[test]
+    fn test_strip_pwd_marker_bytes_preserves_invalid_utf8() {
+        // Binary-ish stdout must pass through the byte truncation step
+        // unchanged until the lossy-decode boundary at the end.
+        let mut output = Vec::new();
+        output.extend_from_slice(b"before\n");
+        output.push(0xFF); // invalid UTF-8 byte
+        output.extend_from_slice(b"\n\n");
+        output.extend_from_slice(TEST_MARKER.as_bytes());
+        output.extend_from_slice(b"\n/home/user\n");
+
+        let cleaned = strip_pwd_marker_bytes(&output, TEST_MARKER);
+        assert!(cleaned.contains(&0xFF), "raw bytes must be preserved");
+        assert!(
+            !cleaned
+                .windows(TEST_MARKER.len())
+                .any(|w| w == TEST_MARKER.as_bytes())
+        );
     }
 
     #[test]
     fn test_extract_cwd_matches_last_marker() {
         // If command output contains the marker string, we must match the LAST one
         let output = format!(
-            "echo {PWD_MARKER}\n/fake/path\nreal output\n\n{PWD_MARKER}\n/home/user/real\n"
+            "echo {TEST_MARKER}\n/fake/path\nreal output\n\n{TEST_MARKER}\n/home/user/real\n"
         );
-        assert_eq!(extract_cwd_from_output(&output), Some("/home/user/real"));
+        assert_eq!(
+            extract_cwd_from_output(&output, TEST_MARKER),
+            Some("/home/user/real")
+        );
     }
 
     #[test]
-    fn test_strip_pwd_marker_matches_last_marker() {
+    fn test_strip_pwd_marker_bytes_matches_last_marker() {
         // Only the last marker should be stripped; earlier occurrences are user data
         let output = format!(
-            "echo {PWD_MARKER}\n/fake/path\nreal output\n\n{PWD_MARKER}\n/home/user/real\n"
+            "echo {TEST_MARKER}\n/fake/path\nreal output\n\n{TEST_MARKER}\n/home/user/real\n"
         );
-        let cleaned = strip_pwd_marker(&output);
+        let cleaned = strip_pwd_marker_bytes(output.as_bytes(), TEST_MARKER);
+        let cleaned_str = String::from_utf8(cleaned).unwrap();
         assert!(
-            cleaned.contains(PWD_MARKER),
+            cleaned_str.contains(TEST_MARKER),
             "first marker should be preserved as user data"
         );
-        assert!(cleaned.contains("/fake/path"));
-        assert!(cleaned.contains("real output"));
+        assert!(cleaned_str.contains("/fake/path"));
+        assert!(cleaned_str.contains("real output"));
         assert!(
-            !cleaned.contains("/home/user/real"),
+            !cleaned_str.contains("/home/user/real"),
             "real cwd line should be stripped"
         );
+    }
+
+    #[test]
+    fn test_command_excerpt_short_returns_full() {
+        assert_eq!(command_excerpt("ls -la"), "ls -la");
+    }
+
+    #[test]
+    fn test_command_excerpt_long_is_truncated() {
+        let long = "x".repeat(500);
+        let excerpt = command_excerpt(&long);
+        // For ASCII input we should be exactly 100 + ellipsis bytes.
+        assert!(excerpt.len() < long.len());
+        assert!(excerpt.ends_with('…'));
+        assert_eq!(&excerpt[..100], &long[..100]);
     }
 
     #[test]
     fn test_build_command_wraps_with_bash() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
-        let cmd = build_command("echo hello", cwd, None, true).unwrap();
+        let cmd = build_command("echo hello", cwd, None, true, TEST_MARKER).unwrap();
         // The command should be a bash process
         let inner = cmd.as_std();
         assert_eq!(inner.get_program(), "bash");
@@ -546,7 +718,7 @@ mod tests {
         // The second arg should contain our command and the pwd marker
         let wrapped = args[1].to_str().unwrap();
         assert!(wrapped.contains("echo hello"));
-        assert!(wrapped.contains(PWD_MARKER));
+        assert!(wrapped.contains(TEST_MARKER));
     }
 
     #[test]

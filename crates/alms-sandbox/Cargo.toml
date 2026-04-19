@@ -23,6 +23,7 @@ iana-time-zone = "0.1"
 regex.workspace = true
 walkdir.workspace = true
 globset.workspace = true
+uuid.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

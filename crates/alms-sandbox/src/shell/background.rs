@@ -25,6 +25,7 @@ pub(crate) async fn submit_background_task(
     sandbox_root: Option<PathBuf>,
     unrestricted: bool,
     default_env: HashMap<String, String>,
+    pwd_marker: String,
 ) -> SandboxResult<String> {
     let task_id = state.next_id().await;
     let command_display = input.command.clone();
@@ -43,6 +44,7 @@ pub(crate) async fn submit_background_task(
             sandbox_root_ref.as_deref(),
             unrestricted,
             &default_env,
+            &pwd_marker,
         )
         .await;
 
@@ -141,9 +143,16 @@ mod tests {
             run_in_background: true,
         };
 
-        let task_id = submit_background_task(input, &state, None, true, HashMap::new())
-            .await
-            .unwrap();
+        let task_id = submit_background_task(
+            input,
+            &state,
+            None,
+            true,
+            HashMap::new(),
+            "__ALMS_PWD_TEST__".to_string(),
+        )
+        .await
+        .unwrap();
 
         assert!(task_id.starts_with("bg_"));
 
