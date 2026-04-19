@@ -1188,4 +1188,345 @@ mod tests {
             );
         }
     }
+
+    // ── Windows test parity (issue #746) ─────────────────────────────────
+    //
+    // Alper's daily driver is Windows, and the integration tests above are
+    // gated on `#[cfg(unix)]` because Unix-style absolute paths (`/tmp`,
+    // `/etc`) and Unix-only utilities (`env`) don't apply on Windows. This
+    // module mirrors the parts of the Unix integration suite that belong on
+    // Windows too: env inheritance (area 1) and permission-regex behaviour
+    // on Windows-shaped command strings (area 4).
+    //
+    // All commands still go through `bash -c` because that is the only shell
+    // the tool dispatches to — on Windows runners this requires Git Bash on
+    // PATH, which is a default on GitHub-hosted `windows-latest` images. The
+    // tests stay minimal and use `printenv` / `echo` rather than `env` so
+    // they run identically under Git Bash.
+    //
+    // Areas 2 (CWD persistence round-trip) and 3 (background-task cleanup
+    // on process handle drop) are deferred to follow-up issues — those
+    // require more careful setup (Windows path canonicalisation / drive
+    // letters, Windows process-group semantics) than fits in a pure
+    // test-parity PR.
+    #[cfg(windows)]
+    mod windows_tests {
+        use super::*;
+
+        // ── Area 1: environment inheritance ─────────────────────────────
+
+        /// On Windows, `env_clear()` followed by selective re-injection of
+        /// `platform_critical_env_vars()` must still leave no API-key
+        /// variables in the child environment. This mirrors the Unix
+        /// `test_shell_tool_env_cleared` test.
+        #[tokio::test]
+        async fn test_shell_tool_env_cleared_windows() {
+            let tool = ShellTool::new();
+            // `printenv` is provided by Git Bash on Windows runners and is
+            // the most portable way to enumerate the child environment —
+            // Windows' native `set` only works in cmd.exe, not bash.
+            let result = tool
+                .execute(serde_json::json!({"command": "printenv || env"}))
+                .await
+                .unwrap();
+            let stdout = result["stdout"].as_str().unwrap();
+            assert!(
+                !stdout.contains("OPENROUTER_API_KEY"),
+                "API keys must not leak into spawned processes on Windows"
+            );
+            assert!(
+                !stdout.contains("ANTHROPIC_API_KEY"),
+                "Anthropic API key must not leak on Windows"
+            );
+            assert!(
+                stdout.contains("PATH="),
+                "PATH must be re-injected after env_clear() on Windows"
+            );
+        }
+
+        /// `default_env` injected via `with_default_env` must reach the
+        /// child process on Windows. Mirrors Unix `test_shell_tool_default_env`.
+        #[tokio::test]
+        async fn test_shell_tool_default_env_windows() {
+            let mut env = HashMap::new();
+            env.insert("ALMS_DATA_DIR".to_string(), "C:\\alms-test".to_string());
+            let tool = ShellTool::new().with_default_env(env);
+
+            let result = tool
+                .execute(serde_json::json!({"command": "printenv ALMS_DATA_DIR"}))
+                .await
+                .unwrap();
+            let stdout = result["stdout"].as_str().unwrap();
+            assert!(
+                stdout.contains("C:\\alms-test") || stdout.contains("C:/alms-test"),
+                "default_env should propagate to child on Windows; got: {stdout:?}"
+            );
+        }
+
+        /// Per-call `env` parameter must override `default_env` on Windows.
+        /// Mirrors Unix `test_shell_tool_env_override`.
+        #[tokio::test]
+        async fn test_shell_tool_env_override_windows() {
+            let mut env = HashMap::new();
+            env.insert("ALMS_DATA_DIR".to_string(), "C:\\default".to_string());
+            let tool = ShellTool::new().with_default_env(env);
+
+            let result = tool
+                .execute(serde_json::json!({
+                    "command": "printenv ALMS_DATA_DIR",
+                    "env": {"ALMS_DATA_DIR": "C:\\override"}
+                }))
+                .await
+                .unwrap();
+            let stdout = result["stdout"].as_str().unwrap();
+            assert!(
+                stdout.contains("C:\\override") || stdout.contains("C:/override"),
+                "per-call env should override default_env on Windows; got: {stdout:?}"
+            );
+            assert!(
+                !stdout.contains("C:\\default") && !stdout.contains("C:/default"),
+                "default value should not appear when overridden; got: {stdout:?}"
+            );
+        }
+
+        /// Secret-env filtering must apply on Windows too. Mirrors Unix
+        /// `test_shell_tool_blocks_secret_env`.
+        #[tokio::test]
+        async fn test_shell_tool_blocks_secret_env_windows() {
+            let tool = ShellTool::new();
+            let result = tool
+                .execute(serde_json::json!({
+                    "command": "printenv",
+                    "env": {
+                        "OPENAI_API_KEY": "stolen",
+                        "SAFE_VAR_WIN": "ok"
+                    }
+                }))
+                .await
+                .unwrap();
+            let stdout = result["stdout"].as_str().unwrap();
+            assert!(
+                !stdout.contains("OPENAI_API_KEY"),
+                "secret env var must be filtered on Windows"
+            );
+            assert!(
+                stdout.contains("SAFE_VAR_WIN=ok"),
+                "non-secret custom env var should be passed through on Windows"
+            );
+        }
+
+        /// The per-tool PWD marker (issue #743) must also be generated on
+        /// Windows — there was previously no Windows assertion for this and
+        /// the marker is security-relevant.
+        #[test]
+        fn test_pwd_marker_generated_on_windows() {
+            let tool = ShellTool::new();
+            let marker = tool.pwd_marker();
+            assert!(
+                marker.starts_with("__ALMS_PWD_"),
+                "marker prefix must be stable across platforms"
+            );
+            assert_eq!(
+                marker.len(),
+                45,
+                "marker length (prefix + UUID simple + suffix) must match on Windows"
+            );
+        }
+
+        /// Cloning a `ShellTool` on Windows must preserve the PWD marker so
+        /// the `shell_exec` alias recovers the cwd through the same token.
+        #[test]
+        fn test_pwd_marker_preserved_across_clone_on_windows() {
+            let a = ShellTool::new();
+            let b = a.clone();
+            assert_eq!(
+                a.pwd_marker(),
+                b.pwd_marker(),
+                "cloned ShellTool must share the marker on Windows"
+            );
+        }
+
+        /// Platform-critical env vars on Windows include `SystemRoot`,
+        /// `PATHEXT`, `COMSPEC`, `PATH`. When these are present in the
+        /// daemon process they must be re-injected; this prevents `bash`
+        /// and basic utilities from failing.
+        ///
+        /// Note: Git Bash on Windows exposes env-var names in uppercase
+        /// through `printenv` (e.g. `SYSTEMROOT` rather than `SystemRoot`).
+        /// Windows env-var names are case-insensitive on the kernel side,
+        /// so we match case-insensitively too.
+        #[tokio::test]
+        async fn test_shell_tool_windows_platform_env_present() {
+            let tool = ShellTool::new();
+            let result = tool
+                .execute(serde_json::json!({"command": "printenv"}))
+                .await
+                .unwrap();
+            let stdout = result["stdout"].as_str().unwrap();
+            let upper = stdout.to_ascii_uppercase();
+            // PATH is always re-injected.
+            assert!(
+                upper.contains("PATH="),
+                "PATH must be present in child env on Windows; got: {stdout:?}"
+            );
+            // SystemRoot is set on any sane Windows host. If the daemon had
+            // it, the child must too.
+            if std::env::var_os("SystemRoot").is_some() {
+                assert!(
+                    upper.contains("SYSTEMROOT="),
+                    "SystemRoot must be re-injected on Windows when present; got: {stdout:?}"
+                );
+            }
+        }
+
+        // ── Area 4: permission-regex matching on Windows command shapes ─
+
+        /// Permission regex matching is a pure-string operation so the
+        /// behaviour should be identical to Unix. This test exercises a
+        /// small but Windows-shaped sample to guard against someone
+        /// accidentally making the matcher platform-dependent in the
+        /// future (e.g. by splitting on shell tokens or calling into
+        /// OS-level path APIs).
+        #[test]
+        fn test_permissions_match_windows_command_strings() {
+            let perms = ShellPermissions {
+                allowed_commands: vec![],
+                denied_commands: vec![
+                    // Windows-style invocation that a prompt-injection
+                    // attacker might try on Windows:
+                    r"^cmd(\.exe)?\s+/c\b".to_string(),
+                    r"^powershell(\.exe)?\b".to_string(),
+                ],
+                classifier_overrides: vec![],
+            };
+            let compiled = CompiledPermissions::compile(&perms);
+
+            assert!(compiled.check_command("cmd /c del /f C:\\Windows").is_err());
+            assert!(
+                compiled
+                    .check_command("cmd.exe /c rmdir /s /q C:\\Users")
+                    .is_err()
+            );
+            assert!(
+                compiled
+                    .check_command("powershell -Command \"Remove-Item -Recurse\"")
+                    .is_err()
+            );
+            assert!(
+                compiled
+                    .check_command("powershell.exe -EncodedCommand foo")
+                    .is_err()
+            );
+            // Legitimate bash commands still pass the Windows-shaped denylist.
+            assert!(compiled.check_command("echo hello").is_ok());
+            assert!(compiled.check_command("ls -la").is_ok());
+        }
+
+        /// Windows paths contain backslashes; regex patterns authored by
+        /// the operator may or may not escape them. The matcher must treat
+        /// the command string as an opaque byte sequence — no
+        /// interpretation of path separators.
+        #[test]
+        fn test_permissions_respect_backslash_paths_on_windows() {
+            let perms = ShellPermissions {
+                allowed_commands: vec![],
+                // Block any command that touches C:\Windows (escaped
+                // backslash in the regex — matches literal `C:\Windows`).
+                denied_commands: vec![r"C:\\Windows".to_string()],
+                classifier_overrides: vec![],
+            };
+            let compiled = CompiledPermissions::compile(&perms);
+
+            assert!(
+                compiled
+                    .check_command("type C:\\Windows\\System32\\drivers\\etc\\hosts")
+                    .is_err(),
+                "backslash-path denylist must match Windows command strings"
+            );
+            // Forward-slash variant must NOT match — the user wrote the
+            // pattern for literal backslashes. This guards against anyone
+            // silently normalising separators in the matcher.
+            assert!(
+                compiled
+                    .check_command("cat C:/Windows/System32/drivers/etc/hosts")
+                    .is_ok(),
+                "forward-slash path must not match a backslash-only pattern"
+            );
+        }
+
+        /// Allowlist-only mode on Windows: the same regex behaviour must
+        /// apply as on Unix.
+        #[test]
+        fn test_permissions_allowlist_on_windows_command_strings() {
+            let perms = ShellPermissions {
+                // Only allow invocations of `git` and `echo`.
+                allowed_commands: vec![r"^git\b".to_string(), r"^echo\b".to_string()],
+                denied_commands: vec![],
+                classifier_overrides: vec![],
+            };
+            let compiled = CompiledPermissions::compile(&perms);
+
+            assert!(compiled.check_command("git status").is_ok());
+            assert!(compiled.check_command("echo hello").is_ok());
+            // Windows-shaped outsider must still be blocked by allowlist.
+            assert!(compiled.check_command("cmd /c dir").is_err());
+            assert!(compiled.check_command("powershell -File foo.ps1").is_err());
+        }
+
+        /// Deny-wins semantics on Windows-shaped command strings: the
+        /// combined allow+deny evaluation order must not depend on
+        /// platform.
+        #[test]
+        fn test_permissions_deny_wins_on_windows() {
+            let perms = ShellPermissions {
+                allowed_commands: vec![r"^git\b".to_string()],
+                // Even among allowed git commands, never let a force-push
+                // through. This mirrors the Unix `deny_takes_precedence_over_allow`
+                // test but using a Windows-style remote path in the assertion.
+                denied_commands: vec![r"git\s+push\s+.*--force".to_string()],
+                classifier_overrides: vec![],
+            };
+            let compiled = CompiledPermissions::compile(&perms);
+
+            assert!(compiled.check_command("git status").is_ok());
+            assert!(compiled.check_command("git push origin main").is_ok());
+            assert!(
+                compiled
+                    .check_command("git push --force origin main")
+                    .is_err()
+            );
+            assert!(
+                compiled
+                    .check_command("git push \\\\server\\share main --force")
+                    .is_err(),
+                "deny should fire even with Windows UNC-style path args"
+            );
+        }
+
+        /// Wiring check: the permission gate in `execute()` must fire on
+        /// Windows too. This catches regressions if a future refactor
+        /// accidentally `#[cfg(unix)]`-gates the permission check.
+        #[tokio::test]
+        async fn test_shell_tool_respects_deny_permission_on_windows() {
+            let perms = ShellPermissions {
+                allowed_commands: vec![],
+                denied_commands: vec![r"^forbidden\b".to_string()],
+                classifier_overrides: vec![],
+            };
+            let tool = ShellTool::new().with_permissions(&perms);
+
+            let result = tool
+                .execute(serde_json::json!({"command": "forbidden --do-evil"}))
+                .await;
+            assert!(
+                result.is_err(),
+                "denied command should be blocked by execute() on Windows"
+            );
+            let err_msg = result.unwrap_err().to_string();
+            assert!(
+                err_msg.contains("Command blocked by security policy"),
+                "error should come from the permission check on Windows, got: {err_msg}"
+            );
+        }
+    }
 }
