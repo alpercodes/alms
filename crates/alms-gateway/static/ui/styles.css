@@ -2132,7 +2132,31 @@ html[data-theme='light'] .msg-warning-code {
 .model-provider-badge--anthropic  { color: var(--dm-accent); background: var(--dm-accent-muted); }
 .model-provider-badge--openai     { color: var(--accent-text); background: var(--accent-muted); }
 .model-provider-badge--openrouter { color: var(--info); background: var(--info-muted); }
+/* Providers unlocked by the generic OpenAI-compatible config (#770). Colors
+ * are brand-adjacent and picked to not clash with the existing four badges.
+ * Defaults target dark mode (the default theme); light-mode overrides below
+ * tune foreground values for contrast on light backgrounds.
+ *   xai      — neutral/graphite (Grok/X visual identity)
+ *   deepseek — blue
+ *   mistral  — orange
+ *   groq     — red/crimson
+ *   ollama   — teal (neutral, "local")
+ *   google   — google-blue (pre-added for #764; no entries yet)
+ */
+.model-provider-badge--xai        { color: #d4d4d8; background: rgba(161, 161, 170, 0.18); }
+.model-provider-badge--deepseek   { color: #93c5fd; background: rgba(59, 130, 246, 0.16); }
+.model-provider-badge--mistral    { color: #fdba74; background: rgba(249, 115, 22, 0.15); }
+.model-provider-badge--groq       { color: #fca5a5; background: rgba(239, 68, 68, 0.15); }
+.model-provider-badge--ollama     { color: #5eead4; background: rgba(20, 184, 166, 0.15); }
+.model-provider-badge--google     { color: #93c5fd; background: rgba(66, 133, 244, 0.16); }
 .model-provider-badge--unknown    { color: var(--text-muted); background: var(--surface-3); }
+/* Light-mode overrides: darker foregrounds on lightly tinted backgrounds. */
+html[data-theme='light'] .model-provider-badge--xai      { color: #27272a; background: #e4e4e7; }
+html[data-theme='light'] .model-provider-badge--deepseek { color: #1e40af; background: rgba(30, 64, 175, 0.10); }
+html[data-theme='light'] .model-provider-badge--mistral  { color: #c2410c; background: rgba(194, 65, 12, 0.10); }
+html[data-theme='light'] .model-provider-badge--groq     { color: #b91c1c; background: rgba(185, 28, 28, 0.10); }
+html[data-theme='light'] .model-provider-badge--ollama   { color: #0f766e; background: rgba(15, 118, 110, 0.10); }
+html[data-theme='light'] .model-provider-badge--google   { color: #1a73e8; background: rgba(26, 115, 232, 0.10); }
 
 /* Override count badge on the settings gear button */
 .settings-btn { position: relative; }
