@@ -181,6 +181,28 @@ ALMS originally hardcoded `take(50)` messages in the agent loop. No compression,
 **Tool call persistence and context reconstruction:**
 Tool calls and their results are persisted to the session database as structured `Content::ToolCall` / `Content::ToolResult` messages. During context building, these are reconstructed into proper OpenAI-format LLM messages (assistant messages with `tool_calls` array, tool-role messages with `tool_call_id`). This means the LLM has full visibility of previous tool executions across runs — it knows what tools were called, with what parameters, and what results were returned.
 
+**Canonical message-shape invariant (issue #586):**
+
+The invariant lives in two distinct layers, and both matter independently:
+
+- **Builder layer** (`Vec<LlmMessage>` out of `ContextBuilder::build_with_perspective`). This is provider-agnostic and uses the three-role alphabet `system` / `user` / `assistant` / `tool`. It is the shape the agent loop and all provider adapters see.
+- **Wire layer** (the actual request body each provider adapter emits). This uses the two-role alphabet the provider's API speaks — for Anthropic, `user` / `assistant` — and is reached after each adapter applies its own relabeling and content-block mapping.
+
+**Builder-layer guarantees** (enforced by `ContextBuilder::normalize_for_llm`):
+
+1. **Non-empty.** At least one message.
+2. **System prefix only at the front.** Mid-history `Role::System` markers are stripped — lifecycle markers (DM-ended, subagent completion, scheduled-job notifications) live in session history for UI/SSE rendering but never appear in the LLM context. The agent receives the relevant payload via the `notification_input` user message pre-persisted by `lifecycle.rs`.
+3. **No adjacent same-role `user`/`assistant` pure-text turns.** Consecutive same-role pure-text turns are merged (content concatenated with a blank line). Tool-call / tool-result pairings are preserved as-is (already handled by `group_tool_calls` and `strip_orphaned_tool_results`). Note that `tool` and `user` are distinct roles at this layer — a canonical tail of `[tool_result, user_text]` satisfies the builder invariant.
+4. **Last non-system message is `user`.** Pending assistant tool_calls with no matching tool_result (e.g. crash, cancel, truncation cutting mid-pair) are closed with synthetic `[Tool execution was interrupted]` tool_result messages, mirroring the conventional interrupted-result pattern. This ensures the tail is either a real user turn, a notification_input message, or a synthesised `"Please continue."` placeholder — never an assistant-with-tool_calls that Anthropic would reject.
+5. **No empty-content messages.** Empty-body assistant or user turns are dropped before dispatch (conventional provider hygiene).
+
+**Wire-layer guarantees** (per adapter, applied after its own transforms):
+
+- The **Anthropic adapter** (`to_anthropic_request` in `anthropic.rs`) relabels `role="tool"` → `role="user"` so that tool_result blocks land inside a user message, which is what Anthropic requires. That relabel can create adjacencies that the builder invariant does not forbid — concretely, a canonical tail of `[tool_result, user_text]` becomes two adjacent `user` wire messages, which Anthropic rejects with a 400. The adapter therefore runs `merge_consecutive_roles` after its conversion loop, concatenating adjacent same-role messages' content blocks in order. A post-pass `debug_assert!` pins the wire-level no-adjacent-same-role property as a tripwire.
+- The **OpenAI-compatible adapter** (OpenAI / OpenRouter / generic OpenAI-compatible providers) serialises the canonical builder shape directly. No role relabeling is needed because OpenAI natively has the `tool` role, so the builder invariant already holds at the wire.
+
+The invariant is pinned by unit tests in `context.rs` (builder layer) and by `debug_assert!`s plus adapter-level tests inside `anthropic.rs` (wire layer — non-empty messages array, trailing user role, no adjacent same-role messages after merge). Provider adapters do ONLY their own genuinely-provider-specific work.
+
 ---
 
 ## 3) Agent Workspace Files

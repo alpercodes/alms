@@ -128,11 +128,32 @@ pub(crate) struct StreamDelta {
 
 /// Convert an internal `CompletionRequest` to an `AnthropicRequest`.
 ///
-/// Key differences from OpenAI:
-/// - System messages become the top-level `system` field
-/// - Tool calls become `tool_use` content blocks in assistant messages
-/// - Tool results become `tool_result` content blocks in user messages
-/// - No `role: "tool"` — results are inside user messages
+/// The input message list is expected to already satisfy the canonical
+/// shape enforced by `ContextBuilder::normalize_for_llm` (see
+/// `context.rs` module docs) at the `LlmMessage` layer: system prefix at
+/// the front, alternating `user`/`assistant`/`tool` turns, trailing user
+/// turn, no empty-content messages, no pending tool_calls.
+///
+/// The transformations here are the narrowly provider-specific ones:
+///
+/// - System messages get extracted into the top-level `system` field
+///   (Anthropic native format).
+/// - Tool calls become `tool_use` content blocks inside assistant messages.
+/// - Tool results become `tool_result` content blocks merged into the
+///   following user message (Anthropic has no `role: "tool"`).
+///
+/// # Wire-level alternation post-pass
+///
+/// Because the `role="tool"` → `role="user"` relabel happens *here*, the
+/// canonical builder invariant ("no adjacent same-role messages") does
+/// NOT automatically hold on the Anthropic wire. Concretely: a canonical
+/// tail `[tool_result, user_text]` becomes two adjacent `user` wire
+/// messages, which Anthropic rejects with a 400.
+///
+/// After the conversion loop we therefore run [`merge_consecutive_roles`]
+/// to concatenate adjacent same-role messages' content blocks in order.
+/// The post-merge `debug_assert!`s pin the wire-level invariant as a
+/// tripwire against future regressions.
 pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest {
     let mut system_parts: Vec<String> = Vec::new();
     let mut messages: Vec<AnthropicMessage> = Vec::new();
@@ -218,8 +239,39 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
         }
     }
 
-    // Merge consecutive same-role messages (Anthropic rejects them)
-    let messages = merge_consecutive_roles(messages);
+    // Wire-level alternation pass. The builder enforces alternation at
+    // the `LlmMessage` layer where `user` and `tool` are distinct roles,
+    // but the `tool` → `user` relabel above can introduce adjacent
+    // `user` wire messages (e.g. canonical tail `[tool_result, user_text]`
+    // or two back-to-back fresh-user turns after a notification run
+    // lands on a tool_result tail). Anthropic rejects adjacent same-role
+    // wire messages with a 400, so we concatenate them here. This is
+    // provider-specific and cannot live in the shared builder.
+    merge_consecutive_roles(&mut messages);
+
+    // Post-conditions from the canonical invariant. Enforced as debug
+    // assertions — if they fire, the caller violated the contract and
+    // #586's tests missed a case; we want the loudest possible signal
+    // in tests and debug builds without paying the cost in release.
+    debug_assert!(
+        !messages.is_empty(),
+        "anthropic adapter received empty messages array after system extraction — \
+         context builder must guarantee at least one non-system message"
+    );
+    debug_assert_eq!(
+        messages.last().map(|m| m.role.as_str()),
+        Some("user"),
+        "anthropic adapter: messages does not end with user role — \
+         context builder must guarantee trailing user turn"
+    );
+    // Wire-level alternation — every adjacent pair must differ in role
+    // after `merge_consecutive_roles`. Tripwire for future regressions.
+    debug_assert!(
+        messages.windows(2).all(|w| w[0].role != w[1].role),
+        "anthropic adapter: adjacent same-role messages on the wire — \
+         merge_consecutive_roles failed to coalesce (roles={:?})",
+        messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
+    );
 
     let system = if system_parts.is_empty() {
         None
@@ -247,41 +299,44 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
     }
 }
 
-/// Merge consecutive messages with the same role into one (Anthropic requires
-/// alternating user/assistant messages).
-fn merge_consecutive_roles(messages: Vec<AnthropicMessage>) -> Vec<AnthropicMessage> {
-    let mut merged: Vec<AnthropicMessage> = Vec::new();
+/// Convert an `AnthropicContent` into a `Vec<ContentBlock>` so that two
+/// adjacent same-role messages can be merged by concatenating their blocks.
+/// `Text` content becomes a single `ContentBlock::Text` block; `Blocks`
+/// content is returned as-is.
+fn content_to_blocks(content: AnthropicContent) -> Vec<ContentBlock> {
+    match content {
+        AnthropicContent::Text(text) => vec![ContentBlock::Text { text }],
+        AnthropicContent::Blocks(blocks) => blocks,
+    }
+}
 
-    for msg in messages {
+/// Merge adjacent same-role `AnthropicMessage`s by concatenating their
+/// content blocks in order. Needed at the adapter boundary because the
+/// `role="tool"` → `role="user"` relabel that happens during
+/// [`to_anthropic_request`] can create adjacencies that the canonical
+/// `Vec<LlmMessage>` shape forbids (see the module-level doc on
+/// [`to_anthropic_request`]).
+fn merge_consecutive_roles(messages: &mut Vec<AnthropicMessage>) {
+    if messages.len() < 2 {
+        return;
+    }
+    let mut merged: Vec<AnthropicMessage> = Vec::with_capacity(messages.len());
+    for msg in messages.drain(..) {
         if let Some(prev) = merged.last_mut()
             && prev.role == msg.role
         {
-            // Merge: convert both to blocks if needed and combine
-            let prev_blocks = content_to_blocks(std::mem::replace(
-                &mut prev.content,
-                AnthropicContent::Blocks(vec![]),
-            ));
-            let new_blocks = content_to_blocks(msg.content);
-            prev.content = AnthropicContent::Blocks([prev_blocks, new_blocks].concat());
+            let mut prev_blocks =
+                match std::mem::replace(&mut prev.content, AnthropicContent::Text(String::new())) {
+                    AnthropicContent::Text(text) => vec![ContentBlock::Text { text }],
+                    AnthropicContent::Blocks(blocks) => blocks,
+                };
+            prev_blocks.extend(content_to_blocks(msg.content));
+            prev.content = AnthropicContent::Blocks(prev_blocks);
             continue;
         }
         merged.push(msg);
     }
-
-    merged
-}
-
-fn content_to_blocks(content: AnthropicContent) -> Vec<ContentBlock> {
-    match content {
-        AnthropicContent::Text(t) => {
-            if t.is_empty() {
-                vec![]
-            } else {
-                vec![ContentBlock::Text { text: t }]
-            }
-        }
-        AnthropicContent::Blocks(b) => b,
-    }
+    *messages = merged;
 }
 
 // ---------------------------------------------------------------------------
@@ -651,12 +706,73 @@ mod tests {
     }
 
     #[test]
-    fn test_consecutive_user_messages_merged() {
+    fn test_tool_result_appended_to_preceding_user_blocks() {
+        // Two tool_results plus a following user_text should all end up
+        // inside the same user-with-blocks message after wire-level
+        // alternation merging: the two tool_result blocks first share a
+        // user wrapper (via `can_append`), then the follow-up user_text
+        // is merged in as a Text block by `merge_consecutive_roles`.
         let req = CompletionRequest::new("test").with_messages(vec![
             LlmMessage::system("sys"),
             LlmMessage::user("first"),
-            // Simulating: assistant with tool_calls, then tool result (becomes user)
-            // but let's just test the merge logic directly
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![
+                    ToolCall::new("c1", "echo", "{}"),
+                    ToolCall::new("c2", "echo", "{}"),
+                ]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("c1", "result1"),
+            LlmMessage::tool_result("c2", "result2"),
+            LlmMessage::user("follow up"),
+        ]);
+
+        let anthropic_req = to_anthropic_request(&req);
+
+        // Wire messages: user("first"), assistant(tool_use x2),
+        // user(tool_result x2 + text("follow up")).
+        assert_eq!(anthropic_req.messages.len(), 3);
+        assert_eq!(anthropic_req.messages[0].role, "user");
+        assert_eq!(anthropic_req.messages[1].role, "assistant");
+        assert_eq!(anthropic_req.messages[2].role, "user");
+        if let AnthropicContent::Blocks(blocks) = &anthropic_req.messages[2].content {
+            assert_eq!(
+                blocks.len(),
+                3,
+                "two tool_results + follow-up text must be packed into one user-blocks message"
+            );
+            assert!(
+                matches!(blocks[0], ContentBlock::ToolResult { .. }),
+                "first block should be tool_result c1"
+            );
+            assert!(
+                matches!(blocks[1], ContentBlock::ToolResult { .. }),
+                "second block should be tool_result c2"
+            );
+            match &blocks[2] {
+                ContentBlock::Text { text } => assert_eq!(text, "follow up"),
+                other => panic!("third block should be text(\"follow up\"), got {other:?}"),
+            }
+        } else {
+            panic!("expected blocks content for merged user message");
+        }
+    }
+
+    /// Wire-level alternation invariant: after `to_anthropic_request`, no
+    /// two adjacent messages share a role, even when the canonical
+    /// `Vec<LlmMessage>` tail is `[tool_result, user_text]`. This is the
+    /// regression Tim identified in PR #773 — the builder-level invariant
+    /// allows `tool` + `user` adjacency, but the adapter's `tool` → `user`
+    /// relabel turns that into two adjacent wire-level `user` messages
+    /// which Anthropic rejects.
+    #[test]
+    fn test_wire_alternation_tool_result_then_fresh_user() {
+        let req = CompletionRequest::new("test").with_messages(vec![
+            LlmMessage::system("sys"),
+            LlmMessage::user("go"),
             LlmMessage {
                 role: "assistant".to_string(),
                 content: None,
@@ -664,16 +780,72 @@ mod tests {
                 tool_calls: Some(vec![ToolCall::new("c1", "echo", "{}")]),
                 tool_call_id: None,
             },
-            LlmMessage::tool_result("c1", "result1"),
-            LlmMessage::user("follow up"),
+            LlmMessage::tool_result("c1", "ok"),
+            LlmMessage::user("fresh input"),
         ]);
 
         let anthropic_req = to_anthropic_request(&req);
 
-        // tool_result (user) + "follow up" (user) should be merged into one user message
-        // Messages: user("first"), assistant(tool_use), user(tool_result + "follow up")
+        let roles: Vec<&str> = anthropic_req
+            .messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect();
+        for w in roles.windows(2) {
+            assert_ne!(
+                w[0], w[1],
+                "wire-level adjacent same-role messages: roles={roles:?}"
+            );
+        }
+
+        // And concretely: user("go"), assistant(tool_use),
+        // user(tool_result + text("fresh input")).
         assert_eq!(anthropic_req.messages.len(), 3);
         assert_eq!(anthropic_req.messages[2].role, "user");
+        if let AnthropicContent::Blocks(blocks) = &anthropic_req.messages[2].content {
+            assert_eq!(blocks.len(), 2);
+            assert!(matches!(blocks[0], ContentBlock::ToolResult { .. }));
+            match &blocks[1] {
+                ContentBlock::Text { text } => assert_eq!(text, "fresh input"),
+                other => panic!("expected text block for fresh input, got {other:?}"),
+            }
+        } else {
+            panic!("expected blocks content after merge");
+        }
+    }
+
+    /// Second scenario from Tim's review: fresh user turn landing on a run
+    /// whose persisted history ends mid-tool-loop at `[assistant(tool_use),
+    /// tool_result]`. Normalize would not add anything here since the tail
+    /// is already `tool` (not `user`), but `ensure_trailing_user` would
+    /// synthesise a `Please continue.` placeholder. Either way the adapter
+    /// must emit an alternating wire shape.
+    #[test]
+    fn test_wire_alternation_continue_placeholder_after_tool_result() {
+        let req = CompletionRequest::new("test").with_messages(vec![
+            LlmMessage::system("sys"),
+            LlmMessage::user("do it"),
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall::new("c1", "echo", "{}")]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("c1", "ok"),
+            LlmMessage::user("Please continue."),
+        ]);
+
+        let anthropic_req = to_anthropic_request(&req);
+
+        let roles: Vec<&str> = anthropic_req
+            .messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect();
+        for w in roles.windows(2) {
+            assert_ne!(w[0], w[1], "adjacent same-role wire messages: {roles:?}");
+        }
     }
 
     #[test]

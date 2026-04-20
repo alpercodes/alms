@@ -905,40 +905,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // message from a prior run (#434, Bug 1).
     let run_start_ts = alms_core::Timestamp::now();
 
-    // System-triggered notification runs (subagent completions, DM-ended
-    // notifications) that land on a user-facing session should NOT persist
-    // the verbose notification input as a normal Role::User message — that
-    // would show the internal LLM prompt as a "user" bubble on page reload.
+    // System-triggered notification runs (subagent completions, DM-ended)
+    // that land on a user-facing session pre-persist the notification as
+    // a `Role::User` message with `notification_input: true` metadata.
+    // The `notification_input` flag drives `get_session_messages` filtering
+    // so the internal prompt never shows as a "user" bubble on reload.
     //
-    // Instead, pre-persist the input as a Role::User message with
-    // `notification_input: true` metadata. This ensures:
-    //
-    //  1. The context builder includes it as a **user** message in the LLM
-    //     context window. This is required across all providers:
-    //
-    //     - **Anthropic (direct)**: The Anthropic Messages API extracts
-    //       system messages into the top-level `system` field. With the
-    //       previous Role::System approach, the messages array ended with
-    //       an assistant message from the prior conversation, causing API
-    //       rejection. Role::User ensures a valid trailing user turn.
-    //
-    //     - **OpenRouter (all models)**: OpenRouter uses the OpenAI chat
-    //       completions format. While the API technically accepts a
-    //       trailing system message, models are not trained to generate
-    //       responses to system messages without a subsequent user turn.
-    //       When proxying to Claude, OpenRouter performs the same system
-    //       message extraction as the direct Anthropic API, causing the
-    //       identical failure. For non-Claude models, a trailing system
-    //       message produces empty or confused responses. Role::User
-    //       ensures the notification is a clear conversation turn that
-    //       all models respond to naturally.
-    //
-    //  2. `get_session_messages` filters it out via the
-    //     `notification_input` metadata flag, making it invisible on page
-    //     reload.
-    //
-    // Then use `run_on_session` to skip the default Role::User persistence
-    // in `runtime.run()`.
+    // The `Role::User` choice is now a consequence of the canonical
+    // message-shape invariant enforced in `ContextBuilder::normalize_for_llm`
+    // (see #586): the invariant guarantees a trailing user turn regardless
+    // of this message's presence, so synthesising a placeholder would be
+    // redundant. Persisting as user keeps the real payload in history.
+    // Applies to Anthropic direct and OpenRouter-to-Claude proxying, which
+    // performs the same system-message extraction as the Anthropic API.
     let is_notification_on_user_session =
         is_system_triggered && !is_peer_message && !is_internal_context_id(&context_id);
 
@@ -960,24 +939,11 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             .run_on_session(&state.session_manager, session_id, &context_id, &input)
             .await
     } else if is_notification_on_user_session {
-        // Notification run landing on a user-facing session.
-        //
-        // Pre-persist the input as Role::User with `notification_input`
-        // metadata so the context builder sees it as a user message.
-        // This is required for all providers — see the detailed comment
-        // above `is_notification_on_user_session` for the full rationale.
-        //
-        // `get_session_messages` filters it out on reload so the internal
-        // prompt never appears as a "user" bubble.
-        //
-        // Then use `run_on_session` to skip the default Role::User
-        // persistence in `runtime.run()`.
-        //
-        // Note: if `run_on_session` fails after the append, the orphaned
-        // message remains in the session. It is invisible on reload (the
-        // API filter hides it) but occupies tokens in the context window
-        // for future runs. This is acceptable — the failure case is rare
-        // and the impact is minor token waste.
+        // Notification run on a user-facing session: pre-persist the
+        // input as Role::User + `notification_input` metadata (see the
+        // comment above `is_notification_on_user_session` for why), then
+        // use `run_on_session` to skip `runtime.run()`'s default
+        // Role::User persistence and avoid a double-write.
         let notif_msg = alms_session::Message {
             id: uuid::Uuid::new_v4().to_string(),
             role: alms_session::Role::User,

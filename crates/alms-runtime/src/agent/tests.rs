@@ -220,10 +220,14 @@ async fn test_build_context_non_dm_no_perspective() {
         .await
         .unwrap();
 
-    // system + 1 history + current = 3
-    assert_eq!(messages.len(), 3);
-    // No perspective mapping: message stays as "user" even though from_agent == "bob"
+    // Two consecutive user turns (history "Hello" + current input "hi")
+    // merge into a single user message under the canonical invariant.
+    // Expected shape: [system, user(merged)].
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
     assert_eq!(messages[1].role, "user");
+    assert!(messages[1].content_str().contains("Hello"));
+    assert!(messages[1].content_str().contains("hi"));
 }
 
 #[test]
