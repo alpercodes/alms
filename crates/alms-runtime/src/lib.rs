@@ -14,6 +14,7 @@ pub(crate) mod anthropic;
 pub mod context;
 pub mod episodic;
 pub mod events;
+pub(crate) mod gemini;
 pub mod llm_client;
 pub mod llm_types;
 pub mod scheduler;

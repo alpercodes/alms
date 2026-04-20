@@ -19,6 +19,7 @@ pub(crate) enum SseParseResult {
 enum Provider {
     OpenAi,
     Anthropic,
+    Gemini,
 }
 
 /// LLM client for making API calls
@@ -39,11 +40,14 @@ impl LlmClient {
 
         let provider = Self::resolve_protocol(&config);
 
-        // Auto-set base_url for Anthropic if the user didn't override it
-        // (legacy users who only set `provider = "anthropic"` in a classic
-        // flat config and never touched `base_url`).
+        // Auto-set base_url for native adapters if the user didn't override
+        // it (legacy users who only set `provider = "anthropic"` or
+        // `"gemini"` in a classic flat config and never touched `base_url`).
         if provider == Provider::Anthropic && config.base_url == "https://openrouter.ai/api/v1" {
             config.base_url = "https://api.anthropic.com/v1".to_string();
+        }
+        if provider == Provider::Gemini && config.base_url == "https://openrouter.ai/api/v1" {
+            config.base_url = "https://generativelanguage.googleapis.com/v1beta".to_string();
         }
 
         info!(
@@ -77,11 +81,13 @@ impl LlmClient {
         if let Some(entry) = config.providers.get(&config.provider) {
             return match entry.kind {
                 ProviderKind::Anthropic => Provider::Anthropic,
+                ProviderKind::Gemini => Provider::Gemini,
                 ProviderKind::OpenAiCompatible => Provider::OpenAi,
             };
         }
         match config.provider.as_str() {
             "anthropic" => Provider::Anthropic,
+            "gemini" => Provider::Gemini,
             _ => Provider::OpenAi,
         }
     }
@@ -123,6 +129,35 @@ impl LlmClient {
                     .header("anthropic-version", "2023-06-01")
                     .header("Content-Type", "application/json")
                     .json(&anthropic_req);
+                Ok(apply_auth(
+                    builder,
+                    &self.config.auth_scheme,
+                    &self.config.api_key,
+                ))
+            }
+            Provider::Gemini => {
+                // Gemini routes on URL path, not a role-based endpoint:
+                //   {base_url}/models/{model}:generateContent
+                //   {base_url}/models/{model}:streamGenerateContent?alt=sse
+                // `request.stream` is set by `complete_stream` before this
+                // is called, so we branch on it here.
+                let streaming = request.stream.unwrap_or(false);
+                let method = if streaming {
+                    "streamGenerateContent?alt=sse"
+                } else {
+                    "generateContent"
+                };
+                let url = format!(
+                    "{}/models/{}:{}",
+                    self.config.base_url, request.model, method
+                );
+                debug!("Sending Gemini completion request to {}", url);
+                let gemini_req = crate::gemini::to_gemini_request(request);
+                let builder = self
+                    .client
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .json(&gemini_req);
                 Ok(apply_auth(
                     builder,
                     &self.config.auth_scheme,
@@ -184,6 +219,14 @@ impl LlmClient {
                         AlmsError::Runtime(format!("Failed to parse Anthropic response: {}", e))
                     })?;
                 crate::anthropic::from_anthropic_response(anthropic_resp)
+            }
+            Provider::Gemini => {
+                let gemini_resp: crate::gemini::GeminiResponse = serde_json::from_str(&body_text)
+                    .map_err(|e| {
+                    error!(body = body_text.as_str(), "Failed to parse Gemini response");
+                    AlmsError::Runtime(format!("Failed to parse Gemini response: {}", e))
+                })?;
+                crate::gemini::from_gemini_response(gemini_resp)
             }
         };
 
@@ -349,7 +392,28 @@ impl LlmClient {
         match provider {
             Provider::OpenAi => Self::parse_sse_event(event),
             Provider::Anthropic => Self::parse_anthropic_sse_block(event),
+            Provider::Gemini => Self::parse_gemini_sse_block(event),
         }
+    }
+
+    /// Parse a single Gemini SSE event block. Gemini's
+    /// `streamGenerateContent?alt=sse` uses OpenAI-style `data: {json}`
+    /// events (no typed `event:` header), so we walk the block for the
+    /// `data:` line and hand it to the provider parser.
+    fn parse_gemini_sse_block(event: &str) -> SseParseResult {
+        for line in event.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            if let Some(data) = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"))
+            {
+                return crate::gemini::parse_gemini_sse(data.trim());
+            }
+        }
+        SseParseResult::Skip
     }
 
     /// Parse an Anthropic SSE event block which has `event:` and `data:` fields.
@@ -514,6 +578,7 @@ impl LlmClient {
         if let Some(entry) = self.config.providers.get(provider).cloned() {
             self.provider = match entry.kind {
                 ProviderKind::Anthropic => Provider::Anthropic,
+                ProviderKind::Gemini => Provider::Gemini,
                 ProviderKind::OpenAiCompatible => Provider::OpenAi,
             };
             self.config.base_url = entry.base_url;
@@ -526,6 +591,7 @@ impl LlmClient {
             // Fall back to sugar-name mapping for tests / bare configs.
             self.provider = match provider {
                 "anthropic" => Provider::Anthropic,
+                "gemini" => Provider::Gemini,
                 _ => Provider::OpenAi,
             };
             match provider {
@@ -533,6 +599,13 @@ impl LlmClient {
                     self.config.base_url = "https://api.anthropic.com/v1".to_string();
                     self.config.auth_scheme = AuthScheme::Header {
                         name: "x-api-key".into(),
+                    };
+                }
+                "gemini" => {
+                    self.config.base_url =
+                        "https://generativelanguage.googleapis.com/v1beta".to_string();
+                    self.config.auth_scheme = AuthScheme::Header {
+                        name: "x-goog-api-key".into(),
                     };
                 }
                 "openrouter" => {
@@ -1332,5 +1405,118 @@ mod tests {
             vec!["user", "tool", "user", "tool"],
             "quirks did not produce the expected message shape: {roles:?}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Gemini native adapter (issue #764)
+    // ------------------------------------------------------------------
+
+    /// `ProviderKind::Gemini` resolves to `Provider::Gemini`, and the
+    /// sugar entry's `x-goog-api-key` header travels through to the final
+    /// request.
+    #[test]
+    fn test_gemini_provider_kind_resolves_to_gemini_protocol() {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "gemini".into();
+
+        let runtime_cfg: LlmConfig = core_cfg.into();
+        let client = LlmClient::new(runtime_cfg).unwrap();
+        assert_eq!(client.provider(), "gemini");
+        assert_eq!(
+            client.base_url(),
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+    }
+
+    /// End-to-end: a Gemini config builds a request with the correct URL
+    /// path (`:generateContent` for non-streaming), `x-goog-api-key`
+    /// header, and Gemini-shaped body (`contents[]` with `systemInstruction`).
+    #[test]
+    fn test_gemini_build_request_non_streaming() {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "gemini".into();
+
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = "gemini-test-key".into();
+        let client = LlmClient::new(runtime_cfg).unwrap();
+
+        let request = CompletionRequest::new("gemini-2.5-pro").with_messages(vec![
+            LlmMessage::system("be helpful"),
+            LlmMessage::user("hi"),
+        ]);
+        let req = client.build_request_for_test(&request).unwrap();
+
+        // URL: {base_url}/models/{model}:generateContent — the non-streaming
+        // variant (request.stream is None).
+        assert_eq!(
+            req.url().as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"
+        );
+
+        // Auth: `x-goog-api-key` header only, no Bearer.
+        assert!(
+            req.headers().get("authorization").is_none(),
+            "Bearer header must not be set when auth_scheme is Header"
+        );
+        assert_eq!(
+            req.headers()
+                .get("x-goog-api-key")
+                .and_then(|v| v.to_str().ok()),
+            Some("gemini-test-key"),
+        );
+
+        // Body: Gemini wire shape — `systemInstruction` pulled out,
+        // `contents[]` with role=user.
+        let body_bytes = req.body().and_then(|b| b.as_bytes()).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "hi");
+        // OpenAI-style `messages` array must not appear.
+        assert!(
+            body.get("messages").is_none(),
+            "Gemini wire format must not emit an OpenAI `messages` array"
+        );
+    }
+
+    /// Streaming branch builds the correct `:streamGenerateContent?alt=sse`
+    /// URL. Verified by forcing `stream = Some(true)` on the request (what
+    /// `complete_stream` does internally).
+    #[test]
+    fn test_gemini_build_request_streaming_url() {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "gemini".into();
+
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = "k".into();
+        let client = LlmClient::new(runtime_cfg).unwrap();
+
+        let mut request =
+            CompletionRequest::new("gemini-2.5-flash").with_messages(vec![LlmMessage::user("hi")]);
+        request.stream = Some(true);
+        let req = client.build_request_for_test(&request).unwrap();
+
+        assert_eq!(
+            req.url().as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+    }
+
+    /// `dispatch_sse_event` routes Gemini SSE blocks through the Gemini
+    /// parser. Verifies the dispatch seam rather than re-covering the
+    /// parser, which has direct tests in `gemini.rs`.
+    #[test]
+    fn test_dispatch_sse_event_routes_gemini() {
+        let event = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}]}";
+        let result = LlmClient::parse_gemini_sse_block(event);
+        match result {
+            SseParseResult::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+            }
+            _ => panic!("expected Chunk"),
+        }
     }
 }

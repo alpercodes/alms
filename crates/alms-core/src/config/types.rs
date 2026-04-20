@@ -224,6 +224,23 @@ impl LlmConfig {
                 },
                 quirks: ProviderQuirks::default(),
             });
+        // Google Gemini — native adapter (see `alms-runtime/src/gemini.rs`).
+        // Authenticates via the `x-goog-api-key` header (preferred over the
+        // `?key=` query parameter because it keeps the secret out of URL
+        // logs).
+        self.providers
+            .entry("gemini".to_string())
+            .or_insert_with(|| ProviderEntry {
+                kind: ProviderKind::Gemini,
+                base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: AuthScheme::Header {
+                    name: "x-goog-api-key".into(),
+                },
+                quirks: ProviderQuirks::default(),
+            });
     }
 
     /// Look up the [`ProviderEntry`] matching [`LlmConfig::provider`],
@@ -321,6 +338,14 @@ pub enum ProviderKind {
     /// Anthropic Messages API.
     #[serde(rename = "anthropic")]
     Anthropic,
+    /// Google Gemini `generateContent` / `streamGenerateContent` API.
+    ///
+    /// Uses a distinct wire shape (`contents[]` with typed `parts[]`,
+    /// top-level `systemInstruction`, `functionCall` / `functionResponse`
+    /// parts for tool use). Reached only via the native adapter in
+    /// `alms-runtime/src/gemini.rs`.
+    #[serde(rename = "gemini")]
+    Gemini,
 }
 
 /// How an API key is attached to each outgoing request.

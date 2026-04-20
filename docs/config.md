@@ -53,7 +53,7 @@ API key precedence at gateway startup:
 
 When resolution fails, the gateway logs a warning and continues; the first outgoing request will surface an auth error from the upstream.
 
-> Note: the `alms auth set <name> <key>` command currently restricts `<name>` to a fixed list (`openai`, `anthropic`, `openrouter`, `telegram`). For any *other* provider you declare in `[llm.providers.<name>]`, use `api_key_env` instead. Extending `alms auth set` to accept arbitrary provider names is tracked separately.
+> Note: the `alms auth set <name> <key>` command currently restricts `<name>` to a fixed list (`openai`, `anthropic`, `gemini`, `openrouter`, `telegram`). For any *other* provider you declare in `[llm.providers.<name>]`, use `api_key_env` instead. Extending `alms auth set` to accept arbitrary provider names is tracked separately.
 
 ### Auth schemes
 
@@ -189,6 +189,39 @@ auth_scheme = { type = "header", name = "X-Proxy-Auth" }
 
 ---
 
+## Gemini
+
+Google Gemini ships a native adapter (`kind = "gemini"`) that speaks the
+`generateContent` / `streamGenerateContent` API directly — `systemInstruction`
+extraction, `functionCall` / `functionResponse` tool parts, SSE streaming.
+The sugar entry is auto-populated, so minimal config is enough:
+
+```toml
+[llm]
+provider = "gemini"
+model    = "gemini-2.5-pro"
+```
+
+Store the API key with `alms auth set gemini <key>`. Alternatively, point the
+sugar entry at an existing environment variable:
+
+```toml
+[llm.providers.gemini]
+api_key_env = "GEMINI_API_KEY"   # or "GOOGLE_API_KEY"
+```
+
+Only override `base_url` if you need to talk to a proxy or a non-default
+region — the default is `https://generativelanguage.googleapis.com/v1beta`.
+Gemini authenticates via the `x-goog-api-key` header (preferred over the
+`?key=` query parameter because it keeps the secret out of URL logs).
+
+**Known gaps** (tracked for future work):
+- Context caching — Gemini-specific feature, not yet wired.
+- Thinking/reasoning token passthrough — not yet surfaced.
+- Multimodal input (image / audio / video parts) — not yet supported.
+
+---
+
 ## Environment-variable overrides
 
 Non-secret `ALMS_*` variables are applied on top of the parsed config file. The LLM-related ones:
@@ -210,7 +243,7 @@ Non-secret `ALMS_*` variables are applied on top of the parsed config file. The 
 The generic `[llm.providers.*]` surface is strictly additive:
 
 - Flat configs (`provider = "openai"` with nothing under `[llm.providers]`) still work — the sugar entries are auto-populated at load time.
-- Existing `[llm.openai]` / `[llm.openrouter]` / `[llm.anthropic]` sugar blocks (where used) are untouched; they simply don't override the generic `[llm.providers.<name>]` entries.
-- `alms auth set <provider> <key>` still works for the fixed list (`openai`, `anthropic`, `openrouter`, `telegram`) as documented above. For any *other* provider declared in `[llm.providers.<name>]`, use `api_key_env` instead — extending `alms auth set` to accept arbitrary provider names is tracked separately.
+- Existing `[llm.openai]` / `[llm.openrouter]` / `[llm.anthropic]` / `[llm.gemini]` sugar blocks (where used) are untouched; they simply don't override the generic `[llm.providers.<name>]` entries.
+- `alms auth set <provider> <key>` still works for the fixed list (`openai`, `anthropic`, `gemini`, `openrouter`, `telegram`) as documented above. For any *other* provider declared in `[llm.providers.<name>]`, use `api_key_env` instead — extending `alms auth set` to accept arbitrary provider names is tracked separately.
 
-Native adapters — currently the Anthropic Messages adapter — are reserved for providers that cannot be reached through the OpenAI chat-completions protocol. Everything else should land here as a docs entry, not new adapter code.
+Native adapters — currently the Anthropic Messages adapter and the Google Gemini `generateContent` adapter — are reserved for providers that cannot be reached through the OpenAI chat-completions protocol. Everything else should land here as a docs entry, not new adapter code.

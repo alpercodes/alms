@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Valid provider/secret names. Single source of truth for CLI, HTTP API, and UI.
-pub const VALID_PROVIDERS: &[&str] = &["openai", "anthropic", "openrouter", "telegram"];
+pub const VALID_PROVIDERS: &[&str] = &["openai", "anthropic", "openrouter", "gemini", "telegram"];
 
 /// Environment variable name for the master encryption key.
 pub const MASTER_KEY_ENV: &str = "ALMS_MASTER_KEY";
@@ -334,6 +334,8 @@ impl SecretsStore {
             ("OPENROUTER_API_KEY", "openrouter"),
             ("OPENAI_API_KEY", "openai"),
             ("ANTHROPIC_API_KEY", "anthropic"),
+            ("GEMINI_API_KEY", "gemini"),
+            ("GOOGLE_API_KEY", "gemini"),
             ("TELEGRAM_BOT_TOKEN", "telegram"),
         ];
         DEPRECATED_VARS

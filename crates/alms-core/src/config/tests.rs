@@ -445,6 +445,113 @@ stream_chunk_timeout_secs = 120
     assert_eq!(config.llm.stream_chunk_timeout_secs, 120);
 }
 
+// ---- Gemini provider layering tests (issue #764) ----
+
+/// `ensure_builtin_providers` populates a `gemini` sugar entry so that
+/// `llm.provider = "gemini"` Just Works without an explicit
+/// `[llm.providers.gemini]` block.
+#[test]
+fn test_gemini_sugar_entry_auto_populated() {
+    let config = AlmsConfig::default();
+    let entry = config
+        .llm
+        .providers
+        .get("gemini")
+        .expect("gemini sugar entry must be auto-populated by ensure_builtin_providers");
+    assert_eq!(entry.kind, ProviderKind::Gemini);
+    assert_eq!(
+        entry.base_url,
+        "https://generativelanguage.googleapis.com/v1beta"
+    );
+    match &entry.auth_scheme {
+        AuthScheme::Header { name } => assert_eq!(name, "x-goog-api-key"),
+        other => panic!("expected header auth scheme for gemini, got {other:?}"),
+    }
+}
+
+/// Selecting Gemini via `ALMS_LLM_PROVIDER=gemini` resolves to the sugar
+/// entry and passes validation (given a mock/no-key config).
+#[test]
+fn test_env_override_selects_gemini_provider() {
+    let _guard = EnvGuard::set(&[("ALMS_LLM_PROVIDER", Some("gemini"))]);
+
+    let mut config = AlmsConfig::default();
+    config.apply_env_overrides();
+    assert_eq!(config.llm.provider, "gemini");
+
+    // Provider must be known to `validate()` so the error path isn't
+    // triggered. The sugar entry makes this true even without a TOML file.
+    config.llm.mock = true;
+    assert!(config.validate().is_ok());
+}
+
+/// `ALMS_LLM_MODEL` override propagates into the resolved provider entry,
+/// not just the flat `llm.model` field — mirrors the existing test for
+/// openrouter/openai/anthropic.
+#[test]
+fn test_env_override_model_propagates_to_gemini_entry() {
+    let _provider_guard = EnvGuard::set(&[("ALMS_LLM_PROVIDER", Some("gemini"))]);
+    let _model_guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "gemini-2.5-flash");
+    let _legacy_guard = SingleEnvGuard::remove("DEFAULT_MODEL");
+
+    let mut config = AlmsConfig::default();
+    config.llm.ensure_builtin_providers();
+    config.apply_env_overrides();
+
+    assert_eq!(config.llm.provider, "gemini");
+    assert_eq!(config.llm.model, "gemini-2.5-flash");
+    let entry = config.llm.providers.get("gemini").unwrap();
+    assert_eq!(entry.model.as_deref(), Some("gemini-2.5-flash"));
+}
+
+/// A user-declared `[llm.providers.gemini]` block overrides the sugar
+/// entry — in particular `api_key_env` and `model` flow through.
+#[test]
+fn test_toml_gemini_provider_with_api_key_env() {
+    let toml = r#"
+[llm]
+provider = "gemini"
+model    = "gemini-2.5-pro"
+
+[llm.providers.gemini]
+kind        = "gemini"
+base_url    = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+model       = "gemini-2.5-pro"
+auth_scheme = { type = "header", name = "x-goog-api-key" }
+"#;
+    let mut config: AlmsConfig = toml::from_str(toml).unwrap();
+    config.llm.ensure_builtin_providers();
+    config.llm.mock = true;
+    config.validate().unwrap();
+
+    let entry = config.llm.providers.get("gemini").unwrap();
+    assert_eq!(entry.kind, ProviderKind::Gemini);
+    assert_eq!(entry.api_key_env.as_deref(), Some("GEMINI_API_KEY"));
+    assert_eq!(entry.model.as_deref(), Some("gemini-2.5-pro"));
+}
+
+/// `ProviderEntry::resolve_api_key()` reads from the declared env var for
+/// the Gemini entry.
+#[test]
+fn test_gemini_resolve_api_key_from_env() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_TEST_GEMINI_KEY_764", "gemini-test-key");
+
+    let entry = ProviderEntry {
+        kind: ProviderKind::Gemini,
+        base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+        api_key_env: Some("ALMS_TEST_GEMINI_KEY_764".into()),
+        api_key: None,
+        model: Some("gemini-2.5-pro".into()),
+        auth_scheme: AuthScheme::Header {
+            name: "x-goog-api-key".into(),
+        },
+        quirks: ProviderQuirks::default(),
+    };
+    assert_eq!(entry.resolve_api_key().as_deref(), Some("gemini-test-key"));
+}
+
 // ---- LoggingConfig tests ----
 
 #[test]
