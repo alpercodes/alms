@@ -1,4 +1,5 @@
 use crate::llm_types::*;
+use alms_core::config::{AuthScheme, ProviderKind};
 use alms_core::{AlmsError, AlmsResult};
 use reqwest::{Client, RequestBuilder};
 use tracing::{debug, error, info, warn};
@@ -36,12 +37,11 @@ impl LlmClient {
             .build()
             .map_err(|e| AlmsError::Runtime(format!("Failed to create HTTP client: {}", e)))?;
 
-        let provider = match config.provider.as_str() {
-            "anthropic" => Provider::Anthropic,
-            _ => Provider::OpenAi,
-        };
+        let provider = Self::resolve_protocol(&config);
 
         // Auto-set base_url for Anthropic if the user didn't override it
+        // (legacy users who only set `provider = "anthropic"` in a classic
+        // flat config and never touched `base_url`).
         if provider == Provider::Anthropic && config.base_url == "https://openrouter.ai/api/v1" {
             config.base_url = "https://api.anthropic.com/v1".to_string();
         }
@@ -66,30 +66,68 @@ impl LlmClient {
         })
     }
 
+    /// Determine the wire-protocol family for the current provider.
+    ///
+    /// Checks the `providers` table first (populated from
+    /// `[llm.providers.<name>]` + auto-injected sugar entries). Falls
+    /// back to the classic hardcoded sugar-name check so that call sites
+    /// constructing a bare `LlmConfig` without a providers map (tests,
+    /// embedded callers) continue to work.
+    fn resolve_protocol(config: &LlmConfig) -> Provider {
+        if let Some(entry) = config.providers.get(&config.provider) {
+            return match entry.kind {
+                ProviderKind::Anthropic => Provider::Anthropic,
+                ProviderKind::OpenAiCompatible => Provider::OpenAi,
+            };
+        }
+        match config.provider.as_str() {
+            "anthropic" => Provider::Anthropic,
+            _ => Provider::OpenAi,
+        }
+    }
+
     /// Create a completion request builder, adapting format per provider.
+    ///
+    /// Applies any configured [`alms_core::config::ProviderQuirks`] to the
+    /// outgoing request body before serialization, and attaches the API key
+    /// according to the configured [`alms_core::config::AuthScheme`].
     fn build_request(&self, request: &CompletionRequest) -> AlmsResult<RequestBuilder> {
         match self.provider {
             Provider::OpenAi => {
                 let url = format!("{}/chat/completions", self.config.base_url);
                 debug!("Sending OpenAI completion request to {}", url);
-                Ok(self
+
+                // Apply quirks in a provider-agnostic way. Mutating a local
+                // copy of the request leaves the caller's input untouched.
+                let mut req_body = request.clone();
+                apply_quirks(&mut req_body, &self.config.quirks);
+
+                let builder = self
                     .client
                     .post(&url)
-                    .header("Authorization", format!("Bearer {}", self.config.api_key))
                     .header("Content-Type", "application/json")
-                    .json(request))
+                    .json(&req_body);
+                Ok(apply_auth(
+                    builder,
+                    &self.config.auth_scheme,
+                    &self.config.api_key,
+                ))
             }
             Provider::Anthropic => {
                 let url = format!("{}/messages", self.config.base_url);
                 debug!("Sending Anthropic completion request to {}", url);
                 let anthropic_req = crate::anthropic::to_anthropic_request(request);
-                Ok(self
+                let builder = self
                     .client
                     .post(&url)
-                    .header("x-api-key", &self.config.api_key)
                     .header("anthropic-version", "2023-06-01")
                     .header("Content-Type", "application/json")
-                    .json(&anthropic_req))
+                    .json(&anthropic_req);
+                Ok(apply_auth(
+                    builder,
+                    &self.config.auth_scheme,
+                    &self.config.api_key,
+                ))
             }
         }
     }
@@ -464,26 +502,50 @@ impl LlmClient {
     /// When switching to a new provider and no key is found, the existing
     /// (wrong-provider) key is cleared to prevent silent 401 errors from
     /// sending one provider's key to another.
+    ///
+    /// The provider's `base_url` / `auth_scheme` / `quirks` are sourced
+    /// from the `providers` map if an entry is present (the normal path
+    /// for configs loaded via `AlmsConfig::load`), falling back to the
+    /// hardcoded sugar-name defaults otherwise (used by standalone tests
+    /// that construct a bare `LlmConfig`).
     fn apply_provider(&mut self, provider: &str, resolve_key: impl FnOnce(&str) -> Option<String>) {
         let old_provider = self.config.provider.clone();
 
-        self.provider = match provider {
-            "anthropic" => Provider::Anthropic,
-            "openrouter" => Provider::OpenAi,
-            _ => Provider::OpenAi,
-        };
-
-        match provider {
-            "anthropic" => {
-                self.config.base_url = "https://api.anthropic.com/v1".to_string();
+        if let Some(entry) = self.config.providers.get(provider).cloned() {
+            self.provider = match entry.kind {
+                ProviderKind::Anthropic => Provider::Anthropic,
+                ProviderKind::OpenAiCompatible => Provider::OpenAi,
+            };
+            self.config.base_url = entry.base_url;
+            self.config.auth_scheme = entry.auth_scheme;
+            self.config.quirks = entry.quirks;
+            if let Some(model) = entry.model {
+                self.config.default_model = model;
             }
-            "openrouter" => {
-                self.config.base_url = "https://openrouter.ai/api/v1".to_string();
+        } else {
+            // Fall back to sugar-name mapping for tests / bare configs.
+            self.provider = match provider {
+                "anthropic" => Provider::Anthropic,
+                _ => Provider::OpenAi,
+            };
+            match provider {
+                "anthropic" => {
+                    self.config.base_url = "https://api.anthropic.com/v1".to_string();
+                    self.config.auth_scheme = AuthScheme::Header {
+                        name: "x-api-key".into(),
+                    };
+                }
+                "openrouter" => {
+                    self.config.base_url = "https://openrouter.ai/api/v1".to_string();
+                    self.config.auth_scheme = AuthScheme::Bearer;
+                }
+                "openai" => {
+                    self.config.base_url = "https://api.openai.com/v1".to_string();
+                    self.config.auth_scheme = AuthScheme::Bearer;
+                }
+                _ => {}
             }
-            "openai" => {
-                self.config.base_url = "https://api.openai.com/v1".to_string();
-            }
-            _ => {}
+            self.config.quirks = alms_core::config::ProviderQuirks::default();
         }
 
         if let Some(key) = resolve_key(provider) {
@@ -520,12 +582,22 @@ impl LlmClient {
     }
 
     /// Override the LLM provider, resolving API key from secrets store.
+    ///
+    /// Key resolution consults the secrets store first, then the
+    /// `[llm.providers.<provider>]` entry's `api_key_env` / `api_key`
+    /// fields as a fallback. This lets configs declare an env-var-backed
+    /// key inline without also running `alms auth set`.
     pub fn with_provider_and_secrets(
         mut self,
         provider: &str,
         secrets: &alms_core::secrets::SecretsStore,
     ) -> Self {
-        self.apply_provider(provider, |p| secrets.resolve_key(p));
+        let entry_key = self
+            .config
+            .providers
+            .get(provider)
+            .and_then(|e| e.resolve_api_key());
+        self.apply_provider(provider, |p| secrets.resolve_key(p).or(entry_key));
         self
     }
 
@@ -571,6 +643,78 @@ impl LlmClient {
     #[cfg(test)]
     pub fn base_url(&self) -> &str {
         &self.config.base_url
+    }
+
+    /// Build a request and return the finalized `reqwest::Request` (test-only).
+    ///
+    /// Exposed so tests can assert the end-to-end effect of the configured
+    /// `auth_scheme` and `quirks` on the outgoing HTTP request — headers,
+    /// URL, and serialized body — without dispatching it to a live upstream.
+    #[cfg(test)]
+    pub(crate) fn build_request_for_test(
+        &self,
+        request: &CompletionRequest,
+    ) -> AlmsResult<reqwest::Request> {
+        let builder = self.build_request(request)?;
+        builder
+            .build()
+            .map_err(|e| AlmsError::Runtime(format!("build request: {e}")))
+    }
+}
+
+/// Attach an API key to a request according to the configured auth scheme.
+///
+/// Returns the builder unmodified when the key is empty — callers will see
+/// a 401 from the upstream, which is the right signal. Silently adding an
+/// empty header would make missing-key errors harder to diagnose.
+pub(crate) fn apply_auth(
+    builder: RequestBuilder,
+    scheme: &AuthScheme,
+    api_key: &str,
+) -> RequestBuilder {
+    if api_key.is_empty() {
+        return builder;
+    }
+    match scheme {
+        AuthScheme::Bearer => builder.header("Authorization", format!("Bearer {api_key}")),
+        AuthScheme::Header { name } => builder.header(name.as_str(), api_key),
+    }
+}
+
+/// Apply [`alms_core::config::ProviderQuirks`] to an OpenAI-format request.
+///
+/// See the individual `quirks.*` fields for semantics. Called from
+/// `build_request` just before serialization; writes through `&mut` so the
+/// caller can compose multiple request transforms without cloning for each.
+pub(crate) fn apply_quirks(
+    request: &mut CompletionRequest,
+    quirks: &alms_core::config::ProviderQuirks,
+) {
+    // Order matters: `drop_empty_content` runs first so it only sees the
+    // user's original history. `tool_gap_fill` then deliberately inserts
+    // empty-user separators between consecutive tool results — a shape that
+    // `drop_empty_content` would have stripped if it ran afterwards. The
+    // two quirks compose cleanly only in this order.
+    if quirks.drop_empty_content {
+        request.messages.retain(|m| {
+            let has_content = m.content.as_deref().is_some_and(|c| !c.is_empty());
+            let has_tool_calls = m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
+            let is_tool_result = m.role == "tool";
+            has_content || has_tool_calls || is_tool_result
+        });
+    }
+
+    if quirks.tool_gap_fill && request.messages.len() > 1 {
+        // Walk from back to front inserting an empty user turn between two
+        // consecutive `tool` messages. Back-to-front avoids re-scanning
+        // indexes we've already visited.
+        let mut i = request.messages.len() - 1;
+        while i > 0 {
+            if request.messages[i].role == "tool" && request.messages[i - 1].role == "tool" {
+                request.messages.insert(i, LlmMessage::user(""));
+            }
+            i -= 1;
+        }
     }
 }
 
@@ -846,5 +990,347 @@ mod tests {
         assert_eq!(same.provider(), "openrouter");
         // Same provider, no new key found -- existing key preserved
         assert_eq!(same.api_key(), "sk-or-existing");
+    }
+
+    // ------------------------------------------------------------------
+    // Generic OpenAI-compatible provider config (issue #765)
+    // ------------------------------------------------------------------
+
+    /// Inspect the `Authorization` header a `RequestBuilder` would send
+    /// without actually dispatching a request.
+    fn header_value(builder: reqwest::RequestBuilder, name: &str) -> Option<String> {
+        let req = builder.build().expect("build request");
+        req.headers()
+            .get(name)
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn test_apply_auth_bearer() {
+        let client = reqwest::Client::new();
+        let builder = client.post("https://example.com");
+        let builder = apply_auth(builder, &AuthScheme::Bearer, "secret-key");
+        assert_eq!(
+            header_value(builder, "authorization"),
+            Some("Bearer secret-key".to_string())
+        );
+    }
+
+    #[test]
+    fn test_apply_auth_custom_header() {
+        let client = reqwest::Client::new();
+        let builder = client.post("https://example.com");
+        let scheme = AuthScheme::Header {
+            name: "x-api-key".into(),
+        };
+        let builder = apply_auth(builder, &scheme, "anthropic-key");
+        let req = builder.build().unwrap();
+        assert_eq!(
+            req.headers().get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("anthropic-key")
+        );
+        // Bearer scheme should NOT have been applied.
+        assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn test_apply_auth_empty_key_skips_header() {
+        let client = reqwest::Client::new();
+        let builder = client.post("https://example.com");
+        let builder = apply_auth(builder, &AuthScheme::Bearer, "");
+        // Empty key -> no header at all (caller will see a 401 upstream).
+        assert!(header_value(builder, "authorization").is_none());
+    }
+
+    #[test]
+    fn test_apply_quirks_drop_empty_content() {
+        let quirks = alms_core::config::ProviderQuirks {
+            drop_empty_content: true,
+            ..Default::default()
+        };
+        let mut req = CompletionRequest::new("test").with_messages(vec![
+            LlmMessage::user("hello"),
+            LlmMessage {
+                role: "assistant".into(),
+                content: Some(String::new()),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            LlmMessage::assistant("response"),
+        ]);
+        apply_quirks(&mut req, &quirks);
+        // Empty assistant turn is dropped; the two real messages remain.
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].content.as_deref(), Some("hello"));
+        assert_eq!(req.messages[1].content.as_deref(), Some("response"));
+    }
+
+    #[test]
+    fn test_apply_quirks_drop_empty_content_keeps_tool_calls() {
+        // An assistant message with no content but present tool_calls must
+        // NOT be dropped — the tool call IS the payload.
+        let quirks = alms_core::config::ProviderQuirks {
+            drop_empty_content: true,
+            ..Default::default()
+        };
+        let tc = ToolCall::new("call_1", "echo", r#"{"text":"hi"}"#);
+        let mut req = CompletionRequest::new("test").with_messages(vec![
+            LlmMessage::user("call echo"),
+            LlmMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![tc]),
+                tool_call_id: None,
+            },
+        ]);
+        apply_quirks(&mut req, &quirks);
+        assert_eq!(req.messages.len(), 2);
+        assert!(req.messages[1].tool_calls.is_some());
+    }
+
+    #[test]
+    fn test_apply_quirks_drop_empty_content_keeps_tool_results() {
+        // Tool-result messages carry `role == "tool"` and must be kept
+        // even though their content might legitimately be empty for
+        // no-op tools.
+        let quirks = alms_core::config::ProviderQuirks {
+            drop_empty_content: true,
+            ..Default::default()
+        };
+        let mut req = CompletionRequest::new("test").with_messages(vec![
+            LlmMessage::user("go"),
+            LlmMessage::tool_result("call_1", ""),
+        ]);
+        apply_quirks(&mut req, &quirks);
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[1].role, "tool");
+    }
+
+    #[test]
+    fn test_apply_quirks_tool_gap_fill_between_consecutive_tools() {
+        // Two back-to-back tool-results get split by an empty user turn.
+        let quirks = alms_core::config::ProviderQuirks {
+            tool_gap_fill: true,
+            ..Default::default()
+        };
+        let mut req = CompletionRequest::new("test").with_messages(vec![
+            LlmMessage::user("do both"),
+            LlmMessage::tool_result("call_1", "result 1"),
+            LlmMessage::tool_result("call_2", "result 2"),
+        ]);
+        apply_quirks(&mut req, &quirks);
+        assert_eq!(req.messages.len(), 4);
+        assert_eq!(req.messages[0].role, "user");
+        assert_eq!(req.messages[1].role, "tool");
+        assert_eq!(req.messages[2].role, "user");
+        assert_eq!(req.messages[2].content.as_deref(), Some(""));
+        assert_eq!(req.messages[3].role, "tool");
+    }
+
+    #[test]
+    fn test_apply_quirks_tool_gap_fill_noop_on_non_adjacent() {
+        // A single tool-result isn't followed by another tool-result,
+        // so no gap-fill insertion should happen.
+        let quirks = alms_core::config::ProviderQuirks {
+            tool_gap_fill: true,
+            ..Default::default()
+        };
+        let mut req = CompletionRequest::new("test").with_messages(vec![
+            LlmMessage::user("do one"),
+            LlmMessage::tool_result("call_1", "result 1"),
+            LlmMessage::assistant("ok"),
+        ]);
+        let before = req.messages.len();
+        apply_quirks(&mut req, &quirks);
+        assert_eq!(req.messages.len(), before);
+    }
+
+    #[test]
+    fn test_apply_quirks_tool_gap_fill_three_in_a_row() {
+        // Three consecutive tool-results get two separators.
+        let quirks = alms_core::config::ProviderQuirks {
+            tool_gap_fill: true,
+            ..Default::default()
+        };
+        let mut req = CompletionRequest::new("test").with_messages(vec![
+            LlmMessage::user("do three"),
+            LlmMessage::tool_result("c1", "r1"),
+            LlmMessage::tool_result("c2", "r2"),
+            LlmMessage::tool_result("c3", "r3"),
+        ]);
+        apply_quirks(&mut req, &quirks);
+        // user, tool, USER, tool, USER, tool  = 6 messages
+        assert_eq!(req.messages.len(), 6);
+        let roles: Vec<&str> = req.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "tool", "user", "tool", "user", "tool"]);
+    }
+
+    #[test]
+    fn test_apply_quirks_default_is_noop() {
+        let quirks = alms_core::config::ProviderQuirks::default();
+        let messages = vec![
+            LlmMessage::user("hello"),
+            LlmMessage::tool_result("call_1", "ok"),
+            LlmMessage::tool_result("call_2", "ok"),
+        ];
+        let mut req = CompletionRequest::new("test").with_messages(messages.clone());
+        apply_quirks(&mut req, &quirks);
+        assert_eq!(req.messages.len(), messages.len());
+    }
+
+    #[test]
+    fn test_generic_provider_entry_sets_base_url_and_auth() {
+        // Simulate a config-loaded `AlmsConfig` with a user-declared xAI
+        // entry and verify that the `From<alms_core::config::LlmConfig>`
+        // impl flattens it into the runtime `LlmConfig` correctly.
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "xai".into();
+        core_cfg.providers.insert(
+            "xai".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.x.ai/v1".into(),
+                api_key_env: None,
+                api_key: Some("xai-literal".into()),
+                model: Some("grok-4".into()),
+                auth_scheme: AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks {
+                    drop_empty_content: true,
+                    ..Default::default()
+                },
+            },
+        );
+
+        let runtime_cfg: LlmConfig = core_cfg.into();
+        assert_eq!(runtime_cfg.base_url, "https://api.x.ai/v1");
+        assert_eq!(runtime_cfg.default_model, "grok-4");
+        assert!(matches!(runtime_cfg.auth_scheme, AuthScheme::Bearer));
+        assert!(runtime_cfg.quirks.drop_empty_content);
+    }
+
+    #[test]
+    fn test_generic_provider_anthropic_kind_resolves_to_anthropic_protocol() {
+        // A provider declared with kind=anthropic should build an Anthropic
+        // LlmClient regardless of the provider name.
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "my-anthropic-proxy".into();
+        core_cfg.providers.insert(
+            "my-anthropic-proxy".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://proxy.example.com/v1".into(),
+                api_key_env: None,
+                api_key: Some("k".into()),
+                model: None,
+                auth_scheme: AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+
+        let runtime_cfg: LlmConfig = core_cfg.into();
+        let client = LlmClient::new(runtime_cfg).unwrap();
+        assert_eq!(client.base_url(), "https://proxy.example.com/v1");
+        assert_eq!(client.provider(), "my-anthropic-proxy");
+    }
+
+    /// End-to-end: a TOML-style `AlmsConfig` with a custom `auth_scheme` and
+    /// `quirks` round-trips through `From<core::LlmConfig>` → `LlmClient` →
+    /// `build_request` and produces the correct URL, headers, and body. Closes
+    /// the gap flagged in PR #770 review where `build_request` was only
+    /// indirectly covered.
+    #[test]
+    fn test_build_request_honours_auth_scheme_and_quirks_end_to_end() {
+        // Custom header + drop_empty_content + tool_gap_fill — exercises
+        // both transform paths and the non-Bearer auth path simultaneously.
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "customlab".into();
+        core_cfg.providers.insert(
+            "customlab".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://customlab.example.com/v1".into(),
+                api_key_env: None,
+                api_key: Some("inline-secret".into()),
+                model: Some("lab-7b".into()),
+                auth_scheme: AuthScheme::Header {
+                    name: "X-Lab-Key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks {
+                    tool_gap_fill: true,
+                    drop_empty_content: true,
+                },
+            },
+        );
+
+        let runtime_cfg: LlmConfig = core_cfg.into();
+        // api_key on the flat config is unset; the provider entry's inline
+        // key should flow through via `resolve_api_key`, but that's the
+        // gateway's job. For this test, populate directly so we can assert
+        // the finalized header.
+        let mut runtime_cfg = runtime_cfg;
+        runtime_cfg.api_key = "inline-secret".into();
+        let client = LlmClient::new(runtime_cfg).unwrap();
+
+        let request = CompletionRequest::new("lab-7b").with_messages(vec![
+            LlmMessage::user("hi"),
+            // Two back-to-back tool results exercise `tool_gap_fill`.
+            LlmMessage::tool_result("t1", "r1"),
+            LlmMessage::tool_result("t2", "r2"),
+            // Empty assistant turn exercises `drop_empty_content`.
+            LlmMessage {
+                role: "assistant".into(),
+                content: Some(String::new()),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ]);
+        let req = client.build_request_for_test(&request).unwrap();
+
+        // URL is sourced from the provider entry's base_url.
+        assert_eq!(
+            req.url().as_str(),
+            "https://customlab.example.com/v1/chat/completions"
+        );
+
+        // Custom header auth scheme -- no Authorization header, custom header
+        // present with the raw key.
+        assert!(
+            req.headers().get("authorization").is_none(),
+            "bearer header must not be set when auth_scheme is Header"
+        );
+        assert_eq!(
+            req.headers().get("X-Lab-Key").and_then(|v| v.to_str().ok()),
+            Some("inline-secret"),
+            "custom header must carry the resolved api key"
+        );
+
+        // Inspect the serialized body to confirm the quirks fired.
+        let body_bytes = req
+            .body()
+            .and_then(|b| b.as_bytes())
+            .expect("body bytes present");
+        let body: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
+        let messages = body["messages"].as_array().expect("messages array");
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        // Expected after quirks run:
+        //   drop_empty_content removes the empty-content assistant turn,
+        //   then tool_gap_fill inserts an empty user between the two tool
+        //   results. Final shape: user, tool, user, tool.
+        assert_eq!(
+            roles,
+            vec!["user", "tool", "user", "tool"],
+            "quirks did not produce the expected message shape: {roles:?}"
+        );
     }
 }

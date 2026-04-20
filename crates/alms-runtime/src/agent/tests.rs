@@ -518,6 +518,7 @@ async fn test_classifier_blocked_shell_surfaces_target_in_tool_end() {
         shell_default_env: std::collections::HashMap::new(),
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::BlockDestructive,
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: None,
     };
 

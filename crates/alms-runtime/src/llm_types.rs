@@ -322,6 +322,18 @@ pub struct LlmConfig {
     pub mock: bool,
     /// Per-chunk read timeout for SSE streaming (seconds).
     pub stream_chunk_timeout_secs: u64,
+    /// How the API key is attached to each outgoing request. Defaults to
+    /// `Bearer` for OpenAI-compatible providers.
+    #[serde(default)]
+    pub auth_scheme: alms_core::config::AuthScheme,
+    /// Provider-specific behaviour tweaks applied at request-build time.
+    #[serde(default)]
+    pub quirks: alms_core::config::ProviderQuirks,
+    /// Snapshot of `[llm.providers]` from the unified `AlmsConfig`. Used
+    /// by `with_provider_and_secrets` so that switching to a different
+    /// configured provider picks up its `base_url` / `auth_scheme` / quirks.
+    #[serde(default)]
+    pub providers: std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
 }
 
 impl Default for LlmConfig {
@@ -334,20 +346,45 @@ impl Default for LlmConfig {
             timeout_secs: 120,
             mock: false,
             stream_chunk_timeout_secs: 60,
+            auth_scheme: alms_core::config::AuthScheme::default(),
+            quirks: alms_core::config::ProviderQuirks::default(),
+            providers: std::collections::BTreeMap::new(),
         }
     }
 }
 
 impl From<alms_core::config::LlmConfig> for LlmConfig {
     fn from(c: alms_core::config::LlmConfig) -> Self {
+        // Merge the resolved provider entry (if any) into the flat runtime
+        // LlmConfig. The provider entry's base_url / auth_scheme / quirks
+        // always win over the flat fields when present, because the
+        // generic form is strictly more expressive.
+        let entry = c.providers.get(&c.provider).cloned();
+
+        let (base_url, auth_scheme, quirks, model) = match entry {
+            Some(e) => {
+                let model = e.model.clone().unwrap_or_else(|| c.model.clone());
+                (e.base_url, e.auth_scheme, e.quirks, model)
+            }
+            None => (
+                c.base_url.clone(),
+                alms_core::config::AuthScheme::default(),
+                alms_core::config::ProviderQuirks::default(),
+                c.model.clone(),
+            ),
+        };
+
         Self {
             provider: c.provider,
             api_key: c.api_key.unwrap_or_default(),
-            base_url: c.base_url,
-            default_model: c.model,
+            base_url,
+            default_model: model,
             timeout_secs: c.timeout_secs,
             mock: c.mock,
             stream_chunk_timeout_secs: c.stream_chunk_timeout_secs,
+            auth_scheme,
+            quirks,
+            providers: c.providers,
         }
     }
 }

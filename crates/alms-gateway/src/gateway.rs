@@ -248,9 +248,18 @@ impl Gateway {
                 alms_core::secrets::SecretsStore::empty()
             });
 
-        // Resolve API key from secrets store (the only source — no env var fallback).
+        // Resolve API key. Precedence:
+        //   1. SecretsStore (`alms auth set <provider> <key>`) — highest,
+        //      because runtime operator changes should always win.
+        //   2. The provider entry's `api_key_env` / `api_key` fields, for
+        //      configs that wire a generic OpenAI-compatible provider
+        //      declaratively in `alms.toml`.
         let mut llm_config = config.llm_config.clone();
         if let Some(key) = secrets_store.resolve_key(&llm_config.provider) {
+            llm_config.api_key = key;
+        } else if let Some(entry) = llm_config.providers.get(&llm_config.provider).cloned()
+            && let Some(key) = entry.resolve_api_key()
+        {
             llm_config.api_key = key;
         }
         let llm = LlmClient::new(llm_config)?;

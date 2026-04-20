@@ -6,6 +6,7 @@
 //! live here alongside their struct.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
@@ -129,7 +130,9 @@ impl ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
-    /// Provider: "openrouter" (default), "openai", or "anthropic"
+    /// Provider selector. Either a built-in sugar name (`openai`,
+    /// `openrouter`, `anthropic`) or the key of an entry in
+    /// `[llm.providers.<name>]`.
     pub provider: String,
     pub base_url: String,
     pub model: String,
@@ -143,6 +146,17 @@ pub struct LlmConfig {
     /// If no data arrives within this window the stream is treated as stalled.
     /// Default: 60. Increase for slow reasoning models or high-latency connections.
     pub stream_chunk_timeout_secs: u64,
+
+    /// Generic per-provider config table. Keys here are referenced by
+    /// [`LlmConfig::provider`].
+    ///
+    /// Entries are populated from `[llm.providers.<name>]` in `alms.toml`.
+    /// Built-in sugar names (`openai`, `openrouter`, `anthropic`) are
+    /// auto-populated at config-load time so the rest of the system sees a
+    /// uniform view regardless of which config shape the user wrote.
+    ///
+    /// See [`ProviderEntry`] for the schema of an individual entry.
+    pub providers: BTreeMap<String, ProviderEntry>,
 }
 
 impl Default for LlmConfig {
@@ -157,8 +171,204 @@ impl Default for LlmConfig {
             max_tokens_per_run: 0,
             mock: false,
             stream_chunk_timeout_secs: 60,
+            providers: BTreeMap::new(),
         }
     }
+}
+
+impl LlmConfig {
+    /// Populate [`providers`][Self::providers] with built-in sugar entries
+    /// for `openai`, `openrouter`, and `anthropic` if the user has not
+    /// already defined them.
+    ///
+    /// This lets the rest of the system look up every provider uniformly
+    /// in `providers`, regardless of whether the user wrote the classic
+    /// flat form (`provider = "openrouter"` + `base_url = "..."`) or the
+    /// new generic form (`[llm.providers.<name>]`).
+    ///
+    /// Called once during [`crate::AlmsConfig::load`]; safe to call
+    /// multiple times (existing entries are preserved).
+    pub fn ensure_builtin_providers(&mut self) {
+        self.providers
+            .entry("openrouter".to_string())
+            .or_insert_with(|| ProviderEntry {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: AuthScheme::Bearer,
+                quirks: ProviderQuirks::default(),
+            });
+        self.providers
+            .entry("openai".to_string())
+            .or_insert_with(|| ProviderEntry {
+                kind: ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: AuthScheme::Bearer,
+                quirks: ProviderQuirks::default(),
+            });
+        self.providers
+            .entry("anthropic".to_string())
+            .or_insert_with(|| ProviderEntry {
+                kind: ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: ProviderQuirks::default(),
+            });
+    }
+
+    /// Look up the [`ProviderEntry`] matching [`LlmConfig::provider`],
+    /// if any.
+    pub fn resolved_provider(&self) -> Option<&ProviderEntry> {
+        self.providers.get(&self.provider)
+    }
+}
+
+impl ProviderEntry {
+    /// Resolve the API key for this provider entry from its configured
+    /// sources, in order of decreasing precedence:
+    ///
+    /// 1. `api_key_env` — read the named environment variable. Empty or
+    ///    unset values fall through to the next source.
+    /// 2. `api_key` — the literal key baked into the entry.
+    ///
+    /// Returns `None` if no source produced a value. The gateway is
+    /// expected to consult its `SecretsStore` as a final fallback, since
+    /// key material stored via `alms auth set` lives there.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        if let Some(var) = &self.api_key_env
+            && let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+        {
+            return Some(val);
+        }
+        if let Some(key) = &self.api_key
+            && !key.is_empty()
+        {
+            return Some(key.clone());
+        }
+        None
+    }
+}
+
+/// Wire-format for a single `[llm.providers.<name>]` entry in `alms.toml`.
+///
+/// This is the generic provider surface: an OpenAI-compatible endpoint is
+/// described by its base URL, authentication scheme, and a small set of
+/// per-provider quirks. Code paths that need to know the protocol family
+/// branch on [`ProviderKind`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderEntry {
+    /// Protocol family. Defaults to [`ProviderKind::OpenAiCompatible`] so
+    /// that simply dropping in a `base_url` for a new provider "just works".
+    pub kind: ProviderKind,
+    /// Base URL (e.g. `https://api.x.ai/v1`). Path segments like
+    /// `/chat/completions` are appended by the client.
+    pub base_url: String,
+    /// Name of an environment variable that holds the API key. If both
+    /// `api_key_env` and `api_key` are set, `api_key_env` wins.
+    ///
+    /// The gateway resolves this value on demand via [`Self::resolve_api_key`]
+    /// when building the runtime `LlmClient`. The env var is **not** written
+    /// into [`crate::secrets::SecretsStore`] — if you want the key persisted
+    /// in `.alms/secrets.json` (and thus redacted via the store's logging
+    /// helpers) run `alms auth set <provider> <key>` separately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Explicit API key. Discouraged — prefer `api_key_env` or
+    /// `alms auth set <provider> <key>`.
+    ///
+    /// Parsed from inline TOML for local-dev convenience (`api_key = "sk-..."`),
+    /// but never serialized back out — the field is only present on the
+    /// deserialize side so that a handwritten dev config "just works". For
+    /// any long-lived deployment, use `api_key_env` so the key lives in an
+    /// environment variable or secrets vault, not in a checked-in file.
+    #[serde(default, skip_serializing)]
+    pub api_key: Option<String>,
+    /// Optional override for the provider's default model. When set, this
+    /// wins over [`LlmConfig::model`] when this provider is selected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// How the API key is sent on each request.
+    pub auth_scheme: AuthScheme,
+    /// Provider-specific behaviour tweaks. See [`ProviderQuirks`].
+    pub quirks: ProviderQuirks,
+}
+
+/// Wire protocol family used to talk to a provider.
+///
+/// Native adapters are reserved for providers that cannot be reached
+/// through the OpenAI chat-completions protocol. All others — including
+/// xAI, DeepSeek, Groq, Mistral, Ollama, LM Studio, and self-hosted vLLM
+/// — use [`ProviderKind::OpenAiCompatible`] and differ only in
+/// `base_url` / `auth_scheme` / `quirks`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ProviderKind {
+    /// OpenAI chat-completions wire format.
+    #[default]
+    #[serde(rename = "openai_compatible", alias = "openai-compatible")]
+    OpenAiCompatible,
+    /// Anthropic Messages API.
+    #[serde(rename = "anthropic")]
+    Anthropic,
+}
+
+/// How an API key is attached to each outgoing request.
+///
+/// Intentionally minimal — only schemes that map to a real-world provider
+/// we ship or test against are listed. Additional variants (e.g. query
+/// parameters, HMAC-signed requests) can be added the day a concrete
+/// integration needs them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AuthScheme {
+    /// `Authorization: Bearer <key>` — default for all OpenAI-compatible
+    /// providers.
+    #[default]
+    Bearer,
+    /// Custom header, e.g. `x-api-key` for Anthropic. The raw API key is
+    /// placed in the header value without a `Bearer ` prefix.
+    Header {
+        /// HTTP header name.
+        name: String,
+    },
+}
+
+/// Per-provider request-build quirks.
+///
+/// These are small, deterministic transforms applied to the final
+/// [`crate::config::LlmConfig`]-derived request body. They exist because
+/// real-world OpenAI-compatible endpoints occasionally deviate from the
+/// reference API in minor ways that are cheaper to paper over here than
+/// to carry through as conditional logic in every caller.
+///
+/// Naming and semantics follow a conventional
+/// provider-transform middleware set.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderQuirks {
+    /// Mistral-style: some providers reject back-to-back `tool` messages
+    /// (tool-result followed immediately by another tool-result, which
+    /// happens when the agent runs multiple tools in parallel). Set to
+    /// true to inject an empty `user` turn between consecutive `tool`
+    /// messages so the model sees an alternating role sequence.
+    pub tool_gap_fill: bool,
+
+    /// Drop messages whose `content` is empty-or-missing and which carry
+    /// no `tool_calls`. Some OpenAI-compatible endpoints 400 on empty
+    /// assistant turns; dropping them is safe because they convey no
+    /// information.
+    pub drop_empty_content: bool,
 }
 
 // ---------------------------------------------------------------------------

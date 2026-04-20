@@ -15,9 +15,9 @@ mod types;
 mod tests;
 
 pub use types::{
-    ChannelsConfig, ContextConfig, FsEditConfig, LlmConfig, LoggingConfig, RunSummaryMode,
-    ServerConfig, SessionConfig, ShellClassificationMode, ShellPermissions, ShellSpillConfig,
-    ToolsConfig,
+    AuthScheme, ChannelsConfig, ContextConfig, FsEditConfig, LlmConfig, LoggingConfig,
+    ProviderEntry, ProviderKind, ProviderQuirks, RunSummaryMode, ServerConfig, SessionConfig,
+    ShellClassificationMode, ShellPermissions, ShellSpillConfig, ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};
@@ -38,12 +38,16 @@ pub struct AlmsConfig {
     pub logging: LoggingConfig,
 }
 
-#[allow(clippy::derivable_impls)]
 impl Default for AlmsConfig {
     fn default() -> Self {
+        let mut llm = LlmConfig::default();
+        // Ensure the built-in provider sugar entries are present so that
+        // `default() → validate()` (the common short-circuit in tests and
+        // CLI fallbacks) passes without requiring the full `load()` path.
+        llm.ensure_builtin_providers();
         Self {
             server: ServerConfig::default(),
-            llm: LlmConfig::default(),
+            llm,
             session: SessionConfig::default(),
             context: ContextConfig::default(),
             tools: ToolsConfig::default(),
@@ -66,6 +70,18 @@ impl AlmsConfig {
             config = file_config;
             info!("Loaded config from {}", path.display());
         }
+
+        // Populate built-in provider entries (openai / openrouter / anthropic)
+        // so `llm.providers` always contains them, regardless of whether the
+        // user wrote the classic flat form or the new generic form.
+        //
+        // Order matters: we ensure sugar entries exist BEFORE env overrides so
+        // that `apply_env_overrides` can propagate `ALMS_LLM_BASE_URL` /
+        // `ALMS_LLM_MODEL` into the resolved provider entry. Without this,
+        // env overrides to the sugar providers would land only on the flat
+        // `llm.base_url` / `llm.model` fields and be silently discarded by the
+        // runtime `From<LlmConfig>` impl, which prefers the entry values.
+        config.llm.ensure_builtin_providers();
 
         // Apply env var overrides
         config.apply_env_overrides();
@@ -100,6 +116,10 @@ impl AlmsConfig {
             Err(e) => {
                 eprintln!("Warning: failed to load config: {e}. Using defaults.");
                 let mut cfg = Self::default();
+                // Ensure sugar provider entries exist before env overrides so
+                // `ALMS_LLM_BASE_URL` / `ALMS_LLM_MODEL` can propagate into
+                // the resolved provider entry (mirrors `load()`).
+                cfg.llm.ensure_builtin_providers();
                 cfg.apply_env_overrides();
                 cfg.server.data_dir = crate::resolve_to_absolute(Path::new(&cfg.server.data_dir));
                 cfg.warn_legacy_data_dir();
@@ -145,6 +165,15 @@ impl AlmsConfig {
     ///
     /// API keys and tokens are NOT loaded from env vars — they must be
     /// configured via `alms auth set` and stored in `.alms/secrets.json`.
+    ///
+    /// Callers must invoke [`LlmConfig::ensure_builtin_providers`] before
+    /// this method so that sugar provider entries (`openai`, `openrouter`,
+    /// `anthropic`) exist in `llm.providers`. When `ALMS_LLM_BASE_URL` or
+    /// `ALMS_LLM_MODEL` is set, the override is propagated into the
+    /// resolved provider entry as well as the flat `llm.base_url` /
+    /// `llm.model` fields; the runtime `From<LlmConfig>` impl prefers the
+    /// entry values, so propagation is required for env overrides to win
+    /// end-to-end.
     pub fn apply_env_overrides(&mut self) {
         // LLM settings (non-secret only)
         if let Ok(provider) = std::env::var("ALMS_LLM_PROVIDER") {
@@ -154,12 +183,21 @@ impl AlmsConfig {
         if let Ok(url) =
             std::env::var("ALMS_LLM_BASE_URL").or_else(|_| std::env::var("LLM_BASE_URL"))
         {
-            self.llm.base_url = url;
+            self.llm.base_url = url.clone();
+            // Also propagate to the resolved provider entry so the runtime
+            // `From` impl (which prefers entry values) honours the override.
+            if let Some(entry) = self.llm.providers.get_mut(&self.llm.provider) {
+                entry.base_url = url;
+            }
         }
         if let Ok(model) =
             std::env::var("ALMS_LLM_MODEL").or_else(|_| std::env::var("DEFAULT_MODEL"))
         {
-            self.llm.model = model;
+            self.llm.model = model.clone();
+            // Same propagation rationale as `base_url` above.
+            if let Some(entry) = self.llm.providers.get_mut(&self.llm.provider) {
+                entry.model = Some(model);
+            }
         }
         if let Ok(val) = std::env::var("ALMS_LLM_MOCK") {
             self.llm.mock = matches!(val.to_lowercase().as_str(), "1" | "true" | "yes");
@@ -252,19 +290,42 @@ impl AlmsConfig {
 
     /// Validate config. Returns error on invalid values.
     pub fn validate(&self) -> AlmsResult<()> {
-        // LLM validation
-        if !self.llm.mock && self.llm.api_key.is_none() {
+        // LLM validation. Suppress the warning when the selected provider
+        // entry declares `api_key_env` or an inline `api_key` — those paths
+        // resolve the key at request time, so a missing `llm.api_key` isn't
+        // the user's problem (see PR #770 review feedback).
+        let entry_has_key_source = self
+            .llm
+            .providers
+            .get(&self.llm.provider)
+            .is_some_and(|e| e.api_key_env.is_some() || e.api_key.is_some());
+        if !self.llm.mock && self.llm.api_key.is_none() && !entry_has_key_source {
             warn!(
                 "No LLM API key configured. Run `alms auth set <provider> <key>` to store a key, or enable mock mode with ALMS_LLM_MOCK=1"
             );
         }
 
-        let valid_providers = ["openai", "anthropic", "openrouter"];
-        if !valid_providers.contains(&self.llm.provider.as_str()) {
+        // Provider must either match a built-in sugar name or be declared
+        // as an entry in `[llm.providers.<name>]`. `ensure_builtin_providers`
+        // guarantees the sugar names are always present in the map, so a
+        // single lookup is sufficient.
+        if !self.llm.mock && !self.llm.providers.contains_key(&self.llm.provider) {
+            let mut known: Vec<&str> = self.llm.providers.keys().map(|s| s.as_str()).collect();
+            known.sort();
             return Err(AlmsError::InvalidConfig(format!(
-                "llm.provider must be one of {:?}, got '{}'",
-                valid_providers, self.llm.provider
+                "llm.provider '{}' is not defined — add a `[llm.providers.{}]` entry \
+                 to alms.toml. Known providers: {:?}",
+                self.llm.provider, self.llm.provider, known
             )));
+        }
+
+        // Provider entries must have a non-empty base_url.
+        for (name, entry) in &self.llm.providers {
+            if entry.base_url.is_empty() {
+                return Err(AlmsError::InvalidConfig(format!(
+                    "llm.providers.{name} is missing a base_url"
+                )));
+            }
         }
 
         if self.llm.timeout_secs == 0 {

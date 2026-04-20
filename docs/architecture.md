@@ -159,13 +159,13 @@ Isolated tool execution used by every agent regardless of hierarchy level.
 
 ### LLM Client (`alms-runtime`)
 
-Multi-provider LLM support with streaming. Provider selected via `llm.provider` config or `ALMS_LLM_PROVIDER` env var.
+Multi-provider LLM support with streaming. Provider selected via `llm.provider` config or `ALMS_LLM_PROVIDER` env var. Providers are declared in `[llm.providers.<name>]` tables and looked up by name; the sugar names `openai`, `openrouter`, and `anthropic` are auto-populated so existing configs keep working.
 
-**Providers:**
-- **OpenAI / OpenRouter** — OpenAI-compatible chat completions API (default)
-- **Anthropic** — Messages API with full streaming, tool use, and response format mapping
+**Native adapters:**
+- **OpenAI-compatible** (`kind = "openai_compatible"`) — reaches any endpoint that speaks the OpenAI chat-completions protocol, with per-provider `base_url` / `auth_scheme` / `quirks`. Out of the box this covers OpenAI, OpenRouter, xAI, DeepSeek, Groq, Mistral, Ollama, LM Studio, self-hosted vLLM, Together, Fireworks, etc. — adding a new provider is a docs entry, not code.
+- **Anthropic** (`kind = "anthropic"`) — Anthropic Messages API with full streaming, tool use, and response format mapping.
 
-API keys loaded exclusively from `.alms/secrets.json` via `alms auth set`. Provider-aware key selection: each provider prefers its own key, falls back to others.
+See `docs/config.md` for copy-paste provider examples. API keys are resolved in order: (1) `SecretsStore` (`alms auth set <provider> <key>`), then (2) the provider entry's `api_key_env` / `api_key`. No keys are read from arbitrary env vars.
 
 ### Session Manager (`alms-session`)
 
