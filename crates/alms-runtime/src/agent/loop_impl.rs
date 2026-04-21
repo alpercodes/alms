@@ -49,6 +49,64 @@ pub(crate) struct StreamCallResult {
     pub usage: Option<Usage>,
 }
 
+/// Project the streamed `content` and `reasoning_content` buffers onto the
+/// `(content, reasoning)` fields of a [`StreamCallResult`], honouring the
+/// wire-invariant that reasoning text is **never** laundered into the visible
+/// `content` channel when tool calls are present (#767, #776).
+///
+/// Scenarios:
+///
+/// 1. `[Text]` or `[Text, ToolUse]` (`content` non-empty) — pass `content`
+///    through verbatim; `reasoning_content`, if any, is surfaced on the
+///    separate `reasoning` field so the caller can persist it as metadata
+///    without replaying it into the next LLM call.
+///
+/// 2. `[Thinking]` only — pure reasoning-model turns where max_tokens was
+///    exhausted before visible output materialised. Promote
+///    `reasoning_content` into `content` so the run has something to say.
+///    This is the legacy fallback path.
+///
+/// 3. `[Thinking, ToolUse]` with empty visible text (#776) — do **not**
+///    promote. The ToolUse is the agent's actual next action; promoting the
+///    thinking trace into `content` would cause it to be replayed as
+///    assistant text on the following turn, contradicting the #767 design
+///    intent that reasoning stays in a sideband channel. Reasoning is
+///    preserved on the `reasoning` field and the caller is expected to
+///    drop it (see the `reasoning_content: None` invariant in
+///    `agent_loop`'s assistant-context-push) when replaying messages.
+///
+/// 4. Fully empty stream — both fields return `None`.
+fn finalize_content_and_reasoning(
+    content: String,
+    reasoning_content: String,
+    has_tool_calls: bool,
+) -> (Option<String>, Option<String>) {
+    if !content.is_empty() {
+        let reasoning = if reasoning_content.is_empty() {
+            None
+        } else {
+            Some(reasoning_content)
+        };
+        return (Some(content), reasoning);
+    }
+
+    if reasoning_content.is_empty() {
+        return (None, None);
+    }
+
+    if has_tool_calls {
+        // [Thinking, ToolUse] with no visible text: keep reasoning on the
+        // reasoning sideband so it is persisted as metadata but never
+        // replayed into the next LLM call as assistant `content`.
+        return (None, Some(reasoning_content));
+    }
+
+    // [Thinking]-only turn (reasoning model hit max_tokens before
+    // emitting visible content). Promote so the run still has an answer.
+    info!("Streaming: content empty, falling back to reasoning_content");
+    (Some(reasoning_content), None)
+}
+
 impl AgentRuntime {
     /// Main agent loop with tool execution
     #[instrument(
@@ -963,30 +1021,12 @@ impl AgentRuntime {
             Some(tool_calls)
         };
 
-        // If the model streamed through `reasoning_content` but produced no
-        // `content` text (common with reasoning models that exhaust
-        // max_tokens before transitioning to visible output), promote the
-        // reasoning trace into `content` so the run still has something to
-        // say. This is distinct from Anthropic extended thinking in a
-        // normal run, where `reasoning_content` is a *supplement* to
-        // `content`: when `content` is non-empty we keep reasoning in the
-        // separate `LlmMessage::reasoning_content` field and let the
-        // caller persist it as metadata on the assistant message.
-        let (content, reasoning_out) = if content.is_empty() {
-            if !reasoning_content.is_empty() {
-                info!("Streaming: content empty, falling back to reasoning_content");
-                (Some(reasoning_content), None)
-            } else {
-                (None, None)
-            }
-        } else {
-            let reasoning = if reasoning_content.is_empty() {
-                None
-            } else {
-                Some(reasoning_content)
-            };
-            (Some(content), reasoning)
-        };
+        // Decide how to project the accumulated `content` and
+        // `reasoning_content` onto the `StreamCallResult`. See
+        // `finalize_content_and_reasoning` for the full rationale.
+        let has_tool_calls = tool_calls.is_some();
+        let (content, reasoning_out) =
+            finalize_content_and_reasoning(content, reasoning_content, has_tool_calls);
 
         Ok(StreamCallResult {
             content,
@@ -1333,5 +1373,114 @@ mod reasoning_tests {
         assert_eq!(meta.get("from_agent").unwrap().as_str(), Some("atlas"));
         let blocks = meta.get("reasoning_blocks").unwrap().as_array().unwrap();
         assert_eq!(blocks[0].get("text").unwrap().as_str(), Some("step 1"));
+    }
+}
+
+#[cfg(test)]
+mod finalize_content_tests {
+    use super::finalize_content_and_reasoning;
+
+    /// `[Text]`-only turn: visible content passes through, no reasoning.
+    #[test]
+    fn visible_text_only_passes_content_through() {
+        let (content, reasoning) =
+            finalize_content_and_reasoning("hello".to_string(), String::new(), false);
+        assert_eq!(content.as_deref(), Some("hello"));
+        assert!(reasoning.is_none());
+    }
+
+    /// `[Text, ToolUse]`: visible content passes through; reasoning is
+    /// absent because none was streamed. `has_tool_calls=true` does not
+    /// change the outcome when `content` is non-empty.
+    #[test]
+    fn visible_text_with_tool_use_passes_content_through() {
+        let (content, reasoning) =
+            finalize_content_and_reasoning("thinking out loud".to_string(), String::new(), true);
+        assert_eq!(content.as_deref(), Some("thinking out loud"));
+        assert!(reasoning.is_none());
+    }
+
+    /// `[Text + Thinking]` (Anthropic extended-thinking supplement path):
+    /// visible content stays in `content`, reasoning is surfaced on the
+    /// separate sideband.
+    #[test]
+    fn visible_text_plus_reasoning_keeps_reasoning_sideband() {
+        let (content, reasoning) = finalize_content_and_reasoning(
+            "final answer".to_string(),
+            "step 1... step 2...".to_string(),
+            false,
+        );
+        assert_eq!(content.as_deref(), Some("final answer"));
+        assert_eq!(reasoning.as_deref(), Some("step 1... step 2..."));
+    }
+
+    /// `[Text + Thinking, ToolUse]`: same as above — visible text wins,
+    /// reasoning stays on the sideband. Tool-call presence is irrelevant
+    /// because content is non-empty.
+    #[test]
+    fn visible_text_plus_reasoning_with_tool_use_keeps_reasoning_sideband() {
+        let (content, reasoning) = finalize_content_and_reasoning(
+            "ok".to_string(),
+            "thinking".to_string(),
+            /* has_tool_calls */ true,
+        );
+        assert_eq!(content.as_deref(), Some("ok"));
+        assert_eq!(reasoning.as_deref(), Some("thinking"));
+    }
+
+    /// `[Thinking]`-only turn (reasoning model exhausted max_tokens before
+    /// emitting visible output): reasoning is promoted into `content` so
+    /// the run still has something to surface.
+    #[test]
+    fn thinking_only_promotes_reasoning_into_content() {
+        let (content, reasoning) =
+            finalize_content_and_reasoning(String::new(), "long deliberation".to_string(), false);
+        assert_eq!(content.as_deref(), Some("long deliberation"));
+        assert!(reasoning.is_none());
+    }
+
+    /// `[Thinking, ToolUse]` with empty visible text (#776 regression):
+    /// reasoning must NOT be promoted into `content` — doing so would
+    /// launder thinking text into the visible channel, which the loop
+    /// would replay as assistant content on the next turn, violating
+    /// the #767 invariant that reasoning is never replayed. Instead,
+    /// reasoning stays on the sideband and the ToolUse carries the turn.
+    #[test]
+    fn thinking_plus_tool_use_empty_text_does_not_promote() {
+        let (content, reasoning) = finalize_content_and_reasoning(
+            String::new(),
+            "secret chain of thought".to_string(),
+            /* has_tool_calls */ true,
+        );
+        assert!(
+            content.is_none(),
+            "reasoning must not be laundered into content when tool_calls are present"
+        );
+        assert_eq!(
+            reasoning.as_deref(),
+            Some("secret chain of thought"),
+            "reasoning is preserved on the sideband for metadata persistence"
+        );
+    }
+
+    /// Fully empty stream: both fields are `None`.
+    #[test]
+    fn fully_empty_stream_returns_none_none() {
+        let (content, reasoning) =
+            finalize_content_and_reasoning(String::new(), String::new(), false);
+        assert!(content.is_none());
+        assert!(reasoning.is_none());
+    }
+
+    /// Fully empty stream with a tool call (rare but possible: model
+    /// emits only a ToolUse block with no thinking and no text): still
+    /// `None`/`None`. The tool call itself lives on the `tool_calls`
+    /// field and is unaffected by this helper.
+    #[test]
+    fn empty_stream_with_tool_use_returns_none_none() {
+        let (content, reasoning) =
+            finalize_content_and_reasoning(String::new(), String::new(), true);
+        assert!(content.is_none());
+        assert!(reasoning.is_none());
     }
 }
