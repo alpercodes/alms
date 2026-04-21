@@ -507,6 +507,45 @@ export function openSessionStream(sessionId, opts) {
         scheduleFlush();
     });
 
+    // -- reasoning_delta (issue #767) --
+    //
+    // Provider-neutral extended-thinking stream. Today only Anthropic's
+    // `thinking_delta` emits these; #768/#769 will add OpenAI/Gemini.
+    // Accumulate per-run reasoning text into a buffer attached to the
+    // live agent message so `ReasoningPanel` can render it collapsed.
+    on('reasoning_delta', (e) => {
+        const data = JSON.parse(e.data);
+        if (data.source_agent) return; // subagent reasoning is suppressed
+        const delta = data.text || '';
+        if (!delta) return;
+        transformMessages(prev => {
+            // Drop any transient "thinking" indicator like token_delta does,
+            // so the reasoning panel doesn't race with the pre-stream
+            // placeholder.
+            const msgs = prev.filter(m => m.type !== 'thinking');
+            const copy = [...msgs];
+            const last = copy[copy.length - 1];
+            if (last && last.type === 'agent' && !last.sealed) {
+                copy[copy.length - 1] = {
+                    ...last,
+                    reasoning: (last.reasoning || '') + delta,
+                };
+            } else {
+                // No live agent message yet — create a reasoning-only
+                // placeholder so the thinking panel is visible immediately.
+                copy.push({
+                    id: nextMsgId(),
+                    type: 'agent',
+                    role: 'assistant',
+                    text: '',
+                    reasoning: delta,
+                    sealed: false,
+                });
+            }
+            return copy;
+        });
+    });
+
     // -- tool_start --
     on('tool_start', (e) => {
         batch(() => {

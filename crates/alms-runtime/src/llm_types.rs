@@ -184,6 +184,18 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// Extended-thinking budget, in tokens, for Anthropic Claude 4.x.
+    ///
+    /// - `None` or `Some(0)`: extended thinking is disabled for this request.
+    /// - `Some(n)` with `n > 0`: the Anthropic adapter injects
+    ///   `"thinking": {"type": "enabled", "budget_tokens": n}` into the
+    ///   outgoing request body.
+    ///
+    /// Never serialized on the wire as-is — the Anthropic adapter reads it
+    /// and rewrites it into the provider-shaped field; other providers
+    /// silently ignore it.
+    #[serde(skip)]
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 impl CompletionRequest {
@@ -196,6 +208,7 @@ impl CompletionRequest {
             max_tokens: None,
             stream: None,
             stream_options: None,
+            thinking_budget_tokens: None,
         }
     }
 
@@ -216,6 +229,13 @@ impl CompletionRequest {
 
     pub fn with_max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
+        self
+    }
+
+    /// Set the extended-thinking budget for this request. A value of `0`
+    /// disables extended thinking; see [`Self::thinking_budget_tokens`].
+    pub fn with_thinking_budget(mut self, budget_tokens: u32) -> Self {
+        self.thinking_budget_tokens = Some(budget_tokens);
         self
     }
 }
@@ -334,6 +354,10 @@ pub struct LlmConfig {
     /// configured provider picks up its `base_url` / `auth_scheme` / quirks.
     #[serde(default)]
     pub providers: std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
+    /// Snapshot of `[llm.anthropic]` from the unified `AlmsConfig`. Consumed
+    /// by the Anthropic adapter in `anthropic.rs`; ignored for other providers.
+    #[serde(default)]
+    pub anthropic: alms_core::config::AnthropicConfig,
 }
 
 impl Default for LlmConfig {
@@ -349,6 +373,7 @@ impl Default for LlmConfig {
             auth_scheme: alms_core::config::AuthScheme::default(),
             quirks: alms_core::config::ProviderQuirks::default(),
             providers: std::collections::BTreeMap::new(),
+            anthropic: alms_core::config::AnthropicConfig::default(),
         }
     }
 }
@@ -385,6 +410,7 @@ impl From<alms_core::config::LlmConfig> for LlmConfig {
             auth_scheme,
             quirks,
             providers: c.providers,
+            anthropic: c.anthropic,
         }
     }
 }

@@ -28,8 +28,9 @@ impl SqliteStore {
 
         tx.execute(
             "INSERT INTO agents \
-             (id, name, description, model, posture, provider, telegram_token, is_default, created_at, last_active) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, name, description, model, posture, provider, telegram_token, \
+              is_default, created_at, last_active, thinking_budget_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 agent.id.0.to_string(),
                 &agent.name,
@@ -41,6 +42,7 @@ impl SqliteStore {
                 1i32,
                 agent.created_at.to_rfc3339(),
                 agent.last_active.to_rfc3339(),
+                agent.thinking_budget_tokens.map(i64::from),
             ],
         )
         .map_err(|e| AlmsError::Runtime(format!("SQLite create_agent_if_none_exist: {e}")))?;
@@ -56,8 +58,9 @@ impl SqliteStore {
             .lock()
             .execute(
                 "INSERT INTO agents \
-                 (id, name, description, model, posture, provider, telegram_token, is_default, created_at, last_active) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, name, description, model, posture, provider, telegram_token, \
+                  is_default, created_at, last_active, thinking_budget_tokens) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     agent.id.0.to_string(),
                     &agent.name,
@@ -69,6 +72,7 @@ impl SqliteStore {
                     agent.is_default as i32,
                     agent.created_at.to_rfc3339(),
                     agent.last_active.to_rfc3339(),
+                    agent.thinking_budget_tokens.map(i64::from),
                 ],
             )
             .map_err(|e| match &e {
@@ -92,13 +96,15 @@ impl SqliteStore {
             .lock()
             .execute(
                 "UPDATE agents SET description = ?1, model = ?2, \
-                 posture = ?3, provider = ?4, telegram_token = ?5, last_active = ?6 WHERE id = ?7",
+                 posture = ?3, provider = ?4, telegram_token = ?5, \
+                 thinking_budget_tokens = ?6, last_active = ?7 WHERE id = ?8",
                 params![
                     &agent.description,
                     agent.model.as_deref(),
                     agent.posture.as_deref(),
                     agent.provider.as_deref(),
                     agent.telegram_token.as_deref(),
+                    agent.thinking_budget_tokens.map(i64::from),
                     agent.last_active.to_rfc3339(),
                     agent.id.0.to_string(),
                 ],
@@ -115,7 +121,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active \
+             is_default, created_at, last_active, thinking_budget_tokens \
              FROM agents WHERE id = ?1",
             params![id.0.to_string()],
             parse_agent_row,
@@ -132,7 +138,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active \
+             is_default, created_at, last_active, thinking_budget_tokens \
              FROM agents WHERE name = ?1",
             params![name],
             parse_agent_row,
@@ -151,7 +157,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active \
+             is_default, created_at, last_active, thinking_budget_tokens \
              FROM agents WHERE is_default = 1 LIMIT 1",
             [],
             parse_agent_row,
@@ -169,7 +175,7 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
-                 is_default, created_at, last_active \
+                 is_default, created_at, last_active, thinking_budget_tokens \
                  FROM agents ORDER BY created_at",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
@@ -197,7 +203,7 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
-                 is_default, created_at, last_active \
+                 is_default, created_at, last_active, thinking_budget_tokens \
                  FROM agents WHERE telegram_token IS NOT NULL AND telegram_token != '' \
                  ORDER BY created_at",
             )
@@ -352,6 +358,7 @@ mod tests {
             posture: None,
             provider: None,
             telegram_token: None,
+            thinking_budget_tokens: None,
             is_default: false,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),

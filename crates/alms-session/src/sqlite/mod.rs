@@ -103,17 +103,18 @@ CREATE TABLE IF NOT EXISTS context_summaries (
 );
 
 CREATE TABLE IF NOT EXISTS agents (
-    id              TEXT PRIMARY KEY,
-    name            TEXT NOT NULL UNIQUE,
-    description     TEXT NOT NULL DEFAULT '',
-    model           TEXT,
-    system_prompt   TEXT,
-    posture         TEXT,
-    provider        TEXT,
-    telegram_token  TEXT,
-    is_default      INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT NOT NULL,
-    last_active     TEXT NOT NULL
+    id                     TEXT PRIMARY KEY,
+    name                   TEXT NOT NULL UNIQUE,
+    description            TEXT NOT NULL DEFAULT '',
+    model                  TEXT,
+    system_prompt          TEXT,
+    posture                TEXT,
+    provider               TEXT,
+    telegram_token         TEXT,
+    is_default             INTEGER NOT NULL DEFAULT 0,
+    created_at             TEXT NOT NULL,
+    last_active            TEXT NOT NULL,
+    thinking_budget_tokens INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
@@ -210,6 +211,11 @@ impl SqliteStore {
         );
         // Auto-migrate: add telegram_token column for per-agent Telegram bots.
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN telegram_token TEXT;");
+        // Auto-migrate: add thinking_budget_tokens column for per-agent
+        // Anthropic extended-thinking opt-in (issue #767). NULL means
+        // "inherit the server default from [llm.anthropic]"; any integer
+        // (including 0) is an explicit per-agent override.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN thinking_budget_tokens INTEGER;");
         // Auto-migrate: add run_tool_calls table for per-run tool call storage.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS run_tool_calls (\
@@ -427,6 +433,12 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let is_default: i32 = row.get(7)?;
     let created_at_str: String = row.get(8)?;
     let last_active_str: String = row.get(9)?;
+    // Per-agent Anthropic thinking budget (issue #767). Stored as INTEGER;
+    // parsed as i64 → saturating u32 so corrupt values don't crash the row
+    // parser. NULL maps to `None` (inherit the server default).
+    let thinking_budget_tokens: Option<u32> = row
+        .get::<_, Option<i64>>(10)?
+        .map(|v| v.clamp(0, i64::from(u32::MAX)) as u32);
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -446,6 +458,7 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         posture,
         provider,
         telegram_token,
+        thinking_budget_tokens,
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),

@@ -97,6 +97,23 @@ impl SseEventData {
         )
     }
 
+    /// Provider-neutral reasoning / extended-thinking text delta.
+    ///
+    /// Emitted alongside `token_delta` when the model produces extended-
+    /// thinking output (Anthropic Claude 4.x, and future reasoning models).
+    /// Clients are expected to render these in a separate collapsible
+    /// panel that defaults to closed.
+    pub fn reasoning_delta(run_id: RunId, text: &str, source_agent: Option<String>) -> Self {
+        Self::new(
+            "reasoning_delta",
+            ReasoningDeltaData {
+                run_id: run_id.0.to_string(),
+                text: text.to_string(),
+                source_agent,
+            },
+        )
+    }
+
     pub fn tool_start(
         run_id: RunId,
         tool_invocation_id: ToolInvocationId,
@@ -577,6 +594,23 @@ struct RunStartedData {
 struct TokenDeltaData {
     run_id: String,
     delta: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<String>,
+}
+
+/// Wire payload for a `reasoning_delta` SSE event — a chunk of the model's
+/// extended-thinking / chain-of-thought trace.
+///
+/// Provider-neutral: populated from Anthropic `thinking_delta` chunks today;
+/// future reasoning-capable providers (OpenAI o-series, DeepSeek R1, xAI
+/// Grok, Gemini) will emit the same event type and the UI will render them
+/// identically.
+#[derive(Debug, Serialize)]
+struct ReasoningDeltaData {
+    run_id: String,
+    /// Reasoning text chunk. The UI is expected to concatenate successive
+    /// chunks into a single collapsible block per assistant turn.
+    text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_agent: Option<String>,
 }

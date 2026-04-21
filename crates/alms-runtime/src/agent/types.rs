@@ -114,6 +114,17 @@ pub struct AgentConfig {
     /// the context window, allowing the web UI to display exactly what the
     /// LLM sees (system prompt, history, tools, token counts).
     pub debug_mode: bool,
+    /// Extended-thinking budget for Anthropic Claude 4.x, in tokens.
+    ///
+    /// `0` disables extended thinking for this agent (no `thinking` field
+    /// on outgoing requests, no reasoning deltas). Non-zero values enable
+    /// it and govern how many tokens the model may spend on internal
+    /// reasoning before emitting its final response.
+    ///
+    /// Populated by the gateway via the three-layer precedence chain
+    /// (per-run > per-agent > server default from `[llm.anthropic]`).
+    /// Silently ignored when the effective provider is not Anthropic.
+    pub anthropic_thinking_budget: u32,
 }
 
 impl Default for AgentConfig {
@@ -133,6 +144,7 @@ impl Default for AgentConfig {
             enabled_tools: Vec::new(),
             fs_edit_fuzzy_match: false,
             debug_mode: false,
+            anthropic_thinking_budget: 0,
         }
     }
 }

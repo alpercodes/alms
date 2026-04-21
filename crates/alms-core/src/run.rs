@@ -217,6 +217,14 @@ pub struct CreateRunRequest {
     /// web UI to inspect exactly what the LLM sees.
     #[serde(default)]
     pub debug_mode: Option<bool>,
+    /// Optional per-run Anthropic extended-thinking budget override.
+    ///
+    /// `Some(0)` explicitly disables extended thinking for just this run
+    /// even when per-agent or server config would enable it. Omitting the
+    /// field falls through to the per-agent override (or server default).
+    /// Silently ignored when the effective provider is not Anthropic.
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 /// Input to a run

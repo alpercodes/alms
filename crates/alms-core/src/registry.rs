@@ -29,6 +29,16 @@ pub struct AgentRecord {
     /// in the API response instead.
     #[serde(skip_serializing)]
     pub telegram_token: Option<String>,
+    /// Per-agent Anthropic extended-thinking budget override.
+    ///
+    /// `None` = inherit the server default from `[llm.anthropic]`.
+    /// `Some(0)` = explicitly disable extended thinking for this agent
+    /// even when the server default enables it.
+    /// `Some(n > 0)` = use exactly `n` tokens.
+    ///
+    /// Only applies when the resolved provider maps to the Anthropic wire
+    /// protocol; silently ignored for other providers.
+    pub thinking_budget_tokens: Option<u32>,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
@@ -46,6 +56,10 @@ pub struct CreateAgentRequest {
     /// Per-agent Telegram bot token. Validated via `getMe` on gateway startup,
     /// not at persist time.
     pub telegram_token: Option<String>,
+    /// Per-agent Anthropic extended-thinking budget override.
+    /// See [`AgentRecord::thinking_budget_tokens`] for semantics.
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
     #[serde(default)]
     pub is_default: Option<bool>,
 }
@@ -62,6 +76,11 @@ pub struct UpdateAgentRequest {
     pub provider: Option<String>,
     /// Per-agent Telegram bot token. Empty string = remove token.
     pub telegram_token: Option<String>,
+    /// Per-agent Anthropic extended-thinking budget override. A value of
+    /// `0` explicitly disables extended thinking for this agent even when
+    /// the server default enables it. Omitting the field leaves the
+    /// existing value unchanged.
+    pub thinking_budget_tokens: Option<u32>,
 }
 
 /// Validate an agent name slug.

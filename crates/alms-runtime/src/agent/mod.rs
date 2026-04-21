@@ -699,7 +699,13 @@ impl AgentRuntime {
         };
 
         match result {
-            Ok((response, usage)) => {
+            Ok(loop_output) => {
+                let crate::agent::loop_impl::AgentLoopOutput {
+                    response,
+                    usage,
+                    reasoning,
+                } = loop_output;
+
                 // Skip persisting an assistant message when the response is
                 // empty. This happens when the agent used `ignore_message` to
                 // decline responding — there is nothing to record.
@@ -725,15 +731,23 @@ impl AgentRuntime {
                     && response != alms_core::MAX_ITERATIONS_SENTINEL
                     && !dm_text_already_persisted
                 {
-                    let (role, metadata) = if is_dm {
-                        if let Some(meta) = self.dm_reasoning_metadata(is_dm) {
-                            (SessionRole::User, Some(meta))
-                        } else {
-                            (SessionRole::Assistant, None)
-                        }
+                    let base_meta = if is_dm {
+                        self.dm_reasoning_metadata(is_dm)
                     } else {
-                        (SessionRole::Assistant, None)
+                        None
                     };
+                    let role = if is_dm && base_meta.is_some() {
+                        SessionRole::User
+                    } else {
+                        SessionRole::Assistant
+                    };
+                    // Attach the extended-thinking trace (if any) as
+                    // `reasoning_blocks` metadata on the final assistant
+                    // message, merged with any existing DM metadata.
+                    let metadata = crate::agent::loop_impl::merge_reasoning_blocks(
+                        base_meta,
+                        reasoning.as_deref(),
+                    );
                     let reply_msg = SessionMessage {
                         id: uuid::Uuid::new_v4().to_string(),
                         role,

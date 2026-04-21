@@ -94,6 +94,7 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
         "posture": agent.posture,
         "provider": agent.provider,
         "has_telegram": agent.telegram_token.is_some(),
+        "thinking_budget_tokens": agent.thinking_budget_tokens,
         "is_default": agent.is_default,
         "created_at": agent.created_at.to_rfc3339(),
         "last_active": agent.last_active.to_rfc3339(),
@@ -107,6 +108,9 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
     }
     if agent.provider.is_none() {
         v.as_object_mut().unwrap().remove("provider");
+    }
+    if agent.thinking_budget_tokens.is_none() {
+        v.as_object_mut().unwrap().remove("thinking_budget_tokens");
     }
     v
 }
@@ -151,6 +155,7 @@ pub async fn create_agent(
         posture: req.posture,
         provider: req.provider,
         telegram_token: req.telegram_token,
+        thinking_budget_tokens: req.thinking_budget_tokens,
         // Always INSERT with is_default=false; set_default_agent atomically
         // clears old default + sets new one in a single transaction.
         is_default: false,
@@ -242,6 +247,16 @@ pub async fn update_agent(
         };
     }
 
+    // `thinking_budget_tokens` uses `Some(n)` (including `Some(0)`) as an
+    // explicit per-agent override. The only way to clear the override back
+    // to "inherit server default" is via DELETE + recreate today; matching
+    // the shape of `model`/`posture` would require a sentinel on the
+    // request wire, which is out of scope here. We document this limitation
+    // in the field comment on `UpdateAgentRequest`.
+    if let Some(budget) = req.thinking_budget_tokens {
+        agent.thinking_budget_tokens = Some(budget);
+    }
+
     agent.last_active = Utc::now();
 
     store
@@ -312,6 +327,7 @@ mod tests {
             posture: None,
             provider: None,
             telegram_token: None,
+            thinking_budget_tokens: None,
             is_default: false,
             created_at: now,
             last_active: now,

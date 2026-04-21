@@ -90,6 +90,10 @@ impl GatewayConfig {
                 shell_spill: config.tools.shell_spill.clone(),
                 enabled_tools: config.tools.enabled.clone(),
                 fs_edit_fuzzy_match: config.tools.fs_edit.fuzzy_match,
+                // Server-default extended-thinking budget — can be
+                // overridden per-agent in the registry and per-run in
+                // the run-create API.
+                anthropic_thinking_budget: config.llm.anthropic.thinking_budget_tokens,
                 ..AgentConfig::default()
             },
             session_config: SessionConfig {
@@ -793,6 +797,7 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         posture: None,
         provider: None,
         telegram_token: None,
+        thinking_budget_tokens: None,
         is_default: false,
         created_at: now,
         last_active: now,
@@ -929,6 +934,7 @@ mod tests {
             posture: None,
             provider: None,
             telegram_token: None,
+            thinking_budget_tokens: None,
             is_default: true,
             created_at: now,
             last_active: now,

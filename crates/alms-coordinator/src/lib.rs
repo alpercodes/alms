@@ -835,6 +835,14 @@ struct SubagentRecordConfig {
     model: Option<String>,
     posture: Option<String>,
     provider: Option<String>,
+    /// Per-named-subagent Anthropic extended-thinking budget override.
+    ///
+    /// Mirrors the top-level agent path in `apply_overrides` (gateway
+    /// `runs/mod.rs`): `Some(n)` (including `Some(0)`) is treated as an
+    /// explicit override; `None` inherits the parent's effective budget.
+    /// This keeps the three-layer precedence (per-run > per-agent >
+    /// server default) intact for named subagents too.
+    thinking_budget_tokens: Option<u32>,
 }
 
 /// Build an `AgentConfig` for a subagent. Named subagents get their config
@@ -845,15 +853,24 @@ fn agent_config_for_subagent(
     record: Option<SubagentRecordConfig>,
     base: &AgentConfig,
 ) -> (AgentConfig, Option<String>, Option<String>) {
-    let (model, posture_str, provider) = match record {
-        Some(r) => (r.model, r.posture, r.provider),
-        None => (None, None, None),
+    let (model, posture_str, provider, thinking_budget_override) = match record {
+        Some(r) => (r.model, r.posture, r.provider, r.thinking_budget_tokens),
+        None => (None, None, None, None),
     };
 
     let posture = posture_str
         .as_deref()
         .and_then(|s| s.parse::<alms_runtime::Posture>().ok())
         .unwrap_or(alms_runtime::Posture::FullControl);
+
+    // Per-named-subagent Anthropic thinking budget override. `Some(0)` is a
+    // legitimate override meaning "disable extended thinking for this
+    // subagent even when the parent enables it", matching the gateway's
+    // top-level `apply_overrides` semantics. `None` inherits the parent's
+    // effective budget so unconfigured subagents stay consistent with their
+    // parent's extended-thinking policy.
+    let anthropic_thinking_budget =
+        thinking_budget_override.unwrap_or(base.anthropic_thinking_budget);
 
     let config = AgentConfig {
         system_prompt: DEFAULT_SUBAGENT_PROMPT.to_string(),
@@ -875,6 +892,7 @@ fn agent_config_for_subagent(
         context_config: base.context_config.clone(),
         prompts: base.prompts.clone(),
         debug_mode: false,
+        anthropic_thinking_budget,
     };
     (config, model, provider)
 }
@@ -961,6 +979,7 @@ async fn run_agent_loop(
                     model: record.model,
                     posture: record.posture,
                     provider: record.provider,
+                    thinking_budget_tokens: record.thinking_budget_tokens,
                 }
             })
             .or_else(|| {
@@ -1144,6 +1163,9 @@ async fn run_agent_loop(
                     }
                     RuntimeEvent::TokenDelta { delta, .. } => {
                         parent_fwd.forward_token_delta(delta, agent_label);
+                    }
+                    RuntimeEvent::ReasoningDelta { text, .. } => {
+                        parent_fwd.forward_reasoning_delta(text, agent_label);
                     }
                     // Suppress subagent status events -- they would overwrite
                     // the parent's thinking indicator with the subagent's phase,
@@ -1494,6 +1516,7 @@ mod tests {
             model: Some("gpt-5".into()),
             posture: Some("guarded".into()),
             provider: Some("anthropic".into()),
+            thinking_budget_tokens: None,
         };
         let (config2, model2, _provider2) = agent_config_for_subagent(Some(record), &parent);
         assert_eq!(model2.as_deref(), Some("gpt-5"));
@@ -1541,6 +1564,7 @@ mod tests {
             model: Some("gpt-5".into()),
             posture: None,
             provider: None,
+            thinking_budget_tokens: None,
         };
         let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
         assert!(named.shell_spill.enabled);
@@ -1558,6 +1582,70 @@ mod tests {
         let (sub, _, _) = agent_config_for_subagent(None, &disabled_parent);
         assert!(!sub.shell_spill.enabled);
         assert_eq!(sub.shell_spill.retention_days, 1);
+    }
+
+    // -- (j-pre-3) subagent thinking-budget three-layer precedence (Tim S1) -----
+    //
+    // Parity with gateway `test_thinking_per_agent_zero_disables`: a named
+    // subagent registered with `thinking_budget_tokens = Some(0)` must
+    // honour its own registry override and disable extended thinking, even
+    // when the parent enables it with `Some(4096)`. Ephemeral subagents
+    // (record = None) still inherit the parent budget.
+    #[test]
+    fn test_subagent_thinking_budget_override() {
+        // Parent has extended thinking enabled at 4096 tokens.
+        let parent = AgentConfig {
+            anthropic_thinking_budget: 4096,
+            ..AgentConfig::default()
+        };
+
+        // Ephemeral subagent: no registry → inherit parent's 4096.
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert_eq!(
+            ephemeral.anthropic_thinking_budget, 4096,
+            "ephemeral subagents inherit the parent's thinking budget"
+        );
+
+        // Named subagent registered with Some(0): explicit per-agent opt-out
+        // must win over the parent's enabled-by-default 4096.
+        let record_zero = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: Some(0),
+        };
+        let (sub_zero, _, _) = agent_config_for_subagent(Some(record_zero), &parent);
+        assert_eq!(
+            sub_zero.anthropic_thinking_budget, 0,
+            "named subagent Some(0) must disable thinking even when parent enables it"
+        );
+
+        // Named subagent registered with Some(n > 0): explicit opt-in with a
+        // different budget overrides the parent's value.
+        let record_explicit = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: Some(8192),
+        };
+        let (sub_explicit, _, _) = agent_config_for_subagent(Some(record_explicit), &parent);
+        assert_eq!(
+            sub_explicit.anthropic_thinking_budget, 8192,
+            "named subagent Some(n) must override the parent's thinking budget"
+        );
+
+        // Named subagent registered with None: unconfigured → inherit parent.
+        let record_none = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+        };
+        let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
+        assert_eq!(
+            sub_none.anthropic_thinking_budget, 4096,
+            "named subagent with no override inherits the parent's budget"
+        );
     }
 
     // -- (j) get_completed_result on unknown task → None ------------------------

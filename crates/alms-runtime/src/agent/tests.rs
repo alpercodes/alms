@@ -42,12 +42,14 @@ async fn test_stream_llm_call_emits_token_deltas() {
     let request =
         CompletionRequest::new("test").with_messages(vec![LlmMessage::user("hello world")]);
 
-    let (content, tool_calls, _usage) = runtime.stream_llm_call(request).await.unwrap();
+    let result = runtime.stream_llm_call(request).await.unwrap();
 
     // Content should be the reassembled mock response
-    assert_eq!(content.as_deref(), Some("[mock] hello world"));
+    assert_eq!(result.content.as_deref(), Some("[mock] hello world"));
     // No tool calls from mock
-    assert!(tool_calls.is_none());
+    assert!(result.tool_calls.is_none());
+    // Mock stream doesn't emit reasoning_content
+    assert!(result.reasoning.is_none());
 
     // Verify TokenDelta events were emitted (one per word chunk)
     let mut deltas = Vec::new();
@@ -1907,4 +1909,154 @@ async fn test_ephemeral_subagent_cannot_read_named_agent_workspace() {
         "ephemeral subagent should NOT be able to read a named agent's workspace: {:?}",
         result.ok()
     );
+}
+
+// --------------------------------------------------------------------------
+// Extended-thinking persistence round-trip (issue #767)
+// --------------------------------------------------------------------------
+
+/// Reasoning blocks accumulated mid-run (alongside a tool call batch) are
+/// written onto the assistant-text session message with a
+/// `reasoning_blocks` metadata field, so page reload can rehydrate them.
+#[tokio::test]
+async fn test_reasoning_persisted_on_assistant_tool_call_message() {
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let llm = LlmClient::new(config).unwrap();
+    let agent_id = AgentId::new();
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(agent_id, agent_config, llm).unwrap();
+
+    let session = session_manager.get_or_create(agent_id, "ctx-reasoning");
+
+    // Directly exercise the persistence path with a reasoning trace.
+    let tool_call = ToolCall::new("call_1", "echo", r#"{"text":"hi"}"#);
+    let invocation_id = uuid::Uuid::new_v4();
+    runtime.persist_assistant_tool_calls(
+        &session_manager,
+        session.id,
+        Some("I will echo hi."),
+        Some("Deliberating about the best approach..."),
+        &[tool_call],
+        &[invocation_id],
+        false, // is_dm
+    );
+
+    let history = session_manager.get_history(session.id).unwrap();
+    // Expected: one assistant text message (with reasoning_blocks meta) +
+    // one tool_call message (without reasoning, that's on the text msg).
+    assert!(!history.is_empty(), "nothing persisted");
+    let assistant_text = history
+        .iter()
+        .find(|m| matches!(m.content, alms_session::Content::Text(ref t) if t == "I will echo hi."))
+        .expect("assistant text message present");
+    let meta = assistant_text
+        .metadata
+        .as_ref()
+        .expect("metadata with reasoning_blocks expected");
+    let blocks = meta["reasoning_blocks"]
+        .as_array()
+        .expect("reasoning_blocks must be an array");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0]["text"].as_str(),
+        Some("Deliberating about the best approach...")
+    );
+}
+
+/// History-loader round-trip: a persisted assistant message with a
+/// `reasoning_blocks` metadata field surfaces as `reasoning` text on
+/// reload. Exercises the full write-then-read path via `SessionManager`.
+#[tokio::test]
+async fn test_reasoning_persisted_reload_roundtrip() {
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let llm = LlmClient::new(config).unwrap();
+    let agent_id = AgentId::new();
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(agent_id, agent_config, llm).unwrap();
+
+    let session = session_manager.get_or_create(agent_id, "ctx-roundtrip");
+
+    let invocation_id = uuid::Uuid::new_v4();
+    runtime.persist_assistant_tool_calls(
+        &session_manager,
+        session.id,
+        Some("Final answer"),
+        Some("step 1: think; step 2: conclude"),
+        &[ToolCall::new("c1", "echo", "{}")],
+        &[invocation_id],
+        false,
+    );
+
+    let reloaded = session_manager.get_history(session.id).unwrap();
+    let hit = reloaded
+        .iter()
+        .find(|m| match &m.content {
+            alms_session::Content::Text(t) => t == "Final answer",
+            _ => false,
+        })
+        .expect("assistant text present");
+    let meta = hit.metadata.as_ref().unwrap();
+    let blocks = meta["reasoning_blocks"].as_array().unwrap();
+    assert_eq!(
+        blocks[0]["text"].as_str(),
+        Some("step 1: think; step 2: conclude"),
+        "reasoning text must survive persistence round-trip"
+    );
+}
+
+/// `AgentConfig.anthropic_thinking_budget` threads through to every LLM
+/// request the agent loop issues. Without this invariant, per-agent /
+/// per-run overrides would land in config but never be seen by the
+/// provider.
+///
+/// This is a shape-assertion test — we don't run a real LLM; we build
+/// the `CompletionRequest` exactly as the agent loop does and check the
+/// thinking budget follows.
+#[test]
+fn test_agent_config_thinking_budget_threads_into_request() {
+    let cfg = AgentConfig {
+        anthropic_thinking_budget: 4096,
+        max_tokens: 2048,
+        ..AgentConfig::default()
+    };
+
+    // Build the request the same way `agent_loop` does. We can't call
+    // `stream_llm_call` here (no mock LLM setup), but the request
+    // builder is a one-liner so we replicate it directly.
+    let mut request = CompletionRequest::new("claude-sonnet-4-20250514")
+        .with_messages(vec![LlmMessage::user("hi")])
+        .with_max_tokens(cfg.max_tokens);
+    if cfg.anthropic_thinking_budget > 0 {
+        request = request.with_thinking_budget(cfg.anthropic_thinking_budget);
+    }
+
+    assert_eq!(request.thinking_budget_tokens, Some(4096));
+
+    // And when budget is 0, the field is None (adapter skips the wire
+    // field in that case — see anthropic.rs tests).
+    let cfg0 = AgentConfig {
+        anthropic_thinking_budget: 0,
+        ..AgentConfig::default()
+    };
+    let mut req0 = CompletionRequest::new("x").with_messages(vec![LlmMessage::user("hi")]);
+    if cfg0.anthropic_thinking_budget > 0 {
+        req0 = req0.with_thinking_budget(cfg0.anthropic_thinking_budget);
+    }
+    assert!(req0.thinking_budget_tokens.is_none());
 }

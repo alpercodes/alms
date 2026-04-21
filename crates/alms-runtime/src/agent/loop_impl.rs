@@ -17,6 +17,38 @@ use super::dm::{
 use super::helpers::tool_result_ok;
 use super::types::Posture;
 
+/// Output of a completed agent loop.
+///
+/// Rolled up from every LLM call in the loop: `response` is the final
+/// assistant text (or `""` for runs that end via `ignore_message`),
+/// `usage` is the summed token accounting, and `reasoning` is the
+/// concatenated extended-thinking trace from the final LLM turn (the one
+/// that produced `response`) — only that turn's reasoning is carried
+/// forward because earlier turns' reasoning has already been persisted
+/// alongside their tool-call batches.
+pub(crate) struct AgentLoopOutput {
+    pub response: String,
+    pub usage: TokenUsage,
+    pub reasoning: Option<String>,
+}
+
+/// Output of a single LLM call (streaming or buffered fallback).
+///
+/// Carries the user-visible `content`, any accumulated extended-thinking
+/// `reasoning` trace, any tool calls the model wants to run, and the usage
+/// accounting from the provider.
+pub(crate) struct StreamCallResult {
+    pub content: Option<String>,
+    /// Extended-thinking / reasoning trace emitted by the model. For
+    /// Anthropic this is the concatenation of all `thinking_delta` chunks;
+    /// for OpenAI-compatible reasoning models it's the accumulated
+    /// `reasoning_content`. Persisted as metadata on the assistant message;
+    /// never replayed back into future LLM calls.
+    pub reasoning: Option<String>,
+    pub tool_calls: Option<Vec<ToolCall>>,
+    pub usage: Option<Usage>,
+}
+
 impl AgentRuntime {
     /// Main agent loop with tool execution
     #[instrument(
@@ -32,10 +64,7 @@ impl AgentRuntime {
         is_dm: bool,
         include_user: bool,
         dm_peer: Option<&str>,
-    ) -> (
-        Vec<alms_core::ToolCallRecord>,
-        AlmsResult<(String, TokenUsage)>,
-    ) {
+    ) -> (Vec<alms_core::ToolCallRecord>, AlmsResult<AgentLoopOutput>) {
         let mut iterations = 0;
         let mut total_usage = TokenUsage::default();
         let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
@@ -63,7 +92,11 @@ impl AgentRuntime {
                 );
                 return (
                     tool_call_records,
-                    Ok((MAX_ITERATIONS_SENTINEL.to_string(), total_usage)),
+                    Ok(AgentLoopOutput {
+                        response: MAX_ITERATIONS_SENTINEL.to_string(),
+                        usage: total_usage,
+                        reasoning: None,
+                    }),
                 );
             }
             iterations += 1;
@@ -82,13 +115,23 @@ impl AgentRuntime {
             // cost scales with conversation length; if this becomes a
             // bottleneck, the LLM client could be changed to accept a
             // reference, but that would require upstream API changes.
-            let request = CompletionRequest::new(self.llm.default_model())
+            let mut request = CompletionRequest::new(self.llm.default_model())
                 .with_messages(messages.clone())
                 .with_tools(self.tools.to_definitions())
                 .with_max_tokens(self.config.max_tokens);
+            // Attach the Anthropic extended-thinking budget so the adapter
+            // can rewrite it into the `thinking` field. Non-Anthropic
+            // providers silently ignore it.
+            if self.config.anthropic_thinking_budget > 0 {
+                request = request.with_thinking_budget(self.config.anthropic_thinking_budget);
+            }
 
-            let (content, tool_calls, usage) = match self.call_llm_with_cancellation(request).await
-            {
+            let StreamCallResult {
+                content,
+                reasoning,
+                tool_calls,
+                usage,
+            } = match self.call_llm_with_cancellation(request).await {
                 Ok(result) => result,
                 Err(e) => return (tool_call_records, Err(e)),
             };
@@ -122,10 +165,17 @@ impl AgentRuntime {
                 // `messages` vec is the authoritative state for the current
                 // run. If persistence is critical for your deployment, monitor
                 // these warnings and consider promoting them to errors.
+                //
+                // `reasoning` carries the extended-thinking trace (when the
+                // model emitted any). It's attached as metadata on the
+                // assistant turn so the UI can render a collapsible
+                // reasoning panel after page reload; it is NOT replayed
+                // back into future LLM context.
                 self.persist_assistant_tool_calls(
                     session_manager,
                     session_id,
                     content.as_deref(),
+                    reasoning.as_deref(),
                     &tool_calls,
                     &invocation_ids,
                     is_dm,
@@ -213,7 +263,19 @@ impl AgentRuntime {
                 // (e.g. called from a non-DM session, or blocked by conflict).
                 if alms_core::ran_ignore_message_successfully(&tool_call_records) {
                     info!("Agent declined to respond via ignore_message -- ending run early");
-                    return (tool_call_records, Ok((String::new(), total_usage)));
+                    return (
+                        tool_call_records,
+                        Ok(AgentLoopOutput {
+                            response: String::new(),
+                            usage: total_usage,
+                            // ignore_message short-circuits before any
+                            // follow-up LLM turn, so whatever reasoning was
+                            // emitted in this turn was already persisted
+                            // with the tool call batch above — don't
+                            // double-attach it to the final output.
+                            reasoning: None,
+                        }),
+                    );
                 }
 
                 // In a DM-triggered run, terminate the loop after the agent
@@ -224,7 +286,16 @@ impl AgentRuntime {
                 if should_terminate_after_dm_send(&tool_calls, is_dm, dm_check.conflict) {
                     info!("DM run: send_message delivered -- ending loop (one reply per DM run)");
                     let text = content.unwrap_or_default();
-                    return (tool_call_records, Ok((text, total_usage)));
+                    return (
+                        tool_call_records,
+                        Ok(AgentLoopOutput {
+                            response: text,
+                            usage: total_usage,
+                            // The reasoning for this turn was already
+                            // persisted alongside its tool calls.
+                            reasoning: None,
+                        }),
+                    );
                 }
 
                 // Append tool_loop instructions to the system prompt for
@@ -323,7 +394,14 @@ impl AgentRuntime {
 
             return (
                 tool_call_records,
-                Ok((content.unwrap_or_default(), total_usage)),
+                Ok(AgentLoopOutput {
+                    response: content.unwrap_or_default(),
+                    usage: total_usage,
+                    // Reasoning for the final (text-only) LLM turn. Persisted
+                    // as metadata on the assistant message by `finish_run`
+                    // so it's recoverable on page reload.
+                    reasoning,
+                }),
             );
         }
     }
@@ -331,12 +409,13 @@ impl AgentRuntime {
     /// Call the LLM (streaming with buffered fallback), respecting cancellation.
     ///
     /// Emits `PHASE_CALLING_LLM` status, attempts streaming first, falls back
-    /// to buffered mode on streaming failure. Returns the same triple as
-    /// `stream_llm_call`: (content, tool_calls, usage).
+    /// to buffered mode on streaming failure. Returns a [`StreamCallResult`]
+    /// carrying content, reasoning trace (extended thinking, if any), tool
+    /// calls, and usage.
     async fn call_llm_with_cancellation(
         &self,
         request: CompletionRequest,
-    ) -> AlmsResult<(Option<String>, Option<Vec<ToolCall>>, Option<Usage>)> {
+    ) -> AlmsResult<StreamCallResult> {
         self.emit_status(PHASE_CALLING_LLM, None);
 
         // Try streaming first.
@@ -365,11 +444,26 @@ impl AgentRuntime {
                 let choice = response.choices.into_iter().next().ok_or_else(|| {
                     AlmsError::Runtime("LLM returned empty choices array".to_string())
                 })?;
-                Ok((
-                    choice.message.effective_content().map(|s| s.to_string()),
-                    choice.message.tool_calls,
+                // In buffered fallback we also carry the `reasoning_content`
+                // field through so Anthropic non-streaming responses (and
+                // OpenAI reasoning models that return the field non-stream)
+                // still surface their thinking trace for persistence.
+                let content = choice.message.content.clone();
+                let reasoning = choice.message.reasoning_content.clone();
+                // Preserve the streaming-path fallback: when `content` is
+                // absent, promote reasoning into `content` so the run has
+                // something to show.
+                let (content, reasoning) = match (content, reasoning) {
+                    (Some(c), r) if !c.is_empty() => (Some(c), r),
+                    (_, Some(r)) if !r.is_empty() => (Some(r), None),
+                    (c, _) => (c, None),
+                };
+                Ok(StreamCallResult {
+                    content,
+                    reasoning,
+                    tool_calls: choice.message.tool_calls,
                     usage,
-                ))
+                })
             }
         }
     }
@@ -506,11 +600,21 @@ impl AgentRuntime {
     /// reconstructed into collapsible reasoning blocks in the UI. This
     /// preserves the DM invariant that all shared-session messages are
     /// `Role::User` (see `apply_perspective()` in context.rs).
-    fn persist_assistant_tool_calls(
+    ///
+    /// `reasoning_trace` carries the extended-thinking / reasoning text
+    /// emitted by the model for this turn, when any. It is attached as
+    /// `reasoning_blocks` metadata on the assistant-text message so the
+    /// UI can render a collapsible reasoning panel after page reload.
+    /// Never replayed back into future LLM context — per Anthropic's
+    /// standard mode, prior thinking blocks are not required for
+    /// subsequent tool-use turns.
+    #[allow(clippy::too_many_arguments)] // Private helper; grouping into a struct would add indirection.
+    pub(crate) fn persist_assistant_tool_calls(
         &self,
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
         content: Option<&str>,
+        reasoning_trace: Option<&str>,
         tool_calls: &[ToolCall],
         invocation_ids: &[Uuid],
         is_dm: bool,
@@ -524,9 +628,15 @@ impl AgentRuntime {
             && !text.is_empty()
         {
             let (role, metadata) = if reasoning_meta.is_some() {
-                (SessionRole::User, reasoning_meta.clone())
+                (
+                    SessionRole::User,
+                    merge_reasoning_blocks(reasoning_meta.clone(), reasoning_trace),
+                )
             } else {
-                (SessionRole::Assistant, None)
+                (
+                    SessionRole::Assistant,
+                    merge_reasoning_blocks(None, reasoning_trace),
+                )
             };
             if let Err(e) = session_manager.append_message(
                 session_id,
@@ -539,6 +649,34 @@ impl AgentRuntime {
                 },
             ) {
                 warn!("Failed to persist assistant text to session: {}", e);
+            }
+        } else if let Some(trace) = reasoning_trace.filter(|t| !t.is_empty()) {
+            // Edge case: extended thinking emitted content but the model
+            // transitioned straight to a tool-use block with no visible
+            // text. Persist a text-less assistant message carrying only
+            // the reasoning blocks so the UI can still render the trace.
+            let (role, metadata) = if reasoning_meta.is_some() {
+                (
+                    SessionRole::User,
+                    merge_reasoning_blocks(reasoning_meta.clone(), Some(trace)),
+                )
+            } else {
+                (
+                    SessionRole::Assistant,
+                    merge_reasoning_blocks(None, Some(trace)),
+                )
+            };
+            if let Err(e) = session_manager.append_message(
+                session_id,
+                SessionMessage {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    role,
+                    content: SessionContent::Text(String::new()),
+                    timestamp: alms_core::Timestamp::now(),
+                    metadata,
+                },
+            ) {
+                warn!("Failed to persist reasoning-only assistant turn: {}", e);
             }
         }
 
@@ -678,7 +816,7 @@ impl AgentRuntime {
     pub(crate) async fn stream_llm_call(
         &self,
         request: CompletionRequest,
-    ) -> AlmsResult<(Option<String>, Option<Vec<ToolCall>>, Option<Usage>)> {
+    ) -> AlmsResult<StreamCallResult> {
         use futures::StreamExt;
 
         let mut stream = self.llm.complete_stream(request).await?;
@@ -732,14 +870,26 @@ impl AgentRuntime {
                 }
             }
 
-            // Accumulate reasoning_content from reasoning models.
-            // This is not emitted as token_delta (it's internal thinking),
-            // but is preserved so we can fall back to it when content is
-            // empty at the end of streaming.
+            // Accumulate reasoning_content from reasoning models (OpenAI
+            // o-series, DeepSeek R1, etc.) and Anthropic extended thinking
+            // (routed through the same channel by `parse_anthropic_sse`).
+            //
+            // Emit as `RuntimeEvent::ReasoningDelta` so the gateway can
+            // forward a `reasoning_delta` SSE event and the UI can render
+            // it in a collapsible panel. Also preserved in-process so we
+            // can fall back to it when the final `content` stream is
+            // empty (some reasoning models exhaust max_tokens before
+            // transitioning to visible output).
             if let Some(text) = choice.delta.reasoning_content
                 && !text.is_empty()
             {
                 reasoning_content.push_str(&text);
+                if let Some(ref sender) = self.event_sender {
+                    let _ = sender.send(RuntimeEvent::ReasoningDelta {
+                        text,
+                        source_agent: None,
+                    });
+                }
             }
 
             // Accumulate tool call deltas
@@ -781,21 +931,37 @@ impl AgentRuntime {
             Some(tool_calls)
         };
 
-        // Fall back to reasoning_content when the model streamed everything
-        // through reasoning (common with reasoning models that exhaust
-        // max_tokens before transitioning to output).
-        let content = if content.is_empty() {
+        // If the model streamed through `reasoning_content` but produced no
+        // `content` text (common with reasoning models that exhaust
+        // max_tokens before transitioning to visible output), promote the
+        // reasoning trace into `content` so the run still has something to
+        // say. This is distinct from Anthropic extended thinking in a
+        // normal run, where `reasoning_content` is a *supplement* to
+        // `content`: when `content` is non-empty we keep reasoning in the
+        // separate `LlmMessage::reasoning_content` field and let the
+        // caller persist it as metadata on the assistant message.
+        let (content, reasoning_out) = if content.is_empty() {
             if !reasoning_content.is_empty() {
                 info!("Streaming: content empty, falling back to reasoning_content");
-                Some(reasoning_content)
+                (Some(reasoning_content), None)
             } else {
-                None
+                (None, None)
             }
         } else {
-            Some(content)
+            let reasoning = if reasoning_content.is_empty() {
+                None
+            } else {
+                Some(reasoning_content)
+            };
+            (Some(content), reasoning)
         };
 
-        Ok((content, tool_calls, usage))
+        Ok(StreamCallResult {
+            content,
+            reasoning: reasoning_out,
+            tool_calls,
+            usage,
+        })
     }
 
     /// Execute a tool call, emitting tool_start/tool_end events and handling approvals.
@@ -1044,5 +1210,96 @@ impl AgentRuntime {
         }
 
         result
+    }
+}
+
+/// Attach a `reasoning_blocks` array to a message's metadata object.
+///
+/// The output shape is `{"reasoning_blocks": [{"text": "..."}]}` merged
+/// into any existing base metadata. When `reasoning_trace` is `None` or
+/// empty the base metadata passes through unchanged — we never write an
+/// empty `reasoning_blocks` array, but we also don't drop the caller's
+/// other fields (e.g. DM `message_type`/`from_agent`).
+///
+/// Kept provider-agnostic so that issues #768 (OpenAI / DeepSeek R1 / xAI)
+/// and #769 (Gemini) can reuse the same persistence shape. For Anthropic
+/// today this stores a single concatenated block; future providers that
+/// stream multiple discrete reasoning blocks can push additional entries
+/// into the array without a migration.
+pub(crate) fn merge_reasoning_blocks(
+    base: Option<serde_json::Value>,
+    reasoning_trace: Option<&str>,
+) -> Option<serde_json::Value> {
+    let trace = reasoning_trace.filter(|t| !t.is_empty());
+    match (base, trace) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (base, Some(text)) => {
+            let blocks = serde_json::json!([{"text": text}]);
+            // Invariant: callers today always pass either `None` or
+            // `Some(Value::Object(..))` (see `dm_reasoning_metadata` in
+            // `dm.rs`, which is the only producer of non-`None` bases).
+            // The non-Object fall-through below is defensive "drop + rebuild"
+            // — if that ever fires we'd silently lose caller-supplied
+            // metadata, so pin the invariant in debug builds so a future
+            // caller mistake trips tests rather than corrupts persistence.
+            debug_assert!(
+                matches!(base, None | Some(serde_json::Value::Object(_))),
+                "merge_reasoning_blocks: non-Object base is unreachable today \
+                 — only `dm_reasoning_metadata` feeds this path and it always \
+                 returns Some(Object(..))"
+            );
+            match base {
+                Some(serde_json::Value::Object(mut map)) => {
+                    map.insert("reasoning_blocks".to_string(), blocks);
+                    Some(serde_json::Value::Object(map))
+                }
+                _ => Some(serde_json::json!({"reasoning_blocks": blocks})),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::merge_reasoning_blocks;
+
+    #[test]
+    fn test_merge_reasoning_blocks_none_when_empty_trace_and_no_base() {
+        assert!(merge_reasoning_blocks(None, None).is_none());
+        assert!(merge_reasoning_blocks(None, Some("")).is_none());
+    }
+
+    #[test]
+    fn test_merge_reasoning_blocks_passes_through_base_when_no_trace() {
+        // Regression guard: the DM metadata path calls this with
+        // `Some({message_type, from_agent, run_id})` and no reasoning.
+        // The base metadata must survive verbatim.
+        let base = serde_json::json!({"message_type": "reasoning", "from_agent": "bob"});
+        let result = merge_reasoning_blocks(Some(base.clone()), None).unwrap();
+        assert_eq!(result, base);
+        let result_empty = merge_reasoning_blocks(Some(base.clone()), Some("")).unwrap();
+        assert_eq!(result_empty, base);
+    }
+
+    #[test]
+    fn test_merge_reasoning_blocks_creates_object() {
+        let meta = merge_reasoning_blocks(None, Some("thinking...")).unwrap();
+        let blocks = meta.get("reasoning_blocks").unwrap().as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].get("text").unwrap().as_str(), Some("thinking..."));
+    }
+
+    #[test]
+    fn test_merge_reasoning_blocks_preserves_existing_meta() {
+        let base = serde_json::json!({"message_type": "reasoning", "from_agent": "atlas"});
+        let meta = merge_reasoning_blocks(Some(base), Some("step 1")).unwrap();
+        assert_eq!(
+            meta.get("message_type").unwrap().as_str(),
+            Some("reasoning")
+        );
+        assert_eq!(meta.get("from_agent").unwrap().as_str(), Some("atlas"));
+        let blocks = meta.get("reasoning_blocks").unwrap().as_array().unwrap();
+        assert_eq!(blocks[0].get("text").unwrap().as_str(), Some("step 1"));
     }
 }

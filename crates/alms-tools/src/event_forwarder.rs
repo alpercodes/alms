@@ -43,6 +43,14 @@ pub trait EventForwarder: Send + Sync + std::fmt::Debug {
     /// A chunk of text from the LLM response stream.
     fn forward_token_delta(&self, delta: String, source_agent: Option<String>);
 
+    /// A chunk of reasoning / extended-thinking text from the LLM stream.
+    ///
+    /// Provider-neutral: Anthropic's `thinking_delta`, future OpenAI /
+    /// DeepSeek / Gemini reasoning streams all surface here. Default is a
+    /// no-op so implementers that don't yet care about reasoning don't
+    /// have to opt in explicitly.
+    fn forward_reasoning_delta(&self, _text: String, _source_agent: Option<String>) {}
+
     /// A status update indicating the current phase of the agent run.
     fn forward_status(&self, phase: String, detail: Option<String>);
 

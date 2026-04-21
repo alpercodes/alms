@@ -256,6 +256,7 @@ Token cost is a first-class constraint:
 - Peer-to-peer direct messaging via `send_message` tool + MessageBus + DM sessions with perspective mapping (Layer 2 Phase 1)
 - DM conversation lifecycle: `ignore_message` and depth-exceeded trigger `end_conversation` with `dm_ended` session markers, depth counter reset, `ConversationEnded` peer notification via `notifications:{agent}` sessions, and `dm_conversation_ended` SSE events (#384 Phases 1-7)
 - Cross-session episodic memory via run summaries (`session_summaries` table, heuristic + LLM modes, context injection with 15% budget cap)
+- Provider-neutral reasoning stream (#767) — Anthropic extended-thinking `thinking_delta` chunks are surfaced as `RuntimeEvent::ReasoningDelta` inside the runtime, forwarded as `reasoning_delta` SSE events, rendered in a collapsible `ReasoningPanel` in the web UI, and persisted as `reasoning_blocks` metadata on the assistant message. Shape is deliberately provider-neutral so OpenAI o-series / DeepSeek R1 / xAI Grok (#768) and Gemini (#769) layer on without changes to the event variant, SSE wire type, or UI component.
 
 ### Pending 🎯
 - Autonomous subagent loops — see `docs/autonomous-subagents-design.md`

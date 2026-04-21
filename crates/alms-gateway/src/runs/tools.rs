@@ -70,6 +70,12 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
         });
     }
 
+    fn forward_reasoning_delta(&self, text: String, source_agent: Option<String>) {
+        let _ = self
+            .tx
+            .send(RuntimeEvent::ReasoningDelta { text, source_agent });
+    }
+
     fn forward_status(&self, phase: String, detail: Option<String>) {
         let _ = self.tx.send(RuntimeEvent::Status { phase, detail });
     }
@@ -128,6 +134,15 @@ pub(super) async fn forward_runtime_events(
                         run_id,
                         session_id,
                         SseEventData::token_delta(run_id, &delta, source_agent),
+                    )
+                    .await;
+            }
+            RuntimeEvent::ReasoningDelta { text, source_agent } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::reasoning_delta(run_id, &text, source_agent),
                     )
                     .await;
             }

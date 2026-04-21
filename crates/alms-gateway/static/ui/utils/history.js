@@ -284,6 +284,18 @@ export function mapHistoryMessages(msgs, opts) {
                 : isDm ? 'agent'
                 : (m.role === 'user' ? 'user' : 'agent');
 
+            // Reconstruct persisted extended-thinking / reasoning blocks
+            // (issue #767). Stored on the assistant-text message as
+            // `metadata.reasoning_blocks = [{text: "..."}]` by the runtime;
+            // the Message component consumes a single `reasoning` string.
+            let reasoning = undefined;
+            if (type === 'agent' && m.metadata && Array.isArray(m.metadata.reasoning_blocks)) {
+                reasoning = m.metadata.reasoning_blocks
+                    .map(b => (b && typeof b.text === 'string') ? b.text : '')
+                    .join('');
+                if (!reasoning) reasoning = undefined;
+            }
+
             pushEntry({
                 id: nextMsgId(),
                 type,
@@ -291,6 +303,7 @@ export function mapHistoryMessages(msgs, opts) {
                 text: m.content || '',
                 metadata: m.metadata || null,
                 sealed: true,
+                reasoning,
                 // Carry the sender name so Message can show it as the label.
                 fromAgent: isDm ? m.metadata.from_agent : undefined,
             }, m.timestamp);

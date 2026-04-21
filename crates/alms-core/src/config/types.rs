@@ -157,6 +157,11 @@ pub struct LlmConfig {
     ///
     /// See [`ProviderEntry`] for the schema of an individual entry.
     pub providers: BTreeMap<String, ProviderEntry>,
+
+    /// Anthropic-specific configuration surfaced as `[llm.anthropic]` in
+    /// `alms.toml`. Only consulted when the effective provider maps to the
+    /// Anthropic wire protocol; ignored otherwise.
+    pub anthropic: AnthropicConfig,
 }
 
 impl Default for LlmConfig {
@@ -172,8 +177,38 @@ impl Default for LlmConfig {
             mock: false,
             stream_chunk_timeout_secs: 60,
             providers: BTreeMap::new(),
+            anthropic: AnthropicConfig::default(),
         }
     }
+}
+
+/// Anthropic-specific configuration (`[llm.anthropic]` in `alms.toml`).
+///
+/// Kept separate from [`ProviderEntry`] — which only models the generic
+/// wire-level plumbing (base URL, auth scheme, quirks) — because extended
+/// thinking is a provider-specific feature whose shape doesn't generalize
+/// to OpenAI-compatible endpoints.
+///
+/// Fields here are the server-level defaults. Agents can opt in or out
+/// individually via [`crate::registry::AgentRecord::thinking_budget_tokens`],
+/// and an individual run can override either via the run-create API.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AnthropicConfig {
+    /// Extended-thinking budget in tokens. `0` disables extended thinking
+    /// (the default — Anthropic returns no `thinking` content blocks).
+    ///
+    /// When non-zero, every Anthropic request grows a
+    /// `"thinking": {"type": "enabled", "budget_tokens": N}` field, and the
+    /// provider streams `thinking_delta` content blocks before the final
+    /// assistant text. The runtime surfaces those as
+    /// `RuntimeEvent::ReasoningDelta` events; the UI renders them in a
+    /// collapsible panel under the assistant turn.
+    ///
+    /// Follow-up turns with tool use do NOT need prior thinking replayed
+    /// back (Anthropic's standard mode doesn't require it), so this value
+    /// only affects what's emitted in the current response.
+    pub thinking_budget_tokens: u32,
 }
 
 impl LlmConfig {

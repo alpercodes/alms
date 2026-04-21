@@ -23,6 +23,26 @@ pub(crate) struct AnthropicRequest {
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// Extended-thinking configuration for Claude 4.x. Omitted when disabled.
+    ///
+    /// Populated only when the incoming `CompletionRequest` carries a
+    /// non-zero `thinking_budget_tokens`. On the wire this serializes to
+    /// `"thinking": {"type": "enabled", "budget_tokens": N}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<AnthropicThinking>,
+}
+
+/// Anthropic extended-thinking request field.
+///
+/// Today only the `enabled` variant exists on the Anthropic side; kept as a
+/// tagged struct rather than a bare u32 so adding future modes (e.g. a
+/// `"redacted"` toggle for the redacted-thinking beta) is a non-breaking
+/// shape evolution.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct AnthropicThinking {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub budget_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,6 +74,21 @@ pub(crate) enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+    },
+    /// Extended-thinking content block — Anthropic's Claude 4.x emits one or
+    /// more of these before the final assistant text when
+    /// `thinking.type == "enabled"` is passed on the request.
+    ///
+    /// The `signature` field is a cryptographic signature Anthropic uses to
+    /// verify replayed thinking blocks in the interleaved-thinking beta. We
+    /// parse it so we don't fail on unexpected fields, but we do NOT replay
+    /// thinking blocks back to the model on subsequent turns — in standard
+    /// (non-interleaved) mode no signature round-trip is required.
+    #[serde(rename = "thinking")]
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
 }
 
@@ -115,6 +150,22 @@ pub(crate) struct StreamDelta {
     pub text: Option<String>,
     #[serde(default)]
     pub partial_json: Option<String>,
+    /// Populated on `thinking_delta` events — a text chunk of the model's
+    /// extended-thinking trace.
+    #[serde(default)]
+    pub thinking: Option<String>,
+    /// Populated on `signature_delta` events — a cryptographic signature
+    /// that Anthropic uses for interleaved-thinking replay. Parsed for
+    /// completeness but discarded by the runtime in standard mode.
+    ///
+    /// `allow(dead_code)` is deliberate: keeping the field on `StreamDelta`
+    /// ensures the JSON deserializer doesn't fail on unknown shapes when
+    /// Anthropic sends a `signature_delta` event, and makes it trivial to
+    /// wire the replay path later if the interleaved-thinking beta is
+    /// adopted (follow-up to #767).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub signature: Option<String>,
     // message_delta fields (deserialized but only usage is read)
     #[serde(default)]
     pub _stop_reason: Option<String>,
@@ -289,6 +340,17 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
             .collect()
     });
 
+    // Extended thinking: emit the `thinking` field only when the caller
+    // supplied a non-zero budget. Zero and `None` both map to "disabled"
+    // so we don't serialize an empty `thinking` object on every request.
+    let thinking = req
+        .thinking_budget_tokens
+        .filter(|n| *n > 0)
+        .map(|budget_tokens| AnthropicThinking {
+            kind: "enabled",
+            budget_tokens,
+        });
+
     AnthropicRequest {
         model: req.model.clone(),
         messages,
@@ -296,6 +358,7 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
         tools,
         max_tokens: req.max_tokens.unwrap_or(100_000),
         stream: req.stream,
+        thinking,
     }
 }
 
@@ -347,6 +410,11 @@ fn merge_consecutive_roles(messages: &mut Vec<AnthropicMessage>) {
 pub(crate) fn from_anthropic_response(resp: AnthropicResponse) -> CompletionResponse {
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    // Accumulated extended-thinking text. Surfaced as `reasoning_content` on
+    // the returned `LlmMessage` so callers that only use the non-streaming
+    // path (buffered fallback, tests) still see the thinking trace — it's
+    // the same field that OpenAI-compatible reasoning models populate.
+    let mut thinking_parts: Vec<String> = Vec::new();
 
     for block in &resp.content {
         match block {
@@ -358,6 +426,13 @@ pub(crate) fn from_anthropic_response(resp: AnthropicResponse) -> CompletionResp
             }
             ContentBlock::ToolResult { .. } => {
                 // Tool results shouldn't appear in responses
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                // Signatures are parsed but intentionally discarded — they
+                // only matter for the interleaved-thinking beta where prior
+                // thinking must be replayed with its signature. In standard
+                // mode we don't replay, so the signature is informational.
+                thinking_parts.push(thinking.clone());
             }
         }
     }
@@ -383,7 +458,11 @@ pub(crate) fn from_anthropic_response(resp: AnthropicResponse) -> CompletionResp
                 } else {
                     Some(text_parts.join(""))
                 },
-                reasoning_content: None,
+                reasoning_content: if thinking_parts.is_empty() {
+                    None
+                } else {
+                    Some(thinking_parts.join(""))
+                },
                 tool_calls: if tool_calls.is_empty() {
                     None
                 } else {
@@ -436,6 +515,40 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                                 }],
                                 usage: None,
                             }),
+                            "thinking_delta" => {
+                                // Route extended-thinking chunks through the
+                                // same `reasoning_content` channel that
+                                // OpenAI-compatible reasoning models use.
+                                // The streaming accumulator in `agent.rs`
+                                // recognises this field and forwards it as
+                                // `RuntimeEvent::ReasoningDelta`.
+                                SseParseResult::Chunk(StreamChunk {
+                                    id: String::new(),
+                                    object: "chat.completion.chunk".to_string(),
+                                    created: 0,
+                                    model: String::new(),
+                                    choices: vec![StreamChoice {
+                                        index,
+                                        delta: Delta {
+                                            role: None,
+                                            content: None,
+                                            reasoning_content: delta.thinking,
+                                            tool_calls: None,
+                                        },
+                                        finish_reason: None,
+                                    }],
+                                    usage: None,
+                                })
+                            }
+                            "signature_delta" => {
+                                // Cryptographic signature on the thinking
+                                // block. Only relevant for the interleaved-
+                                // thinking beta, which replays prior
+                                // thinking back to the model on tool-use
+                                // follow-ups. Standard mode (this code
+                                // path) does not replay, so we skip it.
+                                SseParseResult::Skip
+                            }
                             "input_json_delta" => {
                                 // Partial tool arguments
                                 SseParseResult::Chunk(StreamChunk {
@@ -897,5 +1010,197 @@ mod tests {
             }
             other => panic!("Expected Chunk, got {:?}", std::mem::discriminant(&other)),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Extended-thinking passthrough (issue #767)
+    // -----------------------------------------------------------------
+
+    /// Setting `thinking_budget_tokens` on the `CompletionRequest` produces
+    /// the correct `"thinking": {"type": "enabled", "budget_tokens": N}`
+    /// field in the serialized Anthropic request body. The wire shape has
+    /// to match Anthropic's API exactly, so we go through the full
+    /// serialize path rather than asserting on the struct fields.
+    #[test]
+    fn test_thinking_budget_produces_wire_field() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514")
+            .with_messages(vec![
+                LlmMessage::system("be helpful"),
+                LlmMessage::user("hi"),
+            ])
+            .with_max_tokens(1024)
+            .with_thinking_budget(4096);
+
+        let anthropic_req = to_anthropic_request(&req);
+        let body = serde_json::to_value(&anthropic_req).unwrap();
+
+        let thinking = body
+            .get("thinking")
+            .expect("thinking field should be present when budget is set");
+        assert_eq!(thinking["type"], "enabled");
+        assert_eq!(thinking["budget_tokens"], 4096);
+    }
+
+    /// A budget of zero disables extended thinking — the serialized body
+    /// must NOT include the `thinking` field. (An empty or zero field
+    /// would likely be a 400 from Anthropic; absence is the right signal.)
+    #[test]
+    fn test_thinking_budget_zero_omits_wire_field() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514")
+            .with_messages(vec![LlmMessage::user("hi")])
+            .with_max_tokens(1024)
+            .with_thinking_budget(0);
+
+        let anthropic_req = to_anthropic_request(&req);
+        let body = serde_json::to_value(&anthropic_req).unwrap();
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking field must be omitted when budget is 0, got: {body}",
+        );
+    }
+
+    /// When `thinking_budget_tokens` is `None` (default), the field is
+    /// absent on the wire. This is the path taken by non-Anthropic
+    /// providers and by agents that haven't opted in.
+    #[test]
+    fn test_thinking_default_is_none() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514")
+            .with_messages(vec![LlmMessage::user("hi")])
+            .with_max_tokens(1024);
+
+        let anthropic_req = to_anthropic_request(&req);
+        let body = serde_json::to_value(&anthropic_req).unwrap();
+        assert!(body.get("thinking").is_none());
+    }
+
+    /// `thinking_delta` SSE events route through the `reasoning_content`
+    /// channel on the internal `Delta` struct. The `stream_llm_call` path
+    /// observes this and emits `RuntimeEvent::ReasoningDelta`.
+    #[test]
+    fn test_parse_anthropic_sse_thinking_delta() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me think..."}}"#;
+        let result = parse_anthropic_sse("content_block_delta", data);
+        match result {
+            SseParseResult::Chunk(chunk) => {
+                let delta = &chunk.choices[0].delta;
+                assert_eq!(
+                    delta.reasoning_content.as_deref(),
+                    Some("Let me think..."),
+                    "thinking_delta must populate reasoning_content"
+                );
+                // And must NOT populate visible content — extended thinking
+                // is a separate stream.
+                assert!(
+                    delta.content.is_none(),
+                    "thinking_delta must not populate content"
+                );
+            }
+            _ => panic!("Expected Chunk for thinking_delta"),
+        }
+    }
+
+    /// `signature_delta` is parsed without error but produces `Skip` —
+    /// the signature is only relevant for the interleaved-thinking beta
+    /// which this feature deliberately does not support.
+    #[test]
+    fn test_parse_anthropic_sse_signature_delta_skipped() {
+        let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc123signature"}}"#;
+        let result = parse_anthropic_sse("content_block_delta", data);
+        assert!(
+            matches!(result, SseParseResult::Skip),
+            "signature_delta must be skipped in standard (non-interleaved) mode"
+        );
+    }
+
+    /// End-to-end: a non-streaming response that carries a mix of
+    /// `thinking` and `text` content blocks maps cleanly into the internal
+    /// `LlmMessage` shape. Thinking text → `reasoning_content`; visible
+    /// text → `content`. Tool use coexists with thinking.
+    #[test]
+    fn test_from_anthropic_response_with_thinking_and_tool_use() {
+        let resp = AnthropicResponse {
+            id: "msg_think".to_string(),
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "Considering options...".to_string(),
+                    signature: Some("sig-opaque".to_string()),
+                },
+                ContentBlock::Text {
+                    text: "I will use the echo tool.".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "echo".to_string(),
+                    input: serde_json::json!({"text": "hi"}),
+                },
+            ],
+            model: "claude-sonnet-4-20250514".to_string(),
+            stop_reason: Some("tool_use".to_string()),
+            usage: AnthropicUsage {
+                input_tokens: 20,
+                output_tokens: 30,
+            },
+        };
+
+        let completion = from_anthropic_response(resp);
+        let msg = &completion.choices[0].message;
+        assert_eq!(
+            msg.content.as_deref(),
+            Some("I will use the echo tool."),
+            "visible text should end up in content"
+        );
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("Considering options..."),
+            "thinking should end up in reasoning_content"
+        );
+        assert_eq!(msg.tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(msg.tool_calls.as_ref().unwrap()[0].function.name, "echo");
+    }
+
+    /// Wire invariant check (#773): enabling extended thinking must not
+    /// break the `merge_consecutive_roles` pass or the three post-merge
+    /// debug_asserts. The adapter already exercises the invariant checks
+    /// every time `to_anthropic_request` is called; this test pins that
+    /// the invariant still holds when a thinking field is present and the
+    /// canonical history has a tool-result tail that needs merging.
+    #[test]
+    fn test_thinking_preserves_wire_alternation_invariant() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514")
+            .with_messages(vec![
+                LlmMessage::system("sys"),
+                LlmMessage::user("go"),
+                LlmMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![ToolCall::new("c1", "echo", "{}")]),
+                    tool_call_id: None,
+                },
+                LlmMessage::tool_result("c1", "ok"),
+                LlmMessage::user("fresh input"),
+            ])
+            .with_max_tokens(4096)
+            .with_thinking_budget(4096);
+
+        let anthropic_req = to_anthropic_request(&req);
+
+        // The three debug_asserts inside to_anthropic_request pin the
+        // post-merge invariant in debug builds. Re-check explicitly here
+        // so this test also catches regressions in release builds.
+        assert!(!anthropic_req.messages.is_empty());
+        assert_eq!(anthropic_req.messages.last().unwrap().role, "user");
+        let roles: Vec<&str> = anthropic_req
+            .messages
+            .iter()
+            .map(|m| m.role.as_str())
+            .collect();
+        for w in roles.windows(2) {
+            assert_ne!(w[0], w[1], "adjacent same-role wire messages: {roles:?}");
+        }
+        // And the thinking field is still present.
+        let body = serde_json::to_value(&anthropic_req).unwrap();
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 4096);
     }
 }

@@ -1524,3 +1524,40 @@ fn test_validation_ok_when_provider_entry_declares_api_key_env() {
     );
     assert!(cfg.validate().is_ok());
 }
+
+// --------------------------------------------------------------------------
+// Anthropic extended-thinking config (issue #767)
+// --------------------------------------------------------------------------
+
+/// `[llm.anthropic].thinking_budget_tokens` deserializes correctly from
+/// TOML and round-trips through the canonical `LlmConfig` default path.
+#[test]
+fn test_anthropic_thinking_budget_toml_roundtrip() {
+    let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[llm.anthropic]
+thinking_budget_tokens = 8192
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
+    assert_eq!(cfg.llm.anthropic.thinking_budget_tokens, 8192);
+    // Round-trip: serialize and deserialize again — the field must survive.
+    let re = toml::to_string(&cfg).expect("serialize");
+    let cfg2: AlmsConfig = toml::from_str(&re).expect("reparse");
+    assert_eq!(cfg2.llm.anthropic.thinking_budget_tokens, 8192);
+}
+
+/// Omitted `[llm.anthropic]` section defaults to `thinking_budget_tokens = 0`
+/// (disabled), preserving behaviour for existing configs.
+#[test]
+fn test_anthropic_thinking_budget_default_zero() {
+    let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
+    assert_eq!(cfg.llm.anthropic.thinking_budget_tokens, 0);
+}

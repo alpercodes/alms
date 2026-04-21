@@ -77,6 +77,10 @@ struct RunOverrides {
     posture: Option<String>,
     provider: Option<String>,
     debug_mode: Option<bool>,
+    /// Per-run Anthropic extended-thinking budget override. `Some(0)`
+    /// explicitly disables extended thinking for just this run even when
+    /// both the per-agent and server default would enable it.
+    thinking_budget_tokens: Option<u32>,
 }
 
 /// Bundled parameters for [`lifecycle::execute_run`], avoiding a long positional argument list.
@@ -274,11 +278,19 @@ fn apply_overrides(
     };
 
     // -- Per-agent overrides (middle layer) --
-    if let Some(record) = agent_record
-        && let Some(ref p) = record.posture
-        && let Ok(posture) = p.parse::<alms_runtime::Posture>()
-    {
-        cfg.posture = posture;
+    if let Some(record) = agent_record {
+        if let Some(ref p) = record.posture
+            && let Ok(posture) = p.parse::<alms_runtime::Posture>()
+        {
+            cfg.posture = posture;
+        }
+        // Per-agent Anthropic thinking budget. `Some(0)` is a legitimate
+        // per-agent override meaning "disable extended thinking for this
+        // agent even when the server default enables it", so we honour any
+        // `Some` value here.
+        if let Some(budget) = record.thinking_budget_tokens {
+            cfg.anthropic_thinking_budget = budget;
+        }
     }
 
     // -- Per-run overrides (highest precedence) --
@@ -292,6 +304,11 @@ fn apply_overrides(
     }
     if let Some(debug) = overrides.debug_mode {
         cfg.debug_mode = debug;
+    }
+    // Same semantics as per-agent: `Some(0)` is an explicit per-run
+    // disable, not a "use default" sentinel.
+    if let Some(budget) = overrides.thinking_budget_tokens {
+        cfg.anthropic_thinking_budget = budget;
     }
 
     MergedConfig {
@@ -335,6 +352,7 @@ mod tests {
             posture: posture.map(String::from),
             provider: None,
             telegram_token: None,
+            thinking_budget_tokens: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -441,6 +459,99 @@ mod tests {
         };
         let merged = apply_overrides(base_config(), None, &overrides);
         assert!(merged.agent_config.debug_mode);
+    }
+
+    // -----------------------------------------------------------------
+    // Anthropic extended-thinking three-layer precedence (issue #767)
+    // -----------------------------------------------------------------
+
+    fn base_config_with_thinking(budget: u32) -> AgentConfig {
+        AgentConfig {
+            system_prompt: "server default prompt".into(),
+            max_tokens: 100_000,
+            posture: Posture::FullControl,
+            anthropic_thinking_budget: budget,
+            ..AgentConfig::default()
+        }
+    }
+
+    fn agent_with_thinking(budget: Option<u32>) -> AgentRecord {
+        let now = Utc::now();
+        AgentRecord {
+            id: AgentId::new(),
+            name: "thinker".into(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: budget,
+            is_default: false,
+            created_at: now,
+            last_active: now,
+        }
+    }
+
+    #[test]
+    fn test_thinking_server_default_inherited() {
+        // No per-agent or per-run override: server default (4096) wins.
+        let merged = apply_overrides(
+            base_config_with_thinking(4096),
+            None,
+            &RunOverrides::default(),
+        );
+        assert_eq!(merged.agent_config.anthropic_thinking_budget, 4096);
+    }
+
+    #[test]
+    fn test_thinking_per_agent_overrides_server_default() {
+        // Server default = 0 (disabled), agent opts in with 8192.
+        let agent = agent_with_thinking(Some(8192));
+        let merged = apply_overrides(
+            base_config_with_thinking(0),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(merged.agent_config.anthropic_thinking_budget, 8192);
+    }
+
+    #[test]
+    fn test_thinking_per_agent_zero_disables() {
+        // Server default = 4096 (enabled). Agent explicitly sets 0 to
+        // opt out. This must WIN over the server default.
+        let agent = agent_with_thinking(Some(0));
+        let merged = apply_overrides(
+            base_config_with_thinking(4096),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged.agent_config.anthropic_thinking_budget, 0,
+            "per-agent Some(0) must disable thinking even when server default enables it"
+        );
+    }
+
+    #[test]
+    fn test_thinking_per_run_beats_per_agent() {
+        let agent = agent_with_thinking(Some(2048));
+        let overrides = RunOverrides {
+            thinking_budget_tokens: Some(16384),
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(base_config_with_thinking(4096), Some(&agent), &overrides);
+        assert_eq!(merged.agent_config.anthropic_thinking_budget, 16384);
+    }
+
+    #[test]
+    fn test_thinking_per_agent_none_falls_through_to_server() {
+        // Agent doesn't care — server default (4096) wins.
+        let agent = agent_with_thinking(None);
+        let merged = apply_overrides(
+            base_config_with_thinking(4096),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(merged.agent_config.anthropic_thinking_budget, 4096);
     }
 
     #[test]

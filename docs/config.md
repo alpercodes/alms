@@ -75,6 +75,35 @@ Small, deterministic transforms applied to the outgoing request body — cheaper
 
 ---
 
+## Anthropic extended thinking (issue #767)
+
+Claude 4.x exposes an optional extended-thinking mode where the model streams its internal reasoning as `thinking` content blocks before the final assistant text. ALMS can opt in on a per-server, per-agent, or per-run basis.
+
+```toml
+[llm.anthropic]
+thinking_budget_tokens = 4096   # 0 = disabled (default), any N > 0 enables thinking
+```
+
+When non-zero, every Anthropic request gains a `"thinking": {"type": "enabled", "budget_tokens": N}` field on the wire. The runtime streams the model's reasoning back through a provider-neutral `reasoning_delta` SSE event, and the web UI renders it in a collapsible panel under the assistant message (defaults to collapsed).
+
+Prior thinking blocks are **not** replayed on follow-up tool-use turns — this is standard mode. The Anthropic interleaved-thinking beta (which would require replaying signatures) is out of scope today and will land as a follow-up.
+
+### Per-agent and per-run precedence
+
+The budget follows the same three-layer precedence pattern as `model` / `max_tokens`:
+
+1. **Per-run** (highest) — `thinking_budget_tokens` field on the `POST /runs` body.
+2. **Per-agent** — `thinking_budget_tokens` field on the agent registry entry (set via `POST /agents` or the CLI).
+3. **Server default** (lowest) — `[llm.anthropic].thinking_budget_tokens` in `alms.toml`.
+
+`Some(0)` at any layer is an explicit opt-out — e.g. an agent with `thinking_budget_tokens = 0` will never use extended thinking even when the server default enables it. Non-Anthropic providers silently ignore the field.
+
+### Usage accounting
+
+Anthropic counts thinking tokens inside `output_tokens` today, so the existing `prompt_tokens` / `completion_tokens` / `total_tokens` surface keeps working unchanged. If Anthropic's API ever exposes a separate `thinking_tokens` field, we can plumb it through `TokenUsage` as an additional slot without breaking existing consumers.
+
+---
+
 ## Adding an OpenAI-compatible provider
 
 Copy the block that matches your provider, paste it into `alms.toml`, set `llm.provider` to the entry's name, and run `alms auth set <name> <key>` (or export the `api_key_env` variable before launching the gateway).

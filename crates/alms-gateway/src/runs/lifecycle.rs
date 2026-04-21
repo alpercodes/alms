@@ -312,6 +312,7 @@ pub async fn create_run(
         posture: req.posture.clone(),
         provider: req.provider.clone(),
         debug_mode: req.debug_mode,
+        thinking_budget_tokens: req.thinking_budget_tokens,
     };
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;

@@ -62,6 +62,7 @@ pub(crate) async fn run_create(
         posture,
         provider: None,
         debug_mode: None,
+        thinking_budget_tokens: None,
     };
     let (_status, val) = api_post(client, url, "runs", &req).await?;
     if json {

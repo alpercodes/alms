@@ -312,6 +312,7 @@ async fn main() -> anyhow::Result<()> {
                     model,
                     posture,
                     provider,
+                    thinking_budget_tokens,
                     default,
                 } => {
                     let workspace_dir = config.server.workspace_dir();
@@ -323,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
                             model,
                             posture,
                             provider,
+                            thinking_budget_tokens,
                             default,
                             json,
                             workspace_dir: Some(&workspace_dir),
@@ -344,6 +346,7 @@ async fn main() -> anyhow::Result<()> {
                     posture,
                     provider,
                     description,
+                    thinking_budget_tokens,
                 } => {
                     cmd_agent::agent_config(
                         &store,
@@ -353,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
                             posture,
                             provider,
                             description,
+                            thinking_budget_tokens,
                             json,
                         },
                     )?;
