@@ -476,6 +476,12 @@ pub(crate) fn from_anthropic_response(resp: AnthropicResponse) -> CompletionResp
             prompt_tokens: resp.usage.input_tokens,
             completion_tokens: resp.usage.output_tokens,
             total_tokens: resp.usage.input_tokens + resp.usage.output_tokens,
+            // Anthropic surfaces thinking tokens inside `output_tokens`
+            // (extended thinking is folded into the completion bucket),
+            // so we don't split them out here. See Anthropic's "extended
+            // thinking" usage docs.
+            reasoning_tokens: None,
+            completion_tokens_details: None,
         }),
     }
 }
@@ -632,6 +638,8 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                         prompt_tokens: u.input_tokens,
                         completion_tokens: u.output_tokens,
                         total_tokens: u.input_tokens + u.output_tokens,
+                        reasoning_tokens: None,
+                        completion_tokens_details: None,
                     });
                     if usage.is_some() {
                         SseParseResult::Chunk(StreamChunk {
@@ -674,6 +682,8 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                                 prompt_tokens: msg.usage.input_tokens,
                                 completion_tokens: msg.usage.output_tokens,
                                 total_tokens: msg.usage.input_tokens + msg.usage.output_tokens,
+                                reasoning_tokens: None,
+                                completion_tokens_details: None,
                             }),
                         })
                     } else {

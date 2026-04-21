@@ -1679,11 +1679,15 @@ fn test_streaming_usage_accumulation() {
         prompt_tokens: 150,
         completion_tokens: 0,
         total_tokens: 150,
+        reasoning_tokens: None,
+        completion_tokens_details: None,
     };
     let second = Usage {
         prompt_tokens: 0,
         completion_tokens: 75,
         total_tokens: 75,
+        reasoning_tokens: None,
+        completion_tokens_details: None,
     };
 
     // Replicate the accumulation logic from stream_llm_call
@@ -1696,6 +1700,8 @@ fn test_streaming_usage_accumulation() {
             prompt_tokens: prev.prompt_tokens.max(chunk_usage.prompt_tokens),
             completion_tokens: prev.completion_tokens.max(chunk_usage.completion_tokens),
             total_tokens: 0,
+            reasoning_tokens: None,
+            completion_tokens_details: None,
         },
         None => chunk_usage,
     });
@@ -1710,6 +1716,8 @@ fn test_streaming_usage_accumulation() {
             prompt_tokens: prev.prompt_tokens.max(chunk_usage.prompt_tokens),
             completion_tokens: prev.completion_tokens.max(chunk_usage.completion_tokens),
             total_tokens: 0,
+            reasoning_tokens: None,
+            completion_tokens_details: None,
         },
         None => chunk_usage,
     });
@@ -1727,6 +1735,44 @@ fn test_streaming_usage_accumulation() {
         "completion_tokens should come from second chunk"
     );
     assert_eq!(u.total_tokens, 225, "total should be sum of both");
+}
+
+/// `Usage::reasoning_tokens_effective` prefers the nested OpenAI shape
+/// over the flat DeepSeek/xAI shape when both happen to be present;
+/// falls back to the flat field when only it is set. (#768)
+#[test]
+fn test_usage_reasoning_tokens_effective_priority() {
+    // Nested wins when set.
+    let u = Usage {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        reasoning_tokens: Some(5),
+        completion_tokens_details: Some(crate::llm_types::CompletionTokensDetails {
+            reasoning_tokens: Some(15),
+        }),
+    };
+    assert_eq!(u.reasoning_tokens_effective(), Some(15));
+
+    // Flat wins when nested is missing.
+    let u = Usage {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        reasoning_tokens: Some(7),
+        completion_tokens_details: None,
+    };
+    assert_eq!(u.reasoning_tokens_effective(), Some(7));
+
+    // None when neither.
+    let u = Usage {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        reasoning_tokens: None,
+        completion_tokens_details: None,
+    };
+    assert!(u.reasoning_tokens_effective().is_none());
 }
 
 /// Verify that after `with_workspace()` the parent agent's fs_read tool can

@@ -86,7 +86,12 @@ export function TokenBadge({ usage }) {
     const p = usage.prompt_tokens || 0;
     const c = usage.completion_tokens || 0;
     if (p + c === 0) return null;
-    return html`<div class="msg-tokens">${p}p + ${c}c tokens</div>`;
+    // reasoning_tokens is only present when the provider reports chain-of-thought
+    // usage separately (OpenAI o-series, DeepSeek R1, xAI reasoning variants).
+    // Absent for non-reasoning runs; in that case the badge keeps its old shape.
+    const r = usage.reasoning_tokens;
+    const reasoningPart = (typeof r === 'number' && r > 0) ? ` + ${r}r` : '';
+    return html`<div class="msg-tokens">${p}p + ${c}c${reasoningPart} tokens</div>`;
 }
 
 export function ErrorMessage({ text, code }) {

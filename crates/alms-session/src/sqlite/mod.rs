@@ -114,7 +114,8 @@ CREATE TABLE IF NOT EXISTS agents (
     is_default             INTEGER NOT NULL DEFAULT 0,
     created_at             TEXT NOT NULL,
     last_active            TEXT NOT NULL,
-    thinking_budget_tokens INTEGER
+    thinking_budget_tokens INTEGER,
+    reasoning_effort       TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
@@ -216,6 +217,13 @@ impl SqliteStore {
         // "inherit the server default from [llm.anthropic]"; any integer
         // (including 0) is an explicit per-agent override.
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN thinking_budget_tokens INTEGER;");
+        // Auto-migrate: add reasoning_effort column for per-agent
+        // OpenAI-compat reasoning-model opt-in (issue #768). NULL means
+        // "inherit the server default from [llm.openai]"; a string
+        // ("low"/"medium"/"high"/"minimal") is an explicit per-agent
+        // override. Stored as TEXT to match the `ReasoningEffort` enum's
+        // lowercase serde wire format.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN reasoning_effort TEXT;");
         // Auto-migrate: add run_tool_calls table for per-run tool call storage.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS run_tool_calls (\
@@ -439,6 +447,23 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let thinking_budget_tokens: Option<u32> = row
         .get::<_, Option<i64>>(10)?
         .map(|v| v.clamp(0, i64::from(u32::MAX)) as u32);
+    // Per-agent OpenAI-compat reasoning effort (issue #768). Stored as
+    // TEXT; unrecognised values are logged and mapped to `None` (inherit
+    // the server default) rather than failing row parsing — follows the
+    // same defence-in-depth stance as the thinking budget above.
+    let reasoning_effort: Option<alms_core::config::ReasoningEffort> = row
+        .get::<_, Option<String>>(11)?
+        .and_then(|s| match s.parse() {
+            Ok(effort) => Some(effort),
+            Err(e) => {
+                tracing::warn!(
+                    stored = %s,
+                    error = %e,
+                    "Skipping unparseable reasoning_effort in agents row"
+                );
+                None
+            }
+        });
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -459,6 +484,7 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         provider,
         telegram_token,
         thinking_budget_tokens,
+        reasoning_effort,
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),
@@ -523,6 +549,13 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         (Some(pt), Some(ct)) => Some(TokenUsage {
             prompt_tokens: u32::try_from(pt).unwrap_or(u32::MAX),
             completion_tokens: u32::try_from(ct).unwrap_or(u32::MAX),
+            // Reasoning tokens are not persisted on the `runs` table today.
+            // The live flow is: provider adapter -> `TokenUsage.reasoning_tokens`
+            // -> `RunOutput.usage` -> SSE `run_finished` event + `GET /runs/{id}`
+            // response (both carry the field when the provider reports it).
+            // Persisting a `reasoning_tokens` column to the `runs` table is a
+            // follow-up that requires a schema migration.
+            reasoning_tokens: None,
         }),
         _ => None,
     };

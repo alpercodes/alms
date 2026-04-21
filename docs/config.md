@@ -104,6 +104,50 @@ Anthropic counts thinking tokens inside `output_tokens` today, so the existing `
 
 ---
 
+## OpenAI-compat reasoning models (issue #768)
+
+OpenAI o-series (`o1`, `o3`, `o4-mini`), GPT-5, DeepSeek R1, and xAI Grok reasoning variants all produce chain-of-thought output in addition to the final assistant text. ALMS wires them through the same `ReasoningDelta` / collapsible UI panel used for Anthropic extended thinking, with a provider-family-specific knob to request a reasoning budget on the wire.
+
+```toml
+[llm.openai]
+reasoning_effort = "high"   # "low" | "medium" | "high" | "minimal" (GPT-5 only); default = unset
+```
+
+When set, every OpenAI-compat request targeting a **reasoning-capable** model gains a `"reasoning_effort": "<value>"` field on the wire. The adapter only emits the field when the model is actually a reasoning model — for non-reasoning models (gpt-4o, claude-sonnet via proxy, etc.) the field is silently stripped before serialization, because those endpoints return 400 on unknown params. DeepSeek R1 (`deepseek-reasoner`) is also stripped because reasoning is implicit there and the endpoint rejects the param.
+
+The model-detection heuristic covers:
+- **OpenAI**: `o1*`, `o3*`, `o4*`, `o5*`, `gpt-5*` (case-insensitive, optional `<provider>/` prefix like `openai/o3-mini`).
+- **xAI Grok**: `grok-3-mini`, `grok-3-reasoning`, `grok-4`, `grok-*-reasoning`.
+- **Anything else**: field stripped.
+
+Response-side, ALMS parses reasoning content from whichever field the provider uses — `reasoning_content` (DeepSeek / xAI / OpenRouter), `reasoning_summary` (OpenAI user-visible summary), or `reasoning` (OpenAI raw trace) — and routes all three into the existing `RuntimeEvent::ReasoningDelta` stream. When both `reasoning` and `reasoning_summary` are present, the summary wins (OpenAI's documented preference). Streaming deltas (`choices[].delta.*`) use the same priority ordering.
+
+Like Anthropic thinking, reasoning text is **not** replayed back to the model on follow-up turns — it's a display/debug artifact, persisted as `reasoning_blocks` metadata on the assistant message so it survives page reload.
+
+### Per-agent and per-run precedence
+
+Same three-layer chain as `model` / `max_tokens` / `thinking_budget_tokens`:
+
+1. **Per-run** (highest) — `reasoning_effort` field on the `POST /runs` body.
+2. **Per-agent** — `reasoning_effort` field on the agent registry entry (set via `POST /agents`, `PUT /agents/{id}`, or `alms agent create --reasoning-effort <value>`).
+3. **Server default** (lowest) — `[llm.openai].reasoning_effort` in `alms.toml`.
+
+Omitting the field at every layer means no `reasoning_effort` is sent — non-reasoning models behave exactly as before. There is no sentinel to clear a per-agent override back to "inherit server default" in a PATCH today (matches the `thinking_budget_tokens` PATCH shape); delete + recreate if you need that.
+
+### Usage accounting
+
+OpenAI o-series reports reasoning-token cost separately under `usage.completion_tokens_details.reasoning_tokens`. DeepSeek / xAI may emit a flat `usage.reasoning_tokens` field. ALMS plumbs both shapes through `TokenUsage.reasoning_tokens` — an `Option<u32>` that stays `None` when the provider doesn't split them out (reasoning cost is then implicitly folded into `completion_tokens`). Callers read via `Usage::reasoning_tokens_effective()` which prefers the nested OpenAI shape over the flat DeepSeek/xAI shape when both happen to be present.
+
+### Per-provider notes
+
+- **OpenAI (direct)**: supports `low`, `medium`, `high` on o-series (`o1`/`o3`/`o4`/`o5`). GPT-5 adds `minimal`.
+- **OpenRouter**: pass-through — support depends on the underlying model. Works when the model is an OpenAI reasoning SKU routed via the `openai/` prefix (e.g. `openai/o3-mini`) or an xAI reasoning variant. For non-reasoning models routed through OpenRouter the ALMS adapter strips the param before sending (same heuristic as the direct path).
+- **xAI Grok**: supports the same four values on `grok-3-mini`, `grok-3-reasoning`, `grok-4`, and `grok-*-reasoning`.
+- **DeepSeek R1**: ignores `reasoning_effort`. Reasoning is automatic on `deepseek-reasoner`; the adapter strips the param for any DeepSeek base URL.
+- **Non-reasoning OpenAI models** (`gpt-4o`, `gpt-4`, etc.): param stripped automatically — safe to leave `reasoning_effort` in config even when you switch models.
+
+---
+
 ## Adding an OpenAI-compatible provider
 
 Copy the block that matches your provider, paste it into `alms.toml`, set `llm.provider` to the entry's name, and run `alms auth set <name> <key>` (or export the `api_key_env` variable before launching the gateway).

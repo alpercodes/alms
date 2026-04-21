@@ -464,10 +464,18 @@ pub(crate) async fn completion_notification_loop(
                 meta["duration_ms"] = serde_json::json!(ms);
             }
             if let Some(ref usage) = completion.token_usage {
-                meta["token_usage"] = serde_json::json!({
+                let mut token_usage = serde_json::json!({
                     "prompt_tokens": usage.prompt_tokens,
                     "completion_tokens": usage.completion_tokens,
                 });
+                // Reasoning tokens only appear on the wire when the provider
+                // reports them separately (OpenAI o-series, DeepSeek, xAI).
+                // Absent otherwise so non-reasoning subagents stay
+                // byte-identical to pre-#768 completion markers.
+                if let Some(rt) = usage.reasoning_tokens {
+                    token_usage["reasoning_tokens"] = serde_json::json!(rt);
+                }
+                meta["token_usage"] = token_usage;
             }
 
             super::markers::persist_lifecycle_marker(

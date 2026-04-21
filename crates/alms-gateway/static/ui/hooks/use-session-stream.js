@@ -1054,7 +1054,14 @@ export function openSessionStream(sessionId, opts) {
                 }
 
                 const usage = (data.prompt_tokens || data.completion_tokens)
-                    ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
+                    ? {
+                        prompt_tokens: data.prompt_tokens || 0,
+                        completion_tokens: data.completion_tokens || 0,
+                        // reasoning_tokens is optional (OpenAI o-series / DeepSeek /
+                        // xAI); stays undefined for non-reasoning runs and the
+                        // TokenBadge hides it in that case.
+                        reasoning_tokens: data.reasoning_tokens,
+                    }
                     : data.usage;
                 if (usage) {
                     msgs = [...msgs, { id: nextMsgId(), type: 'tokens', usage }];

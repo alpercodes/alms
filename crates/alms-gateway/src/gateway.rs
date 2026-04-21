@@ -94,6 +94,9 @@ impl GatewayConfig {
                 // overridden per-agent in the registry and per-run in
                 // the run-create API.
                 anthropic_thinking_budget: config.llm.anthropic.thinking_budget_tokens,
+                // Server-default OpenAI-compat reasoning effort (#768) —
+                // three-layer precedence (per-run > per-agent > server).
+                openai_reasoning_effort: config.llm.openai.reasoning_effort,
                 ..AgentConfig::default()
             },
             session_config: SessionConfig {
@@ -798,6 +801,7 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         provider: None,
         telegram_token: None,
         thinking_budget_tokens: None,
+        reasoning_effort: None,
         is_default: false,
         created_at: now,
         last_active: now,
@@ -935,6 +939,7 @@ mod tests {
             provider: None,
             telegram_token: None,
             thinking_budget_tokens: None,
+            reasoning_effort: None,
             is_default: true,
             created_at: now,
             last_active: now,

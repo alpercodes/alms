@@ -29,8 +29,8 @@ impl SqliteStore {
         tx.execute(
             "INSERT INTO agents \
              (id, name, description, model, posture, provider, telegram_token, \
-              is_default, created_at, last_active, thinking_budget_tokens) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 agent.id.0.to_string(),
                 &agent.name,
@@ -43,6 +43,7 @@ impl SqliteStore {
                 agent.created_at.to_rfc3339(),
                 agent.last_active.to_rfc3339(),
                 agent.thinking_budget_tokens.map(i64::from),
+                agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
             ],
         )
         .map_err(|e| AlmsError::Runtime(format!("SQLite create_agent_if_none_exist: {e}")))?;
@@ -59,8 +60,8 @@ impl SqliteStore {
             .execute(
                 "INSERT INTO agents \
                  (id, name, description, model, posture, provider, telegram_token, \
-                  is_default, created_at, last_active, thinking_budget_tokens) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     agent.id.0.to_string(),
                     &agent.name,
@@ -73,6 +74,7 @@ impl SqliteStore {
                     agent.created_at.to_rfc3339(),
                     agent.last_active.to_rfc3339(),
                     agent.thinking_budget_tokens.map(i64::from),
+                    agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
                 ],
             )
             .map_err(|e| match &e {
@@ -97,7 +99,8 @@ impl SqliteStore {
             .execute(
                 "UPDATE agents SET description = ?1, model = ?2, \
                  posture = ?3, provider = ?4, telegram_token = ?5, \
-                 thinking_budget_tokens = ?6, last_active = ?7 WHERE id = ?8",
+                 thinking_budget_tokens = ?6, reasoning_effort = ?7, \
+                 last_active = ?8 WHERE id = ?9",
                 params![
                     &agent.description,
                     agent.model.as_deref(),
@@ -105,6 +108,7 @@ impl SqliteStore {
                     agent.provider.as_deref(),
                     agent.telegram_token.as_deref(),
                     agent.thinking_budget_tokens.map(i64::from),
+                    agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
                     agent.last_active.to_rfc3339(),
                     agent.id.0.to_string(),
                 ],
@@ -121,7 +125,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active, thinking_budget_tokens \
+             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
              FROM agents WHERE id = ?1",
             params![id.0.to_string()],
             parse_agent_row,
@@ -138,7 +142,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active, thinking_budget_tokens \
+             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
              FROM agents WHERE name = ?1",
             params![name],
             parse_agent_row,
@@ -157,7 +161,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active, thinking_budget_tokens \
+             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
              FROM agents WHERE is_default = 1 LIMIT 1",
             [],
             parse_agent_row,
@@ -175,7 +179,7 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
-                 is_default, created_at, last_active, thinking_budget_tokens \
+                 is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
                  FROM agents ORDER BY created_at",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
@@ -203,7 +207,7 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
-                 is_default, created_at, last_active, thinking_budget_tokens \
+                 is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
                  FROM agents WHERE telegram_token IS NOT NULL AND telegram_token != '' \
                  ORDER BY created_at",
             )
@@ -359,6 +363,7 @@ mod tests {
             provider: None,
             telegram_token: None,
             thinking_budget_tokens: None,
+            reasoning_effort: None,
             is_default: false,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
@@ -784,6 +789,43 @@ mod tests {
         store.update_agent(&updated).unwrap();
         let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
         assert!(reloaded.telegram_token.is_none());
+    }
+
+    #[test]
+    fn test_agent_reasoning_effort_roundtrip() {
+        use alms_core::config::ReasoningEffort;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("reasoner");
+        agent.reasoning_effort = Some(ReasoningEffort::High);
+        store.create_agent(&agent).unwrap();
+
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.reasoning_effort, Some(ReasoningEffort::High));
+
+        // Update to a different value.
+        let mut updated = loaded;
+        updated.reasoning_effort = Some(ReasoningEffort::Low);
+        store.update_agent(&updated).unwrap();
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(reloaded.reasoning_effort, Some(ReasoningEffort::Low));
+
+        // Each supported variant must survive round-trip.
+        for variant in [
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ] {
+            let mut a = reloaded.clone();
+            a.reasoning_effort = Some(variant);
+            store.update_agent(&a).unwrap();
+            let r = store.load_agent_by_id(agent.id).unwrap().unwrap();
+            assert_eq!(
+                r.reasoning_effort,
+                Some(variant),
+                "variant {variant:?} did not round-trip"
+            );
+        }
     }
 
     #[test]

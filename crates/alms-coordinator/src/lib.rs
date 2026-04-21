@@ -672,6 +672,7 @@ async fn run_subagent(
                         alms_core::TokenUsage {
                             prompt_tokens: output.usage.prompt_tokens,
                             completion_tokens: output.usage.completion_tokens,
+                            reasoning_tokens: output.usage.reasoning_tokens,
                         },
                     );
                 }
@@ -729,6 +730,7 @@ async fn run_subagent(
                 Some(TokenUsage {
                     prompt_tokens: output.usage.prompt_tokens,
                     completion_tokens: output.usage.completion_tokens,
+                    reasoning_tokens: output.usage.reasoning_tokens,
                 }),
             ),
             None => (None, None),
@@ -843,6 +845,11 @@ struct SubagentRecordConfig {
     /// This keeps the three-layer precedence (per-run > per-agent >
     /// server default) intact for named subagents too.
     thinking_budget_tokens: Option<u32>,
+    /// Per-named-subagent OpenAI-compat reasoning-effort override (#768).
+    /// Mirrors `thinking_budget_tokens` for the OpenAI reasoning path:
+    /// `Some(effort)` wins over the parent; `None` inherits the parent's
+    /// effective effort.
+    reasoning_effort: Option<alms_core::config::ReasoningEffort>,
 }
 
 /// Build an `AgentConfig` for a subagent. Named subagents get their config
@@ -853,10 +860,17 @@ fn agent_config_for_subagent(
     record: Option<SubagentRecordConfig>,
     base: &AgentConfig,
 ) -> (AgentConfig, Option<String>, Option<String>) {
-    let (model, posture_str, provider, thinking_budget_override) = match record {
-        Some(r) => (r.model, r.posture, r.provider, r.thinking_budget_tokens),
-        None => (None, None, None, None),
-    };
+    let (model, posture_str, provider, thinking_budget_override, reasoning_effort_override) =
+        match record {
+            Some(r) => (
+                r.model,
+                r.posture,
+                r.provider,
+                r.thinking_budget_tokens,
+                r.reasoning_effort,
+            ),
+            None => (None, None, None, None, None),
+        };
 
     let posture = posture_str
         .as_deref()
@@ -871,6 +885,11 @@ fn agent_config_for_subagent(
     // parent's extended-thinking policy.
     let anthropic_thinking_budget =
         thinking_budget_override.unwrap_or(base.anthropic_thinking_budget);
+
+    // Per-named-subagent OpenAI reasoning-effort override (#768). Same
+    // shape as the thinking budget: `Some(effort)` overrides the parent;
+    // `None` inherits the parent's effective value.
+    let openai_reasoning_effort = reasoning_effort_override.or(base.openai_reasoning_effort);
 
     let config = AgentConfig {
         system_prompt: DEFAULT_SUBAGENT_PROMPT.to_string(),
@@ -893,6 +912,7 @@ fn agent_config_for_subagent(
         prompts: base.prompts.clone(),
         debug_mode: false,
         anthropic_thinking_budget,
+        openai_reasoning_effort,
     };
     (config, model, provider)
 }
@@ -980,6 +1000,7 @@ async fn run_agent_loop(
                     posture: record.posture,
                     provider: record.provider,
                     thinking_budget_tokens: record.thinking_budget_tokens,
+                    reasoning_effort: record.reasoning_effort,
                 }
             })
             .or_else(|| {
@@ -1517,6 +1538,7 @@ mod tests {
             posture: Some("guarded".into()),
             provider: Some("anthropic".into()),
             thinking_budget_tokens: None,
+            reasoning_effort: None,
         };
         let (config2, model2, _provider2) = agent_config_for_subagent(Some(record), &parent);
         assert_eq!(model2.as_deref(), Some("gpt-5"));
@@ -1565,6 +1587,7 @@ mod tests {
             posture: None,
             provider: None,
             thinking_budget_tokens: None,
+            reasoning_effort: None,
         };
         let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
         assert!(named.shell_spill.enabled);
@@ -1613,6 +1636,7 @@ mod tests {
             posture: None,
             provider: None,
             thinking_budget_tokens: Some(0),
+            reasoning_effort: None,
         };
         let (sub_zero, _, _) = agent_config_for_subagent(Some(record_zero), &parent);
         assert_eq!(
@@ -1627,6 +1651,7 @@ mod tests {
             posture: None,
             provider: None,
             thinking_budget_tokens: Some(8192),
+            reasoning_effort: None,
         };
         let (sub_explicit, _, _) = agent_config_for_subagent(Some(record_explicit), &parent);
         assert_eq!(
@@ -1640,11 +1665,67 @@ mod tests {
             posture: None,
             provider: None,
             thinking_budget_tokens: None,
+            reasoning_effort: None,
         };
         let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
         assert_eq!(
             sub_none.anthropic_thinking_budget, 4096,
             "named subagent with no override inherits the parent's budget"
+        );
+    }
+
+    // -- (j-pre-4) subagent reasoning-effort three-layer precedence (#768) ------
+    //
+    // Mirrors the Anthropic path above: a named subagent registered with
+    // `reasoning_effort = Some(Low)` must honour its own registry override
+    // and override the parent's `Some(High)`. Ephemeral subagents
+    // (record = None) still inherit the parent's effort.
+    #[test]
+    fn test_subagent_reasoning_effort_override() {
+        use alms_core::config::ReasoningEffort;
+
+        // Parent has reasoning set to High.
+        let parent = AgentConfig {
+            openai_reasoning_effort: Some(ReasoningEffort::High),
+            ..AgentConfig::default()
+        };
+
+        // Ephemeral subagent: no registry → inherit parent's High.
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert_eq!(
+            ephemeral.openai_reasoning_effort,
+            Some(ReasoningEffort::High),
+            "ephemeral subagents inherit the parent's reasoning effort"
+        );
+
+        // Named subagent registered with Some(Low): must override parent.
+        let record_low = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: Some(ReasoningEffort::Low),
+        };
+        let (sub_low, _, _) = agent_config_for_subagent(Some(record_low), &parent);
+        assert_eq!(
+            sub_low.openai_reasoning_effort,
+            Some(ReasoningEffort::Low),
+            "named subagent Some(Low) must override parent's High"
+        );
+
+        // Named subagent with None override: inherit parent's High.
+        let record_none = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+        };
+        let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
+        assert_eq!(
+            sub_none.openai_reasoning_effort,
+            Some(ReasoningEffort::High),
+            "named subagent with None override inherits the parent's effort"
         );
     }
 

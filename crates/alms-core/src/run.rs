@@ -5,11 +5,23 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Accumulated token usage for a run
+/// Accumulated token usage for a run.
+///
+/// `reasoning_tokens` is a separate counter populated by providers that
+/// split chain-of-thought usage out of the standard `completion_tokens`
+/// bucket — notably OpenAI o-series via
+/// `usage.completion_tokens_details.reasoning_tokens` (#768). Other
+/// providers (DeepSeek R1, xAI Grok) may or may not surface the split;
+/// when they don't, the field stays `None` and reasoning cost is
+/// implicitly folded into `completion_tokens`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Reasoning (chain-of-thought) tokens, when the provider reports them
+    /// separately. `None` means "not reported" — NOT "zero".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
 }
 
 /// Discriminates tool call records: the LLM requesting a tool call vs. the
@@ -225,6 +237,14 @@ pub struct CreateRunRequest {
     /// Silently ignored when the effective provider is not Anthropic.
     #[serde(default)]
     pub thinking_budget_tokens: Option<u32>,
+    /// Optional per-run OpenAI-compat reasoning-effort override (#768).
+    ///
+    /// Three-layer precedence: per-run > per-agent > server default from
+    /// `[llm.openai].reasoning_effort`. Silently ignored when the effective
+    /// provider is not OpenAI-compatible or the model isn't a reasoning
+    /// model.
+    #[serde(default)]
+    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
 }
 
 /// Input to a run

@@ -125,6 +125,16 @@ pub struct AgentConfig {
     /// (per-run > per-agent > server default from `[llm.anthropic]`).
     /// Silently ignored when the effective provider is not Anthropic.
     pub anthropic_thinking_budget: u32,
+    /// OpenAI-compat reasoning effort (#768). Applies when the effective
+    /// provider is OpenAI-compatible and the model is a reasoning model
+    /// (OpenAI o-series, GPT-5, xAI Grok reasoning variants). The adapter
+    /// in [`crate::llm_client`] strips the value for DeepSeek R1
+    /// (reasoning is implicit there) and non-reasoning OpenAI models
+    /// (gpt-4o etc. would 400 on the unknown param).
+    ///
+    /// Populated by the gateway via the three-layer precedence chain
+    /// (per-run > per-agent > server default from `[llm.openai]`).
+    pub openai_reasoning_effort: Option<alms_core::config::ReasoningEffort>,
 }
 
 impl Default for AgentConfig {
@@ -145,6 +155,7 @@ impl Default for AgentConfig {
             fs_edit_fuzzy_match: false,
             debug_mode: false,
             anthropic_thinking_budget: 0,
+            openai_reasoning_effort: None,
         }
     }
 }

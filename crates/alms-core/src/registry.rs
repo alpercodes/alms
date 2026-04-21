@@ -39,6 +39,20 @@ pub struct AgentRecord {
     /// Only applies when the resolved provider maps to the Anthropic wire
     /// protocol; silently ignored for other providers.
     pub thinking_budget_tokens: Option<u32>,
+    /// Per-agent OpenAI-compat reasoning-effort override (#768).
+    ///
+    /// `None` = inherit the server default from `[llm.openai]`.
+    /// `Some(effort)` = use exactly this effort level for this agent.
+    ///
+    /// Only applies when the resolved provider maps to the OpenAI-compatible
+    /// wire protocol and the model is a reasoning model (o-series, GPT-5,
+    /// xAI Grok reasoning variants). DeepSeek R1 accepts no request-side
+    /// param — reasoning fires automatically on `deepseek-reasoner`. For
+    /// non-reasoning models (gpt-4o, etc.) the value is silently stripped
+    /// from the request body because those models return 400 on unknown
+    /// params.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
@@ -60,6 +74,10 @@ pub struct CreateAgentRequest {
     /// See [`AgentRecord::thinking_budget_tokens`] for semantics.
     #[serde(default)]
     pub thinking_budget_tokens: Option<u32>,
+    /// Per-agent OpenAI-compat reasoning-effort override (#768).
+    /// See [`AgentRecord::reasoning_effort`] for semantics.
+    #[serde(default)]
+    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
     #[serde(default)]
     pub is_default: Option<bool>,
 }
@@ -81,6 +99,12 @@ pub struct UpdateAgentRequest {
     /// the server default enables it. Omitting the field leaves the
     /// existing value unchanged.
     pub thinking_budget_tokens: Option<u32>,
+    /// Per-agent OpenAI-compat reasoning-effort override (#768). Omitting
+    /// the field leaves the existing value unchanged. There is no
+    /// sentinel value to clear the override back to "inherit server
+    /// default" today — mirrors the `thinking_budget_tokens` PATCH
+    /// semantics.
+    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
 }
 
 /// Validate an agent name slug.

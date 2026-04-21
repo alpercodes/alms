@@ -81,6 +81,11 @@ struct RunOverrides {
     /// explicitly disables extended thinking for just this run even when
     /// both the per-agent and server default would enable it.
     thinking_budget_tokens: Option<u32>,
+    /// Per-run OpenAI-compat reasoning-effort override (#768). Three-layer
+    /// precedence: per-run > per-agent > server default from `[llm.openai]`.
+    /// Silently ignored when the effective provider is not OpenAI-compatible
+    /// or the model isn't a reasoning model.
+    reasoning_effort: Option<alms_core::config::ReasoningEffort>,
 }
 
 /// Bundled parameters for [`lifecycle::execute_run`], avoiding a long positional argument list.
@@ -291,6 +296,11 @@ fn apply_overrides(
         if let Some(budget) = record.thinking_budget_tokens {
             cfg.anthropic_thinking_budget = budget;
         }
+        // Per-agent OpenAI-compat reasoning effort (#768). `Some(effort)`
+        // wins over the server default; `None` falls through.
+        if let Some(effort) = record.reasoning_effort {
+            cfg.openai_reasoning_effort = Some(effort);
+        }
     }
 
     // -- Per-run overrides (highest precedence) --
@@ -309,6 +319,11 @@ fn apply_overrides(
     // disable, not a "use default" sentinel.
     if let Some(budget) = overrides.thinking_budget_tokens {
         cfg.anthropic_thinking_budget = budget;
+    }
+    // Per-run OpenAI-compat reasoning effort (#768) wins over per-agent
+    // and server default.
+    if let Some(effort) = overrides.reasoning_effort {
+        cfg.openai_reasoning_effort = Some(effort);
     }
 
     MergedConfig {
@@ -353,6 +368,7 @@ mod tests {
             provider: None,
             telegram_token: None,
             thinking_budget_tokens: None,
+            reasoning_effort: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -486,6 +502,7 @@ mod tests {
             provider: None,
             telegram_token: None,
             thinking_budget_tokens: budget,
+            reasoning_effort: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -552,6 +569,119 @@ mod tests {
             &RunOverrides::default(),
         );
         assert_eq!(merged.agent_config.anthropic_thinking_budget, 4096);
+    }
+
+    // ------------------------------------------------------------------
+    // Reasoning-effort precedence (issue #768)
+    //
+    // Three-layer chain (per-run > per-agent > server default) mirrors the
+    // Anthropic `thinking_budget_tokens` path above. `None` at any layer
+    // falls through; `Some(effort)` wins.
+    // ------------------------------------------------------------------
+
+    fn base_config_with_reasoning(
+        effort: Option<alms_core::config::ReasoningEffort>,
+    ) -> AgentConfig {
+        AgentConfig {
+            system_prompt: "server default prompt".into(),
+            max_tokens: 100_000,
+            posture: Posture::FullControl,
+            openai_reasoning_effort: effort,
+            ..AgentConfig::default()
+        }
+    }
+
+    fn agent_with_reasoning(effort: Option<alms_core::config::ReasoningEffort>) -> AgentRecord {
+        let now = Utc::now();
+        AgentRecord {
+            id: AgentId::new(),
+            name: "reasoner".into(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: effort,
+            is_default: false,
+            created_at: now,
+            last_active: now,
+        }
+    }
+
+    #[test]
+    fn test_reasoning_server_default_inherited() {
+        use alms_core::config::ReasoningEffort;
+        let merged = apply_overrides(
+            base_config_with_reasoning(Some(ReasoningEffort::Medium)),
+            None,
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged.agent_config.openai_reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn test_reasoning_per_agent_overrides_server_default() {
+        use alms_core::config::ReasoningEffort;
+        let agent = agent_with_reasoning(Some(ReasoningEffort::High));
+        let merged = apply_overrides(
+            base_config_with_reasoning(Some(ReasoningEffort::Low)),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged.agent_config.openai_reasoning_effort,
+            Some(ReasoningEffort::High),
+            "per-agent reasoning_effort must override server default"
+        );
+    }
+
+    #[test]
+    fn test_reasoning_per_run_beats_per_agent() {
+        use alms_core::config::ReasoningEffort;
+        let agent = agent_with_reasoning(Some(ReasoningEffort::Low));
+        let overrides = RunOverrides {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(
+            base_config_with_reasoning(Some(ReasoningEffort::Medium)),
+            Some(&agent),
+            &overrides,
+        );
+        assert_eq!(
+            merged.agent_config.openai_reasoning_effort,
+            Some(ReasoningEffort::High),
+            "per-run override must win over per-agent and server"
+        );
+    }
+
+    #[test]
+    fn test_reasoning_per_agent_none_falls_through_to_server() {
+        use alms_core::config::ReasoningEffort;
+        let agent = agent_with_reasoning(None);
+        let merged = apply_overrides(
+            base_config_with_reasoning(Some(ReasoningEffort::Medium)),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged.agent_config.openai_reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
+    }
+
+    #[test]
+    fn test_reasoning_all_none_leaves_none() {
+        let merged = apply_overrides(
+            base_config_with_reasoning(None),
+            None,
+            &RunOverrides::default(),
+        );
+        assert!(merged.agent_config.openai_reasoning_effort.is_none());
     }
 
     #[test]

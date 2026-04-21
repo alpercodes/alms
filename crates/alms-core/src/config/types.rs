@@ -162,6 +162,12 @@ pub struct LlmConfig {
     /// `alms.toml`. Only consulted when the effective provider maps to the
     /// Anthropic wire protocol; ignored otherwise.
     pub anthropic: AnthropicConfig,
+
+    /// OpenAI-compatible reasoning-model configuration surfaced as
+    /// `[llm.openai]` in `alms.toml`. Only consulted when the effective
+    /// provider maps to the OpenAI-compatible wire protocol; ignored on
+    /// Anthropic/Gemini paths.
+    pub openai: OpenAiConfig,
 }
 
 impl Default for LlmConfig {
@@ -178,6 +184,7 @@ impl Default for LlmConfig {
             stream_chunk_timeout_secs: 60,
             providers: BTreeMap::new(),
             anthropic: AnthropicConfig::default(),
+            openai: OpenAiConfig::default(),
         }
     }
 }
@@ -209,6 +216,93 @@ pub struct AnthropicConfig {
     /// back (Anthropic's standard mode doesn't require it), so this value
     /// only affects what's emitted in the current response.
     pub thinking_budget_tokens: u32,
+}
+
+/// Reasoning effort level for OpenAI-compatible reasoning models (#768).
+///
+/// Maps directly to the `reasoning_effort` request field accepted by
+/// OpenAI o-series, GPT-5, and xAI Grok reasoning models. DeepSeek R1 does
+/// NOT accept this param (reasoning is always on for `deepseek-reasoner`);
+/// the adapter strips it from requests routed to DeepSeek-shaped endpoints.
+///
+/// Serialized lowercase for TOML / JSON / wire compatibility. Parsing is
+/// strict — unknown values fail deserialization rather than silently
+/// falling back, so misspellings in `alms.toml` surface at load time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    /// GPT-5 only — fastest, minimal chain-of-thought budget.
+    Minimal,
+    /// Low reasoning budget.
+    Low,
+    /// Balanced reasoning budget (provider default when param is omitted).
+    Medium,
+    /// High reasoning budget — slower, more thorough.
+    High,
+}
+
+impl ReasoningEffort {
+    /// Wire string (`"low"`, `"medium"`, `"high"`, `"minimal"`).
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_wire_str())
+    }
+}
+
+impl std::str::FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => Err(format!(
+                "invalid reasoning_effort '{other}' — expected one of: low, medium, high, minimal"
+            )),
+        }
+    }
+}
+
+/// OpenAI-compatible reasoning-model configuration (`[llm.openai]` in `alms.toml`).
+///
+/// Mirrors the shape of [`AnthropicConfig`] — a provider-family-specific
+/// container that sits alongside the generic [`ProviderEntry`] table.
+/// Applied to requests whose effective provider maps to the
+/// OpenAI-compatible wire protocol (OpenAI, OpenRouter, xAI, Groq,
+/// self-hosted vLLM, etc.). Silently ignored on Anthropic/Gemini paths.
+///
+/// See [`ReasoningEffort`] for semantics and [`crate::registry::AgentRecord::reasoning_effort`]
+/// for the per-agent override. Three-layer precedence (per-run > per-agent >
+/// server default) matches how `thinking_budget_tokens` behaves for Anthropic.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OpenAiConfig {
+    /// Server default reasoning effort for OpenAI-compat reasoning models.
+    ///
+    /// `None` (the default — no value in TOML) means "don't send a
+    /// `reasoning_effort` field on the wire", which preserves existing
+    /// behaviour for non-reasoning models (gpt-4o, claude-sonnet, etc.)
+    /// that 400 when they receive the param.
+    ///
+    /// When set, the adapter forwards the value only to requests targeting
+    /// a reasoning-capable model (see `alms_runtime::llm_client::is_openai_reasoning_model`
+    /// for the detection heuristic). DeepSeek R1 is specifically excluded —
+    /// its `deepseek-reasoner` model reasons automatically and rejects the
+    /// param. Non-reasoning models also skip the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 impl LlmConfig {

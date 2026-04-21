@@ -530,6 +530,7 @@ fn format_completion_notification_for_failed_subagent() {
         token_usage: Some(TokenUsage {
             prompt_tokens: 1000,
             completion_tokens: 200,
+            reasoning_tokens: None,
         }),
     };
 
@@ -640,6 +641,7 @@ async fn completed_run_is_not_cancellable() {
         TokenUsage {
             prompt_tokens: 10,
             completion_tokens: 5,
+            reasoning_tokens: None,
         },
     );
 
@@ -829,6 +831,7 @@ async fn subagent_completion_propagates_session_id() {
             token_usage: Some(TokenUsage {
                 prompt_tokens: 3000,
                 completion_tokens: 800,
+                reasoning_tokens: None,
             }),
         })
         .unwrap();
@@ -996,6 +999,7 @@ async fn subagent_completion_marker_includes_rich_metadata() {
             token_usage: Some(TokenUsage {
                 prompt_tokens: 50_000,
                 completion_tokens: 15_000,
+                reasoning_tokens: None,
             }),
         })
         .unwrap();
@@ -1039,6 +1043,12 @@ async fn subagent_completion_marker_includes_rich_metadata() {
         usage.get("completion_tokens").and_then(|v| v.as_u64()),
         Some(15_000)
     );
+    // reasoning_tokens was None on the TokenUsage; the marker must omit
+    // the field entirely (byte-identical to pre-#768).
+    assert!(
+        usage.get("reasoning_tokens").is_none(),
+        "reasoning_tokens should be absent from token_usage when None"
+    );
 
     // Verify the marker text mentions "failed".
     if let alms_session::Content::Text(ref text) = markers[0].content {
@@ -1047,6 +1057,80 @@ async fn subagent_completion_marker_includes_rich_metadata() {
             "marker text should mention 'failed' for a failed subagent"
         );
     }
+
+    shutdown_token.cancel();
+}
+
+/// Test that subagent completion carries `reasoning_tokens` through to the
+/// persisted marker metadata when the provider reports them separately
+/// (OpenAI o-series, DeepSeek R1, xAI reasoning variants). Previously the
+/// field was dropped at the marker boundary — fixed in response to Tim's
+/// review on #777 (C1).
+#[tokio::test]
+async fn subagent_completion_marker_includes_reasoning_tokens() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+
+    let parent_agent_id = AgentId::new();
+    let parent_session = state
+        .session_manager
+        .get_or_create(parent_agent_id, "reasoning-tokens-test");
+    let parent_session_id = parent_session.id;
+
+    let subagent_session_id = SessionId::new();
+
+    let (test_tx, test_rx) = mpsc::unbounded_channel();
+    test_tx
+        .send(SubagentCompletion {
+            task_id: TaskId::new(),
+            subagent_name: Some("reasoner".to_string()),
+            status: TaskStatus::Completed,
+            summary: "Deep thought complete".to_string(),
+            parent_session_id,
+            parent_agent_id,
+            subagent_session_id,
+            task_description: Some("Solve the hard problem".to_string()),
+            tool_count: Some(3),
+            duration_ms: Some(45_000),
+            token_usage: Some(TokenUsage {
+                prompt_tokens: 1_200,
+                completion_tokens: 300,
+                reasoning_tokens: Some(2_048),
+            }),
+        })
+        .unwrap();
+    drop(test_tx);
+
+    super::notifications::completion_notification_loop(test_rx, state.clone()).await;
+
+    let history = state
+        .session_manager
+        .get_history(parent_session_id)
+        .unwrap();
+    let markers: Vec<_> = history
+        .iter()
+        .filter(|m| {
+            m.metadata.as_ref().is_some_and(|meta| {
+                meta.get("type").and_then(|v| v.as_str()) == Some("subagent_completion")
+            })
+        })
+        .collect();
+    assert!(!markers.is_empty());
+
+    let meta = markers[0].metadata.as_ref().unwrap();
+    let usage = meta.get("token_usage").expect("should have token_usage");
+    assert_eq!(
+        usage.get("prompt_tokens").and_then(|v| v.as_u64()),
+        Some(1_200)
+    );
+    assert_eq!(
+        usage.get("completion_tokens").and_then(|v| v.as_u64()),
+        Some(300)
+    );
+    assert_eq!(
+        usage.get("reasoning_tokens").and_then(|v| v.as_u64()),
+        Some(2_048),
+        "reasoning_tokens must be propagated into the subagent completion marker"
+    );
 
     shutdown_token.cancel();
 }
@@ -1481,6 +1565,7 @@ async fn create_run_pre_persists_user_input_to_session() {
         provider: None,
         debug_mode: None,
         thinking_budget_tokens: None,
+        reasoning_effort: None,
     };
 
     // Call the handler directly. We do NOT await the spawned execute_run -- we
@@ -1572,6 +1657,7 @@ async fn create_run_reports_queued_behind_when_agent_is_running() {
         provider: None,
         debug_mode: None,
         thinking_budget_tokens: None,
+        reasoning_effort: None,
     };
 
     match super::lifecycle::create_run(State(state.clone()), Json(req)).await {

@@ -1,8 +1,32 @@
-use alms_core::{AgentId, AgentRecord, validate_agent_name};
+use alms_core::{AgentId, AgentRecord, config::ReasoningEffort, validate_agent_name};
 use alms_session::SqliteStore;
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 
 use crate::helpers::{fmt_time, resolve_agent, short_id};
+
+/// Clap-compatible wrapper around [`alms_core::config::ReasoningEffort`].
+///
+/// Defined here (rather than deriving `ValueEnum` on the core type) so that
+/// the core crate stays clap-free. The conversion into the canonical
+/// `ReasoningEffort` is a single `From` impl.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ReasoningEffortArg {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl From<ReasoningEffortArg> for ReasoningEffort {
+    fn from(v: ReasoningEffortArg) -> Self {
+        match v {
+            ReasoningEffortArg::Minimal => ReasoningEffort::Minimal,
+            ReasoningEffortArg::Low => ReasoningEffort::Low,
+            ReasoningEffortArg::Medium => ReasoningEffort::Medium,
+            ReasoningEffortArg::High => ReasoningEffort::High,
+        }
+    }
+}
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum AgentCommands {
@@ -30,6 +54,14 @@ pub(crate) enum AgentCommands {
         /// default (three-layer precedence: per-run > per-agent > server).
         #[arg(long)]
         thinking_budget_tokens: Option<u32>,
+        /// OpenAI-compat reasoning effort for reasoning models (OpenAI
+        /// o-series / GPT-5 / xAI Grok). Omit to inherit the server
+        /// default from `[llm.openai].reasoning_effort`. DeepSeek R1
+        /// ignores this flag — reasoning fires automatically on
+        /// `deepseek-reasoner`. Non-reasoning OpenAI models (gpt-4o etc.)
+        /// also ignore it. (#768)
+        #[arg(long, value_enum)]
+        reasoning_effort: Option<ReasoningEffortArg>,
         /// Set as the default agent
         #[arg(long)]
         default: bool,
@@ -75,6 +107,10 @@ pub(crate) enum AgentCommands {
         /// matches the HTTP API semantics (see PR #775 S3).
         #[arg(long)]
         thinking_budget_tokens: Option<u32>,
+        /// OpenAI-compat reasoning effort override (#768). Omit to leave
+        /// the current value unchanged; no sentinel to clear the override.
+        #[arg(long, value_enum)]
+        reasoning_effort: Option<ReasoningEffortArg>,
     },
 }
 
@@ -119,6 +155,10 @@ pub(crate) struct AgentCreateOpts<'a> {
     /// explicitly disables thinking; `None` inherits the server default.
     /// Matches the HTTP API semantics on `POST /agents`.
     pub thinking_budget_tokens: Option<u32>,
+    /// OpenAI-compat reasoning effort override (`low` / `medium` / `high`
+    /// / `minimal`). `None` inherits the server default from
+    /// `[llm.openai]`. Matches the HTTP API semantics on `POST /agents`.
+    pub reasoning_effort: Option<alms_core::config::ReasoningEffort>,
     pub default: bool,
     pub json: bool,
     pub workspace_dir: Option<&'a std::path::Path>,
@@ -132,6 +172,7 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         posture,
         provider,
         thinking_budget_tokens,
+        reasoning_effort,
         default,
         json,
         workspace_dir,
@@ -149,6 +190,7 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         provider,
         telegram_token: None,
         thinking_budget_tokens,
+        reasoning_effort,
         is_default: default,
         created_at: now,
         last_active: now,
@@ -231,6 +273,13 @@ pub(crate) fn agent_show(store: &SqliteStore, name_or_id: &str, json: bool) -> a
         None => "(server default)".to_string(),
     };
     println!("Thinking:      {thinking_display}");
+    // Render the OpenAI-compat reasoning effort so operators can verify
+    // `--reasoning-effort` landed as expected (#768).
+    let reasoning_display = match agent.reasoning_effort {
+        Some(effort) => effort.to_string(),
+        None => "(server default)".to_string(),
+    };
+    println!("Reasoning:     {reasoning_display}");
     println!(
         "Default:       {}",
         if agent.is_default { "yes" } else { "no" }
@@ -295,6 +344,10 @@ pub(crate) struct AgentConfigOpts<'a> {
     /// here means "leave unchanged" — mirrors the HTTP `PATCH /agents`
     /// path where a missing field is a no-op.
     pub thinking_budget_tokens: Option<u32>,
+    /// OpenAI-compat reasoning effort override (`low`/`medium`/`high`/
+    /// `minimal`). `None` leaves the stored value unchanged. Matches
+    /// the HTTP `PATCH /agents` semantics on `reasoning_effort` (#768).
+    pub reasoning_effort: Option<alms_core::config::ReasoningEffort>,
     pub json: bool,
 }
 
@@ -306,6 +359,7 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
         provider,
         description,
         thinking_budget_tokens,
+        reasoning_effort,
         json,
     } = opts;
 
@@ -329,6 +383,12 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     // we defer that until someone actually hits the trap.
     if let Some(budget) = thinking_budget_tokens {
         agent.thinking_budget_tokens = Some(budget);
+    }
+
+    // Same shape as `thinking_budget_tokens`: `Some(effort)` is an explicit
+    // per-agent override; `None` leaves the stored value unchanged (#768).
+    if let Some(effort) = reasoning_effort {
+        agent.reasoning_effort = Some(effort);
     }
 
     agent.last_active = chrono::Utc::now();
@@ -362,6 +422,7 @@ mod tests {
                 posture: None,
                 provider: None,
                 thinking_budget_tokens: None,
+                reasoning_effort: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -396,6 +457,7 @@ mod tests {
                 posture: None,
                 provider: None,
                 thinking_budget_tokens: None,
+                reasoning_effort: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -411,6 +473,7 @@ mod tests {
                 posture: None,
                 provider: None,
                 thinking_budget_tokens: None,
+                reasoning_effort: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -432,6 +495,7 @@ mod tests {
                 posture: None,
                 provider: None,
                 thinking_budget_tokens: None,
+                reasoning_effort: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -456,6 +520,7 @@ mod tests {
                 posture: None,
                 provider: None,
                 thinking_budget_tokens: None,
+                reasoning_effort: None,
                 default: false,
                 json: false,
                 workspace_dir: Some(&ws_dir),
@@ -528,6 +593,7 @@ mod tests {
                 provider: None,
                 description: Some("updated desc".into()),
                 thinking_budget_tokens: None,
+                reasoning_effort: None,
                 json: false,
             },
         )
@@ -552,6 +618,7 @@ mod tests {
             provider: None,
             telegram_token: None,
             thinking_budget_tokens: None,
+            reasoning_effort: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -568,6 +635,7 @@ mod tests {
                 provider: None,
                 description: None,
                 thinking_budget_tokens: None,
+                reasoning_effort: None,
                 json: false,
             },
         )
@@ -596,6 +664,7 @@ mod tests {
                 posture: None,
                 provider: None,
                 thinking_budget_tokens: Some(8192),
+                reasoning_effort: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -620,6 +689,7 @@ mod tests {
                 posture: None,
                 provider: None,
                 thinking_budget_tokens: Some(0),
+                reasoning_effort: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -645,6 +715,7 @@ mod tests {
                 provider: None,
                 description: None,
                 thinking_budget_tokens: Some(4096),
+                reasoning_effort: None,
                 json: false,
             },
         )
@@ -662,6 +733,7 @@ mod tests {
                 provider: None,
                 description: None,
                 thinking_budget_tokens: Some(0),
+                reasoning_effort: None,
                 json: false,
             },
         )
@@ -679,6 +751,7 @@ mod tests {
                 provider: None,
                 description: None,
                 thinking_budget_tokens: None,
+                reasoning_effort: None,
                 json: false,
             },
         )

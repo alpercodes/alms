@@ -347,6 +347,7 @@ mod tests {
             TokenUsage {
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                reasoning_tokens: None,
             },
         );
         store.save_run(&run).unwrap();
@@ -407,6 +408,7 @@ mod tests {
                 TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    reasoning_tokens: None,
                 },
             );
             store.save_run(&run).unwrap();
@@ -430,6 +432,7 @@ mod tests {
                 TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    reasoning_tokens: None,
                 },
             );
             store.save_run(&run).unwrap();
@@ -559,6 +562,7 @@ mod tests {
                 TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    reasoning_tokens: None,
                 },
             );
             store.save_run(&run).unwrap();
@@ -766,6 +770,7 @@ mod tests {
                 TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    reasoning_tokens: None,
                 },
             );
             store.save_run(&run).unwrap();
@@ -808,6 +813,7 @@ mod tests {
             TokenUsage {
                 prompt_tokens: 50,
                 completion_tokens: 20,
+                reasoning_tokens: None,
             },
         );
         store.save_run(&run).unwrap();

@@ -525,6 +525,8 @@ pub(crate) fn from_gemini_response(resp: GeminiResponse) -> CompletionResponse {
         } else {
             u.prompt_token_count + u.candidates_token_count
         },
+        reasoning_tokens: None,
+        completion_tokens_details: None,
     });
 
     CompletionResponse {
@@ -663,6 +665,8 @@ pub(crate) fn parse_gemini_sse(data: &str) -> SseParseResult {
         } else {
             u.prompt_token_count + u.candidates_token_count
         },
+        reasoning_tokens: None,
+        completion_tokens_details: None,
     });
 
     // Nothing to emit (e.g. empty heartbeat event) — skip.

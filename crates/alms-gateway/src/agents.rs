@@ -95,6 +95,7 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
         "provider": agent.provider,
         "has_telegram": agent.telegram_token.is_some(),
         "thinking_budget_tokens": agent.thinking_budget_tokens,
+        "reasoning_effort": agent.reasoning_effort.map(|e| e.as_wire_str()),
         "is_default": agent.is_default,
         "created_at": agent.created_at.to_rfc3339(),
         "last_active": agent.last_active.to_rfc3339(),
@@ -111,6 +112,9 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
     }
     if agent.thinking_budget_tokens.is_none() {
         v.as_object_mut().unwrap().remove("thinking_budget_tokens");
+    }
+    if agent.reasoning_effort.is_none() {
+        v.as_object_mut().unwrap().remove("reasoning_effort");
     }
     v
 }
@@ -156,6 +160,7 @@ pub async fn create_agent(
         provider: req.provider,
         telegram_token: req.telegram_token,
         thinking_budget_tokens: req.thinking_budget_tokens,
+        reasoning_effort: req.reasoning_effort,
         // Always INSERT with is_default=false; set_default_agent atomically
         // clears old default + sets new one in a single transaction.
         is_default: false,
@@ -257,6 +262,14 @@ pub async fn update_agent(
         agent.thinking_budget_tokens = Some(budget);
     }
 
+    // `reasoning_effort` follows the same shape as `thinking_budget_tokens`:
+    // `Some(effort)` is an explicit per-agent override; omitting the field
+    // leaves the existing value unchanged. No sentinel to clear back to
+    // "inherit server default" (#768).
+    if let Some(effort) = req.reasoning_effort {
+        agent.reasoning_effort = Some(effort);
+    }
+
     agent.last_active = Utc::now();
 
     store
@@ -328,6 +341,7 @@ mod tests {
             provider: None,
             telegram_token: None,
             thinking_budget_tokens: None,
+            reasoning_effort: None,
             is_default: false,
             created_at: now,
             last_active: now,

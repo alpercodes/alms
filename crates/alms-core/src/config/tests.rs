@@ -1561,3 +1561,91 @@ model = "claude-sonnet-4-20250514"
     let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
     assert_eq!(cfg.llm.anthropic.thinking_budget_tokens, 0);
 }
+
+// --------------------------------------------------------------------------
+// OpenAI-compat reasoning-effort config (issue #768)
+// --------------------------------------------------------------------------
+
+use crate::config::ReasoningEffort;
+
+/// `[llm.openai].reasoning_effort = "high"` deserializes correctly and
+/// round-trips through `toml::to_string` → reparse.
+#[test]
+fn test_openai_reasoning_effort_toml_roundtrip() {
+    let toml_str = r#"
+[llm]
+provider = "openai"
+model = "o3-mini"
+
+[llm.openai]
+reasoning_effort = "high"
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
+    assert_eq!(cfg.llm.openai.reasoning_effort, Some(ReasoningEffort::High));
+    let re = toml::to_string(&cfg).expect("serialize");
+    let cfg2: AlmsConfig = toml::from_str(&re).expect("reparse");
+    assert_eq!(
+        cfg2.llm.openai.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+}
+
+/// Omitted `[llm.openai]` section defaults to `reasoning_effort = None`
+/// (no param on the wire), preserving behaviour for existing configs
+/// that don't opt in.
+#[test]
+fn test_openai_reasoning_effort_default_none() {
+    let toml_str = r#"
+[llm]
+provider = "openai"
+model = "gpt-4o"
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
+    assert!(cfg.llm.openai.reasoning_effort.is_none());
+}
+
+/// Each valid wire value (`low`/`medium`/`high`/`minimal`) deserializes
+/// into the right enum variant.
+#[test]
+fn test_openai_reasoning_effort_all_values_parse() {
+    for (wire, expected) in [
+        ("low", ReasoningEffort::Low),
+        ("medium", ReasoningEffort::Medium),
+        ("high", ReasoningEffort::High),
+        ("minimal", ReasoningEffort::Minimal),
+    ] {
+        let toml_str = format!(
+            r#"
+[llm]
+provider = "openai"
+model = "o3-mini"
+
+[llm.openai]
+reasoning_effort = "{wire}"
+"#
+        );
+        let cfg: AlmsConfig =
+            toml::from_str(&toml_str).unwrap_or_else(|e| panic!("failed to parse '{wire}': {e}"));
+        assert_eq!(cfg.llm.openai.reasoning_effort, Some(expected));
+    }
+}
+
+/// Unknown reasoning_effort values fail TOML parsing at load time —
+/// operators see the typo rather than silently falling back.
+#[test]
+fn test_openai_reasoning_effort_invalid_value_rejected() {
+    let toml_str = r#"
+[llm]
+provider = "openai"
+model = "o3-mini"
+
+[llm.openai]
+reasoning_effort = "extreme"
+"#;
+    let result: Result<AlmsConfig, _> = toml::from_str(toml_str);
+    assert!(
+        result.is_err(),
+        "invalid reasoning_effort should fail to parse, got: {:?}",
+        result.map(|c| c.llm.openai.reasoning_effort)
+    );
+}

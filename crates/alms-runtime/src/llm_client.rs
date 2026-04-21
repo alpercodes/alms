@@ -108,6 +108,21 @@ impl LlmClient {
                 let mut req_body = request.clone();
                 apply_quirks(&mut req_body, &self.config.quirks);
 
+                // Gate `reasoning_effort` (#768): the param is only valid
+                // for OpenAI-compat reasoning models that actually accept
+                // it. Strip the field for:
+                //   - DeepSeek R1 endpoints (`deepseek-reasoner` reasons
+                //     automatically and rejects the param).
+                //   - Non-reasoning OpenAI models (gpt-4o etc. return 400
+                //     on unknown params).
+                // See `is_openai_reasoning_model` for the exact heuristic
+                // (model-name + base-URL based).
+                if req_body.reasoning_effort.is_some()
+                    && !is_openai_reasoning_model(&req_body.model, &self.config.base_url)
+                {
+                    req_body.reasoning_effort = None;
+                }
+
                 let builder = self
                     .client
                     .post(&url)
@@ -497,6 +512,8 @@ impl LlmClient {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                reasoning_tokens: None,
+                completion_tokens_details: None,
             }),
         }
     }
@@ -545,6 +562,8 @@ impl LlmClient {
                         prompt_tokens: 0,
                         completion_tokens: 0,
                         total_tokens: 0,
+                        reasoning_tokens: None,
+                        completion_tokens_details: None,
                     })
                 } else {
                     None
@@ -789,6 +808,70 @@ pub(crate) fn apply_quirks(
             i -= 1;
         }
     }
+}
+
+/// Returns `true` if the given model+base_url combination accepts the
+/// OpenAI-compat `reasoning_effort` request field (#768).
+///
+/// Detection is model-name + base-URL based:
+/// - DeepSeek endpoints (base URL contains `deepseek`) always return
+///   `false` — `deepseek-reasoner` reasons automatically and rejects
+///   the param.
+/// - OpenAI reasoning models: the `o1`/`o3`/`o4-mini`/`o5` o-series
+///   families and the `gpt-5` family all accept the param. Detection
+///   checks for model name prefixes like `o1-`, `o3-`, `o4-mini`,
+///   `gpt-5`, case-insensitive and with an optional provider prefix
+///   (e.g. OpenRouter uses `openai/o3-mini`, `openai/gpt-5`).
+/// - xAI Grok reasoning variants: `grok-*-reasoning`, `grok-3-mini`,
+///   `grok-4`. Detected by the `grok-` prefix combined with the
+///   `-reasoning` suffix or an explicit reasoning tier name.
+/// - Everything else (gpt-4o, claude-sonnet via proxy, non-reasoning
+///   Grok, etc.) returns `false` so the field gets stripped.
+///
+/// The heuristic is intentionally conservative: false negatives (param
+/// stripped for a model that would accept it) just disable the feature
+/// for that model, while false positives (param sent to a model that
+/// rejects it) produce a hard 400. If new reasoning models ship, extend
+/// this list rather than widening the matcher.
+pub(crate) fn is_openai_reasoning_model(model: &str, base_url: &str) -> bool {
+    // DeepSeek strips `reasoning_effort` regardless of model name because
+    // even if the user points a DeepSeek base URL at a non-reasoner model,
+    // the param is still DeepSeek-incompatible.
+    let base_lower = base_url.to_ascii_lowercase();
+    if base_lower.contains("deepseek") {
+        return false;
+    }
+
+    // Strip an optional `<provider>/` prefix (OpenRouter-style) before
+    // model-name matching. The model name itself is case-insensitive.
+    let model_lower = model.to_ascii_lowercase();
+    let name = model_lower
+        .rsplit_once('/')
+        .map(|(_, rest)| rest)
+        .unwrap_or(&model_lower);
+
+    // OpenAI o-series / GPT-5 reasoning families.
+    if name.starts_with("o1")
+        || name.starts_with("o3")
+        || name.starts_with("o4")
+        || name.starts_with("o5")
+        || name.starts_with("gpt-5")
+    {
+        return true;
+    }
+
+    // xAI Grok reasoning variants. The SKUs listed here accept the
+    // `reasoning_effort` param per xAI's documentation; other Grok
+    // models do not.
+    if name.starts_with("grok-")
+        && (name.contains("-reasoning")
+            || name.starts_with("grok-3-mini")
+            || name.starts_with("grok-4"))
+    {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -1517,6 +1600,443 @@ mod tests {
                 assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
             }
             _ => panic!("expected Chunk"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // OpenAI-compat reasoning models (issue #768)
+    // ------------------------------------------------------------------
+
+    /// Extract the serialized request body from a built request.
+    fn body_json(req: &reqwest::Request) -> serde_json::Value {
+        let bytes = req.body().and_then(|b| b.as_bytes()).expect("body present");
+        serde_json::from_slice(bytes).expect("valid JSON body")
+    }
+
+    /// Helper — build a canonical OpenAI client pointed at the default
+    /// `https://api.openai.com/v1` base URL (so the DeepSeek strip branch
+    /// stays out of the picture).
+    fn openai_client() -> LlmClient {
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "openai".into();
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = "openai-test-key".into();
+        LlmClient::new(runtime_cfg).unwrap()
+    }
+
+    /// `reasoning_effort = "high"` produces `"reasoning_effort":"high"` on
+    /// the OpenAI wire for a reasoning-capable model.
+    #[test]
+    fn test_openai_reasoning_effort_serialized_for_o3() {
+        let client = openai_client();
+        let request = CompletionRequest::new("o3-mini")
+            .with_messages(vec![LlmMessage::user("hi")])
+            .with_reasoning_effort("high");
+        let req = client.build_request_for_test(&request).unwrap();
+        let body = body_json(&req);
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    /// Every supported value (`low` / `medium` / `high` / `minimal`)
+    /// survives a round-trip through the OpenAI adapter.
+    #[test]
+    fn test_openai_reasoning_effort_all_values() {
+        let client = openai_client();
+        for value in &["low", "medium", "high", "minimal"] {
+            let request = CompletionRequest::new("gpt-5-preview")
+                .with_messages(vec![LlmMessage::user("hi")])
+                .with_reasoning_effort(*value);
+            let req = client.build_request_for_test(&request).unwrap();
+            let body = body_json(&req);
+            assert_eq!(
+                body["reasoning_effort"], *value,
+                "reasoning_effort={value} did not round-trip"
+            );
+        }
+    }
+
+    /// `reasoning_effort = None` omits the field entirely from the wire
+    /// body — preserves existing behaviour for runs that don't opt in.
+    #[test]
+    fn test_openai_reasoning_effort_none_omits_field() {
+        let client = openai_client();
+        let request = CompletionRequest::new("gpt-4o").with_messages(vec![LlmMessage::user("hi")]);
+        let req = client.build_request_for_test(&request).unwrap();
+        let body = body_json(&req);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "reasoning_effort must not appear when unset"
+        );
+    }
+
+    /// `reasoning_effort` sent on a non-reasoning OpenAI model (gpt-4o)
+    /// is stripped before hitting the wire — gpt-4o returns 400 on the
+    /// unknown param.
+    #[test]
+    fn test_openai_reasoning_effort_stripped_for_non_reasoning_model() {
+        let client = openai_client();
+        let request = CompletionRequest::new("gpt-4o")
+            .with_messages(vec![LlmMessage::user("hi")])
+            .with_reasoning_effort("medium");
+        let req = client.build_request_for_test(&request).unwrap();
+        let body = body_json(&req);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "reasoning_effort must be stripped for non-reasoning models (gpt-4o), got body: {body}"
+        );
+    }
+
+    /// DeepSeek R1 endpoints reject `reasoning_effort` (reasoning is
+    /// implicit for `deepseek-reasoner`). Detected via the base URL.
+    #[test]
+    fn test_openai_reasoning_effort_stripped_for_deepseek_base_url() {
+        // Build a client pointed at a DeepSeek-shaped base URL via a
+        // custom provider entry (the generic config path), so we don't
+        // need a built-in sugar entry.
+        let mut core_cfg = alms_core::config::LlmConfig::default();
+        core_cfg.ensure_builtin_providers();
+        core_cfg.provider = "deepseek".into();
+        core_cfg.providers.insert(
+            "deepseek".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.deepseek.com/v1".into(),
+                api_key_env: None,
+                api_key: Some("ds-key".into()),
+                model: Some("deepseek-reasoner".into()),
+                auth_scheme: AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let mut runtime_cfg: LlmConfig = core_cfg.into();
+        runtime_cfg.api_key = "ds-key".into();
+        let client = LlmClient::new(runtime_cfg).unwrap();
+
+        let request = CompletionRequest::new("deepseek-reasoner")
+            .with_messages(vec![LlmMessage::user("hi")])
+            .with_reasoning_effort("high");
+        let req = client.build_request_for_test(&request).unwrap();
+        let body = body_json(&req);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "reasoning_effort must be stripped for DeepSeek endpoints, got body: {body}"
+        );
+    }
+
+    /// `is_openai_reasoning_model` recognises the families listed in
+    /// the issue body and rejects everything else.
+    #[test]
+    fn test_is_openai_reasoning_model_matches_known_families() {
+        // OpenAI o-series / GPT-5 — accept.
+        let base = "https://api.openai.com/v1";
+        for m in &[
+            "o1",
+            "o1-mini",
+            "o1-preview",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+            "o5",
+            "gpt-5",
+            "gpt-5-preview",
+            "openai/o3-mini", // OpenRouter-style prefix
+            "openai/gpt-5",
+            "O3-Mini", // case-insensitive
+        ] {
+            assert!(
+                is_openai_reasoning_model(m, base),
+                "'{m}' should be recognised as an OpenAI reasoning model"
+            );
+        }
+        // Non-reasoning OpenAI models.
+        for m in &["gpt-4o", "gpt-4", "gpt-3.5-turbo", "openai/gpt-4o"] {
+            assert!(
+                !is_openai_reasoning_model(m, base),
+                "'{m}' should NOT be recognised as a reasoning model"
+            );
+        }
+        // xAI Grok reasoning variants — accept.
+        let xai_base = "https://api.x.ai/v1";
+        for m in &["grok-3-mini", "grok-3-reasoning", "grok-4"] {
+            assert!(
+                is_openai_reasoning_model(m, xai_base),
+                "'{m}' should be recognised as a Grok reasoning variant"
+            );
+        }
+        // Non-reasoning Grok variants.
+        for m in &["grok-2", "grok-vision"] {
+            assert!(
+                !is_openai_reasoning_model(m, xai_base),
+                "'{m}' should NOT be recognised as a Grok reasoning variant"
+            );
+        }
+        // DeepSeek — always false regardless of model name.
+        let ds_base = "https://api.deepseek.com/v1";
+        for m in &["deepseek-reasoner", "o3-mini", "gpt-5"] {
+            assert!(
+                !is_openai_reasoning_model(m, ds_base),
+                "'{m}' against DeepSeek base_url must return false"
+            );
+        }
+    }
+
+    /// Non-streaming OpenAI response with `reasoning_content` populates
+    /// `LlmMessage::reasoning_content` via serde.
+    #[test]
+    fn test_openai_response_reasoning_content_parses() {
+        let json = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "o3-mini",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final answer",
+                    "reasoning_content": "thinking trace"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.choices[0].message.reasoning_content.as_deref(),
+            Some("thinking trace")
+        );
+    }
+
+    /// OpenAI responses that use `reasoning` (raw field) deserialize
+    /// into `reasoning_content` via the serde alias.
+    #[test]
+    fn test_openai_response_reasoning_alias_parses() {
+        let json = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "o1-preview",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final",
+                    "reasoning": "raw chain-of-thought"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.choices[0].message.reasoning_content.as_deref(),
+            Some("raw chain-of-thought"),
+            "`reasoning` alias should populate `reasoning_content`"
+        );
+    }
+
+    /// OpenAI responses that use `reasoning_summary` deserialize into
+    /// `reasoning_content` via the serde alias. When OpenAI emits both
+    /// `reasoning` and `reasoning_summary`, the second field listed in
+    /// the JSON wins at serde time — which matches OpenAI's preferred
+    /// "summary is the user-visible version" semantics since the
+    /// summary is sent after the raw trace in the wire ordering.
+    #[test]
+    fn test_openai_response_reasoning_summary_parses_and_wins() {
+        // Only `reasoning_summary` — it populates the field.
+        let only_summary = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "o3",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final",
+                    "reasoning_summary": "condensed summary"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(only_summary).unwrap();
+        assert_eq!(
+            resp.choices[0].message.reasoning_content.as_deref(),
+            Some("condensed summary"),
+        );
+
+        // Both present: `reasoning_summary` wins because the custom
+        // `Deserialize` impl on `LlmMessage` (see `llm_types.rs:48-91`)
+        // collects all three fields into the `Raw` struct and applies an
+        // explicit priority order — `reasoning_content` -> `reasoning_summary`
+        // -> `reasoning`, first non-empty wins. With `reasoning_content` absent
+        // here, the summary beats the raw trace. This matches OpenAI's
+        // "prefer summary" rule for #768.
+        let both = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "o3",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final",
+                    "reasoning": "raw trace",
+                    "reasoning_summary": "condensed summary"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(both).unwrap();
+        assert_eq!(
+            resp.choices[0].message.reasoning_content.as_deref(),
+            Some("condensed summary"),
+            "when both present, reasoning_summary should win"
+        );
+    }
+
+    /// OpenAI o-series `usage.completion_tokens_details.reasoning_tokens`
+    /// deserializes via the nested struct and is retrievable through
+    /// `reasoning_tokens_effective`.
+    #[test]
+    fn test_usage_reasoning_tokens_openai_nested_shape() {
+        let json = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "o3",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 42,
+                "total_tokens": 52,
+                "completion_tokens_details": {
+                    "reasoning_tokens": 30
+                }
+            }
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.reasoning_tokens_effective(), Some(30));
+    }
+
+    /// DeepSeek / xAI flat `usage.reasoning_tokens` deserializes into
+    /// the flat field and is retrievable through `reasoning_tokens_effective`.
+    #[test]
+    fn test_usage_reasoning_tokens_flat_shape() {
+        let json = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "deepseek-reasoner",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 100,
+                "total_tokens": 110,
+                "reasoning_tokens": 70
+            }
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.reasoning_tokens_effective(), Some(70));
+    }
+
+    /// Usage without any reasoning-token field leaves
+    /// `reasoning_tokens_effective()` as `None` — not zero.
+    #[test]
+    fn test_usage_reasoning_tokens_absent() {
+        let json = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30
+            }
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.expect("usage present");
+        assert!(usage.reasoning_tokens_effective().is_none());
+    }
+
+    /// Streaming delta with `reasoning_content` populates
+    /// `Delta::reasoning_content` (DeepSeek / xAI shape).
+    #[test]
+    fn test_sse_delta_reasoning_content() {
+        let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"reasoning_content":"ponder"},"finish_reason":null}]}"#;
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+            panic!("expected Chunk");
+        };
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("ponder")
+        );
+    }
+
+    /// Streaming delta with the `reasoning` alias populates
+    /// `Delta::reasoning_content` (OpenAI o-series raw shape).
+    #[test]
+    fn test_sse_delta_reasoning_alias() {
+        let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning":"ponder-raw"},"finish_reason":null}]}"#;
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+            panic!("expected Chunk");
+        };
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("ponder-raw")
+        );
+    }
+
+    /// Streaming delta with `reasoning_summary` alias populates
+    /// `Delta::reasoning_content` (OpenAI summary shape).
+    #[test]
+    fn test_sse_delta_reasoning_summary_alias() {
+        let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_summary":"condensed"},"finish_reason":null}]}"#;
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+            panic!("expected Chunk");
+        };
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("condensed")
+        );
+    }
+
+    /// Wire invariant (#773): an outbound OpenAI request built by the
+    /// runtime never carries `reasoning_content` on any message,
+    /// because the loop path (see `loop_impl.rs`) always constructs
+    /// assistant messages with `reasoning_content: None` regardless of
+    /// what the previous turn returned. This test pins that behaviour
+    /// by building a full request through the adapter and asserting no
+    /// `reasoning_content` appears anywhere in the wire body.
+    #[test]
+    fn test_openai_request_body_never_contains_reasoning_content() {
+        let client = openai_client();
+        // Simulate a messages vec shaped the way context builder +
+        // loop_impl produce it: system + user + assistant (no reasoning)
+        // + tool_result + user. None of the assistant messages carry
+        // `reasoning_content` because the runtime strips it before
+        // persist and never re-populates it on context assembly.
+        let request = CompletionRequest::new("gpt-4o").with_messages(vec![
+            LlmMessage::system("sys"),
+            LlmMessage::user("question"),
+            LlmMessage::assistant("previous answer"),
+            LlmMessage::tool_result("call_1", "tool output"),
+            LlmMessage::user("follow-up"),
+        ]);
+        let req = client.build_request_for_test(&request).unwrap();
+        let body = body_json(&req);
+
+        // Walk every message and assert no `reasoning_content` field.
+        let messages = body["messages"].as_array().expect("messages array");
+        for m in messages {
+            assert!(
+                m.get("reasoning_content").is_none(),
+                "outbound request leaked `reasoning_content` on message: {m}"
+            );
         }
     }
 }

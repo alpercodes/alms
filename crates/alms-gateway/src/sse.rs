@@ -195,6 +195,7 @@ impl SseEventData {
                 ok,
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
                 ts: Utc::now(),
             },
         )
@@ -665,6 +666,12 @@ struct RunFinishedData {
     ok: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Chain-of-thought tokens when the provider reports them separately
+    /// (OpenAI o-series via `usage.completion_tokens_details.reasoning_tokens`,
+    /// DeepSeek / xAI via flat `usage.reasoning_tokens`). Absent from the
+    /// wire when `None` so non-reasoning runs stay byte-identical to pre-#768.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_tokens: Option<u32>,
     ts: DateTime<Utc>,
 }
 

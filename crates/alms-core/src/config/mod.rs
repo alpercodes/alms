@@ -16,8 +16,9 @@ mod tests;
 
 pub use types::{
     AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, FsEditConfig, LlmConfig,
-    LoggingConfig, ProviderEntry, ProviderKind, ProviderQuirks, RunSummaryMode, ServerConfig,
-    SessionConfig, ShellClassificationMode, ShellPermissions, ShellSpillConfig, ToolsConfig,
+    LoggingConfig, OpenAiConfig, ProviderEntry, ProviderKind, ProviderQuirks, ReasoningEffort,
+    RunSummaryMode, ServerConfig, SessionConfig, ShellClassificationMode, ShellPermissions,
+    ShellSpillConfig, ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};

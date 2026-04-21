@@ -187,7 +187,10 @@ export function RunsTab() {
                             <span class="runs-tab-tools">${run.tool_call_count != null ? run.tool_call_count + ' tools' : ''}</span>
                             <span class="runs-tab-tokens">
                                 ${run.usage
-                                    ? fmtTokens(run.usage.prompt_tokens) + ' in / ' + fmtTokens(run.usage.completion_tokens) + ' out'
+                                    ? fmtTokens(run.usage.prompt_tokens) + ' in / ' + fmtTokens(run.usage.completion_tokens) + ' out' +
+                                        (typeof run.usage.reasoning_tokens === 'number' && run.usage.reasoning_tokens > 0
+                                            ? ' (+' + fmtTokens(run.usage.reasoning_tokens) + ' reasoning)'
+                                            : '')
                                     : ''}
                             </span>
                         </div>

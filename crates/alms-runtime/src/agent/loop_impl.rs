@@ -125,6 +125,13 @@ impl AgentRuntime {
             if self.config.anthropic_thinking_budget > 0 {
                 request = request.with_thinking_budget(self.config.anthropic_thinking_budget);
             }
+            // Attach the OpenAI-compat reasoning effort (#768). The
+            // adapter in `llm_client` strips it for non-OpenAI wire
+            // protocols, DeepSeek R1, and non-reasoning OpenAI models
+            // (see `is_openai_reasoning_model`).
+            if let Some(effort) = self.config.openai_reasoning_effort {
+                request = request.with_reasoning_effort(effort.as_wire_str());
+            }
 
             let StreamCallResult {
                 content,
@@ -140,6 +147,16 @@ impl AgentRuntime {
             if let Some(ref usage) = usage {
                 total_usage.prompt_tokens += usage.prompt_tokens;
                 total_usage.completion_tokens += usage.completion_tokens;
+                // Reasoning tokens (#768): OpenAI o-series nests the
+                // count under `completion_tokens_details.reasoning_tokens`
+                // while DeepSeek / xAI put it flat. `reasoning_tokens_effective`
+                // picks the first non-`None` of the two. Accumulate across
+                // iterations so the final `RunOutput.usage` reflects the
+                // sum over all turns of a run.
+                if let Some(r) = usage.reasoning_tokens_effective() {
+                    let acc = total_usage.reasoning_tokens.unwrap_or(0);
+                    total_usage.reasoning_tokens = Some(acc + r);
+                }
             }
 
             if let Some(tool_calls) = tool_calls {
@@ -847,6 +864,21 @@ impl AgentRuntime {
                             prompt_tokens: p,
                             completion_tokens: c,
                             total_tokens: p + c,
+                            // Reasoning tokens are captured from the
+                            // incoming chunk's effective count (nested or
+                            // flat — whichever the provider emits) and
+                            // persisted on the Usage; we take the max
+                            // across chunks for the same "report-once"
+                            // reason as prompt/completion.
+                            reasoning_tokens: {
+                                let prev_r = prev.reasoning_tokens_effective();
+                                let chunk_r = chunk_usage.reasoning_tokens_effective();
+                                match (prev_r, chunk_r) {
+                                    (Some(a), Some(b)) => Some(a.max(b)),
+                                    (a, b) => a.or(b),
+                                }
+                            },
+                            completion_tokens_details: None,
                         }
                     }
                     None => chunk_usage,
