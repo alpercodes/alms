@@ -1895,6 +1895,103 @@ mod tests {
         );
     }
 
+    /// When a response carries all three reasoning wire fields
+    /// simultaneously (the adversarial case where an OpenAI-compat
+    /// provider echoes both DeepSeek-style `reasoning_content` and
+    /// OpenAI-style `reasoning_summary` + `reasoning` on the same
+    /// message), the custom `Deserialize` impl on `LlmMessage` (see
+    /// `llm_types.rs:48-91`) must pick `reasoning_content` — it has
+    /// top priority in the canonical > summary > raw ordering. Pins
+    /// the priority rule against a future refactor that reorders the
+    /// match arms.
+    #[test]
+    fn test_openai_response_all_three_reasoning_fields_prefers_reasoning_content() {
+        let json = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "o3",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final",
+                    "reasoning_content": "canonical",
+                    "reasoning_summary": "summary",
+                    "reasoning": "raw"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.choices[0].message.reasoning_content.as_deref(),
+            Some("canonical"),
+            "reasoning_content must win over both reasoning_summary and reasoning"
+        );
+    }
+
+    /// An empty-string `reasoning_content` must fall through to
+    /// `reasoning_summary`, not be treated as a present-but-empty
+    /// value. The `.filter(|s| !s.is_empty())` call in the custom
+    /// `Deserialize` impl on `LlmMessage` (see `llm_types.rs:48-91`)
+    /// is the enforcement point; this test pins that behaviour. A
+    /// twin assertion covers the `reasoning_summary: ""` -> `reasoning`
+    /// fall-through to round out the empty-string ladder.
+    #[test]
+    fn test_openai_response_empty_reasoning_content_falls_through_to_summary() {
+        // `reasoning_content: ""` falls through to non-empty
+        // `reasoning_summary`.
+        let empty_content = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "o3",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final",
+                    "reasoning_content": "",
+                    "reasoning_summary": "summary text"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(empty_content).unwrap();
+        assert_eq!(
+            resp.choices[0].message.reasoning_content.as_deref(),
+            Some("summary text"),
+            "empty reasoning_content must fall through to reasoning_summary"
+        );
+
+        // Twin: `reasoning_summary: ""` falls through to non-empty
+        // `reasoning`, confirming the fall-through works at the
+        // second ladder rung too.
+        let empty_summary = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "o3",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final",
+                    "reasoning_summary": "",
+                    "reasoning": "raw trace"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(empty_summary).unwrap();
+        assert_eq!(
+            resp.choices[0].message.reasoning_content.as_deref(),
+            Some("raw trace"),
+            "empty reasoning_summary must fall through to reasoning"
+        );
+    }
+
     /// OpenAI o-series `usage.completion_tokens_details.reasoning_tokens`
     /// deserializes via the nested struct and is retrievable through
     /// `reasoning_tokens_effective`.
@@ -2002,6 +2099,57 @@ mod tests {
         assert_eq!(
             chunk.choices[0].delta.reasoning_content.as_deref(),
             Some("condensed")
+        );
+    }
+
+    /// Streaming counterpart to
+    /// `test_openai_response_all_three_reasoning_fields_prefers_reasoning_content`:
+    /// when a single SSE delta chunk carries all three reasoning
+    /// wire fields at once, the custom `Deserialize` impl on `Delta`
+    /// (see `llm_types.rs:445-483`) must select `reasoning_content`
+    /// per the canonical > summary > raw priority rule.
+    #[test]
+    fn test_openai_delta_all_three_reasoning_fields_prefers_reasoning_content() {
+        let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_content":"canonical","reasoning_summary":"summary","reasoning":"raw"},"finish_reason":null}]}"#;
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+            panic!("expected Chunk");
+        };
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("canonical"),
+            "reasoning_content must win in the delta over both reasoning_summary and reasoning"
+        );
+    }
+
+    /// Streaming counterpart to
+    /// `test_openai_response_empty_reasoning_content_falls_through_to_summary`:
+    /// an empty-string `reasoning_content` in a single SSE delta
+    /// must fall through to a non-empty `reasoning_summary`, with a
+    /// twin assertion that `reasoning_summary: ""` falls through to
+    /// `reasoning`. Pins the `.filter(|s| !s.is_empty())` behaviour
+    /// in the `Delta` custom `Deserialize` (see `llm_types.rs:445-483`).
+    #[test]
+    fn test_openai_delta_empty_reasoning_content_falls_through_to_summary() {
+        // Empty `reasoning_content` falls through to `reasoning_summary`.
+        let empty_content = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_content":"","reasoning_summary":"summary text"},"finish_reason":null}]}"#;
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(empty_content) else {
+            panic!("expected Chunk");
+        };
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("summary text"),
+            "empty reasoning_content must fall through to reasoning_summary in delta"
+        );
+
+        // Twin: empty `reasoning_summary` falls through to `reasoning`.
+        let empty_summary = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_summary":"","reasoning":"raw trace"},"finish_reason":null}]}"#;
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(empty_summary) else {
+            panic!("expected Chunk");
+        };
+        assert_eq!(
+            chunk.choices[0].delta.reasoning_content.as_deref(),
+            Some("raw trace"),
+            "empty reasoning_summary must fall through to reasoning in delta"
         );
     }
 
