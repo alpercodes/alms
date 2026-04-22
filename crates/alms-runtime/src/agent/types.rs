@@ -125,6 +125,18 @@ pub struct AgentConfig {
     /// (per-run > per-agent > server default from `[llm.anthropic]`).
     /// Silently ignored when the effective provider is not Anthropic.
     pub anthropic_thinking_budget: u32,
+    /// Anthropic prompt caching toggle (#766).
+    ///
+    /// Server-level only — no per-agent / per-run override per issue #766.
+    /// When `true`, the Anthropic adapter attaches `cache_control` markers
+    /// to the last tool and trailing system block on every request.
+    /// Defaults to `true` — prompt caching is free (Anthropic silently
+    /// ignores markers on prefixes below the minimum cacheable size), so
+    /// there's no downside to leaving it on.
+    ///
+    /// Populated from `[llm.anthropic].prompt_cache_enabled` in `alms.toml`
+    /// via the gateway's `AgentConfig` assembly. Inherited by subagents.
+    pub anthropic_prompt_cache_enabled: bool,
     /// OpenAI-compat reasoning effort (#768). Applies when the effective
     /// provider is OpenAI-compatible and the model is a reasoning model
     /// (OpenAI o-series, GPT-5, xAI Grok reasoning variants). The adapter
@@ -155,6 +167,10 @@ impl Default for AgentConfig {
             fs_edit_fuzzy_match: false,
             debug_mode: false,
             anthropic_thinking_budget: 0,
+            // Caching is on by default — matches `AnthropicConfig::default()`
+            // and is the right answer for every effective provider because
+            // non-Anthropic adapters ignore the flag entirely.
+            anthropic_prompt_cache_enabled: true,
             openai_reasoning_effort: None,
         }
     }

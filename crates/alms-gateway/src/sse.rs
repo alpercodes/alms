@@ -196,6 +196,11 @@ impl SseEventData {
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
                 reasoning_tokens: usage.reasoning_tokens,
+                // Cache tokens (#766) — only Anthropic populates these today;
+                // `skip_serializing_if` on the struct keeps the wire shape
+                // byte-identical to pre-#766 when unset.
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
                 ts: Utc::now(),
             },
         )
@@ -672,6 +677,15 @@ struct RunFinishedData {
     /// wire when `None` so non-reasoning runs stay byte-identical to pre-#768.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_tokens: Option<u32>,
+    /// Anthropic prompt caching (#766): tokens *written* to the cache on
+    /// this run. Absent from the wire when `None` so non-cached or
+    /// non-Anthropic runs stay byte-identical to pre-#766.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_creation_input_tokens: Option<u32>,
+    /// Anthropic prompt caching (#766): tokens *served from* the cache on
+    /// this run. Absent from the wire when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_read_input_tokens: Option<u32>,
     ts: DateTime<Utc>,
 }
 

@@ -14,6 +14,12 @@ use uuid::Uuid;
 /// providers (DeepSeek R1, xAI Grok) may or may not surface the split;
 /// when they don't, the field stays `None` and reasoning cost is
 /// implicitly folded into `completion_tokens`.
+///
+/// `cache_creation_input_tokens` / `cache_read_input_tokens` carry
+/// Anthropic prompt-caching metrics (#766). They are populated only when
+/// the effective provider is Anthropic AND `[llm.anthropic].prompt_cache_enabled`
+/// is on. Other providers always leave them as `None`. Both fields use
+/// `skip_serializing_if` so pre-#766 payloads remain byte-identical.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
@@ -22,6 +28,17 @@ pub struct TokenUsage {
     /// separately. `None` means "not reported" — NOT "zero".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u32>,
+    /// Anthropic prompt-caching: tokens written to the cache on this
+    /// request (billed at ~1.25x standard input rate, see Anthropic docs).
+    /// `None` when the provider does not report the field (non-Anthropic
+    /// providers, or Anthropic requests that did not carry cache markers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Anthropic prompt-caching: tokens served from the cache on this
+    /// request (billed at ~0.1x standard input rate). `None` when the
+    /// provider does not report the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// Discriminates tool call records: the LLM requesting a tool call vs. the
@@ -361,6 +378,79 @@ pub fn ran_ignore_message_successfully(records: &[ToolCallRecord]) -> bool {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    /// `TokenUsage` with no reasoning or cache fields set must serialize
+    /// byte-identically to the pre-#766/#768 shape. Relied on by the
+    /// SSE `run_finished` event and subagent-completion markers whose
+    /// `skip_serializing_if = "Option::is_none"` contract depends on
+    /// `None` fields being omitted entirely rather than emitted as
+    /// `null`.
+    #[test]
+    fn token_usage_serializes_without_optional_fields_when_none() {
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            reasoning_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        };
+        let value = serde_json::to_value(usage).unwrap();
+        let obj = value.as_object().unwrap();
+
+        // Required fields present.
+        assert_eq!(obj.get("prompt_tokens").and_then(|v| v.as_u64()), Some(100));
+        assert_eq!(
+            obj.get("completion_tokens").and_then(|v| v.as_u64()),
+            Some(50)
+        );
+        // Optional fields absent from the serialized JSON, NOT serialized
+        // as `null`.
+        assert!(
+            obj.get("reasoning_tokens").is_none(),
+            "reasoning_tokens must be skipped when None"
+        );
+        assert!(
+            obj.get("cache_creation_input_tokens").is_none(),
+            "cache_creation_input_tokens must be skipped when None"
+        );
+        assert!(
+            obj.get("cache_read_input_tokens").is_none(),
+            "cache_read_input_tokens must be skipped when None"
+        );
+        // Exactly the two required fields — no extras.
+        assert_eq!(
+            obj.len(),
+            2,
+            "pre-#766 shape has exactly prompt_tokens + completion_tokens when all optionals are None"
+        );
+    }
+
+    /// When cache fields ARE populated they surface on the wire under
+    /// their snake_case names. Pinned here so the SSE `run_finished`
+    /// data struct and subagent markers can rely on the shape.
+    #[test]
+    fn token_usage_serializes_cache_fields_when_some() {
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            reasoning_tokens: None,
+            cache_creation_input_tokens: Some(1500),
+            cache_read_input_tokens: Some(8200),
+        };
+        let value = serde_json::to_value(usage).unwrap();
+        assert_eq!(
+            value
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(1500)
+        );
+        assert_eq!(
+            value
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(8200)
+        );
+    }
 
     fn make_record(
         role: ToolCallRole,

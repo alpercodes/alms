@@ -190,6 +190,11 @@ export function RunsTab() {
                                     ? fmtTokens(run.usage.prompt_tokens) + ' in / ' + fmtTokens(run.usage.completion_tokens) + ' out' +
                                         (typeof run.usage.reasoning_tokens === 'number' && run.usage.reasoning_tokens > 0
                                             ? ' (+' + fmtTokens(run.usage.reasoning_tokens) + ' reasoning)'
+                                            : '') +
+                                        // Anthropic prompt caching (#766): show cache-read
+                                        // tokens when the run benefited from the cache.
+                                        (typeof run.usage.cache_read_input_tokens === 'number' && run.usage.cache_read_input_tokens > 0
+                                            ? ' (' + fmtTokens(run.usage.cache_read_input_tokens) + ' cached)'
                                             : '')
                                     : ''}
                             </span>

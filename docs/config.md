@@ -104,6 +104,65 @@ Anthropic counts thinking tokens inside `output_tokens` today, so the existing `
 
 ---
 
+## Anthropic prompt caching (issue #766)
+
+Anthropic's [prompt-caching feature](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching) lets the server cache stable request prefixes (system prompt, workspace files, tool definitions) for 5 minutes, then bill subsequent cache-hit requests at ~10% of the standard input-token rate. ALMS's Anthropic adapter attaches `cache_control: { type: "ephemeral" }` markers on the trailing system content block and the last tool definition whenever caching is enabled.
+
+```toml
+[llm.anthropic]
+prompt_cache_enabled = true   # default = true
+```
+
+Set to `false` to strip all cache markers — useful for diagnosing cache-related failures or if your upstream proxy does not honour Anthropic's `cache_control` shape.
+
+### Why two markers, not four?
+
+Anthropic supports up to four cache breakpoints per request. ALMS uses two:
+
+1. **Last tool definition** — caches the entire tools array.
+2. **Trailing system content block** — caches the full prefix through system + workspace + (optional episodic summary), because Anthropic caches up to *and including* each marker.
+
+Workspace files (personality / goals / memories) and episodic summaries are already concatenated into the system string by `agent::context::assemble_system_prompt` and `ContextBuilder::build_with_perspective` before the adapter sees them. Splitting them into separate content blocks for independent breakpoints would require a runtime refactor; the single trailing-system marker gives the full prefix a cache entry today with no per-turn churn.
+
+### Scope
+
+- **Server-level only.** No per-agent or per-run override — caching is a pure optimization with no downside, so there's no need for fine-grained control.
+- **Anthropic only.** Other provider adapters ignore the `prompt_cache_enabled` flag entirely. `TokenUsage.cache_creation_input_tokens` / `cache_read_input_tokens` stay `None` for them.
+- **5-minute TTL.** The 1-hour beta and Bedrock's `cachePoint` are out of scope for this pass.
+
+### Usage metrics
+
+Anthropic responses include two new usage fields when caching is active:
+
+- `cache_creation_input_tokens` — prefix tokens *written* to the cache on this request (billed at ~1.25× standard input rate).
+- `cache_read_input_tokens` — prefix tokens *served from* the cache on this request (billed at ~0.1×).
+
+Both are plumbed end-to-end:
+
+- Anthropic adapter (`anthropic.rs`) parses them from `AnthropicUsage` and populates the provider-neutral `Usage` struct.
+- Agent loop (`loop_impl.rs`) accumulates them into `TokenUsage` across multi-turn runs.
+- SSE `run_finished` event surfaces them on the wire (absent when `None`, matching the `skip_serializing_if` contract).
+- Subagent completion markers include them under `token_usage.cache_creation_input_tokens` / `cache_read_input_tokens`.
+- The web UI's runs tab shows `N cached` alongside input/output counts when `cache_read_input_tokens > 0`.
+
+### Correctness notes
+
+The cache only hits when the request prefix is byte-identical across turns. Two subtle requirements fall out:
+
+- **Tool ordering is deterministic.** The runtime's tool registry is a `DashMap` whose iteration order is non-deterministic, so `ToolRegistry::to_definitions()` sorts by canonical tool name. Adding or removing a tool via `[tools.enabled]` will invalidate the cache on the next turn (one miss, then steady-state hits resume).
+- **Non-caching wire parity.** With `prompt_cache_enabled = false`, the adapter emits the pre-#766 wire shape unchanged (plain-string `system`, no `cache_control` on tools). Enabling caching switches `system` to an array-of-blocks shape internally; this is Anthropic's supported alternative wire shape and is transparent to the model.
+
+### Minimum cacheable size
+
+Anthropic's documented minimum for `ephemeral` caching is 1024 input tokens (Sonnet/Haiku; older models require 2048). Below that, Anthropic *silently ignores* the cache marker — no error, no warning — and your request is billed as a normal non-cached request. This is fine; ALMS does not attempt to estimate prefix size before attaching markers, because:
+
+- The measurement would need to mirror Anthropic's tokenizer exactly.
+- Short prompts don't benefit from caching anyway, so "no-op below the threshold" is the correct behaviour.
+
+Expect cache hits to stay at zero on very short agent conversations; once you add workspace files or a long system prompt, the prefix crosses the threshold and metrics start flowing.
+
+---
+
 ## OpenAI-compat reasoning models (issue #768)
 
 OpenAI o-series (`o1`, `o3`, `o4-mini`), GPT-5, DeepSeek R1, and xAI Grok reasoning variants all produce chain-of-thought output in addition to the final assistant text. ALMS wires them through the same `ReasoningDelta` / collapsible UI panel used for Anthropic extended thinking, with a provider-family-specific knob to request a reasoning budget on the wire.

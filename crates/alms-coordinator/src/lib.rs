@@ -673,6 +673,8 @@ async fn run_subagent(
                             prompt_tokens: output.usage.prompt_tokens,
                             completion_tokens: output.usage.completion_tokens,
                             reasoning_tokens: output.usage.reasoning_tokens,
+                            cache_creation_input_tokens: output.usage.cache_creation_input_tokens,
+                            cache_read_input_tokens: output.usage.cache_read_input_tokens,
                         },
                     );
                 }
@@ -731,6 +733,8 @@ async fn run_subagent(
                     prompt_tokens: output.usage.prompt_tokens,
                     completion_tokens: output.usage.completion_tokens,
                     reasoning_tokens: output.usage.reasoning_tokens,
+                    cache_creation_input_tokens: output.usage.cache_creation_input_tokens,
+                    cache_read_input_tokens: output.usage.cache_read_input_tokens,
                 }),
             ),
             None => (None, None),
@@ -912,6 +916,9 @@ fn agent_config_for_subagent(
         prompts: base.prompts.clone(),
         debug_mode: false,
         anthropic_thinking_budget,
+        // Prompt caching (#766) — server-level only, inherited verbatim
+        // by subagents so they benefit from the same cached prefix.
+        anthropic_prompt_cache_enabled: base.anthropic_prompt_cache_enabled,
         openai_reasoning_effort,
     };
     (config, model, provider)
@@ -1726,6 +1733,48 @@ mod tests {
             sub_none.openai_reasoning_effort,
             Some(ReasoningEffort::High),
             "named subagent with None override inherits the parent's effort"
+        );
+    }
+
+    /// Issue #766: Anthropic prompt caching is a server-level toggle
+    /// inherited verbatim by subagents. A parent with caching disabled
+    /// produces subagents with caching disabled, and vice versa — no
+    /// per-subagent override path.
+    #[test]
+    fn test_subagent_inherits_anthropic_prompt_cache_enabled() {
+        // Parent has caching DISABLED.
+        let parent = AgentConfig {
+            anthropic_prompt_cache_enabled: false,
+            ..AgentConfig::default()
+        };
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert!(
+            !ephemeral.anthropic_prompt_cache_enabled,
+            "ephemeral subagents must inherit parent's disabled caching"
+        );
+
+        let record = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+        };
+        let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert!(
+            !named.anthropic_prompt_cache_enabled,
+            "named subagents must inherit parent's disabled caching"
+        );
+
+        // Parent has caching ENABLED (the default).
+        let enabled_parent = AgentConfig {
+            anthropic_prompt_cache_enabled: true,
+            ..AgentConfig::default()
+        };
+        let (sub, _, _) = agent_config_for_subagent(None, &enabled_parent);
+        assert!(
+            sub.anthropic_prompt_cache_enabled,
+            "subagents inherit enabled caching"
         );
     }
 

@@ -556,6 +556,12 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
             // Persisting a `reasoning_tokens` column to the `runs` table is a
             // follow-up that requires a schema migration.
             reasoning_tokens: None,
+            // Cache tokens (#766) are similarly not persisted on the
+            // `runs` table yet — they flow through the live SSE path and
+            // subagent completion markers, but a DB-level surface would
+            // need a schema migration.
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         }),
         _ => None,
     };

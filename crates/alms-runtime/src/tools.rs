@@ -172,9 +172,18 @@ impl ToolRegistry {
     /// Deduplicates by `tool.name()` so that aliases (e.g. "shell_exec" ->
     /// "shell") do not produce duplicate function definitions — OpenAI and
     /// other providers reject payloads with duplicate function names.
+    ///
+    /// **Stable ordering**: the underlying registry is a `DashMap` whose
+    /// iteration order is non-deterministic. Anthropic prompt caching
+    /// (#766) requires the tools array to serialize byte-identically
+    /// across turns for cache hits, so we sort the output by canonical
+    /// tool name. The sort is cheap (tool counts are small, O(n log n)
+    /// on <50 entries) and not observable to the LLM beyond the cache
+    /// win — tool ordering has no effect on tool selection.
     pub fn to_definitions(&self) -> Vec<crate::llm_types::ToolDefinition> {
         let mut seen = HashSet::new();
-        self.registry
+        let mut defs: Vec<_> = self
+            .registry
             .list()
             .into_iter()
             .filter_map(|name| {
@@ -188,7 +197,9 @@ impl ToolRegistry {
                         .with_parameters(tool.parameters()),
                 )
             })
-            .collect()
+            .collect();
+        defs.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        defs
     }
 
     /// Check whether a tool is auto-approved (bypasses approval in guarded posture).
@@ -221,5 +232,48 @@ impl ToolRegistry {
                     AlmsError::ToolExecution(other.to_string())
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #766 correctness: `to_definitions()` must return the tools
+    /// array in a deterministic, name-sorted order. The underlying
+    /// registry is a `DashMap` whose iteration order is arbitrary;
+    /// Anthropic prompt caching requires the tools wire shape to be
+    /// byte-identical across turns for cache hits.
+    #[test]
+    fn test_to_definitions_is_sorted_by_name() {
+        // Use the builtin registry — it provides a representative set
+        // (>10 tools) without requiring custom Tool fixtures.
+        let reg = ToolRegistry::with_builtins();
+        let defs = reg.to_definitions();
+
+        let names: Vec<&str> = defs.iter().map(|d| d.function.name.as_str()).collect();
+        assert!(
+            names.len() >= 2,
+            "builtin registry must have at least two tools for this test to be meaningful"
+        );
+
+        // Sorted — adjacent entries must be in ascending order.
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "to_definitions() must return tools in sorted name order for cache-stability"
+        );
+
+        // Deterministic — two successive calls produce the same output.
+        let defs_again = reg.to_definitions();
+        let names_again: Vec<&str> = defs_again
+            .iter()
+            .map(|d| d.function.name.as_str())
+            .collect();
+        assert_eq!(
+            names, names_again,
+            "to_definitions() must produce the same ordering across calls"
+        );
     }
 }

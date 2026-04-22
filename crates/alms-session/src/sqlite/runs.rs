@@ -196,6 +196,8 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         );
 
@@ -271,6 +273,8 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         );
         let completed_id = completed_run.run_id;
@@ -345,6 +349,8 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         );
         store.save_run(&run).unwrap();

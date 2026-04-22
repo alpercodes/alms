@@ -1681,6 +1681,8 @@ fn test_streaming_usage_accumulation() {
         total_tokens: 150,
         reasoning_tokens: None,
         completion_tokens_details: None,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
     };
     let second = Usage {
         prompt_tokens: 0,
@@ -1688,6 +1690,8 @@ fn test_streaming_usage_accumulation() {
         total_tokens: 75,
         reasoning_tokens: None,
         completion_tokens_details: None,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
     };
 
     // Replicate the accumulation logic from stream_llm_call
@@ -1702,6 +1706,8 @@ fn test_streaming_usage_accumulation() {
             total_tokens: 0,
             reasoning_tokens: None,
             completion_tokens_details: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
         None => chunk_usage,
     });
@@ -1718,6 +1724,8 @@ fn test_streaming_usage_accumulation() {
             total_tokens: 0,
             reasoning_tokens: None,
             completion_tokens_details: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
         None => chunk_usage,
     });
@@ -1751,6 +1759,8 @@ fn test_usage_reasoning_tokens_effective_priority() {
         completion_tokens_details: Some(crate::llm_types::CompletionTokensDetails {
             reasoning_tokens: Some(15),
         }),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
     };
     assert_eq!(u.reasoning_tokens_effective(), Some(15));
 
@@ -1761,6 +1771,8 @@ fn test_usage_reasoning_tokens_effective_priority() {
         total_tokens: 30,
         reasoning_tokens: Some(7),
         completion_tokens_details: None,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
     };
     assert_eq!(u.reasoning_tokens_effective(), Some(7));
 
@@ -1771,6 +1783,8 @@ fn test_usage_reasoning_tokens_effective_priority() {
         total_tokens: 30,
         reasoning_tokens: None,
         completion_tokens_details: None,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
     };
     assert!(u.reasoning_tokens_effective().is_none());
 }

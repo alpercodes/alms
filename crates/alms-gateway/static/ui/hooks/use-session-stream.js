@@ -1061,6 +1061,11 @@ export function openSessionStream(sessionId, opts) {
                         // xAI); stays undefined for non-reasoning runs and the
                         // TokenBadge hides it in that case.
                         reasoning_tokens: data.reasoning_tokens,
+                        // Cache metrics (#766) — Anthropic-only; absent on
+                        // other providers. TokenBadge and runs-tab hide
+                        // them when undefined.
+                        cache_creation_input_tokens: data.cache_creation_input_tokens,
+                        cache_read_input_tokens: data.cache_read_input_tokens,
                     }
                     : data.usage;
                 if (usage) {

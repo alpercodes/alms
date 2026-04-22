@@ -282,6 +282,19 @@ pub struct CompletionRequest {
     /// `alms.toml` for the server-default knob. (#768)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Opt-in to Anthropic prompt caching (#766).
+    ///
+    /// Consumed by the Anthropic adapter in [`crate::anthropic`] — when
+    /// `Some(true)`, the adapter attaches `cache_control` markers to the
+    /// last tool definition and the trailing system content block. Other
+    /// providers ignore the field.
+    ///
+    /// Populated by the agent loop from the server's
+    /// `[llm.anthropic].prompt_cache_enabled` config value. Never
+    /// serialized on the wire as-is — the adapter reads it and rewrites
+    /// the outgoing shape.
+    #[serde(skip)]
+    pub prompt_cache_enabled: Option<bool>,
 }
 
 impl CompletionRequest {
@@ -296,6 +309,7 @@ impl CompletionRequest {
             stream_options: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            prompt_cache_enabled: None,
         }
     }
 
@@ -334,6 +348,16 @@ impl CompletionRequest {
     /// when the field is actually emitted on the wire. (#768)
     pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
         self.reasoning_effort = Some(effort.into());
+        self
+    }
+
+    /// Enable Anthropic prompt caching for this request (#766).
+    ///
+    /// The Anthropic adapter reads this flag and attaches `cache_control`
+    /// markers to the last tool definition and the trailing system block.
+    /// Other provider adapters ignore the field.
+    pub fn with_prompt_cache_enabled(mut self, enabled: bool) -> Self {
+        self.prompt_cache_enabled = Some(enabled);
         self
     }
 }
@@ -389,6 +413,16 @@ pub struct Usage {
     /// Absent on DeepSeek / xAI payloads; hence `Option`.
     #[serde(default)]
     pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// Anthropic prompt caching (#766): tokens *written* to the cache on
+    /// this request. Populated only by the Anthropic adapter; other
+    /// providers leave it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Anthropic prompt caching (#766): tokens *served from* the cache on
+    /// this request. Populated only by the Anthropic adapter; other
+    /// providers leave it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 impl Usage {

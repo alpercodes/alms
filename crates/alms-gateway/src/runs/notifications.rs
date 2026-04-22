@@ -475,6 +475,15 @@ pub(crate) async fn completion_notification_loop(
                 if let Some(rt) = usage.reasoning_tokens {
                     token_usage["reasoning_tokens"] = serde_json::json!(rt);
                 }
+                // Cache tokens (#766) only appear for Anthropic subagents.
+                // Same skip-when-None contract as reasoning_tokens — keeps
+                // non-Anthropic markers byte-identical to pre-#766.
+                if let Some(cc) = usage.cache_creation_input_tokens {
+                    token_usage["cache_creation_input_tokens"] = serde_json::json!(cc);
+                }
+                if let Some(cr) = usage.cache_read_input_tokens {
+                    token_usage["cache_read_input_tokens"] = serde_json::json!(cr);
+                }
                 meta["token_usage"] = token_usage;
             }
 

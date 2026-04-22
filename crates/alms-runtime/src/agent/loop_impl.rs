@@ -190,6 +190,11 @@ impl AgentRuntime {
             if let Some(effort) = self.config.openai_reasoning_effort {
                 request = request.with_reasoning_effort(effort.as_wire_str());
             }
+            // Attach the Anthropic prompt-caching flag (#766). The
+            // Anthropic adapter emits `cache_control` markers on the
+            // trailing system block and the trailing tool when `true`;
+            // other providers ignore the field entirely.
+            request = request.with_prompt_cache_enabled(self.config.anthropic_prompt_cache_enabled);
 
             let StreamCallResult {
                 content,
@@ -214,6 +219,21 @@ impl AgentRuntime {
                 if let Some(r) = usage.reasoning_tokens_effective() {
                     let acc = total_usage.reasoning_tokens.unwrap_or(0);
                     total_usage.reasoning_tokens = Some(acc + r);
+                }
+                // Cache tokens (#766): Anthropic-only today. Accumulate
+                // across iterations so a multi-turn run surfaces its full
+                // cache creation + read counts in `RunOutput.usage`.
+                // Once any iteration reports cache metrics, the
+                // accumulator becomes `Some(n)` — zero is meaningful
+                // (cache miss on that turn) and distinct from `None`
+                // (provider did not report the field at all).
+                if let Some(c) = usage.cache_creation_input_tokens {
+                    let acc = total_usage.cache_creation_input_tokens.unwrap_or(0);
+                    total_usage.cache_creation_input_tokens = Some(acc + c);
+                }
+                if let Some(c) = usage.cache_read_input_tokens {
+                    let acc = total_usage.cache_read_input_tokens.unwrap_or(0);
+                    total_usage.cache_read_input_tokens = Some(acc + c);
                 }
             }
 
@@ -941,6 +961,25 @@ impl AgentRuntime {
                                 }
                             },
                             completion_tokens_details: None,
+                            // Cache tokens (#766) — same "report-once"
+                            // semantics as prompt/completion. Anthropic
+                            // emits the creation count on `message_start`
+                            // and repeats it on `message_delta`; max()
+                            // across chunks handles either order.
+                            cache_creation_input_tokens: match (
+                                prev.cache_creation_input_tokens,
+                                chunk_usage.cache_creation_input_tokens,
+                            ) {
+                                (Some(a), Some(b)) => Some(a.max(b)),
+                                (a, b) => a.or(b),
+                            },
+                            cache_read_input_tokens: match (
+                                prev.cache_read_input_tokens,
+                                chunk_usage.cache_read_input_tokens,
+                            ) {
+                                (Some(a), Some(b)) => Some(a.max(b)),
+                                (a, b) => a.or(b),
+                            },
                         }
                     }
                     None => chunk_usage,

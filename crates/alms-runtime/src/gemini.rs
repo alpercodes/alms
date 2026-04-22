@@ -527,6 +527,10 @@ pub(crate) fn from_gemini_response(resp: GeminiResponse) -> CompletionResponse {
         },
         reasoning_tokens: None,
         completion_tokens_details: None,
+        // Cache metrics are Anthropic-specific (#766). Gemini does not
+        // report prompt-caching counts through this surface; always None.
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
     });
 
     CompletionResponse {
@@ -667,6 +671,10 @@ pub(crate) fn parse_gemini_sse(data: &str) -> SseParseResult {
         },
         reasoning_tokens: None,
         completion_tokens_details: None,
+        // Cache metrics are Anthropic-specific (#766). Gemini does not
+        // report prompt-caching counts through this surface; always None.
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: None,
     });
 
     // Nothing to emit (e.g. empty heartbeat event) — skip.

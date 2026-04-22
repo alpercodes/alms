@@ -209,6 +209,8 @@ async fn test_run_finished_no_reasoning_tokens_field_when_absent() {
             prompt_tokens: 100,
             completion_tokens: 200,
             reasoning_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     ))
     .unwrap();
@@ -242,6 +244,8 @@ async fn test_run_finished_emits_reasoning_tokens_when_present() {
             prompt_tokens: 150,
             completion_tokens: 80,
             reasoning_tokens: Some(1024),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         },
     ))
     .unwrap();
@@ -252,6 +256,74 @@ async fn test_run_finished_emits_reasoning_tokens_when_present() {
     assert_eq!(data["prompt_tokens"], 150);
     assert_eq!(data["completion_tokens"], 80);
     assert_eq!(data["reasoning_tokens"], 1024);
+}
+
+/// Issue #766: Anthropic prompt-caching metrics flow through the SSE
+/// `run_finished` event when populated. Absent from the wire when `None`
+/// so non-Anthropic runs stay byte-identical to pre-#766.
+#[tokio::test]
+async fn test_run_finished_emits_cache_tokens_when_present() {
+    let (tx, mut rx) = event_channel();
+    let run_id = RunId::new();
+
+    tx.send(SseEventData::run_finished(
+        run_id,
+        true,
+        TokenUsage {
+            prompt_tokens: 42,
+            completion_tokens: 7,
+            reasoning_tokens: None,
+            cache_creation_input_tokens: Some(1500),
+            cache_read_input_tokens: Some(8200),
+        },
+    ))
+    .unwrap();
+
+    let event = rx.recv().await.unwrap();
+    assert_eq!(event.event_type, "run_finished");
+    let data = &event.data;
+    assert_eq!(data["prompt_tokens"], 42);
+    assert_eq!(data["completion_tokens"], 7);
+    assert_eq!(data["cache_creation_input_tokens"], 1500);
+    assert_eq!(data["cache_read_input_tokens"], 8200);
+    // reasoning_tokens was None — must not be on the wire.
+    assert!(
+        data.get("reasoning_tokens").is_none(),
+        "reasoning_tokens should still be absent when None alongside cache fields"
+    );
+}
+
+/// When cache tokens are `None` (non-Anthropic runs, or Anthropic runs
+/// with caching disabled), the fields must be absent from the wire
+/// entirely — matches the pre-#766 byte shape.
+#[tokio::test]
+async fn test_run_finished_cache_tokens_absent_when_none() {
+    let (tx, mut rx) = event_channel();
+    let run_id = RunId::new();
+
+    tx.send(SseEventData::run_finished(
+        run_id,
+        true,
+        TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 200,
+            reasoning_tokens: None,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        },
+    ))
+    .unwrap();
+
+    let event = rx.recv().await.unwrap();
+    let data = &event.data;
+    assert!(
+        data.get("cache_creation_input_tokens").is_none(),
+        "cache_creation_input_tokens must be absent when None; got: {data:?}"
+    );
+    assert!(
+        data.get("cache_read_input_tokens").is_none(),
+        "cache_read_input_tokens must be absent when None; got: {data:?}"
+    );
 }
 
 /// Tests the pre-start cancellation path where `run_cancelled` is emitted

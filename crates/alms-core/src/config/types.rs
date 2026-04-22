@@ -199,7 +199,7 @@ impl Default for LlmConfig {
 /// Fields here are the server-level defaults. Agents can opt in or out
 /// individually via [`crate::registry::AgentRecord::thinking_budget_tokens`],
 /// and an individual run can override either via the run-create API.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AnthropicConfig {
     /// Extended-thinking budget in tokens. `0` disables extended thinking
@@ -216,6 +216,36 @@ pub struct AnthropicConfig {
     /// back (Anthropic's standard mode doesn't require it), so this value
     /// only affects what's emitted in the current response.
     pub thinking_budget_tokens: u32,
+    /// Enable Anthropic prompt caching (#766).
+    ///
+    /// When `true` (the default), every Anthropic request attaches
+    /// `cache_control: { type: "ephemeral" }` markers to the last tool
+    /// definition and the trailing system content block. Anthropic
+    /// caches the prefix up to each marker for 5 minutes; subsequent
+    /// requests whose prefix matches byte-for-byte are served from
+    /// cache at ~10% of standard input-token cost.
+    ///
+    /// Setting `false` strips all cache markers — use this to diagnose
+    /// cache-related failures or if your upstream proxy does not honour
+    /// Anthropic's cache-control shape.
+    ///
+    /// Server-level only — no per-agent or per-run override. Prompt
+    /// caching is a pure optimization; toggling it mid-session only
+    /// costs one cache miss on the next turn.
+    pub prompt_cache_enabled: bool,
+}
+
+impl Default for AnthropicConfig {
+    fn default() -> Self {
+        Self {
+            thinking_budget_tokens: 0,
+            // Caching defaults to on — it's free when the prefix is below
+            // Anthropic's minimum cacheable size (they silently ignore
+            // markers on short prefixes) and saves input tokens on the
+            // common case of long system prompts + stable tool lists.
+            prompt_cache_enabled: true,
+        }
+    }
 }
 
 /// Reasoning effort level for OpenAI-compatible reasoning models (#768).

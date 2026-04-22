@@ -94,6 +94,9 @@ impl GatewayConfig {
                 // overridden per-agent in the registry and per-run in
                 // the run-create API.
                 anthropic_thinking_budget: config.llm.anthropic.thinking_budget_tokens,
+                // Anthropic prompt caching (#766) — server-level only,
+                // no per-agent / per-run override per issue #766.
+                anthropic_prompt_cache_enabled: config.llm.anthropic.prompt_cache_enabled,
                 // Server-default OpenAI-compat reasoning effort (#768) —
                 // three-layer precedence (per-run > per-agent > server).
                 openai_reasoning_effort: config.llm.openai.reasoning_effort,

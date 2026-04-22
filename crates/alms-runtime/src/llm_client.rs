@@ -514,6 +514,8 @@ impl LlmClient {
                 total_tokens: 0,
                 reasoning_tokens: None,
                 completion_tokens_details: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             }),
         }
     }
@@ -564,6 +566,8 @@ impl LlmClient {
                         total_tokens: 0,
                         reasoning_tokens: None,
                         completion_tokens_details: None,
+                        cache_creation_input_tokens: None,
+                        cache_read_input_tokens: None,
                     })
                 } else {
                     None

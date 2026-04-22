@@ -16,8 +16,13 @@ use serde_json::Value;
 pub(crate) struct AnthropicRequest {
     pub model: String,
     pub messages: Vec<AnthropicMessage>,
+    /// Anthropic system prompt — either a plain string or an array of
+    /// typed content blocks. We emit the array form whenever prompt
+    /// caching (#766) is enabled so the trailing block can carry a
+    /// `cache_control` marker; otherwise we keep the plain-string form
+    /// for wire parity with pre-#766 requests.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system: Option<String>,
+    pub system: Option<AnthropicSystem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<AnthropicTool>>,
     pub max_tokens: u32,
@@ -30,6 +35,69 @@ pub(crate) struct AnthropicRequest {
     /// `"thinking": {"type": "enabled", "budget_tokens": N}`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<AnthropicThinking>,
+}
+
+/// Anthropic's `system` field shape (#766).
+///
+/// The API accepts either a plain string or an array of typed content
+/// blocks — when caching is enabled we need the array form so the last
+/// block can carry a `cache_control` marker. The two variants serialise
+/// untagged (string-or-array), matching Anthropic's documented shape.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(crate) enum AnthropicSystem {
+    /// Plain string — used when prompt caching is disabled. Byte-identical
+    /// to the pre-#766 request shape.
+    Text(String),
+    /// Array of content blocks — used when prompt caching is enabled so
+    /// the trailing block can carry `cache_control`.
+    Blocks(Vec<AnthropicSystemBlock>),
+}
+
+/// A single system content block in the array-shaped system field.
+///
+/// `type == "text"` is the only shape Anthropic accepts inside `system`
+/// today. `cache_control` is attached only to the *last* block in the
+/// array when caching is enabled.
+#[derive(Debug, Serialize)]
+pub(crate) struct AnthropicSystemBlock {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+/// Anthropic cache-control marker (#766).
+///
+/// Currently the only documented `type` is `"ephemeral"` (5-minute TTL).
+/// Kept as a tagged struct so a future 1-hour `type` can land as a
+/// non-breaking shape evolution.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct CacheControl {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+}
+
+impl CacheControl {
+    const fn ephemeral() -> Self {
+        Self { kind: "ephemeral" }
+    }
+}
+
+impl AnthropicSystem {
+    /// Return the raw text of a string-shaped system field, for callers
+    /// (chiefly tests and logs) that want to assert on the system prompt
+    /// without caring about the array-of-blocks shape. Returns `None` for
+    /// the array-shaped variant; those callers should pattern-match on
+    /// `Blocks` directly.
+    #[cfg(test)]
+    pub(crate) fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(s) => Some(s.as_str()),
+            Self::Blocks(_) => None,
+        }
+    }
 }
 
 /// Anthropic extended-thinking request field.
@@ -97,6 +165,11 @@ pub(crate) struct AnthropicTool {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
+    /// Prompt-caching marker (#766). Attached only to the *last* tool in
+    /// the array when prompt caching is enabled, and absent otherwise so
+    /// non-caching requests stay byte-identical to pre-#766.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 // ---------------------------------------------------------------------------
@@ -119,6 +192,16 @@ pub(crate) struct AnthropicUsage {
     #[serde(default)]
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Prompt-caching metric (#766): tokens *written* to the cache on
+    /// this request. Anthropic omits the field when caching is not in
+    /// play; `#[serde(default)]` keeps it at `None` so older responses
+    /// continue to parse.
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Prompt-caching metric (#766): tokens *served from* the cache on
+    /// this request. Same defaulting semantics as the creation field.
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -324,18 +407,73 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
         messages.iter().map(|m| m.role.as_str()).collect::<Vec<_>>()
     );
 
+    // Prompt caching (#766): when enabled, emit `cache_control` markers
+    // on the trailing system block and the trailing tool so Anthropic
+    // caches the full stable prefix (tools + system + workspace +
+    // optional episodic summary) for 5 minutes. Opt-in via
+    // `CompletionRequest.prompt_cache_enabled` — absent or false keeps
+    // the pre-#766 wire shape byte-identical.
+    //
+    // Why two markers and not four (per issue #766's "up to 4
+    // breakpoints" note)?
+    // - Anthropic caching is prefix-based: marking the *last* system
+    //   block caches the full prefix up to and including that block
+    //   (tools + every prior system block). Marking the last tool
+    //   caches the tools prefix. Two markers cover the entire stable
+    //   prefix; the remaining two breakpoints would only be useful for
+    //   independent caching of workspace files or the episodic summary,
+    //   which requires threading them through as separate
+    //   `LlmMessage::system` blocks — a refactor outside this PR. See
+    //   the PR body for the trade-off.
+    // - The adapter sees workspace files already concatenated into the
+    //   first `LlmMessage::system` by `agent::context::assemble_system_prompt`,
+    //   and the episodic summary (when present) added as a second
+    //   `LlmMessage::system` by `ContextBuilder::build_with_perspective`.
+    //   A single marker on the last of those caches all of it.
+    let cache_enabled = req.prompt_cache_enabled.unwrap_or(false);
+
     let system = if system_parts.is_empty() {
         None
+    } else if cache_enabled {
+        // Array form — attach `cache_control` to the trailing block so
+        // the whole system prefix becomes a cache breakpoint.
+        let last_idx = system_parts.len() - 1;
+        let blocks: Vec<AnthropicSystemBlock> = system_parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, text)| AnthropicSystemBlock {
+                kind: "text",
+                text,
+                cache_control: if i == last_idx {
+                    Some(CacheControl::ephemeral())
+                } else {
+                    None
+                },
+            })
+            .collect();
+        Some(AnthropicSystem::Blocks(blocks))
     } else {
-        Some(system_parts.join("\n\n"))
+        // Pre-#766 wire shape — plain string. Preserves byte-parity for
+        // requests made with caching disabled.
+        Some(AnthropicSystem::Text(system_parts.join("\n\n")))
     };
 
     let tools = req.tools.as_ref().map(|defs| {
+        let last_idx = defs.len().saturating_sub(1);
         defs.iter()
-            .map(|d| AnthropicTool {
+            .enumerate()
+            .map(|(i, d)| AnthropicTool {
                 name: d.function.name.clone(),
                 description: d.function.description.clone(),
                 input_schema: d.function.parameters.clone(),
+                cache_control: if cache_enabled && i == last_idx && !defs.is_empty() {
+                    // Anthropic caches the full tools array when any
+                    // tool in it carries `cache_control`. Marking the
+                    // last one is the recommended placement.
+                    Some(CacheControl::ephemeral())
+                } else {
+                    None
+                },
             })
             .collect()
     });
@@ -482,6 +620,12 @@ pub(crate) fn from_anthropic_response(resp: AnthropicResponse) -> CompletionResp
             // thinking" usage docs.
             reasoning_tokens: None,
             completion_tokens_details: None,
+            // Prompt-caching metrics (#766) — flow through unchanged
+            // from the Anthropic wire usage into the provider-neutral
+            // `Usage` shape. `None` when the response does not include
+            // them (non-cached requests, non-Anthropic providers).
+            cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: resp.usage.cache_read_input_tokens,
         }),
     }
 }
@@ -640,6 +784,14 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                         total_tokens: u.input_tokens + u.output_tokens,
                         reasoning_tokens: None,
                         completion_tokens_details: None,
+                        // Cache metrics (#766) — `message_delta` carries
+                        // authoritative cache counts (repeated from
+                        // `message_start` on Anthropic's side). The
+                        // stream accumulator in `loop_impl.rs` takes the
+                        // max across chunks for the same "report-once"
+                        // reason as prompt/completion.
+                        cache_creation_input_tokens: u.cache_creation_input_tokens,
+                        cache_read_input_tokens: u.cache_read_input_tokens,
                     });
                     if usage.is_some() {
                         SseParseResult::Chunk(StreamChunk {
@@ -684,6 +836,12 @@ pub(crate) fn parse_anthropic_sse(event_type: &str, data: &str) -> SseParseResul
                                 total_tokens: msg.usage.input_tokens + msg.usage.output_tokens,
                                 reasoning_tokens: None,
                                 completion_tokens_details: None,
+                                // Cache metrics (#766) — `message_start`
+                                // carries usage counts for the prompt
+                                // side (no output yet). `message_delta`
+                                // later carries completion-side counts.
+                                cache_creation_input_tokens: msg.usage.cache_creation_input_tokens,
+                                cache_read_input_tokens: msg.usage.cache_read_input_tokens,
                             }),
                         })
                     } else {
@@ -718,7 +876,10 @@ mod tests {
         let anthropic_req = to_anthropic_request(&req);
 
         assert_eq!(anthropic_req.model, "claude-sonnet-4-20250514");
-        assert_eq!(anthropic_req.system.as_deref(), Some("You are helpful."));
+        assert_eq!(
+            anthropic_req.system.as_ref().and_then(|s| s.as_text()),
+            Some("You are helpful.")
+        );
         assert_eq!(anthropic_req.messages.len(), 1);
         assert_eq!(anthropic_req.messages[0].role, "user");
         assert_eq!(anthropic_req.max_tokens, 1024);
@@ -763,6 +924,8 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         };
 
@@ -790,6 +953,8 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 20,
                 output_tokens: 10,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         };
 
@@ -1149,6 +1314,8 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: 20,
                 output_tokens: 30,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
             },
         };
 
@@ -1212,5 +1379,306 @@ mod tests {
         let body = serde_json::to_value(&anthropic_req).unwrap();
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], 4096);
+    }
+
+    // -----------------------------------------------------------------
+    // Prompt caching (#766)
+    // -----------------------------------------------------------------
+
+    /// Baseline: when `prompt_cache_enabled` is unset (or `Some(false)`),
+    /// the serialized request body must be byte-identical to the
+    /// pre-#766 shape — plain string `system`, no `cache_control` on
+    /// tools, usage field shapes unchanged.
+    #[test]
+    fn test_cache_disabled_request_has_no_cache_markers() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514")
+            .with_messages(vec![
+                LlmMessage::system("You are helpful."),
+                LlmMessage::user("hi"),
+            ])
+            .with_tools(vec![
+                ToolDefinition::new("echo", "Echo text"),
+                ToolDefinition::new("shell", "Run a shell command"),
+            ])
+            .with_max_tokens(1024);
+
+        let areq = to_anthropic_request(&req);
+        let body = serde_json::to_value(&areq).unwrap();
+
+        // `system` serializes as a plain string.
+        assert!(
+            body["system"].is_string(),
+            "cache disabled: system must serialize as plain string for byte parity with pre-#766; got {body}"
+        );
+        assert_eq!(body["system"], "You are helpful.");
+
+        // No tool has `cache_control`.
+        let tools = body["tools"].as_array().expect("tools array");
+        for (i, t) in tools.iter().enumerate() {
+            assert!(
+                t.get("cache_control").is_none(),
+                "cache disabled: tool[{i}] must not carry cache_control; got {t}"
+            );
+        }
+    }
+
+    /// With caching enabled and a single system message + tools, we emit
+    /// exactly two `cache_control` markers: one on the trailing system
+    /// block, one on the last tool.
+    #[test]
+    fn test_cache_enabled_emits_two_markers_with_system_and_tools() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514")
+            .with_messages(vec![
+                LlmMessage::system("You are helpful.\n\n## Memories\nLikes Rust."),
+                LlmMessage::user("hi"),
+            ])
+            .with_tools(vec![
+                ToolDefinition::new("echo", "Echo"),
+                ToolDefinition::new("shell", "Shell"),
+                ToolDefinition::new("fs_read", "Read files"),
+            ])
+            .with_max_tokens(1024)
+            .with_prompt_cache_enabled(true);
+
+        let areq = to_anthropic_request(&req);
+        let body = serde_json::to_value(&areq).unwrap();
+
+        // System is now an array of blocks with the trailing block
+        // carrying cache_control.
+        let system = body["system"].as_array().expect("system array");
+        assert_eq!(system.len(), 1, "one system block for system+workspace");
+        assert_eq!(
+            system[0]["cache_control"]["type"], "ephemeral",
+            "trailing system block must carry ephemeral cache marker"
+        );
+
+        // Tools: only the last one has cache_control.
+        let tools = body["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 3);
+        assert!(
+            tools[0].get("cache_control").is_none(),
+            "first tool must not be marked"
+        );
+        assert!(
+            tools[1].get("cache_control").is_none(),
+            "middle tool must not be marked"
+        );
+        assert_eq!(
+            tools[2]["cache_control"]["type"], "ephemeral",
+            "last tool must be marked ephemeral"
+        );
+    }
+
+    /// When both a system prompt AND an episodic summary are injected
+    /// (two `LlmMessage::system` blocks before any user turn), only the
+    /// *last* system block carries a cache marker — the earlier blocks
+    /// are still cached by prefix relationship. This models what the
+    /// context builder produces when episodic summaries are enabled.
+    #[test]
+    fn test_cache_enabled_marks_only_last_system_block_of_many() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514")
+            .with_messages(vec![
+                LlmMessage::system("You are helpful."),
+                LlmMessage::system("## Episodic\nPrevious: discussed Rust."),
+                LlmMessage::user("continue"),
+            ])
+            .with_max_tokens(1024)
+            .with_prompt_cache_enabled(true);
+
+        let areq = to_anthropic_request(&req);
+        let body = serde_json::to_value(&areq).unwrap();
+
+        let system = body["system"].as_array().expect("system array");
+        assert_eq!(system.len(), 2, "two system blocks kept separate");
+        assert!(
+            system[0].get("cache_control").is_none(),
+            "first system block must NOT be marked"
+        );
+        assert_eq!(
+            system[1]["cache_control"]["type"], "ephemeral",
+            "last system block must be marked"
+        );
+    }
+
+    /// No tools configured on the request: the adapter must not emit a
+    /// bare `tools: []` with a cache_control on the nonexistent last
+    /// tool, and must not panic. (Guards the `saturating_sub(1)` arith
+    /// on `defs.len()`.)
+    #[test]
+    fn test_cache_enabled_no_tools_emits_no_tool_marker() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514")
+            .with_messages(vec![
+                LlmMessage::system("You are helpful."),
+                LlmMessage::user("hi"),
+            ])
+            .with_max_tokens(1024)
+            .with_prompt_cache_enabled(true);
+
+        let areq = to_anthropic_request(&req);
+        let body = serde_json::to_value(&areq).unwrap();
+
+        // No `tools` key on the wire at all — matches pre-#766 shape.
+        assert!(
+            body.get("tools").is_none()
+                || body["tools"].as_array().map(Vec::is_empty).unwrap_or(false),
+            "no tools must not produce a tools array: {body}"
+        );
+    }
+
+    /// The adapter must emit cache_control on exactly the tool at index
+    /// `len - 1`, regardless of tools vector size. Probes the offset
+    /// logic directly.
+    #[test]
+    fn test_cache_enabled_single_tool_is_marked() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514")
+            .with_messages(vec![LlmMessage::user("hi")])
+            .with_tools(vec![ToolDefinition::new("only_tool", "only")])
+            .with_max_tokens(1024)
+            .with_prompt_cache_enabled(true);
+
+        let areq = to_anthropic_request(&req);
+        let body = serde_json::to_value(&areq).unwrap();
+
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0]["cache_control"]["type"], "ephemeral",
+            "single-tool case: that one tool is the trailing one"
+        );
+    }
+
+    /// Issue #766 correctness invariant: the adapter must emit an
+    /// identical request body for two calls with the same input. This
+    /// is the property that makes Anthropic's cache-prefix matching
+    /// work at all — bitwise drift across turns evicts the cache.
+    #[test]
+    fn test_cache_enabled_produces_deterministic_wire_shape() {
+        let build = || {
+            CompletionRequest::new("claude-sonnet-4-20250514")
+                .with_messages(vec![
+                    LlmMessage::system("stable system prompt"),
+                    LlmMessage::user("hi"),
+                ])
+                .with_tools(vec![
+                    ToolDefinition::new("b_tool", "b"),
+                    ToolDefinition::new("a_tool", "a"),
+                    ToolDefinition::new("c_tool", "c"),
+                ])
+                .with_max_tokens(1024)
+                .with_prompt_cache_enabled(true)
+        };
+
+        let a = serde_json::to_string(&to_anthropic_request(&build())).unwrap();
+        let b = serde_json::to_string(&to_anthropic_request(&build())).unwrap();
+        assert_eq!(
+            a, b,
+            "two adapter calls with identical input must serialise byte-identically"
+        );
+    }
+
+    /// Anthropic response with cache metrics populates the
+    /// provider-neutral `Usage` fields. `TokenUsage` plumbing then
+    /// surfaces the same values at the run level; this test pins the
+    /// adapter boundary.
+    #[test]
+    fn test_anthropic_response_cache_usage_parsed() {
+        let resp = AnthropicResponse {
+            id: "msg_cache".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+            model: "claude-sonnet-4-20250514".to_string(),
+            stop_reason: Some("end_turn".to_string()),
+            usage: AnthropicUsage {
+                input_tokens: 42,
+                output_tokens: 7,
+                cache_creation_input_tokens: Some(1500),
+                cache_read_input_tokens: Some(8200),
+            },
+        };
+
+        let completion = from_anthropic_response(resp);
+        let usage = completion.usage.expect("usage present");
+        assert_eq!(usage.cache_creation_input_tokens, Some(1500));
+        assert_eq!(usage.cache_read_input_tokens, Some(8200));
+    }
+
+    /// Streaming `message_start` and `message_delta` events carry cache
+    /// metrics. Verify both paths deserialize into the provider-neutral
+    /// `Usage` shape.
+    #[test]
+    fn test_anthropic_sse_cache_usage_parsed_on_message_start() {
+        let data = r#"{
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "content": [],
+                "model": "claude-sonnet-4-20250514",
+                "stop_reason": null,
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": 1500,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        }"#;
+        let result = parse_anthropic_sse("message_start", data);
+        match result {
+            SseParseResult::Chunk(chunk) => {
+                let usage = chunk.usage.expect("usage present");
+                assert_eq!(usage.cache_creation_input_tokens, Some(1500));
+                assert_eq!(usage.cache_read_input_tokens, Some(0));
+            }
+            other => panic!(
+                "expected Chunk with cache usage, got: {:?}",
+                std::mem::discriminant(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_sse_cache_usage_parsed_on_message_delta() {
+        let data = r#"{
+            "type": "message_delta",
+            "delta": {
+                "type": "message_delta",
+                "stop_reason": "end_turn"
+            },
+            "usage": {
+                "output_tokens": 42,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 9500
+            }
+        }"#;
+        let result = parse_anthropic_sse("message_delta", data);
+        match result {
+            SseParseResult::Chunk(chunk) => {
+                let usage = chunk.usage.expect("usage present");
+                assert_eq!(usage.completion_tokens, 42);
+                assert_eq!(usage.cache_creation_input_tokens, Some(0));
+                assert_eq!(usage.cache_read_input_tokens, Some(9500));
+            }
+            other => panic!("expected Chunk, got: {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    /// Older Anthropic responses and non-cached requests omit the cache
+    /// fields entirely. Verify that `AnthropicUsage` still deserializes
+    /// without them and the provider-neutral Usage has `None`.
+    #[test]
+    fn test_anthropic_response_without_cache_fields_deserializes() {
+        let raw = r#"{
+            "id": "msg_no_cache",
+            "content": [{"type": "text", "text": "hi"}],
+            "model": "claude-sonnet-4-20250514",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 2}
+        }"#;
+        let resp: AnthropicResponse = serde_json::from_str(raw).unwrap();
+        let completion = from_anthropic_response(resp);
+        let usage = completion.usage.expect("usage present");
+        assert!(usage.cache_creation_input_tokens.is_none());
+        assert!(usage.cache_read_input_tokens.is_none());
     }
 }

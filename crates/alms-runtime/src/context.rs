@@ -2508,7 +2508,7 @@ mod tests {
         ]);
         let areq = to_anthropic_request(&req);
         assert_eq!(
-            areq.system.as_deref(),
+            areq.system.as_ref().and_then(|s| s.as_text()),
             Some("You are helpful."),
             "single system prefix must be extracted to top-level system"
         );
