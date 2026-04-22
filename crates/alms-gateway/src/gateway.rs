@@ -100,6 +100,14 @@ impl GatewayConfig {
                 // Server-default OpenAI-compat reasoning effort (#768) —
                 // three-layer precedence (per-run > per-agent > server).
                 openai_reasoning_effort: config.llm.openai.reasoning_effort,
+                // Server-default Gemini thinking budget (#769) — three-layer
+                // precedence mirrors Anthropic/OpenAI. Silently ignored
+                // when the effective provider is not Gemini.
+                gemini_thinking_budget: config.llm.gemini.thinking_budget,
+                // Gemini context caching (#769) — server-level only,
+                // no per-agent / per-run override per issue #769.
+                gemini_cache_enabled: config.llm.gemini.cache_enabled,
+                gemini_cache_ttl_seconds: config.llm.gemini.cache_ttl_seconds,
                 ..AgentConfig::default()
             },
             session_config: SessionConfig {

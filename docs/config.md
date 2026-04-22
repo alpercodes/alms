@@ -127,15 +127,15 @@ Workspace files (personality / goals / memories) and episodic summaries are alre
 ### Scope
 
 - **Server-level only.** No per-agent or per-run override — caching is a pure optimization with no downside, so there's no need for fine-grained control.
-- **Anthropic only.** Other provider adapters ignore the `prompt_cache_enabled` flag entirely. `TokenUsage.cache_creation_input_tokens` / `cache_read_input_tokens` stay `None` for them.
+- **Anthropic only for the `prompt_cache_enabled` flag and `cache_creation_input_tokens`.** Other provider adapters ignore `prompt_cache_enabled` entirely, and `cache_creation_input_tokens` stays `None` for them. `cache_read_input_tokens` is **provider-neutral** — it is shared with Gemini (#769), which reports `cachedContentTokenCount` through the same field. See the Gemini section below for details.
 - **5-minute TTL.** The 1-hour beta and Bedrock's `cachePoint` are out of scope for this pass.
 
 ### Usage metrics
 
 Anthropic responses include two new usage fields when caching is active:
 
-- `cache_creation_input_tokens` — prefix tokens *written* to the cache on this request (billed at ~1.25× standard input rate).
-- `cache_read_input_tokens` — prefix tokens *served from* the cache on this request (billed at ~0.1×).
+- `cache_creation_input_tokens` — prefix tokens *written* to the cache on this request (billed at ~1.25× standard input rate). **Anthropic-specific**; stays `None` on Gemini (which has no separate creation-side counter).
+- `cache_read_input_tokens` — prefix tokens *served from* the cache on this request (billed at ~0.1× on Anthropic). **Provider-neutral field**, historically named after Anthropic's wire shape but reused by Gemini (#769) to surface `cachedContentTokenCount`. When operators see this field populated in a `run_finished` event, disambiguate by cross-referencing `llm.provider` or the run's model name.
 
 Both are plumbed end-to-end:
 
@@ -347,10 +347,53 @@ region — the default is `https://generativelanguage.googleapis.com/v1beta`.
 Gemini authenticates via the `x-goog-api-key` header (preferred over the
 `?key=` query parameter because it keeps the secret out of URL logs).
 
-**Known gaps** (tracked for future work):
-- Context caching — Gemini-specific feature, not yet wired.
-- Thinking/reasoning token passthrough — not yet surfaced.
-- Multimodal input (image / audio / video parts) — not yet supported.
+### Gemini context caching + thinking (issue #769)
+
+Gemini's [context-caching feature](https://ai.google.dev/gemini-api/docs/caching) caches the stable request prefix (system instruction + tool definitions) as a REST resource and bills subsequent requests that reference it at a discounted rate. Gemini 2.5+ also supports [extended thinking](https://ai.google.dev/gemini-api/docs/thinking) via `generationConfig.thinkingConfig.thinkingBudget`. ALMS wires both through `[llm.gemini]`:
+
+```toml
+[llm.gemini]
+cache_enabled      = true    # default = true
+cache_ttl_seconds  = 300     # default = 300 (5 minutes)
+thinking_budget    = 4096    # default = unset (disabled)
+```
+
+#### Context caching
+
+When `cache_enabled = true`, the Gemini adapter creates a `cachedContents` resource on the first turn of each session whose stable prefix crosses Gemini's minimum cacheable size, and references the returned cache name via `cachedContent: "cachedContents/<id>"` on subsequent turns. The cache is reused until the TTL expires or the stable prefix (system instruction + tool definitions) changes.
+
+Set `cache_enabled = false` to skip cache creation entirely — useful for diagnosing cache-related failures, running on a Gemini project without caching enabled, or when the stable prefix churns faster than the TTL.
+
+**Minimum cacheable size.** Gemini caching requires at least **32,768 input tokens** in the cached prefix. Requests below that threshold are rejected by `cachedContents.create` with a "too small" error; ALMS remembers the rejection per-session+prefix (a `TooSmall` sentinel) to avoid creating a cache on every turn. Most ALMS sessions do not hit this floor until workspace files or the system prompt become substantial — operators running small agents will see `cache_read_input_tokens` stay `None`, which is the correct behaviour. This is a much higher floor than Anthropic's 1,024-token minimum.
+
+**TTL.** `cache_ttl_seconds` is sent as the `ttl` field when creating a cache entry. Gemini enforces the TTL server-side; ALMS does not track expiry client-side. When Gemini returns a cache-not-found error on a subsequent `generateContent` / `streamGenerateContent` request (the referenced cache was GC'd or TTL'd), the adapter transparently invalidates the stored handle and retries the same request once without `cachedContent`. Neither the agent loop nor the operator sees the retry — cache reuse is best-effort.
+
+**Prefix-hash invalidation.** Alongside each cache name, the in-process cache store keeps a hash of the exact JSON bytes that went into the cache (system instruction + tool definitions). On every turn the store re-hashes the current prefix; a mismatch (workspace file edited, tool list changed, system prompt rewritten) drops the stored handle and creates a fresh cache on the next turn. There's no operator knob for this — the hash comparison is automatic.
+
+**Server-level only.** Caching is a pure optimization — no per-agent or per-run override. Subagents inherit the parent's `cache_enabled` / `cache_ttl_seconds` verbatim so they share cache entries wherever possible.
+
+#### Thinking passthrough
+
+Setting `thinking_budget = N` with `N > 0` emits `generationConfig.thinkingConfig: { thinkingBudget: N, includeThoughts: true }` on every Gemini request. The provider streams parts with `thought: true` alongside the visible text; ALMS routes those into the same provider-neutral `RuntimeEvent::ReasoningDelta` channel used by Anthropic extended thinking (#767) and OpenAI o-series reasoning (#768). The web UI renders them in the same collapsible reasoning panel.
+
+**Server default only in this pass** — `[llm.gemini].thinking_budget` in `alms.toml` is the sole knob today. Per-agent and per-run overrides (mirroring how #767 wired Anthropic `thinking_budget_tokens` and #768 wired OpenAI `reasoning_effort`) are reserved for a follow-up — the `CompletionRequest::gemini_thinking_budget` field and the adapter wire-emission are already in place, so the follow-up only needs to thread the value through the CLI (`alms agent create --gemini-thinking-budget`) and the run-create API. `Some(0)` at the server layer is an explicit opt-out. Non-Gemini providers silently ignore the field.
+
+Like Anthropic thinking, reasoning text is **not** replayed back to the model on follow-up turns — it's persisted as `reasoning_blocks` metadata on the assistant message so it survives page reload.
+
+#### Usage metrics
+
+Two new fields flow end-to-end:
+
+- `usageMetadata.thoughtsTokenCount` → `TokenUsage.reasoning_tokens` (same slot used by DeepSeek / xAI via the flat-field path; OpenAI o-series uses the nested `completion_tokens_details.reasoning_tokens` shape — both coalesce through `Usage::reasoning_tokens_effective()`).
+- `usageMetadata.cachedContentTokenCount` → `TokenUsage.cache_read_input_tokens` (**shared surface with Anthropic** — both providers' "tokens served from cache" metric flows through the same field; Gemini has no separate creation-side counter, so `cache_creation_input_tokens` stays `None` for Gemini turns).
+
+Both fields surface on the SSE `run_finished` event, `GET /runs/{run_id}`, subagent completion markers, and the runs-tab UI — same plumbing the Anthropic caching metrics use. When caching is disabled or the prefix is below the 32k-token minimum, `cache_read_input_tokens` stays `None` — zero would be ambiguous with "cache miss on a request that had a marker".
+
+#### Out of scope
+
+- **Implicit caching** — Gemini automatically caches prefixes in some tiers. That path is free (no API call to create, no request field to attach); the metrics still flow through `cachedContentTokenCount` as usual, so operators who rely on implicit caching see the savings on `cache_read_input_tokens` without any ALMS config change.
+- **Multimodal caching** (cached images, audio, video) — will land when ALMS adds multimodal input.
+- **Interleaved thinking replay** — Gemini, like Anthropic, has a beta mode where prior thinking must be replayed on tool-use turns. Out of scope.
 
 ---
 

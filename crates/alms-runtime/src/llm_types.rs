@@ -295,6 +295,48 @@ pub struct CompletionRequest {
     /// the outgoing shape.
     #[serde(skip)]
     pub prompt_cache_enabled: Option<bool>,
+    /// Gemini thinking budget, in tokens (#769).
+    ///
+    /// Consumed by the Gemini adapter — when `Some(n)` with `n > 0`, the
+    /// adapter injects `generationConfig.thinkingConfig: { thinkingBudget: n,
+    /// includeThoughts: true }` into the outgoing request. `None` or
+    /// `Some(0)` disables extended thinking. Other providers ignore the
+    /// field.
+    ///
+    /// Populated by the agent loop from the server's
+    /// `[llm.gemini].thinking_budget` config value (with the three-layer
+    /// precedence chain applied by the gateway). Never serialized on the
+    /// wire as-is.
+    #[serde(skip)]
+    pub gemini_thinking_budget: Option<u32>,
+    /// Opt-in to Gemini explicit context caching (#769).
+    ///
+    /// Consumed by the Gemini adapter — when `Some(true)`, the adapter
+    /// looks up or creates a `cachedContents` resource keyed by
+    /// `session_id` + prefix hash, and references it on subsequent turns
+    /// via `cachedContent: "cachedContents/<id>"`. `None` or `Some(false)`
+    /// skips the cache interaction entirely. Other providers ignore the
+    /// field.
+    ///
+    /// Populated by the agent loop from the server's
+    /// `[llm.gemini].cache_enabled` config value.
+    #[serde(skip)]
+    pub gemini_cache_enabled: Option<bool>,
+    /// Gemini cache TTL in seconds (#769). Sent as `ttl` when creating a
+    /// new `cachedContents` entry. `None` falls back to Gemini's server
+    /// default (1 hour). Ignored when `gemini_cache_enabled` is not
+    /// `Some(true)` and by non-Gemini providers.
+    #[serde(skip)]
+    pub gemini_cache_ttl_seconds: Option<u64>,
+    /// Session ID for provider-scoped caches (#769).
+    ///
+    /// Gemini's context-caching adapter uses this as the key in the
+    /// in-process cache map so that two concurrent sessions don't share
+    /// a cache handle (prefixes differ per agent/session). `None`
+    /// disables cache reuse across turns, which falls back to the
+    /// no-cache behaviour.
+    #[serde(skip)]
+    pub session_id: Option<alms_core::SessionId>,
 }
 
 impl CompletionRequest {
@@ -310,6 +352,10 @@ impl CompletionRequest {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             prompt_cache_enabled: None,
+            gemini_thinking_budget: None,
+            gemini_cache_enabled: None,
+            gemini_cache_ttl_seconds: None,
+            session_id: None,
         }
     }
 
@@ -358,6 +404,32 @@ impl CompletionRequest {
     /// Other provider adapters ignore the field.
     pub fn with_prompt_cache_enabled(mut self, enabled: bool) -> Self {
         self.prompt_cache_enabled = Some(enabled);
+        self
+    }
+
+    /// Set the Gemini thinking budget (#769). See [`Self::gemini_thinking_budget`].
+    pub fn with_gemini_thinking_budget(mut self, budget: u32) -> Self {
+        self.gemini_thinking_budget = Some(budget);
+        self
+    }
+
+    /// Enable Gemini explicit context caching for this request (#769).
+    /// See [`Self::gemini_cache_enabled`].
+    pub fn with_gemini_cache_enabled(mut self, enabled: bool) -> Self {
+        self.gemini_cache_enabled = Some(enabled);
+        self
+    }
+
+    /// Set the Gemini cache TTL in seconds (#769). See [`Self::gemini_cache_ttl_seconds`].
+    pub fn with_gemini_cache_ttl(mut self, secs: u64) -> Self {
+        self.gemini_cache_ttl_seconds = Some(secs);
+        self
+    }
+
+    /// Attach a session ID so provider-scoped caches can key off it (#769).
+    /// See [`Self::session_id`].
+    pub fn with_session_id(mut self, id: alms_core::SessionId) -> Self {
+        self.session_id = Some(id);
         self
     }
 }
@@ -418,9 +490,22 @@ pub struct Usage {
     /// providers leave it as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
-    /// Anthropic prompt caching (#766): tokens *served from* the cache on
-    /// this request. Populated only by the Anthropic adapter; other
-    /// providers leave it as `None`.
+    /// Prompt caching: tokens *served from* the cache on this request.
+    ///
+    /// **Provider-neutral field.** The name is historically Anthropic-coloured
+    /// (mirrors Anthropic's wire field) but this slot is shared across
+    /// providers that report "tokens served from cache". When an operator
+    /// sees this populated in a `run_finished` event, the provider can be
+    /// disambiguated via `llm.provider` on the run config or the run's
+    /// model name.
+    ///
+    /// - Anthropic (#766): populated from the response's
+    ///   `cache_read_input_tokens` field.
+    /// - Gemini (#769): populated from `usageMetadata.cachedContentTokenCount`
+    ///   when a `cachedContents` entry was referenced.
+    ///
+    /// `None` for non-caching providers, or when caching was disabled /
+    /// missed on this request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u32>,
 }

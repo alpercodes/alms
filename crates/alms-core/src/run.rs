@@ -16,10 +16,16 @@ use uuid::Uuid;
 /// implicitly folded into `completion_tokens`.
 ///
 /// `cache_creation_input_tokens` / `cache_read_input_tokens` carry
-/// Anthropic prompt-caching metrics (#766). They are populated only when
-/// the effective provider is Anthropic AND `[llm.anthropic].prompt_cache_enabled`
-/// is on. Other providers always leave them as `None`. Both fields use
-/// `skip_serializing_if` so pre-#766 payloads remain byte-identical.
+/// prompt-caching metrics. `cache_creation_input_tokens` is Anthropic-only
+/// (#766) — Gemini does not distinguish creation cost from input cost in
+/// its `usage` surface. `cache_read_input_tokens` is shared across
+/// providers: Anthropic populates it from `cache_read_input_tokens` on
+/// cache-hit responses; Gemini populates it from
+/// `usageMetadata.cachedContentTokenCount` when a `cachedContents` entry
+/// is referenced via `cachedContent: "cachedContents/<id>"` (#769).
+/// Both providers leave the fields as `None` when caching is disabled or
+/// not applicable. All fields use `skip_serializing_if` so pre-#766
+/// payloads remain byte-identical.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
@@ -34,9 +40,21 @@ pub struct TokenUsage {
     /// providers, or Anthropic requests that did not carry cache markers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
-    /// Anthropic prompt-caching: tokens served from the cache on this
-    /// request (billed at ~0.1x standard input rate). `None` when the
-    /// provider does not report the field.
+    /// Prompt-caching: tokens served from the cache on this request.
+    ///
+    /// **Provider-neutral field.** The name is historically Anthropic-coloured
+    /// but this slot is shared across providers that report "tokens served
+    /// from cache". Operators seeing this populated in a `run_finished`
+    /// event should cross-reference `llm.provider` or the run's model name
+    /// to disambiguate which provider's cache served the tokens.
+    ///
+    /// - Anthropic (#766): billed at ~0.1x standard input rate; populated
+    ///   from the `cache_read_input_tokens` field on the response.
+    /// - Gemini (#769): populated from `usageMetadata.cachedContentTokenCount`
+    ///   when a `cachedContents` entry is referenced.
+    ///
+    /// `None` when the provider does not report the field (cache disabled,
+    /// cache miss on a request without markers, or non-caching provider).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_input_tokens: Option<u32>,
 }

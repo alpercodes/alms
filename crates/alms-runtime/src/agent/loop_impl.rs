@@ -196,6 +196,22 @@ impl AgentRuntime {
             // other providers ignore the field entirely.
             request = request.with_prompt_cache_enabled(self.config.anthropic_prompt_cache_enabled);
 
+            // Attach Gemini knobs (#769): the thinking budget routes
+            // into `generationConfig.thinkingConfig` when non-zero, and
+            // the caching flag / TTL / session_id let the Gemini adapter
+            // create & reference a `cachedContents` resource for the
+            // stable prefix. All four are silently ignored by non-Gemini
+            // providers.
+            if let Some(budget) = self.config.gemini_thinking_budget
+                && budget > 0
+            {
+                request = request.with_gemini_thinking_budget(budget);
+            }
+            request = request
+                .with_gemini_cache_enabled(self.config.gemini_cache_enabled)
+                .with_gemini_cache_ttl(self.config.gemini_cache_ttl_seconds)
+                .with_session_id(session_id);
+
             let StreamCallResult {
                 content,
                 reasoning,

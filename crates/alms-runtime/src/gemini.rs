@@ -44,6 +44,19 @@ pub(crate) struct GeminiRequest {
     pub tools: Option<Vec<GeminiTool>>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
     pub generation_config: Option<GenerationConfig>,
+    /// Explicit context cache reference (#769). When set, Gemini serves
+    /// the cached prefix (systemInstruction + tools + optional contents)
+    /// at the discounted cache-read rate and bills only `contents[]`
+    /// not covered by the cache as normal input tokens.
+    ///
+    /// Populated by the LLM client after calling `cachedContents.create`
+    /// for the session's stable prefix. Value shape: `cachedContents/<id>`.
+    /// Omitted when caching is disabled, the prefix is below Gemini's
+    /// minimum cacheable size (32,768 tokens), or no session_id was
+    /// attached to the request. Serialized via `skip_serializing_if` so
+    /// pre-#769 payloads remain byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cachedContent")]
+    pub cached_content: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,11 +73,28 @@ pub(crate) struct GeminiContent {
 /// Serialized as an **untagged** union — Gemini expects `{text: "..."}`,
 /// `{functionCall: {...}}`, or `{functionResponse: {...}}`, never a tag
 /// field. Deserialization relies on the presence of the discriminating key.
+///
+/// Text parts may carry a `thought: true` marker (#769) when extended
+/// thinking is enabled — those parts carry the model's internal
+/// reasoning trace and should be routed through `RuntimeEvent::ReasoningDelta`
+/// rather than appended to the user-visible content stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum GeminiPart {
     Text {
         text: String,
+        /// When `true`, this text part is an extended-thinking chunk
+        /// (Gemini 2.5+). Only emitted when the request included
+        /// `generationConfig.thinkingConfig.includeThoughts: true`.
+        /// Adapter routes these into the provider-neutral reasoning
+        /// channel; they are NEVER replayed to the model on follow-up
+        /// turns (standard-mode thinking, matching Anthropic behaviour).
+        ///
+        /// `#[serde(default, skip_serializing_if = "std::ops::Not::not")]`
+        /// keeps non-thought parts serializing to `{"text":"..."}` with
+        /// no `thought` field — byte parity with pre-#769 payloads.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        thought: bool,
     },
     FunctionCall {
         #[serde(rename = "functionCall")]
@@ -125,6 +155,26 @@ pub(crate) struct GenerationConfig {
     pub max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Extended-thinking configuration for Gemini 2.5+ (#769). Omitted
+    /// when the caller did not set `gemini_thinking_budget` on the
+    /// request, preserving byte parity with pre-#769 payloads.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
+    pub thinking_config: Option<ThinkingConfig>,
+}
+
+/// Gemini extended-thinking request configuration (#769).
+///
+/// Serializes to `{"thinkingBudget": N, "includeThoughts": true}` when
+/// the caller opts in via [`CompletionRequest::gemini_thinking_budget`].
+/// `includeThoughts: true` is required for the provider to emit
+/// `thought: true` parts in the response — without it the model still
+/// thinks but the trace is hidden.
+#[derive(Debug, Serialize, Default)]
+pub(crate) struct ThinkingConfig {
+    #[serde(rename = "thinkingBudget")]
+    pub thinking_budget: u32,
+    #[serde(rename = "includeThoughts")]
+    pub include_thoughts: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +209,20 @@ pub(crate) struct UsageMetadata {
     pub candidates_token_count: u32,
     #[serde(default, rename = "totalTokenCount")]
     pub total_token_count: u32,
+    /// Tokens spent on extended thinking (#769). Reported separately from
+    /// `candidatesTokenCount` by Gemini 2.5+ when `thinkingConfig.thinkingBudget`
+    /// is non-zero. Routed into the provider-neutral `Usage::reasoning_tokens`
+    /// field so UIs that already render reasoning counts for Anthropic /
+    /// OpenAI also work for Gemini.
+    #[serde(default, rename = "thoughtsTokenCount")]
+    pub thoughts_token_count: Option<u32>,
+    /// Tokens served from a `cachedContents` entry (#769). Populated when
+    /// the request referenced a cache via `cachedContent: "cachedContents/<id>"`.
+    /// Threaded through `Usage::cache_read_input_tokens` so the surface
+    /// matches Anthropic's cache-read metric semantically (both are
+    /// "input tokens served from cache").
+    #[serde(default, rename = "cachedContentTokenCount")]
+    pub cached_content_token_count: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -245,7 +309,10 @@ pub(crate) fn to_gemini_request(req: &CompletionRequest) -> GeminiRequest {
                 };
                 contents.push(GeminiContent {
                     role: Some("user".to_string()),
-                    parts: vec![GeminiPart::Text { text }],
+                    parts: vec![GeminiPart::Text {
+                        text,
+                        thought: false,
+                    }],
                 });
             }
             "assistant" => {
@@ -253,7 +320,10 @@ pub(crate) fn to_gemini_request(req: &CompletionRequest) -> GeminiRequest {
                 if let Some(ref text) = msg.content
                     && !text.is_empty()
                 {
-                    parts.push(GeminiPart::Text { text: text.clone() });
+                    parts.push(GeminiPart::Text {
+                        text: text.clone(),
+                        thought: false,
+                    });
                 }
                 if let Some(ref tool_calls) = msg.tool_calls {
                     for tc in tool_calls {
@@ -398,6 +468,7 @@ pub(crate) fn to_gemini_request(req: &CompletionRequest) -> GeminiRequest {
             role: None,
             parts: vec![GeminiPart::Text {
                 text: system_parts.join("\n\n"),
+                thought: false,
             }],
         })
     };
@@ -417,20 +488,40 @@ pub(crate) fn to_gemini_request(req: &CompletionRequest) -> GeminiRequest {
         }]
     });
 
-    let generation_config = if req.max_tokens.is_some() || req.temperature.is_some() {
-        Some(GenerationConfig {
-            max_output_tokens: req.max_tokens,
-            temperature: req.temperature,
-        })
-    } else {
-        None
+    // Thinking config (#769): only emit when a non-zero budget is set.
+    // `Some(0)` is treated as "explicit off" — no `thinkingConfig` on the
+    // wire, byte-identical to pre-#769 payloads.
+    let thinking_config = match req.gemini_thinking_budget {
+        Some(n) if n > 0 => Some(ThinkingConfig {
+            thinking_budget: n,
+            include_thoughts: true,
+        }),
+        _ => None,
     };
+
+    let generation_config =
+        if req.max_tokens.is_some() || req.temperature.is_some() || thinking_config.is_some() {
+            Some(GenerationConfig {
+                max_output_tokens: req.max_tokens,
+                temperature: req.temperature,
+                thinking_config,
+            })
+        } else {
+            None
+        };
 
     GeminiRequest {
         contents,
         system_instruction,
         tools,
         generation_config,
+        // `cached_content` is populated by the LLM client *after* this
+        // adapter function returns — the client inspects the outgoing
+        // request body (system_instruction + tools), resolves / creates
+        // the Gemini cache for the session, and rewrites this field
+        // before dispatch. Leaving it `None` here keeps the adapter
+        // reentrant and testable in isolation.
+        cached_content: None,
     }
 }
 
@@ -464,6 +555,7 @@ fn merge_consecutive_roles(contents: &mut Vec<GeminiContent>) {
 /// Convert a `GeminiResponse` to an internal `CompletionResponse`.
 pub(crate) fn from_gemini_response(resp: GeminiResponse) -> CompletionResponse {
     let mut text_parts: Vec<String> = Vec::new();
+    let mut thought_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let finish_reason_raw = resp
         .candidates
@@ -479,8 +571,16 @@ pub(crate) fn from_gemini_response(resp: GeminiResponse) -> CompletionResponse {
     {
         for part in content.parts {
             match part {
-                GeminiPart::Text { text } => {
-                    text_parts.push(text);
+                GeminiPart::Text { text, thought } => {
+                    if thought {
+                        // Extended-thinking chunk (#769). Accumulate into
+                        // the reasoning bucket so downstream code routes
+                        // it through `RuntimeEvent::ReasoningDelta` —
+                        // never append to user-visible `content`.
+                        thought_parts.push(text);
+                    } else {
+                        text_parts.push(text);
+                    }
                 }
                 GeminiPart::FunctionCall { function_call } => {
                     synthetic_id_counter += 1;
@@ -525,12 +625,19 @@ pub(crate) fn from_gemini_response(resp: GeminiResponse) -> CompletionResponse {
         } else {
             u.prompt_token_count + u.candidates_token_count
         },
-        reasoning_tokens: None,
+        // Extended-thinking tokens (#769) — Gemini reports them separately
+        // under `thoughtsTokenCount`. Surfaced on the flat `reasoning_tokens`
+        // field (same shape as DeepSeek / xAI) so the existing
+        // `reasoning_tokens_effective()` accumulator in the agent loop
+        // picks them up without provider-specific branches.
+        reasoning_tokens: u.thoughts_token_count,
         completion_tokens_details: None,
-        // Cache metrics are Anthropic-specific (#766). Gemini does not
-        // report prompt-caching counts through this surface; always None.
+        // Gemini has no "cache creation" counter — cache creation cost
+        // is rolled into `promptTokenCount` on the create-cache call.
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        // Tokens served from cache (#769) — Anthropic & Gemini share this
+        // surface per the generalization in `TokenUsage::cache_read_input_tokens`.
+        cache_read_input_tokens: u.cached_content_token_count,
     });
 
     CompletionResponse {
@@ -547,7 +654,16 @@ pub(crate) fn from_gemini_response(resp: GeminiResponse) -> CompletionResponse {
                 } else {
                     Some(text_parts.join(""))
                 },
-                reasoning_content: None,
+                // Extended-thinking trace (#769) — the concatenation of
+                // every `thought: true` part. Downstream `effective_content()`
+                // falls back to this when visible `content` is empty, and
+                // the agent loop surfaces it on the `reasoning` sideband
+                // (never replayed to future LLM calls).
+                reasoning_content: if thought_parts.is_empty() {
+                    None
+                } else {
+                    Some(thought_parts.join(""))
+                },
                 tool_calls: if tool_calls.is_empty() {
                     None
                 } else {
@@ -597,6 +713,7 @@ pub(crate) fn parse_gemini_sse(data: &str) -> SseParseResult {
     };
 
     let mut content_text: Option<String> = None;
+    let mut reasoning_text: Option<String> = None;
     let mut tool_call_deltas: Vec<ToolCallDelta> = Vec::new();
     let mut finish_reason: Option<String> = None;
     let mut synthetic_id_counter: usize = 0;
@@ -611,10 +728,18 @@ pub(crate) fn parse_gemini_sse(data: &str) -> SseParseResult {
 
         if let Some(content) = cand.content {
             let mut text_acc = String::new();
+            let mut thought_acc = String::new();
             for part in content.parts {
                 match part {
-                    GeminiPart::Text { text } => {
-                        text_acc.push_str(&text);
+                    GeminiPart::Text { text, thought } => {
+                        if thought {
+                            // Route thinking deltas into the reasoning
+                            // sideband — same pipeline as Anthropic
+                            // `thinking_delta` / OpenAI `reasoning_content`.
+                            thought_acc.push_str(&text);
+                        } else {
+                            text_acc.push_str(&text);
+                        }
                     }
                     GeminiPart::FunctionCall { function_call } => {
                         synthetic_id_counter += 1;
@@ -645,6 +770,9 @@ pub(crate) fn parse_gemini_sse(data: &str) -> SseParseResult {
             if !text_acc.is_empty() {
                 content_text = Some(text_acc);
             }
+            if !thought_acc.is_empty() {
+                reasoning_text = Some(thought_acc);
+            }
         }
     }
 
@@ -669,16 +797,20 @@ pub(crate) fn parse_gemini_sse(data: &str) -> SseParseResult {
         } else {
             u.prompt_token_count + u.candidates_token_count
         },
-        reasoning_tokens: None,
+        // Gemini reports thinking tokens separately in the streaming
+        // usage; surface on the flat `reasoning_tokens` slot so the
+        // agent loop's accumulator sees it (#769).
+        reasoning_tokens: u.thoughts_token_count,
         completion_tokens_details: None,
-        // Cache metrics are Anthropic-specific (#766). Gemini does not
-        // report prompt-caching counts through this surface; always None.
+        // See non-stream path: cache_creation has no Gemini equivalent,
+        // cache_read maps to `cachedContentTokenCount`.
         cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        cache_read_input_tokens: u.cached_content_token_count,
     });
 
     // Nothing to emit (e.g. empty heartbeat event) — skip.
     if content_text.is_none()
+        && reasoning_text.is_none()
         && tool_call_deltas.is_empty()
         && finish_reason.is_none()
         && usage.is_none()
@@ -700,7 +832,7 @@ pub(crate) fn parse_gemini_sse(data: &str) -> SseParseResult {
                     None
                 },
                 content: content_text,
-                reasoning_content: None,
+                reasoning_content: reasoning_text,
                 tool_calls: if tool_call_deltas.is_empty() {
                     None
                 } else {
@@ -736,7 +868,7 @@ mod tests {
         let sys = gemini_req.system_instruction.as_ref().unwrap();
         assert!(sys.role.is_none());
         match &sys.parts[0] {
-            GeminiPart::Text { text } => assert_eq!(text, "You are helpful."),
+            GeminiPart::Text { text, .. } => assert_eq!(text, "You are helpful."),
             other => panic!("expected system text part, got {other:?}"),
         }
 
@@ -876,6 +1008,7 @@ mod tests {
                     role: Some("model".into()),
                     parts: vec![GeminiPart::Text {
                         text: "Hello!".into(),
+                        thought: false,
                     }],
                 }),
                 finish_reason: Some("STOP".into()),
@@ -884,6 +1017,8 @@ mod tests {
                 prompt_token_count: 10,
                 candidates_token_count: 5,
                 total_token_count: 15,
+                thoughts_token_count: None,
+                cached_content_token_count: None,
             }),
             model_version: Some("gemini-2.5-pro-001".into()),
         };
@@ -916,6 +1051,8 @@ mod tests {
                 prompt_token_count: 20,
                 candidates_token_count: 10,
                 total_token_count: 30,
+                thoughts_token_count: None,
+                cached_content_token_count: None,
             }),
             model_version: None,
         };
@@ -1047,7 +1184,7 @@ mod tests {
         );
         assert!(matches!(tail.parts[0], GeminiPart::FunctionResponse { .. }));
         match &tail.parts[1] {
-            GeminiPart::Text { text } => assert_eq!(text, "fresh input"),
+            GeminiPart::Text { text, .. } => assert_eq!(text, "fresh input"),
             other => panic!("expected text part for fresh input, got {other:?}"),
         }
     }
@@ -1085,7 +1222,7 @@ mod tests {
         assert!(matches!(tail.parts[0], GeminiPart::FunctionResponse { .. }));
         assert!(matches!(tail.parts[1], GeminiPart::FunctionResponse { .. }));
         match &tail.parts[2] {
-            GeminiPart::Text { text } => assert_eq!(text, "follow up"),
+            GeminiPart::Text { text, .. } => assert_eq!(text, "follow up"),
             other => panic!("expected text part for follow up, got {other:?}"),
         }
     }
@@ -1350,10 +1487,253 @@ mod tests {
 
         for entry in &gemini_req.contents {
             for part in &entry.parts {
-                if let GeminiPart::Text { text } = part {
+                if let GeminiPart::Text { text, .. } = part {
                     assert!(!text.is_empty(), "empty text parts must be skipped");
                 }
             }
         }
+    }
+
+    // -- #769: thinking passthrough -----------------------------------
+
+    /// `gemini_thinking_budget = Some(N>0)` must emit the
+    /// `generationConfig.thinkingConfig` block with `includeThoughts:
+    /// true` so Gemini streams `thought: true` parts back.
+    #[test]
+    fn test_thinking_budget_emits_thinking_config() {
+        let mut req = CompletionRequest::new("gemini-2.5-pro")
+            .with_messages(vec![LlmMessage::system("sys"), LlmMessage::user("hi")]);
+        req.gemini_thinking_budget = Some(4096);
+
+        let gemini_req = to_gemini_request(&req);
+        let body = serde_json::to_value(&gemini_req).unwrap();
+
+        let tc = &body["generationConfig"]["thinkingConfig"];
+        assert_eq!(tc["thinkingBudget"], 4096);
+        assert_eq!(tc["includeThoughts"], true);
+    }
+
+    /// `gemini_thinking_budget = None` (the default) must NOT emit
+    /// `thinkingConfig` — byte parity with pre-#769 payloads.
+    #[test]
+    fn test_thinking_budget_absent_omits_thinking_config() {
+        let req = CompletionRequest::new("gemini-2.5-pro")
+            .with_messages(vec![LlmMessage::user("hi")])
+            .with_max_tokens(100);
+
+        let gemini_req = to_gemini_request(&req);
+        let body = serde_json::to_value(&gemini_req).unwrap();
+        assert!(
+            body["generationConfig"].get("thinkingConfig").is_none(),
+            "thinkingConfig must be absent when budget is None: {body}"
+        );
+    }
+
+    /// `Some(0)` is an explicit off — treated the same as `None`, no
+    /// `thinkingConfig` on the wire. Matches the layered-precedence
+    /// contract used by Anthropic `thinking_budget_tokens` and OpenAI
+    /// `reasoning_effort`.
+    #[test]
+    fn test_thinking_budget_zero_is_off() {
+        let mut req =
+            CompletionRequest::new("gemini-2.5-pro").with_messages(vec![LlmMessage::user("hi")]);
+        req.gemini_thinking_budget = Some(0);
+
+        let gemini_req = to_gemini_request(&req);
+        assert!(
+            gemini_req.generation_config.is_none()
+                || gemini_req
+                    .generation_config
+                    .as_ref()
+                    .unwrap()
+                    .thinking_config
+                    .is_none(),
+            "thinking_budget = Some(0) must not emit thinkingConfig"
+        );
+    }
+
+    /// `thought: true` parts on the non-stream response must accumulate
+    /// into `reasoning_content` and NOT into user-visible `content`.
+    #[test]
+    fn test_from_gemini_response_thought_parts_route_to_reasoning_content() {
+        let resp = GeminiResponse {
+            candidates: vec![Candidate {
+                content: Some(GeminiContent {
+                    role: Some("model".into()),
+                    parts: vec![
+                        GeminiPart::Text {
+                            text: "I should think about this.".into(),
+                            thought: true,
+                        },
+                        GeminiPart::Text {
+                            text: "Hello!".into(),
+                            thought: false,
+                        },
+                    ],
+                }),
+                finish_reason: Some("STOP".into()),
+            }],
+            usage_metadata: Some(UsageMetadata {
+                prompt_token_count: 10,
+                candidates_token_count: 5,
+                total_token_count: 15,
+                thoughts_token_count: Some(7),
+                cached_content_token_count: None,
+            }),
+            model_version: None,
+        };
+
+        let completion = from_gemini_response(resp);
+        let msg = &completion.choices[0].message;
+        assert_eq!(msg.content.as_deref(), Some("Hello!"));
+        assert_eq!(
+            msg.reasoning_content.as_deref(),
+            Some("I should think about this."),
+            "thought parts must route to reasoning_content"
+        );
+        // thoughts token count surfaces as reasoning_tokens
+        let usage = completion.usage.unwrap();
+        assert_eq!(usage.reasoning_tokens, Some(7));
+    }
+
+    /// Streaming SSE with `thought: true` parts must emit
+    /// `Delta::reasoning_content` rather than `content`.
+    #[test]
+    fn test_parse_gemini_sse_routes_thought_parts_to_reasoning_delta() {
+        // Shape Gemini sends for a thought-containing chunk.
+        let data = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"thinking step","thought":true}]},"finishReason":null}]}"#;
+        let result = parse_gemini_sse(data);
+        match result {
+            SseParseResult::Chunk(chunk) => {
+                assert!(
+                    chunk.choices[0].delta.content.is_none(),
+                    "thought text must not land in user-visible content"
+                );
+                assert_eq!(
+                    chunk.choices[0].delta.reasoning_content.as_deref(),
+                    Some("thinking step")
+                );
+            }
+            _ => panic!("Expected Chunk"),
+        }
+    }
+
+    /// Mixed chunk with both thought and non-thought text parts: both
+    /// sidebands populate.
+    #[test]
+    fn test_parse_gemini_sse_mixed_thought_and_visible_text() {
+        let data = r#"{"candidates":[{"content":{"role":"model","parts":[{"text":"think","thought":true},{"text":"answer"}]},"finishReason":null}]}"#;
+        let result = parse_gemini_sse(data);
+        match result {
+            SseParseResult::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("answer"));
+                assert_eq!(
+                    chunk.choices[0].delta.reasoning_content.as_deref(),
+                    Some("think")
+                );
+            }
+            _ => panic!("Expected Chunk"),
+        }
+    }
+
+    // -- #769: cache usage passthrough --------------------------------
+
+    /// `usageMetadata.cachedContentTokenCount` must thread through
+    /// `Usage::cache_read_input_tokens` so the surface mirrors
+    /// Anthropic prompt caching.
+    #[test]
+    fn test_from_gemini_response_parses_cached_content_token_count() {
+        let resp = GeminiResponse {
+            candidates: vec![Candidate {
+                content: Some(GeminiContent {
+                    role: Some("model".into()),
+                    parts: vec![GeminiPart::Text {
+                        text: "Hi".into(),
+                        thought: false,
+                    }],
+                }),
+                finish_reason: Some("STOP".into()),
+            }],
+            usage_metadata: Some(UsageMetadata {
+                prompt_token_count: 50_000,
+                candidates_token_count: 10,
+                total_token_count: 50_010,
+                thoughts_token_count: None,
+                cached_content_token_count: Some(32_768),
+            }),
+            model_version: None,
+        };
+
+        let completion = from_gemini_response(resp);
+        let usage = completion.usage.unwrap();
+        assert_eq!(usage.cache_read_input_tokens, Some(32_768));
+        assert!(
+            usage.cache_creation_input_tokens.is_none(),
+            "Gemini does not report a creation-side counter — must stay None"
+        );
+    }
+
+    /// `cachedContentTokenCount` absent on the response (cache disabled
+    /// or below minimum) → `cache_read_input_tokens` stays `None`,
+    /// preserving pre-#769 semantics for non-caching turns.
+    #[test]
+    fn test_from_gemini_response_without_cache_fields_deserializes() {
+        let json = r#"{
+            "candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]},"finishReason":"STOP"}],
+            "usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5,"totalTokenCount":15}
+        }"#;
+        let resp: GeminiResponse = serde_json::from_str(json).unwrap();
+        let completion = from_gemini_response(resp);
+        let usage = completion.usage.unwrap();
+        assert!(usage.cache_read_input_tokens.is_none());
+        assert!(usage.cache_creation_input_tokens.is_none());
+    }
+
+    /// Streaming path: `thoughtsTokenCount` + `cachedContentTokenCount`
+    /// on a usage-only chunk thread through correctly.
+    #[test]
+    fn test_parse_gemini_sse_thought_and_cache_usage_parsed() {
+        let data = r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":42,"totalTokenCount":142,"thoughtsTokenCount":18,"cachedContentTokenCount":60}}"#;
+        let result = parse_gemini_sse(data);
+        match result {
+            SseParseResult::Chunk(chunk) => {
+                let usage = chunk.usage.expect("usage should be present");
+                assert_eq!(usage.reasoning_tokens, Some(18));
+                assert_eq!(usage.cache_read_input_tokens, Some(60));
+                assert!(usage.cache_creation_input_tokens.is_none());
+            }
+            _ => panic!("Expected Chunk"),
+        }
+    }
+
+    // -- #769: `cachedContent` request field --------------------------
+
+    /// When the LLM client populates `GeminiRequest::cached_content`,
+    /// the serialized body carries `cachedContent: "cachedContents/..."`
+    /// at the top level.
+    #[test]
+    fn test_cached_content_field_serializes_when_set() {
+        let mut gemini_req = to_gemini_request(
+            &CompletionRequest::new("gemini-2.5-pro").with_messages(vec![LlmMessage::user("hi")]),
+        );
+        gemini_req.cached_content = Some("cachedContents/abc123".to_string());
+
+        let body = serde_json::to_value(&gemini_req).unwrap();
+        assert_eq!(body["cachedContent"], "cachedContents/abc123");
+    }
+
+    /// When `cached_content` is `None`, the `cachedContent` field must
+    /// be absent on the wire. Byte parity with pre-#769 payloads.
+    #[test]
+    fn test_cached_content_field_absent_when_none() {
+        let gemini_req = to_gemini_request(
+            &CompletionRequest::new("gemini-2.5-pro").with_messages(vec![LlmMessage::user("hi")]),
+        );
+        assert!(gemini_req.cached_content.is_none());
+        let body = serde_json::to_value(&gemini_req).unwrap();
+        assert!(
+            body.get("cachedContent").is_none(),
+            "cachedContent must be absent when None: {body}"
+        );
     }
 }

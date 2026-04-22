@@ -168,6 +168,11 @@ pub struct LlmConfig {
     /// provider maps to the OpenAI-compatible wire protocol; ignored on
     /// Anthropic/Gemini paths.
     pub openai: OpenAiConfig,
+
+    /// Gemini-specific configuration surfaced as `[llm.gemini]` in
+    /// `alms.toml`. Only consulted when the effective provider maps to the
+    /// Gemini wire protocol; ignored on OpenAI / Anthropic paths.
+    pub gemini: GeminiConfig,
 }
 
 impl Default for LlmConfig {
@@ -185,6 +190,7 @@ impl Default for LlmConfig {
             providers: BTreeMap::new(),
             anthropic: AnthropicConfig::default(),
             openai: OpenAiConfig::default(),
+            gemini: GeminiConfig::default(),
         }
     }
 }
@@ -333,6 +339,88 @@ pub struct OpenAiConfig {
     /// param. Non-reasoning models also skip the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Gemini-specific configuration (`[llm.gemini]` in `alms.toml`).
+///
+/// Applied to requests whose effective provider maps to the Gemini wire
+/// protocol. Silently ignored on OpenAI / Anthropic paths.
+///
+/// Covers the two features added in issue #769:
+/// - Explicit context caching via Gemini's `cachedContents` REST resource
+///   ([`cache_enabled`][Self::cache_enabled], [`cache_ttl_seconds`][Self::cache_ttl_seconds]).
+/// - Extended thinking via `generationConfig.thinkingConfig.thinkingBudget`
+///   ([`thinking_budget`][Self::thinking_budget]).
+///
+/// Mirrors the shape of [`AnthropicConfig`] / [`OpenAiConfig`] — a
+/// provider-family-specific container that sits alongside the generic
+/// [`ProviderEntry`] table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GeminiConfig {
+    /// Enable Gemini explicit context caching (#769).
+    ///
+    /// When `true` (the default), the Gemini adapter creates a
+    /// `cachedContents` resource on the first request of a session that
+    /// crosses Gemini's minimum cacheable size (32,768 tokens) and
+    /// references the returned cache name via `cachedContent:
+    /// "cachedContents/<id>"` on subsequent requests. The cache is
+    /// reused until the TTL expires or the stable prefix (system
+    /// instruction + tool definitions) changes.
+    ///
+    /// Setting `false` disables cache creation entirely — useful for
+    /// diagnosing cache-related failures, running on a Gemini project
+    /// that doesn't have caching enabled, or for constraining cost when
+    /// the stable prefix churns faster than the TTL.
+    ///
+    /// Server-level only — no per-agent or per-run override. Gemini
+    /// caching is a pure optimization; toggling it only costs one cache
+    /// miss on the next turn.
+    pub cache_enabled: bool,
+
+    /// Cache TTL in seconds for Gemini `cachedContents` (#769).
+    ///
+    /// Sent as the `ttl` field when creating a cache entry. Gemini
+    /// enforces the TTL server-side; ALMS does not track the expiry
+    /// client-side. When Gemini returns an error indicating the
+    /// referenced cache is gone, the adapter invalidates its stored
+    /// handle and creates a fresh cache on the next turn.
+    ///
+    /// Default: 300 seconds (5 minutes), matching Anthropic's ephemeral
+    /// cache TTL and keeping idle cache storage cost low. Gemini's own
+    /// default when the field is omitted is 1 hour.
+    pub cache_ttl_seconds: u64,
+
+    /// Extended-thinking budget for Gemini 2.5+, in tokens (#769).
+    ///
+    /// `None` or `Some(0)`: extended thinking is disabled (no
+    /// `thinkingConfig` field on outgoing requests; `thought: true`
+    /// parts are never requested).
+    ///
+    /// `Some(n)` with `n > 0`: the Gemini adapter injects
+    /// `generationConfig.thinkingConfig: { thinkingBudget: n,
+    /// includeThoughts: true }` into the outgoing request. The provider
+    /// streams parts with `thought: true` alongside the visible text;
+    /// the runtime routes those through the provider-neutral
+    /// `RuntimeEvent::ReasoningDelta` channel so the UI renders them in
+    /// the same collapsible panel as Anthropic extended thinking and
+    /// OpenAI o-series reasoning.
+    ///
+    /// Three-layer precedence mirrors Anthropic `thinking_budget_tokens`
+    /// and OpenAI `reasoning_effort`: per-run > per-agent > server
+    /// default. `Some(0)` at any layer is an explicit opt-out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+}
+
+impl Default for GeminiConfig {
+    fn default() -> Self {
+        Self {
+            cache_enabled: true,
+            cache_ttl_seconds: 300,
+            thinking_budget: None,
+        }
+    }
 }
 
 impl LlmConfig {

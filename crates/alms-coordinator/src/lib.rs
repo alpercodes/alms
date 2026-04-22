@@ -920,6 +920,12 @@ fn agent_config_for_subagent(
         // by subagents so they benefit from the same cached prefix.
         anthropic_prompt_cache_enabled: base.anthropic_prompt_cache_enabled,
         openai_reasoning_effort,
+        // Gemini thinking (#769) — inherit parent's resolved value.
+        gemini_thinking_budget: base.gemini_thinking_budget,
+        // Gemini caching (#769) — server-level only, inherited verbatim
+        // by subagents so they share cache entries where possible.
+        gemini_cache_enabled: base.gemini_cache_enabled,
+        gemini_cache_ttl_seconds: base.gemini_cache_ttl_seconds,
     };
     (config, model, provider)
 }
@@ -1776,6 +1782,54 @@ mod tests {
             sub.anthropic_prompt_cache_enabled,
             "subagents inherit enabled caching"
         );
+    }
+
+    /// Issue #769: Gemini context caching + thinking budget inherit
+    /// from the parent the same way Anthropic prompt caching does.
+    /// No per-subagent override path — server-level only.
+    #[test]
+    fn test_subagent_inherits_gemini_cache_and_thinking_budget() {
+        // Parent disables caching and sets a thinking budget.
+        let parent = AgentConfig {
+            gemini_cache_enabled: false,
+            gemini_cache_ttl_seconds: 1800,
+            gemini_thinking_budget: Some(8192),
+            ..AgentConfig::default()
+        };
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert!(
+            !ephemeral.gemini_cache_enabled,
+            "ephemeral subagents inherit parent's disabled Gemini caching"
+        );
+        assert_eq!(ephemeral.gemini_cache_ttl_seconds, 1800);
+        assert_eq!(ephemeral.gemini_thinking_budget, Some(8192));
+
+        // Named subagent path — SubagentRecordConfig has no Gemini
+        // knobs, so the parent's values pass through unchanged.
+        let record = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+        };
+        let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert!(!named.gemini_cache_enabled);
+        assert_eq!(named.gemini_cache_ttl_seconds, 1800);
+        assert_eq!(named.gemini_thinking_budget, Some(8192));
+
+        // Parent with caching enabled (the default) → subagent also
+        // enabled. `None` thinking budget on parent passes through.
+        let enabled_parent = AgentConfig {
+            gemini_cache_enabled: true,
+            gemini_cache_ttl_seconds: 300,
+            gemini_thinking_budget: None,
+            ..AgentConfig::default()
+        };
+        let (sub, _, _) = agent_config_for_subagent(None, &enabled_parent);
+        assert!(sub.gemini_cache_enabled);
+        assert_eq!(sub.gemini_cache_ttl_seconds, 300);
+        assert_eq!(sub.gemini_thinking_budget, None);
     }
 
     // -- (j) get_completed_result on unknown task → None ------------------------

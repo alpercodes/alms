@@ -15,6 +15,7 @@ pub mod context;
 pub mod episodic;
 pub mod events;
 pub(crate) mod gemini;
+pub(crate) mod gemini_cache;
 pub mod llm_client;
 pub mod llm_types;
 pub mod scheduler;

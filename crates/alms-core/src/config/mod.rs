@@ -15,10 +15,10 @@ mod types;
 mod tests;
 
 pub use types::{
-    AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, FsEditConfig, LlmConfig,
-    LoggingConfig, OpenAiConfig, ProviderEntry, ProviderKind, ProviderQuirks, ReasoningEffort,
-    RunSummaryMode, ServerConfig, SessionConfig, ShellClassificationMode, ShellPermissions,
-    ShellSpillConfig, ToolsConfig,
+    AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, FsEditConfig, GeminiConfig,
+    LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry, ProviderKind, ProviderQuirks,
+    ReasoningEffort, RunSummaryMode, ServerConfig, SessionConfig, ShellClassificationMode,
+    ShellPermissions, ShellSpillConfig, ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};

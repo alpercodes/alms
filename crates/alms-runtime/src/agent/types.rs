@@ -147,6 +147,28 @@ pub struct AgentConfig {
     /// Populated by the gateway via the three-layer precedence chain
     /// (per-run > per-agent > server default from `[llm.openai]`).
     pub openai_reasoning_effort: Option<alms_core::config::ReasoningEffort>,
+    /// Extended-thinking budget for Gemini 2.5+, in tokens (#769).
+    ///
+    /// `None` or `Some(0)` disables thinking (no `thinkingConfig` on the
+    /// wire). Non-zero values enable it and govern how many tokens the
+    /// model may spend on internal reasoning.
+    ///
+    /// Populated by the gateway via the three-layer precedence chain
+    /// (per-run > per-agent > server default from `[llm.gemini]`).
+    /// Silently ignored when the effective provider is not Gemini.
+    pub gemini_thinking_budget: Option<u32>,
+    /// Gemini explicit context-caching toggle (#769).
+    ///
+    /// Server-level only — no per-agent / per-run override per issue #769.
+    /// When `true`, the Gemini adapter creates a `cachedContents`
+    /// resource for the stable prefix (system instruction + tool
+    /// definitions) on the first turn of a session and references it on
+    /// subsequent turns. Populated from `[llm.gemini].cache_enabled` in
+    /// `alms.toml`; inherited verbatim by subagents.
+    pub gemini_cache_enabled: bool,
+    /// Gemini cache TTL in seconds (#769). Sent as `ttl` when creating a
+    /// new cache entry. Defaults to 300; see [`alms_core::config::GeminiConfig::cache_ttl_seconds`].
+    pub gemini_cache_ttl_seconds: u64,
 }
 
 impl Default for AgentConfig {
@@ -172,6 +194,13 @@ impl Default for AgentConfig {
             // non-Anthropic adapters ignore the flag entirely.
             anthropic_prompt_cache_enabled: true,
             openai_reasoning_effort: None,
+            // Gemini thinking is off by default, like Anthropic thinking.
+            gemini_thinking_budget: None,
+            // Gemini caching mirrors Anthropic caching — on by default;
+            // adapter is a no-op when the effective provider isn't Gemini.
+            gemini_cache_enabled: true,
+            // 5 minutes — mirrors Anthropic ephemeral caching.
+            gemini_cache_ttl_seconds: 300,
         }
     }
 }
