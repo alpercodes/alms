@@ -523,20 +523,24 @@ impl AgentRuntime {
                 // field through so Anthropic non-streaming responses (and
                 // OpenAI reasoning models that return the field non-stream)
                 // still surface their thinking trace for persistence.
-                let content = choice.message.content.clone();
-                let reasoning = choice.message.reasoning_content.clone();
-                // Preserve the streaming-path fallback: when `content` is
-                // absent, promote reasoning into `content` so the run has
-                // something to show.
-                let (content, reasoning) = match (content, reasoning) {
-                    (Some(c), r) if !c.is_empty() => (Some(c), r),
-                    (_, Some(r)) if !r.is_empty() => (Some(r), None),
-                    (c, _) => (c, None),
-                };
+                //
+                // Route through `finalize_content_and_reasoning` so the
+                // buffered-fallback projection honours the same #767/#776
+                // invariant as the streaming path: when tool calls are
+                // present and visible content is empty, reasoning stays on
+                // the sideband and is NOT laundered into `content` (which
+                // would be replayed as assistant text on the next turn).
+                let tool_calls = choice.message.tool_calls;
+                let has_tool_calls = tool_calls.is_some();
+                let (content, reasoning) = finalize_content_and_reasoning(
+                    choice.message.content.unwrap_or_default(),
+                    choice.message.reasoning_content.unwrap_or_default(),
+                    has_tool_calls,
+                );
                 Ok(StreamCallResult {
                     content,
                     reasoning,
-                    tool_calls: choice.message.tool_calls,
+                    tool_calls,
                     usage,
                 })
             }
