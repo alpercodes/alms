@@ -2157,6 +2157,107 @@ mod tests {
         );
     }
 
+    /// Terminal case on the priority ladder (#782): when all three
+    /// reasoning wire fields are present but empty, the custom
+    /// `Deserialize` impl on `LlmMessage` (see `llm_types.rs:48-91`)
+    /// must resolve `reasoning_content` to `None` — every rung of the
+    /// `.filter(|s| !s.is_empty())` chain rejects, and the final
+    /// `.or_else` returns `None`. Pins the bottom of the truth table
+    /// against a future refactor that conflates "present-but-empty"
+    /// with "populated".
+    #[test]
+    fn test_openai_response_all_empty_reasoning_fields_yields_none() {
+        let json = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "o3",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final",
+                    "reasoning_content": "",
+                    "reasoning_summary": "",
+                    "reasoning": ""
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(json).unwrap();
+        assert!(
+            resp.choices[0].message.reasoning_content.is_none(),
+            "all-empty reasoning fields must yield None"
+        );
+    }
+
+    /// Twin of `test_openai_response_all_empty_reasoning_fields_yields_none`
+    /// for the case where none of the three reasoning fields appear in
+    /// the JSON at all. The `#[serde(default)]` on each `Option<String>`
+    /// in `Raw` keeps them as `None`, and the priority chain then
+    /// resolves to `None` as well. Closes the "all-absent" corner of the
+    /// priority-ladder truth table (#782).
+    #[test]
+    fn test_openai_response_all_absent_reasoning_fields_yields_none() {
+        let json = r#"{
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "final"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+        let resp: CompletionResponse = serde_json::from_str(json).unwrap();
+        assert!(
+            resp.choices[0].message.reasoning_content.is_none(),
+            "all-absent reasoning fields must yield None"
+        );
+    }
+
+    /// Streaming counterpart to
+    /// `test_openai_response_all_empty_reasoning_fields_yields_none`
+    /// (#782): when a single SSE delta chunk carries all three
+    /// reasoning fields as empty strings, the custom `Deserialize`
+    /// impl on `Delta` (see `llm_types.rs:445-483`) must resolve
+    /// `reasoning_content` to `None`. Pins the terminal case on the
+    /// streaming path.
+    #[test]
+    fn test_openai_delta_all_empty_reasoning_fields_yields_none() {
+        let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_content":"","reasoning_summary":"","reasoning":""},"finish_reason":null}]}"#;
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+            panic!("expected Chunk");
+        };
+        assert!(
+            chunk.choices[0].delta.reasoning_content.is_none(),
+            "all-empty reasoning fields in delta must yield None"
+        );
+    }
+
+    /// Twin of `test_openai_delta_all_empty_reasoning_fields_yields_none`
+    /// for the case where none of the three reasoning fields appear in
+    /// the delta JSON at all — e.g. a plain content-only chunk. The
+    /// `Option` + `#[serde(default)]` combination on `Raw` keeps them
+    /// `None`, and the priority chain resolves to `None`. Closes the
+    /// "all-absent" corner of the streaming priority-ladder truth
+    /// table (#782).
+    #[test]
+    fn test_openai_delta_all_absent_reasoning_fields_yields_none() {
+        let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#;
+        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+            panic!("expected Chunk");
+        };
+        assert!(
+            chunk.choices[0].delta.reasoning_content.is_none(),
+            "all-absent reasoning fields in delta must yield None"
+        );
+    }
+
     /// Wire invariant (#773): an outbound OpenAI request built by the
     /// runtime never carries `reasoning_content` on any message,
     /// because the loop path (see `loop_impl.rs`) always constructs
