@@ -1,0 +1,40 @@
+/* ══════════════════════════════════════════════════════════════════════
+   Shared utility classes (visual consistency)
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Generic empty state — replaces .run-empty, .audit-empty, inline-styled empties */
+.empty-state {
+  padding: var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-disabled);
+  font-style: italic;
+  text-align: center;
+}
+
+/* Generic loading state — replaces inline-styled loading divs */
+.loading-state {
+  padding: var(--space-4);
+  font-size: var(--text-sm);
+  color: var(--text-disabled);
+}
+
+/* Retry button shown next to status when boot fails */
+.retry-btn {
+  margin-left: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  transition: all var(--duration-fast);
+}
+.retry-btn:hover { background: var(--accent); color: #fff; }
+
+/* Generic inline error — replaces scattered inline error styles */
+.inline-error {
+  font-size: var(--text-xs);
+  color: var(--error);
+}

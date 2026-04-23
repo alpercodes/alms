@@ -1,0 +1,295 @@
+/* ══════════════════════════════════════════════════════════════════════
+   DM Conversation View — Thread Layout (#604)
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* Header bar for DM conversation view */
+.dm-view-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-6);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  flex-shrink: 0;
+}
+.dm-view-header-icon {
+  font-size: var(--text-lg);
+  color: var(--dm-accent);
+}
+.dm-view-header-label {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+}
+.dm-view-header-badge {
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  color: var(--dm-accent);
+  background: var(--dm-accent-muted);
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-left: auto;
+}
+
+/* DM thread — scrollable message area */
+.dm-thread {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-4) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.dm-thread > * {
+  flex-shrink: 0;
+}
+
+/* Individual DM message */
+.dm-msg {
+  display: flex;
+  flex-direction: column;
+  max-width: 80%;
+  font-family: var(--font-mono);
+}
+.dm-msg-left {
+  align-self: flex-start;
+}
+.dm-msg-right {
+  align-self: flex-end;
+}
+.dm-msg-center {
+  align-self: center;
+  max-width: 100%;
+}
+
+/* Agent name label above each message bubble */
+.dm-msg-name {
+  font-size: var(--text-2xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding-bottom: 2px;
+}
+.dm-msg-left .dm-msg-name {
+  color: var(--dm-accent);
+}
+.dm-msg-right .dm-msg-name {
+  color: var(--accent-text);
+  text-align: right;
+}
+
+/* Message bubble */
+.dm-msg-bubble {
+  padding: var(--space-2) var(--space-3);
+  line-height: 1.6;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  border-radius: var(--radius-lg);
+  word-break: break-word;
+}
+.dm-msg-left .dm-msg-bubble {
+  background: var(--surface-2);
+  border-left: 3px solid var(--dm-accent);
+}
+.dm-msg-right .dm-msg-bubble {
+  background: var(--accent-muted);
+  border-right: 3px solid var(--accent);
+}
+
+/* Markdown inside DM bubbles — reuse markdown-body styles */
+.dm-msg-bubble.markdown-body > *:first-child { margin-top: 0; }
+.dm-msg-bubble.markdown-body > *:last-child { margin-bottom: 0; }
+.dm-msg-bubble.markdown-body p { margin-bottom: var(--space-2); }
+.dm-msg-bubble.markdown-body p:last-child { margin-bottom: 0; }
+.dm-msg-bubble.markdown-body code {
+  font-size: var(--text-xs);
+  background: var(--surface-3);
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-xs);
+}
+.dm-msg-bubble.markdown-body pre {
+  background: var(--surface-1);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+  margin: var(--space-2) 0;
+}
+.dm-msg-bubble.markdown-body pre code {
+  background: none;
+  padding: 0;
+}
+/*
+ * Lists inside DM bubbles.  The global `* { padding: 0 }` reset strips the
+ * browser's default list padding-left, which made bullet and number markers
+ * render outside the bubble (to the left of the background).  Restore a
+ * padding-left large enough to keep the markers inside the bubble for both
+ * ordered and unordered (including nested) lists.
+ */
+.dm-msg-bubble.markdown-body ul,
+.dm-msg-bubble.markdown-body ol {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-5);
+}
+.dm-msg-bubble.markdown-body li {
+  margin-bottom: var(--space-1);
+}
+.dm-msg-bubble.markdown-body li:last-child {
+  margin-bottom: 0;
+}
+.dm-msg-bubble.markdown-body ul ul,
+.dm-msg-bubble.markdown-body ul ol,
+.dm-msg-bubble.markdown-body ol ul,
+.dm-msg-bubble.markdown-body ol ol {
+  margin: var(--space-1) 0 var(--space-1) 0;
+}
+
+/* Image messages inside DM bubbles */
+.dm-msg-image {
+  max-width: 100%;
+  border-radius: var(--radius-md);
+  display: block;
+}
+
+/* Error / thinking / tool messages in DM view */
+.dm-msg-error {
+  font-size: var(--text-xs);
+  color: var(--error);
+  padding: var(--space-1) var(--space-2);
+}
+.dm-msg-thinking {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-style: italic;
+  padding: var(--space-1) 0;
+}
+/* Tool calls rendered inside DM view via ToolRow component (#652).
+   The wrapper inherits the dm-msg side positioning while letting the
+   ToolRow card fill the available width. */
+.dm-msg-tool-row {
+  max-width: 90%;
+}
+.dm-msg-tool-row .tc-row {
+  margin: 0;
+}
+.dm-msg-left.dm-msg-tool-row .tc-row {
+  border-left: 3px solid var(--dm-accent);
+}
+.dm-msg-right.dm-msg-tool-row .tc-row {
+  border-right: 3px solid var(--accent);
+}
+
+/* ── DM Reasoning Blocks (#685) ── */
+.dm-reasoning-block {
+  align-self: center;
+  max-width: 90%;
+  width: 100%;
+  margin: var(--space-2) auto;
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  overflow: hidden;
+}
+.dm-reasoning-block--failed {
+  border-left: 3px solid var(--error);
+}
+.dm-reasoning-block--live {
+  border-color: var(--accent);
+  border-style: solid;
+}
+.dm-reasoning-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  user-select: none;
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.dm-reasoning-header:hover {
+  background: var(--surface-2);
+}
+.dm-reasoning-toggle {
+  font-size: 10px;
+  width: 1em;
+  text-align: center;
+  flex-shrink: 0;
+}
+.dm-reasoning-summary {
+  flex-grow: 1;
+}
+.dm-reasoning-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-subtle);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+.dm-reasoning-body {
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px dashed var(--border-subtle);
+}
+.dm-reasoning-thinking {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+  margin: 0 0 var(--space-2) 0;
+  padding: var(--space-2);
+  background: var(--surface-0);
+  border-radius: var(--radius-sm);
+}
+
+/* Footer bar — read-only notice */
+.dm-view-footer {
+  flex-shrink: 0;
+  padding: var(--space-2) var(--space-6);
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.dm-view-footer-text {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  font-style: italic;
+}
+
+/* DM cancel conversation button */
+.dm-cancel-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-4);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-full);
+  background: var(--error-muted);
+  color: var(--error);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition: all var(--duration-fast);
+  white-space: nowrap;
+}
+.dm-cancel-btn:hover:not(:disabled) {
+  background: var(--error);
+  color: #fff;
+}
+.dm-cancel-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.dm-cancel-btn-icon {
+  font-size: 10px;
+  line-height: 1;
+}

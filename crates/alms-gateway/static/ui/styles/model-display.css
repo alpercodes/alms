@@ -1,0 +1,154 @@
+/* ── Model display (shared helper: utils/model-display.js) ───────────────── */
+
+.model-display {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  min-width: 0;
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  line-height: 1.2;
+}
+.model-display--muted {
+  color: var(--text-muted);
+}
+.model-display--default .model-name {
+  color: var(--text-secondary, var(--text-muted));
+}
+.model-name {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 22ch;
+}
+.model-default-label {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  padding: 1px var(--space-2);
+  background: var(--surface-3);
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+.model-override-pill {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px var(--space-2);
+  background: var(--accent-muted);
+  color: var(--accent-text);
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+.model-provider-badge {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+  border: 1px solid transparent;
+}
+.model-provider-badge--anthropic  { color: var(--dm-accent); background: var(--dm-accent-muted); }
+.model-provider-badge--openai     { color: var(--accent-text); background: var(--accent-muted); }
+.model-provider-badge--openrouter { color: var(--info); background: var(--info-muted); }
+/* Providers unlocked by the generic OpenAI-compatible config (#770). Colors
+ * are brand-adjacent and picked to not clash with the existing four badges.
+ * Defaults target dark mode (the default theme); light-mode overrides below
+ * tune foreground values for contrast on light backgrounds.
+ *   xai      — neutral/graphite (Grok/X visual identity)
+ *   deepseek — blue
+ *   mistral  — orange
+ *   groq     — red/crimson
+ *   ollama   — teal (neutral, "local")
+ *   google   — google-blue (pre-added for #764; no entries yet)
+ */
+.model-provider-badge--xai        { color: #d4d4d8; background: rgba(161, 161, 170, 0.18); }
+.model-provider-badge--deepseek   { color: #93c5fd; background: rgba(59, 130, 246, 0.16); }
+.model-provider-badge--mistral    { color: #fdba74; background: rgba(249, 115, 22, 0.15); }
+.model-provider-badge--groq       { color: #fca5a5; background: rgba(239, 68, 68, 0.15); }
+.model-provider-badge--ollama     { color: #5eead4; background: rgba(20, 184, 166, 0.15); }
+.model-provider-badge--google     { color: #93c5fd; background: rgba(66, 133, 244, 0.16); }
+.model-provider-badge--unknown    { color: var(--text-muted); background: var(--surface-3); }
+/* Light-mode overrides: darker foregrounds on lightly tinted backgrounds. */
+html[data-theme='light'] .model-provider-badge--xai      { color: #27272a; background: #e4e4e7; }
+html[data-theme='light'] .model-provider-badge--deepseek { color: #1e40af; background: rgba(30, 64, 175, 0.10); }
+html[data-theme='light'] .model-provider-badge--mistral  { color: #c2410c; background: rgba(194, 65, 12, 0.10); }
+html[data-theme='light'] .model-provider-badge--groq     { color: #b91c1c; background: rgba(185, 28, 28, 0.10); }
+html[data-theme='light'] .model-provider-badge--ollama   { color: #0f766e; background: rgba(15, 118, 110, 0.10); }
+html[data-theme='light'] .model-provider-badge--google   { color: #1a73e8; background: rgba(26, 115, 232, 0.10); }
+
+/* Override count badge on the settings gear button */
+.settings-btn { position: relative; }
+.settings-override-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+  pointer-events: none;
+}
+
+/* Small inline input for editable settings rows */
+.settings-input-sm {
+  max-width: 180px;
+  padding: 3px 6px;
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+.settings-input-sm:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+select.settings-input-sm {
+  max-width: 180px;
+}
+
+/* Toggle label for checkbox fields */
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.settings-toggle input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+/* Error message in settings */
+.settings-error {
+  background: var(--error-muted);
+  color: var(--error);
+  font-size: var(--text-xs);
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--error);
+}
+
+/* Disabled state for save buttons */
+.settings-save:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

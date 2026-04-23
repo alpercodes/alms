@@ -1,0 +1,64 @@
+/* ── Reasoning / extended-thinking panel (issue #767) ────────────────── */
+/* Provider-neutral collapsible panel for Claude 4.x thinking, OpenAI     */
+/* o-series / DeepSeek R1 / Gemini reasoning. Defaults to collapsed per   */
+/* Alper's "no noise" UX preference — the toggle button is all the user   */
+/* sees unless they expand it.                                            */
+
+.reasoning-panel {
+  margin-bottom: var(--space-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--surface-1);
+  overflow: hidden;
+}
+.reasoning-panel--live {
+  border-style: dashed;
+  border-color: var(--border-muted, var(--border-subtle));
+}
+.reasoning-panel-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-1) var(--space-3);
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  text-align: left;
+}
+.reasoning-panel-toggle:hover {
+  background: var(--surface-2);
+}
+.reasoning-panel-arrow {
+  font-size: 10px;
+  color: var(--text-muted);
+  min-width: 12px;
+}
+.reasoning-panel-glyph {
+  font-size: var(--text-xs);
+}
+.reasoning-panel-title {
+  font-weight: 500;
+}
+.reasoning-panel-hint {
+  color: var(--text-disabled);
+  font-size: var(--text-2xs);
+  margin-left: auto;
+}
+.reasoning-panel-body {
+  padding: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+  background: var(--surface-0, var(--surface-1));
+}
+.reasoning-panel-text {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 400px;
+  overflow-y: auto;
+}

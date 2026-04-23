@@ -1,0 +1,65 @@
+/* ── Responsive panel overlay ── */
+@media (max-width: 900px) {
+  #panel.open {
+    position: absolute;
+    right: 0;
+    top: var(--header-height);
+    bottom: 0;
+    z-index: 100;
+    width: 100%;
+    max-width: var(--drawer-width);
+  }
+
+  /* 2a: Collapse sidebar on narrow viewports */
+  #sidebar {
+    display: none;
+  }
+
+  /* Compact header: wrap controls and hide low-priority items */
+  header {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: var(--header-height);
+    padding: var(--space-2) var(--space-3);
+    gap: var(--space-2);
+  }
+  /* Collapse spacer so it doesn't force premature wrapping at 700-850px */
+  .header-spacer {
+    flex: 0;
+  }
+  .header-btns {
+    flex-wrap: wrap;
+  }
+
+  /* 2c: Show sidebar toggle button (hidden on desktop) */
+  .sidebar-toggle-btn {
+    display: flex;
+  }
+
+  /* 2d: Sidebar as overlay when toggled open */
+  #sidebar.sidebar-open {
+    display: flex;
+    position: fixed;
+    top: var(--header-height);
+    left: 0;
+    bottom: 0;
+    z-index: 200;
+    width: var(--sidebar-expanded);
+    max-width: 80vw;
+    box-shadow: var(--shadow-overlay);
+  }
+
+  /* Backdrop behind sidebar overlay */
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 199;
+    background: var(--overlay-backdrop);
+  }
+
+  /* 2e: Stack settings grid to single column */
+  .settings-grid {
+    grid-template-columns: 1fr;
+  }
+}

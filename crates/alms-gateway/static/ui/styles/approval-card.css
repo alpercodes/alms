@@ -1,0 +1,54 @@
+/* ── Approval card ── */
+.approval-card {
+  align-self: flex-start;
+  max-width: 100%;
+  width: 100%;
+  background: var(--surface-1);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-sm);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  font-family: var(--font-mono);
+}
+.approval-card h3 {
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--warning);
+}
+.approval-card pre {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow: auto;
+  max-height: 120px;
+  background: var(--surface-1);
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+}
+.approval-card.resolved {
+  border-color: var(--border-subtle);
+  padding: var(--space-1) var(--space-3);
+  gap: 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+
+.approval-btns { display: flex; gap: var(--space-2); }
+.btn {
+  padding: var(--space-2) var(--space-5);
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  transition: all var(--duration-fast);
+}
+.btn:disabled { opacity: 0.4; cursor: default; }
+.btn-approve { background: var(--success); color: #fff; }
+.btn-approve:not(:disabled):hover { filter: brightness(1.1); }
+.btn-deny { background: var(--error); color: #fff; }
+.btn-deny:not(:disabled):hover { filter: brightness(1.1); }

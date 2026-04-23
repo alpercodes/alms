@@ -1,0 +1,103 @@
+/* ── Jobs panel ── */
+.jobs-form { display: flex; flex-direction: column; gap: var(--space-2); }
+.jobs-form label { font-size: var(--text-xs); color: var(--text-muted); font-weight: 500; }
+.jobs-input, .jobs-select, .jobs-textarea {
+  background: var(--surface-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  outline: none;
+  width: 100%;
+  transition: border-color var(--duration-normal);
+}
+.jobs-input:focus, .jobs-select:focus, .jobs-textarea:focus { border-color: var(--accent); }
+.jobs-select option { background: var(--surface-2); }
+.jobs-textarea { font-family: var(--font-mono); resize: vertical; min-height: 56px; }
+
+.cron-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+.cron-btn {
+  background: var(--surface-3);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  padding: 2px var(--space-2);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+.cron-btn:hover {
+  background: var(--surface-4);
+  color: var(--text-primary);
+}
+.cron-btn.active {
+  background: var(--accent-muted);
+  color: var(--accent-text);
+  border-color: var(--accent);
+}
+.cron-preview {
+  font-size: var(--text-xs);
+  color: var(--accent-text);
+  font-style: italic;
+}
+.jobs-submit {
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+  font-weight: 500;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  align-self: flex-start;
+  transition: all var(--duration-fast);
+}
+.jobs-submit:hover:not(:disabled) { background: var(--accent-hover); }
+.jobs-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  background: var(--surface-4);
+  color: var(--text-disabled);
+}
+.jobs-divider { border: none; border-top: 1px solid var(--border-subtle); margin: var(--space-1) 0; }
+.job-item {
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.job-item-top { display: flex; align-items: flex-start; gap: var(--space-2); }
+.job-prompt { flex: 1; font-size: var(--text-sm); color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-cancel {
+  flex-shrink: 0;
+  padding: 2px var(--space-2);
+  font-size: var(--text-2xs);
+  font-family: var(--font-mono);
+  font-weight: 500;
+  background: none;
+  color: var(--error);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all var(--duration-fast);
+}
+.job-cancel:hover { background: var(--error-muted); }
+.job-cancel:disabled { opacity: 0.4; cursor: default; }
+.job-meta { font-size: var(--text-2xs); color: var(--text-muted); }
+.job-status-active    { color: var(--success); }
+.job-status-cancelled { color: var(--text-disabled); text-decoration: line-through; }
+.job-status-pending   { color: var(--warning); }
+.jobs-empty { padding: var(--space-4); font-size: var(--text-sm); color: var(--text-disabled); font-style: italic; text-align: center; }
+.jobs-error { font-size: var(--text-xs); color: var(--error); }
+.jobs-success { font-size: var(--text-xs); color: var(--success); }
+.schedule-mode-toggle { display: flex; gap: var(--space-1); }
