@@ -6,7 +6,8 @@
 //! in [`super::LlmClient::complete_stream`] and the Gemini cache-expired
 //! retry path so the two code paths cannot diverge.
 
-use super::{LlmClient, Provider, SseParseResult};
+use super::sse_parsers::dispatch_sse_event;
+use super::{Provider, SseParseResult};
 use crate::llm_types::StreamChunk;
 use alms_core::{AlmsError, AlmsResult};
 use tracing::warn;
@@ -36,7 +37,7 @@ pub(crate) fn stream_response(
                 if let Some(pos) = buf.find("\n\n") {
                     let event_text = buf[..pos].to_string();
                     buf = buf[pos + 2..].to_string();
-                    match LlmClient::dispatch_sse_event(provider, &event_text) {
+                    match dispatch_sse_event(provider, &event_text) {
                         SseParseResult::Chunk(chunk) => {
                             return Some((Ok(chunk), (bytes, buf)));
                         }
@@ -67,7 +68,7 @@ pub(crate) fn stream_response(
                         if !buf.trim().is_empty() {
                             let remaining = std::mem::take(&mut buf);
                             if let SseParseResult::Chunk(chunk) =
-                                LlmClient::dispatch_sse_event(provider, remaining.trim())
+                                dispatch_sse_event(provider, remaining.trim())
                             {
                                 return Some((Ok(chunk), (bytes, buf)));
                             }

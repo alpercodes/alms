@@ -1,6 +1,9 @@
 mod cache_retry;
 mod request;
+mod sse_parsers;
 mod streaming;
+#[cfg(test)]
+mod test_responder;
 
 use crate::gemini_cache::{CacheLookup, GeminiCacheStore};
 use crate::llm_types::*;
@@ -519,93 +522,6 @@ impl LlmClient {
         ))
     }
 
-    /// Route an SSE event block to the appropriate provider-specific parser.
-    pub(crate) fn dispatch_sse_event(provider: Provider, event: &str) -> SseParseResult {
-        match provider {
-            Provider::OpenAi => Self::parse_sse_event(event),
-            Provider::Anthropic => Self::parse_anthropic_sse_block(event),
-            Provider::Gemini => Self::parse_gemini_sse_block(event),
-        }
-    }
-
-    /// Parse a single Gemini SSE event block. Gemini's
-    /// `streamGenerateContent?alt=sse` uses OpenAI-style `data: {json}`
-    /// events (no typed `event:` header), so we walk the block for the
-    /// `data:` line and hand it to the provider parser.
-    fn parse_gemini_sse_block(event: &str) -> SseParseResult {
-        for line in event.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-            if let Some(data) = line
-                .strip_prefix("data: ")
-                .or_else(|| line.strip_prefix("data:"))
-            {
-                return crate::gemini::parse_gemini_sse(data.trim());
-            }
-        }
-        SseParseResult::Skip
-    }
-
-    /// Parse an Anthropic SSE event block which has `event:` and `data:` fields.
-    fn parse_anthropic_sse_block(event: &str) -> SseParseResult {
-        let mut event_type: Option<&str> = None;
-        let mut data: Option<&str> = None;
-
-        for line in event.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-            if let Some(et) = line
-                .strip_prefix("event: ")
-                .or_else(|| line.strip_prefix("event:"))
-            {
-                event_type = Some(et.trim());
-            }
-            if let Some(d) = line
-                .strip_prefix("data: ")
-                .or_else(|| line.strip_prefix("data:"))
-            {
-                data = Some(d.trim());
-            }
-        }
-
-        match (event_type, data) {
-            (Some(et), Some(d)) => crate::anthropic::parse_anthropic_sse(et, d),
-            (Some("message_stop"), _) => SseParseResult::Done,
-            _ => SseParseResult::Skip,
-        }
-    }
-
-    /// Parse a single OpenAI SSE event block (one or more `data:` lines) into a StreamChunk.
-    fn parse_sse_event(event: &str) -> SseParseResult {
-        for line in event.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with(':') {
-                continue;
-            }
-            if let Some(data) = line
-                .strip_prefix("data: ")
-                .or_else(|| line.strip_prefix("data:"))
-            {
-                let data = data.trim();
-                if data == "[DONE]" {
-                    return SseParseResult::Done;
-                }
-                match serde_json::from_str::<StreamChunk>(data) {
-                    Ok(chunk) => return SseParseResult::Chunk(chunk),
-                    Err(e) => {
-                        warn!("Failed to parse SSE chunk: {} - data: {}", e, data);
-                        continue;
-                    }
-                }
-            }
-        }
-        SseParseResult::Skip
-    }
-
     fn mock_response(&self, request: &CompletionRequest) -> CompletionResponse {
         let content = request
             .messages
@@ -897,6 +813,8 @@ impl LlmClient {
 
 #[cfg(test)]
 mod tests {
+    use super::sse_parsers::{parse_gemini_sse_block, parse_openai_sse};
+    use super::test_responder::spawn_sequential_responder;
     use super::*;
 
     #[test]
@@ -939,7 +857,7 @@ mod tests {
     #[test]
     fn test_parse_sse_event_content() {
         let event = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(event) else {
             panic!("expected Chunk");
         };
         assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("Hello"));
@@ -948,7 +866,7 @@ mod tests {
     #[test]
     fn test_parse_sse_event_done() {
         assert!(matches!(
-            LlmClient::parse_sse_event("data: [DONE]"),
+            parse_openai_sse("data: [DONE]"),
             SseParseResult::Done
         ));
     }
@@ -956,7 +874,7 @@ mod tests {
     #[test]
     fn test_parse_sse_event_comment_is_skip() {
         assert!(matches!(
-            LlmClient::parse_sse_event(": comment"),
+            parse_openai_sse(": comment"),
             SseParseResult::Skip
         ));
     }
@@ -964,7 +882,7 @@ mod tests {
     #[test]
     fn test_parse_sse_event_tool_call_delta() {
         let event = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"echo","arguments":"{\"te"}}]},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(event) else {
             panic!("expected Chunk");
         };
         let tc = chunk.choices[0].delta.tool_calls.as_ref().unwrap();
@@ -983,7 +901,7 @@ mod tests {
     #[test]
     fn test_parse_sse_event_with_usage() {
         let event = r#"data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":0,"model":"test","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(event) else {
             panic!("expected Chunk");
         };
         let usage = chunk.usage.expect("should have usage");
@@ -1431,7 +1349,7 @@ mod tests {
     #[test]
     fn test_dispatch_sse_event_routes_gemini() {
         let event = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"hi\"}]}}]}";
-        let result = LlmClient::parse_gemini_sse_block(event);
+        let result = parse_gemini_sse_block(event);
         match result {
             SseParseResult::Chunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
@@ -1950,7 +1868,7 @@ mod tests {
     #[test]
     fn test_sse_delta_reasoning_content() {
         let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"deepseek-reasoner","choices":[{"index":0,"delta":{"reasoning_content":"ponder"},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(event) else {
             panic!("expected Chunk");
         };
         assert_eq!(
@@ -1964,7 +1882,7 @@ mod tests {
     #[test]
     fn test_sse_delta_reasoning_alias() {
         let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning":"ponder-raw"},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(event) else {
             panic!("expected Chunk");
         };
         assert_eq!(
@@ -1978,7 +1896,7 @@ mod tests {
     #[test]
     fn test_sse_delta_reasoning_summary_alias() {
         let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_summary":"condensed"},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(event) else {
             panic!("expected Chunk");
         };
         assert_eq!(
@@ -1996,7 +1914,7 @@ mod tests {
     #[test]
     fn test_openai_delta_all_three_reasoning_fields_prefers_reasoning_content() {
         let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_content":"canonical","reasoning_summary":"summary","reasoning":"raw"},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(event) else {
             panic!("expected Chunk");
         };
         assert_eq!(
@@ -2017,7 +1935,7 @@ mod tests {
     fn test_openai_delta_empty_reasoning_content_falls_through_to_summary() {
         // Empty `reasoning_content` falls through to `reasoning_summary`.
         let empty_content = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_content":"","reasoning_summary":"summary text"},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(empty_content) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(empty_content) else {
             panic!("expected Chunk");
         };
         assert_eq!(
@@ -2028,7 +1946,7 @@ mod tests {
 
         // Twin: empty `reasoning_summary` falls through to `reasoning`.
         let empty_summary = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_summary":"","reasoning":"raw trace"},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(empty_summary) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(empty_summary) else {
             panic!("expected Chunk");
         };
         assert_eq!(
@@ -2111,7 +2029,7 @@ mod tests {
     #[test]
     fn test_openai_delta_all_empty_reasoning_fields_yields_none() {
         let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"o3","choices":[{"index":0,"delta":{"reasoning_content":"","reasoning_summary":"","reasoning":""},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(event) else {
             panic!("expected Chunk");
         };
         assert!(
@@ -2130,7 +2048,7 @@ mod tests {
     #[test]
     fn test_openai_delta_all_absent_reasoning_fields_yields_none() {
         let event = r#"data: {"id":"x","object":"chat.completion.chunk","created":0,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}]}"#;
-        let SseParseResult::Chunk(chunk) = LlmClient::parse_sse_event(event) else {
+        let SseParseResult::Chunk(chunk) = parse_openai_sse(event) else {
             panic!("expected Chunk");
         };
         assert!(
@@ -2151,50 +2069,6 @@ mod tests {
     // pins the behaviour with a tiny hand-rolled TCP responder so we
     // don't have to take on wiremock as a dev-dep.
     // ------------------------------------------------------------------
-
-    /// Single-shot HTTP responder: binds a port, accepts one connection,
-    /// reads the request line (enough to dispatch in-order), and writes
-    /// `responses[i]` for request `i`. Returns the `base_url` for the
-    /// `LlmClient`. The listener task exits once all `responses` have
-    /// been served.
-    async fn spawn_sequential_responder(responses: Vec<(u16, &'static str)>) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base_url = format!("http://{}/v1beta", addr);
-
-        tokio::spawn(async move {
-            for (status, body) in responses {
-                let (mut sock, _) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                // Drain the request headers so the client doesn't block
-                // waiting for us to consume the body. We read until the
-                // buffer stops growing for one chunk — the client sends
-                // everything in a single write for these tiny bodies.
-                let mut buf = vec![0u8; 16 * 1024];
-                let _ = sock.read(&mut buf).await;
-                let reason = match status {
-                    200 => "OK",
-                    400 => "Bad Request",
-                    404 => "Not Found",
-                    500 => "Internal Server Error",
-                    _ => "Status",
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = sock.write_all(response.as_bytes()).await;
-                let _ = sock.shutdown().await;
-            }
-        });
-
-        base_url
-    }
 
     fn gemini_client_with_base_url(base_url: String) -> LlmClient {
         let mut core_cfg = alms_core::config::LlmConfig::default();

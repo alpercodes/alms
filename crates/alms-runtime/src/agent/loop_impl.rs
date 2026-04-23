@@ -924,7 +924,7 @@ impl AgentRuntime {
     ///
     /// **Timeout**: Per-chunk timeout is enforced inside the LLM client's
     /// `complete_stream` implementation (see `LlmClient::complete_stream` in
-    /// `llm_client.rs`), controlled by `LlmConfig::stream_chunk_timeout_secs`
+    /// `llm_client/`), controlled by `LlmConfig::stream_chunk_timeout_secs`
     /// (default 60s). If the provider stalls mid-stream, the chunk-level
     /// timeout fires and propagates an error up through this method. User-
     /// initiated cancellation is handled separately in `call_llm_with_cancellation`.
