@@ -122,5 +122,3 @@
   transition: all var(--duration-normal);
 }
 #new-session-btn:hover { color: var(--accent); border-color: var(--accent); }
-
-.run-empty { padding: var(--space-4); font-size: var(--text-sm); color: var(--text-disabled); font-style: italic; text-align: center; }

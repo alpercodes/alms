@@ -147,8 +147,6 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.audit-empty { padding: var(--space-4); font-size: var(--text-sm); color: var(--text-disabled); font-style: italic; text-align: center; }
-
 /* Load more button for audit pagination */
 .audit-load-more {
   display: block;

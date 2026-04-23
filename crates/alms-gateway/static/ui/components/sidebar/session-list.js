@@ -352,7 +352,7 @@ export function SessionList() {
             </div>
             <div id="session-list" role="listbox" aria-label="Sessions">
                 ${chatSessions.length === 0 && dmSessions.length === 0 && notifSessions.length === 0
-                    ? html`<div class="run-empty">No sessions</div>`
+                    ? html`<div class="empty-state">No sessions</div>`
                     : null
                 }
                 ${chatSessions.map(s => html`
