@@ -96,6 +96,7 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
         "has_telegram": agent.telegram_token.is_some(),
         "thinking_budget_tokens": agent.thinking_budget_tokens,
         "reasoning_effort": agent.reasoning_effort.map(|e| e.as_wire_str()),
+        "gemini_thinking_budget": agent.gemini_thinking_budget,
         "is_default": agent.is_default,
         "created_at": agent.created_at.to_rfc3339(),
         "last_active": agent.last_active.to_rfc3339(),
@@ -115,6 +116,9 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
     }
     if agent.reasoning_effort.is_none() {
         v.as_object_mut().unwrap().remove("reasoning_effort");
+    }
+    if agent.gemini_thinking_budget.is_none() {
+        v.as_object_mut().unwrap().remove("gemini_thinking_budget");
     }
     v
 }
@@ -161,6 +165,7 @@ pub async fn create_agent(
         telegram_token: req.telegram_token,
         thinking_budget_tokens: req.thinking_budget_tokens,
         reasoning_effort: req.reasoning_effort,
+        gemini_thinking_budget: req.gemini_thinking_budget,
         // Always INSERT with is_default=false; set_default_agent atomically
         // clears old default + sets new one in a single transaction.
         is_default: false,
@@ -270,6 +275,15 @@ pub async fn update_agent(
         agent.reasoning_effort = Some(effort);
     }
 
+    // `gemini_thinking_budget` follows the same PATCH shape as
+    // `thinking_budget_tokens` above (#794): `Some(n)` (including `Some(0)`)
+    // is an explicit override; omitting the field leaves the existing
+    // value unchanged. No sentinel to clear back to "inherit server
+    // default".
+    if let Some(budget) = req.gemini_thinking_budget {
+        agent.gemini_thinking_budget = Some(budget);
+    }
+
     agent.last_active = Utc::now();
 
     store
@@ -342,6 +356,7 @@ mod tests {
             telegram_token: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
             is_default: false,
             created_at: now,
             last_active: now,

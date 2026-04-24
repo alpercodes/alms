@@ -29,8 +29,9 @@ impl SqliteStore {
         tx.execute(
             "INSERT INTO agents \
              (id, name, description, model, posture, provider, telegram_token, \
-              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+              gemini_thinking_budget) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 agent.id.0.to_string(),
                 &agent.name,
@@ -44,6 +45,7 @@ impl SqliteStore {
                 agent.last_active.to_rfc3339(),
                 agent.thinking_budget_tokens.map(i64::from),
                 agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
+                agent.gemini_thinking_budget.map(i64::from),
             ],
         )
         .map_err(|e| AlmsError::Runtime(format!("SQLite create_agent_if_none_exist: {e}")))?;
@@ -60,8 +62,9 @@ impl SqliteStore {
             .execute(
                 "INSERT INTO agents \
                  (id, name, description, model, posture, provider, telegram_token, \
-                  is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+                  gemini_thinking_budget) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                 params![
                     agent.id.0.to_string(),
                     &agent.name,
@@ -75,6 +78,7 @@ impl SqliteStore {
                     agent.last_active.to_rfc3339(),
                     agent.thinking_budget_tokens.map(i64::from),
                     agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
+                    agent.gemini_thinking_budget.map(i64::from),
                 ],
             )
             .map_err(|e| match &e {
@@ -100,7 +104,7 @@ impl SqliteStore {
                 "UPDATE agents SET description = ?1, model = ?2, \
                  posture = ?3, provider = ?4, telegram_token = ?5, \
                  thinking_budget_tokens = ?6, reasoning_effort = ?7, \
-                 last_active = ?8 WHERE id = ?9",
+                 gemini_thinking_budget = ?8, last_active = ?9 WHERE id = ?10",
                 params![
                     &agent.description,
                     agent.model.as_deref(),
@@ -109,6 +113,7 @@ impl SqliteStore {
                     agent.telegram_token.as_deref(),
                     agent.thinking_budget_tokens.map(i64::from),
                     agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
+                    agent.gemini_thinking_budget.map(i64::from),
                     agent.last_active.to_rfc3339(),
                     agent.id.0.to_string(),
                 ],
@@ -125,7 +130,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
+             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+             gemini_thinking_budget \
              FROM agents WHERE id = ?1",
             params![id.0.to_string()],
             parse_agent_row,
@@ -142,7 +148,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
+             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+             gemini_thinking_budget \
              FROM agents WHERE name = ?1",
             params![name],
             parse_agent_row,
@@ -161,7 +168,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
+             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+             gemini_thinking_budget \
              FROM agents WHERE is_default = 1 LIMIT 1",
             [],
             parse_agent_row,
@@ -179,7 +187,8 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
-                 is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
+                 is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+                 gemini_thinking_budget \
                  FROM agents ORDER BY created_at",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
@@ -207,7 +216,8 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
-                 is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort \
+                 is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+                 gemini_thinking_budget \
                  FROM agents WHERE telegram_token IS NOT NULL AND telegram_token != '' \
                  ORDER BY created_at",
             )
@@ -364,6 +374,7 @@ mod tests {
             telegram_token: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
             is_default: false,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
@@ -826,6 +837,32 @@ mod tests {
                 "variant {variant:?} did not round-trip"
             );
         }
+    }
+
+    #[test]
+    fn test_agent_gemini_thinking_budget_roundtrip() {
+        // Issue #794: per-agent Gemini thinking budget survives round-trip.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("gemini-thinker");
+        agent.gemini_thinking_budget = Some(16384);
+        store.create_agent(&agent).unwrap();
+
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.gemini_thinking_budget, Some(16384));
+
+        // Explicit disable via `Some(0)` must round-trip as `Some(0)`.
+        let mut updated = loaded;
+        updated.gemini_thinking_budget = Some(0);
+        store.update_agent(&updated).unwrap();
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(reloaded.gemini_thinking_budget, Some(0));
+
+        // Clearing to `None` (inherit server default) must round-trip.
+        let mut cleared = reloaded;
+        cleared.gemini_thinking_budget = None;
+        store.update_agent(&cleared).unwrap();
+        let final_state = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(final_state.gemini_thinking_budget, None);
     }
 
     #[test]

@@ -314,6 +314,7 @@ async fn main() -> anyhow::Result<()> {
                     provider,
                     thinking_budget_tokens,
                     reasoning_effort,
+                    gemini_thinking_budget,
                     default,
                 } => {
                     let workspace_dir = config.server.workspace_dir();
@@ -327,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
                             provider,
                             thinking_budget_tokens,
                             reasoning_effort: reasoning_effort.map(Into::into),
+                            gemini_thinking_budget,
                             default,
                             json,
                             workspace_dir: Some(&workspace_dir),
@@ -350,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
                     description,
                     thinking_budget_tokens,
                     reasoning_effort,
+                    gemini_thinking_budget,
                 } => {
                     cmd_agent::agent_config(
                         &store,
@@ -361,6 +364,7 @@ async fn main() -> anyhow::Result<()> {
                             description,
                             thinking_budget_tokens,
                             reasoning_effort: reasoning_effort.map(Into::into),
+                            gemini_thinking_budget,
                             json,
                         },
                     )?;

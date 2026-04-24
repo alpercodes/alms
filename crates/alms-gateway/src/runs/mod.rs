@@ -86,6 +86,13 @@ struct RunOverrides {
     /// Silently ignored when the effective provider is not OpenAI-compatible
     /// or the model isn't a reasoning model.
     reasoning_effort: Option<alms_core::config::ReasoningEffort>,
+    /// Per-run Gemini extended-thinking budget override (#794). `Some(0)`
+    /// explicitly disables extended thinking for just this run even when
+    /// both the per-agent and server default would enable it. Three-layer
+    /// precedence: per-run > per-agent > server default from
+    /// `[llm.gemini].thinking_budget`. Silently ignored when the effective
+    /// provider is not Gemini.
+    gemini_thinking_budget: Option<u32>,
 }
 
 /// Bundled parameters for [`lifecycle::execute_run`], avoiding a long positional argument list.
@@ -301,6 +308,14 @@ fn apply_overrides(
         if let Some(effort) = record.reasoning_effort {
             cfg.openai_reasoning_effort = Some(effort);
         }
+        // Per-agent Gemini thinking budget (#794). `Some(n)` (including
+        // `Some(0)`) is a legitimate per-agent override meaning "disable
+        // extended thinking for this agent even when the server default
+        // enables it", so we honour any `Some` value here — same shape as
+        // Anthropic `thinking_budget_tokens` above.
+        if let Some(budget) = record.gemini_thinking_budget {
+            cfg.gemini_thinking_budget = Some(budget);
+        }
     }
 
     // -- Per-run overrides (highest precedence) --
@@ -324,6 +339,13 @@ fn apply_overrides(
     // and server default.
     if let Some(effort) = overrides.reasoning_effort {
         cfg.openai_reasoning_effort = Some(effort);
+    }
+    // Per-run Gemini thinking budget (#794) wins over per-agent and
+    // server default. Same semantics as Anthropic `thinking_budget_tokens`:
+    // `Some(0)` is an explicit per-run disable, not a "use default"
+    // sentinel.
+    if let Some(budget) = overrides.gemini_thinking_budget {
+        cfg.gemini_thinking_budget = Some(budget);
     }
 
     MergedConfig {
@@ -369,6 +391,7 @@ mod tests {
             telegram_token: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -503,6 +526,7 @@ mod tests {
             telegram_token: None,
             thinking_budget_tokens: budget,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -603,6 +627,7 @@ mod tests {
             telegram_token: None,
             thinking_budget_tokens: None,
             reasoning_effort: effort,
+            gemini_thinking_budget: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -682,6 +707,151 @@ mod tests {
             &RunOverrides::default(),
         );
         assert!(merged.agent_config.openai_reasoning_effort.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Gemini thinking-budget precedence (issue #794)
+    //
+    // Mirrors the Anthropic `thinking_budget_tokens` path above: three-
+    // layer chain (per-run > per-agent > server default), `Some(n)` at
+    // any layer wins (including `Some(0)` as an explicit disable), `None`
+    // falls through. `None` on the `AgentConfig` is a valid terminal
+    // state — it means "inherit the server default at wire-emission
+    // time", matching the behaviour documented on
+    // `AgentConfig::gemini_thinking_budget`.
+    // ------------------------------------------------------------------
+
+    fn base_config_with_gemini_thinking(budget: Option<u32>) -> AgentConfig {
+        AgentConfig {
+            system_prompt: "server default prompt".into(),
+            max_tokens: 100_000,
+            posture: Posture::FullControl,
+            gemini_thinking_budget: budget,
+            ..AgentConfig::default()
+        }
+    }
+
+    fn agent_with_gemini_thinking(budget: Option<u32>) -> AgentRecord {
+        let now = Utc::now();
+        AgentRecord {
+            id: AgentId::new(),
+            name: "gemini-thinker".into(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: budget,
+            is_default: false,
+            created_at: now,
+            last_active: now,
+        }
+    }
+
+    #[test]
+    fn test_gemini_thinking_server_default_inherited() {
+        // No per-agent or per-run override: server default (4096) wins.
+        let merged = apply_overrides(
+            base_config_with_gemini_thinking(Some(4096)),
+            None,
+            &RunOverrides::default(),
+        );
+        assert_eq!(merged.agent_config.gemini_thinking_budget, Some(4096));
+    }
+
+    #[test]
+    fn test_gemini_thinking_per_agent_overrides_server_default() {
+        // Server default = None (disabled), agent opts in with 8192.
+        let agent = agent_with_gemini_thinking(Some(8192));
+        let merged = apply_overrides(
+            base_config_with_gemini_thinking(None),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(merged.agent_config.gemini_thinking_budget, Some(8192));
+    }
+
+    #[test]
+    fn test_gemini_thinking_per_agent_zero_disables() {
+        // Server default = 4096 (enabled). Agent explicitly sets 0 to
+        // opt out. This must WIN over the server default.
+        let agent = agent_with_gemini_thinking(Some(0));
+        let merged = apply_overrides(
+            base_config_with_gemini_thinking(Some(4096)),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged.agent_config.gemini_thinking_budget,
+            Some(0),
+            "per-agent Some(0) must disable Gemini thinking even when server default enables it"
+        );
+    }
+
+    #[test]
+    fn test_gemini_thinking_per_run_beats_per_agent() {
+        let agent = agent_with_gemini_thinking(Some(2048));
+        let overrides = RunOverrides {
+            gemini_thinking_budget: Some(16384),
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(
+            base_config_with_gemini_thinking(Some(4096)),
+            Some(&agent),
+            &overrides,
+        );
+        assert_eq!(
+            merged.agent_config.gemini_thinking_budget,
+            Some(16384),
+            "per-run override must win over per-agent and server"
+        );
+    }
+
+    #[test]
+    fn test_gemini_thinking_per_run_zero_disables_over_everything() {
+        // Server + per-agent both enable; per-run explicitly disables
+        // with `Some(0)` — must win.
+        let agent = agent_with_gemini_thinking(Some(8192));
+        let overrides = RunOverrides {
+            gemini_thinking_budget: Some(0),
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(
+            base_config_with_gemini_thinking(Some(4096)),
+            Some(&agent),
+            &overrides,
+        );
+        assert_eq!(
+            merged.agent_config.gemini_thinking_budget,
+            Some(0),
+            "per-run Some(0) must disable Gemini thinking even when both lower layers enable it"
+        );
+    }
+
+    #[test]
+    fn test_gemini_thinking_per_agent_none_falls_through_to_server() {
+        // Agent doesn't care — server default (4096) wins.
+        let agent = agent_with_gemini_thinking(None);
+        let merged = apply_overrides(
+            base_config_with_gemini_thinking(Some(4096)),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(merged.agent_config.gemini_thinking_budget, Some(4096));
+    }
+
+    #[test]
+    fn test_gemini_thinking_all_none_leaves_none() {
+        // Everyone defers to the next layer — ends as `None` (which the
+        // Gemini adapter treats as "no thinkingConfig on the wire").
+        let merged = apply_overrides(
+            base_config_with_gemini_thinking(None),
+            None,
+            &RunOverrides::default(),
+        );
+        assert!(merged.agent_config.gemini_thinking_budget.is_none());
     }
 
     #[test]

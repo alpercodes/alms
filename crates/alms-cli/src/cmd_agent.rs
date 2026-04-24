@@ -62,6 +62,13 @@ pub(crate) enum AgentCommands {
         /// also ignore it. (#768)
         #[arg(long, value_enum)]
         reasoning_effort: Option<ReasoningEffortArg>,
+        /// Gemini extended-thinking budget in tokens (Gemini 2.5+).
+        /// `0` explicitly disables thinking for this agent even when the
+        /// server default enables it. Omit the flag to inherit the server
+        /// default (three-layer precedence: per-run > per-agent > server).
+        /// Non-Gemini providers silently ignore the value. (#794)
+        #[arg(long)]
+        gemini_thinking_budget: Option<u32>,
         /// Set as the default agent
         #[arg(long)]
         default: bool,
@@ -111,6 +118,13 @@ pub(crate) enum AgentCommands {
         /// the current value unchanged; no sentinel to clear the override.
         #[arg(long, value_enum)]
         reasoning_effort: Option<ReasoningEffortArg>,
+        /// Gemini extended-thinking budget in tokens (Gemini 2.5+).
+        /// `0` explicitly disables thinking for this agent. Omit the flag
+        /// to leave the current value unchanged. No CLI sentinel to clear
+        /// back to "inherit server default" — matches the HTTP API
+        /// semantics on `thinking_budget_tokens` (#794).
+        #[arg(long)]
+        gemini_thinking_budget: Option<u32>,
     },
 }
 
@@ -159,6 +173,11 @@ pub(crate) struct AgentCreateOpts<'a> {
     /// / `minimal`). `None` inherits the server default from
     /// `[llm.openai]`. Matches the HTTP API semantics on `POST /agents`.
     pub reasoning_effort: Option<alms_core::config::ReasoningEffort>,
+    /// Gemini extended-thinking budget override (tokens). `Some(0)`
+    /// explicitly disables thinking; `None` inherits the server default
+    /// from `[llm.gemini]`. Matches the HTTP API semantics on
+    /// `POST /agents` (#794).
+    pub gemini_thinking_budget: Option<u32>,
     pub default: bool,
     pub json: bool,
     pub workspace_dir: Option<&'a std::path::Path>,
@@ -173,6 +192,7 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         provider,
         thinking_budget_tokens,
         reasoning_effort,
+        gemini_thinking_budget,
         default,
         json,
         workspace_dir,
@@ -191,6 +211,7 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         telegram_token: None,
         thinking_budget_tokens,
         reasoning_effort,
+        gemini_thinking_budget,
         is_default: default,
         created_at: now,
         last_active: now,
@@ -280,6 +301,16 @@ pub(crate) fn agent_show(store: &SqliteStore, name_or_id: &str, json: bool) -> a
         None => "(server default)".to_string(),
     };
     println!("Reasoning:     {reasoning_display}");
+    // Render the Gemini extended-thinking budget (#794). `Some(0)` prints
+    // as a distinct "disabled (explicit)" so it's visually separable from
+    // the inherit-server-default case — mirrors the Anthropic Thinking
+    // row above.
+    let gemini_thinking_display = match agent.gemini_thinking_budget {
+        Some(0) => "disabled (explicit)".to_string(),
+        Some(n) => format!("{n} tokens"),
+        None => "(server default)".to_string(),
+    };
+    println!("Gemini Think:  {gemini_thinking_display}");
     println!(
         "Default:       {}",
         if agent.is_default { "yes" } else { "no" }
@@ -348,6 +379,11 @@ pub(crate) struct AgentConfigOpts<'a> {
     /// `minimal`). `None` leaves the stored value unchanged. Matches
     /// the HTTP `PATCH /agents` semantics on `reasoning_effort` (#768).
     pub reasoning_effort: Option<alms_core::config::ReasoningEffort>,
+    /// Gemini extended-thinking budget override (tokens). `Some(0)`
+    /// explicitly disables thinking; `Some(n)` sets the budget. `None`
+    /// leaves the stored value unchanged — matches the HTTP `PATCH
+    /// /agents` semantics on `gemini_thinking_budget` (#794).
+    pub gemini_thinking_budget: Option<u32>,
     pub json: bool,
 }
 
@@ -360,6 +396,7 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
         description,
         thinking_budget_tokens,
         reasoning_effort,
+        gemini_thinking_budget,
         json,
     } = opts;
 
@@ -389,6 +426,14 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
     // per-agent override; `None` leaves the stored value unchanged (#768).
     if let Some(effort) = reasoning_effort {
         agent.reasoning_effort = Some(effort);
+    }
+
+    // Gemini thinking budget: `Some(n)` (including `Some(0)`) is an
+    // explicit override; `None` leaves the stored value unchanged. No
+    // CLI sentinel to clear back to "inherit server default" — matches
+    // the HTTP `PUT /agents/{id}` semantics (#794).
+    if let Some(budget) = gemini_thinking_budget {
+        agent.gemini_thinking_budget = Some(budget);
     }
 
     agent.last_active = chrono::Utc::now();
@@ -423,6 +468,7 @@ mod tests {
                 provider: None,
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -458,6 +504,7 @@ mod tests {
                 provider: None,
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -474,6 +521,7 @@ mod tests {
                 provider: None,
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -496,6 +544,7 @@ mod tests {
                 provider: None,
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -521,6 +570,7 @@ mod tests {
                 provider: None,
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 default: false,
                 json: false,
                 workspace_dir: Some(&ws_dir),
@@ -594,6 +644,7 @@ mod tests {
                 description: Some("updated desc".into()),
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 json: false,
             },
         )
@@ -619,6 +670,7 @@ mod tests {
             telegram_token: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -636,6 +688,7 @@ mod tests {
                 description: None,
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 json: false,
             },
         )
@@ -665,6 +718,7 @@ mod tests {
                 provider: None,
                 thinking_budget_tokens: Some(8192),
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -690,6 +744,7 @@ mod tests {
                 provider: None,
                 thinking_budget_tokens: Some(0),
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -716,6 +771,7 @@ mod tests {
                 description: None,
                 thinking_budget_tokens: Some(4096),
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 json: false,
             },
         )
@@ -734,6 +790,7 @@ mod tests {
                 description: None,
                 thinking_budget_tokens: Some(0),
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 json: false,
             },
         )
@@ -752,6 +809,7 @@ mod tests {
                 description: None,
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
+                gemini_thinking_budget: None,
                 json: false,
             },
         )
@@ -761,6 +819,134 @@ mod tests {
             after_noop.thinking_budget_tokens,
             Some(0),
             "omitted flag must not clobber existing thinking_budget_tokens"
+        );
+        assert_eq!(after_noop.model.as_deref(), Some("some-model"));
+    }
+
+    // -- CLI --gemini-thinking-budget flag on create + update (#794) ----------
+    //
+    // Mirrors the `thinking_budget_tokens` CLI tests above. `alms agent
+    // create --gemini-thinking-budget N` must persist the value verbatim
+    // (including `Some(0)` as an explicit per-agent disable). `alms agent
+    // config --gemini-thinking-budget N` must overwrite; omitting the
+    // flag must leave the stored value untouched.
+
+    #[test]
+    fn test_create_with_gemini_thinking_budget() {
+        let store = new_store();
+        agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "gemini-thinker".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: Some(16384),
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap();
+        let agent = resolve_agent(&store, "gemini-thinker").unwrap();
+        assert_eq!(agent.gemini_thinking_budget, Some(16384));
+    }
+
+    #[test]
+    fn test_create_with_gemini_thinking_budget_zero_disables() {
+        // `--gemini-thinking-budget 0` is an explicit per-agent opt-out,
+        // not "inherit server default". Must survive round-trip as
+        // `Some(0)`.
+        let store = new_store();
+        agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "no-gemini-thinker".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: Some(0),
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap();
+        let agent = resolve_agent(&store, "no-gemini-thinker").unwrap();
+        assert_eq!(agent.gemini_thinking_budget, Some(0));
+    }
+
+    #[test]
+    fn test_config_updates_gemini_thinking_budget() {
+        let store = new_store();
+        make_agent(&store, "gemini-tuner");
+
+        // Set an initial value.
+        agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "gemini-tuner",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: Some(4096),
+                json: false,
+            },
+        )
+        .unwrap();
+        let after_set = resolve_agent(&store, "gemini-tuner").unwrap();
+        assert_eq!(after_set.gemini_thinking_budget, Some(4096));
+
+        // Overwrite with an explicit disable (`Some(0)`).
+        agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "gemini-tuner",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: Some(0),
+                json: false,
+            },
+        )
+        .unwrap();
+        let after_zero = resolve_agent(&store, "gemini-tuner").unwrap();
+        assert_eq!(after_zero.gemini_thinking_budget, Some(0));
+
+        // Omitting the flag (`None`) must leave the stored value
+        // untouched — same no-op semantics as `thinking_budget_tokens`.
+        agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "gemini-tuner",
+                model: Some("some-model".into()),
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                json: false,
+            },
+        )
+        .unwrap();
+        let after_noop = resolve_agent(&store, "gemini-tuner").unwrap();
+        assert_eq!(
+            after_noop.gemini_thinking_budget,
+            Some(0),
+            "omitted flag must not clobber existing gemini_thinking_budget"
         );
         assert_eq!(after_noop.model.as_deref(), Some("some-model"));
     }

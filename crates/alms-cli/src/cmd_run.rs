@@ -64,6 +64,7 @@ pub(crate) async fn run_create(
         debug_mode: None,
         thinking_budget_tokens: None,
         reasoning_effort: None,
+        gemini_thinking_budget: None,
     };
     let (_status, val) = api_post(client, url, "runs", &req).await?;
     if json {

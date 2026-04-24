@@ -854,6 +854,13 @@ struct SubagentRecordConfig {
     /// `Some(effort)` wins over the parent; `None` inherits the parent's
     /// effective effort.
     reasoning_effort: Option<alms_core::config::ReasoningEffort>,
+    /// Per-named-subagent Gemini extended-thinking budget override (#794).
+    /// Same shape as `thinking_budget_tokens` and `reasoning_effort`:
+    /// `Some(n)` (including `Some(0)`) wins over the parent's effective
+    /// budget; `None` inherits it. Keeps the three-layer precedence
+    /// (per-run > per-agent > server default) intact for named
+    /// subagents on the Gemini path.
+    gemini_thinking_budget: Option<u32>,
 }
 
 /// Build an `AgentConfig` for a subagent. Named subagents get their config
@@ -864,17 +871,24 @@ fn agent_config_for_subagent(
     record: Option<SubagentRecordConfig>,
     base: &AgentConfig,
 ) -> (AgentConfig, Option<String>, Option<String>) {
-    let (model, posture_str, provider, thinking_budget_override, reasoning_effort_override) =
-        match record {
-            Some(r) => (
-                r.model,
-                r.posture,
-                r.provider,
-                r.thinking_budget_tokens,
-                r.reasoning_effort,
-            ),
-            None => (None, None, None, None, None),
-        };
+    let (
+        model,
+        posture_str,
+        provider,
+        thinking_budget_override,
+        reasoning_effort_override,
+        gemini_thinking_budget_override,
+    ) = match record {
+        Some(r) => (
+            r.model,
+            r.posture,
+            r.provider,
+            r.thinking_budget_tokens,
+            r.reasoning_effort,
+            r.gemini_thinking_budget,
+        ),
+        None => (None, None, None, None, None, None),
+    };
 
     let posture = posture_str
         .as_deref()
@@ -894,6 +908,15 @@ fn agent_config_for_subagent(
     // shape as the thinking budget: `Some(effort)` overrides the parent;
     // `None` inherits the parent's effective value.
     let openai_reasoning_effort = reasoning_effort_override.or(base.openai_reasoning_effort);
+
+    // Per-named-subagent Gemini thinking budget override (#794). Same
+    // shape as the Anthropic path: `Some(n)` (including `Some(0)`) is an
+    // explicit override; `None` inherits the parent's effective budget.
+    // Using `.or()` here rather than `.unwrap_or(base.gemini_thinking_budget)`
+    // because `base.gemini_thinking_budget` is itself `Option<u32>`, and
+    // we want the parent's `None` state (= "inherit server default") to
+    // propagate verbatim when the subagent record has no override.
+    let gemini_thinking_budget = gemini_thinking_budget_override.or(base.gemini_thinking_budget);
 
     let config = AgentConfig {
         system_prompt: DEFAULT_SUBAGENT_PROMPT.to_string(),
@@ -920,8 +943,10 @@ fn agent_config_for_subagent(
         // by subagents so they benefit from the same cached prefix.
         anthropic_prompt_cache_enabled: base.anthropic_prompt_cache_enabled,
         openai_reasoning_effort,
-        // Gemini thinking (#769) — inherit parent's resolved value.
-        gemini_thinking_budget: base.gemini_thinking_budget,
+        // Gemini thinking (#794) — three-layer precedence: per-named-
+        // subagent > parent's effective budget > server default. Resolved
+        // above via `gemini_thinking_budget_override.or(base.gemini_thinking_budget)`.
+        gemini_thinking_budget,
         // Gemini caching (#769) — server-level only, inherited verbatim
         // by subagents so they share cache entries where possible.
         gemini_cache_enabled: base.gemini_cache_enabled,
@@ -1014,6 +1039,7 @@ async fn run_agent_loop(
                     provider: record.provider,
                     thinking_budget_tokens: record.thinking_budget_tokens,
                     reasoning_effort: record.reasoning_effort,
+                    gemini_thinking_budget: record.gemini_thinking_budget,
                 }
             })
             .or_else(|| {
@@ -1552,6 +1578,7 @@ mod tests {
             provider: Some("anthropic".into()),
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
         };
         let (config2, model2, _provider2) = agent_config_for_subagent(Some(record), &parent);
         assert_eq!(model2.as_deref(), Some("gpt-5"));
@@ -1601,6 +1628,7 @@ mod tests {
             provider: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
         };
         let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
         assert!(named.shell_spill.enabled);
@@ -1650,6 +1678,7 @@ mod tests {
             provider: None,
             thinking_budget_tokens: Some(0),
             reasoning_effort: None,
+            gemini_thinking_budget: None,
         };
         let (sub_zero, _, _) = agent_config_for_subagent(Some(record_zero), &parent);
         assert_eq!(
@@ -1665,6 +1694,7 @@ mod tests {
             provider: None,
             thinking_budget_tokens: Some(8192),
             reasoning_effort: None,
+            gemini_thinking_budget: None,
         };
         let (sub_explicit, _, _) = agent_config_for_subagent(Some(record_explicit), &parent);
         assert_eq!(
@@ -1679,6 +1709,7 @@ mod tests {
             provider: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
         };
         let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
         assert_eq!(
@@ -1718,6 +1749,7 @@ mod tests {
             provider: None,
             thinking_budget_tokens: None,
             reasoning_effort: Some(ReasoningEffort::Low),
+            gemini_thinking_budget: None,
         };
         let (sub_low, _, _) = agent_config_for_subagent(Some(record_low), &parent);
         assert_eq!(
@@ -1733,6 +1765,7 @@ mod tests {
             provider: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
         };
         let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
         assert_eq!(
@@ -1765,6 +1798,7 @@ mod tests {
             provider: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
         };
         let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
         assert!(
@@ -1786,7 +1820,9 @@ mod tests {
 
     /// Issue #769: Gemini context caching + thinking budget inherit
     /// from the parent the same way Anthropic prompt caching does.
-    /// No per-subagent override path — server-level only.
+    /// Caching is server-level only; the thinking budget gained a
+    /// per-named-subagent override in #794 (covered by the separate
+    /// `test_subagent_gemini_thinking_budget_override` below).
     #[test]
     fn test_subagent_inherits_gemini_cache_and_thinking_budget() {
         // Parent disables caching and sets a thinking budget.
@@ -1804,14 +1840,15 @@ mod tests {
         assert_eq!(ephemeral.gemini_cache_ttl_seconds, 1800);
         assert_eq!(ephemeral.gemini_thinking_budget, Some(8192));
 
-        // Named subagent path — SubagentRecordConfig has no Gemini
-        // knobs, so the parent's values pass through unchanged.
+        // Named subagent with `None` override inherits the parent's
+        // effective budget and caching state verbatim (#794 propagation).
         let record = SubagentRecordConfig {
             model: None,
             posture: None,
             provider: None,
             thinking_budget_tokens: None,
             reasoning_effort: None,
+            gemini_thinking_budget: None,
         };
         let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
         assert!(!named.gemini_cache_enabled);
@@ -1830,6 +1867,82 @@ mod tests {
         assert!(sub.gemini_cache_enabled);
         assert_eq!(sub.gemini_cache_ttl_seconds, 300);
         assert_eq!(sub.gemini_thinking_budget, None);
+    }
+
+    /// Issue #794: per-named-subagent Gemini thinking budget override
+    /// wins over the parent's effective budget, mirroring how the
+    /// Anthropic `thinking_budget_tokens` and OpenAI `reasoning_effort`
+    /// overrides work for named subagents. `Some(0)` is an explicit
+    /// disable; `None` falls through to the parent.
+    #[test]
+    fn test_subagent_gemini_thinking_budget_override() {
+        // Parent has Gemini thinking enabled at 4096.
+        let parent = AgentConfig {
+            gemini_thinking_budget: Some(4096),
+            ..AgentConfig::default()
+        };
+
+        // Named subagent explicitly sets Some(16384): must win.
+        let record_high = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: Some(16384),
+        };
+        let (sub_high, _, _) = agent_config_for_subagent(Some(record_high), &parent);
+        assert_eq!(
+            sub_high.gemini_thinking_budget,
+            Some(16384),
+            "named subagent Some(16384) must override parent's Some(4096)"
+        );
+
+        // Named subagent explicitly sets Some(0): must disable even
+        // though the parent would enable.
+        let record_zero = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: Some(0),
+        };
+        let (sub_zero, _, _) = agent_config_for_subagent(Some(record_zero), &parent);
+        assert_eq!(
+            sub_zero.gemini_thinking_budget,
+            Some(0),
+            "named subagent Some(0) must disable Gemini thinking even when parent enables"
+        );
+
+        // Named subagent with None: inherit parent's Some(4096).
+        let record_none = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+        };
+        let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
+        assert_eq!(sub_none.gemini_thinking_budget, Some(4096));
+
+        // Parent with thinking disabled (None), subagent opts in with
+        // Some(8192): subagent wins.
+        let disabled_parent = AgentConfig {
+            gemini_thinking_budget: None,
+            ..AgentConfig::default()
+        };
+        let record_optin = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: Some(8192),
+        };
+        let (sub_optin, _, _) = agent_config_for_subagent(Some(record_optin), &disabled_parent);
+        assert_eq!(sub_optin.gemini_thinking_budget, Some(8192));
     }
 
     // -- (j) get_completed_result on unknown task → None ------------------------

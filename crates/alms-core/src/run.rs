@@ -280,6 +280,17 @@ pub struct CreateRunRequest {
     /// model.
     #[serde(default)]
     pub reasoning_effort: Option<crate::config::ReasoningEffort>,
+    /// Optional per-run Gemini extended-thinking budget override (#794).
+    ///
+    /// `Some(0)` explicitly disables extended thinking for just this run
+    /// even when per-agent or server config would enable it. Omitting the
+    /// field falls through to the per-agent override (or server default).
+    /// Silently ignored when the effective provider is not Gemini.
+    ///
+    /// Three-layer precedence: per-run > per-agent > server default from
+    /// `[llm.gemini].thinking_budget`.
+    #[serde(default)]
+    pub gemini_thinking_budget: Option<u32>,
 }
 
 /// Input to a run

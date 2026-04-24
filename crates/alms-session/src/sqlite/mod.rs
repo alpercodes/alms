@@ -115,7 +115,8 @@ CREATE TABLE IF NOT EXISTS agents (
     created_at             TEXT NOT NULL,
     last_active            TEXT NOT NULL,
     thinking_budget_tokens INTEGER,
-    reasoning_effort       TEXT
+    reasoning_effort       TEXT,
+    gemini_thinking_budget INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
@@ -224,6 +225,11 @@ impl SqliteStore {
         // override. Stored as TEXT to match the `ReasoningEffort` enum's
         // lowercase serde wire format.
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN reasoning_effort TEXT;");
+        // Auto-migrate: add gemini_thinking_budget column for per-agent
+        // Gemini extended-thinking opt-in (issue #794). NULL means
+        // "inherit the server default from [llm.gemini]"; any integer
+        // (including 0) is an explicit per-agent override.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN gemini_thinking_budget INTEGER;");
         // Auto-migrate: add run_tool_calls table for per-run tool call storage.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS run_tool_calls (\
@@ -464,6 +470,12 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
                 None
             }
         });
+    // Per-agent Gemini thinking budget (issue #794). Stored as INTEGER;
+    // parsed as i64 → saturating u32 so corrupt values don't crash the
+    // row parser. NULL maps to `None` (inherit the server default).
+    let gemini_thinking_budget: Option<u32> = row
+        .get::<_, Option<i64>>(12)?
+        .map(|v| v.clamp(0, i64::from(u32::MAX)) as u32);
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -485,6 +497,7 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         telegram_token,
         thinking_budget_tokens,
         reasoning_effort,
+        gemini_thinking_budget,
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),

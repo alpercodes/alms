@@ -314,6 +314,7 @@ pub async fn create_run(
         debug_mode: req.debug_mode,
         thinking_budget_tokens: req.thinking_budget_tokens,
         reasoning_effort: req.reasoning_effort,
+        gemini_thinking_budget: req.gemini_thinking_budget,
     };
     let run = Run::new(session.id, session.agent_id, input_text);
     let run_id = run.run_id;

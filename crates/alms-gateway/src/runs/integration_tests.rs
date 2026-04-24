@@ -1567,6 +1567,7 @@ async fn create_run_pre_persists_user_input_to_session() {
         debug_mode: None,
         thinking_budget_tokens: None,
         reasoning_effort: None,
+        gemini_thinking_budget: None,
     };
 
     // Call the handler directly. We do NOT await the spawned execute_run -- we
@@ -1659,6 +1660,7 @@ async fn create_run_reports_queued_behind_when_agent_is_running() {
         debug_mode: None,
         thinking_budget_tokens: None,
         reasoning_effort: None,
+        gemini_thinking_budget: None,
     };
 
     match super::lifecycle::create_run(State(state.clone()), Json(req)).await {

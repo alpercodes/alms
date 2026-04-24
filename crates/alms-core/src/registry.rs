@@ -53,6 +53,17 @@ pub struct AgentRecord {
     /// params.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<crate::config::ReasoningEffort>,
+    /// Per-agent Gemini extended-thinking budget override (#794).
+    ///
+    /// `None` = inherit the server default from `[llm.gemini].thinking_budget`.
+    /// `Some(0)` = explicitly disable extended thinking for this agent
+    /// even when the server default enables it.
+    /// `Some(n > 0)` = use exactly `n` tokens.
+    ///
+    /// Only applies when the resolved provider maps to the Gemini wire
+    /// protocol; silently ignored for other providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_thinking_budget: Option<u32>,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
@@ -78,6 +89,10 @@ pub struct CreateAgentRequest {
     /// See [`AgentRecord::reasoning_effort`] for semantics.
     #[serde(default)]
     pub reasoning_effort: Option<crate::config::ReasoningEffort>,
+    /// Per-agent Gemini extended-thinking budget override (#794).
+    /// See [`AgentRecord::gemini_thinking_budget`] for semantics.
+    #[serde(default)]
+    pub gemini_thinking_budget: Option<u32>,
     #[serde(default)]
     pub is_default: Option<bool>,
 }
@@ -105,6 +120,13 @@ pub struct UpdateAgentRequest {
     /// default" today — mirrors the `thinking_budget_tokens` PATCH
     /// semantics.
     pub reasoning_effort: Option<crate::config::ReasoningEffort>,
+    /// Per-agent Gemini extended-thinking budget override (#794). A value
+    /// of `0` explicitly disables extended thinking for this agent even
+    /// when the server default enables it. Omitting the field leaves the
+    /// existing value unchanged. No sentinel to clear the override back
+    /// to "inherit server default" — mirrors `thinking_budget_tokens`
+    /// PATCH semantics.
+    pub gemini_thinking_budget: Option<u32>,
 }
 
 /// Validate an agent name slug.
