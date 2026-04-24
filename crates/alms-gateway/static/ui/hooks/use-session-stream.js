@@ -30,7 +30,7 @@
 
 import { batch, signal } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
-import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
+import { appendMessage, updateMessage, filterMessages, transformMessages } from '../state/chat-actions.js';
 import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
@@ -909,11 +909,21 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // -- approval_resolved --
+    //
+    // Remove the approval card entirely so the live render matches the
+    // reload render (which never materialises approval cards for resolved
+    // approvals — listApprovals only returns pending ones, and session
+    // history has no approval records).  Dropping the card also lets the
+    // sibling tool rows collapse back into their parallel-tool group in
+    // app.js `groupMessages`, matching the reload layout.  (#800)
+    //
+    // The tool row itself is updated separately via the `tool_end` event
+    // emitted by the runtime after approve (success/fail based on tool
+    // execution) or immediately after deny (ok=false, "denied by user").
     on('approval_resolved', (e) => {
         const data = JSON.parse(e.data);
-        updateMessage(
-            m => m.type === 'approval' && m.approvalId === data.approval_id,
-            m => ({ ...m, resolved: true, decision: data.decision }),
+        filterMessages(
+            m => !(m.type === 'approval' && m.approvalId === data.approval_id),
         );
     });
 
@@ -965,8 +975,6 @@ export function openSessionStream(sessionId, opts) {
             // (approval resolution + appended status/error/token messages)
             // is collapsed into one write to avoid intermediate states.
             const endingRunId = data.run_id || null;
-            const decision = status === 'cancelled' ? 'cancelled'
-                : status === 'error' ? 'cancelled' : 'expired';
 
             // Read and save thinking text BEFORE deleting from buffer,
             // so the transformMessages callback below can use it.
@@ -985,14 +993,20 @@ export function openSessionStream(sessionId, opts) {
             transformMessages(prev => {
                 const toolCountBefore = prev.filter(m => m.type === 'tool').length;
 
-                // Resolve any pending approval cards for this run.
+                // Drop any pending approval cards for this run.
                 // When a run ends (cancelled, error, or finished), any unresolved
                 // approval prompts are stale and must be dismissed so the user is
                 // not left with dangling Approve/Deny buttons.  (Fixes #487 Bug 1)
                 //
                 // Scoped to the ending run's ID so concurrent runs (future) do not
                 // accidentally dismiss each other's approval cards.  Approval cards
-                // without a runId (legacy) are always resolved as a fallback.
+                // without a runId (legacy) are always dropped as a fallback.
+                //
+                // #800: removing the card instead of marking it resolved also
+                // matches the reload path — `listApprovals` only returns currently-
+                // pending approvals, so on reload these stale entries simply don't
+                // exist.  The accompanying tool row is cancelled via isStuckTool
+                // below, which matches the history render for an interrupted run.
                 const isStaleApproval = (m) =>
                     m.type === 'approval' && !m.resolved
                     && (!m.runId || !endingRunId || m.runId === endingRunId);
@@ -1004,10 +1018,7 @@ export function openSessionStream(sessionId, opts) {
                 const isStuckTool = (m) =>
                     m.type === 'tool' && m.status === 'running';
 
-                let msgs = prev.map(m => {
-                    if (isStaleApproval(m)) {
-                        return { ...m, resolved: true, decision };
-                    }
+                let msgs = prev.filter(m => !isStaleApproval(m)).map(m => {
                     if (isStuckTool(m)) {
                         return { ...m, status: 'cancelled' };
                     }
