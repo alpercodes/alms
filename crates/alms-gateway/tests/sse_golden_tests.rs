@@ -208,9 +208,7 @@ async fn test_run_finished_no_reasoning_tokens_field_when_absent() {
         TokenUsage {
             prompt_tokens: 100,
             completion_tokens: 200,
-            reasoning_tokens: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            ..TokenUsage::default()
         },
     ))
     .unwrap();
@@ -244,8 +242,7 @@ async fn test_run_finished_emits_reasoning_tokens_when_present() {
             prompt_tokens: 150,
             completion_tokens: 80,
             reasoning_tokens: Some(1024),
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            ..TokenUsage::default()
         },
     ))
     .unwrap();
@@ -272,9 +269,9 @@ async fn test_run_finished_emits_cache_tokens_when_present() {
         TokenUsage {
             prompt_tokens: 42,
             completion_tokens: 7,
-            reasoning_tokens: None,
             cache_creation_input_tokens: Some(1500),
             cache_read_input_tokens: Some(8200),
+            ..TokenUsage::default()
         },
     ))
     .unwrap();
@@ -307,9 +304,7 @@ async fn test_run_finished_cache_tokens_absent_when_none() {
         TokenUsage {
             prompt_tokens: 100,
             completion_tokens: 200,
-            reasoning_tokens: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            ..TokenUsage::default()
         },
     ))
     .unwrap();

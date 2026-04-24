@@ -1677,21 +1677,13 @@ fn test_streaming_usage_accumulation() {
     // Simulate two chunks: first has prompt_tokens, second has completion_tokens
     let first = Usage {
         prompt_tokens: 150,
-        completion_tokens: 0,
         total_tokens: 150,
-        reasoning_tokens: None,
-        completion_tokens_details: None,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        ..Usage::default()
     };
     let second = Usage {
-        prompt_tokens: 0,
         completion_tokens: 75,
         total_tokens: 75,
-        reasoning_tokens: None,
-        completion_tokens_details: None,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        ..Usage::default()
     };
 
     // Replicate the accumulation logic from stream_llm_call
@@ -1703,11 +1695,7 @@ fn test_streaming_usage_accumulation() {
         Some(prev) => Usage {
             prompt_tokens: prev.prompt_tokens.max(chunk_usage.prompt_tokens),
             completion_tokens: prev.completion_tokens.max(chunk_usage.completion_tokens),
-            total_tokens: 0,
-            reasoning_tokens: None,
-            completion_tokens_details: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            ..Usage::default()
         },
         None => chunk_usage,
     });
@@ -1721,11 +1709,7 @@ fn test_streaming_usage_accumulation() {
         Some(prev) => Usage {
             prompt_tokens: prev.prompt_tokens.max(chunk_usage.prompt_tokens),
             completion_tokens: prev.completion_tokens.max(chunk_usage.completion_tokens),
-            total_tokens: 0,
-            reasoning_tokens: None,
-            completion_tokens_details: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            ..Usage::default()
         },
         None => chunk_usage,
     });
@@ -1759,8 +1743,7 @@ fn test_usage_reasoning_tokens_effective_priority() {
         completion_tokens_details: Some(crate::llm_types::CompletionTokensDetails {
             reasoning_tokens: Some(15),
         }),
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        ..Usage::default()
     };
     assert_eq!(u.reasoning_tokens_effective(), Some(15));
 
@@ -1770,9 +1753,7 @@ fn test_usage_reasoning_tokens_effective_priority() {
         completion_tokens: 20,
         total_tokens: 30,
         reasoning_tokens: Some(7),
-        completion_tokens_details: None,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        ..Usage::default()
     };
     assert_eq!(u.reasoning_tokens_effective(), Some(7));
 
@@ -1781,10 +1762,7 @@ fn test_usage_reasoning_tokens_effective_priority() {
         prompt_tokens: 10,
         completion_tokens: 20,
         total_tokens: 30,
-        reasoning_tokens: None,
-        completion_tokens_details: None,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens: None,
+        ..Usage::default()
     };
     assert!(u.reasoning_tokens_effective().is_none());
 }

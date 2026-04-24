@@ -408,9 +408,7 @@ mod tests {
         let usage = TokenUsage {
             prompt_tokens: 100,
             completion_tokens: 50,
-            reasoning_tokens: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            ..TokenUsage::default()
         };
         let value = serde_json::to_value(usage).unwrap();
         let obj = value.as_object().unwrap();
@@ -451,9 +449,9 @@ mod tests {
         let usage = TokenUsage {
             prompt_tokens: 100,
             completion_tokens: 50,
-            reasoning_tokens: None,
             cache_creation_input_tokens: Some(1500),
             cache_read_input_tokens: Some(8200),
+            ..TokenUsage::default()
         };
         let value = serde_json::to_value(usage).unwrap();
         assert_eq!(

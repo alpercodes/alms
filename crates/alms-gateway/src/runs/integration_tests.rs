@@ -530,9 +530,7 @@ fn format_completion_notification_for_failed_subagent() {
         token_usage: Some(TokenUsage {
             prompt_tokens: 1000,
             completion_tokens: 200,
-            reasoning_tokens: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            ..TokenUsage::default()
         }),
     };
 
@@ -643,9 +641,7 @@ async fn completed_run_is_not_cancellable() {
         TokenUsage {
             prompt_tokens: 10,
             completion_tokens: 5,
-            reasoning_tokens: None,
-            cache_creation_input_tokens: None,
-            cache_read_input_tokens: None,
+            ..TokenUsage::default()
         },
     );
 
@@ -835,9 +831,7 @@ async fn subagent_completion_propagates_session_id() {
             token_usage: Some(TokenUsage {
                 prompt_tokens: 3000,
                 completion_tokens: 800,
-                reasoning_tokens: None,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
+                ..TokenUsage::default()
             }),
         })
         .unwrap();
@@ -1005,9 +999,7 @@ async fn subagent_completion_marker_includes_rich_metadata() {
             token_usage: Some(TokenUsage {
                 prompt_tokens: 50_000,
                 completion_tokens: 15_000,
-                reasoning_tokens: None,
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
+                ..TokenUsage::default()
             }),
         })
         .unwrap();
@@ -1103,8 +1095,7 @@ async fn subagent_completion_marker_includes_reasoning_tokens() {
                 prompt_tokens: 1_200,
                 completion_tokens: 300,
                 reasoning_tokens: Some(2_048),
-                cache_creation_input_tokens: None,
-                cache_read_input_tokens: None,
+                ..TokenUsage::default()
             }),
         })
         .unwrap();
