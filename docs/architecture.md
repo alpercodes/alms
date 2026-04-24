@@ -46,7 +46,7 @@ Any agent running inside ALMS can call the `invoke_agent` tool to spawn a subage
 - Results propagate up the tree via tool responses
 - Cancellation cascades downward (cancel parent → cancel all children)
 - Each subagent has its own tool registry, context window, and system prompt
-- Subagent runs a full `agent_loop` (multi-iteration tool use, up to `max_iterations`)
+- Subagent runs a full `agent_loop` (multi-iteration tool use; bounded by token budget, provider `max_tokens`, posture approvals, and run cancellation)
 
 ### Layer 2 — Peer-to-Peer Direct Messaging (Phase 1 + DM lifecycle implemented)
 

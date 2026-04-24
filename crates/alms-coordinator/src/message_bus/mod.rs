@@ -95,14 +95,12 @@ pub enum MessageSource {
     },
     /// Subagent completion notification (bridged from the existing channel).
     SubagentCompletion,
-    /// A DM conversation was ended (ignore_message, depth exceeded, or
-    /// max iterations reached).
+    /// A DM conversation was ended (ignore_message or depth exceeded).
     ///
     /// Both the peer and the sender (when the sender has a source session)
     /// receive a one-shot notification run so they can act on the
-    /// conversation outcome. See #384 for the full lifecycle design,
-    /// #556 for the sender self-notification addition, and #681 for the
-    /// max-iterations trigger.
+    /// conversation outcome. See #384 for the full lifecycle design and
+    /// #556 for the sender self-notification addition.
     ConversationEnded {
         from_agent: AgentId,
         from_name: String,

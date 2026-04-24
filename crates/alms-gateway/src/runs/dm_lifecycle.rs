@@ -2,8 +2,7 @@
 //!
 //! When a peer-triggered DM run completes, several steps must happen:
 //!
-//! 1. Detect whether `ignore_message` was called or the agent hit its
-//!    max-iterations limit without replying
+//! 1. Detect whether `ignore_message` was called
 //! 2. Resolve the peer agent from the `dm:` context ID
 //! 3. Call `end_conversation` on the `MessageBus` to reset depth counters
 //!    and emit `ConversationEnded` triggers to both agents
@@ -11,8 +10,7 @@
 //!
 //! Previously this logic was inlined in `execute_run()` (lifecycle.rs lines
 //! 1085-1180). This module consolidates it into a single entry point so there
-//! is exactly one code path for ignore-message-driven and
-//! max-iterations-driven conversation endings.
+//! is exactly one code path for ignore-message-driven conversation endings.
 //!
 //! The `ConversationEnded` trigger handling (depth-exceeded SSE events,
 //! web-chat forwarding, notification formatting) remains in `notifications.rs`
@@ -47,9 +45,6 @@ pub(super) struct DmRunCompletionContext<'a> {
     pub context_id: &'a str,
     pub is_peer_message: bool,
     pub tool_calls: &'a [ToolCallRecord],
-    /// Whether the run hit the agent loop's max-iterations limit.
-    /// Set to `true` when `output.response == MAX_ITERATIONS_SENTINEL`.
-    pub hit_max_iterations: bool,
 }
 
 /// Single entry point for DM post-run lifecycle handling.
@@ -62,15 +57,12 @@ pub(super) struct DmRunCompletionContext<'a> {
 /// Returns `true` if a conversation end was signalled, `false` otherwise
 /// (including when conditions are not met or an error occurs).
 ///
-/// # End conditions (checked in order)
+/// # End condition
 ///
 /// A conversation end is signalled when the run is a peer-triggered DM
-/// (`is_peer_message` and `context_id` starts with `"dm:"`) AND one of:
-///
-/// 1. `ignore_message` was successfully called during the run (verified via
-///    tool call records) -- reason: `Ignored`
-/// 2. The agent loop hit its max-iterations limit (`MAX_ITERATIONS_SENTINEL`
-///    response) -- reason: `MaxIterations`
+/// (`is_peer_message` and `context_id` starts with `"dm:"`) AND
+/// `ignore_message` was successfully called during the run (verified via
+/// tool call records) -- reason: `Ignored`.
 ///
 /// # Actions (in order)
 ///
@@ -85,23 +77,15 @@ pub(super) struct DmRunCompletionContext<'a> {
 /// trigger recipient. Emitting it here as well would cause duplicate markers.
 /// See #556.
 pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) -> bool {
-    // Determine the end reason, if any. Check ignore_message first, then
-    // max-iterations as a fallback.
+    // Determine the end reason, if any.
     let end_reason = if should_signal_dm_end(ctx.is_peer_message, ctx.tool_calls, ctx.context_id) {
         ConversationEndReason::Ignored
-    } else if should_signal_dm_end_max_iterations(
-        ctx.is_peer_message,
-        ctx.context_id,
-        ctx.hit_max_iterations,
-    ) {
-        ConversationEndReason::MaxIterations
     } else {
         return false;
     };
 
     let reason_label = match end_reason {
         ConversationEndReason::Ignored => "ignore_message",
-        ConversationEndReason::MaxIterations => "max_iterations",
         ConversationEndReason::DepthExceeded => "depth_exceeded",
         ConversationEndReason::UserCancelled => "user_cancelled",
     };
@@ -158,10 +142,9 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
             // so the web UI can show a "conversation ended" indicator.
             // Phase 6 of #384.
             //
-            // NOTE: This code path fires for both ignore_message and
-            // max_iterations reasons. The depth-exceeded reason emits this
-            // event from `run_trigger_loop` when processing the
-            // `ConversationEnded` trigger (#419).
+            // NOTE: This code path fires for the ignore_message reason. The
+            // depth-exceeded reason emits this event from `run_trigger_loop`
+            // when processing the `ConversationEnded` trigger (#419).
             //
             // NOTE: If both agents ignore simultaneously, end_conversation
             // returns Ok(()) for both callers (the second sees "already ended
@@ -221,24 +204,6 @@ pub(super) fn should_signal_dm_end(
     is_peer_message
         && alms_core::ran_ignore_message_successfully(tool_calls)
         && context_id.starts_with("dm:")
-}
-
-/// Detect whether a peer-triggered DM run ended because the agent loop hit
-/// its max-iterations limit without calling `send_message` or `ignore_message`.
-///
-/// Returns `true` when all conditions are met:
-/// 1. The run was triggered by a peer message (`is_peer_message`)
-/// 2. The context ID is a DM session (`dm:` prefix)
-/// 3. The run hit the max-iterations limit (`hit_max_iterations`)
-///
-/// When this returns `true`, the caller should signal conversation end with
-/// reason `MaxIterations` so the peer receives the `dm_ended` notification.
-pub(super) fn should_signal_dm_end_max_iterations(
-    is_peer_message: bool,
-    context_id: &str,
-    hit_max_iterations: bool,
-) -> bool {
-    is_peer_message && context_id.starts_with("dm:") && hit_max_iterations
 }
 
 /// POST /sessions/{session_id}/cancel-dm — cancel an active DM conversation.
@@ -574,61 +539,5 @@ mod tests {
             None,
         )];
         assert!(!should_signal_dm_end(true, &records, "dm:alice:bob"));
-    }
-
-    // -- Tests for should_signal_dm_end_max_iterations --
-
-    #[test]
-    fn max_iterations_in_dm_peer_signals_end() {
-        assert!(should_signal_dm_end_max_iterations(
-            true,
-            "dm:alice:bob",
-            true,
-        ));
-    }
-
-    #[test]
-    fn max_iterations_non_peer_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            false,
-            "dm:alice:bob",
-            true,
-        ));
-    }
-
-    #[test]
-    fn max_iterations_non_dm_context_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            true,
-            "session:abc123",
-            true,
-        ));
-    }
-
-    #[test]
-    fn no_max_iterations_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            true,
-            "dm:alice:bob",
-            false,
-        ));
-    }
-
-    #[test]
-    fn max_iterations_in_notification_context_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            true,
-            "notifications:bob",
-            true,
-        ));
-    }
-
-    #[test]
-    fn max_iterations_in_job_context_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            true,
-            "job_some-uuid",
-            true,
-        ));
     }
 }

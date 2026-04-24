@@ -1010,28 +1010,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         Ok(output) => {
             persist_tool_calls(&output.tool_calls);
 
-            // Capture this flag before mark_run_as_completed moves the response.
-            let hit_max_iterations = output.response == alms_core::MAX_ITERATIONS_SENTINEL;
-
-            // Detect max-iterations sentinel and emit a warning event so the
-            // frontend can style it distinctly (yellow) instead of as a normal
-            // agent message.
-            if hit_max_iterations {
-                state
-                    .run_manager
-                    .send_event(
-                        run_id,
-                        session_id,
-                        SseEventData::run_warning(
-                            run_id,
-                            "MAX_ITERATIONS",
-                            "Max iterations reached — the agent hit its iteration limit before finishing. You can continue the conversation to pick up where it left off.",
-                            None,
-                        ),
-                    )
-                    .await;
-            }
-
             // token_delta events already emitted during streaming in the agent loop
             state
                 .run_manager
@@ -1055,22 +1033,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     serde_json::json!({
                         "run_id": run_id.0.to_string(),
                         "status": "completed",
-                    }),
-                );
-            }
-
-            // Persist warning marker when MAX_ITERATIONS was hit, so it
-            // survives page reloads.
-            if hit_max_iterations && !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_warning",
-                    "Max iterations reached — the agent hit its iteration limit before finishing."
-                        .to_string(),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "code": "MAX_ITERATIONS",
                     }),
                 );
             }
@@ -1152,8 +1114,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
             // -- DM post-run lifecycle (consolidated in #628) --
             //
-            // Detect ignore_message or max-iterations, signal conversation
-            // end, emit SSE events.
+            // Detect ignore_message, signal conversation end, emit SSE events.
             // All logic lives in `dm_lifecycle::handle_dm_run_completion()`.
             super::dm_lifecycle::handle_dm_run_completion(
                 super::dm_lifecycle::DmRunCompletionContext {
@@ -1165,7 +1126,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     context_id: &context_id,
                     is_peer_message,
                     tool_calls: &output.tool_calls,
-                    hit_max_iterations,
                 },
             )
             .await;

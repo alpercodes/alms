@@ -284,7 +284,6 @@ pub(super) async fn notify_dm_ended_to_webchat(
     let reason_text = match reason {
         "ignored" => "no further replies".to_string(),
         "depth_exceeded" => "message limit reached".to_string(),
-        "max_iterations" => "agent iteration limit reached".to_string(),
         other => other.to_string(),
     };
     super::markers::persist_lifecycle_marker(
@@ -672,12 +671,6 @@ pub(super) fn format_dm_ended_notification(
             format!(
                 "The conversation with agent \"{from_name}\" was terminated \
                  because the maximum message depth was reached."
-            )
-        }
-        ConversationEndReason::MaxIterations => {
-            format!(
-                "The conversation with agent \"{from_name}\" was terminated \
-                 because the agent hit its iteration limit while processing the DM."
             )
         }
         ConversationEndReason::UserCancelled => {
@@ -1075,46 +1068,95 @@ pub(crate) async fn dm_event_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alms_coordinator::message_bus::{MessageSource, RunTrigger};
+    use alms_core::AgentId;
     use alms_tools::message_sender::ConversationEndReason;
 
-    #[test]
-    fn test_format_dm_ended_notification_max_iterations_with_history() {
-        let result = format_dm_ended_notification(
-            "bob",
-            ConversationEndReason::MaxIterations,
-            Some("[12:00] alice: hello\n[12:01] bob: working on it..."),
-        );
-        assert!(
-            result.contains("iteration limit"),
-            "MaxIterations reason text should mention iteration limit, got: {result}"
-        );
-        assert!(
-            result.contains("bob"),
-            "notification should mention the peer agent name, got: {result}"
-        );
-        assert!(
-            result.contains("[12:00] alice: hello"),
-            "notification should include conversation history, got: {result}"
-        );
-    }
+    /// Regression test for #513: when a `ConversationEnded` trigger has
+    /// `source_session_id: None` (the agent was a pure DM recipient),
+    /// `run_trigger_loop` must NOT reroute the notification run to a
+    /// user-facing session. The run must stay on the original
+    /// `notifications:{agent}` session.
+    ///
+    /// Before this fix, the gateway rerouted the notification to the
+    /// agent's most recent user-facing session (#495), which polluted
+    /// the web-chat with notification runs that should have been invisible.
+    #[tokio::test]
+    async fn test_conversation_ended_no_reroute_when_source_session_none() {
+        // -- Build a minimal AppState --
+        let gateway_config = crate::gateway::GatewayConfig::default();
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = CancellationToken::new();
+        let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
+        // The trigger_tx is consumed by AppState's MessageBus; the test
+        // feeds run_trigger_loop via a separate channel below.
+        let (trigger_tx, _bus_rx) = mpsc::unbounded_channel();
+        let (dm_event_tx, _dm_event_rx) = mpsc::unbounded_channel();
+        let state = AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token.clone(),
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap();
 
-    #[test]
-    fn test_format_dm_ended_notification_max_iterations_without_history() {
-        let result =
-            format_dm_ended_notification("bob", ConversationEndReason::MaxIterations, None);
+        let agent_id = AgentId::new();
+        let sender_agent_id = AgentId::new();
+
+        // Create a `notifications:bob` session (the trigger target).
+        let notif_session = state
+            .session_manager
+            .get_or_create(agent_id, "notifications:bob");
+        let notif_session_id = notif_session.id;
+        let notif_context_id = notif_session.context_id.clone();
+
+        // Create a user-facing `web` session for the same agent. If the old
+        // rerouting logic were still present, the notification run would be
+        // incorrectly routed here instead.
+        let _web_session = state.session_manager.get_or_create(agent_id, "web");
+
+        // -- Send a ConversationEnded trigger with source_session_id: None --
+        let (test_tx, test_rx) = mpsc::unbounded_channel();
+        test_tx
+            .send(RunTrigger {
+                agent_id,
+                session_id: notif_session_id,
+                input: "DM ended marker".to_string(),
+                source: MessageSource::ConversationEnded {
+                    from_agent: sender_agent_id,
+                    from_name: "alice".to_string(),
+                    reason: ConversationEndReason::Ignored,
+                    source_session_id: None,
+                },
+                context_id: notif_context_id.clone(),
+            })
+            .unwrap();
+        // Drop the sender so the loop exits after processing the one trigger.
+        drop(test_tx);
+
+        // -- Run the trigger loop to completion --
+        run_trigger_loop(test_rx, state.clone()).await;
+
+        // -- Verify the run was created on the notifications session --
+        let runs = state.run_manager.list_by_session(notif_session_id, 10);
         assert!(
-            result.contains("iteration limit"),
-            "MaxIterations reason text should mention iteration limit, got: {result}"
+            !runs.is_empty(),
+            "expected at least one run on the notifications session"
         );
-        assert!(
-            result.contains("bob"),
-            "notification should mention the peer agent name, got: {result}"
+        assert_eq!(
+            runs[0].session_id, notif_session_id,
+            "notification run must stay on the notifications: session, not be rerouted \
+             to the user-facing web session"
         );
-        // Without history, should fall back to the no-history template which
-        // directs the agent to use read_messages.
-        assert!(
-            result.contains("read_messages"),
-            "no-history fallback should reference read_messages tool, got: {result}"
+        assert_eq!(
+            runs[0].agent_id, agent_id,
+            "run should belong to the target agent"
         );
+
+        // Clean up: cancel the shutdown token so background tasks (if any) stop.
+        shutdown_token.cancel();
     }
 }

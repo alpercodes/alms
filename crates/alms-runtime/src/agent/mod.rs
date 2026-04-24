@@ -558,7 +558,6 @@ impl AgentRuntime {
         fields(
             agent_id = %self.agent_id.0,
             context_id = %context_id.as_ref(),
-            max_iterations = %self.config.max_iterations
         )
     )]
     pub async fn run(
@@ -618,7 +617,6 @@ impl AgentRuntime {
             agent_id = %self.agent_id.0,
             session_id = %session_id.0,
             context_id = %context_id,
-            max_iterations = %self.config.max_iterations
         )
     )]
     pub async fn run_on_session(
@@ -710,10 +708,6 @@ impl AgentRuntime {
                 // empty. This happens when the agent used `ignore_message` to
                 // decline responding — there is nothing to record.
                 //
-                // Also skip persisting the max-iterations sentinel — it is
-                // surfaced as a `run_warning` SSE event by the gateway and
-                // should not appear as a normal assistant bubble on reload.
-                //
                 // For DM sessions: persist the final text response as
                 // reasoning (Role::User with message_type="reasoning") so
                 // the UI can display it in a collapsible reasoning block
@@ -727,10 +721,7 @@ impl AgentRuntime {
                 // concatenates, resulting in doubled text on page reload.
                 // Skip persistence when tool calls were present.  (Fixes #687)
                 let dm_text_already_persisted = is_dm && !tool_calls.is_empty();
-                if !response.is_empty()
-                    && response != alms_core::MAX_ITERATIONS_SENTINEL
-                    && !dm_text_already_persisted
-                {
+                if !response.is_empty() && !dm_text_already_persisted {
                     let base_meta = if is_dm {
                         self.dm_reasoning_metadata(is_dm)
                     } else {

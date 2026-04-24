@@ -78,8 +78,6 @@ pub struct AgentConfig {
     pub system_prompt: String,
     /// Staged system prompts for the agent loop.
     pub prompts: SystemPrompts,
-    /// Maximum iterations for tool loops
-    pub max_iterations: u32,
     /// Maximum tokens per response
     pub max_tokens: u32,
     /// Context window management config
@@ -176,7 +174,6 @@ impl Default for AgentConfig {
         Self {
             system_prompt: include_str!("../../prompts/initial.md").trim().to_string(),
             prompts: SystemPrompts::default(),
-            max_iterations: 10,
             max_tokens: 100_000,
             context_config: ContextConfig::default(),
             posture: Posture::default(),

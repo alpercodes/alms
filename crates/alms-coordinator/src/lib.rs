@@ -865,8 +865,8 @@ struct SubagentRecordConfig {
 
 /// Build an `AgentConfig` for a subagent. Named subagents get their config
 /// from the agent registry; ephemeral subagents use a default prompt.
-/// Both inherit sandbox, tool, and runtime settings (max_iterations,
-/// max_tokens, context_config) from the parent's base config.
+/// Both inherit sandbox, tool, and runtime settings (max_tokens,
+/// context_config) from the parent's base config.
 fn agent_config_for_subagent(
     record: Option<SubagentRecordConfig>,
     base: &AgentConfig,
@@ -933,7 +933,6 @@ fn agent_config_for_subagent(
         shell_spill: base.shell_spill.clone(),
         enabled_tools: base.enabled_tools.clone(),
         fs_edit_fuzzy_match: base.fs_edit_fuzzy_match,
-        max_iterations: base.max_iterations,
         max_tokens: base.max_tokens,
         context_config: base.context_config.clone(),
         prompts: base.prompts.clone(),
@@ -1531,7 +1530,6 @@ mod tests {
     fn test_subagent_inherits_parent_config() {
         let parent = AgentConfig {
             system_prompt: "parent prompt".into(),
-            max_iterations: 42,
             max_tokens: 9999,
             context_config: alms_core::config::ContextConfig {
                 strategy: "sliding-summary".into(),
@@ -1556,7 +1554,6 @@ mod tests {
         let (config, model, _provider) = agent_config_for_subagent(None, &parent);
         assert!(model.is_none());
         // Should inherit runtime settings from parent
-        assert_eq!(config.max_iterations, 42);
         assert_eq!(config.max_tokens, 9999);
         assert_eq!(config.context_config.strategy, "sliding-summary");
         assert_eq!(config.context_config.max_input_tokens, 50_000);
@@ -1586,7 +1583,6 @@ mod tests {
         assert_eq!(config2.system_prompt, DEFAULT_SUBAGENT_PROMPT);
         assert_eq!(config2.posture, alms_runtime::Posture::Guarded);
         // Should still inherit runtime settings from parent
-        assert_eq!(config2.max_iterations, 42);
         assert_eq!(config2.max_tokens, 9999);
         assert_eq!(config2.context_config.max_input_tokens, 50_000);
         // Shell spill policy still inherited through the registry-override path

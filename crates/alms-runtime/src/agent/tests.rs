@@ -9,7 +9,6 @@ use alms_session::{SessionConfig, SessionManager};
 #[tokio::test]
 async fn test_agent_config_default() {
     let config = AgentConfig::default();
-    assert_eq!(config.max_iterations, 10);
     assert!(!config.system_prompt.is_empty());
     assert_eq!(config.posture, Posture::Guarded);
 }

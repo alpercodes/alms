@@ -1,8 +1,6 @@
 use crate::events::{PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS, RuntimeEvent};
 use crate::llm_types::*;
-use alms_core::{
-    AlmsError, AlmsResult, AuditDecision, AuditEvent, MAX_ITERATIONS_SENTINEL, TokenUsage,
-};
+use alms_core::{AlmsError, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
 use alms_session::{
     Content as SessionContent, Message as SessionMessage, Role as SessionRole, SessionManager,
 };
@@ -123,7 +121,6 @@ impl AgentRuntime {
         include_user: bool,
         dm_peer: Option<&str>,
     ) -> (Vec<alms_core::ToolCallRecord>, AlmsResult<AgentLoopOutput>) {
-        let mut iterations = 0;
         let mut total_usage = TokenUsage::default();
         let mut tool_call_records: Vec<alms_core::ToolCallRecord> = Vec::new();
         let mut tool_seq: u32 = 0;
@@ -140,29 +137,9 @@ impl AgentRuntime {
                 return (tool_call_records, Err(AlmsError::Cancelled));
             }
 
-            if iterations >= self.config.max_iterations {
-                warn!(
-                    target: "agent::loop",
-                    agent_id = %self.agent_id.0,
-                    iterations,
-                    max_iterations = %self.config.max_iterations,
-                    "Max iterations reached"
-                );
-                return (
-                    tool_call_records,
-                    Ok(AgentLoopOutput {
-                        response: MAX_ITERATIONS_SENTINEL.to_string(),
-                        usage: total_usage,
-                        reasoning: None,
-                    }),
-                );
-            }
-            iterations += 1;
-
             debug!(
                 target: "agent::loop",
                 agent_id = %self.agent_id.0,
-                iteration = iterations,
                 "Agent loop iteration"
             );
 

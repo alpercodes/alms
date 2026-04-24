@@ -225,8 +225,8 @@ impl SseEventData {
         )
     }
 
-    /// Emit a `run_warning` event for non-fatal conditions like max iterations
-    /// reached. The frontend should style these as warnings (yellow), not
+    /// Emit a `run_warning` event for non-fatal conditions (e.g. DM text-only
+    /// retries). The frontend should style these as warnings (yellow), not
     /// errors (red).
     pub fn run_warning(
         run_id: RunId,
@@ -998,11 +998,18 @@ mod tests {
     #[test]
     fn test_run_warning_event() {
         let run_id = RunId::new();
-        let event =
-            SseEventData::run_warning(run_id, "MAX_ITERATIONS", "Max iterations reached", None);
+        let event = SseEventData::run_warning(
+            run_id,
+            "DM_TEXT_ONLY_RETRY",
+            "DM agent responded with text only",
+            None,
+        );
         assert_eq!(event.event_type, "run_warning");
-        assert_eq!(event.data["warning"]["code"], "MAX_ITERATIONS");
-        assert_eq!(event.data["warning"]["message"], "Max iterations reached");
+        assert_eq!(event.data["warning"]["code"], "DM_TEXT_ONLY_RETRY");
+        assert_eq!(
+            event.data["warning"]["message"],
+            "DM agent responded with text only"
+        );
     }
 
     #[test]

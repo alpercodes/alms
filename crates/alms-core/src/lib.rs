@@ -61,11 +61,6 @@ pub fn classify_session_type(context_id: &str) -> &'static str {
     }
 }
 
-/// Sentinel string returned by the agent loop when the max-iterations limit is
-/// hit.  Defined once so that the runtime (`agent.rs`) and the gateway
-/// (`runs.rs`) stay in sync.
-pub const MAX_ITERATIONS_SENTINEL: &str = "[Max iterations reached]";
-
 /// Error message returned to the LLM when both `send_message` and
 /// `ignore_message` appear in the same tool-call batch (DM conflict).
 ///

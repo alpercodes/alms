@@ -85,7 +85,6 @@ Tests to include:
 - tool call emitted → tool executed → tool result fed back → final assistant message
 - invalid JSON args in tool_call → graceful error path
 - multiple tool calls in one turn
-- max-iterations reached behavior
 
 ---
 
