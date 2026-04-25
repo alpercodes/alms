@@ -642,7 +642,7 @@ export function SettingsModal({ open, onClose }) {
 
                     These three knobs were previously only surfaced via the
                     composer's Advanced expander (#818). They share the same
-                    `localSettings` keys, so a value set from either surface
+                    'localSettings' keys, so a value set from either surface
                     is visible to both — this section just makes the modal a
                     full editor too. Live-write to localSettings (no Apply
                     needed for these specific rows) so changes round-trip
