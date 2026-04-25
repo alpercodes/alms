@@ -654,6 +654,9 @@ export function SettingsModal({ open, onClose }) {
                         Provider-specific. Silently ignored when the effective
                         provider doesn't support the knob.
                     </span>
+                    <span class="settings-hint">
+                        Applied immediately &mdash; Cancel does not revert these.
+                    </span>
                 </div>
 
                 <div class="settings-grid">
