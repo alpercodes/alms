@@ -150,6 +150,16 @@ impl Tool for FsWriteTool {
             .and_then(|v| v.as_str())
             .unwrap_or("write");
 
+        // Validate `mode` before any filesystem mutation so a rejected request
+        // is side-effect-free (no orphaned parent directories left behind).
+        // See #814.
+        if mode != "write" && mode != "append" {
+            return Err(SandboxError::InvalidParameters(format!(
+                "Invalid mode '{}': must be 'write' or 'append'",
+                mode
+            )));
+        }
+
         // Create parent directories if needed.
         if let Some(parent) = resolved.parent()
             && !parent.as_os_str().is_empty()
@@ -177,12 +187,9 @@ impl Tool for FsWriteTool {
                     SandboxError::Io(format!("Failed to append to '{}': {}", path, e))
                 })?;
             }
-            other => {
-                return Err(SandboxError::InvalidParameters(format!(
-                    "Invalid mode '{}': must be 'write' or 'append'",
-                    other
-                )));
-            }
+            // Unreachable: `mode` was validated against the allowed set above
+            // before any filesystem mutation occurred.
+            _ => unreachable!("mode was validated to be 'write' or 'append'"),
         }
 
         // Update the cache so subsequent writes/edits to the same file
@@ -219,6 +226,49 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid mode"));
+    }
+
+    /// Regression guard for #814: a rejected `fs_write` (invalid `mode`) must
+    /// not have created the target's parent directories. Before the fix,
+    /// `create_dir_all` ran *before* `mode` was validated, so a malformed
+    /// request returned an error to the agent but left empty directories on
+    /// disk. The contract is "if the write fails, nothing changed" — assert
+    /// that the parent path was not created when the request is structurally
+    /// invalid.
+    #[tokio::test]
+    async fn test_fs_write_invalid_mode_no_parent_dir_side_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("new").join("deep");
+        let target = parent.join("file.txt");
+
+        // Sanity: nothing exists yet.
+        assert!(!parent.exists(), "precondition: parent must not exist yet");
+        assert!(!target.exists(), "precondition: target must not exist yet");
+
+        let result = FsWriteTool::new()
+            .execute(serde_json::json!({
+                "path": target.to_str().unwrap(),
+                "content": "hi",
+                "mode": "bad",
+            }))
+            .await;
+
+        // Same error contract as before — wire shape unchanged.
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("Invalid mode"),
+            "error message must remain the existing 'Invalid mode' contract",
+        );
+
+        // The fix: parent directory must NOT have been created.
+        assert!(
+            !parent.exists(),
+            "rejected fs_write must not create parent dirs (side-effect leak)",
+        );
+        assert!(
+            !target.exists(),
+            "rejected fs_write must not create the target"
+        );
     }
 
     #[tokio::test]
