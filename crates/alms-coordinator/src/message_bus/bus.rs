@@ -465,7 +465,7 @@ impl MessageSender for MessageBus {
             source: MessageSource::ConversationEnded {
                 from_agent: sender_agent_id,
                 from_name: sender_name.to_string(),
-                reason,
+                reason: reason.clone(),
                 source_session_id: peer_source_session,
             },
             context_id: target_context_id,

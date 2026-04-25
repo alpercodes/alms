@@ -354,6 +354,48 @@ fn apply_overrides(
     }
 }
 
+/// Apply per-run LLM overrides (provider + model) on top of the resolved
+/// per-agent `LlmClient`, preserving the three-layer precedence
+/// (per-run > per-agent > server default) for the model field.
+///
+/// The non-trivial bit is the interaction between `provider` and `model`:
+///
+/// 1. `with_provider_and_secrets` calls `apply_provider`, which rewrites
+///    `LlmConfig::default_model` to the new provider entry's `model` field
+///    when one is configured in `[llm.providers.<name>]`.
+/// 2. Without protection, that silently drops a per-agent model that
+///    `resolve_agent_config` had already applied to the resolved client.
+///
+/// We snapshot the resolved client's `default_model()` before the provider
+/// switch and re-apply it afterwards if the switch clobbered the value.
+/// The per-run model still wins last when set, so explicit overrides are
+/// honored regardless. Closes #833.
+fn apply_per_run_llm_overrides(
+    resolved_llm: alms_runtime::LlmClient,
+    overrides: &RunOverrides,
+    secrets: &alms_core::secrets::SecretsStore,
+) -> alms_runtime::LlmClient {
+    let resolved_model = resolved_llm.default_model().to_string();
+    let mut llm = resolved_llm;
+    if let Some(ref provider) = overrides.provider {
+        llm = llm.with_provider_and_secrets(provider, secrets);
+        if llm.default_model() != resolved_model {
+            tracing::info!(
+                provider = %provider,
+                clobbered_model = %llm.default_model(),
+                preserved_model = %resolved_model,
+                "Per-run provider switch rewrote default_model from a provider entry; \
+                 restoring resolved per-agent / server-default model (#833)"
+            );
+            llm = llm.with_model(resolved_model);
+        }
+    }
+    if let Some(ref model) = overrides.model {
+        llm = llm.with_model(model.clone());
+    }
+    llm
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1028,6 +1070,220 @@ mod tests {
             llm = llm.with_provider_and_secrets(provider, &secrets);
         }
 
+        assert_eq!(llm.provider(), "anthropic");
+    }
+
+    // -----------------------------------------------------------------------
+    // Model-override end-to-end tests (#833)
+    //
+    // These exercise resolve_agent_config -> lifecycle.rs:569-578 layering at
+    // the LlmClient::default_model() level so a regression in the three-layer
+    // precedence (per-run > per-agent > server default) cannot slip past the
+    // apply_overrides-only unit tests like test_per_run_overrides_beat_per_agent.
+    // -----------------------------------------------------------------------
+
+    /// Build an `LlmClient` whose snapshot matches a typical server default
+    /// so the model-override regression tests can layer per-agent and
+    /// per-run overrides on top.
+    fn server_default_llm(model: &str) -> alms_runtime::LlmClient {
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openai".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let config = LlmConfig {
+            provider: "openai".into(),
+            api_key: "openai-key".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            default_model: model.into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        alms_runtime::LlmClient::new(config).unwrap()
+    }
+
+    fn empty_secrets() -> alms_core::secrets::SecretsStore {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let store = alms_core::secrets::SecretsStore::load(path)
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        std::mem::forget(dir);
+        store
+    }
+
+    fn manager_with_agent(record: &AgentRecord) -> alms_session::SessionManager {
+        let store = alms_session::SqliteStore::open_in_memory().unwrap();
+        store.create_agent(record).unwrap();
+        alms_session::SessionManager::with_store(alms_session::SessionConfig::default(), store)
+            .unwrap()
+    }
+
+    /// Per-agent model lands on the resolved `LlmClient::default_model()`
+    /// the value `loop_impl.rs:153` reads for every wire `CompletionRequest`.
+    /// This layer has no `info!` log on success (only the per-run side logs at
+    /// `lifecycle.rs:577`), so it is the most likely to silently regress.
+    #[test]
+    fn test_per_agent_model_lands_on_wire_via_resolve_agent_config() {
+        let mut record = test_agent(Some("claude-haiku-4-5-20251001"), None);
+        record.is_default = true;
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+        let server_llm = server_default_llm("server-default-model");
+        let secrets = empty_secrets();
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        assert_eq!(
+            resolved.llm.default_model(),
+            "claude-haiku-4-5-20251001",
+            "per-agent model must land on the LlmClient -- the value loop_impl.rs:153 reads"
+        );
+    }
+
+    /// Per-run model override beats the per-agent model in the resolved
+    /// `LlmClient`, mirroring the layering at `lifecycle.rs:569-578`.
+    #[test]
+    fn test_per_run_model_beats_per_agent_at_llm_client() {
+        let mut record = test_agent(Some("per-agent-model"), None);
+        record.is_default = true;
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+        let server_llm = server_default_llm("server-default-model");
+        let secrets = empty_secrets();
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        let overrides = RunOverrides {
+            model: Some("per-run-model".into()),
+            ..RunOverrides::default()
+        };
+        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
+        assert_eq!(
+            llm.default_model(),
+            "per-run-model",
+            "per-run model must beat per-agent model"
+        );
+    }
+
+    /// No overrides means the resolved client falls back to server default.
+    #[test]
+    fn test_no_overrides_falls_through_to_server_default_at_llm_client() {
+        let mut record = test_agent(None, None);
+        record.is_default = true;
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+        let server_llm = server_default_llm("server-default-model");
+        let secrets = empty_secrets();
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let overrides = RunOverrides::default();
+        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
+        assert_eq!(
+            llm.default_model(),
+            "server-default-model",
+            "no overrides at any layer must fall through to server default"
+        );
+    }
+
+    /// Regression test for #833 -- when a per-run `provider` override is set
+    /// without a per-run `model`, the per-agent model must still reach the
+    /// wire. Before the fix this scenario silently dropped the per-agent
+    /// model because `with_provider_and_secrets` re-runs `apply_provider`,
+    /// which can overwrite `default_model` from a custom
+    /// `[llm.providers.<name>].model` entry, and the lifecycle only
+    /// re-applies `with_model` when the per-run `model` field is set.
+    #[test]
+    fn test_per_run_provider_does_not_drop_per_agent_model() {
+        let mut record = test_agent(Some("claude-haiku-4-5-20251001"), None);
+        record.is_default = true;
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // The bug trigger: provider entry has its own model that
+                // would overwrite per-agent model when the per-run code
+                // re-applies the provider via with_provider_and_secrets.
+                model: Some("claude-sonnet-from-provider-entry".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "openai".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let server_cfg = LlmConfig {
+            provider: "openai".into(),
+            api_key: "openai-key".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            default_model: "server-default-model".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
+        std::mem::forget(dir);
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        assert_eq!(resolved.llm.default_model(), "claude-haiku-4-5-20251001");
+
+        let overrides = RunOverrides {
+            provider: Some("anthropic".into()),
+            ..RunOverrides::default()
+        };
+        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
+
+        assert_eq!(
+            llm.default_model(),
+            "claude-haiku-4-5-20251001",
+            "per-run provider override must NOT clobber per-agent model"
+        );
+        // Sanity: provider switch did happen.
         assert_eq!(llm.provider(), "anthropic");
     }
 

@@ -833,13 +833,15 @@ Agent B runs, processes message, may reply (send_message back) or end (ignore_me
 
 - **`end_conversation` on MessageBus** (`crates/alms-coordinator/src/message_bus/bus.rs`): Uses `depths.remove()` as an atomicity guard. If two agents call `end_conversation` simultaneously for the same DM pair, only the one whose `remove()` returns `Some` proceeds with the marker write and trigger emission. The other returns `Ok(())` early, preventing double notifications.
 
-- **`ConversationEndReason` enum** (`crates/alms-tools/src/message_sender.rs`): `Ignored` (agent called `ignore_message`) or `DepthExceeded` (MAX_DM_DEPTH hit). Included in the `dm_ended` marker metadata and the `ConversationEnded` `RunTrigger`.
+- **`ConversationEndReason` enum** (`crates/alms-tools/src/message_sender.rs`): `Ignored` (agent called `ignore_message`), `DepthExceeded` (MAX_DM_DEPTH hit), `UserCancelled` (operator cancelled the run mid-flight), or `Errored { message }` (the run failed — LLM error, tool error, posture trip, etc.; the truncated error message rides along for peer-side rendering). Included in the `dm_ended` marker metadata and the `ConversationEnded` `RunTrigger`.
 
 - **Notification sessions**: Context ID pattern `notifications:{agent_name}`, one per agent. When the agent initiated the DM from a user-facing session, the `MessageBus` routes the `ConversationEnded` trigger directly to that source session (via `source_session_id`). When `source_session_id` is `None` (the agent was a pure DM recipient), the notification run stays on the `notifications:` session — the gateway does NOT reroute it. A lightweight `dm_conversation_ended` SSE event + marker message is sent to the web-chat separately by `notify_dm_ended_to_webchat`. These sessions do NOT start with `dm:`, so the existing DM detection code naturally skips DM-specific behavior (no DM addendum, no perspective mapping). Notification sessions are excluded from user-facing context (e.g. the `user.md` workspace file).
 
 - **`dm_conversation_ended` SSE event** (`crates/alms-gateway/src/sse.rs`): Emitted on the DM session stream. Payload: `{session_id, ended_by, peer, reason, context_id, ts}`. The frontend should be prepared to handle duplicates (simultaneous ignore from both agents may emit two events).
 
 - **`dm_recipient.md` prompt**: The DM addendum tells agents that calling `ignore_message` will notify the peer. This is injected only for peer DM runs (`is_peer = true`), never for notification runs.
+
+- **Ephemeral subagents cannot receive DMs**: Recipient resolution in `send_message` goes through `store.load_agent_by_name(to)` (`crates/alms-tools/src/send_message.rs:107`). Ephemeral (unnamed) subagents have no registry record, so the lookup fails and the tool returns a JSON `{error: "agent not found"}` to the LLM. Only **named, registered agents** can be DM recipients. Senders, by contrast, only need an `AgentId`; an ephemeral subagent could in principle send to a named peer, but doing so creates a DM session keyed on a name the recipient cannot resolve back to anything stable — treat ephemeral subagents as DM-isolated by design.
 
 ---
 

@@ -647,45 +647,45 @@ export function SettingsModal({ open, onClose }) {
                     full editor too. Live-write to localSettings (no Apply
                     needed for these specific rows) so changes round-trip
                     through the same path as the composer.
+
+                    Wrapped in <Section> for visual parity with the
+                    Context / Session / Tools / LLM Providers / Logging
+                    sections below — defaultOpen=false matches siblings.
                 -->
-                <div class="settings-overrides-subheader">
-                    <span class="settings-label">Reasoning &amp; thinking</span>
-                    <span class="settings-hint">
-                        Provider-specific. Silently ignored when the effective
-                        provider doesn't support the knob.
-                    </span>
-                    <span class="settings-hint">
+                <${Section} key="reasoning" title=${'Reasoning & thinking'} defaultOpen=${false}>
+                    <span class="settings-hint settings-section-desc">
+                        Provider-specific. Silently ignored when the effective provider doesn't support the knob.
                         Applied immediately &mdash; Cancel does not revert these.
                     </span>
-                </div>
 
-                <div class="settings-grid">
-                    <${BudgetTriState}
-                        label="Anthropic thinking budget"
-                        wireValue=${localSettings.value.thinking_budget_tokens}
-                        onWrite=${(v) => saveSettings({ thinking_budget_tokens: v })}
-                        classNames=${MODAL_TRISTATE_CLASSES} />
+                    <div class="settings-grid">
+                        <${BudgetTriState}
+                            label="Anthropic thinking budget"
+                            wireValue=${localSettings.value.thinking_budget_tokens}
+                            onWrite=${(v) => saveSettings({ thinking_budget_tokens: v })}
+                            classNames=${MODAL_TRISTATE_CLASSES} />
 
-                    <div class="settings-row">
-                        <label class="settings-label">OpenAI reasoning effort</label>
-                        <select class="settings-select"
-                                value=${localSettings.value.reasoning_effort || ''}
-                                onChange=${e => saveSettings({ reasoning_effort: e.target.value || null })}>
-                            <option value="">Inherit (server default)</option>
-                            ${REASONING_EFFORTS.map(eff => html`
-                                <option value=${eff} key=${eff}>${eff}</option>
-                            `)}
-                        </select>
+                        <div class="settings-row">
+                            <label class="settings-label">OpenAI reasoning effort</label>
+                            <select class="settings-select"
+                                    value=${localSettings.value.reasoning_effort || ''}
+                                    onChange=${e => saveSettings({ reasoning_effort: e.target.value || null })}>
+                                <option value="">Inherit (server default)</option>
+                                ${REASONING_EFFORTS.map(eff => html`
+                                    <option value=${eff} key=${eff}>${eff}</option>
+                                `)}
+                            </select>
+                        </div>
                     </div>
-                </div>
 
-                <div class="settings-grid">
-                    <${BudgetTriState}
-                        label="Gemini thinking budget"
-                        wireValue=${localSettings.value.gemini_thinking_budget}
-                        onWrite=${(v) => saveSettings({ gemini_thinking_budget: v })}
-                        classNames=${MODAL_TRISTATE_CLASSES} />
-                </div>
+                    <div class="settings-grid">
+                        <${BudgetTriState}
+                            label="Gemini thinking budget"
+                            wireValue=${localSettings.value.gemini_thinking_budget}
+                            onWrite=${(v) => saveSettings({ gemini_thinking_budget: v })}
+                            classNames=${MODAL_TRISTATE_CLASSES} />
+                    </div>
+                <//>
 
                 <div class="settings-divider"></div>
 
