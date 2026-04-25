@@ -236,6 +236,29 @@
   gap: 2px;
 }
 
+/* Sub-section header within per-run overrides (e.g. Reasoning & thinking).
+   Visually lighter than the main overrides header — same flex-column shape
+   but with a top margin to separate it from the preceding grid. */
+.settings-overrides-subheader {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: var(--space-2);
+}
+
+/* Tri-state budget control (Inherit / Disable / Custom) — modal flavor.
+   Used by the shared <BudgetTriState> component when the modal supplies
+   its own className map. The select sits flush; the optional number
+   input renders inline next to it when mode === 'custom'. */
+.settings-tristate-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.settings-tristate-group .settings-select { flex: 1 1 auto; min-width: 0; }
+.settings-tristate-value { flex: 0 0 auto; max-width: 50%; }
+
 /* Effective value hint below each editable field */
 .settings-effective {
   font-size: var(--text-2xs);

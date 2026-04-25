@@ -8,6 +8,23 @@ import {
     ProviderDisplay,
     formatProviderLabel,
 } from '../utils/model-display.js';
+import { BudgetTriState } from './budget-tri-state.js';
+
+const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
+
+/**
+ * Modal-flavored class map for the shared <BudgetTriState>. Keeps the
+ * tri-state visually consistent with the rest of the modal's per-run
+ * section (settings-row / settings-label / settings-select) instead of
+ * the composer's `composer-advanced-*` classes.
+ */
+const MODAL_TRISTATE_CLASSES = {
+    row: 'settings-row',
+    label: 'settings-label',
+    group: 'settings-tristate-group',
+    select: 'settings-select',
+    input: 'settings-input settings-tristate-value',
+};
 
 const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
 
@@ -176,11 +193,12 @@ function ApiKeysSection() {
  * Exported so the header (and composer Advanced expander) can show an
  * indicator badge.
  *
- * Includes the legacy fields and the three reasoning knobs added in
- * #804 Slice C — `thinking_budget_tokens`, `reasoning_effort`,
- * `gemini_thinking_budget`. For the budget knobs, `Some(0)` (explicit
+ * Includes the legacy fields plus `debug_mode` and the three reasoning
+ * knobs (`thinking_budget_tokens`, `reasoning_effort`,
+ * `gemini_thinking_budget`). For the budget knobs, `Some(0)` (explicit
  * disable) and any positive value both count as "active overrides";
- * only `null`/`undefined` is "inherit".
+ * only `null`/`undefined` is "inherit". For `debug_mode`, both `true`
+ * and `false` count — `null` is inherit.
  */
 export const activeOverrideCount = computed(() => {
     const s = localSettings.value;
@@ -330,7 +348,8 @@ export function SettingsModal({ open, onClose }) {
     const onReset = () => {
         // Clear all per-run overrides — including the three reasoning
         // knobs added by #804 Slice C — so the modal's Reset button
-        // mirrors the composer Advanced expander's "Reset all".
+        // mirrors the composer Advanced expander's "Reset all". Both
+        // surfaces share the same eight localSettings keys.
         saveSettings({
             provider: null,
             model: null,
@@ -616,6 +635,53 @@ export function SettingsModal({ open, onClose }) {
                             Off explicitly disables it for the next run even if the agent has it enabled.
                         </span>
                     </div>
+                </div>
+
+                <!--
+                    Reasoning & thinking knobs (#804 Slice C parity).
+
+                    These three knobs were previously only surfaced via the
+                    composer's Advanced expander (#818). They share the same
+                    `localSettings` keys, so a value set from either surface
+                    is visible to both — this section just makes the modal a
+                    full editor too. Live-write to localSettings (no Apply
+                    needed for these specific rows) so changes round-trip
+                    through the same path as the composer.
+                -->
+                <div class="settings-overrides-subheader">
+                    <span class="settings-label">Reasoning &amp; thinking</span>
+                    <span class="settings-hint">
+                        Provider-specific. Silently ignored when the effective
+                        provider doesn't support the knob.
+                    </span>
+                </div>
+
+                <div class="settings-grid">
+                    <${BudgetTriState}
+                        label="Anthropic thinking budget"
+                        wireValue=${localSettings.value.thinking_budget_tokens}
+                        onWrite=${(v) => saveSettings({ thinking_budget_tokens: v })}
+                        classNames=${MODAL_TRISTATE_CLASSES} />
+
+                    <div class="settings-row">
+                        <label class="settings-label">OpenAI reasoning effort</label>
+                        <select class="settings-select"
+                                value=${localSettings.value.reasoning_effort || ''}
+                                onChange=${e => saveSettings({ reasoning_effort: e.target.value || null })}>
+                            <option value="">Inherit (server default)</option>
+                            ${REASONING_EFFORTS.map(eff => html`
+                                <option value=${eff} key=${eff}>${eff}</option>
+                            `)}
+                        </select>
+                    </div>
+                </div>
+
+                <div class="settings-grid">
+                    <${BudgetTriState}
+                        label="Gemini thinking budget"
+                        wireValue=${localSettings.value.gemini_thinking_budget}
+                        onWrite=${(v) => saveSettings({ gemini_thinking_budget: v })}
+                        classNames=${MODAL_TRISTATE_CLASSES} />
                 </div>
 
                 <div class="settings-divider"></div>
