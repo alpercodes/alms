@@ -512,7 +512,7 @@ async fn test_end_conversation_emits_run_trigger_with_conversation_ended() {
         } => {
             assert_eq!(*from_agent, alice_id);
             assert_eq!(from_name, "alice");
-            assert_eq!(*reason, ConversationEndReason::Ignored);
+            assert_eq!(reason, &ConversationEndReason::Ignored);
         }
         other => panic!("expected ConversationEnded, got {:?}", other),
     }
@@ -552,7 +552,7 @@ async fn test_end_conversation_depth_exceeded_reason() {
     let trigger = rx.try_recv().unwrap();
     match &trigger.source {
         MessageSource::ConversationEnded { reason, .. } => {
-            assert_eq!(*reason, ConversationEndReason::DepthExceeded);
+            assert_eq!(reason, &ConversationEndReason::DepthExceeded);
         }
         other => panic!("expected ConversationEnded, got {:?}", other),
     }
@@ -1393,7 +1393,7 @@ async fn test_depth_exceeded_emits_notification_trigger() {
         } => {
             assert_eq!(*from_agent, next_id);
             assert_eq!(from_name, next_sender);
-            assert_eq!(*reason, ConversationEndReason::DepthExceeded);
+            assert_eq!(reason, &ConversationEndReason::DepthExceeded);
         }
         other => panic!("expected ConversationEnded, got {:?}", other),
     }
@@ -1680,7 +1680,7 @@ async fn test_ignore_full_roundtrip_lifecycle() {
         } => {
             assert_eq!(*from_agent, alice_id);
             assert_eq!(from_name, "alice");
-            assert_eq!(*reason, ConversationEndReason::Ignored);
+            assert_eq!(reason, &ConversationEndReason::Ignored);
         }
         other => panic!("expected ConversationEnded, got {:?}", other),
     }
@@ -1777,7 +1777,7 @@ async fn test_depth_exceeded_full_roundtrip_lifecycle() {
         } => {
             assert_eq!(*from_agent, next_id);
             assert_eq!(from_name, next_sender);
-            assert_eq!(*reason, ConversationEndReason::DepthExceeded);
+            assert_eq!(reason, &ConversationEndReason::DepthExceeded);
         }
         other => panic!("expected ConversationEnded, got {:?}", other),
     }

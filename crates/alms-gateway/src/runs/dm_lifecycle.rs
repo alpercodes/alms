@@ -84,10 +84,11 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
         return false;
     };
 
-    let reason_label = match end_reason {
+    let reason_label = match &end_reason {
         ConversationEndReason::Ignored => "ignore_message",
         ConversationEndReason::DepthExceeded => "depth_exceeded",
         ConversationEndReason::UserCancelled => "user_cancelled",
+        ConversationEndReason::Errored { .. } => "errored",
     };
 
     let Some(agent_name) = ctx.agent_name else {
@@ -134,7 +135,13 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
     match ctx
         .state
         .message_bus
-        .end_conversation(agent_name, ctx.agent_id, &peer_name, peer_id, end_reason)
+        .end_conversation(
+            agent_name,
+            ctx.agent_id,
+            &peer_name,
+            peer_id,
+            end_reason.clone(),
+        )
         .await
     {
         Ok(()) => {
@@ -184,6 +191,148 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
             false
         }
     }
+}
+
+/// Signal conversation end when a peer-triggered DM run failed or was
+/// cancelled mid-flight.
+///
+/// Mirrors [`handle_dm_run_completion`] for the four error arms in
+/// `execute_run()`:
+///
+/// - `AlmsError::Cancelled`
+/// - `AlmsError::CancelledWithToolCalls`
+/// - `AlmsError::FailedWithToolCalls`
+/// - generic `Err(_)`
+///
+/// Without this, a peer-triggered DM run that fails for any reason (LLM 5xx,
+/// rate-limit, tool panic, posture trip, `POST /runs/{id}/cancel` mid-flight)
+/// leaves the depth counter unreset, no `dm_ended` marker, and no
+/// `ConversationEnded` peer notification — the peer thinks the DM is still
+/// open until the 1800s `DEPTH_EXPIRY_SECS` sweep eventually clears it.
+///
+/// # End condition
+///
+/// A conversation end is signalled when the run is a peer-triggered DM
+/// (`is_peer_message` and `context_id` starts with `"dm:"`). Tool call
+/// records are NOT consulted here — we end the conversation purely on the
+/// run-level outcome, regardless of whether `ignore_message` was called.
+///
+/// # Reason mapping
+///
+/// Callers pass the reason directly:
+///
+/// - cancel arms (`Cancelled`, `CancelledWithToolCalls`) →
+///   [`ConversationEndReason::UserCancelled`]
+/// - failure arms (`FailedWithToolCalls`, generic `Err(_)`) →
+///   [`ConversationEndReason::Errored`] with the truncated `AlmsError`
+///   `Display` string
+///
+/// # Atomicity
+///
+/// `MessageBus::end_conversation()` uses `depths.remove()` as an atomicity
+/// guard (see `bus.rs:359`), so if the peer also independently calls
+/// `end_conversation` (e.g. their own happy-path `ignore_message`), only the
+/// first caller writes the `dm_ended` marker and emits the
+/// `ConversationEnded` trigger. Best-effort: a returned `Err` is logged but
+/// does not abort the surrounding error-arm bookkeeping.
+///
+/// Returns `Ok(())` on success or skip; returns `Err` only when the
+/// underlying `MessageBus::end_conversation` fails (the caller logs and
+/// continues).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_dm_run_failure(
+    state: &AppState,
+    run_id: &RunId,
+    session_id: &SessionId,
+    agent_id: AgentId,
+    agent_name: Option<&str>,
+    context_id: &str,
+    is_peer_message: bool,
+    reason: ConversationEndReason,
+) -> Result<(), alms_core::AlmsError> {
+    // Same gating as the happy path: only DM peer-triggered runs.
+    if !(is_peer_message && context_id.starts_with("dm:")) {
+        return Ok(());
+    }
+
+    let reason_label = match &reason {
+        ConversationEndReason::Ignored => "ignore_message",
+        ConversationEndReason::DepthExceeded => "depth_exceeded",
+        ConversationEndReason::UserCancelled => "user_cancelled",
+        ConversationEndReason::Errored { .. } => "errored",
+    };
+
+    let Some(agent_name) = agent_name else {
+        debug!(
+            reason = reason_label,
+            "DM run failure detected but agent name is not set — skipping conversation end"
+        );
+        return Ok(());
+    };
+
+    let Some(peer_name) = extract_peer_from_dm_context(context_id, agent_name) else {
+        debug!(
+            context_id = %context_id,
+            reason = reason_label,
+            "DM run failure detected but could not extract peer from context_id"
+        );
+        return Ok(());
+    };
+
+    // Resolve the peer's AgentId from the agent registry.
+    let peer_agent_id = state
+        .session_manager
+        .store()
+        .and_then(|store| store.load_agent_by_name(&peer_name).ok())
+        .flatten()
+        .map(|record| record.id);
+
+    let Some(peer_id) = peer_agent_id else {
+        warn!(
+            peer = %peer_name,
+            "Cannot signal conversation end on failure — peer agent not found in registry"
+        );
+        return Ok(());
+    };
+
+    info!(
+        agent = %agent_name,
+        peer = %peer_name,
+        reason = reason_label,
+        run_id = %run_id.0,
+        "DM run failed/cancelled — signalling conversation end ({reason_label})"
+    );
+
+    state
+        .message_bus
+        .end_conversation(agent_name, agent_id, &peer_name, peer_id, reason.clone())
+        .await
+        .map_err(|e| alms_core::AlmsError::Runtime(e.to_string()))?;
+
+    // Emit dm_conversation_ended SSE on the DM session stream so the web UI
+    // shows the "conversation ended" indicator regardless of run outcome.
+    //
+    // Atomicity: `MessageBus::end_conversation()` returns `Ok(())` even when
+    // the depth-counter remove was a no-op (already ended by peer). That
+    // means the peer-side helper may race in too. Frontend already tolerates
+    // duplicate `dm_conversation_ended` events — see the comment in
+    // `handle_dm_run_completion`.
+    state
+        .run_manager
+        .send_session_event(
+            *session_id,
+            *run_id,
+            SseEventData::dm_conversation_ended(
+                *session_id,
+                agent_name,
+                &peer_name,
+                &reason.to_string(),
+                context_id,
+            ),
+        )
+        .await;
+
+    Ok(())
 }
 
 /// Evaluate the three-way condition for ignore_message detection.

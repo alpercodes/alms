@@ -663,7 +663,7 @@ pub(super) fn format_dm_ended_notification(
     reason: ConversationEndReason,
     conversation_history: Option<&str>,
 ) -> String {
-    let reason_text = match reason {
+    let reason_text = match &reason {
         ConversationEndReason::Ignored => {
             format!("Agent \"{from_name}\" ended the conversation (chose not to reply).")
         }
@@ -675,6 +675,12 @@ pub(super) fn format_dm_ended_notification(
         }
         ConversationEndReason::UserCancelled => {
             "The DM conversation was cancelled by the user.".to_string()
+        }
+        ConversationEndReason::Errored { message } => {
+            format!(
+                "The conversation with agent \"{from_name}\" ended because \
+                 the run failed: {message}"
+            )
         }
     };
 
@@ -844,7 +850,7 @@ pub(crate) async fn run_trigger_loop(
                 // has no access to SSE infrastructure. We emit the event
                 // here instead, since the ConversationEnded trigger
                 // carries all the information we need.
-                if *reason == ConversationEndReason::DepthExceeded {
+                if matches!(reason, ConversationEndReason::DepthExceeded) {
                     if let Some(ref peer_name) = peer_name_resolved {
                         let dm_context = alms_core::dm_context_id(from_name, peer_name);
                         let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
@@ -984,7 +990,7 @@ pub(crate) async fn run_trigger_loop(
                     // follow-up hint.
                     format_dm_ended_notification(
                         from_name,
-                        *reason,
+                        reason.clone(),
                         conversation_history.as_deref(),
                     ),
                     None,

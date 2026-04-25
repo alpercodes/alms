@@ -16,4 +16,5 @@ export const DM_END_REASON_LABELS = {
     'ignored': 'no further replies',
     'depth_exceeded': 'message limit reached',
     'user_cancelled': 'cancelled by user',
+    'errored': 'run failed',
 };

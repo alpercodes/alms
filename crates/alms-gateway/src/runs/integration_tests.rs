@@ -20,6 +20,7 @@ use crate::sse::SseEventData;
 use alms_coordinator::message_bus::{DmEvent, MessageSource, RunTrigger};
 use alms_coordinator::{SubagentCompletion, TaskId, TaskStatus};
 use alms_core::{AgentId, Run, RunStatus, SessionId, TokenUsage};
+use alms_tools::MessageSender;
 use alms_tools::message_sender::ConversationEndReason;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -63,6 +64,84 @@ fn test_app_state() -> (
         trigger_rx,
         dm_event_rx,
     )
+}
+
+/// Build an `AppState` backed by an in-memory SQLite store.
+///
+/// Used by tests that need a real agent registry (e.g. peer-name -> AgentId
+/// resolution in `handle_dm_run_failure`). Mirrors the channel plumbing of
+/// [`test_app_state`] but threads `db_path = Some(":memory:")` into the
+/// `GatewayConfig` so `session_manager.store()` returns `Some(...)`.
+fn test_app_state_with_sqlite() -> (
+    AppState,
+    CancellationToken,
+    mpsc::UnboundedReceiver<SubagentCompletion>,
+    mpsc::UnboundedReceiver<RunTrigger>,
+    mpsc::UnboundedReceiver<DmEvent>,
+) {
+    let gateway_config = GatewayConfig {
+        db_path: Some(":memory:".to_string()),
+        ..GatewayConfig::default()
+    };
+    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let scheduler = Arc::new(alms_runtime::Scheduler::new());
+    let shutdown_token = CancellationToken::new();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
+    let (dm_event_tx, dm_event_rx) = mpsc::unbounded_channel();
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        trigger_tx,
+        dm_event_tx,
+    )
+    .unwrap();
+    (
+        state,
+        shutdown_token,
+        completion_rx,
+        trigger_rx,
+        dm_event_rx,
+    )
+}
+
+/// Seed two agents (`alice` and `bob`) into the SQLite-backed agent registry
+/// so that peer-name resolution works in `handle_dm_run_failure` and
+/// related lifecycle helpers.
+///
+/// Returns `(alice_id, bob_id)`.
+fn seed_alice_bob(state: &AppState) -> (AgentId, AgentId) {
+    use alms_core::registry::AgentRecord;
+    use chrono::Utc;
+    let store = state
+        .session_manager
+        .store()
+        .expect("test_app_state_with_sqlite must provide a SQLite store");
+    let alice = AgentRecord {
+        id: AgentId::new(),
+        name: "alice".into(),
+        description: String::new(),
+        model: None,
+        posture: None,
+        provider: None,
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        is_default: false,
+        created_at: Utc::now(),
+        last_active: Utc::now(),
+    };
+    let bob = AgentRecord {
+        id: AgentId::new(),
+        name: "bob".into(),
+        ..alice.clone()
+    };
+    store.create_agent(&alice).unwrap();
+    store.create_agent(&bob).unwrap();
+    (alice.id, bob.id)
 }
 
 /// Subscribe to SSE events on a session and return the receiver.
@@ -1692,4 +1771,367 @@ async fn create_run_reports_queued_behind_when_agent_is_running() {
         queued_behind >= 1,
         "queued_behind should be >= 1 when the agent is already running another run; got {queued_behind}",
     );
+}
+
+// ---------------------------------------------------------------------------
+// handle_dm_run_failure tests
+//
+// Regression coverage for the gap surfaced during v0.2.2 sign-off: the four
+// error arms in `execute_run` (Cancelled, CancelledWithToolCalls,
+// FailedWithToolCalls, generic Err) skipped DM peer-state notification, so
+// a peer-triggered DM run that failed left the depth counter, `dm_ended`
+// marker, and `ConversationEnded` peer notification unset until the 1800s
+// `DEPTH_EXPIRY_SECS` sweep eventually cleared it.
+// ---------------------------------------------------------------------------
+
+/// Test that `handle_dm_run_failure` is a no-op for non-peer runs.
+///
+/// The helper must NOT call `MessageBus::end_conversation` or emit any SSE
+/// when `is_peer_message` is false — only peer-triggered DM runs participate
+/// in the DM lifecycle handshake.
+#[tokio::test]
+async fn handle_dm_run_failure_skips_when_not_peer_message() {
+    let (state, _shutdown, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (_alice_id, bob_id) = seed_alice_bob(&state);
+
+    let session_id = SessionId::deterministic_dm("alice", "bob");
+    state
+        .session_manager
+        .get_or_create_with_id(session_id, bob_id, "dm:alice:bob");
+    let mut dm_rx = subscribe_session(&state, session_id);
+
+    let run_id = alms_core::RunId::new();
+    let res = super::dm_lifecycle::handle_dm_run_failure(
+        &state,
+        &run_id,
+        &session_id,
+        bob_id,
+        Some("bob"),
+        "dm:alice:bob",
+        false, // <-- is_peer_message = false
+        ConversationEndReason::UserCancelled,
+    )
+    .await;
+    assert!(res.is_ok(), "no-op path should succeed");
+
+    // No RunTrigger should have been emitted.
+    assert!(
+        tr.try_recv().is_err(),
+        "no ConversationEnded RunTrigger should fire for non-peer runs"
+    );
+
+    // No SSE event should land on the DM session stream.
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut dm_rx);
+    assert!(
+        events.is_empty(),
+        "no SSE should be emitted; got {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+}
+
+/// Test that `handle_dm_run_failure` is a no-op for non-DM context IDs.
+///
+/// The helper must only act on `dm:` context IDs — a peer-triggered run on
+/// any other context (e.g. `notifications:bob`, `web`, `subagent_…`) is not
+/// a DM and must not trigger the DM end handshake.
+#[tokio::test]
+async fn handle_dm_run_failure_skips_when_not_dm_context() {
+    let (state, _shutdown, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (_alice_id, bob_id) = seed_alice_bob(&state);
+
+    let session = state.session_manager.get_or_create(bob_id, "web");
+    let session_id = session.id;
+    let mut rx = subscribe_session(&state, session_id);
+
+    let run_id = alms_core::RunId::new();
+    let res = super::dm_lifecycle::handle_dm_run_failure(
+        &state,
+        &run_id,
+        &session_id,
+        bob_id,
+        Some("bob"),
+        "web", // <-- not a dm: context
+        true,
+        ConversationEndReason::UserCancelled,
+    )
+    .await;
+    assert!(res.is_ok());
+
+    assert!(tr.try_recv().is_err(), "no RunTrigger for non-DM context");
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut rx);
+    assert!(
+        events.is_empty(),
+        "no SSE for non-DM context; got {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+}
+
+/// Happy path: a peer-triggered DM run that errored should end the
+/// conversation, reset the depth counter, emit a `ConversationEnded`
+/// `RunTrigger` carrying `Errored { message }` for the peer, and emit a
+/// `dm_conversation_ended` SSE on the DM session stream.
+#[tokio::test]
+async fn handle_dm_run_failure_errored_resets_depth_and_emits_sse() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Bootstrap the depth counter as if alice had just sent a DM to bob.
+    // This routes through the real `MessageBus::send`, which creates the
+    // shared DM session and bumps the depth.
+    let _receipt = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    // Drain the trigger emitted by `send` so subsequent assertions are
+    // scoped to the failure-driven trigger only.
+    let _initial_trigger = tr.try_recv().expect("send should emit a trigger");
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+
+    // Subscribe to the DM session SSE stream so we can capture the
+    // `dm_conversation_ended` event.
+    let mut dm_rx = subscribe_session(&state, dm_session_id);
+
+    // Simulate bob's peer-triggered DM run failing mid-flight. This is the
+    // generic `Err(e)` arm in `execute_run` — the message field is the
+    // truncated error display.
+    let run_id = alms_core::RunId::new();
+    let result = super::dm_lifecycle::handle_dm_run_failure(
+        &state,
+        &run_id,
+        &dm_session_id,
+        bob_id,
+        Some("bob"),
+        dm_context,
+        true,
+        ConversationEndReason::Errored {
+            message: "LLM provider error".to_string(),
+        },
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "happy path should return Ok; got {result:?}"
+    );
+
+    // 1. The DM session must contain a `dm_ended` marker — this proves
+    //    `MessageBus::end_conversation` ran (the marker write happens after
+    //    the depth counter has been removed). The depth-counter map is a
+    //    `pub(super)` field of MessageBus so we cannot inspect it directly
+    //    from the gateway tests; the marker is the next-best public proof.
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    let dm_ended_marker = history.iter().find(|m| {
+        m.metadata
+            .as_ref()
+            .and_then(|meta| meta.get("message_type"))
+            .and_then(|v| v.as_str())
+            == Some("dm_ended")
+    });
+    assert!(
+        dm_ended_marker.is_some(),
+        "expected a `dm_ended` marker to be persisted to the DM session"
+    );
+    let marker_meta = dm_ended_marker.unwrap().metadata.as_ref().unwrap();
+    assert_eq!(
+        marker_meta.get("reason").and_then(|v| v.as_str()),
+        Some("errored"),
+        "dm_ended marker must record the Errored reason"
+    );
+
+    // 2. `ConversationEnded` RunTrigger should have been emitted for alice
+    //    (the peer of the failed run) carrying the `Errored` reason.
+    let trigger = tr.try_recv().expect("expected ConversationEnded trigger");
+    match trigger.source {
+        MessageSource::ConversationEnded {
+            from_name, reason, ..
+        } => {
+            assert_eq!(from_name, "bob", "from_name must be the failed run's agent");
+            match reason {
+                ConversationEndReason::Errored { message } => {
+                    assert_eq!(message, "LLM provider error");
+                }
+                other => panic!("expected Errored reason, got {other:?}"),
+            }
+        }
+        other => panic!("expected ConversationEnded source, got {other:?}"),
+    }
+
+    // 3. `dm_conversation_ended` SSE event with reason "errored" should
+    //    have landed on the DM session stream.
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut dm_rx);
+    let dm_ended = events
+        .iter()
+        .find(|e| e.event_type == "dm_conversation_ended")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected dm_conversation_ended SSE; got {:?}",
+                events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+            )
+        });
+    let reason_str = dm_ended
+        .data
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert_eq!(
+        reason_str, "errored",
+        "SSE reason must be 'errored' for the Errored variant"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Cancel arm: a peer-triggered DM run that was cancelled mid-flight should
+/// emit `dm_conversation_ended` with reason `user_cancelled` and reset the
+/// depth counter, mirroring the `Errored` happy-path test.
+#[tokio::test]
+async fn handle_dm_run_failure_user_cancelled_emits_sse() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Open a DM conversation.
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv();
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+    let mut dm_rx = subscribe_session(&state, dm_session_id);
+
+    let run_id = alms_core::RunId::new();
+    super::dm_lifecycle::handle_dm_run_failure(
+        &state,
+        &run_id,
+        &dm_session_id,
+        bob_id,
+        Some("bob"),
+        dm_context,
+        true,
+        ConversationEndReason::UserCancelled,
+    )
+    .await
+    .unwrap();
+
+    // dm_ended marker is the public proof that `MessageBus::end_conversation`
+    // ran end-to-end (depth counter removal happens immediately before the
+    // marker write).
+    let history = state.session_manager.get_history(dm_session_id).unwrap();
+    assert!(
+        history.iter().any(|m| {
+            m.metadata
+                .as_ref()
+                .and_then(|meta| meta.get("reason"))
+                .and_then(|v| v.as_str())
+                == Some("user_cancelled")
+        }),
+        "dm_ended marker with reason=user_cancelled must be persisted"
+    );
+
+    let trigger = tr.try_recv().expect("expected ConversationEnded trigger");
+    match trigger.source {
+        MessageSource::ConversationEnded { reason, .. } => {
+            assert!(
+                matches!(reason, ConversationEndReason::UserCancelled),
+                "trigger reason must be UserCancelled; got {reason:?}"
+            );
+        }
+        other => panic!("expected ConversationEnded source, got {other:?}"),
+    }
+
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut dm_rx);
+    let dm_ended = events
+        .iter()
+        .find(|e| e.event_type == "dm_conversation_ended")
+        .expect("expected dm_conversation_ended SSE");
+    assert_eq!(
+        dm_ended
+            .data
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+        "user_cancelled",
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Atomicity guard: when both peers race to end the conversation (e.g. the
+/// peer's happy-path `ignore_message` runs at the same time as the local
+/// run's failure arm), only the first caller should win. The atomicity
+/// guard at `bus.rs:359` (`depths.remove()`) ensures the second
+/// `end_conversation` returns `Ok(())` without re-emitting a trigger.
+#[tokio::test]
+async fn handle_dm_run_failure_double_end_is_idempotent() {
+    let (state, shutdown_token, _cr, mut tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, bob_id) = seed_alice_bob(&state);
+
+    // Open a DM conversation.
+    let _ = state
+        .message_bus
+        .send("alice", alice_id, "bob", bob_id, "ping", None)
+        .await
+        .unwrap();
+    let _ = tr.try_recv();
+
+    let dm_context = "dm:alice:bob";
+    let dm_session_id = SessionId::deterministic_dm("alice", "bob");
+
+    let run_id = alms_core::RunId::new();
+
+    // First call: should emit the ConversationEnded trigger.
+    super::dm_lifecycle::handle_dm_run_failure(
+        &state,
+        &run_id,
+        &dm_session_id,
+        bob_id,
+        Some("bob"),
+        dm_context,
+        true,
+        ConversationEndReason::Errored {
+            message: "first".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Second call: depth has been removed already; bus.rs's atomicity guard
+    // returns Ok(()) without re-emitting a trigger.
+    super::dm_lifecycle::handle_dm_run_failure(
+        &state,
+        &run_id,
+        &dm_session_id,
+        bob_id,
+        Some("bob"),
+        dm_context,
+        true,
+        ConversationEndReason::Errored {
+            message: "second".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Exactly one ConversationEnded trigger should have been emitted across
+    // the two calls (the second call hits the atomicity guard).
+    let mut conversation_ended_triggers = 0;
+    while let Ok(t) = tr.try_recv() {
+        if matches!(t.source, MessageSource::ConversationEnded { .. }) {
+            conversation_ended_triggers += 1;
+        }
+    }
+    assert_eq!(
+        conversation_ended_triggers, 1,
+        "atomicity guard must suppress duplicate ConversationEnded triggers"
+    );
+
+    shutdown_token.cancel();
 }

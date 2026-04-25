@@ -13,6 +13,7 @@ use alms_core::{
     RunStatusResponse, SessionId, classify_session_type,
 };
 use alms_runtime::RuntimeEvent;
+use alms_tools::message_sender::ConversationEndReason;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -487,6 +488,33 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.run_manager.untrack_in_flight();
     }
+}
+
+/// Maximum bytes of an `AlmsError` Display string to embed in the
+/// `ConversationEndReason::Errored { message }` payload.
+///
+/// Bounds the size of the peer-side notification text so a verbose error
+/// (e.g. an LLM JSON dump) does not balloon the `dm_ended` marker / SSE
+/// frame. Truncation is done on a UTF-8 char boundary.
+const PEER_ERROR_MESSAGE_MAX_LEN: usize = 300;
+
+/// Build the human-readable error string carried in
+/// `ConversationEndReason::Errored { message }` for the peer-side
+/// notification. Truncated to [`PEER_ERROR_MESSAGE_MAX_LEN`] on a UTF-8
+/// char boundary; appends an ellipsis when truncated.
+fn truncate_error_for_peer(err: &dyn std::fmt::Display) -> String {
+    let s = err.to_string();
+    if s.len() <= PEER_ERROR_MESSAGE_MAX_LEN {
+        return s;
+    }
+    // Walk back from PEER_ERROR_MESSAGE_MAX_LEN to a char boundary.
+    let mut end = PEER_ERROR_MESSAGE_MAX_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = s[..end].to_string();
+    truncated.push_str("...");
+    truncated
 }
 
 /// Execute a run in background, forwarding runtime events to SSE.
@@ -1153,6 +1181,28 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
+            // Best-effort: notify the DM peer that the conversation ended
+            // because this run was cancelled mid-flight. Without this, the
+            // peer thinks the DM is still open until the 1800s
+            // `DEPTH_EXPIRY_SECS` sweep clears the depth counter.
+            if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                ConversationEndReason::UserCancelled,
+            )
+            .await
+            {
+                warn!(
+                    error = %e,
+                    "handle_dm_run_failure emitted error — DM peer state may be stale"
+                );
+            }
+
             info!("Run {} cancelled", run_id.0);
         }
         Err(alms_core::AlmsError::CancelledWithToolCalls { tool_calls }) => {
@@ -1176,6 +1226,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                         "run_id": run_id.0.to_string(),
                         "status": "cancelled",
                     }),
+                );
+            }
+
+            // Best-effort: see comment in the `Cancelled` arm.
+            if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                ConversationEndReason::UserCancelled,
+            )
+            .await
+            {
+                warn!(
+                    error = %e,
+                    "handle_dm_run_failure emitted error — DM peer state may be stale"
                 );
             }
 
@@ -1216,6 +1285,31 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
+            // Best-effort: notify the DM peer that the conversation ended
+            // due to a runtime error. The truncated `source` string is
+            // surfaced in the peer's `dm_ended` notification so the peer
+            // (and human user watching the DM) sees a useful reason instead
+            // of a stale "in-flight" indicator until the 1800s sweep.
+            if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                ConversationEndReason::Errored {
+                    message: truncate_error_for_peer(&source),
+                },
+            )
+            .await
+            {
+                warn!(
+                    error = %e,
+                    "handle_dm_run_failure emitted error — DM peer state may be stale"
+                );
+            }
+
             error!(
                 "Run {} failed ({} tool calls persisted): {}",
                 run_id.0,
@@ -1246,6 +1340,27 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                         "status": "failed",
                         "error": e.to_string(),
                     }),
+                );
+            }
+
+            // Best-effort: see comment in the `FailedWithToolCalls` arm.
+            if let Err(end_err) = super::dm_lifecycle::handle_dm_run_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                ConversationEndReason::Errored {
+                    message: truncate_error_for_peer(&e),
+                },
+            )
+            .await
+            {
+                warn!(
+                    error = %end_err,
+                    "handle_dm_run_failure emitted error — DM peer state may be stale"
                 );
             }
 
@@ -1392,5 +1507,56 @@ mod tests {
         // parent_run_id should win over context_id prefix
         let run = Run::for_subagent(SessionId::new(), AgentId::new(), "sub".into(), RunId::new());
         assert_eq!(derive_trigger(&run, "dm:a:b"), "subagent");
+    }
+
+    #[test]
+    fn test_truncate_error_for_peer_short_ascii_unchanged() {
+        // Short ASCII passes through unmodified (no ellipsis appended).
+        let s = "boom";
+        let out = truncate_error_for_peer(&s);
+        assert_eq!(out, "boom");
+    }
+
+    #[test]
+    fn test_truncate_error_for_peer_exact_boundary_unchanged() {
+        // Exactly PEER_ERROR_MESSAGE_MAX_LEN bytes -> no truncation, no ellipsis.
+        let s = "a".repeat(PEER_ERROR_MESSAGE_MAX_LEN);
+        let out = truncate_error_for_peer(&s);
+        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN);
+        assert!(!out.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_error_for_peer_oversize_ascii_truncates_with_ellipsis() {
+        // Oversize ASCII clips to PEER_ERROR_MESSAGE_MAX_LEN bytes + "..."
+        // (char-boundary walkback is a no-op for ASCII).
+        let s = "a".repeat(PEER_ERROR_MESSAGE_MAX_LEN + 50);
+        let out = truncate_error_for_peer(&s);
+        assert!(out.ends_with("..."));
+        // Body is exactly the max-len prefix; total len = max + 3 ("...").
+        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN + 3);
+    }
+
+    #[test]
+    fn test_truncate_error_for_peer_multibyte_walks_back_to_char_boundary() {
+        // "é" is 2 bytes in UTF-8. With 200 copies (400 bytes), the raw
+        // PEER_ERROR_MESSAGE_MAX_LEN=300 cut would land mid-codepoint at
+        // offset 300 (which IS a char boundary for 2-byte codepoints since
+        // 300 is even); construct a 3-byte char case that forces a walkback.
+        // "あ" is 3 bytes; 150 copies = 450 bytes. Cut at 300 -> 300 % 3 == 0,
+        // also a boundary. Use a mix: leading "a" then 3-byte chars so the
+        // cut lands inside a codepoint and must walk back.
+        let s = format!("a{}", "あ".repeat(200)); // 1 + 600 = 601 bytes
+        // Cut at 300: byte 0 is 'a', then "あ" starts at byte 1 (3 bytes each).
+        // Boundaries after byte 1 are at 1 + 3k. 300 - 1 = 299, not a multiple
+        // of 3, so 300 is mid-codepoint. Walk back: 300 -> 299 -> 298 (1+3*99=298).
+        let out = truncate_error_for_peer(&s);
+        assert!(out.ends_with("..."));
+        // The body must end at a UTF-8 char boundary (no panic on slicing).
+        let body = out.trim_end_matches("...");
+        assert!(body.is_char_boundary(body.len()));
+        // Body length is the largest valid char boundary <= 300.
+        assert!(body.len() <= PEER_ERROR_MESSAGE_MAX_LEN);
+        assert!(s.is_char_boundary(body.len()));
     }
 }
