@@ -380,6 +380,9 @@ export function AgentEditModal({ agent, onClose }) {
                             ? 'A token is set but is never displayed. Replace overwrites it; Remove clears it.'
                             : 'Set a bot token to enable a dedicated Telegram polling loop for this agent.'}
                     </span>
+                    <span class="settings-hint">
+                        Token changes only take effect after the daemon restarts. Tracked in #821.
+                    </span>
                 </div>
 
                 ${error.value && html`<div class="inline-error">${error.value}</div>`}
