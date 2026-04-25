@@ -190,6 +190,20 @@
   margin-bottom: var(--space-1);
 }
 
+/* LLM Providers section: provider sub-heading separator (#804 Slice A).
+   Rendered as <h4> for screen-reader landmark navigation; reset the
+   browser's default h4 margin so the rule's own spacing wins. */
+.settings-llm-subhead {
+  margin: var(--space-2) 0 0 0;
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-2);
+}
+
 /* Read-only info rows within sections */
 .settings-info-row {
   display: flex;

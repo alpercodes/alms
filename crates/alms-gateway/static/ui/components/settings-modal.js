@@ -231,6 +231,21 @@ export function SettingsModal({ open, onClose }) {
     const toolsTimeout = useSignal('');
     const toolsMaxOutput = useSignal('');
 
+    // Server-level editable signals — LLM provider-family (#809 / #804 Slice A).
+    // Numeric strings are the form representation; an empty string means
+    // "don't include this field in the PATCH body" (= leave server alone).
+    // Each field is sent on Apply only if it differs from the current
+    // server-reported value, mirroring the existing context/session/tools
+    // diff-on-Apply pattern.
+    const llmAnthropicThinking = useSignal('');
+    const llmAnthropicCache = useSignal(true);
+    const llmAnthropicCacheTouched = useSignal(false);
+    const llmOpenaiEffort = useSignal('');
+    const llmGeminiThinking = useSignal('');
+    const llmGeminiCache = useSignal(true);
+    const llmGeminiCacheTouched = useSignal(false);
+    const llmGeminiCacheTtl = useSignal('');
+
     // Feedback for server settings save
     const serverSaving = useSignal(false);
     const serverError = useSignal('');
@@ -241,6 +256,10 @@ export function SettingsModal({ open, onClose }) {
             const ctx = d.context || {};
             const sess = d.session || {};
             const tools = d.tools || {};
+            const llm = d.llm || {};
+            const llmAnth = llm.anthropic || {};
+            const llmOpen = llm.openai || {};
+            const llmGem = llm.gemini || {};
 
             provider.value = localSettings.value.provider || '';
             model.value = localSettings.value.model || '';
@@ -269,6 +288,27 @@ export function SettingsModal({ open, onClose }) {
             toolsTimeout.value = tools.timeout_secs != null ? String(tools.timeout_secs) : '';
             toolsMaxOutput.value = tools.max_output_bytes != null ? String(tools.max_output_bytes) : '';
 
+            // LLM provider-family populate. The wire shape always emits
+            // every key (with `null` for openai.reasoning_effort when
+            // unset), so we initialise from whatever the server reports
+            // and only PATCH fields the user actively changes.
+            llmAnthropicThinking.value = llmAnth.thinking_budget_tokens != null
+                ? String(llmAnth.thinking_budget_tokens) : '';
+            llmAnthropicCache.value = llmAnth.prompt_cache_enabled != null
+                ? !!llmAnth.prompt_cache_enabled : true;
+            llmAnthropicCacheTouched.value = false;
+            // OpenAI reasoning_effort: '' represents "no override" / "cleared"
+            // (server returns `null` here). When the user picks an empty
+            // option, we send `""` on the wire to clear an existing override.
+            llmOpenaiEffort.value = llmOpen.reasoning_effort || '';
+            llmGeminiThinking.value = llmGem.thinking_budget != null
+                ? String(llmGem.thinking_budget) : '';
+            llmGeminiCache.value = llmGem.cache_enabled != null
+                ? !!llmGem.cache_enabled : true;
+            llmGeminiCacheTouched.value = false;
+            llmGeminiCacheTtl.value = llmGem.cache_ttl_seconds != null
+                ? String(llmGem.cache_ttl_seconds) : '';
+
             saved.value = false;
 
             serverError.value = '';
@@ -282,6 +322,10 @@ export function SettingsModal({ open, onClose }) {
     const sess = defaults.session || {};
     const log = defaults.logging || {};
     const tools = defaults.tools || {};
+    const llm = defaults.llm || {};
+    const llmAnth = llm.anthropic || {};
+    const llmOpen = llm.openai || {};
+    const llmGem = llm.gemini || {};
 
     const onReset = () => {
         // Clear all per-run overrides — including the three reasoning
@@ -388,6 +432,62 @@ export function SettingsModal({ open, onClose }) {
             toolsPatch.max_output_bytes = newMaxOut;
         }
         if (Object.keys(toolsPatch).length > 0) body.tools = toolsPatch;
+
+        // LLM provider-family (#809 / #804 Slice A). Each provider sub-block
+        // is built independently and only attached if it has at least one
+        // changed field. Numeric "cleared" inputs (empty string) are treated
+        // as "leave server alone" — the field is omitted from the PATCH.
+        // Booleans are only sent when the user actively toggled them, since
+        // there's no `null` sentinel for booleans on this surface.
+        const llmPatch = {};
+
+        const anthPatch = {};
+        const newAnthThink = parseInt(llmAnthropicThinking.value, 10);
+        // Allow `0` (= explicit disable) — it differs from `''` (cleared form
+        // input = leave alone).
+        if (llmAnthropicThinking.value !== '' && !isNaN(newAnthThink)
+            && newAnthThink !== llmAnth.thinking_budget_tokens) {
+            anthPatch.thinking_budget_tokens = newAnthThink;
+        }
+        if (llmAnthropicCacheTouched.value
+            && llmAnthropicCache.value !== !!llmAnth.prompt_cache_enabled) {
+            anthPatch.prompt_cache_enabled = llmAnthropicCache.value;
+        }
+        if (Object.keys(anthPatch).length > 0) llmPatch.anthropic = anthPatch;
+
+        const openPatch = {};
+        // OpenAI reasoning_effort uses `""` as the explicit-clear sentinel.
+        // The form's empty option corresponds to "(unset)" -> send `""`
+        // to clear an existing PATCH'd value back to null. If the form
+        // value matches the server value (both empty, or both equal
+        // strings), we don't send the field.
+        const currentEffort = llmOpen.reasoning_effort || '';
+        if (llmOpenaiEffort.value !== currentEffort) {
+            openPatch.reasoning_effort = llmOpenaiEffort.value;
+        }
+        if (Object.keys(openPatch).length > 0) llmPatch.openai = openPatch;
+
+        const gemPatch = {};
+        const newGemThink = parseInt(llmGeminiThinking.value, 10);
+        if (llmGeminiThinking.value !== '' && !isNaN(newGemThink)
+            && newGemThink !== llmGem.thinking_budget) {
+            gemPatch.thinking_budget = newGemThink;
+        }
+        if (llmGeminiCacheTouched.value
+            && llmGeminiCache.value !== !!llmGem.cache_enabled) {
+            gemPatch.cache_enabled = llmGeminiCache.value;
+        }
+        const newGemTtl = parseInt(llmGeminiCacheTtl.value, 10);
+        // Pass `0` through to the backend so a 422 surfaces if the operator
+        // typed it intentionally — backend is the source-of-truth on
+        // validation; we no longer silently swallow it client-side.
+        if (llmGeminiCacheTtl.value !== '' && !isNaN(newGemTtl)
+            && newGemTtl !== llmGem.cache_ttl_seconds) {
+            gemPatch.cache_ttl_seconds = newGemTtl;
+        }
+        if (Object.keys(gemPatch).length > 0) llmPatch.gemini = gemPatch;
+
+        if (Object.keys(llmPatch).length > 0) body.llm = llmPatch;
 
         // 3. If there are server-level changes, PATCH them
         if (Object.keys(body).length > 0) {
@@ -640,6 +740,76 @@ export function SettingsModal({ open, onClose }) {
                     <//>
                     <${InfoRow} label="Enabled tools" value=${`${enabledTools.length} tools`}
                         desc=${enabledTools.join(', ')} />
+                <//>
+
+                <!-- LLM Providers (server-level, editable) — #809 / #804 Slice A -->
+                <${Section} key="llm" title="LLM Providers" defaultOpen=${false}>
+                    <span class="settings-hint settings-section-desc">
+                        Server-level reasoning &amp; caching defaults. Mutations propagate to the next HTTP-triggered run without restart; Telegram-triggered runs use a boot-time snapshot until the daemon is restarted.
+                    </span>
+
+                    <h4 class="settings-llm-subhead">Anthropic</h4>
+                    <${EditRow} label="Thinking budget tokens"
+                        desc="0 = extended thinking off. Leave blank to keep the current server value. The wire surface has no clear sentinel — once PATCHed, revert by editing settings.json + restart.">
+                        <input class="settings-input settings-input-sm" type="number" min="0" step="1024"
+                               placeholder=${llmAnth.thinking_budget_tokens != null ? String(llmAnth.thinking_budget_tokens) : 'unset'}
+                               value=${llmAnthropicThinking.value}
+                               onInput=${e => { llmAnthropicThinking.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Prompt cache enabled"
+                        desc="Anthropic prefix caching (5-minute TTL). Server-level only.">
+                        <label class="settings-toggle">
+                            <input type="checkbox"
+                                   checked=${llmAnthropicCache.value}
+                                   onChange=${e => {
+                                       llmAnthropicCache.value = e.target.checked;
+                                       llmAnthropicCacheTouched.value = true;
+                                   }} />
+                            <span>${llmAnthropicCache.value ? 'enabled' : 'disabled'}</span>
+                        </label>
+                    <//>
+
+                    <h4 class="settings-llm-subhead">OpenAI / OpenRouter</h4>
+                    <${EditRow} label="Reasoning effort"
+                        desc="Applies to o-series, GPT-5, and reasoning-capable Grok models. Auto-stripped on non-reasoning models. Choose Unset to clear an existing override.">
+                        <select class="settings-select settings-input-sm"
+                                value=${llmOpenaiEffort.value}
+                                onChange=${e => { llmOpenaiEffort.value = e.target.value; }}>
+                            <option value="">Unset (no override)</option>
+                            <option value="minimal">minimal</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                        </select>
+                    <//>
+
+                    <h4 class="settings-llm-subhead">Gemini</h4>
+                    <${EditRow} label="Thinking budget"
+                        desc="0 = extended thinking off. Leave blank to keep the current server value. Once PATCHed, this value can only be reverted by editing settings.json + restart.">
+                        <input class="settings-input settings-input-sm" type="number" min="0" step="1024"
+                               placeholder=${llmGem.thinking_budget != null ? String(llmGem.thinking_budget) : 'unset'}
+                               value=${llmGeminiThinking.value}
+                               onInput=${e => { llmGeminiThinking.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Cache enabled"
+                        desc="Gemini context caching via cachedContents. Server-level only.">
+                        <label class="settings-toggle">
+                            <input type="checkbox"
+                                   checked=${llmGeminiCache.value}
+                                   onChange=${e => {
+                                       llmGeminiCache.value = e.target.checked;
+                                       llmGeminiCacheTouched.value = true;
+                                   }} />
+                            <span>${llmGeminiCache.value ? 'enabled' : 'disabled'}</span>
+                        </label>
+                    <//>
+                    <${EditRow} label="Cache TTL (seconds)"
+                        desc="Lifetime of a Gemini cache entry. Must be > 0.">
+                        <input class="settings-input settings-input-sm" type="number" min="1" step="60"
+                               placeholder=${llmGem.cache_ttl_seconds != null ? String(llmGem.cache_ttl_seconds) : '300'}
+                               value=${llmGeminiCacheTtl.value}
+                               onInput=${e => { llmGeminiCacheTtl.value = e.target.value; }} />
+                    <//>
                 <//>
 
                 <!-- Logging (server-level, read-only) -->
