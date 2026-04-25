@@ -173,7 +173,14 @@ function ApiKeysSection() {
 
 /**
  * Count how many per-run overrides are currently active.
- * Exported so the header can show an indicator badge.
+ * Exported so the header (and composer Advanced expander) can show an
+ * indicator badge.
+ *
+ * Includes the legacy fields and the three reasoning knobs added in
+ * #804 Slice C — `thinking_budget_tokens`, `reasoning_effort`,
+ * `gemini_thinking_budget`. For the budget knobs, `Some(0)` (explicit
+ * disable) and any positive value both count as "active overrides";
+ * only `null`/`undefined` is "inherit".
  */
 export const activeOverrideCount = computed(() => {
     const s = localSettings.value;
@@ -182,6 +189,13 @@ export const activeOverrideCount = computed(() => {
     if (s.model) count++;
     if (s.max_tokens != null) count++;
     if (s.posture) count++;
+    // debug_mode is now tri-state on the composer (#818 nit follow-up):
+    // null = inherit, true = enable, false = explicit per-run disable.
+    // Both `true` and `false` count as active overrides.
+    if (s.debug_mode != null) count++;
+    if (s.thinking_budget_tokens != null) count++;
+    if (s.reasoning_effort) count++;
+    if (s.gemini_thinking_budget != null) count++;
     return count;
 });
 
@@ -190,7 +204,11 @@ export function SettingsModal({ open, onClose }) {
     const model = useSignal('');
     const maxTokens = useSignal('');
     const posture = useSignal('');
-    const debugMode = useSignal(false);
+    // debug_mode is tri-state to mirror the composer: '' = inherit
+    // (null), 'true' = enable, 'false' = explicit disable. The composer's
+    // tri-state introduced meaningful `false`, so the modal must round-trip
+    // it without collapsing back to `null` on Apply.
+    const debugMode = useSignal('');
     const saved = useSignal(false);
 
     // Server-level editable signals — Context
@@ -230,7 +248,8 @@ export function SettingsModal({ open, onClose }) {
                 ? String(localSettings.value.max_tokens)
                 : '';
             posture.value = localSettings.value.posture || '';
-            debugMode.value = !!localSettings.value.debug_mode;
+            const dm = localSettings.value.debug_mode;
+            debugMode.value = dm == null ? '' : (dm ? 'true' : 'false');
 
             // Populate server-level fields
             ctxStrategy.value = ctx.strategy || 'truncate';
@@ -265,12 +284,24 @@ export function SettingsModal({ open, onClose }) {
     const tools = defaults.tools || {};
 
     const onReset = () => {
-        saveSettings({ provider: null, model: null, max_tokens: null, posture: null, debug_mode: null });
+        // Clear all per-run overrides — including the three reasoning
+        // knobs added by #804 Slice C — so the modal's Reset button
+        // mirrors the composer Advanced expander's "Reset all".
+        saveSettings({
+            provider: null,
+            model: null,
+            max_tokens: null,
+            posture: null,
+            debug_mode: null,
+            thinking_budget_tokens: null,
+            reasoning_effort: null,
+            gemini_thinking_budget: null,
+        });
         provider.value = '';
         model.value = '';
         maxTokens.value = '';
         posture.value = '';
-        debugMode.value = false;
+        debugMode.value = '';
         saved.value = true;
         setTimeout(() => onClose(), 600);
     };
@@ -288,7 +319,11 @@ export function SettingsModal({ open, onClose }) {
         const mt = parseInt(maxTokens.value, 10);
         updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
         updates.posture = posture.value || null;
-        updates.debug_mode = debugMode.value || null;
+        // Tri-state debug_mode: '' = inherit (null), 'true' / 'false'
+        // round-trip as explicit booleans so the modal doesn't clobber an
+        // explicit `false` set from the composer.
+        if (debugMode.value === '') updates.debug_mode = null;
+        else updates.debug_mode = debugMode.value === 'true';
         saveSettings(updates);
 
         // 2. Build server settings patch — only include fields that changed from server defaults
@@ -469,14 +504,16 @@ export function SettingsModal({ open, onClose }) {
                 <div class="settings-grid">
                     <div class="settings-row">
                         <label class="settings-label">Debug mode</label>
-                        <label class="settings-toggle">
-                            <input type="checkbox"
-                                   checked=${debugMode.value}
-                                   onChange=${e => { debugMode.value = e.target.checked; }} />
-                            <span>${debugMode.value ? 'enabled' : 'disabled'}</span>
-                        </label>
+                        <select class="settings-select"
+                                value=${debugMode.value}
+                                onChange=${e => { debugMode.value = e.target.value; }}>
+                            <option value="">Inherit (default)</option>
+                            <option value="true">On</option>
+                            <option value="false">Off</option>
+                        </select>
                         <span class="settings-hint">
-                            When enabled, shows the full context window sent to the LLM before each response.
+                            When On, shows the full context window sent to the LLM before each response.
+                            Off explicitly disables it for the next run even if the agent has it enabled.
                         </span>
                     </div>
                 </div>

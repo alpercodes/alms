@@ -9,6 +9,7 @@ import { localSettings } from '../../state/settings.js';
 import { createRun, cancelRun as apiCancelRun } from '../../api/runs.js';
 import { savePendingMessage, setPendingRunId, clearPendingMessage } from '../../state/pending-messages.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
+import { ComposerAdvanced } from './composer-advanced.js';
 
 /**
  * Start a new run with the given text.
@@ -46,7 +47,24 @@ export async function startRun(text, opts) {
         if (settings.model) runBody.model = settings.model;
         if (settings.max_tokens != null) runBody.max_tokens = settings.max_tokens;
         if (settings.posture) runBody.posture = settings.posture;
-        if (settings.debug_mode) runBody.debug_mode = true;
+        // debug_mode is tri-state on the composer (Inherit / On / Off):
+        // null -> omit (inherit), true -> enable, false -> explicitly
+        // disable (overrides an agent-level `true` for this one run).
+        if (settings.debug_mode != null) runBody.debug_mode = !!settings.debug_mode;
+        // Reasoning / thinking overrides (#804 Slice C). Send `0` on the
+        // wire as an explicit-disable signal — only `null`/`undefined`
+        // means "inherit per-agent / server default". This preserves the
+        // `None` vs `Some(0)` distinction the backend three-layer
+        // precedence relies on.
+        if (settings.thinking_budget_tokens != null) {
+            runBody.thinking_budget_tokens = settings.thinking_budget_tokens;
+        }
+        if (settings.reasoning_effort) {
+            runBody.reasoning_effort = settings.reasoning_effort;
+        }
+        if (settings.gemini_thinking_budget != null) {
+            runBody.gemini_thinking_budget = settings.gemini_thinking_budget;
+        }
 
         const runResp = await createRun(runBody);
         // Attach the run ID to the pending message so reconciliation can
@@ -115,6 +133,7 @@ export function InputArea() {
 
     return html`
         <div id="input-area">
+            <${ComposerAdvanced} />
             <div class="input-container">
                 <textarea id="prompt" ref=${promptRef} rows="1"
                           placeholder="Send a message..."
