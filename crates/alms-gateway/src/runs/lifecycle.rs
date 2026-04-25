@@ -596,15 +596,18 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // does not handle, so those stay inline.
     let merged = apply_overrides(resolved.agent_config, None, &overrides);
     let mut agent_config = merged.agent_config;
-    let mut llm = resolved.llm;
     if let Some(ref provider) = overrides.provider {
         info!("Run {} using provider override: {}", run_id.0, provider);
-        llm = llm.with_provider_and_secrets(provider, &state.secrets.read());
     }
-    if let Some(model) = merged.model_override {
+    if let Some(ref model) = overrides.model {
         info!("Run {} using model override: {}", run_id.0, model);
-        llm = llm.with_model(model);
     }
+    // Apply per-run LLM overrides (provider + model) via the shared helper
+    // in `runs/mod.rs::apply_per_run_llm_overrides`. The helper preserves
+    // the three-layer precedence (per-run > per-agent > server default) for
+    // model even when a per-run provider override would otherwise clobber
+    // the resolved per-agent model via `apply_provider` (#833).
+    let llm = super::apply_per_run_llm_overrides(resolved.llm, &overrides, &state.secrets.read());
 
     // System-triggered runs (peer DMs, notifications, subagent completions)
     // have no human in the loop, so Guarded posture would hang forever
