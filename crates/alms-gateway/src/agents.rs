@@ -215,15 +215,26 @@ pub async fn get_agent(
     Ok(Json(agent_to_json(&agent)))
 }
 
-/// PUT /agents/{id_or_name} — update agent config.
-pub async fn update_agent(
-    State(state): State<AppState>,
-    Path(id_or_name): Path<String>,
-    Json(req): Json<UpdateAgentRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let store = get_store(&state)?;
-    let mut agent = resolve_agent(store, &id_or_name)?;
-
+/// Apply an `UpdateAgentRequest` to an existing `AgentRecord` in-place.
+///
+/// Returns `Ok(())` on success or a structured `UpdateAgentError` on
+/// validation failure. Pure function — no I/O, no AppState. Split out
+/// from the axum handler so the reasoning-knob clear-sentinel logic
+/// (#809) is unit-testable without spinning up a fake HTTP stack.
+///
+/// Semantics:
+/// - Empty-string sentinel for `model` / `posture` / `provider` /
+///   `telegram_token` clears the override back to `None`.
+/// - `clear_thinking_budget_tokens` / `clear_reasoning_effort` /
+///   `clear_gemini_thinking_budget` booleans clear the corresponding
+///   reasoning knob back to `None` (inherit server default). Sending
+///   both a value and a clear flag for the same knob returns
+///   `ClearAndValueConflict` — the handler surfaces that as
+///   `400 BAD_REQUEST`.
+pub(crate) fn apply_update_request(
+    agent: &mut AgentRecord,
+    req: UpdateAgentRequest,
+) -> Result<(), UpdateAgentError> {
     // Apply non-None fields. Empty string = clear override.
     if let Some(desc) = req.description {
         agent.description = desc;
@@ -232,8 +243,7 @@ pub async fn update_agent(
         agent.model = if model.is_empty() { None } else { Some(model) };
     }
     if let Some(posture) = req.posture {
-        validate_posture(&posture)
-            .map_err(|msg| api_error(StatusCode::BAD_REQUEST, "INVALID_POSTURE", msg))?;
+        validate_posture(&posture).map_err(UpdateAgentError::InvalidPosture)?;
         agent.posture = if posture.is_empty() {
             None
         } else {
@@ -257,34 +267,89 @@ pub async fn update_agent(
         };
     }
 
-    // `thinking_budget_tokens` uses `Some(n)` (including `Some(0)`) as an
-    // explicit per-agent override. The only way to clear the override back
-    // to "inherit server default" is via DELETE + recreate today; matching
-    // the shape of `model`/`posture` would require a sentinel on the
-    // request wire, which is out of scope here. We document this limitation
-    // in the field comment on `UpdateAgentRequest`.
-    if let Some(budget) = req.thinking_budget_tokens {
+    // Three reasoning knobs use `clear_*` boolean sentinels (#809) because
+    // `Some(0)` on the value field is a legitimate override meaning
+    // "disable extended thinking for this agent even when the server
+    // default enables it". Sending both a value AND a clear flag for the
+    // same knob is ambiguous (the caller is asking us to do two
+    // contradictory things), so we reject with 400 rather than silently
+    // picking one.
+
+    // `thinking_budget_tokens`
+    if req.thinking_budget_tokens.is_some() && req.clear_thinking_budget_tokens == Some(true) {
+        return Err(UpdateAgentError::ClearAndValueConflict(
+            "thinking_budget_tokens",
+        ));
+    }
+    if req.clear_thinking_budget_tokens == Some(true) {
+        agent.thinking_budget_tokens = None;
+    } else if let Some(budget) = req.thinking_budget_tokens {
         agent.thinking_budget_tokens = Some(budget);
     }
 
-    // `reasoning_effort` follows the same shape as `thinking_budget_tokens`:
-    // `Some(effort)` is an explicit per-agent override; omitting the field
-    // leaves the existing value unchanged. No sentinel to clear back to
-    // "inherit server default" (#768).
-    if let Some(effort) = req.reasoning_effort {
+    // `reasoning_effort` (#768)
+    if req.reasoning_effort.is_some() && req.clear_reasoning_effort == Some(true) {
+        return Err(UpdateAgentError::ClearAndValueConflict("reasoning_effort"));
+    }
+    if req.clear_reasoning_effort == Some(true) {
+        agent.reasoning_effort = None;
+    } else if let Some(effort) = req.reasoning_effort {
         agent.reasoning_effort = Some(effort);
     }
 
-    // `gemini_thinking_budget` follows the same PATCH shape as
-    // `thinking_budget_tokens` above (#794): `Some(n)` (including `Some(0)`)
-    // is an explicit override; omitting the field leaves the existing
-    // value unchanged. No sentinel to clear back to "inherit server
-    // default".
-    if let Some(budget) = req.gemini_thinking_budget {
+    // `gemini_thinking_budget` (#794)
+    if req.gemini_thinking_budget.is_some() && req.clear_gemini_thinking_budget == Some(true) {
+        return Err(UpdateAgentError::ClearAndValueConflict(
+            "gemini_thinking_budget",
+        ));
+    }
+    if req.clear_gemini_thinking_budget == Some(true) {
+        agent.gemini_thinking_budget = None;
+    } else if let Some(budget) = req.gemini_thinking_budget {
         agent.gemini_thinking_budget = Some(budget);
     }
 
     agent.last_active = Utc::now();
+    Ok(())
+}
+
+/// Validation errors surfaced by [`apply_update_request`].
+#[derive(Debug)]
+pub(crate) enum UpdateAgentError {
+    /// Posture string failed `Posture::from_str`.
+    InvalidPosture(String),
+    /// Request contained both a value and a `clear_*: true` for the same
+    /// reasoning knob (#809).
+    ClearAndValueConflict(&'static str),
+}
+
+impl UpdateAgentError {
+    fn to_api_error(&self) -> (StatusCode, Json<serde_json::Value>) {
+        match self {
+            UpdateAgentError::InvalidPosture(msg) => {
+                api_error(StatusCode::BAD_REQUEST, "INVALID_POSTURE", msg)
+            }
+            UpdateAgentError::ClearAndValueConflict(field) => api_error(
+                StatusCode::BAD_REQUEST,
+                "CLEAR_AND_VALUE_CONFLICT",
+                format!(
+                    "Cannot send both `{field}` value and `clear_{field}: true` in the same request"
+                ),
+            ),
+        }
+    }
+}
+
+/// PUT /agents/{id_or_name} — update agent config.
+pub async fn update_agent(
+    State(state): State<AppState>,
+    Path(id_or_name): Path<String>,
+    Json(req): Json<UpdateAgentRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let store = get_store(&state)?;
+    let mut agent = resolve_agent(store, &id_or_name)?;
+
+    apply_update_request(&mut agent, req).map_err(|e| e.to_api_error())?;
 
     store
         .update_agent(&agent)
@@ -445,5 +510,288 @@ mod tests {
         let json = agent_to_json(&agent);
         assert_eq!(json["has_telegram"], serde_json::json!(false));
         assert!(json.get("telegram_token").is_none());
+    }
+
+    // ==================================================================
+    // UpdateAgentRequest clear-sentinel (#809)
+    //
+    // Covers Option A of the chosen approach: three boolean `clear_*`
+    // flags that reset the corresponding reasoning knob back to `None`.
+    // When a value and a clear flag are sent together we reject with
+    // 400 BAD_REQUEST / `CLEAR_AND_VALUE_CONFLICT`.
+    // ==================================================================
+
+    #[test]
+    fn update_request_defaults_all_clear_flags_to_none() {
+        let req: UpdateAgentRequest = serde_json::from_str("{}").unwrap();
+        assert!(req.clear_thinking_budget_tokens.is_none());
+        assert!(req.clear_reasoning_effort.is_none());
+        assert!(req.clear_gemini_thinking_budget.is_none());
+    }
+
+    #[test]
+    fn update_request_parses_clear_thinking_budget_tokens() {
+        let req: UpdateAgentRequest =
+            serde_json::from_str(r#"{"clear_thinking_budget_tokens": true}"#).unwrap();
+        assert_eq!(req.clear_thinking_budget_tokens, Some(true));
+        assert!(req.thinking_budget_tokens.is_none());
+    }
+
+    #[test]
+    fn apply_update_clears_thinking_budget_tokens() {
+        let mut agent = new_agent("test");
+        agent.thinking_budget_tokens = Some(8192);
+
+        let req = UpdateAgentRequest {
+            clear_thinking_budget_tokens: Some(true),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert!(
+            agent.thinking_budget_tokens.is_none(),
+            "clear flag must reset thinking_budget_tokens to None"
+        );
+    }
+
+    #[test]
+    fn apply_update_clears_reasoning_effort() {
+        let mut agent = new_agent("test");
+        agent.reasoning_effort = Some(alms_core::config::ReasoningEffort::High);
+
+        let req = UpdateAgentRequest {
+            clear_reasoning_effort: Some(true),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert!(agent.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn apply_update_clears_gemini_thinking_budget() {
+        let mut agent = new_agent("test");
+        agent.gemini_thinking_budget = Some(4096);
+
+        let req = UpdateAgentRequest {
+            clear_gemini_thinking_budget: Some(true),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert!(agent.gemini_thinking_budget.is_none());
+    }
+
+    #[test]
+    fn apply_update_clear_flag_false_is_no_op() {
+        // `clear_*: false` is documented as equivalent to omitting the
+        // field entirely — only `Some(true)` triggers the clear.
+        let mut agent = new_agent("test");
+        agent.thinking_budget_tokens = Some(8192);
+        let req = UpdateAgentRequest {
+            clear_thinking_budget_tokens: Some(false),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert_eq!(
+            agent.thinking_budget_tokens,
+            Some(8192),
+            "clear_*: false must NOT clear the existing value"
+        );
+    }
+
+    #[test]
+    fn apply_update_rejects_clear_and_value_together_thinking_budget() {
+        let mut agent = new_agent("test");
+        let req = UpdateAgentRequest {
+            thinking_budget_tokens: Some(4096),
+            clear_thinking_budget_tokens: Some(true),
+            ..Default::default()
+        };
+        let err = apply_update_request(&mut agent, req).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                UpdateAgentError::ClearAndValueConflict("thinking_budget_tokens")
+            ),
+            "sending both a value and clear flag must return ClearAndValueConflict"
+        );
+        let (status, _) = err.to_api_error();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn apply_update_rejects_clear_and_value_together_reasoning_effort() {
+        let mut agent = new_agent("test");
+        let req = UpdateAgentRequest {
+            reasoning_effort: Some(alms_core::config::ReasoningEffort::Medium),
+            clear_reasoning_effort: Some(true),
+            ..Default::default()
+        };
+        let err = apply_update_request(&mut agent, req).unwrap_err();
+        assert!(matches!(
+            err,
+            UpdateAgentError::ClearAndValueConflict("reasoning_effort")
+        ));
+    }
+
+    #[test]
+    fn apply_update_rejects_clear_and_value_together_gemini_thinking_budget() {
+        let mut agent = new_agent("test");
+        let req = UpdateAgentRequest {
+            gemini_thinking_budget: Some(2048),
+            clear_gemini_thinking_budget: Some(true),
+            ..Default::default()
+        };
+        let err = apply_update_request(&mut agent, req).unwrap_err();
+        assert!(matches!(
+            err,
+            UpdateAgentError::ClearAndValueConflict("gemini_thinking_budget")
+        ));
+    }
+
+    #[test]
+    fn apply_update_preserves_non_cleared_fields() {
+        // Clearing one knob must not disturb the other two.
+        let mut agent = new_agent("test");
+        agent.thinking_budget_tokens = Some(8192);
+        agent.reasoning_effort = Some(alms_core::config::ReasoningEffort::Medium);
+        agent.gemini_thinking_budget = Some(4096);
+
+        let req = UpdateAgentRequest {
+            clear_thinking_budget_tokens: Some(true),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert!(agent.thinking_budget_tokens.is_none());
+        assert_eq!(
+            agent.reasoning_effort,
+            Some(alms_core::config::ReasoningEffort::Medium),
+            "clearing thinking_budget_tokens must not disturb reasoning_effort"
+        );
+        assert_eq!(
+            agent.gemini_thinking_budget,
+            Some(4096),
+            "clearing thinking_budget_tokens must not disturb gemini_thinking_budget"
+        );
+    }
+
+    /// End-to-end round trip through SQLite: insert an agent with all
+    /// three reasoning knobs set, PATCH with all three `clear_*: true`,
+    /// reload from the store, verify all three are `None`. This is what
+    /// the `apply_overrides` precedence test relies on: once the SQLite
+    /// record's knob is `None`, the agent-layer precedence falls through
+    /// to the server default.
+    #[test]
+    fn clear_sentinels_round_trip_through_sqlite() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("round-trip");
+        agent.thinking_budget_tokens = Some(16384);
+        agent.reasoning_effort = Some(alms_core::config::ReasoningEffort::High);
+        agent.gemini_thinking_budget = Some(8192);
+        store.create_agent(&agent).unwrap();
+
+        // Load, mutate via apply_update_request, persist.
+        let mut loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        let req = UpdateAgentRequest {
+            clear_thinking_budget_tokens: Some(true),
+            clear_reasoning_effort: Some(true),
+            clear_gemini_thinking_budget: Some(true),
+            ..Default::default()
+        };
+        apply_update_request(&mut loaded, req).unwrap();
+        store.update_agent(&loaded).unwrap();
+
+        // Reload and verify all three are None — this is what
+        // `apply_overrides` will see on a subsequent POST /runs, and
+        // that's what makes the precedence fall through to the server
+        // default.
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(reloaded.thinking_budget_tokens.is_none());
+        assert!(reloaded.reasoning_effort.is_none());
+        assert!(reloaded.gemini_thinking_budget.is_none());
+    }
+
+    // ==================================================================
+    // `agent_to_json` wire-shape coverage for the new reasoning fields
+    // (#809 follow-up — Tim review item 6).
+    //
+    // The UI work for #804 Slice B leans on the exact wire shape
+    // produced by `agent_to_json`, including the "Some(N) emits the key,
+    // None omits the key" contract. These tests pin all three new
+    // reasoning knobs to that contract for `Some(N)`, `Some(0)`, and
+    // `None` so a future refactor of `agent_to_json` cannot silently
+    // drop a field.
+    // ==================================================================
+
+    #[test]
+    fn agent_to_json_emits_reasoning_fields_when_some_nonzero() {
+        let mut agent = new_agent("with-overrides");
+        agent.thinking_budget_tokens = Some(8192);
+        agent.reasoning_effort = Some(alms_core::config::ReasoningEffort::High);
+        agent.gemini_thinking_budget = Some(4096);
+
+        let json = agent_to_json(&agent);
+        assert_eq!(json["thinking_budget_tokens"], serde_json::json!(8192));
+        assert_eq!(json["reasoning_effort"], serde_json::json!("high"));
+        assert_eq!(json["gemini_thinking_budget"], serde_json::json!(4096));
+    }
+
+    #[test]
+    fn agent_to_json_emits_reasoning_fields_when_some_zero() {
+        // `Some(0)` is a legitimate per-agent override meaning "disable
+        // extended thinking even when the server default enables it".
+        // It must NOT be dropped from the wire shape — that distinction
+        // is exactly what the clear-sentinel design (#809) preserves.
+        let mut agent = new_agent("with-zero");
+        agent.thinking_budget_tokens = Some(0);
+        agent.gemini_thinking_budget = Some(0);
+
+        let json = agent_to_json(&agent);
+        assert_eq!(json["thinking_budget_tokens"], serde_json::json!(0));
+        assert_eq!(json["gemini_thinking_budget"], serde_json::json!(0));
+        // reasoning_effort has no zero — only string variants — but
+        // None still omits the key (covered in the next test).
+    }
+
+    #[test]
+    fn agent_to_json_omits_reasoning_fields_when_none() {
+        // Default `new_agent("...")` leaves all three fields `None` —
+        // mirrors a freshly-created agent with no per-agent overrides.
+        let agent = new_agent("no-overrides");
+        let json = agent_to_json(&agent);
+        let obj = json.as_object().unwrap();
+
+        assert!(
+            !obj.contains_key("thinking_budget_tokens"),
+            "thinking_budget_tokens must be omitted when None: {json}"
+        );
+        assert!(
+            !obj.contains_key("reasoning_effort"),
+            "reasoning_effort must be omitted when None: {json}"
+        );
+        assert!(
+            !obj.contains_key("gemini_thinking_budget"),
+            "gemini_thinking_budget must be omitted when None: {json}"
+        );
+    }
+
+    #[test]
+    fn agent_to_json_emits_each_reasoning_effort_variant() {
+        // Pin the wire-string mapping for every `ReasoningEffort` variant
+        // so a future rename of `as_wire_str` is caught here, not in the
+        // UI. This is the surface the dropdown in #804 will populate from.
+        for (variant, expected_str) in [
+            (alms_core::config::ReasoningEffort::Minimal, "minimal"),
+            (alms_core::config::ReasoningEffort::Low, "low"),
+            (alms_core::config::ReasoningEffort::Medium, "medium"),
+            (alms_core::config::ReasoningEffort::High, "high"),
+        ] {
+            let mut agent = new_agent("variant-test");
+            agent.reasoning_effort = Some(variant);
+            let json = agent_to_json(&agent);
+            assert_eq!(
+                json["reasoning_effort"],
+                serde_json::json!(expected_str),
+                "variant {variant:?} must serialize as {expected_str:?}"
+            );
+        }
     }
 }

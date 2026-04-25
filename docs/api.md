@@ -890,9 +890,40 @@ Valid `posture` values: `"guarded"` (default — requires approval for risky too
 
 > **Note:** When a run is system-triggered (peer-to-peer DMs via `send_message`, notification runs, subagent completions, and scheduled jobs), Guarded posture is automatically overridden to Autonomous for that run via the `is_system_triggered` flag, since there is no human in the loop to approve tool calls. Without this override the run would hang indefinitely waiting for approval that can never arrive. User-initiated runs (via the HTTP API) are never affected — Guarded posture is preserved as configured.
 
-To clear an override, pass an empty string: `"model": ""`.
+To clear a string override (`model`, `posture`, `provider`, `telegram_token`), pass an empty string: `"model": ""`.
+
+**Clearing reasoning overrides (#809):** The three reasoning knobs
+— `thinking_budget_tokens`, `reasoning_effort`, `gemini_thinking_budget` —
+cannot use the empty-string trick because `Some(0)` is a legitimate
+per-agent override meaning "disable extended thinking for this agent even
+when the server default enables it". Each has a dedicated boolean clear
+sentinel:
+
+| Reasoning knob              | Clear flag                          |
+|-----------------------------|-------------------------------------|
+| `thinking_budget_tokens`    | `clear_thinking_budget_tokens`      |
+| `reasoning_effort`          | `clear_reasoning_effort`            |
+| `gemini_thinking_budget`    | `clear_gemini_thinking_budget`      |
+
+Setting the flag to `true` resets the stored value back to `None`
+(inherit server default). Example:
+```json
+{ "clear_thinking_budget_tokens": true }
+```
+
+Sending both the value AND the clear flag for the same knob in one
+request is a `400 BAD_REQUEST` / `CLEAR_AND_VALUE_CONFLICT` — the caller
+is asking for two contradictory things, so we reject rather than silently
+pick one. `clear_*: false` is equivalent to omitting the field entirely
+(the stored value is unchanged).
+
+After a successful clear, a subsequent `POST /runs` with no per-run
+override for that knob resolves to the server default from
+`[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]`, completing the
+three-layer precedence chain (per-run > per-agent > server default).
 
 **Response 200** — updated `AgentRecord`
+**Response 400 CLEAR_AND_VALUE_CONFLICT** — both a value and the matching `clear_*` flag were sent for the same reasoning knob.
 
 ### 9.5 Delete agent
 `DELETE /agents/{id_or_name}`
@@ -960,18 +991,55 @@ Returns current server defaults for UI pre-population.
     "timeout_secs": 30,
     "max_output_bytes": null,
     "enabled": ["echo", "fs_edit", "fs_glob", "fs_grep", "fs_list", "fs_read", "fs_write", "http_get", "math", "shell_exec", "invoke_agent", "read_subagent_session", "workspace_write", "list_my_sessions", "read_session", "send_message", "list_agents", "read_messages", "ignore_message"]
+  },
+  "llm": {
+    "anthropic": {
+      "thinking_budget_tokens": 0,
+      "prompt_cache_enabled": true
+    },
+    "openai": {
+      "reasoning_effort": null
+    },
+    "gemini": {
+      "thinking_budget": null,
+      "cache_enabled": true,
+      "cache_ttl_seconds": 300
+    }
   }
 }
 ```
 
-Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved for backward compatibility alongside the new nested objects (`context`, `session`, `logging`, `tools`). The nested objects contain the same data in a structured form. New consumers should prefer the nested objects.
+Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved for backward compatibility alongside the new nested objects (`context`, `session`, `logging`, `tools`, `llm`). The nested objects contain the same data in a structured form. New consumers should prefer the nested objects. The `llm` block (added in #809) mirrors the `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` sections of `alms.toml` — these are the *server-level* defaults that feed the three-layer precedence chain for per-agent and per-run overrides.
 
 ### 10.2 Update server settings
 `PATCH /settings`
 
-Partially update server-level configuration at runtime. Only `context`, `session`, and `tools` sections are mutable. Changes take effect on the next run; in-flight runs are unaffected. Logging requires a restart and is not accepted here.
+Partially update server-level configuration at runtime. The `context`, `session`, `tools`, and `llm` (#809) sections are mutable. Changes take effect on the next run; in-flight runs are unaffected. Logging requires a restart and is not accepted here.
+
+> **Live-mutation propagation — HTTP path only.** `PATCH /settings` mutations to all four mutable sections (`context`, `session`, `tools`, `llm`) propagate to the **next `POST /runs` immediately**, with no daemon restart required. Telegram-triggered runs read from a boot-time snapshot of the `AgentConfig` held inside the `Gateway` and continue to use that snapshot until the daemon is restarted. This is pre-existing behaviour for the `context` / `session` / `tools` sections; the new `llm` block in #809 inherits the same limitation. Tooling and frontends building on `PATCH /settings` should treat HTTP and Telegram as separate propagation domains.
+>
+> **Persistence — `settings.json` wins over `alms.toml` on restart.** Once any field has been PATCHed, the entire mutable surface is written to `{data_dir}/settings.json` and that file is the source of truth on the next boot. Subsequent edits to the corresponding sections of `alms.toml` are silently overwritten by the persisted snapshot. To revert a PATCHed value to a TOML- or env-var-driven configuration, edit `settings.json` directly (or remove it) before restart.
 
 Within `tools`, only `shell_policy`, `sandbox_root`, `timeout_secs`, and `max_output_bytes` are dynamically mutable. **`tools.shell_permissions` is configured in `alms.toml` only** — its allow/deny regex patterns are compiled once at startup and baked into each `ShellTool` instance (see `docs/agent-runtime-design.md` for the config schema and `docs/security-model.md` § 4.3 for the policy semantics). This applies to every field in the block: `allowed_commands`, `denied_commands`, and `classifier_overrides` are all config-file-only and are **not** PATCH-mutable. Sending `shell_permissions` in a `PATCH /settings` body is ignored; restart the gateway to pick up new patterns.
+
+Within `llm`, each provider-family sub-block mirrors the shape of `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` in `alms.toml`. Mutations feed the server-default layer of the three-layer precedence chain (per-run > per-agent > server default) and are picked up on the next `POST /runs` without a restart. All provider-family sub-blocks and fields are optional; fields that are `None` in the patch body are left unchanged. API keys and endpoints are **not** in scope — those live under a separate security surface.
+
+#### `llm` field semantics — clear sentinels and wire shape
+
+The reasoning / caching knobs on `/settings.llm.*` use **two different "no override" semantics** at the PATCH layer, depending on the underlying type. The asymmetry is deliberate but confusing without context, so the table below is the authoritative reference.
+
+| Field                                | Type            | "Leave alone"   | "Clear / disable" sentinel                    | Notes                                                                                                       |
+|--------------------------------------|-----------------|-----------------|-----------------------------------------------|-------------------------------------------------------------------------------------------------------------|
+| `llm.anthropic.thinking_budget_tokens` | `u32`         | omit the field  | `0` (= "extended thinking off")               | No "unset" state — `0` is a real value the runtime forwards as "thinking disabled".                          |
+| `llm.anthropic.prompt_cache_enabled`   | `bool`        | omit the field  | `false`                                       | No tri-state.                                                                                               |
+| `llm.openai.reasoning_effort`          | `Option<enum>`| omit the field  | `""` (empty string clears to `null`)          | Empty string is required because non-reasoning models (gpt-4o, claude-sonnet) reject `reasoning_effort` on the wire — clearing the server default back to "don't send" is operationally meaningful. Valid non-empty values: `"minimal"`, `"low"`, `"medium"`, `"high"`. |
+| `llm.gemini.thinking_budget`           | `Option<u32>` | omit the field  | `0` (= "thinking disabled")                   | **No clear sentinel on this wire surface.** `Some(0)` is "disable", `None` (omitted) is "leave alone". To revert a PATCHed value back to the TOML / env-var default, edit `settings.json` directly and restart — the server-default layer is the bottom of the stack, so this is a operator-only escape hatch. |
+| `llm.gemini.cache_enabled`             | `bool`        | omit the field  | `false`                                       | No tri-state.                                                                                               |
+| `llm.gemini.cache_ttl_seconds`         | `u64`         | omit the field  | n/a — `0` rejected with 422                   | Must be > 0 if provided.                                                                                    |
+
+**Why the asymmetry between `openai.reasoning_effort` and `gemini.thinking_budget`?** The OpenAI knob has an explicit "don't send the field at all" wire shape that is materially different from any specific value (non-reasoning models 400 if you send any `reasoning_effort`). The Gemini knob has no such state — `Some(0)` and "field absent" both produce a `thinkingBudget: 0` server-side disable in practice, so a clear sentinel would buy you nothing at the runtime layer. Tooling that needs to detect a PATCHed value can do so by reading `GET /settings`: `null` for OpenAI means "cleared", and any specific number for Gemini (including `0`) means "operator has a server-level value set".
+
+**Wire-shape note for UI consumers — `null` vs. omitted across endpoints.** `GET /settings` always emits every `llm.*` key, with `null` for `openai.reasoning_effort` when the server default is unset. `GET /agents/{id}` **omits** the per-agent reasoning fields entirely when they are unset (`thinking_budget_tokens`, `reasoning_effort`, `gemini_thinking_budget`). Frontends rendering both surfaces should treat "field absent" and "field is `null`" as equivalent ("no value set"). The asymmetry is preserved for backward compatibility — `GET /agents` predates #809 and other consumers depend on the omit-when-null shape; `GET /settings` was added in #809 with explicit `null` to make the empty-string-clear sentinel for OpenAI legible to UI form code.
 
 **Request body** (all fields optional):
 ```json
@@ -995,6 +1063,20 @@ Within `tools`, only `shell_policy`, `sandbox_root`, `timeout_secs`, and `max_ou
     "sandbox_root": ".",
     "timeout_secs": 30,
     "max_output_bytes": 65536
+  },
+  "llm": {
+    "anthropic": {
+      "thinking_budget_tokens": 8192,
+      "prompt_cache_enabled": true
+    },
+    "openai": {
+      "reasoning_effort": "medium"
+    },
+    "gemini": {
+      "thinking_budget": 4096,
+      "cache_enabled": true,
+      "cache_ttl_seconds": 300
+    }
   }
 }
 ```

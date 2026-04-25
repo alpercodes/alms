@@ -100,8 +100,20 @@ pub struct CreateAgentRequest {
 /// Request body for updating an existing agent.
 ///
 /// All fields are optional — only non-`None` fields are applied.
-/// To clear an override, pass an empty string (handler treats `""` as `None`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// To clear an override on `model`/`posture`/`provider`/`telegram_token`,
+/// pass an empty string (handler treats `""` as `None`).
+///
+/// The three reasoning knobs (`thinking_budget_tokens`, `reasoning_effort`,
+/// `gemini_thinking_budget`) have a dedicated `clear_*` boolean sentinel
+/// (#809) because they cannot use the empty-string trick — `Some(0)` is a
+/// legitimate per-agent override meaning "disable extended thinking for
+/// this agent even when the server default enables it". Setting the
+/// corresponding `clear_*` flag to `true` resets the stored value back to
+/// `None` (inherit server default). It is an error (400 BAD_REQUEST) to
+/// send both a `clear_*` flag and a value for the same knob in one
+/// request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UpdateAgentRequest {
     pub description: Option<String>,
     pub model: Option<String>,
@@ -112,21 +124,41 @@ pub struct UpdateAgentRequest {
     /// Per-agent Anthropic extended-thinking budget override. A value of
     /// `0` explicitly disables extended thinking for this agent even when
     /// the server default enables it. Omitting the field leaves the
-    /// existing value unchanged.
+    /// existing value unchanged. Use `clear_thinking_budget_tokens: true`
+    /// to reset back to "inherit server default".
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budget_tokens: Option<u32>,
     /// Per-agent OpenAI-compat reasoning-effort override (#768). Omitting
-    /// the field leaves the existing value unchanged. There is no
-    /// sentinel value to clear the override back to "inherit server
-    /// default" today — mirrors the `thinking_budget_tokens` PATCH
-    /// semantics.
+    /// the field leaves the existing value unchanged. Use
+    /// `clear_reasoning_effort: true` to reset back to "inherit server
+    /// default".
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<crate::config::ReasoningEffort>,
     /// Per-agent Gemini extended-thinking budget override (#794). A value
     /// of `0` explicitly disables extended thinking for this agent even
     /// when the server default enables it. Omitting the field leaves the
-    /// existing value unchanged. No sentinel to clear the override back
-    /// to "inherit server default" — mirrors `thinking_budget_tokens`
-    /// PATCH semantics.
+    /// existing value unchanged. Use `clear_gemini_thinking_budget: true`
+    /// to reset back to "inherit server default".
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gemini_thinking_budget: Option<u32>,
+    /// When `true`, clear `thinking_budget_tokens` back to `None` (inherit
+    /// server default). Mutually exclusive with a non-`None` value for
+    /// `thinking_budget_tokens` in the same request — sending both is a
+    /// `400 BAD_REQUEST`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_thinking_budget_tokens: Option<bool>,
+    /// When `true`, clear `reasoning_effort` back to `None` (inherit
+    /// server default). Mutually exclusive with a non-`None` value for
+    /// `reasoning_effort` in the same request — sending both is a `400
+    /// BAD_REQUEST`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_reasoning_effort: Option<bool>,
+    /// When `true`, clear `gemini_thinking_budget` back to `None` (inherit
+    /// server default). Mutually exclusive with a non-`None` value for
+    /// `gemini_thinking_budget` in the same request — sending both is a
+    /// `400 BAD_REQUEST`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_gemini_thinking_budget: Option<bool>,
 }
 
 /// Validate an agent name slug.

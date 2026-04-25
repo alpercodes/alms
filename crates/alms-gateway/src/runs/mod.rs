@@ -854,6 +854,72 @@ mod tests {
         assert!(merged.agent_config.gemini_thinking_budget.is_none());
     }
 
+    // ------------------------------------------------------------------
+    // Clear-sentinel precedence (#809)
+    //
+    // After `PATCH /agents/{id}` with `clear_*: true`, the stored
+    // `AgentRecord` has `None` for that knob. A subsequent `POST /runs`
+    // with no per-run override must therefore resolve to the server
+    // default — NOT the cleared per-agent value, and NOT `None` on the
+    // wire. These tests lock down that behaviour for all three knobs.
+    // The SQLite round-trip that produces the `None` record is covered
+    // in `agents.rs::tests::clear_sentinels_round_trip_through_sqlite`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_clear_sentinel_thinking_budget_falls_through_to_server_default() {
+        // Simulates the post-clear state: agent record has
+        // `thinking_budget_tokens = None`. A subsequent run with no
+        // per-run override must resolve to the server default (4096).
+        let agent = agent_with_thinking(None);
+        let merged = apply_overrides(
+            base_config_with_thinking(4096),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged.agent_config.anthropic_thinking_budget, 4096,
+            "after clear, per-agent None must fall through to server default"
+        );
+    }
+
+    #[test]
+    fn test_clear_sentinel_reasoning_effort_falls_through_to_server_default() {
+        use alms_core::config::ReasoningEffort;
+        // Simulates the post-clear state: agent record has
+        // `reasoning_effort = None`. Server default (Medium) must win
+        // on the next run.
+        let agent = agent_with_reasoning(None);
+        let merged = apply_overrides(
+            base_config_with_reasoning(Some(ReasoningEffort::Medium)),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged.agent_config.openai_reasoning_effort,
+            Some(ReasoningEffort::Medium),
+            "after clear, per-agent None must fall through to server default"
+        );
+    }
+
+    #[test]
+    fn test_clear_sentinel_gemini_thinking_budget_falls_through_to_server_default() {
+        // Simulates the post-clear state: agent record has
+        // `gemini_thinking_budget = None`. Server default (4096) must
+        // win on the next run.
+        let agent = agent_with_gemini_thinking(None);
+        let merged = apply_overrides(
+            base_config_with_gemini_thinking(Some(4096)),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged.agent_config.gemini_thinking_budget,
+            Some(4096),
+            "after clear, per-agent None must fall through to server default"
+        );
+    }
+
     #[test]
     fn test_validate_provider_accepts_valid_providers() {
         assert!(validate_provider("openai").is_ok());

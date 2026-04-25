@@ -39,7 +39,12 @@ pub struct AppState {
     pub agent_queue: Arc<SessionQueue<AgentId>>,
     /// Snapshot of LLM config — read once at startup so handlers avoid locking the gateway.
     pub llm_config: alms_runtime::LlmConfig,
-    /// Agent config — mutable via PATCH /settings (context section).
+    /// Agent config — mutable via PATCH /settings (context, llm provider
+    /// defaults, and the `sandbox_root` / `shell_policy` mirrors of the
+    /// tools section). Shared with the Coordinator (`Arc::clone`) so all
+    /// HTTP-triggered run paths observe the same live config; the
+    /// Telegram path inherits a boot-time snapshot — see
+    /// `gateway.rs::Gateway::run_telegram` and `docs/api.md` § 10.2.
     pub agent_config: Arc<parking_lot::RwLock<alms_runtime::AgentConfig>>,
     /// Default agent ID — shared with Gateway, updated live on set-default.
     pub default_agent_id: Arc<parking_lot::RwLock<AgentId>>,
@@ -114,6 +119,12 @@ impl AppState {
                     agent_config_val.shell_policy = policy.clone();
                 }
                 tools_overrides.apply_to(&mut tools_config);
+            }
+            // LLM provider-family overrides (#809). Applied directly to
+            // the live `AgentConfig` which is the source of truth for
+            // every `POST /runs`.
+            if let Some(llm_overrides) = persisted.llm {
+                llm_overrides.apply_to(&mut agent_config_val);
             }
         }
 

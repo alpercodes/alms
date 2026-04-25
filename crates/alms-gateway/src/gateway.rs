@@ -539,6 +539,17 @@ impl Gateway {
             tokio::select! {
                 Some((agent_id, agent_name, telegram, msg)) = merged_rx.recv() => {
                     // Route the message to the owning agent (not the default).
+                    //
+                    // NOTE: `self.config.agent_config` is a boot-time snapshot
+                    // — `Gateway` holds `GatewayConfig` by value and never sees
+                    // PATCH /settings mutations. HTTP-triggered runs (and the
+                    // Coordinator) share the live `Arc<RwLock<AgentConfig>>` on
+                    // `AppState`, so this is a known asymmetry: PATCH /settings
+                    // updates to context / session / tools / llm provider
+                    // defaults take effect for HTTP runs immediately and for
+                    // Telegram runs only after a daemon restart. This is
+                    // pre-existing behaviour for the context / session / tools
+                    // sections and is documented in `docs/api.md` § 10.2.
                     let secrets_guard = self.secrets.read();
                     let resolved = crate::runs::resolve_agent_config(
                         agent_id,

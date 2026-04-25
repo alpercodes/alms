@@ -146,6 +146,26 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
             "max_output_bytes": tools_cfg.max_output_bytes,
             "enabled": tools,
         },
+        // LLM provider-family settings (#809). Mirrors the shape of the
+        // `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` blocks in
+        // `alms.toml`. Server-level defaults only; per-agent overrides
+        // live on the agent registry, per-run overrides on `POST /runs`.
+        "llm": {
+            "anthropic": {
+                "thinking_budget_tokens": agent.anthropic_thinking_budget,
+                "prompt_cache_enabled": agent.anthropic_prompt_cache_enabled,
+            },
+            "openai": {
+                "reasoning_effort": agent.openai_reasoning_effort
+                    .as_ref()
+                    .map(|e| e.as_wire_str()),
+            },
+            "gemini": {
+                "thinking_budget": agent.gemini_thinking_budget,
+                "cache_enabled": agent.gemini_cache_enabled,
+                "cache_ttl_seconds": agent.gemini_cache_ttl_seconds,
+            },
+        },
     }))
 }
 
@@ -183,6 +203,60 @@ pub struct PatchTools {
     pub max_output_bytes: Option<usize>,
 }
 
+/// Partial Anthropic LLM config update (#809).
+///
+/// Mirrors `[llm.anthropic]` in `alms.toml`. Fields that are `None` are
+/// untouched; fields that are `Some` overwrite the live server default.
+/// The provider-neutral `AgentConfig` (which is what the agent loop reads
+/// per run) is what the PATCH handler mutates — no restart required.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PatchLlmAnthropic {
+    pub thinking_budget_tokens: Option<u32>,
+    pub prompt_cache_enabled: Option<bool>,
+}
+
+/// Partial OpenAI-compat LLM config update (#809).
+///
+/// Mirrors `[llm.openai]` in `alms.toml`. `reasoning_effort = None` in the
+/// patch body means "leave unchanged"; to clear the server default back
+/// to "don't send the field on the wire", use an empty-string value —
+/// i.e. `{ "reasoning_effort": "" }` — which the handler treats as an
+/// explicit clear sentinel. This matches the existing pattern used by
+/// `PatchContext::summary_model`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PatchLlmOpenai {
+    pub reasoning_effort: Option<String>,
+}
+
+/// Partial Gemini LLM config update (#809).
+///
+/// Mirrors `[llm.gemini]` in `alms.toml`. `thinking_budget = Some(0)` is
+/// a legitimate value meaning "disable extended thinking server-wide";
+/// it is not a clear sentinel. Three-layer precedence (per-run >
+/// per-agent > server default) still applies downstream.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PatchLlmGemini {
+    pub thinking_budget: Option<u32>,
+    pub cache_enabled: Option<bool>,
+    pub cache_ttl_seconds: Option<u64>,
+}
+
+/// Partial LLM config update (#809).
+///
+/// Nested under `llm` in the top-level PATCH /settings body. Each
+/// provider family has its own sub-object; absent sub-objects are
+/// untouched.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PatchLlm {
+    pub anthropic: Option<PatchLlmAnthropic>,
+    pub openai: Option<PatchLlmOpenai>,
+    pub gemini: Option<PatchLlmGemini>,
+}
+
 /// Top-level PATCH /settings request body.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
@@ -190,13 +264,23 @@ pub struct PatchSettingsRequest {
     pub context: Option<PatchContext>,
     pub session: Option<PatchSession>,
     pub tools: Option<PatchTools>,
+    pub llm: Option<PatchLlm>,
 }
 
 /// PATCH /settings — apply partial config updates to the running server.
 ///
-/// Only context, session, and tools sections are mutable at runtime.
-/// Logging requires a restart and is not accepted here.
+/// The context, session, tools, and llm (#809) sections are mutable at
+/// runtime. Logging requires a restart and is not accepted here.
 /// Changes take effect on the next run (in-flight runs are unaffected).
+///
+/// Live-mutation propagation is **HTTP-path only**: mutations write through
+/// to the shared `Arc<RwLock<AgentConfig>>` referenced by the HTTP `POST
+/// /runs` and Coordinator paths. Telegram-triggered runs read from a
+/// boot-time clone held inside `Gateway` and continue to use the snapshot
+/// until the daemon restarts. See `gateway.rs::Gateway::run_telegram` for
+/// the inheritance site. This is pre-existing behaviour for the
+/// `context` / `session` / `tools` sections and is documented in
+/// `docs/api.md` § 10.2.
 pub async fn patch_settings(
     State(state): State<AppState>,
     Json(body): Json<PatchSettingsRequest>,
@@ -332,10 +416,98 @@ pub async fn patch_settings(
         );
     }
 
-    // Persist current settings to disk so they survive restarts.
-    persist_settings(&state);
+    // ── LLM (provider-family defaults, #809) ──────────────────────────
+    //
+    // All six knobs live on the server-level `AgentConfig` which is the
+    // single source of truth for new runs (see `runs/mod.rs::apply_overrides`
+    // and `runs/lifecycle.rs::execute_run`). Mutating it under the same
+    // write lock as the other PATCH branches ensures the next `POST /runs`
+    // picks up the new value without a daemon restart.
+    if let Some(llm_patch) = &body.llm {
+        let mut agent = state.agent_config.write();
 
+        if let Some(ant) = &llm_patch.anthropic {
+            if let Some(v) = ant.thinking_budget_tokens {
+                agent.anthropic_thinking_budget = v;
+            }
+            if let Some(v) = ant.prompt_cache_enabled {
+                agent.anthropic_prompt_cache_enabled = v;
+            }
+        }
+
+        if let Some(oai) = &llm_patch.openai
+            && let Some(ref v) = oai.reasoning_effort
+        {
+            if v.is_empty() {
+                // Empty string = clear server default back to "don't
+                // send reasoning_effort on the wire".
+                agent.openai_reasoning_effort = None;
+            } else {
+                match v.parse::<alms_core::config::ReasoningEffort>() {
+                    Ok(effort) => {
+                        agent.openai_reasoning_effort = Some(effort);
+                    }
+                    Err(msg) => {
+                        errors.push(format!("llm.openai.reasoning_effort: {msg}"));
+                    }
+                }
+            }
+        }
+
+        if let Some(gem) = &llm_patch.gemini {
+            if let Some(v) = gem.thinking_budget {
+                // `Some(0)` is a legitimate server-level disable, not a
+                // clear sentinel — preserved verbatim.
+                agent.gemini_thinking_budget = Some(v);
+            }
+            if let Some(v) = gem.cache_enabled {
+                agent.gemini_cache_enabled = v;
+            }
+            if let Some(v) = gem.cache_ttl_seconds {
+                if v == 0 {
+                    errors.push("llm.gemini.cache_ttl_seconds must be > 0".into());
+                } else {
+                    agent.gemini_cache_ttl_seconds = v;
+                }
+            }
+        }
+
+        // Tag the log with the rejected-fields count so a partial-failure
+        // PATCH (e.g. one valid sub-field plus one rejected sub-field) is
+        // not misread as a clean success — the message still says "Updated"
+        // because some fields *did* land, but `errors_count > 0` is the
+        // signal that the response was 422 not 200.
+        info!(
+            anthropic_thinking_budget = agent.anthropic_thinking_budget,
+            anthropic_prompt_cache_enabled = agent.anthropic_prompt_cache_enabled,
+            openai_reasoning_effort = ?agent.openai_reasoning_effort,
+            gemini_thinking_budget = ?agent.gemini_thinking_budget,
+            gemini_cache_enabled = agent.gemini_cache_enabled,
+            gemini_cache_ttl_seconds = agent.gemini_cache_ttl_seconds,
+            errors_count = errors.len(),
+            "Updated LLM config via PATCH /settings"
+        );
+    }
+
+    // Persist current settings to disk so they survive restarts — but only
+    // when the request validates cleanly. A rejected PATCH (handler returns
+    // 422) must be side-effect-free at the persistence layer: otherwise an
+    // invalid request like `{ "llm": { "openai": { "reasoning_effort":
+    // "turbo" } } }` would still rewrite `settings.json` from the current
+    // live snapshot, and any field that *did* land before the validation
+    // error (or earlier PATCH-applied values still in memory) would be
+    // baked into the persisted snapshot — silently changing post-restart
+    // behaviour for a request the operator was told failed.
+    //
+    // Note: this only closes the persistence half. Live `AgentConfig`
+    // mutations are still applied inline above and a partial-failure 422
+    // can leave the in-memory config half-mutated until the next
+    // successful PATCH or a restart. That is the documented
+    // "status: partial" wire contract — fixing it would require buffering
+    // every mutation and applying atomically only after validation passes.
+    // See PR #810 for context.
     if errors.is_empty() {
+        persist_settings(&state);
         (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
     } else {
         (
@@ -474,6 +646,101 @@ impl PersistedToolsOverrides {
     }
 }
 
+/// Persisted Anthropic LLM overrides (#809).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedLlmAnthropicOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_enabled: Option<bool>,
+}
+
+/// Persisted OpenAI-compat LLM overrides (#809).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedLlmOpenaiOverrides {
+    /// Wire-string representation (`"low"` / `"medium"` / `"high"` /
+    /// `"minimal"`). We store the string rather than the enum so the
+    /// JSON on disk round-trips through JSON-anything without requiring
+    /// the reader to know about `ReasoningEffort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+/// Persisted Gemini LLM overrides (#809).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedLlmGeminiOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_seconds: Option<u64>,
+}
+
+/// Persisted LLM overrides umbrella (#809).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedLlmOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic: Option<PersistedLlmAnthropicOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai: Option<PersistedLlmOpenaiOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gemini: Option<PersistedLlmGeminiOverrides>,
+}
+
+impl PersistedLlmOverrides {
+    /// Merge these overrides into the live `AgentConfig` on startup so
+    /// the PATCH /settings mutations survive a gateway restart.
+    ///
+    /// Semantics mirror the other `PersistedXOverrides::apply_to` impls:
+    /// fields that are `Some` overwrite the target; fields that are
+    /// `None` leave the target untouched. The one subtlety is
+    /// `openai.reasoning_effort`: because the target field is itself an
+    /// `Option<ReasoningEffort>`, we need a way to represent "cleared"
+    /// on disk. We use the empty string (`""`) for that — same trick
+    /// the rest of the API uses to clear a nullable value, and matching
+    /// the PATCH-wire shape of `PatchLlmOpenai::reasoning_effort`.
+    pub fn apply_to(&self, cfg: &mut alms_runtime::AgentConfig) {
+        if let Some(ant) = &self.anthropic {
+            if let Some(v) = ant.thinking_budget_tokens {
+                cfg.anthropic_thinking_budget = v;
+            }
+            if let Some(v) = ant.prompt_cache_enabled {
+                cfg.anthropic_prompt_cache_enabled = v;
+            }
+        }
+        if let Some(oai) = &self.openai
+            && let Some(ref v) = oai.reasoning_effort
+        {
+            if v.is_empty() {
+                cfg.openai_reasoning_effort = None;
+            } else if let Ok(effort) = v.parse::<alms_core::config::ReasoningEffort>() {
+                cfg.openai_reasoning_effort = Some(effort);
+            } else {
+                tracing::warn!(
+                    value = %v,
+                    "Ignoring unknown persisted openai.reasoning_effort value"
+                );
+            }
+        }
+        if let Some(gem) = &self.gemini {
+            if let Some(v) = gem.thinking_budget {
+                cfg.gemini_thinking_budget = Some(v);
+            }
+            if let Some(v) = gem.cache_enabled {
+                cfg.gemini_cache_enabled = v;
+            }
+            if let Some(v) = gem.cache_ttl_seconds {
+                cfg.gemini_cache_ttl_seconds = v;
+            }
+        }
+    }
+}
+
 /// On-disk representation of the mutable server-level settings.
 ///
 /// Written to `{data_dir}/settings.json` after every PATCH /settings and
@@ -498,6 +765,8 @@ pub struct PersistedSettings {
     pub session: Option<PersistedSessionOverrides>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<PersistedToolsOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm: Option<PersistedLlmOverrides>,
 }
 
 /// Return the canonical path for the persisted settings file.
@@ -543,6 +812,38 @@ fn persist_settings(state: &AppState) {
             sandbox_root: Some(tools.sandbox_root.clone()),
             timeout_secs: Some(tools.timeout_secs),
             max_output_bytes: Some(tools.max_output_bytes),
+        }),
+        // LLM provider-family defaults (#809). We persist the full
+        // snapshot of each knob — they all live on `AgentConfig` as
+        // plain values with no "unset" sentinel at the struct level, so
+        // there's nothing to distinguish "user-set via PATCH" from
+        // "loaded from TOML / env on boot" anyway. On restart the
+        // persisted value wins over TOML / env (same precedence as the
+        // context / session / tools blocks above).
+        llm: Some(PersistedLlmOverrides {
+            anthropic: Some(PersistedLlmAnthropicOverrides {
+                thinking_budget_tokens: Some(agent.anthropic_thinking_budget),
+                prompt_cache_enabled: Some(agent.anthropic_prompt_cache_enabled),
+            }),
+            openai: Some(PersistedLlmOpenaiOverrides {
+                // Persist the wire string, or `""` to represent
+                // "explicitly cleared". `None` at this layer would mean
+                // "leave the TOML / env value alone on reload" which is
+                // NOT what we want after a PATCH clear — we want the
+                // clear to win on every subsequent boot.
+                reasoning_effort: Some(
+                    agent
+                        .openai_reasoning_effort
+                        .as_ref()
+                        .map(|e| e.as_wire_str().to_string())
+                        .unwrap_or_default(),
+                ),
+            }),
+            gemini: Some(PersistedLlmGeminiOverrides {
+                thinking_budget: agent.gemini_thinking_budget,
+                cache_enabled: Some(agent.gemini_cache_enabled),
+                cache_ttl_seconds: Some(agent.gemini_cache_ttl_seconds),
+            }),
         }),
     };
 
@@ -734,6 +1035,7 @@ mod tests {
             }),
             session: None,
             tools: None,
+            llm: None,
         };
         let json = serde_json::to_string_pretty(&persisted).unwrap();
         assert!(
@@ -772,6 +1074,7 @@ mod tests {
                 timeout_secs: Some(60),
                 max_output_bytes: Some(1_000_000),
             }),
+            llm: None,
         };
         let json = serde_json::to_string_pretty(&original).unwrap();
         let deserialized: PersistedSettings = serde_json::from_str(&json).unwrap();
@@ -797,6 +1100,7 @@ mod tests {
         assert!(persisted.context.is_none());
         assert!(persisted.session.is_none());
         assert!(persisted.tools.is_none());
+        assert!(persisted.llm.is_none());
     }
 
     /// Old format with full SessionConfig should still deserialize.
@@ -816,5 +1120,554 @@ mod tests {
         assert_eq!(sess.max_messages, Some(10_000));
         assert_eq!(sess.idle_timeout_secs, Some(86_400));
         assert_eq!(sess.auto_archive, Some(true));
+    }
+
+    // ==================================================================
+    // LLM provider-family surface (#809)
+    // ==================================================================
+
+    /// Old settings.json files predating #809 must still deserialize
+    /// cleanly — the new `llm` field must be optional.
+    #[test]
+    fn backward_compat_settings_json_without_llm() {
+        let old_json = r#"{
+            "context": { "strategy": "truncate", "max_input_tokens": 128000 },
+            "tools": { "shell_policy": "sandboxed" }
+        }"#;
+        let persisted: PersistedSettings = serde_json::from_str(old_json).unwrap();
+        assert!(persisted.llm.is_none(), "pre-#809 JSON should lack `llm`");
+        // And the other sections should still deserialize.
+        assert_eq!(persisted.context.unwrap().strategy, Some("truncate".into()));
+    }
+
+    /// A `PersistedSettings` with `llm: None` must NOT emit the key in
+    /// the serialized JSON — same `skip_serializing_if` pattern as the
+    /// other top-level sections.
+    #[test]
+    fn serialized_omits_llm_when_none() {
+        let persisted = PersistedSettings {
+            context: None,
+            session: None,
+            tools: None,
+            llm: None,
+        };
+        let json = serde_json::to_string_pretty(&persisted).unwrap();
+        assert!(
+            !json.contains("\"llm\""),
+            "JSON should not contain llm key when it is None: {json}"
+        );
+    }
+
+    /// `PersistedLlmOverrides::apply_to` must overwrite each field the
+    /// overrides populate and leave everything else untouched. Mirrors
+    /// the shape of the context/session/tools `apply_to` tests above.
+    #[test]
+    fn llm_overrides_apply_to_mutates_agent_config() {
+        let mut cfg = alms_runtime::AgentConfig::default();
+        // Baseline: caching on, no reasoning effort, no Gemini thinking.
+        assert!(cfg.anthropic_prompt_cache_enabled);
+        assert_eq!(cfg.anthropic_thinking_budget, 0);
+        assert!(cfg.openai_reasoning_effort.is_none());
+        assert!(cfg.gemini_thinking_budget.is_none());
+        assert!(cfg.gemini_cache_enabled);
+        assert_eq!(cfg.gemini_cache_ttl_seconds, 300);
+
+        let overrides = PersistedLlmOverrides {
+            anthropic: Some(PersistedLlmAnthropicOverrides {
+                thinking_budget_tokens: Some(8192),
+                prompt_cache_enabled: Some(false),
+            }),
+            openai: Some(PersistedLlmOpenaiOverrides {
+                reasoning_effort: Some("high".into()),
+            }),
+            gemini: Some(PersistedLlmGeminiOverrides {
+                thinking_budget: Some(4096),
+                cache_enabled: Some(false),
+                cache_ttl_seconds: Some(600),
+            }),
+        };
+        overrides.apply_to(&mut cfg);
+
+        assert_eq!(cfg.anthropic_thinking_budget, 8192);
+        assert!(!cfg.anthropic_prompt_cache_enabled);
+        assert_eq!(
+            cfg.openai_reasoning_effort,
+            Some(alms_core::config::ReasoningEffort::High)
+        );
+        assert_eq!(cfg.gemini_thinking_budget, Some(4096));
+        assert!(!cfg.gemini_cache_enabled);
+        assert_eq!(cfg.gemini_cache_ttl_seconds, 600);
+    }
+
+    /// Empty-string `reasoning_effort` on the persisted layer must clear
+    /// the live `AgentConfig.openai_reasoning_effort` back to `None`.
+    /// This is the only "clear sentinel" the /settings surface needs
+    /// for LLM knobs — the other two tri-state fields
+    /// (`gemini_thinking_budget`, `anthropic_thinking_budget` is plain
+    /// u32) don't need one because `Some(0)` is a legitimate disable
+    /// value for those.
+    #[test]
+    fn llm_overrides_empty_string_reasoning_effort_clears() {
+        let mut cfg = alms_runtime::AgentConfig {
+            openai_reasoning_effort: Some(alms_core::config::ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let overrides = PersistedLlmOverrides {
+            anthropic: None,
+            openai: Some(PersistedLlmOpenaiOverrides {
+                reasoning_effort: Some(String::new()),
+            }),
+            gemini: None,
+        };
+        overrides.apply_to(&mut cfg);
+        assert!(
+            cfg.openai_reasoning_effort.is_none(),
+            "empty-string reasoning_effort must clear to None"
+        );
+    }
+
+    /// Unknown `reasoning_effort` string (typo in persisted JSON) must
+    /// be ignored with a warning — never panic, never crash the apply.
+    #[test]
+    fn llm_overrides_unknown_reasoning_effort_ignored() {
+        let mut cfg = alms_runtime::AgentConfig {
+            openai_reasoning_effort: Some(alms_core::config::ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let overrides = PersistedLlmOverrides {
+            anthropic: None,
+            openai: Some(PersistedLlmOpenaiOverrides {
+                reasoning_effort: Some("turbo".into()),
+            }),
+            gemini: None,
+        };
+        overrides.apply_to(&mut cfg);
+        // Target is untouched on unknown input.
+        assert_eq!(
+            cfg.openai_reasoning_effort,
+            Some(alms_core::config::ReasoningEffort::Medium)
+        );
+    }
+
+    /// The `PatchLlm*` wire structs must all default cleanly — used by
+    /// axum's JSON body extractor to accept callers that omit the new
+    /// surface entirely.
+    #[test]
+    fn patch_llm_body_all_none_by_default() {
+        let body: PatchSettingsRequest = serde_json::from_str("{}").unwrap();
+        assert!(body.llm.is_none());
+    }
+
+    /// A PATCH body with `llm: { anthropic: { thinking_budget_tokens: 16384 } }`
+    /// must deserialize into the expected nested shape.
+    #[test]
+    fn patch_llm_body_parses_nested_shape() {
+        let json = r#"{
+            "llm": {
+                "anthropic": { "thinking_budget_tokens": 16384, "prompt_cache_enabled": false },
+                "openai": { "reasoning_effort": "high" },
+                "gemini": { "thinking_budget": 4096, "cache_enabled": false, "cache_ttl_seconds": 600 }
+            }
+        }"#;
+        let body: PatchSettingsRequest = serde_json::from_str(json).unwrap();
+        let llm = body.llm.expect("llm should be present");
+        let ant = llm.anthropic.expect("anthropic should be present");
+        assert_eq!(ant.thinking_budget_tokens, Some(16384));
+        assert_eq!(ant.prompt_cache_enabled, Some(false));
+        let oai = llm.openai.expect("openai should be present");
+        assert_eq!(oai.reasoning_effort.as_deref(), Some("high"));
+        let gem = llm.gemini.expect("gemini should be present");
+        assert_eq!(gem.thinking_budget, Some(4096));
+        assert_eq!(gem.cache_enabled, Some(false));
+        assert_eq!(gem.cache_ttl_seconds, Some(600));
+    }
+
+    /// Round-trip a full LLM-populated PersistedSettings through JSON
+    /// and back, verifying every field survives.
+    #[test]
+    fn llm_overrides_round_trip() {
+        let original = PersistedSettings {
+            context: None,
+            session: None,
+            tools: None,
+            llm: Some(PersistedLlmOverrides {
+                anthropic: Some(PersistedLlmAnthropicOverrides {
+                    thinking_budget_tokens: Some(8192),
+                    prompt_cache_enabled: Some(true),
+                }),
+                openai: Some(PersistedLlmOpenaiOverrides {
+                    reasoning_effort: Some("low".into()),
+                }),
+                gemini: Some(PersistedLlmGeminiOverrides {
+                    thinking_budget: Some(0),
+                    cache_enabled: Some(false),
+                    cache_ttl_seconds: Some(1800),
+                }),
+            }),
+        };
+        let json = serde_json::to_string_pretty(&original).unwrap();
+        let round_tripped: PersistedSettings = serde_json::from_str(&json).unwrap();
+        let llm = round_tripped.llm.unwrap();
+        let ant = llm.anthropic.unwrap();
+        assert_eq!(ant.thinking_budget_tokens, Some(8192));
+        assert_eq!(ant.prompt_cache_enabled, Some(true));
+        let oai = llm.openai.unwrap();
+        assert_eq!(oai.reasoning_effort, Some("low".into()));
+        let gem = llm.gemini.unwrap();
+        assert_eq!(gem.thinking_budget, Some(0));
+        assert_eq!(gem.cache_enabled, Some(false));
+        assert_eq!(gem.cache_ttl_seconds, Some(1800));
+    }
+
+    // ==================================================================
+    // PATCH /settings -> live `AgentConfig` mutation (#809 follow-up,
+    // Tim review item 1).
+    //
+    // The persistence-load and per-run-merge tests above prove the
+    // serde / business-logic layers, but the actual claim of #809 is
+    // that `patch_settings()` writes through to the live
+    // `Arc<RwLock<AgentConfig>>` shared with the HTTP run path. These
+    // end-to-end tests construct a real `AppState`, call
+    // `patch_settings()` as the axum handler, and read
+    // `state.agent_config.read()` afterwards to assert the mutation
+    // landed. They are the only tests that would catch a future
+    // refactor introducing a stale-clone in the handler.
+    // ==================================================================
+
+    /// Construct a minimal `AppState` with no SQLite, no LLM, fresh
+    /// channels — same shape as `runs::integration_tests::test_app_state`,
+    /// inlined here because that helper is private to its module.
+    fn settings_test_app_state() -> crate::server::AppState {
+        let gateway_config = crate::gateway::GatewayConfig::default();
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::server::AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token,
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn patch_llm_writes_through_to_live_agent_config() {
+        let state = settings_test_app_state();
+
+        // Seed a baseline different from the values we will PATCH so the
+        // assertions below distinguish the mutation from the default.
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.anthropic_thinking_budget = 0;
+            cfg.anthropic_prompt_cache_enabled = true;
+            cfg.openai_reasoning_effort = None;
+            cfg.gemini_thinking_budget = None;
+            cfg.gemini_cache_enabled = true;
+            cfg.gemini_cache_ttl_seconds = 300;
+        }
+
+        // PATCH every LLM knob to a non-default value.
+        let body = PatchSettingsRequest {
+            llm: Some(PatchLlm {
+                anthropic: Some(PatchLlmAnthropic {
+                    thinking_budget_tokens: Some(8192),
+                    prompt_cache_enabled: Some(false),
+                }),
+                openai: Some(PatchLlmOpenai {
+                    reasoning_effort: Some("high".into()),
+                }),
+                gemini: Some(PatchLlmGemini {
+                    thinking_budget: Some(4096),
+                    cache_enabled: Some(false),
+                    cache_ttl_seconds: Some(1800),
+                }),
+            }),
+            ..Default::default()
+        };
+        let _resp = patch_settings(axum::extract::State(state.clone()), Json(body)).await;
+
+        // Read the live config back through the shared lock.
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.anthropic_thinking_budget, 8192,
+            "PATCH must write through to live anthropic_thinking_budget"
+        );
+        assert!(
+            !cfg.anthropic_prompt_cache_enabled,
+            "PATCH must write through to live anthropic_prompt_cache_enabled"
+        );
+        assert_eq!(
+            cfg.openai_reasoning_effort,
+            Some(alms_core::config::ReasoningEffort::High),
+            "PATCH must write through to live openai_reasoning_effort"
+        );
+        assert_eq!(
+            cfg.gemini_thinking_budget,
+            Some(4096),
+            "PATCH must write through to live gemini_thinking_budget"
+        );
+        assert!(
+            !cfg.gemini_cache_enabled,
+            "PATCH must write through to live gemini_cache_enabled"
+        );
+        assert_eq!(
+            cfg.gemini_cache_ttl_seconds, 1800,
+            "PATCH must write through to live gemini_cache_ttl_seconds"
+        );
+    }
+
+    /// Empty-string `reasoning_effort` on the PATCH wire must clear the
+    /// live `openai_reasoning_effort` back to `None` — same clear-sentinel
+    /// behaviour as the persistence-load path.
+    #[tokio::test]
+    async fn patch_openai_empty_string_clears_live_reasoning_effort() {
+        let state = settings_test_app_state();
+        // Seed: high effort.
+        state.agent_config.write().openai_reasoning_effort =
+            Some(alms_core::config::ReasoningEffort::High);
+
+        let body = PatchSettingsRequest {
+            llm: Some(PatchLlm {
+                openai: Some(PatchLlmOpenai {
+                    reasoning_effort: Some(String::new()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _resp = patch_settings(axum::extract::State(state.clone()), Json(body)).await;
+
+        assert!(
+            state.agent_config.read().openai_reasoning_effort.is_none(),
+            "empty-string reasoning_effort must clear the live config to None"
+        );
+    }
+
+    /// `gemini.thinking_budget = Some(0)` on the PATCH wire must land as
+    /// `Some(0)` on the live config — it is "disable extended thinking",
+    /// not a clear sentinel. This is the asymmetry from the OpenAI knob
+    /// that the api.md table calls out.
+    #[tokio::test]
+    async fn patch_gemini_thinking_budget_zero_is_disable_not_clear() {
+        let state = settings_test_app_state();
+        state.agent_config.write().gemini_thinking_budget = Some(4096);
+
+        let body = PatchSettingsRequest {
+            llm: Some(PatchLlm {
+                gemini: Some(PatchLlmGemini {
+                    thinking_budget: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _resp = patch_settings(axum::extract::State(state.clone()), Json(body)).await;
+
+        assert_eq!(
+            state.agent_config.read().gemini_thinking_budget,
+            Some(0),
+            "gemini.thinking_budget = Some(0) is disable, not clear — \
+             must round-trip through the handler verbatim"
+        );
+    }
+
+    // ==================================================================
+    // Rejected PATCH must be side-effect-free at the persistence layer
+    // (#810 follow-up).
+    //
+    // Before the fix, `patch_settings` called `persist_settings(&state)`
+    // unconditionally — even when validation errors were collected and
+    // the handler was about to return 422. That meant any rejected
+    // request still rewrote `settings.json` from the current live
+    // snapshot, baking in pre-existing PATCH-applied values (and any
+    // sub-fields that landed before the rejected one) such that they
+    // would override `alms.toml` / env on the next daemon boot. This is
+    // the same shape as #814 (rejected fs_write leaving directories
+    // behind): the operationally damaging case is a *failed* request
+    // changing post-restart behaviour.
+    // ==================================================================
+
+    /// Rejected PATCH must NOT write `settings.json`. The handler returns
+    /// 422 and the persistence file does not exist on disk afterwards.
+    /// This is the load-bearing assertion for the #810 follow-up.
+    #[tokio::test]
+    async fn rejected_llm_patch_does_not_persist_settings_json() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        // Redirect persistence into a fresh tempdir so the assertion is
+        // self-contained and does not race with the cwd-relative
+        // `./.alms/settings.json` other tests in this module write to.
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let path = settings_path(&state.data_dir);
+        assert!(
+            !path.exists(),
+            "precondition: settings.json must not exist before the rejected PATCH"
+        );
+
+        // Seed the live config with a known baseline so we can also
+        // verify the per-knob ordering claim below.
+        let baseline_effort = Some(alms_core::config::ReasoningEffort::High);
+        state.agent_config.write().openai_reasoning_effort = baseline_effort;
+
+        // Send an invalid `reasoning_effort` — `"turbo"` is not one of
+        // minimal/low/medium/high so `ReasoningEffort::from_str` rejects
+        // it and `errors` ends up non-empty.
+        let body = PatchSettingsRequest {
+            llm: Some(PatchLlm {
+                openai: Some(PatchLlmOpenai {
+                    reasoning_effort: Some("turbo".into()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+            .await
+            .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid reasoning_effort must produce 422"
+        );
+
+        // Core assertion: the rejected request did not write the
+        // persistence file. On the next daemon boot, `alms.toml` /
+        // env-var values for the LLM block will be honoured, not
+        // shadowed by a bogus snapshot the operator was told failed.
+        assert!(
+            !path.exists(),
+            "rejected PATCH must not persist settings.json — found at {}",
+            path.display(),
+        );
+
+        // Bonus: for this specific knob the validation happens *before*
+        // the live mutation (the parse() error path doesn't write to
+        // `agent.openai_reasoning_effort`), so the live config is also
+        // unchanged. This is the per-knob ordering #810 already had
+        // right; the persistence skip closes the broader bug surface.
+        assert_eq!(
+            state.agent_config.read().openai_reasoning_effort,
+            baseline_effort,
+            "rejected reasoning_effort must not mutate the live config either"
+        );
+    }
+
+    /// Same persistence-skip guarantee for the `context` sub-path. The
+    /// `errors` vec is shared across all PATCH branches so the single
+    /// `persist_settings` skip-on-error closes the same bug surface for
+    /// every section uniformly — this test pins that behaviour for
+    /// `context` so a future refactor that splits the error vec per
+    /// section can't quietly regress it.
+    #[tokio::test]
+    async fn rejected_context_patch_does_not_persist_settings_json() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        let path = settings_path(&state.data_dir);
+
+        // Invalid strategy — must be one of sliding-summary/full/truncate.
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                strategy: Some("nonsense".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            !path.exists(),
+            "rejected context PATCH must not persist settings.json"
+        );
+    }
+
+    /// Rejected PATCH on a fresh state must also not overwrite a
+    /// *pre-existing* `settings.json` from an earlier successful PATCH.
+    /// This is the operationally damaging case: prior overrides stay
+    /// intact, the rejected request is a true no-op on disk.
+    #[tokio::test]
+    async fn rejected_llm_patch_preserves_prior_settings_json() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        let path = settings_path(&state.data_dir);
+
+        // Step 1: a valid PATCH lands and writes settings.json with
+        // known values.
+        {
+            let body = PatchSettingsRequest {
+                llm: Some(PatchLlm {
+                    anthropic: Some(PatchLlmAnthropic {
+                        thinking_budget_tokens: Some(8192),
+                        prompt_cache_enabled: Some(false),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let prior_snapshot =
+            std::fs::read_to_string(&path).expect("first PATCH should have written settings.json");
+        assert!(
+            prior_snapshot.contains("8192"),
+            "sanity: prior snapshot must contain the previously-PATCHed thinking_budget"
+        );
+
+        // Step 2: a follow-up PATCH carries one valid mutation
+        // (anthropic.thinking_budget_tokens = 16384) AND one invalid
+        // mutation (openai.reasoning_effort = "turbo"). Pre-fix, this
+        // would still rewrite settings.json from the live snapshot
+        // (which now has 16384 baked in) — silently committing a
+        // mutation the operator was told was a partial-failure 422.
+        {
+            let body = PatchSettingsRequest {
+                llm: Some(PatchLlm {
+                    anthropic: Some(PatchLlmAnthropic {
+                        thinking_budget_tokens: Some(16384),
+                        prompt_cache_enabled: None,
+                    }),
+                    openai: Some(PatchLlmOpenai {
+                        reasoning_effort: Some("turbo".into()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        // Disk must still hold the prior snapshot byte-for-byte. The
+        // rejected request is a no-op at the persistence layer.
+        let after_snapshot = std::fs::read_to_string(&path)
+            .expect("settings.json must still exist from the prior successful PATCH");
+        assert_eq!(
+            after_snapshot, prior_snapshot,
+            "rejected PATCH must not rewrite settings.json — \
+             persisted snapshot drifted across a 422 response"
+        );
     }
 }
