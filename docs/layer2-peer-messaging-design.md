@@ -841,6 +841,8 @@ Agent B runs, processes message, may reply (send_message back) or end (ignore_me
 
 - **`dm_recipient.md` prompt**: The DM addendum tells agents that calling `ignore_message` will notify the peer. This is injected only for peer DM runs (`is_peer = true`), never for notification runs.
 
+- **Ephemeral subagents cannot receive DMs**: Recipient resolution in `send_message` goes through `store.load_agent_by_name(to)` (`crates/alms-tools/src/send_message.rs:107`). Ephemeral (unnamed) subagents have no registry record, so the lookup fails and the tool returns a JSON `{error: "agent not found"}` to the LLM. Only **named, registered agents** can be DM recipients. Senders, by contrast, only need an `AgentId`; an ephemeral subagent could in principle send to a named peer, but doing so creates a DM session keyed on a name the recipient cannot resolve back to anything stable — treat ephemeral subagents as DM-isolated by design.
+
 ---
 
 ## 10. Database Schema Changes
