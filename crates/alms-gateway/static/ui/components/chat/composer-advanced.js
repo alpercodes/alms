@@ -1,7 +1,8 @@
-import { html, useSignal, useEffect } from '../../deps.js';
+import { html, useSignal } from '../../deps.js';
 import { localSettings, saveSettings, serverDefaults } from '../../state/settings.js';
 import { activeOverrideCount } from '../settings-modal.js';
 import { IconChevronDown } from '../../utils/icons.js';
+import { BudgetTriState } from '../budget-tri-state.js';
 
 /**
  * Common model suggestions for the datalist (mirrors settings-modal.js).
@@ -18,113 +19,10 @@ const MODEL_SUGGESTIONS = [
 
 const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
 
-/**
- * Pick the effective tri-state mode from a wire value when no explicit
- * UI override is in effect.
- *
- *   null/undefined -> 'inherit'  (omit on wire)
- *   0              -> 'disable'  (Some(0) — explicit disable)
- *   positive int   -> 'custom'   (Some(n) — operator-specified value)
- */
-function modeFromWire(wire) {
-    if (wire == null) return 'inherit';
-    if (wire === 0) return 'disable';
-    return 'custom';
-}
-
-/**
- * Tri-state budget control — Inherit / Disable / Custom.
- *
- * Owns its own `mode` signal so that flipping into Custom from Inherit
- * (which has an empty value) doesn't immediately collapse back to
- * Inherit. Only writes to `localSettings` once the value is meaningful:
- *   - mode = inherit -> wire = null
- *   - mode = disable -> wire = 0
- *   - mode = custom + non-empty value -> wire = parsed int
- *   - mode = custom + empty value -> wire = null (cleared, but the
- *     Custom-with-empty-input UI state is preserved locally)
- *
- * Stays in sync with external resets (e.g. settings modal Reset, the
- * Reset-all button) by watching the live wire value: when the
- * external wire flips, we adopt its mode unless the user is mid-Custom
- * with an empty input (we keep that state to avoid yanking focus).
- */
-function BudgetTriState({ label, wireValue, onWrite }) {
-    const mode = useSignal(modeFromWire(wireValue));
-    const draft = useSignal(wireValue && wireValue > 0 ? String(wireValue) : '');
-
-    // External resets: when the wire value changes underneath us
-    // (Reset-all, settings-modal Reset, etc.), re-derive mode and draft
-    // from wire — but only when the wire-derived mode genuinely differs
-    // from the local mode signal, so we don't fight the user's input.
-    //
-    // Special case: when the user has just flipped Inherit -> Custom
-    // (and hasn't typed yet), our own onModeChange wrote `null` to the
-    // wire. The wire-derived mode is 'inherit', but we want to stay in
-    // 'custom' so the number input renders for the user to type into.
-    // Detect this by `mode === 'custom' && draft === '' && wire == null`.
-    // (Edge corner: a forced external Reset while mid-Custom-empty won't
-    //  visually unfreeze the dropdown until the user clicks back to
-    //  Inherit. Acceptable; the wire is correctly null in that case.)
-    //
-    // Tim's #818 nit: this used to run during render. Moved into a
-    // useEffect so we never mutate signals from the render pass — the
-    // effect re-runs whenever the wire value flips externally.
-    useEffect(() => {
-        const wireMode = modeFromWire(wireValue);
-        if (wireMode !== mode.value && !(mode.value === 'custom' && draft.value === '' && wireValue == null)) {
-            mode.value = wireMode;
-            draft.value = wireValue && wireValue > 0 ? String(wireValue) : '';
-        }
-    }, [wireValue]);
-
-    const onModeChange = (e) => {
-        const next = e.target.value;
-        mode.value = next;
-        if (next === 'inherit') {
-            onWrite(null);
-        } else if (next === 'disable') {
-            onWrite(0);
-        } else {
-            // mode === 'custom' — only write if there's a value already;
-            // otherwise wait for the user to fill it in.
-            const n = parseInt(draft.value, 10);
-            if (!isNaN(n) && n >= 0) onWrite(n);
-            else onWrite(null);
-        }
-    };
-
-    const onDraftChange = (e) => {
-        draft.value = e.target.value;
-        const n = parseInt(e.target.value, 10);
-        if (!isNaN(n) && n >= 0) onWrite(n);
-        else onWrite(null);
-    };
-
-    return html`
-        <div class="composer-advanced-row composer-advanced-row--tristate">
-            <span class="composer-advanced-row-label">${label}</span>
-            <div class="composer-advanced-tristate">
-                <select class="composer-advanced-input composer-advanced-input--mode"
-                        value=${mode.value}
-                        onChange=${onModeChange}>
-                    <option value="inherit">Inherit</option>
-                    <option value="disable">Disable</option>
-                    <option value="custom">Custom</option>
-                </select>
-                ${mode.value === 'custom' && html`
-                    <input class="composer-advanced-input composer-advanced-input--value"
-                           type="number"
-                           min="0"
-                           step="1024"
-                           placeholder="tokens"
-                           value=${draft.value}
-                           onInput=${onDraftChange} />
-                `}
-            </div>
-        </div>
-    `;
-}
+// `BudgetTriState` lives in `../budget-tri-state.js` and is shared with
+// the settings modal (#822). Its `DEFAULT_CLASSES` already use the
+// composer-advanced-* class names, so this surface keeps byte-identical
+// markup without passing a `classNames` prop.
 
 /**
  * Composer "Advanced" expander — per-run override controls living below
