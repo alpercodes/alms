@@ -534,7 +534,7 @@ Emitted on the DM session SSE stream whenever a peer message is persisted to a s
 ```
 
 `dm_conversation_ended`
-Emitted on the DM session SSE stream when a DM conversation between two agents ends (via `ignore_message` or depth limit exceeded). The web UI can use this to show a "conversation ended" indicator.
+Emitted on the DM session SSE stream when a DM conversation between two agents ends (via `ignore_message`, depth limit exceeded, user cancellation, or run failure). The web UI can use this to show a "conversation ended" indicator.
 ```json
 {
   "session_id": "<uuid>",
@@ -546,7 +546,7 @@ Emitted on the DM session SSE stream when a DM conversation between two agents e
 }
 ```
 
-`reason` values: `"ignored"` (agent called `ignore_message`), `"depth_exceeded"` (MAX_DM_DEPTH reached).
+`reason` values: `"ignored"` (agent called `ignore_message`), `"depth_exceeded"` (MAX_DM_DEPTH reached), `"user_cancelled"` (operator cancelled the run via `POST /runs/{id}/cancel` or `POST /sessions/{id}/cancel-dm`), `"errored"` (the run failed mid-flight — LLM error, tool error, posture trip, etc.).
 
 Note: If both agents call `ignore_message` simultaneously, duplicate `dm_conversation_ended` events may be emitted for the same session. Clients should handle duplicates gracefully.
 
