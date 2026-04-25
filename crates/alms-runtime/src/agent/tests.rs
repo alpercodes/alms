@@ -406,6 +406,128 @@ async fn test_guarded_posture_sequential_approvals() {
     );
 }
 
+/// Regression test for #816: cancellation during approval-wait must emit a
+/// matching `ToolEnd` for the `ToolStart` already fired before the approval
+/// gate. Without that terminal event the UI's tool row stays in the spinner
+/// state until the user reloads — live render diverges from persisted/reload
+/// render, breaking the same invariant #800/#803 fixed for the
+/// approve-then-resolve path.
+#[tokio::test]
+async fn test_cancel_during_approval_wait_emits_tool_end() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // `math` is NOT auto-approved, so the approval gate fires.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+    let cancel_token = CancellationToken::new();
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: Some(cancel_token.clone()),
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        agent_name: None,
+    };
+
+    let tool_call = ToolCall::new("tc1", "math", r#"{"operation":"add","a":1,"b":2}"#);
+    let invocation_id = uuid::Uuid::new_v4();
+
+    // Spawn a task that watches for `ApprovalRequired` and then cancels the
+    // run instead of resolving the decision channel — simulating an operator
+    // hitting `run cancel` while the approval prompt is open. We hold onto
+    // `decision_tx` so it isn't dropped (which would unblock the await with
+    // `false` and resolve as "denied" rather than "cancelled").
+    let cancel_token_clone = cancel_token.clone();
+    let approval_handler = tokio::spawn(async move {
+        let mut held_tx = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                RuntimeEvent::ApprovalRequired { decision_tx, .. } => {
+                    held_tx = Some(decision_tx);
+                    cancel_token_clone.cancel();
+                }
+                RuntimeEvent::ToolEnd { .. } => {
+                    // Surface the terminal event back to the test body.
+                    return (held_tx, Some(event));
+                }
+                _ => {}
+            }
+        }
+        (held_tx, None)
+    });
+
+    let result = runtime
+        .execute_tool_call(&tool_call, invocation_id, &session_manager, session.id)
+        .await;
+
+    // Drop the runtime so the event channel closes and the handler's `recv`
+    // loop terminates cleanly if `ToolEnd` was never observed.
+    drop(runtime);
+
+    // The loop must surface `Cancelled` — not a denial or success.
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+
+    let (_held_tx, tool_end) = approval_handler.await.unwrap();
+
+    // The terminal event must have been emitted before unwind.
+    let tool_end = tool_end.expect(
+        "tool_end must be emitted on cancel-during-approval-wait — \
+         every tool_start must have a matching terminal event (#816)",
+    );
+    match tool_end {
+        RuntimeEvent::ToolEnd {
+            invocation_id: end_id,
+            ok,
+            result,
+            ..
+        } => {
+            assert_eq!(
+                end_id, invocation_id,
+                "tool_end must reference the same invocation_id as the tool_start"
+            );
+            assert!(!ok, "tool_end after cancel must report ok=false");
+            // Result payload should mention cancellation so the UI / persisted
+            // state can distinguish this from a denial or generic error.
+            let err_str = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            assert!(
+                err_str.contains("cancel"),
+                "tool_end result.error should mention cancellation, got {:?}",
+                result
+            );
+        }
+        _ => panic!("expected RuntimeEvent::ToolEnd, got a different RuntimeEvent variant"),
+    }
+}
+
 #[tokio::test]
 async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
     // Prove that an auto-approved tool (echo) executes successfully under

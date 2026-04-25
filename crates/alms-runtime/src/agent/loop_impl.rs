@@ -1186,10 +1186,26 @@ impl AgentRuntime {
                 source_agent: None,
             });
             // Checkpoint D: approval wait with cancellation support.
+            //
+            // If the run is cancelled while we're blocked here, we MUST emit a
+            // matching `ToolEnd` for the `tool_start` we already fired above —
+            // the frontend's spinner-cleanup, group-collapsing, and
+            // persisted-state-parity logic all rely on that 1:1 invariant. See
+            // #816 (the cancel-during-approval-wait counterpart of the
+            // post-approval-resolve fix in #800/#803).
             let approved = if let Some(ref token) = self.cancel_token {
                 tokio::select! {
                     result = decision_rx => result.unwrap_or(false),
-                    _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                    _ = token.cancelled() => {
+                        let _ = sender.send(RuntimeEvent::ToolEnd {
+                            invocation_id,
+                            ok: false,
+                            result: serde_json::json!({"error": "run cancelled"}),
+                            source_agent: None,
+                            task_id: None,
+                        });
+                        return Err(AlmsError::Cancelled);
+                    }
                 }
             } else {
                 match decision_rx.await {
