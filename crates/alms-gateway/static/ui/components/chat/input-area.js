@@ -23,6 +23,14 @@ import { ComposerAdvanced } from './composer-advanced.js';
  */
 export async function startRun(text, opts) {
     const sessionId = opts?.sessionId || activeSessionId.value;
+    const agentId = activeAgentId.value;
+    if (!agentId) {
+        transformMessages(msgs =>
+            [...msgs,
+             { id: nextMsgId(), type: 'error', text: 'Select an agent before sending a message.' }]
+        );
+        return;
+    }
 
     appendMessage(
         { id: nextMsgId(), type: 'user', role: 'user', text },
@@ -40,6 +48,7 @@ export async function startRun(text, opts) {
     try {
         const runBody = {
             session_id: sessionId,
+            agent_id: agentId,
             input: { type: 'text', text },
         };
         const settings = localSettings.value;
@@ -89,7 +98,7 @@ export async function startRun(text, opts) {
 
 function sendMessage(promptRef) {
     const text = promptRef.current.value.trim();
-    if (!text || !activeSessionId.value) return;
+    if (!text || !activeSessionId.value || !activeAgentId.value) return;
     promptRef.current.value = '';
     promptRef.current.style.height = 'auto';
 
@@ -113,8 +122,10 @@ export function InputArea() {
     const promptRef = useRef(null);
     const hasAgent = agents.value.length > 0;
     const hasSession = !!activeSessionId.value;
-    const canSend = hasAgent && hasSession;
+    const hasActiveAgent = !!activeAgentId.value;
+    const canSend = hasAgent && hasActiveAgent && hasSession;
     const isRunning = !!activeRunId.value;
+    const placeholder = hasActiveAgent ? 'Send a message...' : 'Select an agent to send a message';
 
     const onKeyDown = (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -136,7 +147,7 @@ export function InputArea() {
             <${ComposerAdvanced} />
             <div class="input-container">
                 <textarea id="prompt" ref=${promptRef} rows="1"
-                          placeholder="Send a message..."
+                          placeholder=${placeholder}
                           aria-label="Message input"
                           disabled=${!canSend}
                           onKeyDown=${onKeyDown}

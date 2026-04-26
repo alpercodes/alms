@@ -92,6 +92,14 @@ impl AgentId {
         Self(Uuid::new_v4())
     }
 
+    pub fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    pub fn is_nil(&self) -> bool {
+        self.0 == Uuid::nil()
+    }
+
     /// Derive a deterministic AgentId from a parent agent ID and a subagent name.
     /// Same inputs always produce the same output (UUID v5).
     pub fn deterministic(parent: AgentId, subagent_name: &str) -> Self {

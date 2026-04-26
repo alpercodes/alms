@@ -301,6 +301,27 @@ pub async fn create_run(
         RunInput::Text { text } => text,
     };
 
+    let session_agent_id = session.agent_id;
+    let is_shared_session = session_agent_id.is_nil();
+    let agent_id = match req.agent_id {
+        Some(requested) if requested != session_agent_id && !is_shared_session => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "AGENT_SESSION_MISMATCH",
+                "Session belongs to a different agent",
+            ));
+        }
+        Some(requested) => requested,
+        None if is_shared_session => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "AGENT_ID_REQUIRED",
+                "Shared sessions require agent_id so per-agent config can be resolved",
+            ));
+        }
+        None => session_agent_id,
+    };
+
     // Validate provider override early so the user gets a clear 400 instead
     // of a confusing "invalid API key" error from a wrong provider.
     if let Some(ref p) = req.provider {
@@ -317,7 +338,7 @@ pub async fn create_run(
         reasoning_effort: req.reasoning_effort,
         gemini_thinking_budget: req.gemini_thinking_budget,
     };
-    let run = Run::new(session.id, session.agent_id, input_text);
+    let run = Run::new(session.id, agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
     let agent_id = run.agent_id;
