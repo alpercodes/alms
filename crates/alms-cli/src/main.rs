@@ -383,8 +383,7 @@ async fn main() -> anyhow::Result<()> {
                     posture,
                 } => {
                     cmd_run::run_create(
-                        &client, &url, &session, &input, agent, model, max_tokens, posture,
-                        json,
+                        &client, &url, &session, &input, agent, model, max_tokens, posture, json,
                     )
                     .await?;
                 }

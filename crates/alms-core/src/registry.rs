@@ -64,6 +64,30 @@ pub struct AgentRecord {
     /// protocol; silently ignored for other providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gemini_thinking_budget: Option<u32>,
+    /// Per-agent summary-task provider override (#872).
+    ///
+    /// `None` = fall through to the server-level `[context].summary_provider`
+    /// (if that is also `None`, the summary task is refused with a clean
+    /// `SUMMARY_NOT_CONFIGURED` error rather than silently inheriting the
+    /// agent's primary provider — see #872 for the rationale).
+    /// `Some(provider)` = re-target the per-run summary task at this
+    /// provider exclusively, regardless of the server-level setting.
+    ///
+    /// Must be set together with `summary_model`. Setting one without the
+    /// other is rejected at PATCH time with `SUMMARY_PROVIDER_REQUIRES_MODEL`
+    /// or `SUMMARY_MODEL_REQUIRES_PROVIDER`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_provider: Option<String>,
+    /// Per-agent summary-task model override (#872).
+    ///
+    /// `None` = fall through to the server-level `[context].summary_model`.
+    /// `Some(model)` = use this model on the summary provider's wire,
+    /// regardless of the server-level setting.
+    ///
+    /// Must be set together with `summary_provider`. See
+    /// [`AgentRecord::summary_provider`] for the validation rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<String>,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
@@ -93,6 +117,16 @@ pub struct CreateAgentRequest {
     /// See [`AgentRecord::gemini_thinking_budget`] for semantics.
     #[serde(default)]
     pub gemini_thinking_budget: Option<u32>,
+    /// Per-agent summary-task provider override (#872).
+    /// See [`AgentRecord::summary_provider`] for semantics; must be set
+    /// together with `summary_model`.
+    #[serde(default)]
+    pub summary_provider: Option<String>,
+    /// Per-agent summary-task model override (#872).
+    /// See [`AgentRecord::summary_model`] for semantics; must be set
+    /// together with `summary_provider`.
+    #[serde(default)]
+    pub summary_model: Option<String>,
     #[serde(default)]
     pub is_default: Option<bool>,
 }
@@ -159,6 +193,34 @@ pub struct UpdateAgentRequest {
     /// `400 BAD_REQUEST`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clear_gemini_thinking_budget: Option<bool>,
+    /// Per-agent summary-task provider override (#872). Empty string
+    /// `""` is rejected — use `clear_summary_provider: true` to clear,
+    /// or send a non-empty provider name. Must be set together with
+    /// `summary_model` (the symmetric pair-only validator runs at
+    /// post-PATCH state).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_provider: Option<String>,
+    /// Per-agent summary-task model override (#872). Empty string `""`
+    /// is rejected — use `clear_summary_model: true` to clear. Must be
+    /// set together with `summary_provider`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<String>,
+    /// When `true`, clear `summary_provider` back to `None` (fall
+    /// through to the server-level `[context].summary_provider`).
+    /// Mutually exclusive with a non-`None` value for
+    /// `summary_provider` in the same request — sending both is a
+    /// `400 CLEAR_AND_VALUE_CONFLICT`. Must be sent together with
+    /// `clear_summary_model: true` (or with both summary_* fields
+    /// staying None) so the post-PATCH state respects the pair-only
+    /// invariant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_summary_provider: Option<bool>,
+    /// When `true`, clear `summary_model` back to `None` (fall through
+    /// to the server-level `[context].summary_model`). Mutually
+    /// exclusive with a non-`None` value for `summary_model` in the
+    /// same request — sending both is a `400 CLEAR_AND_VALUE_CONFLICT`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_summary_model: Option<bool>,
 }
 
 /// Validate an agent name slug.

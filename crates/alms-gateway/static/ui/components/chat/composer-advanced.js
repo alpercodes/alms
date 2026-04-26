@@ -125,7 +125,7 @@ export function ComposerAdvanced() {
                             <select class="composer-advanced-input"
                                     value=""
                                     disabled
-                                    title="Per-run provider overrides are disabled (#865). Configure provider on the agent."
+                                    title="Per-run provider overrides are disabled. Configure provider on the agent."
                                     onChange=${onProviderChange}>
                                 <option value="">Inherit (${defaults.provider || 'server default'})</option>
                                 <option value="openai">openai</option>
@@ -140,7 +140,7 @@ export function ComposerAdvanced() {
                                    type="text"
                                    list="composer-advanced-models"
                                    disabled
-                                   title="Per-run model overrides are disabled (#865). Configure model on the agent."
+                                   title="Per-run model overrides are disabled. Configure model on the agent."
                                    placeholder=${defaults.model || 'inherit'}
                                    value=""
                                    onChange=${onModelChange} />

@@ -130,6 +130,8 @@ fn seed_alice_bob(state: &AppState) -> (AgentId, AgentId) {
         thinking_budget_tokens: None,
         reasoning_effort: None,
         gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
         is_default: false,
         created_at: Utc::now(),
         last_active: Utc::now(),
@@ -1714,7 +1716,9 @@ async fn create_run_rejects_agent_session_mismatch() {
     let req = CreateRunRequest {
         session_id: session.id,
         agent_id: Some(other_id),
-        input: RunInput::Text { text: "hello".into() },
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
         model: None,
         max_tokens: None,
         posture: None,
@@ -1747,7 +1751,9 @@ async fn create_run_requires_agent_id_for_shared_session() {
     let req = CreateRunRequest {
         session_id: session.id,
         agent_id: None,
-        input: RunInput::Text { text: "hello".into() },
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
         model: None,
         max_tokens: None,
         posture: None,
@@ -1787,6 +1793,8 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
         thinking_budget_tokens: None,
         reasoning_effort: None,
         gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
         is_default: false,
         created_at: now,
         last_active: now,
@@ -1806,7 +1814,9 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
     let req = CreateRunRequest {
         session_id: session.id,
         agent_id: Some(agent_id),
-        input: RunInput::Text { text: "hello".into() },
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
         model: None,
         max_tokens: None,
         posture: None,

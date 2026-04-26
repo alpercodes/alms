@@ -749,7 +749,15 @@ impl Default for ContextConfig {
             max_input_tokens: 128_000,
             recent_window: 20,
             summary_interval: 30,
-            summary_model: Some("minimax/minimax-m2.7".into()),
+            // Default to None for both fields (#872). The pre-#872 default
+            // paired `summary_model = Some("minimax/minimax-m2.7")` with
+            // `summary_provider = None`, which the resolver silently
+            // mapped onto the agent's primary provider — the exact
+            // misconfiguration that produced the `model: not found` 404
+            // in #866. The new pair-only validator rejects that
+            // asymmetric state, so the default ships with both fields
+            // unset; operators opt in by configuring both at once.
+            summary_model: None,
             summary_provider: None,
             run_summary_mode: RunSummaryMode::Llm,
             run_summary_budget: 2000,

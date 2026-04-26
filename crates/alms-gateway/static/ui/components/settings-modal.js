@@ -595,7 +595,7 @@ export function SettingsModal({ open, onClose }) {
                         <select class="settings-select"
                                 value=${provider.value}
                                 disabled
-                                title="Per-run provider overrides are disabled (#865). Configure provider on the agent (Agents panel) or as the server default."
+                                title="Per-run provider overrides are disabled. Configure provider on the agent (Agents panel) or as the server default."
                                 onChange=${e => { provider.value = e.target.value; }}>
                             <option value="">Default (${formatProviderLabel(defaults.provider || 'openai')})</option>
                             <option value="openai">OpenAI</option>
@@ -615,7 +615,7 @@ export function SettingsModal({ open, onClose }) {
                         <input class="settings-input" type="text"
                                list="model-suggestions"
                                disabled
-                               title="Per-run model overrides are disabled (#865). Configure model on the agent (Agents panel) or as the server default."
+                               title="Per-run model overrides are disabled. Configure model on the agent (Agents panel) or as the server default."
                                placeholder=${defaults.model || 'server default'}
                                value=${model.value}
                                onInput=${e => { model.value = e.target.value; }} />
@@ -628,7 +628,7 @@ export function SettingsModal({ open, onClose }) {
                     </div>
                 </div>
                 <div class="settings-hint settings-overrides-disabled-note">
-                    Provider and model are configured per-agent (Agents panel) or as the server default. Per-run overrides are disabled here to keep per-agent config from being silently squashed by stale localStorage values (#865).
+                    Provider and model are configured per-agent (Agents panel) or as the server default. Per-run overrides are disabled here to keep per-agent config from being silently squashed by stale localStorage values.
                 </div>
 
                 <div class="settings-grid">
@@ -761,10 +761,23 @@ export function SettingsModal({ open, onClose }) {
                                value=${ctxSummaryInterval.value}
                                onInput=${e => { ctxSummaryInterval.value = e.target.value; }} />
                     <//>
+                <//>
+
+                <!-- Summary (server-level, editable) — controls BOTH the
+                     in-loop sliding-summary compaction AND the post-run
+                     episodic memory generation. Lifted out of the Context
+                     section to make the dual-path scope obvious. -->
+                <${Section} key="summary" title="Summary (sliding-summary compaction + episodic memory)" defaultOpen=${false}>
+                    <span class="settings-hint settings-section-desc">
+                        Optional dedicated provider/model for the summary task. Drives both the in-loop sliding-summary compaction
+                        (rolling context window) and the per-run episodic memory generation. Both fields must be set together — partial
+                        configurations are rejected so the user-supplied summary_model is never silently paired with the agent's primary provider.
+                        Per-agent overrides live on the agent record (Agents panel).
+                    </span>
                     <${EditRow} label="Summary model"
-                        desc="Optional cheaper model for generating summaries. Leave empty for default.">
+                        desc="Cheaper model for generating summaries. Set together with Summary provider, or leave both empty to use the agent's main LLM.">
                         <input class="settings-input settings-input-sm" type="text"
-                               placeholder="same as default"
+                               placeholder="leave empty to use the agent's main LLM"
                                list="model-suggestions"
                                value=${ctxSummaryModel.value}
                                onInput=${e => { ctxSummaryModel.value = e.target.value; }} />
@@ -773,11 +786,11 @@ export function SettingsModal({ open, onClose }) {
                         </span>
                     <//>
                     <${EditRow} label="Summary provider"
-                        desc="Optional dedicated provider for the summary task (#866). Default = inherit agent provider. Set this when summary_model belongs to a different provider than the agent.">
+                        desc="Dedicated provider for the summary task. Must be configured under [llm.providers.<name>] with a resolvable API key. Set together with Summary model.">
                         <select class="settings-select settings-input-sm"
                                 value=${ctxSummaryProvider.value}
                                 onChange=${e => { ctxSummaryProvider.value = e.target.value; }}>
-                            <option value="">Inherit agent provider</option>
+                            <option value="">Unset (no dedicated summary task)</option>
                             ${(defaults.llm_providers && defaults.llm_providers.length > 0
                                 ? defaults.llm_providers
                                 : PROVIDERS).map(p => {

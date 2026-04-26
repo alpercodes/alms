@@ -30,8 +30,8 @@ impl SqliteStore {
             "INSERT INTO agents \
              (id, name, description, model, posture, provider, telegram_token, \
               is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-              gemini_thinking_budget) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              gemini_thinking_budget, summary_provider, summary_model) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 agent.id.0.to_string(),
                 &agent.name,
@@ -46,6 +46,8 @@ impl SqliteStore {
                 agent.thinking_budget_tokens.map(i64::from),
                 agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
                 agent.gemini_thinking_budget.map(i64::from),
+                agent.summary_provider.as_deref(),
+                agent.summary_model.as_deref(),
             ],
         )
         .map_err(|e| AlmsError::Runtime(format!("SQLite create_agent_if_none_exist: {e}")))?;
@@ -63,8 +65,8 @@ impl SqliteStore {
                 "INSERT INTO agents \
                  (id, name, description, model, posture, provider, telegram_token, \
                   is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-                  gemini_thinking_budget) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                  gemini_thinking_budget, summary_provider, summary_model) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     agent.id.0.to_string(),
                     &agent.name,
@@ -79,6 +81,8 @@ impl SqliteStore {
                     agent.thinking_budget_tokens.map(i64::from),
                     agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
                     agent.gemini_thinking_budget.map(i64::from),
+                    agent.summary_provider.as_deref(),
+                    agent.summary_model.as_deref(),
                 ],
             )
             .map_err(|e| match &e {
@@ -104,7 +108,8 @@ impl SqliteStore {
                 "UPDATE agents SET description = ?1, model = ?2, \
                  posture = ?3, provider = ?4, telegram_token = ?5, \
                  thinking_budget_tokens = ?6, reasoning_effort = ?7, \
-                 gemini_thinking_budget = ?8, last_active = ?9 WHERE id = ?10",
+                 gemini_thinking_budget = ?8, summary_provider = ?9, \
+                 summary_model = ?10, last_active = ?11 WHERE id = ?12",
                 params![
                     &agent.description,
                     agent.model.as_deref(),
@@ -114,6 +119,8 @@ impl SqliteStore {
                     agent.thinking_budget_tokens.map(i64::from),
                     agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
                     agent.gemini_thinking_budget.map(i64::from),
+                    agent.summary_provider.as_deref(),
+                    agent.summary_model.as_deref(),
                     agent.last_active.to_rfc3339(),
                     agent.id.0.to_string(),
                 ],
@@ -131,7 +138,7 @@ impl SqliteStore {
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-             gemini_thinking_budget \
+             gemini_thinking_budget, summary_provider, summary_model \
              FROM agents WHERE id = ?1",
             params![id.0.to_string()],
             parse_agent_row,
@@ -149,7 +156,7 @@ impl SqliteStore {
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-             gemini_thinking_budget \
+             gemini_thinking_budget, summary_provider, summary_model \
              FROM agents WHERE name = ?1",
             params![name],
             parse_agent_row,
@@ -169,7 +176,7 @@ impl SqliteStore {
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-             gemini_thinking_budget \
+             gemini_thinking_budget, summary_provider, summary_model \
              FROM agents WHERE is_default = 1 LIMIT 1",
             [],
             parse_agent_row,
@@ -188,7 +195,7 @@ impl SqliteStore {
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
                  is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-                 gemini_thinking_budget \
+                 gemini_thinking_budget, summary_provider, summary_model \
                  FROM agents ORDER BY created_at",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
@@ -217,7 +224,7 @@ impl SqliteStore {
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
                  is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-                 gemini_thinking_budget \
+                 gemini_thinking_budget, summary_provider, summary_model \
                  FROM agents WHERE telegram_token IS NOT NULL AND telegram_token != '' \
                  ORDER BY created_at",
             )
@@ -375,6 +382,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
@@ -863,6 +872,54 @@ mod tests {
         store.update_agent(&cleared).unwrap();
         let final_state = store.load_agent_by_id(agent.id).unwrap().unwrap();
         assert_eq!(final_state.gemini_thinking_budget, None);
+    }
+
+    #[test]
+    fn test_agent_summary_provider_model_roundtrip() {
+        // Issue #872: per-agent summary_provider / summary_model survive
+        // create → load → update → load → clear → load. Mirrors the
+        // round-trip shape of test_agent_gemini_thinking_budget_roundtrip.
+        // Both fields are NULL in the default new_agent fixture so the
+        // freshly-created record exercises the both-None path; subsequent
+        // update_agent calls exercise the both-Some path; the final
+        // clear-back-to-None step verifies the SQL UPDATE handles NULL
+        // for the new columns 9 / 10.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("summary-cfg");
+        store.create_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(loaded.summary_provider.is_none());
+        assert!(loaded.summary_model.is_none());
+
+        // Set both together — pair-only invariant holds.
+        agent = loaded;
+        agent.summary_provider = Some("openrouter".into());
+        agent.summary_model = Some("minimax/minimax-m2.7".into());
+        store.update_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            loaded.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
+
+        // Update both to a different pair — both fields update together.
+        agent = loaded;
+        agent.summary_provider = Some("anthropic".into());
+        agent.summary_model = Some("claude-haiku-4".into());
+        store.update_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.summary_provider.as_deref(), Some("anthropic"));
+        assert_eq!(loaded.summary_model.as_deref(), Some("claude-haiku-4"));
+
+        // Clear both — back to inheriting the server-level setting.
+        agent = loaded;
+        agent.summary_provider = None;
+        agent.summary_model = None;
+        store.update_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(loaded.summary_provider.is_none());
+        assert!(loaded.summary_model.is_none());
     }
 
     #[test]

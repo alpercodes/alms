@@ -35,6 +35,76 @@ fn validate_posture(posture: &str) -> Result<(), String> {
     }
 }
 
+/// Validate the per-agent summary provider/model pair (#872).
+///
+/// Both fields must be set together or both must be unset. When a provider
+/// is set, it must reference a configured `[llm.providers.<name>]` entry
+/// and have a resolvable API key (entry-level `api_key_env` / `api_key`,
+/// or a key in the live `SecretsStore`). Mirrors the symmetric pair-only
+/// validation that runs at the server-level layer in `settings.rs`.
+///
+/// `provider` and `model` here are the post-update values (i.e. the state
+/// the agent record will be in after the PATCH commits) — callers compute
+/// these by merging the request against the live record before calling.
+fn validate_summary_pair(
+    state: &AppState,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match (provider, model) {
+        (None, None) | (Some(_), Some(_)) => {}
+        (Some(_), None) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "SUMMARY_PROVIDER_REQUIRES_MODEL",
+                "summary_provider is set but summary_model is empty. Set both \
+                 fields together — the summary provider's wire model namespace \
+                 is independent of the agent's primary provider, so partial \
+                 settings cannot be safely resolved.",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "SUMMARY_MODEL_REQUIRES_PROVIDER",
+                "summary_model is set but summary_provider is empty. Set both \
+                 fields together — leaving summary_provider unset would fall \
+                 through to the server-level [context].summary_provider, which \
+                 may not match this model's namespace.",
+            ));
+        }
+    }
+
+    if let Some(p) = provider {
+        let entry = state.llm_config.providers.get(p);
+        if entry.is_none() {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "SUMMARY_PROVIDER_UNKNOWN",
+                format!(
+                    "summary_provider '{p}' is not configured under \
+                     [llm.providers.<name>] in alms.toml"
+                ),
+            ));
+        }
+        let entry_has_key = entry.is_some_and(|e| e.resolve_api_key().is_some());
+        let secrets_has_key = state.secrets.read().resolve_key(p).is_some();
+        if !entry_has_key && !secrets_has_key {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "SUMMARY_PROVIDER_MISSING_API_KEY",
+                format!(
+                    "summary_provider '{p}' has no resolvable API key — set one \
+                     with `alms auth set {p}` or configure \
+                     `[llm.providers.{p}].api_key_env` / `api_key`"
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Helper: get the SqliteStore from app state, or return 503.
 pub(crate) fn get_store(
     state: &AppState,
@@ -97,6 +167,8 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
         "thinking_budget_tokens": agent.thinking_budget_tokens,
         "reasoning_effort": agent.reasoning_effort.map(|e| e.as_wire_str()),
         "gemini_thinking_budget": agent.gemini_thinking_budget,
+        "summary_provider": agent.summary_provider,
+        "summary_model": agent.summary_model,
         "is_default": agent.is_default,
         "created_at": agent.created_at.to_rfc3339(),
         "last_active": agent.last_active.to_rfc3339(),
@@ -119,6 +191,12 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
     }
     if agent.gemini_thinking_budget.is_none() {
         v.as_object_mut().unwrap().remove("gemini_thinking_budget");
+    }
+    if agent.summary_provider.is_none() {
+        v.as_object_mut().unwrap().remove("summary_provider");
+    }
+    if agent.summary_model.is_none() {
+        v.as_object_mut().unwrap().remove("summary_model");
     }
     v
 }
@@ -154,6 +232,27 @@ pub async fn create_agent(
             .map_err(|msg| api_error(StatusCode::BAD_REQUEST, "INVALID_POSTURE", msg))?;
     }
 
+    // Per-agent summary overrides (#872) — pair-only validation. Treat
+    // the empty string the same as a missing field for back-compat with
+    // CLIs / scripts that habitually pass `""` to mean "unset".
+    let summary_provider_norm = req
+        .summary_provider
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let summary_model_norm = req
+        .summary_model
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    validate_summary_pair(
+        &state,
+        summary_provider_norm.as_deref(),
+        summary_model_norm.as_deref(),
+    )?;
+
     let now = Utc::now();
     let mut agent = AgentRecord {
         id: AgentId::new(),
@@ -166,6 +265,8 @@ pub async fn create_agent(
         thinking_budget_tokens: req.thinking_budget_tokens,
         reasoning_effort: req.reasoning_effort,
         gemini_thinking_budget: req.gemini_thinking_budget,
+        summary_provider: summary_provider_norm,
+        summary_model: summary_model_norm,
         // Always INSERT with is_default=false; set_default_agent atomically
         // clears old default + sets new one in a single transaction.
         is_default: false,
@@ -309,6 +410,41 @@ pub(crate) fn apply_update_request(
         agent.gemini_thinking_budget = Some(budget);
     }
 
+    // Per-agent summary provider/model (#872). Like the reasoning knobs
+    // above, these use `clear_*` boolean sentinels rather than the
+    // empty-string trick — an empty string is silently rejected here so
+    // that callers can't smuggle a partial-set state past the pair-only
+    // validator. A non-empty value writes through; `clear_*: true` resets
+    // the field to `None`. The cross-field pair invariant is enforced in
+    // the handler (`update_agent`) because it requires `AppState` to
+    // validate the provider against the live `[llm.providers.<name>]` map
+    // and the secrets store.
+    if req.summary_provider.is_some() && req.clear_summary_provider == Some(true) {
+        return Err(UpdateAgentError::ClearAndValueConflict("summary_provider"));
+    }
+    if req.clear_summary_provider == Some(true) {
+        agent.summary_provider = None;
+    } else if let Some(ref provider) = req.summary_provider {
+        let trimmed = provider.trim();
+        if trimmed.is_empty() {
+            return Err(UpdateAgentError::EmptySummaryField("summary_provider"));
+        }
+        agent.summary_provider = Some(trimmed.to_string());
+    }
+
+    if req.summary_model.is_some() && req.clear_summary_model == Some(true) {
+        return Err(UpdateAgentError::ClearAndValueConflict("summary_model"));
+    }
+    if req.clear_summary_model == Some(true) {
+        agent.summary_model = None;
+    } else if let Some(ref model) = req.summary_model {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            return Err(UpdateAgentError::EmptySummaryField("summary_model"));
+        }
+        agent.summary_model = Some(trimmed.to_string());
+    }
+
     agent.last_active = Utc::now();
     Ok(())
 }
@@ -321,6 +457,13 @@ pub(crate) enum UpdateAgentError {
     /// Request contained both a value and a `clear_*: true` for the same
     /// reasoning knob (#809).
     ClearAndValueConflict(&'static str),
+    /// `summary_provider` / `summary_model` (#872) was sent as an empty
+    /// string. Empty strings are not a valid clear-sentinel for this pair —
+    /// callers must use `clear_summary_provider: true` /
+    /// `clear_summary_model: true` so the pair-only invariant can be
+    /// validated cleanly. Empty-string-as-clear was deliberately rejected
+    /// for these fields to keep the wire shape unambiguous.
+    EmptySummaryField(&'static str),
 }
 
 impl UpdateAgentError {
@@ -334,6 +477,14 @@ impl UpdateAgentError {
                 "CLEAR_AND_VALUE_CONFLICT",
                 format!(
                     "Cannot send both `{field}` value and `clear_{field}: true` in the same request"
+                ),
+            ),
+            UpdateAgentError::EmptySummaryField(field) => api_error(
+                StatusCode::BAD_REQUEST,
+                "SUMMARY_FIELD_EMPTY",
+                format!(
+                    "`{field}` cannot be an empty string — use `clear_{field}: true` to reset \
+                     back to inheriting the server-level [context] settings"
                 ),
             ),
         }
@@ -350,6 +501,18 @@ pub async fn update_agent(
     let mut agent = resolve_agent(store, &id_or_name)?;
 
     apply_update_request(&mut agent, req).map_err(|e| e.to_api_error())?;
+
+    // Cross-field pair invariant for the per-agent summary fields (#872).
+    // Validated against the post-update record state so a single-field
+    // PATCH that lands the row in an asymmetric shape is rejected even
+    // when the live record has the other half set. Mirrors the
+    // server-level `SUMMARY_PROVIDER_REQUIRES_MODEL` /
+    // `SUMMARY_MODEL_REQUIRES_PROVIDER` check in `settings.rs`.
+    validate_summary_pair(
+        &state,
+        agent.summary_provider.as_deref(),
+        agent.summary_model.as_deref(),
+    )?;
 
     store
         .update_agent(&agent)
@@ -422,6 +585,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -771,6 +936,201 @@ mod tests {
             !obj.contains_key("gemini_thinking_budget"),
             "gemini_thinking_budget must be omitted when None: {json}"
         );
+    }
+
+    // ==================================================================
+    // Per-agent summary provider/model (#872)
+    //
+    // Pair-only validation runs in two layers:
+    //   - `apply_update_request` (this layer) handles the per-field
+    //     `clear_*` sentinel + empty-string rejection. Cross-field pair
+    //     invariant is delegated to `validate_summary_pair` in the HTTP
+    //     handler (because that needs `AppState` to verify provider
+    //     existence and key resolvability).
+    // ==================================================================
+
+    #[test]
+    fn apply_update_sets_summary_provider_and_model_together() {
+        let mut agent = new_agent("summary-set");
+        let req = UpdateAgentRequest {
+            summary_provider: Some("openrouter".into()),
+            summary_model: Some("minimax/minimax-m2.7".into()),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert_eq!(agent.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(agent.summary_model.as_deref(), Some("minimax/minimax-m2.7"));
+    }
+
+    #[test]
+    fn apply_update_clears_summary_provider_and_model() {
+        let mut agent = new_agent("summary-clear");
+        agent.summary_provider = Some("openrouter".into());
+        agent.summary_model = Some("minimax/minimax-m2.7".into());
+        let req = UpdateAgentRequest {
+            clear_summary_provider: Some(true),
+            clear_summary_model: Some(true),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert!(agent.summary_provider.is_none());
+        assert!(agent.summary_model.is_none());
+    }
+
+    #[test]
+    fn apply_update_rejects_clear_and_value_together_summary_provider() {
+        let mut agent = new_agent("test");
+        let req = UpdateAgentRequest {
+            summary_provider: Some("openrouter".into()),
+            clear_summary_provider: Some(true),
+            ..Default::default()
+        };
+        let err = apply_update_request(&mut agent, req).unwrap_err();
+        assert!(matches!(
+            err,
+            UpdateAgentError::ClearAndValueConflict("summary_provider")
+        ));
+    }
+
+    #[test]
+    fn apply_update_rejects_clear_and_value_together_summary_model() {
+        let mut agent = new_agent("test");
+        let req = UpdateAgentRequest {
+            summary_model: Some("anthropic/claude-haiku-4".into()),
+            clear_summary_model: Some(true),
+            ..Default::default()
+        };
+        let err = apply_update_request(&mut agent, req).unwrap_err();
+        assert!(matches!(
+            err,
+            UpdateAgentError::ClearAndValueConflict("summary_model")
+        ));
+    }
+
+    #[test]
+    fn apply_update_rejects_empty_summary_provider() {
+        // `""` for `summary_provider` is rejected — operators must use
+        // `clear_summary_provider: true` so the pair-only invariant can
+        // be validated cleanly. This is intentionally stricter than the
+        // empty-string-as-clear convention used for `model`/`provider`/
+        // `posture` (those fields have no pair-only invariant).
+        let mut agent = new_agent("test");
+        let req = UpdateAgentRequest {
+            summary_provider: Some(String::new()),
+            ..Default::default()
+        };
+        let err = apply_update_request(&mut agent, req).unwrap_err();
+        assert!(matches!(
+            err,
+            UpdateAgentError::EmptySummaryField("summary_provider")
+        ));
+        let (status, _) = err.to_api_error();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn apply_update_rejects_empty_summary_model() {
+        let mut agent = new_agent("test");
+        let req = UpdateAgentRequest {
+            summary_model: Some(String::new()),
+            ..Default::default()
+        };
+        let err = apply_update_request(&mut agent, req).unwrap_err();
+        assert!(matches!(
+            err,
+            UpdateAgentError::EmptySummaryField("summary_model")
+        ));
+    }
+
+    #[test]
+    fn apply_update_summary_fields_are_trimmed() {
+        // Non-empty values are trimmed so accidental leading/trailing
+        // whitespace doesn't slip onto the wire as a malformed model
+        // slug. Empty after trim is treated the same as empty from the
+        // start — rejected with EmptySummaryField, not silently mapped
+        // to None.
+        let mut agent = new_agent("test");
+        let req = UpdateAgentRequest {
+            summary_provider: Some("  openrouter  ".into()),
+            summary_model: Some("  minimax/minimax-m2.7  ".into()),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert_eq!(agent.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(agent.summary_model.as_deref(), Some("minimax/minimax-m2.7"));
+    }
+
+    #[test]
+    fn agent_to_json_emits_summary_fields_when_some() {
+        let mut agent = new_agent("with-summary");
+        agent.summary_provider = Some("openrouter".into());
+        agent.summary_model = Some("minimax/minimax-m2.7".into());
+        let json = agent_to_json(&agent);
+        assert_eq!(json["summary_provider"], serde_json::json!("openrouter"));
+        assert_eq!(
+            json["summary_model"],
+            serde_json::json!("minimax/minimax-m2.7")
+        );
+    }
+
+    #[test]
+    fn agent_to_json_omits_summary_fields_when_none() {
+        // Default `new_agent("...")` leaves both fields None so the
+        // JSON shape must omit the keys entirely — matches the existing
+        // pattern for `provider`/`posture`/`reasoning_effort`.
+        let agent = new_agent("no-summary");
+        let json = agent_to_json(&agent);
+        let obj = json.as_object().unwrap();
+        assert!(
+            !obj.contains_key("summary_provider"),
+            "summary_provider must be omitted when None: {json}"
+        );
+        assert!(
+            !obj.contains_key("summary_model"),
+            "summary_model must be omitted when None: {json}"
+        );
+    }
+
+    #[test]
+    fn summary_fields_round_trip_through_sqlite_with_apply_update() {
+        // End-to-end through the gateway-side wrapper: insert an agent,
+        // set both fields via PATCH, reload from the store, verify both
+        // round-trip; then clear both via the dedicated sentinels,
+        // reload, verify both are None. Mirrors
+        // `clear_sentinels_round_trip_through_sqlite` but for the new
+        // #872 fields.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let agent = new_agent("round-trip-summary");
+        store.create_agent(&agent).unwrap();
+
+        // Set both fields together.
+        let mut loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        let req = UpdateAgentRequest {
+            summary_provider: Some("openrouter".into()),
+            summary_model: Some("minimax/minimax-m2.7".into()),
+            ..Default::default()
+        };
+        apply_update_request(&mut loaded, req).unwrap();
+        store.update_agent(&loaded).unwrap();
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(reloaded.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            reloaded.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
+
+        // Clear both fields together.
+        let mut loaded = reloaded;
+        let req = UpdateAgentRequest {
+            clear_summary_provider: Some(true),
+            clear_summary_model: Some(true),
+            ..Default::default()
+        };
+        apply_update_request(&mut loaded, req).unwrap();
+        store.update_agent(&loaded).unwrap();
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(reloaded.summary_provider.is_none());
+        assert!(reloaded.summary_model.is_none());
     }
 
     #[test]

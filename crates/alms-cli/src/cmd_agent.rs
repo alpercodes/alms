@@ -212,6 +212,14 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         thinking_budget_tokens,
         reasoning_effort,
         gemini_thinking_budget,
+        // Per-agent summary overrides (#872) are not surfaced via the
+        // `alms agent create` CLI today — the CLI is operator-friendly
+        // and tracks the most-common knobs. Operators that need this
+        // can set both fields via `alms agent config <name>` once we
+        // surface the flag, or via the HTTP `PATCH /agents/{name}`
+        // endpoint which already supports them.
+        summary_provider: None,
+        summary_model: None,
         is_default: default,
         created_at: now,
         last_active: now,
@@ -671,6 +679,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,

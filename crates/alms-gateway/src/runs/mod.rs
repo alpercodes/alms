@@ -351,6 +351,20 @@ fn apply_overrides(
         if let Some(budget) = record.gemini_thinking_budget {
             cfg.gemini_thinking_budget = Some(budget);
         }
+        // Per-agent summary provider/model overrides (#872). `Some(_)`
+        // overrides the server-level `[context].summary_provider` /
+        // `summary_model` for this agent's runs. The validator on
+        // `POST /agents` / `PATCH /agents/{id}` enforces the pair-only
+        // invariant (both fields set together or both unset) so by the
+        // time we get here the per-agent values are guaranteed
+        // symmetric. `None` falls through to the server-level setting
+        // already on `cfg.context_config`.
+        if let Some(ref provider) = record.summary_provider {
+            cfg.context_config.summary_provider = Some(provider.clone());
+        }
+        if let Some(ref model) = record.summary_model {
+            cfg.context_config.summary_model = Some(model.clone());
+        }
     }
 
     // -- Per-run overrides (highest precedence) --
@@ -503,6 +517,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -638,6 +654,8 @@ mod tests {
             thinking_budget_tokens: budget,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -739,6 +757,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: effort,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -855,6 +875,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: budget,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -963,6 +985,151 @@ mod tests {
             &RunOverrides::default(),
         );
         assert!(merged.agent_config.gemini_thinking_budget.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Per-agent summary provider/model overlay (issue #872)
+    //
+    // `apply_overrides` overlays the per-agent `summary_provider` /
+    // `summary_model` from the `AgentRecord` onto the inherited
+    // `context_config`. Resolution: per-agent ?? server-level. When
+    // both are None at the per-agent layer the server-level setting
+    // (already on `cfg.context_config`) shines through — preserving
+    // the back-compat path described in #872. The pair-only invariant
+    // is enforced upstream in the HTTP handler so by the time the
+    // record reaches `apply_overrides` the two fields are guaranteed
+    // symmetric.
+    // ------------------------------------------------------------------
+
+    fn base_config_with_server_summary(
+        summary_provider: Option<&str>,
+        summary_model: Option<&str>,
+    ) -> AgentConfig {
+        AgentConfig {
+            context_config: alms_core::config::ContextConfig {
+                summary_provider: summary_provider.map(str::to_string),
+                summary_model: summary_model.map(str::to_string),
+                ..alms_core::config::ContextConfig::default()
+            },
+            ..AgentConfig::default()
+        }
+    }
+
+    fn agent_with_summary(provider: Option<&str>, model: Option<&str>) -> AgentRecord {
+        let now = Utc::now();
+        AgentRecord {
+            id: AgentId::new(),
+            name: "summary-agent".into(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: provider.map(str::to_string),
+            summary_model: model.map(str::to_string),
+            is_default: false,
+            created_at: now,
+            last_active: now,
+        }
+    }
+
+    #[test]
+    fn test_summary_per_agent_overrides_server_default() {
+        // Server default points the summary task at OpenRouter; agent
+        // overrides to Anthropic. Per-agent must win.
+        let agent = agent_with_summary(Some("anthropic"), Some("claude-haiku-4"));
+        let merged = apply_overrides(
+            base_config_with_server_summary(Some("openrouter"), Some("minimax/minimax-m2.7")),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged
+                .agent_config
+                .context_config
+                .summary_provider
+                .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            merged.agent_config.context_config.summary_model.as_deref(),
+            Some("claude-haiku-4")
+        );
+    }
+
+    #[test]
+    fn test_summary_per_agent_none_falls_through_to_server() {
+        // Per-agent both-None: the server-level summary config inherited
+        // via `context_config.clone()` wins. Identical to today's
+        // server-level path — the back-compat guarantee from #872.
+        let agent = agent_with_summary(None, None);
+        let merged = apply_overrides(
+            base_config_with_server_summary(Some("openrouter"), Some("minimax/minimax-m2.7")),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged
+                .agent_config
+                .context_config
+                .summary_provider
+                .as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            merged.agent_config.context_config.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
+    }
+
+    #[test]
+    fn test_summary_all_none_stays_none() {
+        // Both layers unset → the merged config has both fields None.
+        // The runtime-side `build_summary_client` short-circuits on
+        // `summary_provider = None` to a clone of the agent's main
+        // LLM client (the back-compat path), so no separate summary
+        // task runs.
+        let agent = agent_with_summary(None, None);
+        let merged = apply_overrides(
+            base_config_with_server_summary(None, None),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert!(
+            merged
+                .agent_config
+                .context_config
+                .summary_provider
+                .is_none()
+        );
+        assert!(merged.agent_config.context_config.summary_model.is_none());
+    }
+
+    #[test]
+    fn test_summary_per_agent_overrides_when_server_unset() {
+        // Server default is unset (the post-#872 default); per-agent
+        // opts in. Per-agent reaches the merged config exactly as set.
+        let agent = agent_with_summary(Some("openrouter"), Some("minimax/minimax-m2.7"));
+        let merged = apply_overrides(
+            base_config_with_server_summary(None, None),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged
+                .agent_config
+                .context_config
+                .summary_provider
+                .as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            merged.agent_config.context_config.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
     }
 
     // ------------------------------------------------------------------

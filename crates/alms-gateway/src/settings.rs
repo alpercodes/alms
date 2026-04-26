@@ -386,15 +386,19 @@ pub async fn patch_settings(
                 }
             };
 
-        // #871 cross-field invariant: a dedicated summary provider without an
-        // explicit summary_model would leak the agent's model slug onto the
-        // summary provider's wire (or fall back to "" via the runtime leak
-        // guard, which fails fast but is unintended UX). Reject combinations
-        // that would land in this shape, regardless of which field the patch
+        // #871 / #872 cross-field invariant: the summary provider/model
+        // pair must be symmetric — both set or both unset. The pre-#872
+        // shape only validated provider-set + model-missing, but the
+        // model-set + provider-missing direction is just as broken: the
+        // resolver used to silently pair the user's `summary_model` with
+        // the agent's primary provider (the exact misconfiguration that
+        // produced the `model: not found` 404 in #866), and the v0.2.2
+        // default config shipped in that asymmetric shape. Reject both
+        // directions at PATCH time, regardless of which field the patch
         // touched.
         let provider_set = next_summary_provider_resolved.is_some();
-        let model_missing = next_summary_model.is_none();
-        if provider_set && model_missing {
+        let model_set = next_summary_model.is_some();
+        if provider_set && !model_set {
             errors.push(
                 "SUMMARY_PROVIDER_REQUIRES_MODEL: context.summary_provider is set but \
                  context.summary_model is empty. The agent's resolved model belongs to \
@@ -402,6 +406,16 @@ pub async fn patch_settings(
                  summary provider's wire — set summary_model to a slug valid for the \
                  summary provider, or clear summary_provider (use empty string) to \
                  inherit the agent's provider/model."
+                    .to_string(),
+            );
+        } else if !provider_set && model_set {
+            errors.push(
+                "SUMMARY_MODEL_REQUIRES_PROVIDER: context.summary_model is set but \
+                 context.summary_provider is empty. The user-supplied summary_model \
+                 belongs to a specific provider's namespace; pairing it with the \
+                 agent's primary provider would 404 on the wire (#866 / #872). Set \
+                 summary_provider to the matching provider name, or clear summary_model \
+                 (use empty string) to inherit the agent's provider/model."
                     .to_string(),
             );
         } else {
@@ -1982,6 +1996,99 @@ mod tests {
                 .iter()
                 .any(|e| e.contains("SUMMARY_PROVIDER_REQUIRES_MODEL")),
             "expected SUMMARY_PROVIDER_REQUIRES_MODEL error, got: {errors:?}"
+        );
+
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.context_config.summary_provider,
+            Some("openrouter".into()),
+            "rejected PATCH must leave live summary_provider intact"
+        );
+        assert_eq!(
+            cfg.context_config.summary_model,
+            Some("minimax/minimax-m2.7".into()),
+            "rejected PATCH must leave live summary_model intact"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Symmetric pair-only validation (#872)
+    //
+    // The pre-#872 validator rejected only the (provider-set,
+    // model-missing) direction. The (model-set, provider-missing)
+    // direction was the original v0.2.2 default and silently paired
+    // the user's `summary_model` with the agent's primary provider —
+    // the exact misconfiguration that produced the 404 in #866. These
+    // tests lock down the symmetric reject path so the regression
+    // can't sneak back in.
+    // ------------------------------------------------------------------
+
+    /// Setting `summary_model` alone (provider untouched / unset) must
+    /// fire the new symmetric `SUMMARY_MODEL_REQUIRES_PROVIDER` error.
+    #[tokio::test]
+    async fn patch_rejects_summary_model_when_provider_is_unset() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = None;
+            agent.context_config.summary_model = None;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_MODEL_REQUIRES_PROVIDER")),
+            "expected SUMMARY_MODEL_REQUIRES_PROVIDER error, got: {errors:?}"
+        );
+        let cfg = state.agent_config.read();
+        assert!(
+            cfg.context_config.summary_provider.is_none(),
+            "rejected PATCH must not change summary_provider"
+        );
+        assert!(
+            cfg.context_config.summary_model.is_none(),
+            "rejected PATCH must not commit summary_model"
+        );
+    }
+
+    /// Clearing `summary_provider` (`""`) when the live `summary_model`
+    /// is `Some(...)` must produce 422 — symmetric to
+    /// `patch_rejects_clearing_model_while_provider_is_set`. Pre-#872
+    /// this combination was silently accepted, leaving the model
+    /// stranded with no matching provider.
+    #[tokio::test]
+    async fn patch_rejects_clearing_provider_while_model_is_set() {
+        let state = settings_test_app_state_with_openrouter();
+        // Seed: both set together (the valid state).
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = Some("openrouter".into());
+            agent.context_config.summary_model = Some("minimax/minimax-m2.7".into());
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_MODEL_REQUIRES_PROVIDER")),
+            "expected SUMMARY_MODEL_REQUIRES_PROVIDER error, got: {errors:?}"
         );
 
         let cfg = state.agent_config.read();
