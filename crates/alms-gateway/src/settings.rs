@@ -413,7 +413,7 @@ pub async fn patch_settings(
                 "SUMMARY_MODEL_REQUIRES_PROVIDER: context.summary_model is set but \
                  context.summary_provider is empty. The user-supplied summary_model \
                  belongs to a specific provider's namespace; pairing it with the \
-                 agent's primary provider would 404 on the wire (#866 / #872). Set \
+                 agent's primary provider would 404 on the wire. Set \
                  summary_provider to the matching provider name, or clear summary_model \
                  (use empty string) to inherit the agent's provider/model."
                     .to_string(),
