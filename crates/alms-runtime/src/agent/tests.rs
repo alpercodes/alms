@@ -388,7 +388,7 @@ async fn test_guarded_posture_sequential_approvals() {
     for tc in &tool_calls {
         results.push(
             runtime
-                .execute_tool_call(tc, uuid::Uuid::new_v4(), &session_manager, session.id)
+                .execute_tool_call(tc, uuid::Uuid::new_v4(), &session_manager, session.id, None)
                 .await,
         );
     }
@@ -442,6 +442,7 @@ async fn test_cancel_during_approval_wait_emits_tool_end() {
             ..AgentConfig::default()
         },
         llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
         tools,
         workspace: None,
         event_sender: Some(tx),
@@ -484,7 +485,13 @@ async fn test_cancel_during_approval_wait_emits_tool_end() {
     });
 
     let result = runtime
-        .execute_tool_call(&tool_call, invocation_id, &session_manager, session.id)
+        .execute_tool_call(
+            &tool_call,
+            invocation_id,
+            &session_manager,
+            session.id,
+            None,
+        )
         .await;
 
     // Drop the runtime so the event channel closes and the handler's `recv`
@@ -579,7 +586,13 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
 
     // Execute the auto-approved tool — should succeed without blocking.
     let result = runtime
-        .execute_tool_call(&tc, uuid::Uuid::new_v4(), &session_manager, session.id)
+        .execute_tool_call(
+            &tc,
+            uuid::Uuid::new_v4(),
+            &session_manager,
+            session.id,
+            None,
+        )
         .await;
     assert!(
         result.is_ok(),
@@ -658,7 +671,13 @@ async fn test_classifier_blocked_shell_surfaces_target_in_tool_end() {
 
     let tc = ToolCall::new("tc-blocked", "shell", r#"{"command":"rm -rf /etc"}"#);
     let result = runtime
-        .execute_tool_call(&tc, uuid::Uuid::new_v4(), &session_manager, session.id)
+        .execute_tool_call(
+            &tc,
+            uuid::Uuid::new_v4(),
+            &session_manager,
+            session.id,
+            None,
+        )
         .await;
     assert!(
         result.is_err(),
@@ -2225,6 +2244,465 @@ fn test_agent_config_thinking_budget_threads_into_request() {
         req0 = req0.with_thinking_budget(cfg0.anthropic_thinking_budget);
     }
     assert!(req0.thinking_budget_tokens.is_none());
+}
+
+// =====================================================================
+// #846 — cancel-during-tool-execution must emit a synthetic ToolEnd.
+//
+// Sibling of #816 (cancel during approval-wait, fixed in #845). Both
+// cancel arms in `run_tool_calls` (Guarded sequential, line ~603, and
+// FullControl/Autonomous parallel, line ~637) race against the inner
+// `execute_tool_call` future. When the cancel arm wins, the inner future
+// is dropped at an `await` point — `tool_start` was already emitted but
+// `tool_end` was not. The runtime must synthesise a matching `ToolEnd`
+// before unwinding so consumers (UI, audit log, persisted state) see
+// the 1:1 invariant honoured. The frontend defensive sweep that
+// previously masked this bug (`use-session-stream.js:1018-1023`, added
+// in #594) is removed in the same PR — this test stands alone.
+// =====================================================================
+
+/// Test helper: a tool whose `execute()` awaits on a oneshot receiver
+/// before returning, letting the test deterministically hold the tool
+/// in-flight until it deliberately fires the cancel token.
+///
+/// Marked `is_auto_approved = true` so it bypasses the Guarded approval
+/// gate and the inner future immediately reaches `tools.execute().await`
+/// (the cancel-during-tool-execution race window).
+#[derive(Debug)]
+struct BlockingTestTool {
+    name: String,
+    /// Drained on each call. Tests pre-load this with one or more
+    /// receivers; each `execute()` invocation pops one and awaits it.
+    /// Once the channel sender is dropped (without sending), `await`
+    /// returns Err and the tool returns an error.
+    rx_queue: tokio::sync::Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl BlockingTestTool {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            rx_queue: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    async fn enqueue(&self, rx: tokio::sync::oneshot::Receiver<()>) {
+        self.rx_queue.lock().await.push_back(rx);
+    }
+}
+
+#[async_trait::async_trait]
+impl alms_sandbox::Tool for BlockingTestTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "test-only tool that blocks on a oneshot receiver"
+    }
+    fn is_auto_approved(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _params: serde_json::Value,
+    ) -> alms_sandbox::SandboxResult<serde_json::Value> {
+        let rx = {
+            let mut q = self.rx_queue.lock().await;
+            q.pop_front()
+        };
+        if let Some(rx) = rx {
+            // Block until the test fires the sender, OR until the future
+            // is dropped (cancel-during-tool-execution race). Drop is the
+            // expected path for #846 tests.
+            let _ = rx.await;
+        }
+        Ok(serde_json::json!({"ok": true}))
+    }
+}
+
+fn make_runtime_for_cancel_test(
+    posture: Posture,
+    tool: std::sync::Arc<dyn alms_sandbox::Tool>,
+    cancel_token: tokio_util::sync::CancellationToken,
+    tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+) -> AgentRuntime {
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let tools = ToolRegistry::new();
+    tools.register(tool);
+    AgentRuntime {
+        agent_id: AgentId::new(),
+        config: AgentConfig {
+            posture,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: Some(cancel_token),
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        agent_name: None,
+    }
+}
+
+/// Spawn a watcher task that consumes events from `rx`, mirrors
+/// `(invocation_id, ok, result)` of every ToolEnd into `ends`, marks
+/// every ToolStart's `invocation_id` in `starts`, and once the
+/// observed `ToolStart` count reaches `cancel_after_n_starts` fires
+/// `cancel_token`. This deterministically arranges for the cancel to
+/// land after every expected inner future has registered with the
+/// in-flight tracker and is parked at its blocking await — removing
+/// the dependency on tokio scheduling order that an "always cancel on
+/// first start" variant would have in the multi-tool parallel case
+/// (Tim's nit on #846).
+// Test helper return type is intentionally a tuple of two collections
+// — splitting into a named alias would obscure the call sites without
+// any reuse benefit (only one caller shape).
+#[allow(clippy::type_complexity)]
+fn spawn_cancel_on_tool_start(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
+    cancel_token: tokio_util::sync::CancellationToken,
+    cancel_after_n_starts: usize,
+) -> tokio::task::JoinHandle<(
+    std::collections::HashSet<uuid::Uuid>,
+    Vec<(uuid::Uuid, bool, serde_json::Value)>,
+)> {
+    assert!(
+        cancel_after_n_starts >= 1,
+        "cancel_after_n_starts must be at least 1"
+    );
+    tokio::spawn(async move {
+        let mut starts = std::collections::HashSet::new();
+        let mut ends = Vec::new();
+        let mut cancelled = false;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                RuntimeEvent::ToolStart { invocation_id, .. } => {
+                    starts.insert(invocation_id);
+                    // Cancel only once we've observed the expected
+                    // number of ToolStarts. For the parallel test (n=3)
+                    // this guarantees all 3 inner futures have
+                    // registered with the in-flight tracker before the
+                    // cancel arm fires, regardless of how the runtime
+                    // interleaves the watcher task with `join_all`'s
+                    // synchronous walk.
+                    if !cancelled && starts.len() >= cancel_after_n_starts {
+                        cancel_token.cancel();
+                        cancelled = true;
+                    }
+                }
+                RuntimeEvent::ToolEnd {
+                    invocation_id,
+                    ok,
+                    result,
+                    ..
+                } => {
+                    ends.push((invocation_id, ok, result));
+                }
+                _ => {}
+            }
+        }
+        (starts, ends)
+    })
+}
+
+/// #846 — Guarded sequential cancel arm: a non-conflicting tool starts
+/// executing under Guarded posture (auto-approved → no approval gate),
+/// the test cancels mid-execution, and `run_tool_calls` must synthesise
+/// a matching `ToolEnd` for the in-flight tool before returning
+/// `Cancelled`.
+#[tokio::test]
+async fn test_cancel_during_tool_execution_emits_tool_end_guarded() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let cancel_token = CancellationToken::new();
+
+    let blocking = std::sync::Arc::new(BlockingTestTool::new("block_test"));
+    // Pre-load one receiver — the matching sender is held by the test
+    // and never fired, so the tool will block until its future is
+    // dropped by the cancel arm.
+    let (_tx_release, rx_release) = tokio::sync::oneshot::channel::<()>();
+    blocking.enqueue(rx_release).await;
+
+    let runtime = make_runtime_for_cancel_test(
+        Posture::Guarded,
+        blocking.clone() as std::sync::Arc<dyn alms_sandbox::Tool>,
+        cancel_token.clone(),
+        tx,
+    );
+
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+    let tool_calls = vec![ToolCall::new("tc1", "block_test", "{}")];
+    let invocation_id = uuid::Uuid::new_v4();
+    let invocation_ids = vec![invocation_id];
+
+    // Guarded sequential cancel arm — single tool, cancel after the
+    // first (only) ToolStart.
+    let watcher = spawn_cancel_on_tool_start(rx, cancel_token.clone(), 1);
+
+    let result = runtime
+        .run_tool_calls(
+            &tool_calls,
+            &invocation_ids,
+            &[],
+            &session_manager,
+            session.id,
+        )
+        .await;
+
+    // Drop runtime so the event channel closes and the watcher task's
+    // `recv` loop terminates.
+    drop(runtime);
+    let (starts, ends) = watcher.await.unwrap();
+
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+    assert!(
+        starts.contains(&invocation_id),
+        "tool_start must have been emitted before cancel landed (#846)"
+    );
+
+    let our_ends: Vec<_> = ends
+        .iter()
+        .filter(|(id, _, _)| *id == invocation_id)
+        .collect();
+    assert_eq!(
+        our_ends.len(),
+        1,
+        "exactly one ToolEnd must be emitted for invocation {} — got {:?}",
+        invocation_id,
+        ends
+    );
+    let (_id, ok, result_val) = our_ends[0];
+    assert!(!ok, "synthetic tool_end after cancel must report ok=false");
+    let err_str = result_val
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        err_str.contains("cancel"),
+        "synthetic tool_end result.error should mention cancellation, got {:?}",
+        result_val
+    );
+}
+
+/// #846 — FullControl/Autonomous parallel cancel arm: 3 tools run
+/// concurrently in `join_all` under FullControl, the test cancels
+/// mid-execution, and `run_tool_calls` must synthesise a matching
+/// `ToolEnd` for *each* in-flight tool before returning `Cancelled`.
+/// This exercises the harder of the two arms — multiple in-flight calls
+/// at cancel time, each needs its own synthetic event.
+#[tokio::test]
+async fn test_cancel_during_tool_execution_emits_tool_end_parallel() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let cancel_token = CancellationToken::new();
+
+    let blocking = std::sync::Arc::new(BlockingTestTool::new("block_test"));
+    // Three calls — pre-load three receivers, hold all three senders
+    // unfired so all three futures park at their blocking awaits.
+    let mut held_senders = Vec::new();
+    for _ in 0..3 {
+        let (s, r) = tokio::sync::oneshot::channel::<()>();
+        blocking.enqueue(r).await;
+        held_senders.push(s);
+    }
+
+    let runtime = make_runtime_for_cancel_test(
+        Posture::FullControl,
+        blocking.clone() as std::sync::Arc<dyn alms_sandbox::Tool>,
+        cancel_token.clone(),
+        tx,
+    );
+
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+    let tool_calls = vec![
+        ToolCall::new("tc1", "block_test", "{}"),
+        ToolCall::new("tc2", "block_test", "{}"),
+        ToolCall::new("tc3", "block_test", "{}"),
+    ];
+    let inv_ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+
+    // Cancel only after observing all 3 ToolStarts. This removes the
+    // dependency on tokio scheduling order — instead of trusting that
+    // `join_all`'s synchronous walk polls all 3 inner futures through
+    // their first await before the watcher task is scheduled, we wait
+    // until the watcher has actually seen 3 ToolStart events, which
+    // proves all 3 invocations are registered in the in-flight tracker
+    // before the cancel arm fires (Tim's nit on #846).
+    let watcher = spawn_cancel_on_tool_start(rx, cancel_token.clone(), 3);
+
+    let result = runtime
+        .run_tool_calls(&tool_calls, &inv_ids, &[], &session_manager, session.id)
+        .await;
+
+    drop(runtime);
+    drop(held_senders);
+    let (starts, ends) = watcher.await.unwrap();
+
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+
+    for inv in &inv_ids {
+        assert!(
+            starts.contains(inv),
+            "tool_start missing for invocation {} — test setup broken",
+            inv
+        );
+        let our_ends: Vec<_> = ends.iter().filter(|(id, _, _)| id == inv).collect();
+        assert_eq!(
+            our_ends.len(),
+            1,
+            "expected exactly one ToolEnd for invocation {} — got {:?} \
+             (the parallel cancel arm must synthesise one ToolEnd per \
+             in-flight tool, no more no less; #846)",
+            inv,
+            ends
+        );
+        let (_id, ok, result_val) = our_ends[0];
+        assert!(
+            !ok,
+            "synthetic tool_end after cancel must report ok=false (inv {})",
+            inv
+        );
+        let err_str = result_val
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            err_str.contains("cancel"),
+            "synthetic tool_end result.error should mention cancellation \
+             (inv {}), got {:?}",
+            inv,
+            result_val
+        );
+    }
+}
+
+/// #846 — No-double-emission regression: a tool that finishes Ok
+/// followed (in real time) by a cancel arrival must not produce two
+/// `ToolEnd` events for the same invocation. The unregister-before-emit
+/// protocol inside `execute_tool_call` ensures the entry is gone from
+/// the in-flight tracker before the outer cancel arm could even see it.
+///
+/// Sequencing is event-driven, not wall-clock based (Tim's nit on
+/// #846): the watcher task fires `cancel_token.cancel()` the moment it
+/// observes a `ToolEnd`, which proves the success path's
+/// unregister-before-emit step has already run by the time the cancel
+/// could possibly land. Nothing depends on `tokio::time::sleep`.
+#[tokio::test]
+async fn test_no_double_tool_end_when_tool_ok_then_cancel() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let cancel_token = CancellationToken::new();
+
+    let blocking = std::sync::Arc::new(BlockingTestTool::new("block_test"));
+    // Single call with a sender that we WILL fire before cancelling —
+    // forces the inner branch of `select!` to win and emit the normal
+    // success ToolEnd. The cancel arrives after, by which point the
+    // tracker is empty so no synthetic should be emitted.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    blocking.enqueue(release_rx).await;
+
+    let runtime = make_runtime_for_cancel_test(
+        Posture::Guarded,
+        blocking.clone() as std::sync::Arc<dyn alms_sandbox::Tool>,
+        cancel_token.clone(),
+        tx,
+    );
+
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+    let tool_calls = vec![ToolCall::new("tc1", "block_test", "{}")];
+    let invocation_id = uuid::Uuid::new_v4();
+    let invocation_ids = vec![invocation_id];
+
+    // Watcher: counts ToolEnd events for this invocation, and on the
+    // FIRST observed ToolEnd fires `cancel_token.cancel()`. Because
+    // the success ToolEnd is sent only AFTER the inner future has
+    // already removed itself from the in-flight tracker (the
+    // unregister-before-emit protocol in `execute_tool_call`), this
+    // guarantees that the cancel — if it races into the outer
+    // `run_tool_calls` cancel arm at all — finds an empty tracker and
+    // emits zero synthetic ToolEnds. Replaces a fragile sleep(20ms)/
+    // sleep(200ms) pair with deterministic event-based sequencing.
+    let watcher = {
+        let cancel_token = cancel_token.clone();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            let mut tool_end_count = 0usize;
+            while let Some(ev) = rx.recv().await {
+                if let RuntimeEvent::ToolEnd {
+                    invocation_id: id, ..
+                } = ev
+                    && id == invocation_id
+                {
+                    tool_end_count += 1;
+                    if tool_end_count == 1 {
+                        cancel_token.cancel();
+                    }
+                }
+            }
+            tool_end_count
+        })
+    };
+
+    // Release the tool synchronously — no wall-clock wait needed. The
+    // runtime has not started yet, but the inner await on the receiver
+    // sees the value as soon as it polls.
+    let _ = release_tx.send(());
+
+    let result = runtime
+        .run_tool_calls(
+            &tool_calls,
+            &invocation_ids,
+            &[],
+            &session_manager,
+            session.id,
+        )
+        .await;
+    drop(runtime);
+
+    let tool_end_count = watcher.await.unwrap();
+
+    assert!(
+        result.is_ok(),
+        "tool finished normally, run_tool_calls should return Ok, got {:?}",
+        result
+    );
+    assert_eq!(
+        tool_end_count, 1,
+        "exactly one ToolEnd must be emitted per invocation — even if a \
+         cancel arrives after the inner future already removed itself \
+         from the in-flight tracker (#846 no-double-emission protocol)"
+    );
 }
 
 /// #866: `with_summary_llm` populates the dedicated summary client.

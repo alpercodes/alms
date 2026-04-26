@@ -1011,17 +1011,22 @@ export function openSessionStream(sessionId, opts) {
                     m.type === 'approval' && !m.resolved
                     && (!m.runId || !endingRunId || m.runId === endingRunId);
 
-                // Mark any still-running tool messages as cancelled.
-                // When a run is cancelled (or errors) mid-tool-execution, the
-                // backend emits run_cancelled but never emits tool_end for in-
-                // flight tools, leaving the spinner animation stuck.  (Fixes #593)
-                const isStuckTool = (m) =>
-                    m.type === 'tool' && m.status === 'running';
+                // NOTE: The defensive sweep that previously rewrote any
+                // `m.type === 'tool' && m.status === 'running'` to
+                // `cancelled` on run_end (added in PR #594 for #593) was
+                // removed in #846. The runtime now guarantees that every
+                // `tool_start` has a matching terminal `tool_end` event,
+                // including the cancel-during-tool-execution case (the
+                // synthesised `ToolEnd { ok: false, result: { error: 'run
+                // cancelled' } }` emitted from the outer `select!` cancel
+                // arm in `run_tool_calls`). The bandage was hiding a
+                // contract violation rather than fixing it; with the
+                // runtime fix in place the bandage is no longer needed,
+                // and removing it ensures any future regression in the
+                // runtime's terminal-event invariant surfaces immediately
+                // (stuck spinner) rather than being silently masked.
 
                 let msgs = prev.filter(m => !isStaleApproval(m)).map(m => {
-                    if (isStuckTool(m)) {
-                        return { ...m, status: 'cancelled' };
-                    }
                     // Seal live DM reasoning blocks for this run.
                     if (m.type === 'dm_reasoning' && m.runId === endingRunId && m.isLive) {
                         const finalThinking = savedThinkingText || m.thinkingText || '';

@@ -1,9 +1,11 @@
-use crate::events::{PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS, RuntimeEvent};
+use crate::events::{PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS, RuntimeEvent, RuntimeEventSender};
 use crate::llm_types::*;
 use alms_core::{AlmsError, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
 use alms_session::{
     Content as SessionContent, Message as SessionMessage, Role as SessionRole, SessionManager,
 };
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -14,6 +16,76 @@ use super::dm::{
 };
 use super::helpers::tool_result_ok;
 use super::types::Posture;
+
+/// In-flight tool-call tracker shared between `run_tool_calls` and
+/// `execute_tool_call`.
+///
+/// Keyed by `invocation_id` (the SSE-facing identifier carried by both
+/// `ToolStart` and `ToolEnd`), value is the canonical tool name (kept for
+/// log context when the outer cancel arm synthesises `ToolEnd` events).
+///
+/// **Protocol**:
+///   1. `execute_tool_call` inserts `(invocation_id, name)` immediately
+///      before emitting `ToolStart`, and removes the entry immediately
+///      before emitting any of its terminal `ToolEnd` paths (success,
+///      error, denied, cancel-during-approval-wait).
+///   2. When the outer `select!` cancel arm fires (cancel-during-tool-
+///      execution), the inner `execute_tool_call` future is dropped at an
+///      `await` point — between award boundaries the steps in (1) are
+///      synchronous, so any entry still in the tracker corresponds to a
+///      live `tool_start` with no terminal event yet.
+///   3. The cancel arm drains the tracker and emits a synthetic
+///      `ToolEnd { ok: false, result: {"error": "run cancelled"} }` per
+///      remaining entry, restoring the 1:1 invariant before returning
+///      `AlmsError::Cancelled`. (Mirrors the result shape from the
+///      cancel-during-approval-wait fix in #816 / #845.)
+///
+/// See issue #846 for the full bug write-up. The frontend defensive sweep
+/// at `use-session-stream.js` (added in #594 to mask this bug at the UI
+/// layer) is removed in the same PR — the runtime is now solely
+/// responsible for terminal-event emission.
+type InflightTracker = Mutex<HashMap<Uuid, String>>;
+
+/// Remove `invocation_id` from the in-flight tracker if present. Called by
+/// each terminal `ToolEnd` emission path inside `execute_tool_call` so the
+/// outer cancel arm in `run_tool_calls` does not synthesise a duplicate
+/// event for a tool that already terminated.
+///
+/// Cheap (single hashmap remove) and a no-op when no tracker is attached.
+fn unregister_inflight(inflight: Option<&InflightTracker>, invocation_id: Uuid) {
+    if let Some(tracker) = inflight {
+        let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        guard.remove(&invocation_id);
+    }
+}
+
+/// Drain `inflight` and emit a synthetic `ToolEnd` for each remaining
+/// entry. Used by the outer cancel arms in `run_tool_calls` after one of
+/// the `select!` cancel branches wins and the inner futures are dropped.
+fn synthesize_cancel_tool_ends(sender: Option<&RuntimeEventSender>, inflight: &InflightTracker) {
+    let drained: Vec<(Uuid, String)> = {
+        let mut guard = inflight.lock().unwrap_or_else(|p| p.into_inner());
+        guard.drain().collect()
+    };
+    if drained.is_empty() {
+        return;
+    }
+    let Some(sender) = sender else { return };
+    for (invocation_id, tool_name) in drained {
+        debug!(
+            tool_name = %tool_name,
+            invocation_id = %invocation_id,
+            "Emitting synthetic tool_end for cancel-during-tool-execution (#846)"
+        );
+        let _ = sender.send(RuntimeEvent::ToolEnd {
+            invocation_id,
+            ok: false,
+            result: serde_json::json!({"error": "run cancelled"}),
+            source_agent: None,
+            task_id: None,
+        });
+    }
+}
 
 /// Output of a completed agent loop.
 ///
@@ -572,7 +644,7 @@ impl AgentRuntime {
     ///
     /// Returns `Err(AlmsError::Cancelled)` if the run is cancelled during
     /// execution; otherwise returns the result vector in tool_calls order.
-    async fn run_tool_calls(
+    pub(crate) async fn run_tool_calls(
         &self,
         tool_calls: &[ToolCall],
         invocation_ids: &[Uuid],
@@ -580,6 +652,11 @@ impl AgentRuntime {
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
     ) -> AlmsResult<Vec<AlmsResult<serde_json::Value>>> {
+        // Tracker for in-flight tool calls (#846). Shared with each
+        // `execute_tool_call` invocation so the outer cancel arms below can
+        // synthesise matching `ToolEnd` events for any tool whose inner
+        // future was dropped mid-flight by `tokio::select!`.
+        let inflight: InflightTracker = Mutex::new(HashMap::new());
         match self.config.posture {
             Posture::Guarded => {
                 // Sequential execution with cancellation support during each tool.
@@ -599,11 +676,19 @@ impl AgentRuntime {
                     }
                     let result = if let Some(ref token) = self.cancel_token {
                         tokio::select! {
-                            r = self.execute_tool_call(tc, inv_id, session_manager, session_id) => r,
-                            _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                            r = self.execute_tool_call(tc, inv_id, session_manager, session_id, Some(&inflight)) => r,
+                            _ = token.cancelled() => {
+                                // Cancel-during-tool-execution (#846): the
+                                // inner future was dropped at an await point
+                                // inside `execute_tool_call`. Emit synthetic
+                                // `ToolEnd` events for any tool that had
+                                // already fired `ToolStart`, then unwind.
+                                synthesize_cancel_tool_ends(self.event_sender.as_ref(), &inflight);
+                                return Err(AlmsError::Cancelled);
+                            }
                         }
                     } else {
-                        self.execute_tool_call(tc, inv_id, session_manager, session_id)
+                        self.execute_tool_call(tc, inv_id, session_manager, session_id, None)
                             .await
                     };
                     results.push(result);
@@ -629,12 +714,25 @@ impl AgentRuntime {
                             invocation_ids[i],
                             session_manager,
                             session_id,
+                            Some(&inflight),
                         )
                     });
                     if let Some(ref token) = self.cancel_token {
                         tokio::select! {
                             r = futures::future::join_all(exec_futures) => r,
-                            _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                            _ = token.cancelled() => {
+                                // Cancel-during-tool-execution (#846): up to
+                                // N inner futures were running concurrently
+                                // when the cancel arm won — each one needs a
+                                // synthetic `ToolEnd` to match its already-
+                                // emitted `ToolStart`. Tools that finished
+                                // before the cancel raced through have
+                                // already removed themselves from the
+                                // tracker, so this only synthesises for
+                                // genuinely in-flight calls.
+                                synthesize_cancel_tool_ends(self.event_sender.as_ref(), &inflight);
+                                return Err(AlmsError::Cancelled);
+                            }
                         }
                     } else {
                         futures::future::join_all(exec_futures).await
@@ -1073,9 +1171,18 @@ impl AgentRuntime {
     }
 
     /// Execute a tool call, emitting tool_start/tool_end events and handling approvals.
+    ///
+    /// `inflight` is the in-flight tool tracker shared with `run_tool_calls`
+    /// (see [`InflightTracker`]). When `Some`, this method registers the
+    /// `(invocation_id, tool_name)` pair before emitting `ToolStart` and
+    /// removes it before any of its terminal `ToolEnd` paths so the outer
+    /// `select!` cancel arm can synthesise events for any future that was
+    /// dropped mid-flight. `None` is used by the non-cancel-token branch
+    /// and by tests that do not care about cancel-during-execution
+    /// bookkeeping.
     #[instrument(
         level = "info",
-        skip(self, tool_call, invocation_id, session_manager),
+        skip(self, tool_call, invocation_id, session_manager, inflight),
         fields(
             agent_id = %self.agent_id.0,
             tool_name = %tool_call.function.name,
@@ -1090,6 +1197,7 @@ impl AgentRuntime {
         invocation_id: Uuid,
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
+        inflight: Option<&InflightTracker>,
     ) -> AlmsResult<serde_json::Value> {
         let name = &tool_call.function.name;
         let args_str = &tool_call.function.arguments;
@@ -1149,6 +1257,34 @@ impl AgentRuntime {
             return Err(err);
         }
 
+        // Hoisted guard (Tim's nit on #846): the Guarded-posture branch
+        // below requires an event sender to emit `ApprovalRequired`. If
+        // we discover that requirement AFTER inserting into the in-flight
+        // tracker, the early-return via `?` would leave a dangling
+        // tracker entry, and a subsequent outer cancel arm would
+        // synthesise a `ToolEnd` for an `invocation_id` that never had a
+        // matching `ToolStart` (the emit below is itself gated on
+        // `Some(ref sender)`). Validating up-front keeps the
+        // tracker-insert + tool_start-emit + approval-gate trio
+        // structurally consistent.
+        let auto_approved = self.tools.is_auto_approved(name);
+        let needs_approval_gate = self.config.posture == Posture::Guarded && !auto_approved;
+        if needs_approval_gate && self.event_sender.is_none() {
+            return Err(alms_core::AlmsError::Runtime(
+                "Guarded posture requires an event sender for approvals".to_string(),
+            ));
+        }
+
+        // Register in the in-flight tracker BEFORE emitting tool_start so
+        // that if the next await is dropped by an outer cancel arm (#846),
+        // the cancel arm can find this entry and synthesise a matching
+        // ToolEnd. Insert + emit are both synchronous, so no future
+        // cancellation can fire between them.
+        if let Some(tracker) = inflight {
+            let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+            guard.insert(invocation_id, name.to_string());
+        }
+
         // Emit tool_start
         if let Some(ref sender) = self.event_sender {
             let _ = sender.send(RuntimeEvent::ToolStart {
@@ -1164,18 +1300,17 @@ impl AgentRuntime {
         // Auto-approved tools (datetime, echo, read-only tools) bypass this
         // gate — they are inherently safe and requiring approval adds friction
         // with zero security benefit.
-        let auto_approved = self.tools.is_auto_approved(name);
         if self.config.posture == Posture::Guarded && auto_approved {
             debug!(
                 tool_name = %name,
                 "Auto-approved tool — skipping approval gate in guarded posture"
             );
-        } else if self.config.posture == Posture::Guarded {
-            let sender = self.event_sender.as_ref().ok_or_else(|| {
-                alms_core::AlmsError::Runtime(
-                    "Guarded posture requires an event sender for approvals".to_string(),
-                )
-            })?;
+        } else if needs_approval_gate {
+            // Sender presence already validated above; unwrap is safe.
+            let sender = self
+                .event_sender
+                .as_ref()
+                .expect("event_sender presence validated above");
             let approval_id = Uuid::new_v4();
             let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
             let _ = sender.send(RuntimeEvent::ApprovalRequired {
@@ -1197,6 +1332,10 @@ impl AgentRuntime {
                 tokio::select! {
                     result = decision_rx => result.unwrap_or(false),
                     _ = token.cancelled() => {
+                        // Unregister before emit so the outer cancel arm in
+                        // `run_tool_calls` does not synthesise a duplicate
+                        // (#846 protocol).
+                        unregister_inflight(inflight, invocation_id);
                         let _ = sender.send(RuntimeEvent::ToolEnd {
                             invocation_id,
                             ok: false,
@@ -1211,6 +1350,12 @@ impl AgentRuntime {
                 match decision_rx.await {
                     Ok(v) => v,
                     Err(_) => {
+                        // Approval channel closed without resolution. This
+                        // is a structural error and the cancel-token branch
+                        // is not active here (`inflight` is `None`), so no
+                        // bookkeeping is required. Pre-existing behaviour:
+                        // the run unwinds without a matching ToolEnd. That
+                        // gap is out of scope for #846.
                         return Err(alms_core::AlmsError::ToolExecution(
                             "Approval channel closed".to_string(),
                         ));
@@ -1218,6 +1363,7 @@ impl AgentRuntime {
                 }
             };
             if !approved {
+                unregister_inflight(inflight, invocation_id);
                 let _ = sender.send(RuntimeEvent::ToolEnd {
                     invocation_id,
                     ok: false,
@@ -1235,6 +1381,16 @@ impl AgentRuntime {
         // Execute
         let result = self.tools.execute(name, args.clone()).await;
         let elapsed = start.elapsed();
+
+        // The inner future has finished and we are now in synchronous code
+        // that emits the matching ToolEnd. Unregister from the in-flight
+        // tracker BEFORE the emission below so the outer cancel arm in
+        // `run_tool_calls` cannot synthesise a duplicate ToolEnd.
+        //
+        // Safety: from this point until the ToolEnd `sender.send(..)` call
+        // there are no `await`s, so `tokio::select!` cannot drop this
+        // future and the cancel arm cannot fire. (#846 protocol)
+        unregister_inflight(inflight, invocation_id);
 
         match &result {
             Ok(value) => {
