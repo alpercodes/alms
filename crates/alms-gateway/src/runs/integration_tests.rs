@@ -130,6 +130,8 @@ fn seed_alice_bob(state: &AppState) -> (AgentId, AgentId) {
         thinking_budget_tokens: None,
         reasoning_effort: None,
         gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
         is_default: false,
         created_at: Utc::now(),
         last_active: Utc::now(),
@@ -1636,6 +1638,7 @@ async fn create_run_pre_persists_user_input_to_session() {
 
     let req = CreateRunRequest {
         session_id,
+        agent_id: None,
         input: RunInput::Text {
             text: "hello from the user".into(),
         },
@@ -1699,6 +1702,158 @@ async fn create_run_pre_persists_user_input_to_session() {
     );
 }
 
+#[tokio::test]
+async fn create_run_rejects_agent_session_mismatch() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, _shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let owner_id = AgentId::new();
+    let other_id = AgentId::new();
+    let session = state.session_manager.get_or_create(owner_id, "web");
+
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(other_id),
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+        model: None,
+        max_tokens: None,
+        posture: None,
+        provider: None,
+        debug_mode: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+    };
+
+    let Err((status, body)) = super::lifecycle::create_run(State(state), Json(req)).await else {
+        panic!("create_run should reject mismatched agent_id");
+    };
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(body.0["error"]["code"], "AGENT_SESSION_MISMATCH");
+}
+
+#[tokio::test]
+async fn create_run_requires_agent_id_for_shared_session() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, _shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let session_id = SessionId::deterministic_dm("alice", "bob");
+    let session = state
+        .session_manager
+        .get_or_create_shared(session_id, "dm:alice:bob");
+
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: None,
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+        model: None,
+        max_tokens: None,
+        posture: None,
+        provider: None,
+        debug_mode: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+    };
+
+    let Err((status, body)) = super::lifecycle::create_run(State(state), Json(req)).await else {
+        panic!("create_run should require agent_id for shared sessions");
+    };
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(body.0["error"]["code"], "AGENT_ID_REQUIRED");
+}
+
+#[tokio::test]
+async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_agent_id() {
+    use alms_core::registry::AgentRecord;
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+    use chrono::Utc;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "chamunchuk".into(),
+        description: String::new(),
+        model: Some("claude-sonnet-4-6".into()),
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session_id = SessionId::deterministic_dm("alice", "bob");
+    let session = state
+        .session_manager
+        .get_or_create_shared(session_id, "dm:alice:bob");
+
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+        model: None,
+        max_tokens: None,
+        posture: None,
+        provider: None,
+        debug_mode: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+    };
+
+    let (status, resp) = match super::lifecycle::create_run(State(state.clone()), Json(req)).await {
+        Ok(ok) => ok,
+        Err((code, body)) => panic!("create_run failed: status={code:?} body={:?}", body.0),
+    };
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    shutdown_token.cancel();
+
+    let runs = state.run_manager.list_by_agent(agent_id, 10);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_id, resp.0.run_id);
+    assert_eq!(runs[0].agent_id, agent_id);
+    assert_eq!(runs[0].session_id, session.id);
+
+    let base_agent_config = state.agent_config.read().clone();
+    let secrets = state.secrets.read();
+    let resolved = super::resolve_agent_config(
+        runs[0].agent_id,
+        &state.session_manager,
+        &base_agent_config,
+        &state.llm,
+        Some(&secrets),
+    );
+    assert_eq!(resolved.agent_name.as_deref(), Some("chamunchuk"));
+    assert_eq!(resolved.llm.provider(), "anthropic");
+    assert_eq!(resolved.llm.default_model(), "claude-sonnet-4-6");
+}
+
 /// When the user sends a message to an agent that is already *running* another
 /// task (but nothing is queued behind it), `queued_behind` in the run_created
 /// SSE event must be >= 1 so the UI shows "Queued -- waiting for agent..."
@@ -1729,6 +1884,7 @@ async fn create_run_reports_queued_behind_when_agent_is_running() {
 
     let req = CreateRunRequest {
         session_id,
+        agent_id: None,
         input: RunInput::Text {
             text: "second message".into(),
         },

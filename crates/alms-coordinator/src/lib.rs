@@ -861,6 +861,18 @@ struct SubagentRecordConfig {
     /// (per-run > per-agent > server default) intact for named
     /// subagents on the Gemini path.
     gemini_thinking_budget: Option<u32>,
+    /// Per-named-subagent summary provider override (#872). When the
+    /// subagent has its own `summary_provider`/`summary_model` pair set
+    /// on the registry record, those values override the parent's
+    /// effective summary config for this subagent's run. `None` (on
+    /// either field) inherits the parent's effective summary config —
+    /// which is itself the result of (parent's per-agent ?? server-
+    /// level). The pair-only invariant guarantees these arrive together
+    /// so the two-field overlay below is symmetric.
+    summary_provider: Option<String>,
+    /// Per-named-subagent summary model override (#872). See
+    /// [`SubagentRecordConfig::summary_provider`] for semantics.
+    summary_model: Option<String>,
 }
 
 /// Build an `AgentConfig` for a subagent. Named subagents get their config
@@ -878,6 +890,8 @@ fn agent_config_for_subagent(
         thinking_budget_override,
         reasoning_effort_override,
         gemini_thinking_budget_override,
+        summary_provider_override,
+        summary_model_override,
     ) = match record {
         Some(r) => (
             r.model,
@@ -886,8 +900,10 @@ fn agent_config_for_subagent(
             r.thinking_budget_tokens,
             r.reasoning_effort,
             r.gemini_thinking_budget,
+            r.summary_provider,
+            r.summary_model,
         ),
-        None => (None, None, None, None, None, None),
+        None => (None, None, None, None, None, None, None, None),
     };
 
     let posture = posture_str
@@ -918,6 +934,21 @@ fn agent_config_for_subagent(
     // propagate verbatim when the subagent record has no override.
     let gemini_thinking_budget = gemini_thinking_budget_override.or(base.gemini_thinking_budget);
 
+    // Inherit the parent's effective context config (which already has
+    // per-agent summary overrides applied via `apply_overrides`), then
+    // overlay any summary_provider/summary_model the subagent's own
+    // registry record carries. The pair-only validator on `POST /agents`
+    // / `PATCH /agents/{id}` guarantees these arrive symmetric, so we
+    // honour each field independently — `Some` wins over the parent;
+    // `None` inherits.
+    let mut subagent_context_config = base.context_config.clone();
+    if let Some(provider) = summary_provider_override {
+        subagent_context_config.summary_provider = Some(provider);
+    }
+    if let Some(model) = summary_model_override {
+        subagent_context_config.summary_model = Some(model);
+    }
+
     let config = AgentConfig {
         system_prompt: DEFAULT_SUBAGENT_PROMPT.to_string(),
         posture,
@@ -934,7 +965,7 @@ fn agent_config_for_subagent(
         enabled_tools: base.enabled_tools.clone(),
         fs_edit_fuzzy_match: base.fs_edit_fuzzy_match,
         max_tokens: base.max_tokens,
-        context_config: base.context_config.clone(),
+        context_config: subagent_context_config,
         prompts: base.prompts.clone(),
         debug_mode: false,
         anthropic_thinking_budget,
@@ -1039,6 +1070,8 @@ async fn run_agent_loop(
                     thinking_budget_tokens: record.thinking_budget_tokens,
                     reasoning_effort: record.reasoning_effort,
                     gemini_thinking_budget: record.gemini_thinking_budget,
+                    summary_provider: record.summary_provider,
+                    summary_model: record.summary_model,
                 }
             })
             .or_else(|| {
@@ -1119,9 +1152,50 @@ async fn run_agent_loop(
     // per-subagent run directory.
     let subagent_spill_cfg = config.shell_spill.clone();
 
+    // #871: snapshot the subagent's `summary_provider` / `summary_model`
+    // before `config` is moved into the runtime so we can build a dedicated
+    // summary client and wire it via `with_summary_llm`. Subagents inherit
+    // the parent's `[context].summary_provider` through `base_agent_config`
+    // (cloned at spawn time via `self.base_agent_config.read().clone()`),
+    // but pre-#871 the field was silently ignored at the runtime level —
+    // the subagent loop fell back to its own `self.llm` for summarization,
+    // defeating the parent's "summary on a different provider" intent
+    // (Tim's review on PR #871, item 5).
+    let subagent_summary_provider = config.context_config.summary_provider.clone();
+    let subagent_summary_model = config.context_config.summary_model.clone();
+
+    // Build the dedicated summary client BEFORE `subagent_llm` is moved into
+    // `AgentRuntime::new`. Delegates to the shared `alms_runtime::build_summary_client`
+    // helper so the #866 + #871 leak-guard rules cannot drift between the
+    // gateway run path and this subagent inheritance path. When
+    // `summary_provider` is None the helper returns a clone we discard; we
+    // only call `with_summary_llm` when the user opted in.
+    let summary_llm_for_subagent: Option<alms_runtime::LlmClient> =
+        subagent_summary_provider.as_deref().map(|provider| {
+            let secrets_guard = secrets.as_ref().map(|s| s.read());
+            let summary_client = alms_runtime::build_summary_client(
+                &subagent_llm,
+                Some(provider),
+                subagent_summary_model.as_deref(),
+                secrets_guard.as_deref(),
+            );
+            info!(
+                task_id = %task_id.0,
+                agent_provider = %subagent_llm.provider(),
+                summary_provider = %provider,
+                summary_model = %subagent_summary_model.as_deref().unwrap_or("<inherit>"),
+                "Subagent inheriting parent summary_provider config (#871)"
+            );
+            summary_client
+        });
+
     let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?
         .with_event_sender(sub_tx)
         .with_cancel_token(cancel_token);
+
+    if let Some(summary_client) = summary_llm_for_subagent {
+        runtime = runtime.with_summary_llm(summary_client);
+    }
 
     // Set agent name for perspective mapping in DM sessions.
     if let Some(ref name) = request.subagent_name {
@@ -1576,6 +1650,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (config2, model2, _provider2) = agent_config_for_subagent(Some(record), &parent);
         assert_eq!(model2.as_deref(), Some("gpt-5"));
@@ -1588,6 +1664,125 @@ mod tests {
         // Shell spill policy still inherited through the registry-override path
         assert!(!config2.shell_spill.enabled);
         assert_eq!(config2.shell_spill.retention_days, 42);
+    }
+
+    // -- per-named-subagent summary provider/model overlay (issue #872) --------
+
+    /// When the parent has summary_provider / summary_model set on its
+    /// effective context config (per-agent ?? server-level resolved at
+    /// the gateway), the subagent inherits those values verbatim through
+    /// the `base.context_config.clone()` path. The subagent's own
+    /// registry record can then OVERRIDE them by setting both fields on
+    /// `SubagentRecordConfig`. `None` on the subagent record falls
+    /// through to the parent's effective values — which is what the
+    /// issue calls out as "subagents inherit the parent's effective
+    /// summary config (not parent's primary provider)".
+    #[test]
+    fn test_subagent_inherits_parent_effective_summary_config() {
+        let parent = AgentConfig {
+            context_config: alms_core::config::ContextConfig {
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                ..Default::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        // Ephemeral subagent: inherits the parent's effective summary
+        // config wholesale. No registry record means no override.
+        let (config, _, _) = agent_config_for_subagent(None, &parent);
+        assert_eq!(
+            config.context_config.summary_provider.as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            config.context_config.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
+
+        // Named subagent with no per-agent summary fields: same
+        // inheritance as ephemeral.
+        let record = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (config2, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert_eq!(
+            config2.context_config.summary_provider.as_deref(),
+            Some("openrouter"),
+            "subagent without per-agent summary config inherits parent's effective summary_provider"
+        );
+        assert_eq!(
+            config2.context_config.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7"),
+            "subagent without per-agent summary config inherits parent's effective summary_model"
+        );
+    }
+
+    /// When the subagent's registry record carries its own
+    /// summary_provider / summary_model pair, those override the
+    /// parent's effective config. Pair-only invariant means both fields
+    /// are guaranteed symmetric by the time they reach the coordinator.
+    #[test]
+    fn test_subagent_summary_override_wins_over_parent_inherit() {
+        let parent = AgentConfig {
+            context_config: alms_core::config::ContextConfig {
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                ..Default::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        let record = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: Some("anthropic".into()),
+            summary_model: Some("claude-haiku-4".into()),
+        };
+        let (config, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert_eq!(
+            config.context_config.summary_provider.as_deref(),
+            Some("anthropic"),
+            "subagent's per-agent summary_provider must win over parent's effective value"
+        );
+        assert_eq!(
+            config.context_config.summary_model.as_deref(),
+            Some("claude-haiku-4"),
+            "subagent's per-agent summary_model must win over parent's effective value"
+        );
+    }
+
+    /// Both layers None: subagent inherits the both-None state. The
+    /// runtime-side `build_summary_client` short-circuits on
+    /// `summary_provider = None` to a clone of the agent's main LLM
+    /// client (the back-compat path), so no separate summary task runs.
+    /// This is the "neither set" path from the issue: clean inheritance,
+    /// no inadvertent provider switch.
+    #[test]
+    fn test_subagent_summary_all_none_stays_none() {
+        let parent = AgentConfig {
+            context_config: alms_core::config::ContextConfig {
+                summary_provider: None,
+                summary_model: None,
+                ..Default::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        let (config, _, _) = agent_config_for_subagent(None, &parent);
+        assert!(config.context_config.summary_provider.is_none());
+        assert!(config.context_config.summary_model.is_none());
     }
 
     // -- (j-pre-2) subagent inherits shell spill policy (issue #756) ------------
@@ -1625,6 +1820,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
         assert!(named.shell_spill.enabled);
@@ -1675,6 +1872,8 @@ mod tests {
             thinking_budget_tokens: Some(0),
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (sub_zero, _, _) = agent_config_for_subagent(Some(record_zero), &parent);
         assert_eq!(
@@ -1691,6 +1890,8 @@ mod tests {
             thinking_budget_tokens: Some(8192),
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (sub_explicit, _, _) = agent_config_for_subagent(Some(record_explicit), &parent);
         assert_eq!(
@@ -1706,6 +1907,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
         assert_eq!(
@@ -1746,6 +1949,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: Some(ReasoningEffort::Low),
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (sub_low, _, _) = agent_config_for_subagent(Some(record_low), &parent);
         assert_eq!(
@@ -1762,6 +1967,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
         assert_eq!(
@@ -1795,6 +2002,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
         assert!(
@@ -1845,6 +2054,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
         assert!(!named.gemini_cache_enabled);
@@ -1886,6 +2097,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: Some(16384),
+            summary_provider: None,
+            summary_model: None,
         };
         let (sub_high, _, _) = agent_config_for_subagent(Some(record_high), &parent);
         assert_eq!(
@@ -1903,6 +2116,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: Some(0),
+            summary_provider: None,
+            summary_model: None,
         };
         let (sub_zero, _, _) = agent_config_for_subagent(Some(record_zero), &parent);
         assert_eq!(
@@ -1919,6 +2134,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
         assert_eq!(sub_none.gemini_thinking_budget, Some(4096));
@@ -1936,6 +2153,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: Some(8192),
+            summary_provider: None,
+            summary_model: None,
         };
         let (sub_optin, _, _) = agent_config_for_subagent(Some(record_optin), &disabled_parent);
         assert_eq!(sub_optin.gemini_thinking_budget, Some(8192));

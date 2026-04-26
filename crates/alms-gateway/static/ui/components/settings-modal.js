@@ -5,7 +5,6 @@ import { listKeys, setKey, removeKey } from '../api/auth.js';
 import {
     MODEL_SUGGESTIONS,
     ModelDisplay,
-    ProviderDisplay,
     formatProviderLabel,
 } from '../utils/model-display.js';
 import { BudgetTriState } from './budget-tri-state.js';
@@ -26,7 +25,7 @@ const MODAL_TRISTATE_CLASSES = {
     input: 'settings-input settings-tristate-value',
 };
 
-const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
+const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'gemini'];
 
 /** Format large numbers with commas for readability. */
 function fmt(n) {
@@ -193,18 +192,23 @@ function ApiKeysSection() {
  * Exported so the header (and composer Advanced expander) can show an
  * indicator badge.
  *
- * Includes the legacy fields plus `debug_mode` and the three reasoning
- * knobs (`thinking_budget_tokens`, `reasoning_effort`,
+ * Includes `max_tokens`, `posture`, `debug_mode`, and the three
+ * reasoning knobs (`thinking_budget_tokens`, `reasoning_effort`,
  * `gemini_thinking_budget`). For the budget knobs, `Some(0)` (explicit
  * disable) and any positive value both count as "active overrides";
  * only `null`/`undefined` is "inherit". For `debug_mode`, both `true`
  * and `false` count — `null` is inherit.
+ *
+ * NOTE: `provider` and `model` are intentionally NOT counted — chat UI
+ * no longer forwards those keys as per-run overrides (#865), so they
+ * have no effect on the wire and including them here would mislead the
+ * badge. Their controls remain visible-but-disabled in the modal /
+ * composer Advanced UIs until a deliberate "use this provider/model
+ * for this chat" UX exists.
  */
 export const activeOverrideCount = computed(() => {
     const s = localSettings.value;
     let count = 0;
-    if (s.provider) count++;
-    if (s.model) count++;
     if (s.max_tokens != null) count++;
     if (s.posture) count++;
     // debug_mode is now tri-state on the composer (#818 nit follow-up):
@@ -235,6 +239,10 @@ export function SettingsModal({ open, onClose }) {
     const ctxRecentWindow = useSignal('');
     const ctxSummaryInterval = useSignal('');
     const ctxSummaryModel = useSignal('');
+    // #866: dedicated provider for the summary task. '' = inherit agent
+    // provider (pre-#866 behaviour); non-empty re-targets the summary
+    // client at that provider via with_provider_and_secrets.
+    const ctxSummaryProvider = useSignal('');
 
     // Server-level editable signals — Session
     const sessMaxMessages = useSignal('');
@@ -279,8 +287,14 @@ export function SettingsModal({ open, onClose }) {
             const llmOpen = llm.openai || {};
             const llmGem = llm.gemini || {};
 
-            provider.value = localSettings.value.provider || '';
-            model.value = localSettings.value.model || '';
+            // provider / model inputs are disabled (#865) — keep their
+            // signals empty so the UI doesn't echo stale localStorage
+            // values back to the user. The "Effective" display next to
+            // each row pulls from `defaults` (server) and the agent
+            // record handles per-agent values, so an empty signal here
+            // is the truthful representation of "no per-run override".
+            provider.value = '';
+            model.value = '';
             maxTokens.value = localSettings.value.max_tokens != null
                 ? String(localSettings.value.max_tokens)
                 : '';
@@ -294,6 +308,7 @@ export function SettingsModal({ open, onClose }) {
             ctxRecentWindow.value = ctx.recent_window != null ? String(ctx.recent_window) : '';
             ctxSummaryInterval.value = ctx.summary_interval != null ? String(ctx.summary_interval) : '';
             ctxSummaryModel.value = ctx.summary_model || '';
+            ctxSummaryProvider.value = ctx.summary_provider || '';
 
             sessMaxMessages.value = sess.max_messages != null ? String(sess.max_messages) : '';
             sessMaxCtxTokens.value = sess.max_context_tokens != null ? String(sess.max_context_tokens) : '';
@@ -375,10 +390,18 @@ export function SettingsModal({ open, onClose }) {
         serverError.value = '';
         saved.value = false;
 
-        // 1. Always save per-run overrides to localStorage (this never fails)
-        const updates = {};
-        updates.provider = provider.value || null;
-        updates.model = model.value.trim() || null;
+        // 1. Always save per-run overrides to localStorage (this never fails).
+        //
+        // `provider` / `model` are intentionally NOT written here (#865).
+        // Their inputs are disabled in the UI; chat UI ignores those keys
+        // when forwarding per-run overrides to /runs. We also actively
+        // clear any pre-existing stale values so users affected by the
+        // pre-#865 silent-stamp bug get unblocked the first time they
+        // hit Apply (or Reset) on the upgraded build.
+        const updates = {
+            provider: null,
+            model: null,
+        };
         const mt = parseInt(maxTokens.value, 10);
         updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
         updates.posture = posture.value || null;
@@ -410,6 +433,11 @@ export function SettingsModal({ open, onClose }) {
         }
         if (ctxSummaryModel.value !== (ctx.summary_model || '')) {
             ctxPatch.summary_model = ctxSummaryModel.value;
+        }
+        // #866: only PATCH summary_provider when the user actually changed
+        // it. Empty string clears back to "inherit agent provider".
+        if (ctxSummaryProvider.value !== (ctx.summary_provider || '')) {
+            ctxPatch.summary_provider = ctxSummaryProvider.value;
         }
         if (Object.keys(ctxPatch).length > 0) body.context = ctxPatch;
 
@@ -537,8 +565,9 @@ export function SettingsModal({ open, onClose }) {
     const enabledTools = tools.enabled || defaults.enabled_tools || [];
 
     // Effective values: what the next run will actually use.
-    // (Provider and model Effective lines use <ProviderDisplay> / <ModelDisplay>
-    // which derive the effective value internally.)
+    // (Provider/model rows are disabled here so they no longer render an
+    // "Effective:" line — see #865 / Tim's v0.2.3 note on PR #868. The
+    // context-summary <${ModelDisplay} below still uses ModelDisplay.)
     const effMaxTokens = maxTokens.value ? parseInt(maxTokens.value, 10) : (defaults.max_tokens || 100000);
     const effPosture = posture.value || defaults.posture || 'guarded';
 
@@ -565,31 +594,41 @@ export function SettingsModal({ open, onClose }) {
                         <label class="settings-label">Provider</label>
                         <select class="settings-select"
                                 value=${provider.value}
+                                disabled
+                                title="Per-run provider overrides are disabled. Configure provider on the agent (Agents panel) or as the server default."
                                 onChange=${e => { provider.value = e.target.value; }}>
                             <option value="">Default (${formatProviderLabel(defaults.provider || 'openai')})</option>
                             <option value="openai">OpenAI</option>
                             <option value="anthropic">Anthropic</option>
                             <option value="openrouter">OpenRouter</option>
                         </select>
-                        <span class="settings-effective">
-                            Effective: <${ProviderDisplay} value=${provider.value} defaultValue=${defaults.provider || 'openai'} />
-                        </span>
+                        <!-- No "Effective:" row while the control is disabled.
+                             It would only ever show the server default and
+                             would lie for any agent with a per-agent override
+                             (Tim's v0.2.3 note on PR #868). Threading the
+                             active agent's provider/model through the modal
+                             is a separate, larger change tracked for v0.2.3. -->
                     </div>
 
                     <div class="settings-row">
                         <label class="settings-label">Model</label>
                         <input class="settings-input" type="text"
                                list="model-suggestions"
+                               disabled
+                               title="Per-run model overrides are disabled. Configure model on the agent (Agents panel) or as the server default."
                                placeholder=${defaults.model || 'server default'}
                                value=${model.value}
                                onInput=${e => { model.value = e.target.value; }} />
                         <datalist id="model-suggestions">
                             ${MODEL_SUGGESTIONS.map(m => html`<option value=${m} />`)}
                         </datalist>
-                        <span class="settings-effective">
-                            Effective: <${ModelDisplay} value=${model.value.trim()} defaultValue=${defaults.model} />
-                        </span>
+                        <!-- No "Effective:" row while the control is disabled.
+                             Same rationale as the Provider row above — see
+                             Tim's v0.2.3 note on PR #868. -->
                     </div>
+                </div>
+                <div class="settings-hint settings-overrides-disabled-note">
+                    Provider and model are configured per-agent (Agents panel) or as the server default. Per-run overrides are disabled here to keep per-agent config from being silently squashed by stale localStorage values.
                 </div>
 
                 <div class="settings-grid">
@@ -722,16 +761,47 @@ export function SettingsModal({ open, onClose }) {
                                value=${ctxSummaryInterval.value}
                                onInput=${e => { ctxSummaryInterval.value = e.target.value; }} />
                     <//>
+                <//>
+
+                <!-- Summary (server-level, editable) — controls BOTH the
+                     in-loop sliding-summary compaction AND the post-run
+                     episodic memory generation. Lifted out of the Context
+                     section to make the dual-path scope obvious. -->
+                <${Section} key="summary" title="Summary (sliding-summary compaction + episodic memory)" defaultOpen=${false}>
+                    <span class="settings-hint settings-section-desc">
+                        Optional dedicated provider/model for the summary task. Drives both the in-loop sliding-summary compaction
+                        (rolling context window) and the per-run episodic memory generation. Both fields must be set together — partial
+                        configurations are rejected so the user-supplied summary_model is never silently paired with the agent's primary provider.
+                        Per-agent overrides live on the agent record (Agents panel).
+                    </span>
                     <${EditRow} label="Summary model"
-                        desc="Optional cheaper model for generating summaries. Leave empty for default.">
+                        desc="Cheaper model for generating summaries. Set together with Summary provider, or leave both empty to use the agent's main LLM.">
                         <input class="settings-input settings-input-sm" type="text"
-                               placeholder="same as default"
+                               placeholder="leave empty to use the agent's main LLM"
                                list="model-suggestions"
                                value=${ctxSummaryModel.value}
                                onInput=${e => { ctxSummaryModel.value = e.target.value; }} />
                         <span class="settings-effective">
                             <${ModelDisplay} value=${ctxSummaryModel.value.trim()} defaultValue=${defaults.model} />
                         </span>
+                    <//>
+                    <${EditRow} label="Summary provider"
+                        desc="Dedicated provider for the summary task. Must be configured under [llm.providers.<name>] with a resolvable API key. Set together with Summary model.">
+                        <select class="settings-select settings-input-sm"
+                                value=${ctxSummaryProvider.value}
+                                onChange=${e => { ctxSummaryProvider.value = e.target.value; }}>
+                            <option value="">Unset (no dedicated summary task)</option>
+                            ${(defaults.llm_providers && defaults.llm_providers.length > 0
+                                ? defaults.llm_providers
+                                : PROVIDERS).map(p => {
+                                    const known = formatProviderLabel(p);
+                                    // formatProviderLabel returns "Custom" for unknown
+                                    // names — fall back to the raw key so users can
+                                    // tell custom providers apart in the dropdown.
+                                    const label = known === 'Custom' ? p : known;
+                                    return html`<option value=${p} key=${p}>${label}</option>`;
+                                })}
+                        </select>
                     <//>
                 <//>
 

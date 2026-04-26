@@ -246,6 +246,13 @@ impl Run {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRunRequest {
     pub session_id: SessionId,
+    /// Optional agent identity asserted by the caller.
+    ///
+    /// Normal sessions are owned by exactly one agent and the gateway rejects
+    /// mismatches. Shared sessions (DMs) are stored under a nil-agent sentinel,
+    /// so callers must provide the active agent id to resolve per-agent config.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
     pub input: RunInput,
     /// Optional model override — uses server default when absent.
     #[serde(default)]

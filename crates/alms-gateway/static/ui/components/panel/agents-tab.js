@@ -158,11 +158,20 @@ export function AgentEditModal({ agent, onClose }) {
             ? String(agent.gemini_thinking_budget) : ''
     );
 
+    // Per-agent summary provider/model overrides (#872). Empty string =
+    // "use server default" (the per-agent value is None on the wire).
+    // The server enforces the pair-only invariant and returns
+    // SUMMARY_PROVIDER_REQUIRES_MODEL / SUMMARY_MODEL_REQUIRES_PROVIDER
+    // for asymmetric combinations; the error surfaces inline below.
+    const summaryProvider = useSignal(agent.summary_provider || '');
+    const summaryModel = useSignal(agent.summary_model || '');
+
     const saving = useSignal(false);
     const error = useSignal('');
 
     const serverModelId = serverDefaults.value.model || '';
     const serverProvider = serverDefaults.value.provider || '';
+    const llmProviders = serverDefaults.value.llm_providers || [];
 
     /**
      * Build the PUT body from the current form state.
@@ -236,6 +245,32 @@ export function AgentEditModal({ agent, onClose }) {
             const n = parseInt(geminiDraft.value, 10);
             if (!isNaN(n) && n >= 0 && n !== currentGemini) {
                 body.gemini_thinking_budget = n;
+            }
+        }
+
+        // summary_provider / summary_model (#872). Pair-only — enforced
+        // server-side. Empty string sentinels are NOT used here; the
+        // PATCH wire surface uses dedicated `clear_*` booleans because
+        // the server treats `""` as a malformed value (so the validator
+        // can never see an asymmetric live state). Each field independently
+        // emits one of: a non-empty string value, `clear_*: true` (when
+        // the field had a value and is being cleared), or nothing.
+        const currentSummaryProvider = agent.summary_provider || '';
+        const draftSummaryProvider = (summaryProvider.value || '').trim();
+        if (draftSummaryProvider !== currentSummaryProvider) {
+            if (draftSummaryProvider === '') {
+                body.clear_summary_provider = true;
+            } else {
+                body.summary_provider = draftSummaryProvider;
+            }
+        }
+        const currentSummaryModel = agent.summary_model || '';
+        const draftSummaryModel = (summaryModel.value || '').trim();
+        if (draftSummaryModel !== currentSummaryModel) {
+            if (draftSummaryModel === '') {
+                body.clear_summary_model = true;
+            } else {
+                body.summary_model = draftSummaryModel;
             }
         }
 
@@ -347,6 +382,41 @@ export function AgentEditModal({ agent, onClose }) {
                     agentValue=${agent.gemini_thinking_budget}
                     mode=${geminiMode}
                     draft=${geminiDraft} />
+
+                <div class="agent-edit-section-divider"></div>
+                <div class="agent-edit-section-title">Summary (sliding-summary compaction + episodic memory)</div>
+
+                <span class="settings-hint">
+                    Per-agent summary provider/model. Drives both the in-loop sliding-summary compaction and the
+                    post-run episodic memory generation. Both fields must be set together — partial settings are
+                    rejected server-side. Leave both empty to inherit the server default.
+                </span>
+
+                <div class="settings-row">
+                    <label class="settings-label">Summary provider</label>
+                    <select class="settings-select"
+                            value=${summaryProvider.value}
+                            onChange=${e => { summaryProvider.value = e.target.value; }}>
+                        <option value="">Use server default</option>
+                        ${(llmProviders.length > 0 ? llmProviders : ['openai', 'anthropic', 'openrouter', 'gemini']).map(p => {
+                            const known = formatProviderLabel(p);
+                            const label = known === 'Custom' ? p : known;
+                            return html`<option value=${p} key=${p}>${label}</option>`;
+                        })}
+                    </select>
+                </div>
+
+                <div class="settings-row">
+                    <label class="settings-label">Summary model</label>
+                    <input class="settings-input" type="text"
+                           list="agent-model-suggestions"
+                           placeholder="(use server default)"
+                           value=${summaryModel.value}
+                           onInput=${e => { summaryModel.value = e.target.value; }} />
+                    <span class="settings-hint">
+                        Model slug for the summary provider. Set together with Summary provider.
+                    </span>
+                </div>
 
                 <div class="agent-edit-section-divider"></div>
                 <div class="agent-edit-section-title">Telegram bot</div>

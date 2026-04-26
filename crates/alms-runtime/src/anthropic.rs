@@ -7,6 +7,8 @@ use crate::llm_client::SseParseResult;
 use crate::llm_types::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -260,6 +262,90 @@ pub(crate) struct StreamDelta {
 // Conversion: internal → Anthropic request
 // ---------------------------------------------------------------------------
 
+/// Sanitize a tool call ID so it satisfies Anthropic's strict
+/// `^[a-zA-Z0-9_-]+$` regex on `tool_use.id` and `tool_result.tool_use_id`
+/// (issue #850).
+///
+/// Other providers (OpenAI, Gemini) accept a wider character set, so IDs
+/// that originated upstream — or that survived in session history from a
+/// prior provider switch — can carry characters Anthropic rejects (most
+/// commonly `:`, `.`, `/`). Without this sanitizer the Anthropic API
+/// returns a 400 on the very first replayed tool_use, blocking any
+/// multi-turn run with tool history.
+///
+/// # Contract
+///
+/// - Characters in `[a-zA-Z0-9_-]` pass through unchanged.
+/// - Any other character is replaced with `_`.
+/// - If the input contained no characters in the allowed set
+///   (entirely-invalid input like `"!!!"`, `"@@@"`, the empty string,
+///   or non-ASCII like `"你好"`), we fall back to `"call_" + hex hash
+///   of the original ID`. The hash uses `DefaultHasher` which is
+///   process-stable but deliberately not cryptographic — we only need
+///   a deterministic, regex-conforming, non-colliding identifier so
+///   the matching tool_use / tool_result pair lines up on the wire.
+///
+///   We test "no valid characters" rather than "result is empty"
+///   because dumb char-by-char replacement maps `"!!!"` and `"@@@"`
+///   to the same `"___"`, which would silently collide and pair
+///   tool_use blocks with the wrong tool_result.
+///
+/// ## Known corner — standard-path collisions
+///
+/// The non-fallback path can also collide in principle: `call_a:b` and
+/// `call_a/b` both sanitize to `call_a_b`. We accept this because no
+/// real-world LLM provider generates IDs that differ only in their
+/// forbidden delimiter character — upstream IDs are either UUIDs,
+/// `toolu_*` opaque strings, or monotonic counters, none of which
+/// exhibit this shape. If a future provider does, the right move is
+/// to extend the fallback to also cover `had_collision_after_replace`,
+/// not to weaken the regex-conformance guarantee here.
+///
+/// # Determinism
+///
+/// The function is a pure mapping with no time, randomness, or external
+/// state. This is load-bearing for prompt caching (#766): the same input
+/// must produce the same output across turns or the Anthropic cache
+/// prefix invalidates and we lose cache hits.
+///
+/// # Identical application at both ends
+///
+/// Anthropic pairs `tool_use.id` (assistant) with `tool_result.tool_use_id`
+/// (user) by exact string match. The caller MUST run both through this
+/// same function or Anthropic will reject the request with a different
+/// 400 about an unmatched `tool_use_id`.
+///
+/// # Scope
+///
+/// This sanitizer is intentionally Anthropic-adapter-local. We do NOT
+/// sanitize at persistence time — stored IDs stay in their original form
+/// so OpenAI / Gemini wire shapes remain byte-identical to pre-#850.
+fn sanitize_anthropic_tool_id(id: &str) -> String {
+    let mut cleaned = String::with_capacity(id.len());
+    let mut had_valid_char = false;
+    for c in id.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            cleaned.push(c);
+            had_valid_char = true;
+        } else {
+            cleaned.push('_');
+        }
+    }
+    if !had_valid_char {
+        // Entirely-invalid input (or empty string). A blind char-by-char
+        // map would land different inputs on the same all-underscore
+        // string and silently collide. Route to a deterministic hash
+        // fallback so distinct inputs stay distinct, the result is
+        // non-empty, and repeated calls are byte-stable for prompt
+        // caching (#766).
+        let mut hasher = DefaultHasher::new();
+        id.hash(&mut hasher);
+        format!("call_{:016x}", hasher.finish())
+    } else {
+        cleaned
+    }
+}
+
 /// Convert an internal `CompletionRequest` to an `AnthropicRequest`.
 ///
 /// The input message list is expected to already satisfy the canonical
@@ -325,7 +411,10 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
                                 Value::String(tc.function.arguments.clone())
                             });
                         blocks.push(ContentBlock::ToolUse {
-                            id: tc.id.clone(),
+                            // Sanitize for Anthropic's `^[a-zA-Z0-9_-]+$`
+                            // regex (#850). Must use the same function on
+                            // the matching tool_result below.
+                            id: sanitize_anthropic_tool_id(&tc.id),
                             name: tc.function.name.clone(),
                             input,
                         });
@@ -345,7 +434,16 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
                 // Tool results → tool_result content block inside a user message.
                 // Anthropic requires tool results in user messages.
                 let block = ContentBlock::ToolResult {
-                    tool_use_id: msg.tool_call_id.clone().unwrap_or_default(),
+                    // Sanitize for Anthropic's `^[a-zA-Z0-9_-]+$` regex
+                    // (#850). Identical mapping to the `tool_use.id`
+                    // emit point above so the pair still matches on the
+                    // wire. Empty `tool_call_id` (defensive default)
+                    // routes through `sanitize_anthropic_tool_id` and
+                    // produces a deterministic synthetic id rather than
+                    // an empty string Anthropic would reject.
+                    tool_use_id: sanitize_anthropic_tool_id(
+                        msg.tool_call_id.as_deref().unwrap_or(""),
+                    ),
                     content: msg.content.clone().unwrap_or_default(),
                 };
                 // If the previous message is a user with blocks, append to it.
@@ -1680,5 +1778,292 @@ mod tests {
         let usage = completion.usage.expect("usage present");
         assert!(usage.cache_creation_input_tokens.is_none());
         assert!(usage.cache_read_input_tokens.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // tool_use.id sanitization (issue #850)
+    // -----------------------------------------------------------------
+
+    /// Anthropic's regex on `tool_use.id` and `tool_result.tool_use_id`
+    /// is `^[a-zA-Z0-9_-]+$`. Re-derived as a Rust check so the assertions
+    /// below pin the actual contract and not just our paraphrase of it.
+    fn matches_anthropic_id_regex(id: &str) -> bool {
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+
+    /// Pure-alphanumeric / underscore / hyphen IDs pass through unchanged.
+    /// This is the common case for Anthropic-native (`toolu_...`) and
+    /// well-formed OpenAI (`call_abc123`) IDs — sanitization must not
+    /// gratuitously rewrite them, both because rewriting would invalidate
+    /// prompt-cache prefixes (#766) and because matching pairs would
+    /// silently shift.
+    #[test]
+    fn test_sanitize_anthropic_tool_id_passthrough_for_valid() {
+        for id in [
+            "call_abc123",
+            "toolu_01ABC",
+            "a",
+            "Z9_-_test",
+            "----",
+            "____",
+            "0",
+        ] {
+            assert_eq!(
+                sanitize_anthropic_tool_id(id),
+                id,
+                "valid id `{id}` must pass through unchanged"
+            );
+            assert!(matches_anthropic_id_regex(&sanitize_anthropic_tool_id(id)));
+        }
+    }
+
+    /// Each forbidden character in the issue's reproduction set maps to
+    /// `_`, and the sanitized result satisfies Anthropic's regex.
+    #[test]
+    fn test_sanitize_anthropic_tool_id_replaces_forbidden_chars() {
+        let cases = [
+            ("call_abc:123", "call_abc_123"), // colon — primary suspect
+            ("call_abc.def", "call_abc_def"), // period
+            ("call_abc/123", "call_abc_123"), // slash
+            ("tool@result", "tool_result"),   // at sign
+            ("a b c", "a_b_c"),               // space
+            ("call_<id>", "call__id_"),       // angle brackets
+            ("call_abc!", "call_abc_"),       // bang
+            ("café", "caf_"),                 // non-ASCII (single scalar)
+        ];
+        for (input, expected) in cases {
+            let got = sanitize_anthropic_tool_id(input);
+            assert_eq!(
+                got, expected,
+                "input `{input}` should sanitize to `{expected}`"
+            );
+            assert!(
+                matches_anthropic_id_regex(&got),
+                "sanitized `{got}` must match Anthropic regex",
+            );
+        }
+    }
+
+    /// All-invalid input falls back to a deterministic synthetic ID. The
+    /// fallback must be non-empty, regex-conforming, and identical across
+    /// repeated calls (no time, no randomness — caching depends on this).
+    #[test]
+    fn test_sanitize_anthropic_tool_id_fallback_for_all_invalid() {
+        let inputs = ["!!!", "...", "", "@@@", "你好"];
+        for input in inputs {
+            let a = sanitize_anthropic_tool_id(input);
+            let b = sanitize_anthropic_tool_id(input);
+            assert_eq!(a, b, "fallback for `{input}` must be deterministic");
+            assert!(!a.is_empty(), "fallback for `{input}` must be non-empty");
+            assert!(
+                matches_anthropic_id_regex(&a),
+                "fallback `{a}` must match Anthropic regex",
+            );
+            assert!(
+                a.starts_with("call_"),
+                "fallback should be prefixed `call_`, got `{a}`",
+            );
+        }
+    }
+
+    /// Distinct all-invalid inputs should produce distinct fallback IDs
+    /// in the common case — otherwise two unrelated calls could collide
+    /// and Anthropic would pair the wrong tool_use with the wrong
+    /// tool_result. (DefaultHasher is not collision-free, but for these
+    /// short ASCII inputs collisions are negligibly unlikely.)
+    #[test]
+    fn test_sanitize_anthropic_tool_id_fallback_distinguishes_distinct_inputs() {
+        let a = sanitize_anthropic_tool_id("!!!");
+        let b = sanitize_anthropic_tool_id("@@@");
+        assert_ne!(
+            a, b,
+            "distinct invalid inputs should map to distinct fallbacks"
+        );
+    }
+
+    /// End-to-end through the request builder: a forbidden character on
+    /// the `ToolCall.id` shows up sanitized on the wire `tool_use.id`,
+    /// AND the matching `tool_result.tool_use_id` is sanitized identically
+    /// — so the pair still matches by string. This is the contract
+    /// Anthropic relies on.
+    #[test]
+    fn test_to_anthropic_request_sanitizes_tool_use_and_tool_result_pair() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514").with_messages(vec![
+            LlmMessage::system("sys"),
+            LlmMessage::user("go"),
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall::new("call_abc:123", "echo", "{}")]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("call_abc:123", "ok"),
+            LlmMessage::user("done"),
+        ]);
+
+        let areq = to_anthropic_request(&req);
+
+        // Find the tool_use id and the tool_result tool_use_id; they must
+        // both pass Anthropic's regex AND be equal so the pair matches.
+        let mut tool_use_id: Option<String> = None;
+        let mut tool_result_id: Option<String> = None;
+        for msg in &areq.messages {
+            if let AnthropicContent::Blocks(blocks) = &msg.content {
+                for b in blocks {
+                    match b {
+                        ContentBlock::ToolUse { id, .. } => {
+                            tool_use_id = Some(id.clone());
+                        }
+                        ContentBlock::ToolResult {
+                            tool_use_id: id, ..
+                        } => {
+                            tool_result_id = Some(id.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let tu = tool_use_id.expect("tool_use block must be present");
+        let tr = tool_result_id.expect("tool_result block must be present");
+        assert!(
+            matches_anthropic_id_regex(&tu),
+            "tool_use.id `{tu}` must match Anthropic regex"
+        );
+        assert!(
+            matches_anthropic_id_regex(&tr),
+            "tool_result.tool_use_id `{tr}` must match Anthropic regex"
+        );
+        assert_eq!(
+            tu, tr,
+            "sanitized tool_use.id and tool_result.tool_use_id must still pair: tu=`{tu}` tr=`{tr}`"
+        );
+        assert_eq!(
+            tu, "call_abc_123",
+            "expected colon → underscore replacement"
+        );
+    }
+
+    /// Multiple forbidden characters across multiple tool calls all get
+    /// sanitized in the same request, and each pair still lines up.
+    #[test]
+    fn test_to_anthropic_request_sanitizes_multiple_pairs() {
+        let req = CompletionRequest::new("test").with_messages(vec![
+            LlmMessage::system("sys"),
+            LlmMessage::user("go"),
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![
+                    ToolCall::new("call_a:1", "echo", "{}"),
+                    ToolCall::new("call_b.2", "echo", "{}"),
+                    ToolCall::new("call_c/3", "echo", "{}"),
+                ]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("call_a:1", "r1"),
+            LlmMessage::tool_result("call_b.2", "r2"),
+            LlmMessage::tool_result("call_c/3", "r3"),
+            LlmMessage::user("end"),
+        ]);
+
+        let areq = to_anthropic_request(&req);
+
+        // Collect IDs in document order.
+        let mut tool_use_ids: Vec<String> = Vec::new();
+        let mut tool_result_ids: Vec<String> = Vec::new();
+        for msg in &areq.messages {
+            if let AnthropicContent::Blocks(blocks) = &msg.content {
+                for b in blocks {
+                    match b {
+                        ContentBlock::ToolUse { id, .. } => tool_use_ids.push(id.clone()),
+                        ContentBlock::ToolResult { tool_use_id, .. } => {
+                            tool_result_ids.push(tool_use_id.clone())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        assert_eq!(tool_use_ids, vec!["call_a_1", "call_b_2", "call_c_3"]);
+        assert_eq!(
+            tool_result_ids, tool_use_ids,
+            "pairs must align by sanitized id"
+        );
+        for id in tool_use_ids.iter().chain(tool_result_ids.iter()) {
+            assert!(
+                matches_anthropic_id_regex(id),
+                "id `{id}` must match Anthropic regex",
+            );
+        }
+    }
+
+    /// Two adapter calls with identical forbidden-character input must
+    /// produce byte-identical wire bodies. This is the property prompt
+    /// caching (#766) depends on — any per-call drift in the sanitizer
+    /// would invalidate the cache prefix and silently double Anthropic
+    /// spend.
+    #[test]
+    fn test_sanitization_is_deterministic_across_adapter_calls() {
+        let build = || {
+            CompletionRequest::new("claude-sonnet-4-20250514").with_messages(vec![
+                LlmMessage::system("sys"),
+                LlmMessage::user("go"),
+                LlmMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(vec![ToolCall::new("call_!!!", "echo", "{}")]),
+                    tool_call_id: None,
+                },
+                LlmMessage::tool_result("call_!!!", "ok"),
+                LlmMessage::user("end"),
+            ])
+        };
+        let a = serde_json::to_string(&to_anthropic_request(&build())).unwrap();
+        let b = serde_json::to_string(&to_anthropic_request(&build())).unwrap();
+        assert_eq!(
+            a, b,
+            "two adapter calls with identical (forbidden-char) input must serialise byte-identically"
+        );
+    }
+
+    /// Already-valid IDs survive the sanitizer untouched in the wire body —
+    /// the pre-#850 wire shape for valid IDs must remain byte-stable so we
+    /// don't accidentally regress prompt cache hits for agents that never
+    /// switched providers.
+    #[test]
+    fn test_already_valid_ids_unchanged_on_wire() {
+        let req = CompletionRequest::new("claude-sonnet-4-20250514").with_messages(vec![
+            LlmMessage::system("sys"),
+            LlmMessage::user("go"),
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall::new("toolu_01ABCdef", "echo", "{}")]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("toolu_01ABCdef", "ok"),
+            LlmMessage::user("end"),
+        ]);
+
+        let body = serde_json::to_value(to_anthropic_request(&req)).unwrap();
+        let s = serde_json::to_string(&body).unwrap();
+        assert!(
+            s.contains("\"id\":\"toolu_01ABCdef\""),
+            "valid tool_use.id must survive verbatim: {s}"
+        );
+        assert!(
+            s.contains("\"tool_use_id\":\"toolu_01ABCdef\""),
+            "valid tool_result.tool_use_id must survive verbatim: {s}"
+        );
     }
 }

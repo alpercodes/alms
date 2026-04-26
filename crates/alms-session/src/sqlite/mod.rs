@@ -116,7 +116,9 @@ CREATE TABLE IF NOT EXISTS agents (
     last_active            TEXT NOT NULL,
     thinking_budget_tokens INTEGER,
     reasoning_effort       TEXT,
-    gemini_thinking_budget INTEGER
+    gemini_thinking_budget INTEGER,
+    summary_provider       TEXT,
+    summary_model          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
@@ -230,6 +232,15 @@ impl SqliteStore {
         // "inherit the server default from [llm.gemini]"; any integer
         // (including 0) is an explicit per-agent override.
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN gemini_thinking_budget INTEGER;");
+        // Auto-migrate: add summary_provider / summary_model columns for
+        // per-agent summary-task overrides (issue #872). NULL on either
+        // means "fall through to the server-level [context] settings";
+        // both must be set together (PATCH validator enforces the pair
+        // invariant). Additive, reversible: existing rows stay NULL on
+        // both columns and behave identically to today's server-level
+        // path.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN summary_provider TEXT;");
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN summary_model TEXT;");
         // Auto-migrate: add run_tool_calls table for per-run tool call storage.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS run_tool_calls (\
@@ -476,6 +487,14 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let gemini_thinking_budget: Option<u32> = row
         .get::<_, Option<i64>>(12)?
         .map(|v| v.clamp(0, i64::from(u32::MAX)) as u32);
+    // Per-agent summary-task provider / model (issue #872). Both stored
+    // as TEXT; NULL on either means "fall through to the server-level
+    // [context] settings". The PATCH validator and CRUD handlers
+    // enforce the pair invariant — at the parser level we just deserialize
+    // whatever is on disk and let the resolver flag invalid combinations
+    // when they're observed at run time.
+    let summary_provider: Option<String> = row.get(13)?;
+    let summary_model: Option<String> = row.get(14)?;
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -498,6 +517,8 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         thinking_budget_tokens,
         reasoning_effort,
         gemini_thinking_budget,
+        summary_provider,
+        summary_model,
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),

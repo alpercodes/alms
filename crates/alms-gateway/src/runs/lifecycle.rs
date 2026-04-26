@@ -301,6 +301,27 @@ pub async fn create_run(
         RunInput::Text { text } => text,
     };
 
+    let session_agent_id = session.agent_id;
+    let is_shared_session = session_agent_id.is_nil();
+    let agent_id = match req.agent_id {
+        Some(requested) if requested != session_agent_id && !is_shared_session => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "AGENT_SESSION_MISMATCH",
+                "Session belongs to a different agent",
+            ));
+        }
+        Some(requested) => requested,
+        None if is_shared_session => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "AGENT_ID_REQUIRED",
+                "Shared sessions require agent_id so per-agent config can be resolved",
+            ));
+        }
+        None => session_agent_id,
+    };
+
     // Validate provider override early so the user gets a clear 400 instead
     // of a confusing "invalid API key" error from a wrong provider.
     if let Some(ref p) = req.provider {
@@ -317,7 +338,7 @@ pub async fn create_run(
         reasoning_effort: req.reasoning_effort,
         gemini_thinking_budget: req.gemini_thinking_budget,
     };
-    let run = Run::new(session.id, session.agent_id, input_text);
+    let run = Run::new(session.id, agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
     let agent_id = run.agent_id;
@@ -488,6 +509,38 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.run_manager.untrack_in_flight();
     }
+}
+
+/// Build the LLM client used for the per-run summary task (#866 + #871).
+///
+/// Thin wrapper around `alms_runtime::build_summary_client` that adds the
+/// gateway-side contextual `info!` log (the runtime helper is shared with the
+/// coordinator subagent path and stays log-agnostic so each caller can label
+/// with its own ID — `agent_id` here, `task_id` in the coordinator). All the
+/// leak-guard logic lives in the runtime helper so future drift is impossible.
+///
+/// See `alms_runtime::summary_client` for the full rule set.
+fn build_summary_client(
+    llm: &alms_runtime::LlmClient,
+    summary_provider: Option<&str>,
+    summary_model: Option<&str>,
+    secrets: &alms_core::secrets::SecretsStore,
+    agent_id: AgentId,
+) -> alms_runtime::LlmClient {
+    let switched =
+        alms_runtime::build_summary_client(llm, summary_provider, summary_model, Some(secrets));
+
+    if let Some(provider) = summary_provider {
+        info!(
+            agent_id = %agent_id,
+            agent_provider = %llm.provider(),
+            summary_provider = %provider,
+            summary_model = %summary_model.unwrap_or("<inherit>"),
+            "Using dedicated provider for summary task (#866)"
+        );
+    }
+
+    switched
 }
 
 /// Maximum bytes of an `AlmsError` Display string to embed in the
@@ -677,18 +730,56 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // that when `summary_model` is None we fall back to the agent's configured
     // model, not the server default.  After this line `llm` is consumed by
     // `AgentRuntime::new` and no longer available.
+    //
+    // #871 leak guard (mirror of #860/#861 on the summary path): when
+    // `summary_provider` is configured AND `summary_model` is None, the
+    // agent's model name belongs to the AGENT's provider, not the summary
+    // provider. Falling back to it would leak the agent's model slug onto
+    // the summary provider's wire and produce a confusing 404 (the symptom
+    // #861 was meant to prevent, on the summary task this time). Pass `None`
+    // through to `generate_and_persist_summary` instead so it falls back to
+    // `llm_for_summary.default_model()` — which the leak guard below clears
+    // to "" so the wire fails fast with a clean missing-model error.
     let run_summary_mode = agent_config.context_config.run_summary_mode.clone();
     let summary_max_tokens = agent_config.context_config.summary_max_tokens;
-    let summary_model_resolved = agent_config
-        .context_config
-        .summary_model
-        .clone()
-        .or_else(|| Some(llm.default_model().to_string()));
+    let summary_provider_cfg = agent_config.context_config.summary_provider.clone();
+    let summary_model_cfg = agent_config.context_config.summary_model.clone();
+    let summary_model_resolved = if summary_provider_cfg.is_some() {
+        // Dedicated summary provider: only use an explicit summary_model.
+        // Never inherit the agent's resolved model — it belongs to a
+        // different provider's namespace. None falls through to the
+        // summary client's default_model in `generate_session_summary`,
+        // which the leak guard below has already cleared to "".
+        summary_model_cfg.clone()
+    } else {
+        // No provider switch: agent and summary share a wire, so the
+        // agent's resolved model is a safe fallback (pre-#871 behaviour).
+        summary_model_cfg
+            .clone()
+            .or_else(|| Some(llm.default_model().to_string()))
+    };
 
     // S6 fix: clone the per-agent resolved LLM client *before* AgentRuntime::new
     // consumes it.  The summary task needs the agent's provider/base_url/api_key,
     // not the server-default `state.llm`.
-    let llm_for_summary = llm.clone();
+    //
+    // #866: when `summary_provider` is configured, re-target the summary
+    // client at that provider via `with_provider_and_secrets`. This lets the
+    // summary task hit a different provider than the agent (e.g. agent on
+    // Anthropic, summary on OpenRouter). When `summary_provider` is None the
+    // client is byte-identical to the agent's `llm`, preserving pre-#866
+    // behaviour.
+    //
+    // The construction logic (including the #871 leak guard) lives in
+    // `build_summary_client` so it can be unit-tested without spinning up a
+    // full AppState. Here we just borrow `state.secrets` and forward it.
+    let llm_for_summary = build_summary_client(
+        &llm,
+        summary_provider_cfg.as_deref(),
+        summary_model_cfg.as_deref(),
+        &state.secrets.read(),
+        agent_id,
+    );
 
     let mut runtime = match alms_runtime::AgentRuntime::new(agent_id, agent_config, llm) {
         Ok(rt) => rt,
@@ -716,6 +807,16 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // Set agent name for perspective mapping in DM sessions.
     if let Some(ref name) = agent_name {
         runtime = runtime.with_agent_name(name.clone());
+    }
+
+    // #866: when a separate summary provider is configured, wire the
+    // re-targeted client into the runtime so the in-loop sliding-summary path
+    // (`maybe_summarize`) hits the configured provider rather than the
+    // agent's. When `summary_provider` is None we leave the runtime's
+    // `summary_llm` as None — the summarizer transparently falls back to
+    // `self.llm` (pre-#866 behaviour).
+    if summary_provider_cfg.is_some() {
+        runtime = runtime.with_summary_llm(llm_for_summary.clone());
     }
 
     // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into shell_exec processes
@@ -1561,5 +1662,179 @@ mod tests {
         // Body length is the largest valid char boundary <= 300.
         assert!(body.len() <= PEER_ERROR_MESSAGE_MAX_LEN);
         assert!(s.is_char_boundary(body.len()));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // build_summary_client (#866 + #871) — mirror of #860/#861 leak-guard
+    // tests in `runs/mod.rs::tests` but on the summary path.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build an `LlmConfig` whose `[llm.providers.<name>]` map contains
+    /// (anthropic, openrouter) and an in-memory `SecretsStore` with keys
+    /// for both. Mirrors the fixture shape used by the #860/#861 tests in
+    /// `runs/mod.rs::tests`.
+    fn summary_test_fixtures(
+        anthropic_entry_model: Option<&str>,
+        openrouter_entry_model: Option<&str>,
+    ) -> (alms_runtime::LlmClient, alms_core::secrets::SecretsStore) {
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: openrouter_entry_model.map(str::to_string),
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: anthropic_entry_model.map(str::to_string),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let cfg = LlmConfig {
+            // Agent's resolved client is on Anthropic with a sonnet model.
+            provider: "anthropic".into(),
+            api_key: "sk-ant-runtime".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            default_model: "claude-sonnet-4-20250514".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let llm = alms_runtime::LlmClient::new(cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
+        secrets.set_key("openrouter", "sk-or-runtime").unwrap();
+        std::mem::forget(dir);
+        (llm, secrets)
+    }
+
+    /// Pre-#866 behaviour: when `summary_provider` is `None`, the helper
+    /// returns a clone of the agent's `llm` byte-identical to pre-#866
+    /// behaviour. Provider, default_model, and base_url all match.
+    #[test]
+    fn build_summary_client_no_provider_returns_agent_llm_clone() {
+        let (llm, secrets) = summary_test_fixtures(None, None);
+        let summary = build_summary_client(&llm, None, None, &secrets, AgentId::new());
+        assert_eq!(summary.provider(), llm.provider());
+        assert_eq!(summary.default_model(), llm.default_model());
+    }
+
+    /// #866 happy path: provider AND model both set. Both reach the wire
+    /// regardless of any provider-entry model field.
+    #[test]
+    fn build_summary_client_provider_and_model_set_both_apply() {
+        let (llm, secrets) = summary_test_fixtures(None, None);
+        let summary = build_summary_client(
+            &llm,
+            Some("openrouter"),
+            Some("minimax/minimax-m2.7"),
+            &secrets,
+            AgentId::new(),
+        );
+        assert_eq!(summary.provider(), "openrouter");
+        assert_eq!(summary.default_model(), "minimax/minimax-m2.7");
+    }
+
+    /// #866 + #871: provider set, no model, AND the new provider entry has
+    /// its own `model` field. `apply_provider` rewrites `default_model` to
+    /// the entry's model — that's the (provider, model) pair the user
+    /// configured, so the leak guard does NOT clear it. This shape is
+    /// rejected by the PATCH validator (`SUMMARY_PROVIDER_REQUIRES_MODEL`
+    /// fires when `summary_model` is None) but a hand-edited TOML can still
+    /// reach this branch — keep the property pinned.
+    #[test]
+    fn build_summary_client_provider_only_with_entry_model_uses_entry_model() {
+        let (llm, secrets) = summary_test_fixtures(None, Some("provider-default-model"));
+        let summary =
+            build_summary_client(&llm, Some("openrouter"), None, &secrets, AgentId::new());
+        assert_eq!(summary.provider(), "openrouter");
+        assert_eq!(
+            summary.default_model(),
+            "provider-default-model",
+            "provider-entry model should reach the wire when no \
+             summary_model is configured (#866)"
+        );
+    }
+
+    /// #871 leak guard (the bug Tim flagged): provider set, no model, AND
+    /// the new provider entry has NO `model` field. `apply_provider` leaves
+    /// `default_model` unchanged, so the cloned client carries the AGENT's
+    /// model slug ("claude-sonnet-4-...") into the new (openrouter) wire.
+    /// Pre-fix: the agent's slug reaches openrouter and produces a 404 (the
+    /// exact symptom #861 was meant to prevent on the agent path). Post-fix:
+    /// the leak guard clears `default_model` so the wire request fails fast
+    /// with a missing-model error rather than 404'ing on the wrong slug.
+    #[test]
+    fn build_summary_client_provider_only_no_entry_model_clears_to_fail_fast() {
+        let (llm, secrets) = summary_test_fixtures(None, None);
+        let agent_model = llm.default_model().to_string();
+        let summary =
+            build_summary_client(&llm, Some("openrouter"), None, &secrets, AgentId::new());
+        assert_eq!(summary.provider(), "openrouter");
+        assert_ne!(
+            summary.default_model(),
+            agent_model,
+            "summary_provider switch must NOT leak the agent's model slug \
+             onto the summary provider's wire (#871, mirror of #860/#861)"
+        );
+        assert_eq!(
+            summary.default_model(),
+            "",
+            "leak guard clears default_model when summary_provider is set, \
+             summary_model is None, and the provider entry has no model \
+             field — wire fails fast with a missing-model error (#871)"
+        );
+    }
+
+    /// #866 + #871: provider set, model set, and the new provider entry
+    /// also has its own `model` field. The explicit `summary_model`
+    /// override must win — same property as the per-agent #861 test
+    /// (`test_per_agent_provider_with_entry_model_does_not_drop_per_agent_model`).
+    #[test]
+    fn build_summary_client_explicit_model_wins_over_entry_model() {
+        let (llm, secrets) = summary_test_fixtures(None, Some("provider-default-model"));
+        let summary = build_summary_client(
+            &llm,
+            Some("openrouter"),
+            Some("user-chosen-summary-model"),
+            &secrets,
+            AgentId::new(),
+        );
+        assert_eq!(summary.provider(), "openrouter");
+        assert_eq!(
+            summary.default_model(),
+            "user-chosen-summary-model",
+            "explicit summary_model must reach the wire even when the \
+             provider entry has its own model field"
+        );
+    }
+
+    /// Back-compat: when both fields are unset and the agent has a normal
+    /// resolved client, the helper short-circuits to a clone with the same
+    /// provider+model+base_url. This is the byte-identical-to-pre-#866
+    /// guarantee.
+    #[test]
+    fn build_summary_client_back_compat_when_provider_and_model_both_none() {
+        let (llm, secrets) = summary_test_fixtures(None, None);
+        let summary = build_summary_client(&llm, None, None, &secrets, AgentId::new());
+        assert_eq!(summary.provider(), "anthropic");
+        assert_eq!(summary.default_model(), "claude-sonnet-4-20250514");
     }
 }

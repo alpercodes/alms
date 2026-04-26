@@ -36,6 +36,13 @@
   letter-spacing: 0.06em;
 }
 .settings-hint { font-size: var(--text-2xs); color: var(--text-disabled); }
+/* Provider/model "disabled" hint sits directly under the Provider+Model
+   row (#865); pull it tight against the row above so it visually groups
+   with that pair instead of floating into the Max-tokens row below. */
+.settings-overrides-disabled-note {
+  margin-top: calc(-1 * var(--space-1));
+  margin-bottom: var(--space-2);
+}
 .settings-input, .settings-select {
   background: var(--surface-1);
   border: 1px solid var(--border-default);

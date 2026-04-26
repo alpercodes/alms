@@ -95,6 +95,14 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         .as_ref()
         .map(|p| p.display().to_string());
 
+    // #871 (Tim's nit on PR #871): expose the configured provider names so
+    // the UI can populate the summary-provider dropdown from
+    // `state.llm_config.providers` instead of a hardcoded four-entry list.
+    // Names are sorted for deterministic UI ordering. Only the keys are
+    // exposed — base URLs / API keys never leave the server.
+    let mut llm_provider_names: Vec<String> = state.llm_config.providers.keys().cloned().collect();
+    llm_provider_names.sort();
+
     let ctx = &agent.context_config;
     let sess = state.session_config.read().clone();
     let log = &state.logging_config;
@@ -113,6 +121,10 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "agent_id": agent_id,
         "agents": agents_list,
         "workspace_dir": workspace_dir,
+        // #871 (Tim's nit): provider names from `[llm.providers.<name>]`,
+        // sorted alphabetically. UI uses this to populate the summary-provider
+        // dropdown so user-defined providers in alms.toml show up automatically.
+        "llm_providers": llm_provider_names,
         // Context settings
         "context": {
             "strategy": ctx.strategy,
@@ -120,6 +132,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
             "recent_window": ctx.recent_window,
             "summary_interval": ctx.summary_interval,
             "summary_model": ctx.summary_model,
+            "summary_provider": ctx.summary_provider,
             "run_summary_mode": ctx.run_summary_mode.to_string(),
             "run_summary_budget": ctx.run_summary_budget,
         },
@@ -180,6 +193,10 @@ pub struct PatchContext {
     pub recent_window: Option<usize>,
     pub summary_interval: Option<usize>,
     pub summary_model: Option<String>,
+    /// Separate provider for the summary task (#866). Empty string clears
+    /// back to "inherit agent provider"; non-empty must reference a
+    /// configured `[llm.providers.<name>]` block whose API key is resolvable.
+    pub summary_provider: Option<String>,
 }
 
 /// Partial session config update.
@@ -319,11 +336,97 @@ pub async fn patch_settings(
         if let Some(v) = ctx_patch.summary_interval {
             ctx.summary_interval = v;
         }
-        if let Some(ref v) = ctx_patch.summary_model {
-            if v.is_empty() {
-                ctx.summary_model = None;
-            } else {
-                ctx.summary_model = Some(v.clone());
+
+        // #866 / #871: `summary_model` and `summary_provider` are validated
+        // together because their post-PATCH combined state matters: when a
+        // dedicated summary provider is configured, the agent's resolved
+        // model name belongs to a different provider and must NOT be used
+        // as a fallback for the summary task's wire model. The runtime has
+        // a defense-in-depth leak guard in `runs/lifecycle.rs` that clears
+        // the inherited model in this shape, but we reject the combination
+        // up front so misconfigurations surface at PATCH time exactly like
+        // `SUMMARY_PROVIDER_UNKNOWN` / `SUMMARY_PROVIDER_MISSING_API_KEY`
+        // do (Option 1 philosophy from #866).
+        //
+        // Compute the would-be post-PATCH values without committing them,
+        // validate the combined invariant, then commit.
+        let next_summary_model: Option<String> = match ctx_patch.summary_model.as_ref() {
+            Some(v) if v.is_empty() => None,
+            Some(v) => Some(v.clone()),
+            None => ctx.summary_model.clone(),
+        };
+        // Validate `summary_provider` if the patch touches it. `Ok(Some(p))`
+        // = set to provider name `p`; `Ok(None)` = clear; per-field error
+        // pushed onto `errors` and the live value preserved for the cross-
+        // field check.
+        let next_summary_provider_resolved: Option<String> =
+            match ctx_patch.summary_provider.as_ref() {
+                None => ctx.summary_provider.clone(),
+                Some(v) if v.is_empty() => None,
+                Some(v) => {
+                    let entry = state.llm_config.providers.get(v);
+                    let entry_has_key = entry.is_some_and(|e| e.resolve_api_key().is_some());
+                    let secrets_has_key = state.secrets.read().resolve_key(v).is_some();
+                    if entry.is_none() {
+                        errors.push(format!(
+                            "SUMMARY_PROVIDER_UNKNOWN: context.summary_provider '{v}' \
+                         is not configured under [llm.providers.<name>] in alms.toml"
+                        ));
+                        ctx.summary_provider.clone()
+                    } else if !entry_has_key && !secrets_has_key {
+                        errors.push(format!(
+                            "SUMMARY_PROVIDER_MISSING_API_KEY: context.summary_provider '{v}' \
+                         has no resolvable API key — set one with `alms auth set {v}` or \
+                         configure `[llm.providers.{v}].api_key_env` / `api_key`"
+                        ));
+                        ctx.summary_provider.clone()
+                    } else {
+                        Some(v.clone())
+                    }
+                }
+            };
+
+        // #871 / #872 cross-field invariant: the summary provider/model
+        // pair must be symmetric — both set or both unset. The pre-#872
+        // shape only validated provider-set + model-missing, but the
+        // model-set + provider-missing direction is just as broken: the
+        // resolver used to silently pair the user's `summary_model` with
+        // the agent's primary provider (the exact misconfiguration that
+        // produced the `model: not found` 404 in #866), and the v0.2.2
+        // default config shipped in that asymmetric shape. Reject both
+        // directions at PATCH time, regardless of which field the patch
+        // touched.
+        let provider_set = next_summary_provider_resolved.is_some();
+        let model_set = next_summary_model.is_some();
+        if provider_set && !model_set {
+            errors.push(
+                "SUMMARY_PROVIDER_REQUIRES_MODEL: context.summary_provider is set but \
+                 context.summary_model is empty. The agent's resolved model belongs to \
+                 the AGENT's provider namespace and is not a safe fallback for the \
+                 summary provider's wire — set summary_model to a slug valid for the \
+                 summary provider, or clear summary_provider (use empty string) to \
+                 inherit the agent's provider/model."
+                    .to_string(),
+            );
+        } else if !provider_set && model_set {
+            errors.push(
+                "SUMMARY_MODEL_REQUIRES_PROVIDER: context.summary_model is set but \
+                 context.summary_provider is empty. The user-supplied summary_model \
+                 belongs to a specific provider's namespace; pairing it with the \
+                 agent's primary provider would 404 on the wire (#866 / #872). Set \
+                 summary_provider to the matching provider name, or clear summary_model \
+                 (use empty string) to inherit the agent's provider/model."
+                    .to_string(),
+            );
+        } else {
+            // Cross-field invariant holds — commit the would-be values for
+            // any field the patch touched. Per-field validation errors above
+            // already preserved the live value, so this is a no-op for those.
+            if ctx_patch.summary_model.is_some() {
+                ctx.summary_model = next_summary_model;
+            }
+            if ctx_patch.summary_provider.is_some() {
+                ctx.summary_provider = next_summary_provider_resolved;
             }
         }
 
@@ -332,6 +435,7 @@ pub async fn patch_settings(
             max_input_tokens = ctx.max_input_tokens,
             recent_window = ctx.recent_window,
             summary_interval = ctx.summary_interval,
+            summary_provider = ?ctx.summary_provider,
             "Updated context config via PATCH /settings"
         );
     }
@@ -543,6 +647,12 @@ pub struct PersistedContextOverrides {
     pub summary_interval: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_model: Option<String>,
+    /// Persisted summary provider override (#866).
+    /// `None` means "fall through to TOML / env / code default" — typically
+    /// "inherit agent provider". `Some(provider)` re-targets the summary
+    /// task at that provider on every restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_summary_mode: Option<alms_core::config::RunSummaryMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -567,6 +677,9 @@ impl PersistedContextOverrides {
         }
         if self.summary_model.is_some() {
             ctx.summary_model = self.summary_model.clone();
+        }
+        if self.summary_provider.is_some() {
+            ctx.summary_provider = self.summary_provider.clone();
         }
         if let Some(ref v) = self.run_summary_mode {
             ctx.run_summary_mode = v.clone();
@@ -794,6 +907,7 @@ fn persist_settings(state: &AppState) {
             recent_window: Some(ctx.recent_window),
             summary_interval: Some(ctx.summary_interval),
             summary_model: ctx.summary_model.clone(),
+            summary_provider: ctx.summary_provider.clone(),
             // run_summary_mode and run_summary_budget are NOT exposed in
             // PATCH /settings, so we never persist them. This ensures that
             // code-default changes and env-var overrides are always respected.
@@ -980,6 +1094,43 @@ mod tests {
         assert_eq!(ctx.summary_interval, 30);
     }
 
+    /// #866: `summary_provider` applies to ContextConfig when set in
+    /// overrides and is preserved when overrides leave it None.
+    #[test]
+    fn context_overrides_summary_provider_round_trip() {
+        let mut ctx = alms_core::config::ContextConfig::default();
+        assert_eq!(
+            ctx.summary_provider, None,
+            "default ContextConfig has summary_provider = None"
+        );
+
+        // Setting it on the override applies it.
+        let overrides = PersistedContextOverrides {
+            summary_provider: Some("openrouter".into()),
+            ..Default::default()
+        };
+        overrides.apply_to(&mut ctx);
+        assert_eq!(
+            ctx.summary_provider,
+            Some("openrouter".into()),
+            "summary_provider override should land on ContextConfig"
+        );
+
+        // Subsequent override with None on summary_provider must not clear
+        // the value (the persisted-overrides semantics: only Some fields
+        // overwrite; mirrors `summary_model`).
+        let no_op = PersistedContextOverrides {
+            strategy: Some("truncate".into()),
+            ..Default::default()
+        };
+        no_op.apply_to(&mut ctx);
+        assert_eq!(
+            ctx.summary_provider,
+            Some("openrouter".into()),
+            "PersistedContextOverrides with None summary_provider must not clear the live value"
+        );
+    }
+
     /// Session overrides with partial fields should only overwrite `Some` fields.
     #[test]
     fn session_overrides_apply_only_some_fields() {
@@ -1030,6 +1181,7 @@ mod tests {
                 recent_window: Some(20),
                 summary_interval: Some(30),
                 summary_model: None,
+                summary_provider: None,
                 run_summary_mode: None,
                 run_summary_budget: None,
             }),
@@ -1058,6 +1210,7 @@ mod tests {
                 recent_window: Some(10),
                 summary_interval: Some(15),
                 summary_model: Some("gpt-4o-mini".into()),
+                summary_provider: None,
                 run_summary_mode: None,
                 run_summary_budget: None,
             }),
@@ -1669,5 +1822,350 @@ mod tests {
             "rejected PATCH must not rewrite settings.json — \
              persisted snapshot drifted across a 422 response"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #871 cross-field validator: SUMMARY_PROVIDER_REQUIRES_MODEL
+    //
+    // Mirror of #861's leak-guard tests but at the PATCH layer. The
+    // validator rejects any combination that would leave the live config
+    // with `summary_provider = Some(...)` AND `summary_model = None`,
+    // regardless of which field the patch actually touched. The runtime
+    // leak guard in `lifecycle.rs::build_summary_client` is the second
+    // layer of defense for hand-edited TOML and any other path that
+    // bypasses PATCH validation.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build an `AppState` with `[llm.providers.openrouter]` configured
+    /// AND a usable API key in the secrets store, so the `summary_provider`
+    /// validator passes the `SUMMARY_PROVIDER_UNKNOWN` /
+    /// `SUMMARY_PROVIDER_MISSING_API_KEY` per-field checks. The
+    /// cross-field invariant is what we want to exercise.
+    fn settings_test_app_state_with_openrouter() -> crate::server::AppState {
+        let mut state = settings_test_app_state();
+        // Inject an `[llm.providers.openrouter]` entry so SUMMARY_PROVIDER_UNKNOWN
+        // does not fire. The base_url / kind don't matter for validation.
+        state.llm_config.providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        state
+            .secrets
+            .write()
+            .set_key("openrouter", "sk-or-test")
+            .unwrap();
+        state
+    }
+
+    /// Helper: read the `errors` array from a PATCH /settings 422 response.
+    async fn patch_and_read_errors(
+        state: crate::server::AppState,
+        body: PatchSettingsRequest,
+    ) -> (StatusCode, Vec<String>) {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        let resp = patch_settings(axum::extract::State(state), Json(body))
+            .await
+            .into_response();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let errors = json
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (status, errors)
+    }
+
+    /// Attempting to set `summary_provider` while `summary_model` is empty
+    /// (cleared in the SAME patch) must produce 422 and leave both fields
+    /// untouched in the live config.
+    #[tokio::test]
+    async fn patch_rejects_summary_provider_with_empty_summary_model() {
+        let state = settings_test_app_state_with_openrouter();
+        // Seed: both fields cleared so the pre-state is the default.
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = None;
+            agent.context_config.summary_model = None;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_PROVIDER_REQUIRES_MODEL")),
+            "expected SUMMARY_PROVIDER_REQUIRES_MODEL error, got: {errors:?}"
+        );
+
+        let cfg = state.agent_config.read();
+        assert!(
+            cfg.context_config.summary_provider.is_none(),
+            "rejected PATCH must not commit summary_provider"
+        );
+        assert!(
+            cfg.context_config.summary_model.is_none(),
+            "rejected PATCH must not commit summary_model"
+        );
+    }
+
+    /// Setting `summary_provider` alone when `summary_model` is already
+    /// `None` in the live config must produce 422 — the cross-field check
+    /// considers the would-be combined post-state, not just the patch
+    /// fields.
+    #[tokio::test]
+    async fn patch_rejects_summary_provider_when_live_model_is_none() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = None;
+            agent.context_config.summary_model = None;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some("openrouter".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_PROVIDER_REQUIRES_MODEL")),
+            "expected SUMMARY_PROVIDER_REQUIRES_MODEL error, got: {errors:?}"
+        );
+        assert!(
+            state
+                .agent_config
+                .read()
+                .context_config
+                .summary_provider
+                .is_none(),
+        );
+    }
+
+    /// Clearing `summary_model` (`""`) when the live `summary_provider`
+    /// is `Some(...)` must produce 422 — the operator is told to clear
+    /// both together, mirroring the validator's recommended remediation.
+    #[tokio::test]
+    async fn patch_rejects_clearing_model_while_provider_is_set() {
+        let state = settings_test_app_state_with_openrouter();
+        // Seed: both set together (the valid state).
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = Some("openrouter".into());
+            agent.context_config.summary_model = Some("minimax/minimax-m2.7".into());
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_model: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_PROVIDER_REQUIRES_MODEL")),
+            "expected SUMMARY_PROVIDER_REQUIRES_MODEL error, got: {errors:?}"
+        );
+
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.context_config.summary_provider,
+            Some("openrouter".into()),
+            "rejected PATCH must leave live summary_provider intact"
+        );
+        assert_eq!(
+            cfg.context_config.summary_model,
+            Some("minimax/minimax-m2.7".into()),
+            "rejected PATCH must leave live summary_model intact"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Symmetric pair-only validation (#872)
+    //
+    // The pre-#872 validator rejected only the (provider-set,
+    // model-missing) direction. The (model-set, provider-missing)
+    // direction was the original v0.2.2 default and silently paired
+    // the user's `summary_model` with the agent's primary provider —
+    // the exact misconfiguration that produced the 404 in #866. These
+    // tests lock down the symmetric reject path so the regression
+    // can't sneak back in.
+    // ------------------------------------------------------------------
+
+    /// Setting `summary_model` alone (provider untouched / unset) must
+    /// fire the new symmetric `SUMMARY_MODEL_REQUIRES_PROVIDER` error.
+    #[tokio::test]
+    async fn patch_rejects_summary_model_when_provider_is_unset() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = None;
+            agent.context_config.summary_model = None;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_MODEL_REQUIRES_PROVIDER")),
+            "expected SUMMARY_MODEL_REQUIRES_PROVIDER error, got: {errors:?}"
+        );
+        let cfg = state.agent_config.read();
+        assert!(
+            cfg.context_config.summary_provider.is_none(),
+            "rejected PATCH must not change summary_provider"
+        );
+        assert!(
+            cfg.context_config.summary_model.is_none(),
+            "rejected PATCH must not commit summary_model"
+        );
+    }
+
+    /// Clearing `summary_provider` (`""`) when the live `summary_model`
+    /// is `Some(...)` must produce 422 — symmetric to
+    /// `patch_rejects_clearing_model_while_provider_is_set`. Pre-#872
+    /// this combination was silently accepted, leaving the model
+    /// stranded with no matching provider.
+    #[tokio::test]
+    async fn patch_rejects_clearing_provider_while_model_is_set() {
+        let state = settings_test_app_state_with_openrouter();
+        // Seed: both set together (the valid state).
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = Some("openrouter".into());
+            agent.context_config.summary_model = Some("minimax/minimax-m2.7".into());
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_MODEL_REQUIRES_PROVIDER")),
+            "expected SUMMARY_MODEL_REQUIRES_PROVIDER error, got: {errors:?}"
+        );
+
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.context_config.summary_provider,
+            Some("openrouter".into()),
+            "rejected PATCH must leave live summary_provider intact"
+        );
+        assert_eq!(
+            cfg.context_config.summary_model,
+            Some("minimax/minimax-m2.7".into()),
+            "rejected PATCH must leave live summary_model intact"
+        );
+    }
+
+    /// Happy path: setting both fields together in one PATCH is accepted.
+    #[tokio::test]
+    async fn patch_accepts_summary_provider_and_model_together() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = None;
+            agent.context_config.summary_model = None;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        use axum::response::IntoResponse;
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.context_config.summary_provider,
+            Some("openrouter".into())
+        );
+        assert_eq!(
+            cfg.context_config.summary_model,
+            Some("minimax/minimax-m2.7".into())
+        );
+    }
+
+    /// Clearing both fields together is accepted — the cross-field
+    /// invariant ("provider set without model") is `false` so PATCH lands.
+    #[tokio::test]
+    async fn patch_accepts_clearing_both_summary_fields_together() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = Some("openrouter".into());
+            agent.context_config.summary_model = Some("minimax/minimax-m2.7".into());
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some(String::new()),
+                summary_model: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        use axum::response::IntoResponse;
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.agent_config.read();
+        assert!(cfg.context_config.summary_provider.is_none());
+        assert!(cfg.context_config.summary_model.is_none());
     }
 }

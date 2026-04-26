@@ -377,12 +377,13 @@ async fn main() -> anyhow::Result<()> {
                 RunCommands::Create {
                     session,
                     input,
+                    agent,
                     model,
                     max_tokens,
                     posture,
                 } => {
                     cmd_run::run_create(
-                        &client, &url, &session, &input, model, max_tokens, posture, json,
+                        &client, &url, &session, &input, agent, model, max_tokens, posture, json,
                     )
                     .await?;
                 }

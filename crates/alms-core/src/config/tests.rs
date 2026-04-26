@@ -779,10 +779,21 @@ fn test_load_or_default_resolves_data_dir() {
 #[test]
 fn test_context_config_defaults_episodic() {
     let config = ContextConfig::default();
+    // #872 changed the default from Some("minimax/minimax-m2.7") + None
+    // to None + None so the shipped baseline doesn't sit in the
+    // asymmetric (model-only) shape that the new pair-only validator
+    // would otherwise reject. Operators opt into a dedicated summary
+    // task by setting both fields together.
     assert_eq!(
-        config.summary_model,
-        Some("minimax/minimax-m2.7".into()),
-        "summary_model should default to a cheap non-reasoning model"
+        config.summary_model, None,
+        "summary_model now defaults to None — the pre-#872 default \
+         (Some(\"minimax/...\") + None) was the asymmetric shape the \
+         validator rejects"
+    );
+    assert_eq!(
+        config.summary_provider, None,
+        "summary_provider mirrors summary_model — both default to None \
+         post-#872 so the pair-only invariant holds out of the box"
     );
     assert_eq!(config.run_summary_mode, RunSummaryMode::Llm);
     assert_eq!(config.run_summary_budget, 2000);

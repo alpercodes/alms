@@ -218,6 +218,15 @@ mod config {
         // then ALWAYS re-resolve the API key from secrets for the effective
         // provider. This ensures keys set at runtime (via UI or CLI) are picked
         // up even for the default agent which has no per-agent provider field.
+        //
+        // Snapshot the previous provider AND model so the leak guard below
+        // can detect a per-agent provider switch where neither layer (per-
+        // agent model nor provider-entry model) supplies a model for the new
+        // provider. In that case `apply_provider` leaves `default_model`
+        // unchanged from the OLD provider's default -- and that wrong-
+        // provider model name reaches the wire (#860).
+        let previous_provider = llm.provider().to_string();
+        let previous_default_model = llm.default_model().to_string();
         let mut llm = llm.clone();
         if let Some(ref record) = agent_record
             && let Some(ref provider) = record.provider
@@ -252,8 +261,34 @@ mod config {
                 "No secrets store and no per-agent provider — using base LLM client key as-is"
             );
         }
+
+        // Apply the per-agent model. When set this overrides any value
+        // `apply_provider` left on `default_model` -- the per-agent override
+        // is the user's explicit choice and must reach the wire.
         if let Some(model) = merged.model_override {
             llm = llm.with_model(model);
+        } else if llm.provider() != previous_provider
+            && llm.default_model() == previous_default_model
+        {
+            // #860 leak guard: per-agent provider switch fired AND neither
+            // a per-agent model nor a `[llm.providers.<new_provider>].model`
+            // entry supplied a model for the new provider, so `default_model`
+            // is still the OLD provider's default. Clear it so the agent
+            // loop's wire request fails fast with a clear "missing model"
+            // error rather than 404'ing on the new provider with the wrong
+            // model name (the original symptom in #860 was Anthropic 404 on
+            // an OpenRouter model name).
+            warn!(
+                agent_id = %agent_id,
+                old_provider = %previous_provider,
+                new_provider = %llm.provider(),
+                stale_model = %previous_default_model,
+                "Per-agent provider switch with no per-agent model and no \
+                 provider-entry model -- clearing inherited model so the run \
+                 fails fast instead of sending the previous provider's default \
+                 model to the new provider's wire (#860)"
+            );
+            llm = llm.with_model(String::new());
         }
 
         ResolvedAgentConfig {
@@ -316,6 +351,20 @@ fn apply_overrides(
         if let Some(budget) = record.gemini_thinking_budget {
             cfg.gemini_thinking_budget = Some(budget);
         }
+        // Per-agent summary provider/model overrides (#872). `Some(_)`
+        // overrides the server-level `[context].summary_provider` /
+        // `summary_model` for this agent's runs. The validator on
+        // `POST /agents` / `PATCH /agents/{id}` enforces the pair-only
+        // invariant (both fields set together or both unset) so by the
+        // time we get here the per-agent values are guaranteed
+        // symmetric. `None` falls through to the server-level setting
+        // already on `cfg.context_config`.
+        if let Some(ref provider) = record.summary_provider {
+            cfg.context_config.summary_provider = Some(provider.clone());
+        }
+        if let Some(ref model) = record.summary_model {
+            cfg.context_config.summary_model = Some(model.clone());
+        }
     }
 
     // -- Per-run overrides (highest precedence) --
@@ -370,16 +419,32 @@ fn apply_overrides(
 /// switch and re-apply it afterwards if the switch clobbered the value.
 /// The per-run model still wins last when set, so explicit overrides are
 /// honored regardless. Closes #833.
+///
+/// #860 leak guard: when a per-run `provider` override fires AND neither a
+/// per-run model nor a per-agent model is set AND the new provider entry
+/// has no `model` field, the snapshot is the OLD provider's server default
+/// — a model name that does not belong to the new provider. We clear
+/// `default_model` in that case so the wire request fails fast with a
+/// clear "missing model" error rather than a confusing 404 from the new
+/// provider naming the wrong model. The per-agent path plugs the same leak
+/// inside `resolve_agent_config`; the guard here covers the case where the
+/// switch happens at the per-run layer with no per-agent override.
 fn apply_per_run_llm_overrides(
     resolved_llm: alms_runtime::LlmClient,
     overrides: &RunOverrides,
     secrets: &alms_core::secrets::SecretsStore,
 ) -> alms_runtime::LlmClient {
     let resolved_model = resolved_llm.default_model().to_string();
+    let resolved_provider = resolved_llm.provider().to_string();
     let mut llm = resolved_llm;
     if let Some(ref provider) = overrides.provider {
         llm = llm.with_provider_and_secrets(provider, secrets);
+        let provider_changed = llm.provider() != resolved_provider;
         if llm.default_model() != resolved_model {
+            // #833 path: `apply_provider` overwrote `default_model` with the
+            // new provider entry's `model`. Restore the previously resolved
+            // model so per-agent overrides are not silently dropped. The
+            // per-run model still wins last when set.
             tracing::info!(
                 provider = %provider,
                 clobbered_model = %llm.default_model(),
@@ -387,7 +452,25 @@ fn apply_per_run_llm_overrides(
                 "Per-run provider switch rewrote default_model from a provider entry; \
                  restoring resolved per-agent / server-default model (#833)"
             );
-            llm = llm.with_model(resolved_model);
+            llm = llm.with_model(resolved_model.clone());
+        } else if provider_changed && overrides.model.is_none() && !resolved_model.is_empty() {
+            // #860 path: provider changed but `apply_provider` left
+            // `default_model` unchanged because the new provider entry has
+            // no `model` field. The snapshot is the OLD provider's default
+            // -- wrong for the new provider's wire. Clear `default_model`
+            // so the wire request fails fast with a clear "missing model"
+            // error instead of 404'ing on the new provider with the wrong
+            // model name.
+            tracing::warn!(
+                old_provider = %resolved_provider,
+                new_provider = %llm.provider(),
+                stale_model = %resolved_model,
+                "Per-run provider switch with no per-run / per-agent model and no \
+                 provider-entry model -- clearing inherited model so the run \
+                 fails fast instead of sending the previous provider's default \
+                 model to the new provider's wire (#860)"
+            );
+            llm = llm.with_model(String::new());
         }
     }
     if let Some(ref model) = overrides.model {
@@ -434,6 +517,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -569,6 +654,8 @@ mod tests {
             thinking_budget_tokens: budget,
             reasoning_effort: None,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -670,6 +757,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: effort,
             gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -786,6 +875,8 @@ mod tests {
             thinking_budget_tokens: None,
             reasoning_effort: None,
             gemini_thinking_budget: budget,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -894,6 +985,151 @@ mod tests {
             &RunOverrides::default(),
         );
         assert!(merged.agent_config.gemini_thinking_budget.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Per-agent summary provider/model overlay (issue #872)
+    //
+    // `apply_overrides` overlays the per-agent `summary_provider` /
+    // `summary_model` from the `AgentRecord` onto the inherited
+    // `context_config`. Resolution: per-agent ?? server-level. When
+    // both are None at the per-agent layer the server-level setting
+    // (already on `cfg.context_config`) shines through — preserving
+    // the back-compat path described in #872. The pair-only invariant
+    // is enforced upstream in the HTTP handler so by the time the
+    // record reaches `apply_overrides` the two fields are guaranteed
+    // symmetric.
+    // ------------------------------------------------------------------
+
+    fn base_config_with_server_summary(
+        summary_provider: Option<&str>,
+        summary_model: Option<&str>,
+    ) -> AgentConfig {
+        AgentConfig {
+            context_config: alms_core::config::ContextConfig {
+                summary_provider: summary_provider.map(str::to_string),
+                summary_model: summary_model.map(str::to_string),
+                ..alms_core::config::ContextConfig::default()
+            },
+            ..AgentConfig::default()
+        }
+    }
+
+    fn agent_with_summary(provider: Option<&str>, model: Option<&str>) -> AgentRecord {
+        let now = Utc::now();
+        AgentRecord {
+            id: AgentId::new(),
+            name: "summary-agent".into(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: provider.map(str::to_string),
+            summary_model: model.map(str::to_string),
+            is_default: false,
+            created_at: now,
+            last_active: now,
+        }
+    }
+
+    #[test]
+    fn test_summary_per_agent_overrides_server_default() {
+        // Server default points the summary task at OpenRouter; agent
+        // overrides to Anthropic. Per-agent must win.
+        let agent = agent_with_summary(Some("anthropic"), Some("claude-haiku-4"));
+        let merged = apply_overrides(
+            base_config_with_server_summary(Some("openrouter"), Some("minimax/minimax-m2.7")),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged
+                .agent_config
+                .context_config
+                .summary_provider
+                .as_deref(),
+            Some("anthropic")
+        );
+        assert_eq!(
+            merged.agent_config.context_config.summary_model.as_deref(),
+            Some("claude-haiku-4")
+        );
+    }
+
+    #[test]
+    fn test_summary_per_agent_none_falls_through_to_server() {
+        // Per-agent both-None: the server-level summary config inherited
+        // via `context_config.clone()` wins. Identical to today's
+        // server-level path — the back-compat guarantee from #872.
+        let agent = agent_with_summary(None, None);
+        let merged = apply_overrides(
+            base_config_with_server_summary(Some("openrouter"), Some("minimax/minimax-m2.7")),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged
+                .agent_config
+                .context_config
+                .summary_provider
+                .as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            merged.agent_config.context_config.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
+    }
+
+    #[test]
+    fn test_summary_all_none_stays_none() {
+        // Both layers unset → the merged config has both fields None.
+        // The runtime-side `build_summary_client` short-circuits on
+        // `summary_provider = None` to a clone of the agent's main
+        // LLM client (the back-compat path), so no separate summary
+        // task runs.
+        let agent = agent_with_summary(None, None);
+        let merged = apply_overrides(
+            base_config_with_server_summary(None, None),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert!(
+            merged
+                .agent_config
+                .context_config
+                .summary_provider
+                .is_none()
+        );
+        assert!(merged.agent_config.context_config.summary_model.is_none());
+    }
+
+    #[test]
+    fn test_summary_per_agent_overrides_when_server_unset() {
+        // Server default is unset (the post-#872 default); per-agent
+        // opts in. Per-agent reaches the merged config exactly as set.
+        let agent = agent_with_summary(Some("openrouter"), Some("minimax/minimax-m2.7"));
+        let merged = apply_overrides(
+            base_config_with_server_summary(None, None),
+            Some(&agent),
+            &RunOverrides::default(),
+        );
+        assert_eq!(
+            merged
+                .agent_config
+                .context_config
+                .summary_provider
+                .as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            merged.agent_config.context_config.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1284,6 +1520,321 @@ mod tests {
             "per-run provider override must NOT clobber per-agent model"
         );
         // Sanity: provider switch did happen.
+        assert_eq!(llm.provider(), "anthropic");
+    }
+
+    /// Regression test for #860 -- when a per-agent `provider` override is
+    /// set together with a per-agent `model` override, the per-agent model
+    /// must reach the wire even though the server-default provider entry
+    /// has its own `model` field set.
+    ///
+    /// Bug scenario from the issue: server default provider is `openrouter`
+    /// with `[llm.providers.openrouter].model = "moonshotai/kimi-k2.6"`.
+    /// Agent has `provider = "anthropic"` and `model = "claude-sonnet-4-6"`.
+    /// The expected wire model is `claude-sonnet-4-6` (per-agent), but the
+    /// bug surfaced as a 404 from Anthropic referencing `moonshotai/kimi-k2.6`
+    /// because the per-agent model was being clobbered before reaching the
+    /// wire (parallel of #833 but on the per-agent path).
+    #[test]
+    fn test_per_agent_provider_does_not_drop_per_agent_model() {
+        let mut record = test_agent(Some("claude-sonnet-4-6"), None);
+        record.is_default = true;
+        record.provider = Some("anthropic".into());
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // Server-default provider entry pinned to a specific model.
+                // This is the value that surfaced on the wire in #860 when
+                // the per-agent model was clobbered.
+                model: Some("moonshotai/kimi-k2.6".into()),
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let server_cfg = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "openrouter-key".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            default_model: "moonshotai/kimi-k2.6".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
+        std::mem::forget(dir);
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        assert_eq!(
+            resolved.llm.default_model(),
+            "claude-sonnet-4-6",
+            "per-agent provider override must NOT clobber per-agent model (#860)"
+        );
+        assert_eq!(resolved.llm.provider(), "anthropic");
+    }
+
+    /// Companion regression for #860 -- the most pernicious shape, where the
+    /// new provider's entry has its own `model` field that would clobber
+    /// `default_model` inside `apply_provider`. The per-agent `with_model`
+    /// must still win because `resolve_agent_config` re-applies it after the
+    /// provider switch.
+    #[test]
+    fn test_per_agent_provider_with_entry_model_does_not_drop_per_agent_model() {
+        let mut record = test_agent(Some("claude-sonnet-4-6"), None);
+        record.is_default = true;
+        record.provider = Some("anthropic".into());
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: Some("moonshotai/kimi-k2.6".into()),
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // Bug trigger -- anthropic entry pinned to its own model so
+                // `apply_provider` inside `with_provider_and_secrets`
+                // overwrites `default_model` to this value before the
+                // per-agent `with_model` step runs.
+                model: Some("claude-sonnet-from-anthropic-entry".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let server_cfg = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "openrouter-key".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            default_model: "moonshotai/kimi-k2.6".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
+        std::mem::forget(dir);
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        assert_eq!(
+            resolved.llm.default_model(),
+            "claude-sonnet-4-6",
+            "per-agent provider override must NOT clobber per-agent model \
+             even when the new provider entry has its own model (#860)"
+        );
+        assert_eq!(resolved.llm.provider(), "anthropic");
+    }
+
+    /// Hypothetical: per-agent provider only, no per-agent model. The
+    /// server-default model leaks through to the new provider when the new
+    /// provider's `[llm.providers.<name>]` entry has no `model` field.
+    /// This is the specific scenario surfaced in #860.
+    #[test]
+    fn test_per_agent_provider_only_no_per_agent_model_does_not_leak_server_default() {
+        let mut record = test_agent(None, None); // no per-agent model
+        record.is_default = true;
+        record.provider = Some("anthropic".into());
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // No model field on the anthropic entry, so apply_provider
+                // leaves default_model untouched. Without an explicit
+                // restore step the server-default kimi model leaks through.
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let server_cfg = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "openrouter-key".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            // The smoking gun -- this is what surfaces on the wire to
+            // anthropic in #860, even though the user wanted nothing
+            // openrouter-related when they switched providers per-agent.
+            default_model: "moonshotai/kimi-k2.6".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
+        std::mem::forget(dir);
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        // Pre-fix: default_model() == "moonshotai/kimi-k2.6" (the leak).
+        // Post-fix: the leak guard clears default_model so the wire request
+        // fails fast with a clear missing-model error rather than 404'ing
+        // on Anthropic with the wrong (OpenRouter) model name.
+        assert_ne!(
+            resolved.llm.default_model(),
+            "moonshotai/kimi-k2.6",
+            "per-agent provider switch must NOT leak the server-default model \
+             of the previous provider to the new provider's wire (#860)"
+        );
+        assert_eq!(
+            resolved.llm.default_model(),
+            "",
+            "leak guard clears default_model when a per-agent provider switch \
+             produces no model from any layer (#860)"
+        );
+        assert_eq!(resolved.llm.provider(), "anthropic");
+    }
+
+    /// Sibling of the per-agent leak: when a per-run `provider` override
+    /// is set with no per-run model and the agent has no per-agent model,
+    /// the server-default model of the OLD provider leaks through to the
+    /// new provider when the new provider entry has no `model` field.
+    /// Pre-fix this passes only because #841's snapshot+restore happens to
+    /// also paper over the leak; the post-fix behaviour pins the property.
+    #[test]
+    fn test_per_run_provider_only_no_model_does_not_leak_server_default() {
+        let record = test_agent(None, None); // no per-agent model, no per-agent provider
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let server_cfg = LlmConfig {
+            provider: "openrouter".into(),
+            api_key: "openrouter-key".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            default_model: "moonshotai/kimi-k2.6".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
+        std::mem::forget(dir);
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        let overrides = RunOverrides {
+            provider: Some("anthropic".into()),
+            ..RunOverrides::default()
+        };
+        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
+
+        // Same property as #860 but on the per-run path. Pre-fix this also
+        // leaks moonshotai/kimi-k2.6 because the new anthropic entry has no
+        // model field of its own. Post-fix the per-run leak guard clears
+        // default_model so the wire request fails fast.
+        assert_ne!(
+            llm.default_model(),
+            "moonshotai/kimi-k2.6",
+            "per-run provider switch with no model overrides must NOT leak \
+             the server-default model of the previous provider (#860)"
+        );
+        assert_eq!(
+            llm.default_model(),
+            "",
+            "per-run leak guard clears default_model when no layer supplies \
+             a model for the new provider (#860)"
+        );
         assert_eq!(llm.provider(), "anthropic");
     }
 
