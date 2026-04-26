@@ -19,6 +19,7 @@ pub(crate) mod gemini_cache;
 pub mod llm_client;
 pub mod llm_types;
 pub mod scheduler;
+pub mod summary_client;
 pub mod tools;
 pub mod workspace;
 pub mod workspace_tool;
@@ -28,6 +29,7 @@ pub use events::{RuntimeEvent, RuntimeEventSender};
 pub use llm_client::LlmClient;
 pub use llm_types::*;
 pub use scheduler::Scheduler;
+pub use summary_client::build_summary_client;
 pub use workspace::{AgentWorkspace, WorkspaceFile};
 
 // Re-export core types for convenience

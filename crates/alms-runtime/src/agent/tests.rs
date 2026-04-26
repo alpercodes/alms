@@ -24,6 +24,7 @@ async fn test_stream_llm_call_emits_token_deltas() {
         agent_id: AgentId::new(),
         config: AgentConfig::default(),
         llm: LlmClient::new(config).unwrap(),
+        summary_llm: None,
         tools: ToolRegistry::new(),
         workspace: None,
         event_sender: Some(tx),
@@ -68,6 +69,7 @@ async fn test_build_context() {
         agent_id: AgentId::new(),
         config: AgentConfig::default(),
         llm: LlmClient::new(LlmConfig::default()).unwrap(),
+        summary_llm: None,
         tools: ToolRegistry::new(),
         workspace: None,
         event_sender: None,
@@ -102,6 +104,7 @@ async fn test_build_context_dm_perspective_mapping() {
         agent_id: AgentId::new(),
         config: AgentConfig::default(),
         llm: LlmClient::new(LlmConfig::default()).unwrap(),
+        summary_llm: None,
         tools: ToolRegistry::new(),
         workspace: None,
         event_sender: None,
@@ -184,6 +187,7 @@ async fn test_build_context_non_dm_no_perspective() {
         agent_id: AgentId::new(),
         config: AgentConfig::default(),
         llm: LlmClient::new(LlmConfig::default()).unwrap(),
+        summary_llm: None,
         tools: ToolRegistry::new(),
         workspace: None,
         event_sender: None,
@@ -338,6 +342,7 @@ async fn test_guarded_posture_sequential_approvals() {
             ..AgentConfig::default()
         },
         llm: LlmClient::new(config).unwrap(),
+        summary_llm: None,
         tools,
         workspace: None,
         event_sender: Some(tx),
@@ -433,6 +438,7 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
             ..AgentConfig::default()
         },
         llm: LlmClient::new(config).unwrap(),
+        summary_llm: None,
         tools,
         workspace: None,
         event_sender: Some(tx),
@@ -513,6 +519,7 @@ async fn test_classifier_blocked_shell_surfaces_target_in_tool_end() {
             ..AgentConfig::default()
         },
         llm: LlmClient::new(config).unwrap(),
+        summary_llm: None,
         tools,
         workspace: None,
         event_sender: Some(tx),
@@ -2096,4 +2103,67 @@ fn test_agent_config_thinking_budget_threads_into_request() {
         req0 = req0.with_thinking_budget(cfg0.anthropic_thinking_budget);
     }
     assert!(req0.thinking_budget_tokens.is_none());
+}
+
+/// #866: `with_summary_llm` populates the dedicated summary client.
+///
+/// Default state: `summary_llm` is `None` so the in-loop sliding-summary
+/// path falls back to `self.llm` (pre-#866 behaviour).
+///
+/// After `with_summary_llm`, the field is `Some(client)` whose provider
+/// can differ from `self.llm`'s provider. This is the path the gateway
+/// uses when `[context].summary_provider` is configured: it clones the
+/// agent's resolved client, calls `with_provider_and_secrets` on the
+/// clone, and hands the re-targeted client to the runtime via
+/// `with_summary_llm`. The runtime never re-resolves the provider — it
+/// just reads back what the gateway plumbed in.
+#[tokio::test]
+async fn test_with_summary_llm_sets_dedicated_client_for_866() {
+    use crate::LlmConfig;
+
+    let agent_llm = LlmClient::new(LlmConfig {
+        provider: "anthropic".into(),
+        default_model: "claude-sonnet-4-20250514".into(),
+        ..LlmConfig::default()
+    })
+    .unwrap();
+
+    // Build a separate client for the summary task on a different
+    // provider — exactly what the gateway does when
+    // `[context].summary_provider = "openrouter"` is set.
+    let summary_llm = LlmClient::new(LlmConfig {
+        provider: "openrouter".into(),
+        default_model: "minimax/minimax-m2.7".into(),
+        ..LlmConfig::default()
+    })
+    .unwrap();
+
+    let runtime =
+        AgentRuntime::new(AgentId::new(), AgentConfig::default(), agent_llm.clone()).unwrap();
+
+    // Default: no summary client wired -> agent's llm is used.
+    assert!(
+        runtime.summary_llm.is_none(),
+        "AgentRuntime::new must leave summary_llm as None for back-compat"
+    );
+    assert_eq!(runtime.llm.provider(), "anthropic");
+
+    // After with_summary_llm, the dedicated client is present and points
+    // at a different provider than the agent's llm. The agent's primary
+    // llm (used for the main run loop) is untouched.
+    let runtime = runtime.with_summary_llm(summary_llm);
+    let summary_client = runtime
+        .summary_llm
+        .as_ref()
+        .expect("with_summary_llm must populate the field");
+    assert_eq!(
+        summary_client.provider(),
+        "openrouter",
+        "summary client must keep the override provider"
+    );
+    assert_eq!(
+        runtime.llm.provider(),
+        "anthropic",
+        "agent's main llm must NOT be re-targeted by with_summary_llm"
+    );
 }

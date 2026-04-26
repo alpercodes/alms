@@ -25,7 +25,7 @@ const MODAL_TRISTATE_CLASSES = {
     input: 'settings-input settings-tristate-value',
 };
 
-const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
+const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'gemini'];
 
 /** Format large numbers with commas for readability. */
 function fmt(n) {
@@ -239,6 +239,10 @@ export function SettingsModal({ open, onClose }) {
     const ctxRecentWindow = useSignal('');
     const ctxSummaryInterval = useSignal('');
     const ctxSummaryModel = useSignal('');
+    // #866: dedicated provider for the summary task. '' = inherit agent
+    // provider (pre-#866 behaviour); non-empty re-targets the summary
+    // client at that provider via with_provider_and_secrets.
+    const ctxSummaryProvider = useSignal('');
 
     // Server-level editable signals — Session
     const sessMaxMessages = useSignal('');
@@ -304,6 +308,7 @@ export function SettingsModal({ open, onClose }) {
             ctxRecentWindow.value = ctx.recent_window != null ? String(ctx.recent_window) : '';
             ctxSummaryInterval.value = ctx.summary_interval != null ? String(ctx.summary_interval) : '';
             ctxSummaryModel.value = ctx.summary_model || '';
+            ctxSummaryProvider.value = ctx.summary_provider || '';
 
             sessMaxMessages.value = sess.max_messages != null ? String(sess.max_messages) : '';
             sessMaxCtxTokens.value = sess.max_context_tokens != null ? String(sess.max_context_tokens) : '';
@@ -428,6 +433,11 @@ export function SettingsModal({ open, onClose }) {
         }
         if (ctxSummaryModel.value !== (ctx.summary_model || '')) {
             ctxPatch.summary_model = ctxSummaryModel.value;
+        }
+        // #866: only PATCH summary_provider when the user actually changed
+        // it. Empty string clears back to "inherit agent provider".
+        if (ctxSummaryProvider.value !== (ctx.summary_provider || '')) {
+            ctxPatch.summary_provider = ctxSummaryProvider.value;
         }
         if (Object.keys(ctxPatch).length > 0) body.context = ctxPatch;
 
@@ -761,6 +771,24 @@ export function SettingsModal({ open, onClose }) {
                         <span class="settings-effective">
                             <${ModelDisplay} value=${ctxSummaryModel.value.trim()} defaultValue=${defaults.model} />
                         </span>
+                    <//>
+                    <${EditRow} label="Summary provider"
+                        desc="Optional dedicated provider for the summary task (#866). Default = inherit agent provider. Set this when summary_model belongs to a different provider than the agent.">
+                        <select class="settings-select settings-input-sm"
+                                value=${ctxSummaryProvider.value}
+                                onChange=${e => { ctxSummaryProvider.value = e.target.value; }}>
+                            <option value="">Inherit agent provider</option>
+                            ${(defaults.llm_providers && defaults.llm_providers.length > 0
+                                ? defaults.llm_providers
+                                : PROVIDERS).map(p => {
+                                    const known = formatProviderLabel(p);
+                                    // formatProviderLabel returns "Custom" for unknown
+                                    // names — fall back to the raw key so users can
+                                    // tell custom providers apart in the dropdown.
+                                    const label = known === 'Custom' ? p : known;
+                                    return html`<option value=${p} key=${p}>${label}</option>`;
+                                })}
+                        </select>
                     <//>
                 <//>
 

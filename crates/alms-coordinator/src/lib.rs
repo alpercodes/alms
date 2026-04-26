@@ -1119,9 +1119,50 @@ async fn run_agent_loop(
     // per-subagent run directory.
     let subagent_spill_cfg = config.shell_spill.clone();
 
+    // #871: snapshot the subagent's `summary_provider` / `summary_model`
+    // before `config` is moved into the runtime so we can build a dedicated
+    // summary client and wire it via `with_summary_llm`. Subagents inherit
+    // the parent's `[context].summary_provider` through `base_agent_config`
+    // (cloned at spawn time via `self.base_agent_config.read().clone()`),
+    // but pre-#871 the field was silently ignored at the runtime level —
+    // the subagent loop fell back to its own `self.llm` for summarization,
+    // defeating the parent's "summary on a different provider" intent
+    // (Tim's review on PR #871, item 5).
+    let subagent_summary_provider = config.context_config.summary_provider.clone();
+    let subagent_summary_model = config.context_config.summary_model.clone();
+
+    // Build the dedicated summary client BEFORE `subagent_llm` is moved into
+    // `AgentRuntime::new`. Delegates to the shared `alms_runtime::build_summary_client`
+    // helper so the #866 + #871 leak-guard rules cannot drift between the
+    // gateway run path and this subagent inheritance path. When
+    // `summary_provider` is None the helper returns a clone we discard; we
+    // only call `with_summary_llm` when the user opted in.
+    let summary_llm_for_subagent: Option<alms_runtime::LlmClient> =
+        subagent_summary_provider.as_deref().map(|provider| {
+            let secrets_guard = secrets.as_ref().map(|s| s.read());
+            let summary_client = alms_runtime::build_summary_client(
+                &subagent_llm,
+                Some(provider),
+                subagent_summary_model.as_deref(),
+                secrets_guard.as_deref(),
+            );
+            info!(
+                task_id = %task_id.0,
+                agent_provider = %subagent_llm.provider(),
+                summary_provider = %provider,
+                summary_model = %subagent_summary_model.as_deref().unwrap_or("<inherit>"),
+                "Subagent inheriting parent summary_provider config (#871)"
+            );
+            summary_client
+        });
+
     let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?
         .with_event_sender(sub_tx)
         .with_cancel_token(cancel_token);
+
+    if let Some(summary_client) = summary_llm_for_subagent {
+        runtime = runtime.with_summary_llm(summary_client);
+    }
 
     // Set agent name for perspective mapping in DM sessions.
     if let Some(ref name) = request.subagent_name {

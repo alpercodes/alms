@@ -31,6 +31,12 @@ pub struct AgentRuntime {
     pub(crate) agent_id: AgentId,
     pub(crate) config: AgentConfig,
     pub(crate) llm: LlmClient,
+    /// Optional dedicated LLM client for in-loop sliding-summary generation
+    /// (#866). When `Some`, `maybe_summarize` uses this client instead of
+    /// `llm` so the summary task can target a different provider than the
+    /// agent (e.g. agent on Anthropic, summary on OpenRouter). When `None`,
+    /// summaries inherit the agent's `llm` (pre-#866 behaviour).
+    pub(crate) summary_llm: Option<LlmClient>,
     pub(crate) tools: ToolRegistry,
     pub(crate) workspace: Option<AgentWorkspace>,
     /// Optional channel for emitting runtime events to the gateway layer.
@@ -124,6 +130,7 @@ impl AgentRuntime {
             agent_id,
             config,
             llm,
+            summary_llm: None,
             tools,
             workspace: None,
             event_sender: None,
@@ -300,6 +307,22 @@ impl AgentRuntime {
     /// Attach a runtime event sender so the gateway can observe tool events.
     pub fn with_event_sender(mut self, sender: RuntimeEventSender) -> Self {
         self.event_sender = Some(sender);
+        self
+    }
+
+    /// Attach a dedicated LLM client for in-loop sliding-summary generation
+    /// (#866).
+    ///
+    /// When set, the in-loop summarizer (`maybe_summarize`) uses this client
+    /// instead of `self.llm`. The gateway constructs this client by cloning
+    /// the agent's resolved `LlmClient` and re-applying a different provider
+    /// via `with_provider_and_secrets` when
+    /// [`ContextConfig::summary_provider`](alms_core::config::ContextConfig)
+    /// is set. Callers that do not set a separate summary provider should
+    /// leave this `None` so the summarizer transparently inherits the
+    /// agent's provider (pre-#866 behaviour).
+    pub fn with_summary_llm(mut self, llm: LlmClient) -> Self {
+        self.summary_llm = Some(llm);
         self
     }
 
