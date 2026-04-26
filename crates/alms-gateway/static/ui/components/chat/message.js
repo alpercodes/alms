@@ -57,17 +57,27 @@ export function Message({ type, role, text, sealed, fromAgent, reasoning }) {
         ? html`<${ReasoningPanel} text=${reasoning} live=${streaming} />`
         : null;
 
+    // Reasoning-only assistant turns (extended thinking with no body text,
+    // e.g. when the model emits only thinking + tool_use blocks) would
+    // otherwise leave an empty `<div class="msg-body markdown-body">` below
+    // the reasoning panel — the .msg-body border-left + padding renders that
+    // empty element as an orphan white-line stub. Suppress the body element
+    // entirely when there's no text to show. (#853)
+    const hasBody = typeof text === 'string' && text.trim().length > 0;
+
     // Render Markdown for sealed (finished) agent messages only.
     // While streaming, use plain text with pre-wrap to avoid running
     // marked.parse() + DOMPurify.sanitize() on every animation frame.
     if (type === 'agent' && sealed) {
-        const rendered = renderMarkdown(text || '');
+        const rendered = hasBody ? renderMarkdown(text) : '';
         return html`
             <div class="msg ${cls}">
                 <div class="msg-label">${label}</div>
                 ${panel}
-                <div class="msg-body markdown-body"
-                     dangerouslySetInnerHTML=${{ __html: rendered }} />
+                ${hasBody && html`
+                    <div class="msg-body markdown-body"
+                         dangerouslySetInnerHTML=${{ __html: rendered }} />
+                `}
             </div>
         `;
     }
@@ -76,7 +86,9 @@ export function Message({ type, role, text, sealed, fromAgent, reasoning }) {
         <div class="msg ${cls}">
             <div class="msg-label">${label}</div>
             ${panel}
-            <div class="msg-body ${streaming ? 'streaming-cursor' : ''}">${text}</div>
+            ${(hasBody || streaming) && html`
+                <div class="msg-body ${streaming ? 'streaming-cursor' : ''}">${text}</div>
+            `}
         </div>
     `;
 }
