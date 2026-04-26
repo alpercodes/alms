@@ -44,8 +44,12 @@ export function ComposerAdvanced() {
     const defaults = serverDefaults.value || {};
     const overrideCount = activeOverrideCount.value;
 
-    const onProviderChange = (e) => saveSettings({ provider: e.target.value || null });
-    const onModelChange = (e) => saveSettings({ model: e.target.value.trim() || null });
+    // Provider / model per-run overrides are disabled (#865). The
+    // controls remain visible-but-inert until a deliberate
+    // session-scoped UX exists; the change handlers are wired to no-ops
+    // so any residual user input cannot stamp localSettings.
+    const onProviderChange = () => {};
+    const onModelChange = () => {};
     const onMaxTokensChange = (e) => {
         const n = parseInt(e.target.value, 10);
         saveSettings({ max_tokens: !isNaN(n) && n > 0 ? n : null });
@@ -119,7 +123,9 @@ export function ComposerAdvanced() {
                         <label class="composer-advanced-row">
                             <span class="composer-advanced-row-label">Provider</span>
                             <select class="composer-advanced-input"
-                                    value=${s.provider || ''}
+                                    value=""
+                                    disabled
+                                    title="Per-run provider overrides are disabled (#865). Configure provider on the agent."
                                     onChange=${onProviderChange}>
                                 <option value="">Inherit (${defaults.provider || 'server default'})</option>
                                 <option value="openai">openai</option>
@@ -133,8 +139,10 @@ export function ComposerAdvanced() {
                             <input class="composer-advanced-input"
                                    type="text"
                                    list="composer-advanced-models"
+                                   disabled
+                                   title="Per-run model overrides are disabled (#865). Configure model on the agent."
                                    placeholder=${defaults.model || 'inherit'}
-                                   value=${s.model || ''}
+                                   value=""
                                    onChange=${onModelChange} />
                             <datalist id="composer-advanced-models">
                                 ${MODEL_SUGGESTIONS.map(m => html`<option value=${m} />`)}

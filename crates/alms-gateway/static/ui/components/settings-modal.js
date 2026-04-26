@@ -5,7 +5,6 @@ import { listKeys, setKey, removeKey } from '../api/auth.js';
 import {
     MODEL_SUGGESTIONS,
     ModelDisplay,
-    ProviderDisplay,
     formatProviderLabel,
 } from '../utils/model-display.js';
 import { BudgetTriState } from './budget-tri-state.js';
@@ -193,18 +192,23 @@ function ApiKeysSection() {
  * Exported so the header (and composer Advanced expander) can show an
  * indicator badge.
  *
- * Includes the legacy fields plus `debug_mode` and the three reasoning
- * knobs (`thinking_budget_tokens`, `reasoning_effort`,
+ * Includes `max_tokens`, `posture`, `debug_mode`, and the three
+ * reasoning knobs (`thinking_budget_tokens`, `reasoning_effort`,
  * `gemini_thinking_budget`). For the budget knobs, `Some(0)` (explicit
  * disable) and any positive value both count as "active overrides";
  * only `null`/`undefined` is "inherit". For `debug_mode`, both `true`
  * and `false` count — `null` is inherit.
+ *
+ * NOTE: `provider` and `model` are intentionally NOT counted — chat UI
+ * no longer forwards those keys as per-run overrides (#865), so they
+ * have no effect on the wire and including them here would mislead the
+ * badge. Their controls remain visible-but-disabled in the modal /
+ * composer Advanced UIs until a deliberate "use this provider/model
+ * for this chat" UX exists.
  */
 export const activeOverrideCount = computed(() => {
     const s = localSettings.value;
     let count = 0;
-    if (s.provider) count++;
-    if (s.model) count++;
     if (s.max_tokens != null) count++;
     if (s.posture) count++;
     // debug_mode is now tri-state on the composer (#818 nit follow-up):
@@ -279,8 +283,14 @@ export function SettingsModal({ open, onClose }) {
             const llmOpen = llm.openai || {};
             const llmGem = llm.gemini || {};
 
-            provider.value = localSettings.value.provider || '';
-            model.value = localSettings.value.model || '';
+            // provider / model inputs are disabled (#865) — keep their
+            // signals empty so the UI doesn't echo stale localStorage
+            // values back to the user. The "Effective" display next to
+            // each row pulls from `defaults` (server) and the agent
+            // record handles per-agent values, so an empty signal here
+            // is the truthful representation of "no per-run override".
+            provider.value = '';
+            model.value = '';
             maxTokens.value = localSettings.value.max_tokens != null
                 ? String(localSettings.value.max_tokens)
                 : '';
@@ -375,10 +385,18 @@ export function SettingsModal({ open, onClose }) {
         serverError.value = '';
         saved.value = false;
 
-        // 1. Always save per-run overrides to localStorage (this never fails)
-        const updates = {};
-        updates.provider = provider.value || null;
-        updates.model = model.value.trim() || null;
+        // 1. Always save per-run overrides to localStorage (this never fails).
+        //
+        // `provider` / `model` are intentionally NOT written here (#865).
+        // Their inputs are disabled in the UI; chat UI ignores those keys
+        // when forwarding per-run overrides to /runs. We also actively
+        // clear any pre-existing stale values so users affected by the
+        // pre-#865 silent-stamp bug get unblocked the first time they
+        // hit Apply (or Reset) on the upgraded build.
+        const updates = {
+            provider: null,
+            model: null,
+        };
         const mt = parseInt(maxTokens.value, 10);
         updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
         updates.posture = posture.value || null;
@@ -537,8 +555,9 @@ export function SettingsModal({ open, onClose }) {
     const enabledTools = tools.enabled || defaults.enabled_tools || [];
 
     // Effective values: what the next run will actually use.
-    // (Provider and model Effective lines use <ProviderDisplay> / <ModelDisplay>
-    // which derive the effective value internally.)
+    // (Provider/model rows are disabled here so they no longer render an
+    // "Effective:" line — see #865 / Tim's v0.2.3 note on PR #868. The
+    // context-summary <${ModelDisplay} below still uses ModelDisplay.)
     const effMaxTokens = maxTokens.value ? parseInt(maxTokens.value, 10) : (defaults.max_tokens || 100000);
     const effPosture = posture.value || defaults.posture || 'guarded';
 
@@ -565,31 +584,41 @@ export function SettingsModal({ open, onClose }) {
                         <label class="settings-label">Provider</label>
                         <select class="settings-select"
                                 value=${provider.value}
+                                disabled
+                                title="Per-run provider overrides are disabled (#865). Configure provider on the agent (Agents panel) or as the server default."
                                 onChange=${e => { provider.value = e.target.value; }}>
                             <option value="">Default (${formatProviderLabel(defaults.provider || 'openai')})</option>
                             <option value="openai">OpenAI</option>
                             <option value="anthropic">Anthropic</option>
                             <option value="openrouter">OpenRouter</option>
                         </select>
-                        <span class="settings-effective">
-                            Effective: <${ProviderDisplay} value=${provider.value} defaultValue=${defaults.provider || 'openai'} />
-                        </span>
+                        <!-- No "Effective:" row while the control is disabled.
+                             It would only ever show the server default and
+                             would lie for any agent with a per-agent override
+                             (Tim's v0.2.3 note on PR #868). Threading the
+                             active agent's provider/model through the modal
+                             is a separate, larger change tracked for v0.2.3. -->
                     </div>
 
                     <div class="settings-row">
                         <label class="settings-label">Model</label>
                         <input class="settings-input" type="text"
                                list="model-suggestions"
+                               disabled
+                               title="Per-run model overrides are disabled (#865). Configure model on the agent (Agents panel) or as the server default."
                                placeholder=${defaults.model || 'server default'}
                                value=${model.value}
                                onInput=${e => { model.value = e.target.value; }} />
                         <datalist id="model-suggestions">
                             ${MODEL_SUGGESTIONS.map(m => html`<option value=${m} />`)}
                         </datalist>
-                        <span class="settings-effective">
-                            Effective: <${ModelDisplay} value=${model.value.trim()} defaultValue=${defaults.model} />
-                        </span>
+                        <!-- No "Effective:" row while the control is disabled.
+                             Same rationale as the Provider row above — see
+                             Tim's v0.2.3 note on PR #868. -->
                     </div>
+                </div>
+                <div class="settings-hint settings-overrides-disabled-note">
+                    Provider and model are configured per-agent (Agents panel) or as the server default. Per-run overrides are disabled here to keep per-agent config from being silently squashed by stale localStorage values (#865).
                 </div>
 
                 <div class="settings-grid">
