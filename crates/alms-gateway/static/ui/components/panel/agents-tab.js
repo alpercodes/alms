@@ -363,6 +363,12 @@ export function AgentEditModal({ agent, onClose }) {
                 <div class="agent-edit-section-divider"></div>
                 <div class="agent-edit-section-title">Reasoning &amp; thinking</div>
 
+                <span class="settings-hint">
+                    Provider-specific. Each row applies only when this agent's effective provider matches —
+                    Anthropic / OpenAI / Gemini knobs are silently ignored on other providers. Explicit values
+                    take effect on the next run.
+                </span>
+
                 <${BudgetTriState}
                     label="Anthropic thinking budget"
                     hint="Inherit = use server default. Disable = Some(0) (force off for this agent). Custom = override with N tokens."
