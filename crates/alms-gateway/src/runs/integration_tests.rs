@@ -2291,3 +2291,207 @@ async fn handle_dm_run_failure_double_end_is_idempotent() {
 
     shutdown_token.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// Agent-scoped session-activity SSE feed (#856)
+// ---------------------------------------------------------------------------
+
+/// Subscribe to the agent-scoped session-activity feed and return the receiver.
+fn subscribe_agent(state: &AppState, agent_id: AgentId) -> mpsc::UnboundedReceiver<SseEventData> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    state.run_manager.register_agent_sender(agent_id, tx);
+    rx
+}
+
+/// End-to-end happy path for the agent-scoped session-activity feed.
+///
+/// Exercises the full `RunManager` plumbing the way `execute_run` does:
+/// emit `session_activity_started` at the start, transition the run
+/// through `Running` -> `Completed`, then emit `session_activity_ended`.
+/// Verifies that:
+/// - Both events arrive on the agent's subscriber.
+/// - The events carry the correct `session_id`, `run_id`, and `agent_id`.
+/// - `RunManager::has_active_runs` (which backs `GET /sessions`'s
+///   `has_active_run` field) flips `true` while running and `false`
+///   after completion.
+#[tokio::test]
+async fn agent_session_activity_started_and_ended_arrive_on_feed() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session_a = state.session_manager.get_or_create(agent_id, "chat-a");
+    let session_a_id = session_a.id;
+    // A second session exists but no run is started on it — must not
+    // appear active in the snapshot.
+    let _session_b = state.session_manager.get_or_create(agent_id, "chat-b");
+
+    let mut rx = subscribe_agent(&state, agent_id);
+
+    // Insert and mark a run as running on session A.
+    let run = Run::new(session_a_id, agent_id, "test".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+
+    // Mid-run: GET /sessions should report has_active_run=true for A only.
+    assert!(
+        state.run_manager.has_active_runs(session_a_id),
+        "session A should report has_active_run=true while a run is in flight"
+    );
+    let session_b_id = state.session_manager.get_or_create(agent_id, "chat-b").id;
+    assert!(
+        !state.run_manager.has_active_runs(session_b_id),
+        "session B has no runs and must report has_active_run=false"
+    );
+
+    // Emit the started event the way execute_run does.
+    state
+        .run_manager
+        .send_agent_event(
+            agent_id,
+            run_id,
+            session_a_id,
+            SseEventData::session_activity_started(session_a_id, run_id, agent_id),
+        )
+        .await;
+
+    let started = rx.recv().await.expect("started event should arrive");
+    assert_eq!(started.event_type, "session_activity_started");
+    assert_eq!(started.data["session_id"], session_a_id.0.to_string());
+    assert_eq!(started.data["run_id"], run_id.0.to_string());
+    assert_eq!(started.data["agent_id"], agent_id.0.to_string());
+
+    // Complete the run and emit the ended event.
+    state
+        .run_manager
+        .mark_run_as_completed(run_id, "ok".into(), Default::default());
+    state
+        .run_manager
+        .send_agent_event(
+            agent_id,
+            run_id,
+            session_a_id,
+            SseEventData::session_activity_ended(session_a_id, run_id, agent_id),
+        )
+        .await;
+
+    let ended = rx.recv().await.expect("ended event should arrive");
+    assert_eq!(ended.event_type, "session_activity_ended");
+    assert_eq!(ended.data["session_id"], session_a_id.0.to_string());
+    assert_eq!(ended.data["run_id"], run_id.0.to_string());
+    assert_eq!(ended.data["agent_id"], agent_id.0.to_string());
+
+    // Post-completion: has_active_run flips back to false.
+    assert!(
+        !state.run_manager.has_active_runs(session_a_id),
+        "session A should report has_active_run=false after run completes"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// `agent_id` filter test: an agent X subscribed to its own feed should
+/// NOT receive activity events for runs belonging to agent Y. The feed
+/// is scoped at the broadcast layer, so subscribers to one agent's feed
+/// are entirely isolated from any other agent's runs (#856).
+#[tokio::test]
+async fn agent_session_activity_feed_filters_by_agent_id() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_x = AgentId::new();
+    let agent_y = AgentId::new();
+    let session_y = state.session_manager.get_or_create(agent_y, "chat-y");
+    let session_y_id = session_y.id;
+
+    // Subscribe agent X (not agent Y) to its own session-activity feed.
+    let mut rx_x = subscribe_agent(&state, agent_x);
+
+    // Emit activity on agent Y's feed.
+    let run = Run::new(session_y_id, agent_y, "Y run".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state
+        .run_manager
+        .send_agent_event(
+            agent_y,
+            run_id,
+            session_y_id,
+            SseEventData::session_activity_started(session_y_id, run_id, agent_y),
+        )
+        .await;
+    state
+        .run_manager
+        .send_agent_event(
+            agent_y,
+            run_id,
+            session_y_id,
+            SseEventData::session_activity_ended(session_y_id, run_id, agent_y),
+        )
+        .await;
+
+    // Yield so any pending fan-out completes.
+    tokio::task::yield_now().await;
+
+    // Agent X must receive nothing.
+    assert!(
+        rx_x.try_recv().is_err(),
+        "agent X must not receive any events for agent Y's runs",
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Pre-cancellation paths in `execute_run` return early before emitting
+/// either `session_activity_started` or `session_activity_ended`. The
+/// agent-scoped feed must stay silent for runs that never actually
+/// executed — they did not "appear active" in any UI sense and so do
+/// not need a started/ended pair (#856).
+#[tokio::test]
+async fn pre_cancelled_run_emits_no_agent_session_activity_events() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-pre-cancel");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "noop".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    cancel_token.cancel();
+
+    let mut agent_rx = subscribe_agent(&state, agent_id);
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: run.input,
+            overrides: super::RunOverrides::default(),
+            context_id: "test-pre-cancel".to_string(),
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    // No session_activity_* events should have been emitted.
+    let events = drain_events(&mut agent_rx);
+    assert!(
+        events
+            .iter()
+            .all(|e| e.event_type != "session_activity_started"
+                && e.event_type != "session_activity_ended"),
+        "pre-cancelled runs must not emit agent session-activity events; got: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+
+    shutdown_token.cancel();
+}

@@ -5,9 +5,9 @@
 //! senders, in-flight counters for graceful shutdown, and optional SQLite
 //! persistence.
 
-use crate::event_log::{EventLogManager, LoggedEvent};
+use crate::event_log::{AgentEventLogManager, EventLogManager, LoggedEvent};
 use crate::sse::SseEventData;
-use alms_core::{Run, RunId, SessionId};
+use alms_core::{AgentId, Run, RunId, SessionId};
 use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,6 +27,12 @@ pub struct RunManager {
     pub session_senders: Arc<DashMap<SessionId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
     /// Session-level event log for reconnect support.
     pub session_event_log: crate::event_log::SessionEventLogManager,
+    /// Agent-scoped event senders for the per-agent SSE feed
+    /// (`GET /agents/{agent_id}/events`, #856).
+    pub agent_senders: Arc<DashMap<AgentId, Vec<mpsc::UnboundedSender<SseEventData>>>>,
+    /// Agent-scoped event log for `Last-Event-Id` reconnect on the
+    /// agent-scoped feed.
+    pub agent_event_log: AgentEventLogManager,
     /// Counter of in-flight (spawned but not yet finished) run tasks.
     in_flight: Arc<AtomicUsize>,
     /// Notified when an in-flight run completes (counter reaches zero).
@@ -45,6 +51,8 @@ impl RunManager {
             event_log: EventLogManager::new(),
             session_senders: Arc::new(DashMap::new()),
             session_event_log: crate::event_log::SessionEventLogManager::new(),
+            agent_senders: Arc::new(DashMap::new()),
+            agent_event_log: AgentEventLogManager::new(),
             in_flight: Arc::new(AtomicUsize::new(0)),
             drain_notify: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: Arc::new(DashMap::new()),
@@ -499,7 +507,57 @@ impl RunManager {
             .push(sender);
     }
 
-    /// Close all active SSE sender channels (both per-run and per-session).
+    /// Register an SSE sender for the agent-scoped feed
+    /// (`GET /agents/{agent_id}/events`, #856).
+    pub fn register_agent_sender(
+        &self,
+        agent_id: AgentId,
+        sender: mpsc::UnboundedSender<SseEventData>,
+    ) {
+        self.agent_senders.entry(agent_id).or_default().push(sender);
+    }
+
+    /// Send an agent-scoped event to the per-agent SSE feed and persist
+    /// it to the agent event log for SSE reconnect (#856).
+    ///
+    /// Filtering is performed at the sender map: only subscribers to
+    /// `agent_id`'s feed receive the event. Subscribers to other agents'
+    /// feeds (or no feed at all) are unaffected.
+    pub async fn send_agent_event(
+        &self,
+        agent_id: AgentId,
+        run_id: RunId,
+        session_id: SessionId,
+        event: SseEventData,
+    ) {
+        let event_id = self
+            .agent_event_log
+            .log_event(
+                agent_id,
+                run_id,
+                session_id,
+                &event.event_type,
+                event.data.clone(),
+            )
+            .await;
+        let mut tagged = event;
+        tagged.event_id = Some(event_id);
+
+        if let Some(mut senders) = self.agent_senders.get_mut(&agent_id) {
+            senders.retain(|sender| sender.send(tagged.clone()).is_ok());
+            if senders.is_empty() {
+                drop(senders);
+                self.agent_senders.remove(&agent_id);
+            }
+        }
+    }
+
+    /// Get agent-scoped events from a specific ID for SSE reconnect (#856).
+    pub async fn agent_events_from(&self, agent_id: AgentId, from_id: u64) -> Vec<LoggedEvent> {
+        self.agent_event_log.events_from(agent_id, from_id).await
+    }
+
+    /// Close all active SSE sender channels (per-run, per-session, per-agent).
     ///
     /// Dropping the senders causes the corresponding `UnboundedReceiverStream`
     /// in each SSE response to terminate, which allows Axum's graceful
@@ -508,12 +566,14 @@ impl RunManager {
     pub fn close_all_senders(&self) {
         let run_count = self.event_senders.len();
         let session_count = self.session_senders.len();
+        let agent_count = self.agent_senders.len();
         self.event_senders.clear();
         self.session_senders.clear();
-        if run_count + session_count > 0 {
+        self.agent_senders.clear();
+        if run_count + session_count + agent_count > 0 {
             info!(
-                "Closed {} per-run and {} per-session SSE sender(s) for shutdown",
-                run_count, session_count
+                "Closed {} per-run, {} per-session, and {} per-agent SSE sender(s) for shutdown",
+                run_count, session_count, agent_count
             );
         }
     }
@@ -1215,5 +1275,116 @@ mod tests {
                 .any(|r| r.run_id == dm_running_id && r.status == alms_core::RunStatus::Running),
             "new restore limit (100) surfaces the active DM run"
         );
+    }
+
+    /// `has_active_runs` returns `true` when at least one run on the
+    /// session is in `Queued` or `Running` state, and `false` once all
+    /// runs reach a terminal state. Backs the `has_active_run` field on
+    /// `GET /sessions` (#856).
+    #[tokio::test]
+    async fn test_has_active_runs_reflects_run_lifecycle() {
+        let rm = RunManager::new();
+        let session_id = SessionId::new();
+        let agent_id = AgentId::new();
+
+        // No runs yet.
+        assert!(!rm.has_active_runs(session_id));
+
+        // Insert a queued run -> active.
+        let run = Run::new(session_id, agent_id, "test".into());
+        let run_id = run.run_id;
+        rm.insert_run(run);
+        assert!(rm.has_active_runs(session_id));
+
+        // Mark running -> still active.
+        rm.mark_run_as_running(run_id);
+        assert!(rm.has_active_runs(session_id));
+
+        // Mark completed -> no longer active.
+        rm.mark_run_as_completed(run_id, "ok".into(), Default::default());
+        assert!(!rm.has_active_runs(session_id));
+    }
+
+    /// `has_active_runs` is correctly scoped by `session_id`. A running
+    /// run on session B does not make session A appear active.
+    #[tokio::test]
+    async fn test_has_active_runs_scoped_by_session() {
+        let rm = RunManager::new();
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        let agent_id = AgentId::new();
+
+        let run_b = Run::new(session_b, agent_id, "on B".into());
+        let run_b_id = run_b.run_id;
+        rm.insert_run(run_b);
+        rm.mark_run_as_running(run_b_id);
+
+        assert!(!rm.has_active_runs(session_a), "session A has no runs");
+        assert!(rm.has_active_runs(session_b), "session B has a running run");
+    }
+
+    /// `send_agent_event` fans out only to subscribers of the matching
+    /// `agent_id` — confirming the per-agent SSE feed is properly scoped
+    /// (#856).
+    #[tokio::test]
+    async fn test_agent_event_fanout_filtered_by_agent_id() {
+        let rm = RunManager::new();
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        rm.register_agent_sender(agent_a, tx_a);
+        rm.register_agent_sender(agent_b, tx_b);
+
+        // Send an event for agent A only.
+        rm.send_agent_event(
+            agent_a,
+            run_id,
+            session_id,
+            SseEventData::session_activity_started(session_id, run_id, agent_a),
+        )
+        .await;
+
+        // Agent A's subscriber receives the event...
+        let received = rx_a.recv().await.expect("agent A should receive");
+        assert_eq!(received.event_type, "session_activity_started");
+        assert_eq!(received.data["agent_id"], agent_a.0.to_string());
+
+        // ...and agent B's subscriber receives nothing.
+        assert!(
+            rx_b.try_recv().is_err(),
+            "agent B must not receive events for agent A"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_agent_event_replay_via_events_from() {
+        let rm = RunManager::new();
+        let agent_id = AgentId::new();
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+
+        rm.send_agent_event(
+            agent_id,
+            run_id,
+            session_id,
+            SseEventData::session_activity_started(session_id, run_id, agent_id),
+        )
+        .await;
+        rm.send_agent_event(
+            agent_id,
+            run_id,
+            session_id,
+            SseEventData::session_activity_ended(session_id, run_id, agent_id),
+        )
+        .await;
+
+        let events = rm.agent_events_from(agent_id, 0).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "session_activity_started");
+        assert_eq!(events[1].event_type, "session_activity_ended");
     }
 }

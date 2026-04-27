@@ -29,7 +29,9 @@ pub use lifecycle::{
 pub(crate) use notifications::{
     completion_notification_loop, dm_event_loop, run_trigger_loop, scheduler_fire_loop,
 };
-pub use streaming::{SessionEventsQuery, stream_run_events, stream_session_events};
+pub use streaming::{
+    SessionEventsQuery, stream_agent_events, stream_run_events, stream_session_events,
+};
 
 // Public struct and function used by gateway.rs
 pub use self::config::{ResolvedAgentConfig, resolve_agent_config};

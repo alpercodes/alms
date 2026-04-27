@@ -477,6 +477,52 @@ impl SseEventData {
             },
         )
     }
+
+    /// Agent-scoped: a run started on a session belonging to this agent.
+    ///
+    /// Mirrors the per-session `run_started` event onto the agent-scoped
+    /// SSE feed (`GET /agents/{agent_id}/events`) so the web UI's session
+    /// sidebar can show an "active" indicator for any session — not just
+    /// the currently-viewed one (#856).
+    ///
+    /// Emitted from the standard run lifecycle so it covers both regular
+    /// runs (chat, job, notification) and DM runs.
+    pub fn session_activity_started(
+        session_id: alms_core::SessionId,
+        run_id: RunId,
+        agent_id: alms_core::AgentId,
+    ) -> Self {
+        Self::new(
+            "session_activity_started",
+            SessionActivityStartedData {
+                session_id: session_id.0.to_string(),
+                run_id: run_id.0.to_string(),
+                agent_id: agent_id.0.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
+
+    /// Agent-scoped: a run on a session belonging to this agent ended
+    /// (completed, failed, or cancelled).
+    ///
+    /// Pair to [`session_activity_started`].  See that method for the
+    /// design rationale.
+    pub fn session_activity_ended(
+        session_id: alms_core::SessionId,
+        run_id: RunId,
+        agent_id: alms_core::AgentId,
+    ) -> Self {
+        Self::new(
+            "session_activity_ended",
+            SessionActivityEndedData {
+                session_id: session_id.0.to_string(),
+                run_id: run_id.0.to_string(),
+                agent_id: agent_id.0.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
 }
 
 /// SSE event stream wrapper
@@ -816,6 +862,25 @@ struct DmActivityStatusData {
 struct DmActivityEndedData {
     session_id: String,
     peer: String,
+    ts: DateTime<Utc>,
+}
+
+/// Wire payload for the agent-scoped `session_activity_started` event
+/// emitted on `GET /agents/{agent_id}/events` (#856).
+#[derive(Debug, Serialize)]
+struct SessionActivityStartedData {
+    session_id: String,
+    run_id: String,
+    agent_id: String,
+    ts: DateTime<Utc>,
+}
+
+/// Wire payload for the agent-scoped `session_activity_ended` event.
+#[derive(Debug, Serialize)]
+struct SessionActivityEndedData {
+    session_id: String,
+    run_id: String,
+    agent_id: String,
     ts: DateTime<Utc>,
 }
 
@@ -1162,6 +1227,36 @@ mod tests {
         assert_eq!(event.event_type, "dm_activity_ended");
         assert_eq!(event.data["session_id"], session_id.0.to_string());
         assert_eq!(event.data["peer"], "researcher");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+    }
+
+    #[test]
+    fn test_session_activity_started_event() {
+        let session_id = alms_core::SessionId::new();
+        let run_id = RunId::new();
+        let agent_id = alms_core::AgentId::new();
+        let event = SseEventData::session_activity_started(session_id, run_id, agent_id);
+
+        assert_eq!(event.event_type, "session_activity_started");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["run_id"], run_id.0.to_string());
+        assert_eq!(event.data["agent_id"], agent_id.0.to_string());
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+        let ts_str = event.data["ts"].as_str().unwrap();
+        assert!(ts_str.contains("T"), "ts should be ISO8601/RFC3339");
+    }
+
+    #[test]
+    fn test_session_activity_ended_event() {
+        let session_id = alms_core::SessionId::new();
+        let run_id = RunId::new();
+        let agent_id = alms_core::AgentId::new();
+        let event = SseEventData::session_activity_ended(session_id, run_id, agent_id);
+
+        assert_eq!(event.event_type, "session_activity_ended");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["run_id"], run_id.0.to_string());
+        assert_eq!(event.data["agent_id"], agent_id.0.to_string());
         assert!(event.data["ts"].is_string(), "ts should be a string");
     }
 

@@ -4,7 +4,7 @@
 //! process restart.  This supports `Last-Event-ID` reconnect within a
 //! single gateway lifetime but does **not** provide cross-restart durability.
 
-use alms_core::{RunId, SessionId};
+use alms_core::{AgentId, RunId, SessionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -194,6 +194,81 @@ impl SessionEventLogManager {
     }
 }
 
+/// Maximum events retained per agent. Older events are discarded.
+const AGENT_EVENT_LOG_MAX: usize = 1000;
+
+/// Agent-level event log — stores activity events across all sessions
+/// belonging to a single agent (#856).
+///
+/// Backs the `GET /agents/{agent_id}/events` SSE feed, which currently
+/// carries `session_activity_started` / `session_activity_ended` events
+/// (and will carry future per-agent events such as DM activity in #886).
+/// Uses its own monotonic event ID counter (separate from per-run /
+/// per-session IDs) so `Last-Event-ID` reconnect works independently.
+/// Trimmed to [`AGENT_EVENT_LOG_MAX`] to bound memory.
+#[derive(Debug, Default, Clone)]
+pub struct AgentEventLogManager {
+    logs: Arc<RwLock<HashMap<AgentId, EventLog>>>,
+}
+
+impl AgentEventLogManager {
+    pub fn new() -> Self {
+        Self {
+            logs: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn get_or_create(&self, agent_id: AgentId) -> EventLog {
+        let mut logs = self.logs.write().await;
+        logs.get(&agent_id).cloned().unwrap_or_else(|| {
+            let log = EventLog::new();
+            logs.insert(agent_id, log.clone());
+            log
+        })
+    }
+
+    pub async fn log_event(
+        &self,
+        agent_id: AgentId,
+        run_id: RunId,
+        session_id: SessionId,
+        event_type: &str,
+        data: serde_json::Value,
+    ) -> u64 {
+        let log = self.get_or_create(agent_id).await;
+        let event_id = log.next_event_id().await;
+
+        let event = LoggedEvent {
+            event_id,
+            run_id,
+            session_id,
+            event_type: event_type.to_string(),
+            data,
+            ts: Utc::now(),
+        };
+
+        // Append + trim in a single lock acquisition
+        {
+            let mut events = log.events.write().await;
+            events.push(event);
+            if events.len() > AGENT_EVENT_LOG_MAX {
+                let drain = events.len() - AGENT_EVENT_LOG_MAX;
+                events.drain(..drain);
+            }
+        }
+
+        event_id
+    }
+
+    pub async fn events_from(&self, agent_id: AgentId, from_id: u64) -> Vec<LoggedEvent> {
+        let logs = self.logs.read().await;
+        match logs.get(&agent_id) {
+            Some(log) => log.events_from(from_id).await,
+            None => Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +360,78 @@ mod tests {
         // from_id = id1 + 1 should skip the first event
         let events = mgr.events_from(sid, id1 + 1).await;
         assert_eq!(events.len(), 2);
+    }
+
+    fn test_agent_id() -> AgentId {
+        AgentId(Uuid::new_v4())
+    }
+
+    #[tokio::test]
+    async fn agent_event_log_independent_per_agent() {
+        let mgr = AgentEventLogManager::new();
+        let agent_a = test_agent_id();
+        let agent_b = test_agent_id();
+        let session_id = test_session_id();
+        let run_id = test_run_id();
+
+        let id_a = mgr
+            .log_event(
+                agent_a,
+                run_id,
+                session_id,
+                "session_activity_started",
+                serde_json::json!({}),
+            )
+            .await;
+        let id_b = mgr
+            .log_event(
+                agent_b,
+                run_id,
+                session_id,
+                "session_activity_started",
+                serde_json::json!({}),
+            )
+            .await;
+
+        // Event IDs are per-agent, so both agents should see their own log
+        // start at id 1 (and be unaware of each other's events).
+        let a_events = mgr.events_from(agent_a, 0).await;
+        let b_events = mgr.events_from(agent_b, 0).await;
+        assert_eq!(a_events.len(), 1);
+        assert_eq!(b_events.len(), 1);
+        assert_eq!(a_events[0].event_id, id_a);
+        assert_eq!(b_events[0].event_id, id_b);
+    }
+
+    #[tokio::test]
+    async fn agent_event_log_replays_from_event_id() {
+        let mgr = AgentEventLogManager::new();
+        let agent_id = test_agent_id();
+        let session_id = test_session_id();
+        let run_id = test_run_id();
+
+        let _id1 = mgr
+            .log_event(
+                agent_id,
+                run_id,
+                session_id,
+                "session_activity_started",
+                serde_json::json!({}),
+            )
+            .await;
+        let id2 = mgr
+            .log_event(
+                agent_id,
+                run_id,
+                session_id,
+                "session_activity_ended",
+                serde_json::json!({}),
+            )
+            .await;
+
+        // from_id = id2 should yield only the second event
+        let events = mgr.events_from(agent_id, id2).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "session_activity_ended");
     }
 }

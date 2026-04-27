@@ -622,6 +622,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         )
         .await;
 
+    // Mirror onto the agent-scoped session-activity feed (#856) so the
+    // web UI sidebar can surface activity on sessions other than the
+    // currently-viewed one. Covers both regular runs and DM runs because
+    // every run goes through this point.
+    state
+        .run_manager
+        .send_agent_event(
+            agent_id,
+            run_id,
+            session_id,
+            SseEventData::session_activity_started(session_id, run_id, agent_id),
+        )
+        .await;
+
     state.run_manager.mark_run_as_running(run_id);
 
     // Resolve per-agent config (model, posture) from the agent registry,
@@ -791,6 +805,18 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     run_id,
                     session_id,
                     SseEventData::run_error(run_id, &e.to_string()),
+                )
+                .await;
+            // Pair the earlier `session_activity_started` so the agent feed
+            // sees a clean started/ended cycle even when the runtime fails
+            // to initialise (#856).
+            state
+                .run_manager
+                .send_agent_event(
+                    agent_id,
+                    run_id,
+                    session_id,
+                    SseEventData::session_activity_ended(session_id, run_id, agent_id),
                 )
                 .await;
             state.run_manager.mark_run_as_failed(run_id, e.to_string());
@@ -1471,6 +1497,24 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             error!("Run {} failed: {}", run_id.0, e);
         }
     }
+
+    // Mirror the run's terminal transition onto the agent-scoped
+    // session-activity feed (#856) — paired with the
+    // `session_activity_started` emitted before the run executed. Fires
+    // exactly once per run regardless of which terminal arm the result
+    // took (Ok / Cancelled / CancelledWithToolCalls / FailedWithToolCalls
+    // / generic Err). Pre-execution cancellation and runtime-construction
+    // failure paths handle their own emissions inline above and return
+    // early, so this site is reached only when the run actually started.
+    state
+        .run_manager
+        .send_agent_event(
+            agent_id,
+            run_id,
+            session_id,
+            SseEventData::session_activity_ended(session_id, run_id, agent_id),
+        )
+        .await;
 
     // Forward a `dm_activity_ended` event to the agent's webchat session
     // so the frontend can update the status bar (#688).  This is distinct
