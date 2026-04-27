@@ -107,8 +107,50 @@ pub async fn generate_session_summary(llm: &LlmClient, params: &SummaryParams) -
             return None;
         }
         RunSummaryMode::Heuristic => generate_heuristic(params),
-        RunSummaryMode::Llm => generate_llm(llm, params).await,
+        RunSummaryMode::Llm => apply_llm_fallback(generate_llm(llm, params).await, params),
     }
+}
+
+/// Apply the LLM-mode fallback policy: if the LLM path produced a summary,
+/// return it; otherwise fall back to the deterministic heuristic — but only
+/// when there is no accumulated history to protect.
+///
+/// The LLM path returns `None` when the provider call errored, returned an
+/// empty response, or both `run_input` and `run_output` were empty.  In all
+/// of those cases we'd previously persist nothing, leaving the session
+/// silently summary-less (#832).  The heuristic produces a deterministic
+/// "input -> output" line and is lossy but never silent.
+///
+/// **Existing-summary safeguard (PR #884 follow-up):** when
+/// `params.existing_summary` is non-empty, the heuristic is *not* invoked.
+/// Concatenating a 60-byte heuristic line onto a 450-byte LLM-mode paragraph
+/// and feeding it through `trim_oldest_lines(_, 500)` would evict the older
+/// (LLM) line — silently dropping real accumulated history on every transient
+/// LLM failure.  Returning `None` here means the upsert path is skipped and
+/// the existing summary is preserved verbatim.  This is strictly safer than
+/// risking eviction of real content for a deterministic stub.
+///
+/// The heuristic itself may also return `None` (e.g. excluded session via
+/// `derive_source_label`, or empty `run_input`); in that case the silent-skip
+/// behavior is preserved as before.
+fn apply_llm_fallback(llm_result: Option<String>, params: &SummaryParams) -> Option<String> {
+    if let Some(text) = llm_result {
+        return Some(text);
+    }
+    // Existing summary is load-bearing -- don't risk it via trim eviction.
+    if params
+        .existing_summary
+        .as_deref()
+        .is_some_and(|s| !s.is_empty())
+    {
+        info!(
+            "LLM summary path produced no output -- preserving existing summary (heuristic fallback skipped)"
+        );
+        return None;
+    }
+    // No accumulated history -- heuristic is strictly an upgrade over silent skip.
+    info!("LLM summary path produced no output -- falling back to heuristic");
+    generate_heuristic(params)
 }
 
 /// Parameters for the fire-and-forget summary generation + persistence.
@@ -953,6 +995,158 @@ mod tests {
         assert!(
             text.starts_with('"'),
             "DM summary should not include source_label prefix, got: {text}"
+        );
+    }
+
+    // -- LLM-mode fallback to heuristic (#832) -----------------------------
+
+    /// LLM path errors -> apply_llm_fallback invokes the heuristic and
+    /// produces a heuristic-shaped string instead of silently dropping the
+    /// summary.
+    #[test]
+    fn test_llm_fallback_on_error_uses_heuristic() {
+        let params = SummaryParams {
+            mode: RunSummaryMode::Llm,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "How do I configure CORS?".into(),
+            run_output: "Set Access-Control-Allow-Origin.".into(),
+            context_id: "web-chat-1".into(),
+            existing_summary: None,
+            summary_model: None,
+            agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
+        };
+        // Simulate the LLM path having errored out (returns None, mirroring
+        // the `error!("LLM summarizer call failed: {e}")` branch).
+        let result = apply_llm_fallback(None, &params);
+        let text = result.expect("fallback should produce a heuristic summary");
+        // Heuristic shape: `"<input>" -> "<output>"`
+        assert_eq!(
+            text,
+            "\"How do I configure CORS?\" -> \"Set Access-Control-Allow-Origin.\""
+        );
+    }
+
+    /// LLM path returns empty content -> apply_llm_fallback invokes the
+    /// heuristic and produces a heuristic-shaped string instead of silently
+    /// dropping the summary.
+    #[test]
+    fn test_llm_fallback_on_empty_uses_heuristic() {
+        let params = SummaryParams {
+            mode: RunSummaryMode::Llm,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "Help me debug this error".into(),
+            run_output: "The issue is in your config file.".into(),
+            context_id: "web-chat-1".into(),
+            existing_summary: None,
+            summary_model: None,
+            agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
+        };
+        // Simulate the LLM path having returned empty content (returns None,
+        // mirroring the `warn!("LLM summarizer returned empty response")`
+        // branch -- e.g. a reasoning model that exhausted summary_max_tokens
+        // on thinking with no visible output, or a transient provider hiccup).
+        let result = apply_llm_fallback(None, &params);
+        let text = result.expect("fallback should produce a heuristic summary");
+        assert_eq!(
+            text,
+            "\"Help me debug this error\" -> \"The issue is in your config file.\""
+        );
+    }
+
+    /// When the LLM path succeeds, the fallback is a no-op pass-through and
+    /// the heuristic is NOT invoked.
+    #[test]
+    fn test_llm_fallback_passthrough_on_success() {
+        let params = SummaryParams {
+            mode: RunSummaryMode::Llm,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "anything".into(),
+            run_output: "anything".into(),
+            context_id: "web-chat-1".into(),
+            existing_summary: None,
+            summary_model: None,
+            agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
+        };
+        let llm_text = "LLM-generated summary text".to_string();
+        let result = apply_llm_fallback(Some(llm_text.clone()), &params);
+        assert_eq!(result, Some(llm_text));
+    }
+
+    /// When the LLM path returns None AND the heuristic would also return
+    /// None (e.g. excluded subagent session), the fallback returns None as
+    /// well -- the silent-skip path is preserved for sessions that genuinely
+    /// shouldn't be summarized.
+    #[test]
+    fn test_llm_fallback_returns_none_when_heuristic_also_skips() {
+        let params = SummaryParams {
+            mode: RunSummaryMode::Llm,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "hello".into(),
+            run_output: "world".into(),
+            // Subagent context is excluded by derive_source_label, so the
+            // heuristic returns None.
+            context_id: "subagent_task_1".into(),
+            existing_summary: None,
+            summary_model: None,
+            agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
+        };
+        assert!(apply_llm_fallback(None, &params).is_none());
+    }
+
+    /// Regression test for PR #884 follow-up: when the LLM path fails *and*
+    /// `existing_summary` is non-empty (a typical LLM-mode paragraph), the
+    /// fallback must NOT invoke the heuristic.  Otherwise the heuristic would
+    /// concatenate a short heuristic line onto the long existing paragraph and
+    /// `trim_oldest_lines(_, 500)` would evict the paragraph — silently
+    /// dropping real history on every transient LLM failure.
+    ///
+    /// Expected behavior: `apply_llm_fallback` returns `None`, the upsert
+    /// path is skipped, and the existing summary stays intact in the DB.
+    #[test]
+    fn test_llm_fallback_preserves_existing_summary_on_failure() {
+        // 450-byte LLM-mode paragraph -- representative of accumulated history.
+        let existing = "x".repeat(450);
+        let params = SummaryParams {
+            mode: RunSummaryMode::Llm,
+            agent_id: AgentId::new(),
+            session_id: SessionId::new(),
+            run_id: RunId::new(),
+            run_input: "Follow-up question after a failure".into(),
+            run_output: "Some new response".into(),
+            context_id: "web-chat-1".into(),
+            existing_summary: Some(existing.clone()),
+            summary_model: None,
+            agent_name: "myagent".into(),
+            summary_max_tokens: 1000,
+        };
+        // Simulate LLM failure (provider call errored or empty content).
+        let result = apply_llm_fallback(None, &params);
+        assert!(
+            result.is_none(),
+            "Must return None to preserve existing summary, got: {result:?}"
+        );
+
+        // Sanity check: verify the bug we're guarding against -- the heuristic,
+        // if invoked, would have evicted the 450-byte paragraph and persisted
+        // only the new heuristic-shaped line, silently losing the history.
+        let heuristic_result = generate_heuristic(&params).expect("heuristic produces a string");
+        assert!(
+            !heuristic_result.contains(&existing),
+            "Heuristic eviction precondition: with a 450-byte existing summary + heuristic line, \
+             trim_oldest_lines(_, 500) drops the older line. If this assertion ever fails, the \
+             eviction risk is gone and the safeguard above can be reconsidered."
         );
     }
 
