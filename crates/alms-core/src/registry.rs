@@ -64,28 +64,35 @@ pub struct AgentRecord {
     /// protocol; silently ignored for other providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gemini_thinking_budget: Option<u32>,
-    /// Per-agent summary-task provider override (#872).
+    /// Per-agent summary-task provider override (#872, #875).
     ///
-    /// `None` = fall through to the server-level `[context].summary_provider`
-    /// (if that is also `None`, the summary task is refused with a clean
-    /// `SUMMARY_NOT_CONFIGURED` error rather than silently inheriting the
-    /// agent's primary provider — see #872 for the rationale).
+    /// Resolution: per-agent ?? server-level `[context].summary_provider`
+    /// ?? fall back to the agent's primary LLM (lenient interpretation —
+    /// when both per-agent and server-level are `None`, the summary task
+    /// silently runs against the agent's own provider/model rather than
+    /// being refused).
     /// `Some(provider)` = re-target the per-run summary task at this
     /// provider exclusively, regardless of the server-level setting.
     ///
-    /// Must be set together with `summary_model`. Setting one without the
-    /// other is rejected at PATCH time with `SUMMARY_PROVIDER_REQUIRES_MODEL`
-    /// or `SUMMARY_MODEL_REQUIRES_PROVIDER`.
+    /// Must be set together with `summary_model` — asymmetric configs are
+    /// rejected at PATCH time with `SUMMARY_PROVIDER_REQUIRES_MODEL` or
+    /// `SUMMARY_MODEL_REQUIRES_PROVIDER`. When set, the provider must
+    /// reference a configured `[llm.providers.<name>]` entry and have a
+    /// resolvable API key, otherwise `SUMMARY_PROVIDER_UNKNOWN` or
+    /// `SUMMARY_PROVIDER_MISSING_API_KEY` is returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_provider: Option<String>,
-    /// Per-agent summary-task model override (#872).
+    /// Per-agent summary-task model override (#872, #875).
     ///
-    /// `None` = fall through to the server-level `[context].summary_model`.
+    /// Resolution: per-agent ?? server-level `[context].summary_model` ??
+    /// fall back to the agent's primary model (lenient interpretation —
+    /// see #875).
     /// `Some(model)` = use this model on the summary provider's wire,
     /// regardless of the server-level setting.
     ///
     /// Must be set together with `summary_provider`. See
-    /// [`AgentRecord::summary_provider`] for the validation rules.
+    /// [`AgentRecord::summary_provider`] for the validation rules and
+    /// the full list of error codes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_model: Option<String>,
     pub is_default: bool,
