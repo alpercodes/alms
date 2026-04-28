@@ -142,6 +142,7 @@ subagent, job) are excluded by default.
       "agent_id": "<uuid>",
       "context_id": "telegram_main_1853446411",
       "session_type": "telegram",
+      "has_active_run": false,
       "created_at": "2026-02-11T07:00:00Z",
       "last_activity": "2026-02-11T07:52:00Z",
       "status": "active"
@@ -152,6 +153,7 @@ subagent, job) are excluded by default.
       "context_id": "dm:alice:bob",
       "session_type": "dm",
       "participants": ["alice", "bob"],
+      "has_active_run": true,
       "created_at": "2026-02-11T08:00:00Z",
       "last_activity": "2026-02-11T08:15:00Z",
       "status": "active"
@@ -162,6 +164,7 @@ subagent, job) are excluded by default.
       "context_id": "notifications:alice",
       "session_type": "notification",
       "agent_name": "alice",
+      "has_active_run": false,
       "created_at": "2026-02-11T09:00:00Z",
       "last_activity": "2026-02-11T09:30:00Z",
       "status": "active"
@@ -177,6 +180,7 @@ subagent, job) are excluded by default.
 | `session_type` | string | Session type derived from the `context_id`. Always present. See table below. |
 | `participants` | string[] | Participant names parsed from the DM context ID (e.g. `["alice", "bob"]`). Only present when `session_type` is `"dm"`. |
 | `agent_name` | string | Agent name extracted from the notification context ID (e.g. `"alice"` from `"notifications:alice"`). Only present when `session_type` is `"notification"`. |
+| `has_active_run` | bool | `true` if any queued or running run is currently tied to this session, `false` otherwise. Drives the sidebar's "active" indicator on the initial load and after SSE reconnect. Always present. Pairs with the agent-scoped SSE feed (`GET /agents/{agent_id}/events`, section 5.7) which emits live `session_activity_started` / `session_activity_ended` transitions between calls to this endpoint. See #856. |
 
 **`session_type` values**
 
@@ -724,6 +728,72 @@ Notes:
 { "error": { "code": "MISSING_FILTER", "message": "..." } }
 { "error": { "code": "AMBIGUOUS_FILTER", "message": "..." } }
 ```
+
+### 5.7 Stream agent-scoped events (SSE)
+`GET /agents/{agent_id}/events`
+
+Persistent SSE feed scoped to a single agent, carrying activity events
+across **all** of the agent's sessions (regular chat, DMs, notifications,
+jobs). Backs the web UI's session sidebar so it can light up the
+"active" indicator on any session — not just the currently-viewed one
+(#856).
+
+Filtering is performed at the broadcast layer: subscribers to one
+agent's feed never see events for any other agent.
+
+**Response 200**
+- `Content-Type: text/event-stream`
+
+**Response 404** — `agent_id` does not resolve to a known agent in the
+registry. The check happens before any sender is registered, so
+unknown-agent connections never insert orphan entries into the in-memory
+sender map (#887).
+
+#### Event types
+
+`session_activity_started`
+Emitted when a run on any of the agent's sessions transitions out of
+`Queued` and starts executing. Pairs 1:1 with `session_activity_ended`
+when the run actually executes.
+```json
+{
+  "session_id": "<uuid>",
+  "run_id": "<uuid>",
+  "agent_id": "<uuid>",
+  "ts": "..."
+}
+```
+
+`session_activity_ended`
+Emitted when a run on any of the agent's sessions reaches a terminal
+state (completed, failed, or cancelled). Always paired with a prior
+`session_activity_started`, **except** for the pre-cancellation path:
+when a queued run is cancelled before it starts executing, the feed
+emits an `ended` without a paired `started` so the sidebar's
+snapshot-derived `has_active_run: true` indicator clears. Consumers
+should treat the snapshot from `GET /sessions` as the source of truth
+for "indicator on" and `ended` as the universal "indicator off" signal
+(#888).
+```json
+{
+  "session_id": "<uuid>",
+  "run_id": "<uuid>",
+  "agent_id": "<uuid>",
+  "ts": "..."
+}
+```
+
+#### Reconnect
+Supported via `Last-Event-ID` header (automatic browser reconnect) or
+`?last_event_id=<n>` query parameter (initial connection). The query
+parameter takes precedence when both are present. Event IDs are scoped
+to the agent's event log — separate from per-run and per-session event
+log counters.
+
+> **Note:** The agent event log is held in memory and lost on daemon
+> restart. After a restart, clients should open the SSE stream without a
+> `last_event_id` parameter and rely on `GET /sessions` to repopulate
+> any sidebar indicators.
 
 ---
 

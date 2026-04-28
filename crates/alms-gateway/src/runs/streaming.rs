@@ -236,10 +236,19 @@ pub async fn stream_session_events(
 /// IDs are scoped to the agent's event log (separate counter from the
 /// per-run / per-session logs).
 ///
-/// The handler does **not** verify that the agent record exists — the
-/// auth layer already gates access, and a feed for an unknown agent
-/// simply produces no events. This mirrors the per-session handler's
-/// behaviour for sessions whose runs never produce events.
+/// Returns `404 NOT_FOUND` when the `agent_id` does not resolve to a
+/// known agent in the registry (#887). The check happens **before** any
+/// sender is registered, so unknown-agent connections never insert an
+/// orphan entry into the in-memory `agent_senders` map. Without this
+/// guard, a misbehaving client could slowly grow that map by repeatedly
+/// connecting with random UUIDs — the entries are only pruned on
+/// `send_agent_event` fanout, which never fires for an agent that never
+/// emits, so disconnected senders accumulate until process restart.
+///
+/// When no SQLite store is configured (test fixtures or store-less
+/// deployments), agent existence cannot be verified and the request is
+/// allowed through. In that mode the registry concept does not exist,
+/// so there is no "unknown agent" to leak against.
 #[instrument(level = "info", skip(state, headers, query), fields(agent_id = %agent_id.0))]
 pub async fn stream_agent_events(
     State(state): State<AppState>,
@@ -247,6 +256,26 @@ pub async fn stream_agent_events(
     headers: HeaderMap,
     Query(query): Query<SessionEventsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Validate the agent exists *before* registering a sender so
+    // unknown-agent UUIDs never insert orphan entries into
+    // `agent_senders` (#887). When no store is configured (test
+    // fixtures), skip the check and proceed.
+    if let Some(store) = state.session_manager.store() {
+        match store.load_agent_by_id(agent_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(api_error(
+                    StatusCode::NOT_FOUND,
+                    "NOT_FOUND",
+                    format!("Agent not found: {}", agent_id.0),
+                ));
+            }
+            Err(e) => {
+                return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e));
+            }
+        }
+    }
+
     // Query parameter takes precedence over header (the header is only
     // sent by the browser on automatic reconnects).
     let last_event_id = query

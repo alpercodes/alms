@@ -602,6 +602,26 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             .run_manager
             .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
             .await;
+        // Emit a synthetic `session_activity_ended` on the agent-scoped
+        // feed (#888). The pre-cancel branch never emits a paired
+        // `session_activity_started`, so this is asymmetric — but the run
+        // was visible as `Queued` between insertion and cancellation, so
+        // any concurrent `GET /sessions` snapshot will have observed
+        // `has_active_run: true` and lit the sidebar's "active" indicator.
+        // Without this `ended` event, that indicator stays stuck until the
+        // page reloads. The consumer treats the snapshot as the source of
+        // truth for "indicator on" and `ended` as the universal "indicator
+        // off" signal, so the missing `started` is harmless: clients with
+        // no indicator simply ignore the event.
+        state
+            .run_manager
+            .send_agent_event(
+                agent_id,
+                run_id,
+                session_id,
+                SseEventData::session_activity_ended(session_id, run_id, agent_id),
+            )
+            .await;
         state.run_manager.mark_run_as_cancelled(run_id);
         state.run_manager.remove_cancel_token(run_id);
         state.run_manager.remove_senders(run_id);

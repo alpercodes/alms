@@ -2439,13 +2439,23 @@ async fn agent_session_activity_feed_filters_by_agent_id() {
     shutdown_token.cancel();
 }
 
-/// Pre-cancellation paths in `execute_run` return early before emitting
-/// either `session_activity_started` or `session_activity_ended`. The
-/// agent-scoped feed must stay silent for runs that never actually
-/// executed — they did not "appear active" in any UI sense and so do
-/// not need a started/ended pair (#856).
+/// Pre-cancellation in `execute_run` emits a synthetic
+/// `session_activity_ended` (without a paired `session_activity_started`)
+/// so the sidebar's snapshot-derived "active" indicator clears (#888).
+///
+/// Background: a queued run is observable via `GET /sessions`'s
+/// `has_active_run: true` field between insertion and cancellation, so a
+/// concurrent client snapshot will have lit up the indicator. The
+/// pre-cancel branch never emits a `started` (the run never executed),
+/// but it MUST emit `ended` to clear that indicator — otherwise the UI
+/// shows a stuck "active" state until the next reload.
+///
+/// The asymmetric `ended`-without-`started` is intentional and documented
+/// in the lifecycle code: the consumer treats the snapshot as the source
+/// of truth for "indicator on" and `ended` as the universal "indicator
+/// off" signal.
 #[tokio::test]
-async fn pre_cancelled_run_emits_no_agent_session_activity_events() {
+async fn pre_cancelled_run_emits_session_activity_ended() {
     let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
     let agent_id = AgentId::new();
     let session = state
@@ -2482,15 +2492,127 @@ async fn pre_cancelled_run_emits_no_agent_session_activity_events() {
     )
     .await;
 
-    // No session_activity_* events should have been emitted.
     let events = drain_events(&mut agent_rx);
+    let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+
+    // Pre-cancelled runs MUST NOT emit `started` (the run never executed)
+    // but MUST emit exactly one `ended` so the sidebar indicator clears.
     assert!(
-        events
-            .iter()
-            .all(|e| e.event_type != "session_activity_started"
-                && e.event_type != "session_activity_ended"),
-        "pre-cancelled runs must not emit agent session-activity events; got: {:?}",
-        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+        !event_types.contains(&"session_activity_started"),
+        "pre-cancelled runs must not emit session_activity_started; got: {event_types:?}"
+    );
+    let ended_count = event_types
+        .iter()
+        .filter(|t| **t == "session_activity_ended")
+        .count();
+    assert_eq!(
+        ended_count, 1,
+        "pre-cancelled runs must emit exactly one session_activity_ended; got: {event_types:?}"
+    );
+
+    // Verify the ended event carries the right payload so consumers can
+    // correlate it with their snapshot-derived indicator state.
+    let ended = events
+        .iter()
+        .find(|e| e.event_type == "session_activity_ended")
+        .expect("session_activity_ended must be present");
+    assert_eq!(ended.data["session_id"], session_id.0.to_string());
+    assert_eq!(ended.data["run_id"], run_id.0.to_string());
+    assert_eq!(ended.data["agent_id"], agent_id.0.to_string());
+
+    // And the snapshot truth flips to false post-cancel, matching what
+    // a freshly-loading client would see.
+    assert!(
+        !state.run_manager.has_active_runs(session_id),
+        "session must report has_active_run=false after pre-cancellation"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// `GET /agents/{agent_id}/events` returns 404 when the `agent_id` does
+/// not resolve to a record in the registry, and crucially does NOT
+/// register a sender for the unknown agent (#887).
+///
+/// Without this guard, a misbehaving client could slowly grow the
+/// in-memory `agent_senders` map by repeatedly connecting with random
+/// UUIDs — entries are only pruned on `send_agent_event` fanout, which
+/// never fires for an agent that never emits events.
+#[tokio::test]
+async fn stream_agent_events_returns_404_for_unknown_agent_and_does_not_leak_sender() {
+    use axum::extract::{Path, Query, State};
+    use axum::http::HeaderMap;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let (alice_id, _bob_id) = seed_alice_bob(&state);
+
+    // Sanity: looking up alice should succeed; an unknown UUID should
+    // not exist in the registry.
+    let unknown_id = AgentId::new();
+    assert_ne!(unknown_id, alice_id);
+
+    // Pre-condition: agent_senders is empty.
+    assert_eq!(
+        state.run_manager.agent_senders.len(),
+        0,
+        "test fixture must start with no agent senders"
+    );
+
+    // Hit the handler with an unknown agent_id.
+    let result = super::stream_agent_events(
+        State(state.clone()),
+        Path(unknown_id),
+        HeaderMap::new(),
+        Query(super::SessionEventsQuery {
+            last_event_id: None,
+        }),
+    )
+    .await;
+
+    let (status, body) = match result {
+        Err(err) => err,
+        Ok(_) => panic!("stream_agent_events must return 404 for an unknown agent_id"),
+    };
+    assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
+    assert_eq!(body.0["error"]["code"], "NOT_FOUND");
+
+    // Critical: no sender was registered for the unknown agent. This
+    // is the behavioural guarantee that prevents the slow-leak failure
+    // mode #887 was filed for.
+    assert_eq!(
+        state.run_manager.agent_senders.len(),
+        0,
+        "stream_agent_events must NOT register a sender for unknown agent_ids"
+    );
+    assert!(
+        !state.run_manager.agent_senders.contains_key(&unknown_id),
+        "no agent_senders entry should exist for the unknown agent_id"
+    );
+
+    // A request for a known agent should still succeed.  We don't
+    // inspect the response body (it is a stream), but registration must
+    // succeed and the sender map must contain exactly one entry.
+    let ok = super::stream_agent_events(
+        State(state.clone()),
+        Path(alice_id),
+        HeaderMap::new(),
+        Query(super::SessionEventsQuery {
+            last_event_id: None,
+        }),
+    )
+    .await;
+    assert!(
+        ok.is_ok(),
+        "stream_agent_events must succeed for a known agent_id"
+    );
+    assert_eq!(
+        state.run_manager.agent_senders.len(),
+        1,
+        "exactly one sender should be registered for the known agent"
+    );
+    assert!(
+        state.run_manager.agent_senders.contains_key(&alice_id),
+        "the sender must be keyed by the known agent's id"
     );
 
     shutdown_token.cancel();
