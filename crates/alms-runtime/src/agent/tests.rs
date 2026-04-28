@@ -411,6 +411,139 @@ async fn test_guarded_posture_sequential_approvals() {
     );
 }
 
+/// Regression test for #815: a user-denied approval under Guarded posture
+/// must append an `AuditDecision::Deny` entry. Before the fix, the deny
+/// branch of the approval gate emitted `tool_end` and returned the
+/// `ToolExecution` error to the loop — but never called
+/// `session_manager.append_audit`. That left a one-sided audit trail
+/// (every approved call recorded, every denied call silently dropped),
+/// which is useless for any forensic / compliance / post-incident review
+/// that needs to answer "did the operator deny X at this time?".
+///
+/// Approve-side audit emission remains covered by other tests in this
+/// module; the explicit positive assertion here is for the deny path.
+#[tokio::test]
+async fn test_denied_approval_appends_deny_audit_entry() {
+    use alms_core::AuditDecision;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // `math` is NOT auto-approved, so the approval gate fires.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: None,
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        agent_name: None,
+    };
+
+    let tool_call = ToolCall::new("tc-deny", "math", r#"{"operation":"add","a":1,"b":2}"#);
+
+    // Spawn a handler that denies the approval (`decision_tx.send(false)`).
+    let deny_handler = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let RuntimeEvent::ApprovalRequired { decision_tx, .. } = event {
+                decision_tx.send(false).unwrap();
+                break;
+            }
+        }
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call,
+            uuid::Uuid::new_v4(),
+            &session_manager,
+            session.id,
+            None,
+        )
+        .await;
+
+    deny_handler.await.unwrap();
+
+    // The loop must surface a tool-execution error mentioning the denial.
+    match &result {
+        Err(AlmsError::ToolExecution(msg)) => {
+            assert!(
+                msg.contains("denied by user"),
+                "expected denial reason in error, got {:?}",
+                msg
+            );
+        }
+        other => panic!("expected ToolExecution(denied by user), got {:?}", other),
+    }
+
+    // The audit log must contain exactly one entry: a `Deny` decision for
+    // the `math` tool, with the params we passed in and a denial-shaped
+    // error string. Before the #815 fix this assertion would fail with
+    // an empty audit log.
+    let audit = session_manager.get_audit(session.id).unwrap();
+    let deny_entries: Vec<_> = audit
+        .iter()
+        .filter(|e| matches!(e.decision, AuditDecision::Deny))
+        .collect();
+    assert_eq!(
+        deny_entries.len(),
+        1,
+        "expected exactly one Deny audit entry for the user-denied approval, \
+         got {} (full audit: {:#?})",
+        deny_entries.len(),
+        audit
+    );
+    let entry = deny_entries[0];
+    assert_eq!(entry.tool, "math", "deny entry must record tool name");
+    assert!(
+        entry
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("denied by user")),
+        "deny entry must record denial reason, got {:?}",
+        entry.error
+    );
+    assert!(
+        entry.result.is_none(),
+        "deny entry must not carry a result payload, got {:?}",
+        entry.result
+    );
+    // `params` should be the parsed JSON form of the tool call's arguments.
+    assert_eq!(
+        entry.params,
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+        "deny entry must record the parsed tool arguments"
+    );
+    // No `Allow` entry should sneak in for a denied call.
+    assert!(
+        !audit
+            .iter()
+            .any(|e| matches!(e.decision, AuditDecision::Allow)),
+        "denied call must not produce an Allow audit entry"
+    );
+}
+
 /// Regression test for #816: cancellation during approval-wait must emit a
 /// matching `ToolEnd` for the `ToolStart` already fired before the approval
 /// gate. Without that terminal event the UI's tool row stays in the spinner

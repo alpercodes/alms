@@ -1364,6 +1364,31 @@ impl AgentRuntime {
             };
             if !approved {
                 unregister_inflight(inflight, invocation_id);
+                // #815: persist the denial to the audit log. Without this
+                // append, the audit trail is one-sided — it captures every
+                // approved tool call but silently drops user-rejected ones,
+                // so operators cannot retroactively answer "did I deny X
+                // at this time?". Mirror the structure of the approve+execute
+                // success path's audit emission, but with `Decision::Deny`
+                // and a denial-shaped error string. The deny path for
+                // unknown-tools / argument-parse failures earlier in this
+                // function already uses `AuditDecision::Deny`; user denials
+                // belong in the same bucket — they are a policy decision,
+                // not a runtime execution failure (`AuditDecision::Error`).
+                let denial_reason = format!("Tool '{}' denied by user", name);
+                let _ = session_manager.append_audit(
+                    session_id,
+                    AuditEvent {
+                        session_id,
+                        run_id: self.run_id,
+                        tool: name.to_string(),
+                        decision: AuditDecision::Deny,
+                        params: args.clone(),
+                        result: None,
+                        error: Some(denial_reason.clone()),
+                        timestamp: alms_core::Timestamp::now(),
+                    },
+                );
                 let _ = sender.send(RuntimeEvent::ToolEnd {
                     invocation_id,
                     ok: false,
@@ -1371,10 +1396,7 @@ impl AgentRuntime {
                     source_agent: None,
                     task_id: None,
                 });
-                return Err(alms_core::AlmsError::ToolExecution(format!(
-                    "Tool '{}' denied by user",
-                    name
-                )));
+                return Err(alms_core::AlmsError::ToolExecution(denial_reason));
             }
         }
 
