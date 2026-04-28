@@ -518,6 +518,31 @@ export function openSessionStream(sessionId, opts) {
         if (data.source_agent) return; // subagent reasoning is suppressed
         const delta = data.text || '';
         if (!delta) return;
+        const isDm = activeSession.value?.session_type === 'dm';
+        if (isDm) {
+            // For DM sessions: accumulate reasoning text into the per-run
+            // thinking buffer instead of mutating chatMessages.  The
+            // DmReasoningBlock for the active run reads this buffer and
+            // displays the text inside the collapsible "thinking" pane.
+            //
+            // Without this branch, the fallback path below would push a
+            // brand-new agent placeholder message with empty `text` and
+            // only a `reasoning` field — which DmConversationView routes
+            // through DmMessage, producing an empty right-side bubble that
+            // never gets content (the canonical message text arrives via
+            // `dm_message`, on a separate row).  The empty bubble persists
+            // until reload re-fetches history (where reasoning is grouped
+            // into dm_reasoning blocks via groupDmReasoningBlocks and
+            // never materialises as a stand-alone agent message). (#849)
+            const runId = activeRunId.value;
+            if (runId) {
+                const prev = dmThinkingBuffers.value;
+                const next = new Map(prev);
+                next.set(runId, (next.get(runId) || '') + delta);
+                dmThinkingBuffers.value = next;
+            }
+            return;
+        }
         transformMessages(prev => {
             // Drop any transient "thinking" indicator like token_delta does,
             // so the reasoning panel doesn't race with the pre-stream
