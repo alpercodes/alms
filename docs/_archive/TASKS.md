@@ -259,7 +259,7 @@ This is the running task list for ALMS. Keep it short, current, and merge-friend
 - New config: `tools.sandbox_root` (default ".") and `tools.shell_policy` ("sandboxed"/"unrestricted").
 - Safe by default — fs tools sandboxed to cwd, shell_exec cwd restricted to sandbox_root.
 - Set `sandbox_root = ""` or `shell_policy = "unrestricted"` for full access.
-- Future: Landlock (Linux) or restricted OS user for true shell isolation (see security-model.md §4.4).
+- Future: Landlock (Linux) or restricted OS user for true shell isolation (see security-model.md §4.5).
 - **Owners:** Atlas
 
 26) Context window visibility in UI

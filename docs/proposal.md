@@ -24,7 +24,7 @@ ALMS is a **local-first Agent Loop Management System** — effectively an **agen
 
 ## 2) Tech stack recommendation (canonical direction)
 
-**Rust core daemon + SQLite durable state + WASM tool sandbox + HTTP/WebSocket API + TypeScript UI/SDK**
+**Rust core daemon + SQLite durable state + native tool registry + HTTP/WebSocket API + TypeScript UI/SDK**
 
 Rationale:
 - ALMS’s hardest problems are concurrency, cancellation, resource limits, isolation, and durable state.
@@ -181,7 +181,7 @@ The key near-term objective is to make ALMS **buildable and runnable end-to-end*
 
 `docs/tech-stack.md` is strong, but should be tightened with:
 - explicit agent/subagent lifecycle semantics
-- clearer separation of “WASM plugin sandbox” vs “host-privileged tools”
+- clearer separation of future plugin substrate (if/when revived) vs host-privileged tools
 - explicit networking posture (default deny, allowlists)
 - observability/event stream model (correlation IDs)
 - cross-link to `docs/security-model.md`

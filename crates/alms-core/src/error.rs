@@ -18,6 +18,16 @@ pub enum AlmsError {
     #[error("Tool execution failed: {0}")]
     ToolExecution(String),
 
+    /// A tool call was blocked by a pre-execution guard (e.g. the shell risk
+    /// classifier). Carries the structured `target` path so the runtime can
+    /// surface it in SSE events, audit entries, and the approval/audit UI
+    /// without re-parsing the stringified reason. Issue #758.
+    #[error("{reason}")]
+    ToolBlocked {
+        reason: String,
+        target: Option<String>,
+    },
+
     #[error("Channel error: {0}")]
     Channel(String),
 

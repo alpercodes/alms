@@ -5,11 +5,58 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Accumulated token usage for a run
+/// Accumulated token usage for a run.
+///
+/// `reasoning_tokens` is a separate counter populated by providers that
+/// split chain-of-thought usage out of the standard `completion_tokens`
+/// bucket — notably OpenAI o-series via
+/// `usage.completion_tokens_details.reasoning_tokens` (#768). Other
+/// providers (DeepSeek R1, xAI Grok) may or may not surface the split;
+/// when they don't, the field stays `None` and reasoning cost is
+/// implicitly folded into `completion_tokens`.
+///
+/// `cache_creation_input_tokens` / `cache_read_input_tokens` carry
+/// prompt-caching metrics. `cache_creation_input_tokens` is Anthropic-only
+/// (#766) — Gemini does not distinguish creation cost from input cost in
+/// its `usage` surface. `cache_read_input_tokens` is shared across
+/// providers: Anthropic populates it from `cache_read_input_tokens` on
+/// cache-hit responses; Gemini populates it from
+/// `usageMetadata.cachedContentTokenCount` when a `cachedContents` entry
+/// is referenced via `cachedContent: "cachedContents/<id>"` (#769).
+/// Both providers leave the fields as `None` when caching is disabled or
+/// not applicable. All fields use `skip_serializing_if` so pre-#766
+/// payloads remain byte-identical.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Reasoning (chain-of-thought) tokens, when the provider reports them
+    /// separately. `None` means "not reported" — NOT "zero".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+    /// Anthropic prompt-caching: tokens written to the cache on this
+    /// request (billed at ~1.25x standard input rate, see Anthropic docs).
+    /// `None` when the provider does not report the field (non-Anthropic
+    /// providers, or Anthropic requests that did not carry cache markers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Prompt-caching: tokens served from the cache on this request.
+    ///
+    /// **Provider-neutral field.** The name is historically Anthropic-coloured
+    /// but this slot is shared across providers that report "tokens served
+    /// from cache". Operators seeing this populated in a `run_finished`
+    /// event should cross-reference `llm.provider` or the run's model name
+    /// to disambiguate which provider's cache served the tokens.
+    ///
+    /// - Anthropic (#766): billed at ~0.1x standard input rate; populated
+    ///   from the `cache_read_input_tokens` field on the response.
+    /// - Gemini (#769): populated from `usageMetadata.cachedContentTokenCount`
+    ///   when a `cachedContents` entry is referenced.
+    ///
+    /// `None` when the provider does not report the field (cache disabled,
+    /// cache miss on a request without markers, or non-caching provider).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
 }
 
 /// Discriminates tool call records: the LLM requesting a tool call vs. the
@@ -68,6 +115,14 @@ pub struct ToolCallRecord {
     pub result: Option<String>,
     /// When this record was created.
     pub timestamp: DateTime<Utc>,
+    /// Name of the agent that issued this tool call (or returned this result).
+    ///
+    /// Mirrors the `from_agent` metadata stored on DM session messages so
+    /// that the frontend fallback merge path (which reconstructs tool rows
+    /// from `run_tool_calls` when session-level persistence is missing) can
+    /// attribute each reasoning block to the correct agent. Fixes #696.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_agent: Option<String>,
 }
 
 /// Unique identifier for runs
@@ -191,6 +246,13 @@ impl Run {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRunRequest {
     pub session_id: SessionId,
+    /// Optional agent identity asserted by the caller.
+    ///
+    /// Normal sessions are owned by exactly one agent and the gateway rejects
+    /// mismatches. Shared sessions (DMs) are stored under a nil-agent sentinel,
+    /// so callers must provide the active agent id to resolve per-agent config.
+    #[serde(default)]
+    pub agent_id: Option<AgentId>,
     pub input: RunInput,
     /// Optional model override — uses server default when absent.
     #[serde(default)]
@@ -209,6 +271,33 @@ pub struct CreateRunRequest {
     /// web UI to inspect exactly what the LLM sees.
     #[serde(default)]
     pub debug_mode: Option<bool>,
+    /// Optional per-run Anthropic extended-thinking budget override.
+    ///
+    /// `Some(0)` explicitly disables extended thinking for just this run
+    /// even when per-agent or server config would enable it. Omitting the
+    /// field falls through to the per-agent override (or server default).
+    /// Silently ignored when the effective provider is not Anthropic.
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
+    /// Optional per-run OpenAI-compat reasoning-effort override (#768).
+    ///
+    /// Three-layer precedence: per-run > per-agent > server default from
+    /// `[llm.openai].reasoning_effort`. Silently ignored when the effective
+    /// provider is not OpenAI-compatible or the model isn't a reasoning
+    /// model.
+    #[serde(default)]
+    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
+    /// Optional per-run Gemini extended-thinking budget override (#794).
+    ///
+    /// `Some(0)` explicitly disables extended thinking for just this run
+    /// even when per-agent or server config would enable it. Omitting the
+    /// field falls through to the per-agent override (or server default).
+    /// Silently ignored when the effective provider is not Gemini.
+    ///
+    /// Three-layer precedence: per-run > per-agent > server default from
+    /// `[llm.gemini].thinking_budget`.
+    #[serde(default)]
+    pub gemini_thinking_budget: Option<u32>,
 }
 
 /// Input to a run
@@ -326,6 +415,77 @@ mod tests {
     use super::*;
     use chrono::Utc;
 
+    /// `TokenUsage` with no reasoning or cache fields set must serialize
+    /// byte-identically to the pre-#766/#768 shape. Relied on by the
+    /// SSE `run_finished` event and subagent-completion markers whose
+    /// `skip_serializing_if = "Option::is_none"` contract depends on
+    /// `None` fields being omitted entirely rather than emitted as
+    /// `null`.
+    #[test]
+    fn token_usage_serializes_without_optional_fields_when_none() {
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            ..TokenUsage::default()
+        };
+        let value = serde_json::to_value(usage).unwrap();
+        let obj = value.as_object().unwrap();
+
+        // Required fields present.
+        assert_eq!(obj.get("prompt_tokens").and_then(|v| v.as_u64()), Some(100));
+        assert_eq!(
+            obj.get("completion_tokens").and_then(|v| v.as_u64()),
+            Some(50)
+        );
+        // Optional fields absent from the serialized JSON, NOT serialized
+        // as `null`.
+        assert!(
+            obj.get("reasoning_tokens").is_none(),
+            "reasoning_tokens must be skipped when None"
+        );
+        assert!(
+            obj.get("cache_creation_input_tokens").is_none(),
+            "cache_creation_input_tokens must be skipped when None"
+        );
+        assert!(
+            obj.get("cache_read_input_tokens").is_none(),
+            "cache_read_input_tokens must be skipped when None"
+        );
+        // Exactly the two required fields — no extras.
+        assert_eq!(
+            obj.len(),
+            2,
+            "pre-#766 shape has exactly prompt_tokens + completion_tokens when all optionals are None"
+        );
+    }
+
+    /// When cache fields ARE populated they surface on the wire under
+    /// their snake_case names. Pinned here so the SSE `run_finished`
+    /// data struct and subagent markers can rely on the shape.
+    #[test]
+    fn token_usage_serializes_cache_fields_when_some() {
+        let usage = TokenUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cache_creation_input_tokens: Some(1500),
+            cache_read_input_tokens: Some(8200),
+            ..TokenUsage::default()
+        };
+        let value = serde_json::to_value(usage).unwrap();
+        assert_eq!(
+            value
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(1500)
+        );
+        assert_eq!(
+            value
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_u64()),
+            Some(8200)
+        );
+    }
+
     fn make_record(
         role: ToolCallRole,
         tool_name: &str,
@@ -340,6 +500,7 @@ mod tests {
             params: None,
             result: result.map(String::from),
             timestamp: Utc::now(),
+            from_agent: None,
         }
     }
 

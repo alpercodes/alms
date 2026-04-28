@@ -445,6 +445,113 @@ stream_chunk_timeout_secs = 120
     assert_eq!(config.llm.stream_chunk_timeout_secs, 120);
 }
 
+// ---- Gemini provider layering tests (issue #764) ----
+
+/// `ensure_builtin_providers` populates a `gemini` sugar entry so that
+/// `llm.provider = "gemini"` Just Works without an explicit
+/// `[llm.providers.gemini]` block.
+#[test]
+fn test_gemini_sugar_entry_auto_populated() {
+    let config = AlmsConfig::default();
+    let entry = config
+        .llm
+        .providers
+        .get("gemini")
+        .expect("gemini sugar entry must be auto-populated by ensure_builtin_providers");
+    assert_eq!(entry.kind, ProviderKind::Gemini);
+    assert_eq!(
+        entry.base_url,
+        "https://generativelanguage.googleapis.com/v1beta"
+    );
+    match &entry.auth_scheme {
+        AuthScheme::Header { name } => assert_eq!(name, "x-goog-api-key"),
+        other => panic!("expected header auth scheme for gemini, got {other:?}"),
+    }
+}
+
+/// Selecting Gemini via `ALMS_LLM_PROVIDER=gemini` resolves to the sugar
+/// entry and passes validation (given a mock/no-key config).
+#[test]
+fn test_env_override_selects_gemini_provider() {
+    let _guard = EnvGuard::set(&[("ALMS_LLM_PROVIDER", Some("gemini"))]);
+
+    let mut config = AlmsConfig::default();
+    config.apply_env_overrides();
+    assert_eq!(config.llm.provider, "gemini");
+
+    // Provider must be known to `validate()` so the error path isn't
+    // triggered. The sugar entry makes this true even without a TOML file.
+    config.llm.mock = true;
+    assert!(config.validate().is_ok());
+}
+
+/// `ALMS_LLM_MODEL` override propagates into the resolved provider entry,
+/// not just the flat `llm.model` field — mirrors the existing test for
+/// openrouter/openai/anthropic.
+#[test]
+fn test_env_override_model_propagates_to_gemini_entry() {
+    let _provider_guard = EnvGuard::set(&[("ALMS_LLM_PROVIDER", Some("gemini"))]);
+    let _model_guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "gemini-2.5-flash");
+    let _legacy_guard = SingleEnvGuard::remove("DEFAULT_MODEL");
+
+    let mut config = AlmsConfig::default();
+    config.llm.ensure_builtin_providers();
+    config.apply_env_overrides();
+
+    assert_eq!(config.llm.provider, "gemini");
+    assert_eq!(config.llm.model, "gemini-2.5-flash");
+    let entry = config.llm.providers.get("gemini").unwrap();
+    assert_eq!(entry.model.as_deref(), Some("gemini-2.5-flash"));
+}
+
+/// A user-declared `[llm.providers.gemini]` block overrides the sugar
+/// entry — in particular `api_key_env` and `model` flow through.
+#[test]
+fn test_toml_gemini_provider_with_api_key_env() {
+    let toml = r#"
+[llm]
+provider = "gemini"
+model    = "gemini-2.5-pro"
+
+[llm.providers.gemini]
+kind        = "gemini"
+base_url    = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+model       = "gemini-2.5-pro"
+auth_scheme = { type = "header", name = "x-goog-api-key" }
+"#;
+    let mut config: AlmsConfig = toml::from_str(toml).unwrap();
+    config.llm.ensure_builtin_providers();
+    config.llm.mock = true;
+    config.validate().unwrap();
+
+    let entry = config.llm.providers.get("gemini").unwrap();
+    assert_eq!(entry.kind, ProviderKind::Gemini);
+    assert_eq!(entry.api_key_env.as_deref(), Some("GEMINI_API_KEY"));
+    assert_eq!(entry.model.as_deref(), Some("gemini-2.5-pro"));
+}
+
+/// `ProviderEntry::resolve_api_key()` reads from the declared env var for
+/// the Gemini entry.
+#[test]
+fn test_gemini_resolve_api_key_from_env() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_TEST_GEMINI_KEY_764", "gemini-test-key");
+
+    let entry = ProviderEntry {
+        kind: ProviderKind::Gemini,
+        base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+        api_key_env: Some("ALMS_TEST_GEMINI_KEY_764".into()),
+        api_key: None,
+        model: Some("gemini-2.5-pro".into()),
+        auth_scheme: AuthScheme::Header {
+            name: "x-goog-api-key".into(),
+        },
+        quirks: ProviderQuirks::default(),
+    };
+    assert_eq!(entry.resolve_api_key().as_deref(), Some("gemini-test-key"));
+}
+
 // ---- LoggingConfig tests ----
 
 #[test]
@@ -672,10 +779,21 @@ fn test_load_or_default_resolves_data_dir() {
 #[test]
 fn test_context_config_defaults_episodic() {
     let config = ContextConfig::default();
+    // #872 changed the default from Some("minimax/minimax-m2.7") + None
+    // to None + None so the shipped baseline doesn't sit in the
+    // asymmetric (model-only) shape that the new pair-only validator
+    // would otherwise reject. Operators opt into a dedicated summary
+    // task by setting both fields together.
     assert_eq!(
-        config.summary_model,
-        Some("minimax/minimax-m2.7".into()),
-        "summary_model should default to a cheap non-reasoning model"
+        config.summary_model, None,
+        "summary_model now defaults to None — the pre-#872 default \
+         (Some(\"minimax/...\") + None) was the asymmetric shape the \
+         validator rejects"
+    );
+    assert_eq!(
+        config.summary_provider, None,
+        "summary_provider mirrors summary_model — both default to None \
+         post-#872 so the pair-only invariant holds out of the box"
     );
     assert_eq!(config.run_summary_mode, RunSummaryMode::Llm);
     assert_eq!(config.run_summary_budget, 2000);
@@ -1004,4 +1122,541 @@ fn test_warn_legacy_data_dir_custom_data_dir() {
     cfg.warn_legacy_data_dir();
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// Generic OpenAI-compatible provider config (issue #765)
+// ---------------------------------------------------------------------------
+
+/// The generic `[llm.providers.<name>]` table parses from TOML and threads
+/// through to the `providers` map on `LlmConfig`.
+#[test]
+fn test_llm_providers_generic_form_parses() {
+    let toml_str = r#"
+        [llm]
+        provider = "xai"
+        base_url = "https://openrouter.ai/api/v1"
+        model = "grok-4"
+
+        [llm.providers.xai]
+        kind = "openai_compatible"
+        base_url = "https://api.x.ai/v1"
+        api_key_env = "XAI_API_KEY"
+        model = "grok-4"
+        auth_scheme = { type = "bearer" }
+
+        [llm.providers.xai.quirks]
+        tool_gap_fill = false
+        drop_empty_content = true
+    "#;
+
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("parses");
+    let entry = cfg.llm.providers.get("xai").expect("xai entry present");
+    assert_eq!(entry.base_url, "https://api.x.ai/v1");
+    assert_eq!(entry.api_key_env.as_deref(), Some("XAI_API_KEY"));
+    assert_eq!(entry.model.as_deref(), Some("grok-4"));
+    assert_eq!(entry.kind, ProviderKind::OpenAiCompatible);
+    assert!(matches!(entry.auth_scheme, AuthScheme::Bearer));
+    assert!(!entry.quirks.tool_gap_fill);
+    assert!(entry.quirks.drop_empty_content);
+}
+
+/// Entries default `kind = "openai_compatible"` when the field is omitted,
+/// so adding a new provider is as minimal as `base_url` + `api_key_env`.
+#[test]
+fn test_llm_providers_kind_defaults_to_openai_compatible() {
+    let toml_str = r#"
+        [llm]
+        provider = "ollama"
+
+        [llm.providers.ollama]
+        base_url = "http://localhost:11434/v1"
+    "#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).unwrap();
+    let entry = cfg.llm.providers.get("ollama").unwrap();
+    assert_eq!(entry.kind, ProviderKind::OpenAiCompatible);
+}
+
+/// Anthropic sugar is auto-populated on load with the right kind and
+/// auth scheme even when the user writes nothing but `provider = "anthropic"`.
+#[test]
+fn test_ensure_builtin_providers_anthropic_sugar() {
+    let mut cfg = LlmConfig::default();
+    cfg.ensure_builtin_providers();
+    let anthropic = cfg.providers.get("anthropic").expect("anthropic sugar");
+    assert_eq!(anthropic.kind, ProviderKind::Anthropic);
+    assert_eq!(anthropic.base_url, "https://api.anthropic.com/v1");
+    match &anthropic.auth_scheme {
+        AuthScheme::Header { name } => assert_eq!(name, "x-api-key"),
+        other => panic!("expected x-api-key header, got {other:?}"),
+    }
+}
+
+/// User-defined entries for sugar names must not be silently overwritten
+/// by `ensure_builtin_providers`.
+#[test]
+fn test_ensure_builtin_providers_preserves_user_entries() {
+    let toml_str = r#"
+        [llm]
+        provider = "openai"
+
+        [llm.providers.openai]
+        base_url = "http://localhost:9999/v1"
+    "#;
+    let mut cfg: AlmsConfig = toml::from_str(toml_str).unwrap();
+    cfg.llm.ensure_builtin_providers();
+    assert_eq!(
+        cfg.llm.providers.get("openai").unwrap().base_url,
+        "http://localhost:9999/v1"
+    );
+}
+
+/// `validate()` rejects provider selectors that match neither a built-in
+/// sugar name nor a user-declared entry.
+#[test]
+fn test_validation_unknown_provider_rejected() {
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.provider = "does-not-exist".into();
+    let err = cfg.validate().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("does-not-exist"),
+        "error should mention bad provider name: {msg}"
+    );
+    assert!(
+        msg.contains("llm.providers"),
+        "error should point at the providers table: {msg}"
+    );
+}
+
+/// `validate()` accepts a user-declared provider entry.
+#[test]
+fn test_validation_generic_provider_accepted() {
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.provider = "xai".into();
+    cfg.llm.providers.insert(
+        "xai".into(),
+        ProviderEntry {
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.x.ai/v1".into(),
+            api_key_env: Some("XAI_API_KEY".into()),
+            api_key: None,
+            model: Some("grok-4".into()),
+            auth_scheme: AuthScheme::Bearer,
+            quirks: ProviderQuirks::default(),
+        },
+    );
+    assert!(cfg.validate().is_ok());
+}
+
+/// A provider entry with an empty `base_url` is a config error — it
+/// would produce nonsense URLs at request time.
+#[test]
+fn test_validation_empty_base_url_rejected() {
+    let mut cfg = AlmsConfig::default();
+    cfg.llm
+        .providers
+        .get_mut("openai")
+        .unwrap()
+        .base_url
+        .clear();
+    let err = cfg.validate().unwrap_err();
+    assert!(err.to_string().contains("base_url"), "got: {err}");
+}
+
+/// `ProviderEntry::resolve_api_key` reads from `api_key_env` when the
+/// named environment variable is set and non-empty.
+#[test]
+fn test_resolve_api_key_from_env() {
+    let _guard = SingleEnvGuard::set("XAI_API_KEY_FOR_TEST", "xai-secret-value");
+    let entry = ProviderEntry {
+        kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.x.ai/v1".into(),
+        api_key_env: Some("XAI_API_KEY_FOR_TEST".into()),
+        api_key: None,
+        model: None,
+        auth_scheme: AuthScheme::Bearer,
+        quirks: ProviderQuirks::default(),
+    };
+    assert_eq!(entry.resolve_api_key().as_deref(), Some("xai-secret-value"));
+}
+
+/// `api_key_env` takes precedence over `api_key` when both are set.
+#[test]
+fn test_resolve_api_key_env_beats_literal() {
+    let _guard = SingleEnvGuard::set("XAI_API_KEY_PRECEDENCE", "from-env");
+    let entry = ProviderEntry {
+        kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.x.ai/v1".into(),
+        api_key_env: Some("XAI_API_KEY_PRECEDENCE".into()),
+        api_key: Some("from-literal".into()),
+        model: None,
+        auth_scheme: AuthScheme::Bearer,
+        quirks: ProviderQuirks::default(),
+    };
+    assert_eq!(entry.resolve_api_key().as_deref(), Some("from-env"));
+}
+
+/// With no env var and no literal, resolution returns None (the gateway
+/// then falls back to the secrets store).
+#[test]
+fn test_resolve_api_key_none_when_nothing_configured() {
+    let entry = ProviderEntry {
+        kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://api.x.ai/v1".into(),
+        api_key_env: Some("DEFINITELY_UNSET_ENV_VAR_765".into()),
+        api_key: None,
+        model: None,
+        auth_scheme: AuthScheme::Bearer,
+        quirks: ProviderQuirks::default(),
+    };
+    // Ensure the var really is unset.
+    unsafe { std::env::remove_var("DEFINITELY_UNSET_ENV_VAR_765") };
+    assert!(entry.resolve_api_key().is_none());
+}
+
+/// `ALMS_LLM_PROVIDER` env-var override selects a user-declared generic
+/// provider by name (the env var wins over the file's `provider` key).
+#[test]
+fn test_env_var_selects_generic_provider() {
+    let _guard = EnvGuard::set(&[("ALMS_LLM_PROVIDER", Some("groq"))]);
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.providers.insert(
+        "groq".into(),
+        ProviderEntry {
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.groq.com/openai/v1".into(),
+            api_key_env: Some("GROQ_API_KEY".into()),
+            api_key: None,
+            model: Some("llama-3.3-70b".into()),
+            auth_scheme: AuthScheme::Bearer,
+            quirks: ProviderQuirks::default(),
+        },
+    );
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.llm.provider, "groq");
+    assert!(cfg.validate().is_ok());
+}
+
+/// Custom header auth scheme parses from TOML.
+#[test]
+fn test_auth_scheme_header_parses() {
+    let toml_str = r#"
+        [llm]
+        provider = "custom"
+
+        [llm.providers.custom]
+        base_url = "https://example.com/v1"
+        auth_scheme = { type = "header", name = "X-Custom-Key" }
+    "#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).unwrap();
+    let entry = cfg.llm.providers.get("custom").unwrap();
+    match &entry.auth_scheme {
+        AuthScheme::Header { name } => assert_eq!(name, "X-Custom-Key"),
+        other => panic!("expected Header, got {other:?}"),
+    }
+}
+
+// --------------------------------------------------------------------
+// Env-var override regression tests (PR #770 review follow-up)
+// --------------------------------------------------------------------
+
+/// `ALMS_LLM_BASE_URL` must propagate into the resolved sugar provider
+/// entry, not just the flat `llm.base_url`. Regression: previously the
+/// runtime `From<LlmConfig>` impl preferred `entry.base_url` which held
+/// the hardcoded default, silently discarding the env override.
+#[test]
+fn test_env_override_base_url_propagates_to_openai_sugar_entry() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "http://local-proxy:9999/v1");
+    let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
+    let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "openai");
+
+    let mut cfg = AlmsConfig::default();
+    // Mirror the `load()` order: ensure sugar entries, then apply env.
+    cfg.llm.ensure_builtin_providers();
+    cfg.apply_env_overrides();
+
+    assert_eq!(cfg.llm.base_url, "http://local-proxy:9999/v1");
+    let entry = cfg
+        .llm
+        .providers
+        .get("openai")
+        .expect("openai sugar entry present");
+    assert_eq!(
+        entry.base_url, "http://local-proxy:9999/v1",
+        "ALMS_LLM_BASE_URL must propagate into the openai sugar entry"
+    );
+}
+
+#[test]
+fn test_env_override_base_url_propagates_to_openrouter_sugar_entry() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "https://proxy.example.com/v1");
+    let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
+    let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "openrouter");
+
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.ensure_builtin_providers();
+    cfg.apply_env_overrides();
+
+    let entry = cfg.llm.providers.get("openrouter").unwrap();
+    assert_eq!(entry.base_url, "https://proxy.example.com/v1");
+}
+
+#[test]
+fn test_env_override_base_url_propagates_to_anthropic_sugar_entry() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "https://anthropic-proxy.local/v1");
+    let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
+    let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "anthropic");
+
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.ensure_builtin_providers();
+    cfg.apply_env_overrides();
+
+    let entry = cfg.llm.providers.get("anthropic").unwrap();
+    assert_eq!(entry.base_url, "https://anthropic-proxy.local/v1");
+}
+
+/// Same story for `ALMS_LLM_MODEL`: the env override must win over the
+/// (currently empty) `entry.model` so the runtime picks it up.
+#[test]
+fn test_env_override_model_propagates_to_resolved_entry() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_LLM_MODEL", "my-env-model");
+    let _legacy = SingleEnvGuard::remove("DEFAULT_MODEL");
+    let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "openai");
+
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.ensure_builtin_providers();
+    cfg.apply_env_overrides();
+
+    assert_eq!(cfg.llm.model, "my-env-model");
+    let entry = cfg.llm.providers.get("openai").unwrap();
+    assert_eq!(entry.model.as_deref(), Some("my-env-model"));
+}
+
+/// Env-override propagation also applies to user-declared generic
+/// providers: setting `ALMS_LLM_BASE_URL` after selecting an xai entry
+/// should overwrite that entry's base_url.
+#[test]
+fn test_env_override_base_url_propagates_to_user_declared_provider() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_LLM_BASE_URL", "http://override.local/v1");
+    let _legacy = SingleEnvGuard::remove("LLM_BASE_URL");
+    let _provider = SingleEnvGuard::set("ALMS_LLM_PROVIDER", "xai");
+
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.providers.insert(
+        "xai".into(),
+        ProviderEntry {
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://api.x.ai/v1".into(),
+            api_key_env: Some("XAI_API_KEY".into()),
+            api_key: None,
+            model: Some("grok-4".into()),
+            auth_scheme: AuthScheme::Bearer,
+            quirks: ProviderQuirks::default(),
+        },
+    );
+    cfg.llm.ensure_builtin_providers();
+    cfg.apply_env_overrides();
+
+    let entry = cfg.llm.providers.get("xai").unwrap();
+    assert_eq!(entry.base_url, "http://override.local/v1");
+}
+
+/// Inline `api_key` in TOML should deserialize into the entry, matching
+/// the dev-convenience affordance documented on the field. Prior to the
+/// PR #770 review follow-up, `#[serde(skip)]` silently dropped the value.
+#[test]
+fn test_provider_entry_inline_api_key_deserializes_from_toml() {
+    let toml_str = r#"
+        [llm]
+        provider = "customlab"
+
+        [llm.providers.customlab]
+        base_url = "https://customlab.example.com/v1"
+        api_key  = "sk-inline-dev-key"
+    "#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).unwrap();
+    let entry = cfg.llm.providers.get("customlab").unwrap();
+    assert_eq!(entry.api_key.as_deref(), Some("sk-inline-dev-key"));
+}
+
+/// Inline `api_key` must not serialize back out (no round-trip of secrets
+/// to disk). The docstring guarantees this.
+#[test]
+fn test_provider_entry_inline_api_key_does_not_serialize() {
+    let entry = ProviderEntry {
+        kind: ProviderKind::OpenAiCompatible,
+        base_url: "https://example.com/v1".into(),
+        api_key_env: None,
+        api_key: Some("sk-should-be-hidden".into()),
+        model: None,
+        auth_scheme: AuthScheme::Bearer,
+        quirks: ProviderQuirks::default(),
+    };
+    let out = toml::to_string(&entry).unwrap();
+    assert!(
+        !out.contains("sk-should-be-hidden"),
+        "inline api_key must never round-trip through serialize: {out}"
+    );
+    assert!(
+        !out.contains("api_key ="),
+        "api_key field must be absent from serialized TOML: {out}"
+    );
+}
+
+/// `validate()` no longer emits the "No LLM API key configured" warning
+/// when the selected provider entry declares an env-var-backed key.
+/// This is a smoke-level check — we only assert the call returns Ok.
+/// (The warning goes to `tracing`; suppressing it completely keeps users
+/// who adopted the declarative shape from seeing spurious noise.)
+#[test]
+fn test_validation_ok_when_provider_entry_declares_api_key_env() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    // Ensure no API key is present on the flat config.
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.api_key = None;
+    cfg.llm.provider = "mylab".into();
+    cfg.llm.providers.insert(
+        "mylab".into(),
+        ProviderEntry {
+            kind: ProviderKind::OpenAiCompatible,
+            base_url: "https://mylab.example.com/v1".into(),
+            api_key_env: Some("MYLAB_API_KEY".into()),
+            api_key: None,
+            model: None,
+            auth_scheme: AuthScheme::Bearer,
+            quirks: ProviderQuirks::default(),
+        },
+    );
+    assert!(cfg.validate().is_ok());
+}
+
+// --------------------------------------------------------------------------
+// Anthropic extended-thinking config (issue #767)
+// --------------------------------------------------------------------------
+
+/// `[llm.anthropic].thinking_budget_tokens` deserializes correctly from
+/// TOML and round-trips through the canonical `LlmConfig` default path.
+#[test]
+fn test_anthropic_thinking_budget_toml_roundtrip() {
+    let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[llm.anthropic]
+thinking_budget_tokens = 8192
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
+    assert_eq!(cfg.llm.anthropic.thinking_budget_tokens, 8192);
+    // Round-trip: serialize and deserialize again — the field must survive.
+    let re = toml::to_string(&cfg).expect("serialize");
+    let cfg2: AlmsConfig = toml::from_str(&re).expect("reparse");
+    assert_eq!(cfg2.llm.anthropic.thinking_budget_tokens, 8192);
+}
+
+/// Omitted `[llm.anthropic]` section defaults to `thinking_budget_tokens = 0`
+/// (disabled), preserving behaviour for existing configs.
+#[test]
+fn test_anthropic_thinking_budget_default_zero() {
+    let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
+    assert_eq!(cfg.llm.anthropic.thinking_budget_tokens, 0);
+}
+
+// --------------------------------------------------------------------------
+// OpenAI-compat reasoning-effort config (issue #768)
+// --------------------------------------------------------------------------
+
+use crate::config::ReasoningEffort;
+
+/// `[llm.openai].reasoning_effort = "high"` deserializes correctly and
+/// round-trips through `toml::to_string` → reparse.
+#[test]
+fn test_openai_reasoning_effort_toml_roundtrip() {
+    let toml_str = r#"
+[llm]
+provider = "openai"
+model = "o3-mini"
+
+[llm.openai]
+reasoning_effort = "high"
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
+    assert_eq!(cfg.llm.openai.reasoning_effort, Some(ReasoningEffort::High));
+    let re = toml::to_string(&cfg).expect("serialize");
+    let cfg2: AlmsConfig = toml::from_str(&re).expect("reparse");
+    assert_eq!(
+        cfg2.llm.openai.reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+}
+
+/// Omitted `[llm.openai]` section defaults to `reasoning_effort = None`
+/// (no param on the wire), preserving behaviour for existing configs
+/// that don't opt in.
+#[test]
+fn test_openai_reasoning_effort_default_none() {
+    let toml_str = r#"
+[llm]
+provider = "openai"
+model = "gpt-4o"
+"#;
+    let cfg: AlmsConfig = toml::from_str(toml_str).expect("valid TOML");
+    assert!(cfg.llm.openai.reasoning_effort.is_none());
+}
+
+/// Each valid wire value (`low`/`medium`/`high`/`minimal`) deserializes
+/// into the right enum variant.
+#[test]
+fn test_openai_reasoning_effort_all_values_parse() {
+    for (wire, expected) in [
+        ("low", ReasoningEffort::Low),
+        ("medium", ReasoningEffort::Medium),
+        ("high", ReasoningEffort::High),
+        ("minimal", ReasoningEffort::Minimal),
+    ] {
+        let toml_str = format!(
+            r#"
+[llm]
+provider = "openai"
+model = "o3-mini"
+
+[llm.openai]
+reasoning_effort = "{wire}"
+"#
+        );
+        let cfg: AlmsConfig =
+            toml::from_str(&toml_str).unwrap_or_else(|e| panic!("failed to parse '{wire}': {e}"));
+        assert_eq!(cfg.llm.openai.reasoning_effort, Some(expected));
+    }
+}
+
+/// Unknown reasoning_effort values fail TOML parsing at load time —
+/// operators see the typo rather than silently falling back.
+#[test]
+fn test_openai_reasoning_effort_invalid_value_rejected() {
+    let toml_str = r#"
+[llm]
+provider = "openai"
+model = "o3-mini"
+
+[llm.openai]
+reasoning_effort = "extreme"
+"#;
+    let result: Result<AlmsConfig, _> = toml::from_str(toml_str);
+    assert!(
+        result.is_err(),
+        "invalid reasoning_effort should fail to parse, got: {:?}",
+        result.map(|c| c.llm.openai.reasoning_effort)
+    );
 }

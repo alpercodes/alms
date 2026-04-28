@@ -11,8 +11,8 @@ impl SqliteStore {
             .lock()
             .execute(
                 "INSERT INTO run_tool_calls \
-                 (run_id, seq, role, tool_name, tool_id, params, result, timestamp) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (run_id, seq, role, tool_name, tool_id, params, result, timestamp, from_agent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     run_id.0.to_string(),
                     record.seq as i64,
@@ -22,6 +22,7 @@ impl SqliteStore {
                     record.params.as_deref(),
                     record.result.as_deref(),
                     record.timestamp.to_rfc3339(),
+                    record.from_agent.as_deref(),
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_tool_call: {e}")))?;
@@ -40,8 +41,8 @@ impl SqliteStore {
         for record in records {
             tx.execute(
                 "INSERT INTO run_tool_calls \
-                 (run_id, seq, role, tool_name, tool_id, params, result, timestamp) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (run_id, seq, role, tool_name, tool_id, params, result, timestamp, from_agent) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     run_id.0.to_string(),
                     record.seq as i64,
@@ -51,6 +52,7 @@ impl SqliteStore {
                     record.params.as_deref(),
                     record.result.as_deref(),
                     record.timestamp.to_rfc3339(),
+                    record.from_agent.as_deref(),
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_tool_call batch: {e}")))?;
@@ -65,7 +67,7 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let mut stmt = conn
             .prepare(
-                "SELECT seq, role, tool_name, tool_id, params, result, timestamp \
+                "SELECT seq, role, tool_name, tool_id, params, result, timestamp, from_agent \
                  FROM run_tool_calls WHERE run_id = ?1 ORDER BY seq",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_tool_calls: {e}")))?;
@@ -80,11 +82,12 @@ impl SqliteStore {
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             })
             .map_err(|e| AlmsError::Runtime(format!("SQLite query load_tool_calls: {e}")))?
             .filter_map(|r| match r {
-                Ok((seq, role_str, tool_name, tool_id, params, result, ts_str)) => {
+                Ok((seq, role_str, tool_name, tool_id, params, result, ts_str, from_agent)) => {
                     let role: ToolCallRole = role_str
                         .parse()
                         .inspect_err(|e| {
@@ -111,6 +114,7 @@ impl SqliteStore {
                         params,
                         result,
                         timestamp,
+                        from_agent,
                     })
                 }
                 Err(e) => {
@@ -149,7 +153,7 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT tc.run_id, tc.seq, tc.role, tc.tool_name, tc.tool_id, \
-                        tc.params, tc.result, tc.timestamp \
+                        tc.params, tc.result, tc.timestamp, tc.from_agent \
                  FROM run_tool_calls tc \
                  INNER JOIN runs r ON tc.run_id = r.run_id \
                  WHERE r.session_id = ?1 \
@@ -170,13 +174,24 @@ impl SqliteStore {
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(|e| {
                 AlmsError::Runtime(format!("SQLite query load_tool_calls_for_session: {e}"))
             })?
             .filter_map(|r| match r {
-                Ok((run_id_str, seq, role_str, tool_name, tool_id, params, result, ts_str)) => {
+                Ok((
+                    run_id_str,
+                    seq,
+                    role_str,
+                    tool_name,
+                    tool_id,
+                    params,
+                    result,
+                    ts_str,
+                    from_agent,
+                )) => {
                     let run_id: RunId = uuid::Uuid::parse_str(&run_id_str)
                         .inspect_err(|e| {
                             tracing::warn!(
@@ -214,6 +229,7 @@ impl SqliteStore {
                             params,
                             result,
                             timestamp,
+                            from_agent,
                         },
                     })
                 }
@@ -259,6 +275,7 @@ mod tests {
                 None
             },
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         }
     }
 
@@ -357,6 +374,7 @@ mod tests {
                 params: None, // Empty-args tool call
                 result: None,
                 timestamp: chrono::Utc::now(),
+                from_agent: None,
             },
             ToolCallRecord {
                 seq: 1,
@@ -366,6 +384,7 @@ mod tests {
                 params: None,
                 result: None, // Tool returned nothing
                 timestamp: chrono::Utc::now(),
+                from_agent: None,
             },
         ];
 
@@ -469,5 +488,38 @@ mod tests {
         let calls_b = store.load_tool_calls_for_session(session_b).unwrap();
         assert_eq!(calls_b.len(), 1);
         assert_eq!(calls_b[0].record.tool_name.as_deref(), Some("shell"));
+    }
+
+    /// Verify that `from_agent` is persisted and round-trips through both
+    /// `load_tool_calls` (per-run) and `load_tool_calls_for_session`
+    /// (session-level). This supports the frontend fallback merge path so
+    /// DM reasoning blocks can be attributed to the correct agent. (#696)
+    #[test]
+    fn test_tool_call_from_agent_roundtrip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session_id = SessionId::new();
+        let agent_id = alms_core::AgentId::new();
+        let run = alms_core::Run::new(session_id, agent_id, "hi".to_string());
+        store.save_run(&run).unwrap();
+
+        let record = ToolCallRecord {
+            seq: 0,
+            role: ToolCallRole::Assistant,
+            tool_name: Some("send_message".to_string()),
+            tool_id: Some("call_0".to_string()),
+            params: Some(r#"{"text":"hi"}"#.to_string()),
+            result: None,
+            timestamp: chrono::Utc::now(),
+            from_agent: Some("alice".to_string()),
+        };
+        store.save_tool_call(run.run_id, &record).unwrap();
+
+        let loaded = store.load_tool_calls(run.run_id).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].from_agent.as_deref(), Some("alice"));
+
+        let session_calls = store.load_tool_calls_for_session(session_id).unwrap();
+        assert_eq!(session_calls.len(), 1);
+        assert_eq!(session_calls[0].record.from_agent.as_deref(), Some("alice"));
     }
 }

@@ -85,7 +85,29 @@ impl GatewayConfig {
                 context_config: config.context.clone(),
                 sandbox_root: config.tools.sandbox_root.clone(),
                 shell_policy: config.tools.shell_policy.clone(),
+                shell_permissions: config.tools.shell_permissions.clone(),
+                shell_classification_mode: config.tools.shell_classification_mode,
+                shell_spill: config.tools.shell_spill.clone(),
                 enabled_tools: config.tools.enabled.clone(),
+                fs_edit_fuzzy_match: config.tools.fs_edit.fuzzy_match,
+                // Server-default extended-thinking budget — can be
+                // overridden per-agent in the registry and per-run in
+                // the run-create API.
+                anthropic_thinking_budget: config.llm.anthropic.thinking_budget_tokens,
+                // Anthropic prompt caching (#766) — server-level only,
+                // no per-agent / per-run override per issue #766.
+                anthropic_prompt_cache_enabled: config.llm.anthropic.prompt_cache_enabled,
+                // Server-default OpenAI-compat reasoning effort (#768) —
+                // three-layer precedence (per-run > per-agent > server).
+                openai_reasoning_effort: config.llm.openai.reasoning_effort,
+                // Server-default Gemini thinking budget (#769) — three-layer
+                // precedence mirrors Anthropic/OpenAI. Silently ignored
+                // when the effective provider is not Gemini.
+                gemini_thinking_budget: config.llm.gemini.thinking_budget,
+                // Gemini context caching (#769) — server-level only,
+                // no per-agent / per-run override per issue #769.
+                gemini_cache_enabled: config.llm.gemini.cache_enabled,
+                gemini_cache_ttl_seconds: config.llm.gemini.cache_ttl_seconds,
                 ..AgentConfig::default()
             },
             session_config: SessionConfig {
@@ -244,9 +266,18 @@ impl Gateway {
                 alms_core::secrets::SecretsStore::empty()
             });
 
-        // Resolve API key from secrets store (the only source — no env var fallback).
+        // Resolve API key. Precedence:
+        //   1. SecretsStore (`alms auth set <provider> <key>`) — highest,
+        //      because runtime operator changes should always win.
+        //   2. The provider entry's `api_key_env` / `api_key` fields, for
+        //      configs that wire a generic OpenAI-compatible provider
+        //      declaratively in `alms.toml`.
         let mut llm_config = config.llm_config.clone();
         if let Some(key) = secrets_store.resolve_key(&llm_config.provider) {
+            llm_config.api_key = key;
+        } else if let Some(entry) = llm_config.providers.get(&llm_config.provider).cloned()
+            && let Some(key) = entry.resolve_api_key()
+        {
             llm_config.api_key = key;
         }
         let llm = LlmClient::new(llm_config)?;
@@ -393,6 +424,32 @@ impl Gateway {
     pub async fn start(&mut self) -> AlmsResult<()> {
         info!("Starting ALMS Gateway");
 
+        // Shell output spill retention sweep (issue #756). Runs once at
+        // startup — no background ticker — so expired `.alms/shell_output/*`
+        // files are cleaned up the next time the gateway restarts rather
+        // than growing unbounded. Failures are non-fatal and logged.
+        if let Some(ref data_dir) = self.config.data_dir {
+            let retention_days = self.config.tools_config.shell_spill.retention_days;
+            match alms_runtime::spill::sweep_expired(data_dir, retention_days) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        info!(
+                            deleted,
+                            retention_days,
+                            "Cleaned up expired shell output spill files at startup"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        data_dir = %data_dir.display(),
+                        "Shell output spill retention sweep failed at startup"
+                    );
+                }
+            }
+        }
+
         // Start all Telegram channels (non-fatal per bot — log and continue)
         for bot in &self.telegram_bots {
             if let Err(e) = bot.channel.start().await {
@@ -482,6 +539,17 @@ impl Gateway {
             tokio::select! {
                 Some((agent_id, agent_name, telegram, msg)) = merged_rx.recv() => {
                     // Route the message to the owning agent (not the default).
+                    //
+                    // NOTE: `self.config.agent_config` is a boot-time snapshot
+                    // — `Gateway` holds `GatewayConfig` by value and never sees
+                    // PATCH /settings mutations. HTTP-triggered runs (and the
+                    // Coordinator) share the live `Arc<RwLock<AgentConfig>>` on
+                    // `AppState`, so this is a known asymmetry: PATCH /settings
+                    // updates to context / session / tools / llm provider
+                    // defaults take effect for HTTP runs immediately and for
+                    // Telegram runs only after a daemon restart. This is
+                    // pre-existing behaviour for the context / session / tools
+                    // sections and is documented in `docs/api.md` § 10.2.
                     let secrets_guard = self.secrets.read();
                     let resolved = crate::runs::resolve_agent_config(
                         agent_id,
@@ -754,6 +822,11 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         posture: None,
         provider: None,
         telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
         is_default: false,
         created_at: now,
         last_active: now,
@@ -890,6 +963,11 @@ mod tests {
             posture: None,
             provider: None,
             telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: true,
             created_at: now,
             last_active: now,

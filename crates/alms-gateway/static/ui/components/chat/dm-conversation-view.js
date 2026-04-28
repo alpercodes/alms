@@ -8,13 +8,22 @@
  * Relates to #604.
  */
 
-import { html, useEffect, useRef, useState, effect, renderMarkdown } from '../../deps.js';
+import { html, useEffect, useRef, useState, signal, effect, renderMarkdown } from '../../deps.js';
 import { chatMessages } from '../../state/chat.js';
-import { dmParticipants } from '../../state/sessions.js';
+import { activeSessionId, dmParticipants } from '../../state/sessions.js';
 import { activeAgent } from '../../state/agents.js';
+import { activeRunId } from '../../state/runs.js';
+import { dmPeer } from '../../state/agent-status.js';
 import { scrollToBottom } from '../../utils/format.js';
 import { ToolRow } from './tool-row.js';
 import { dmThinkingBuffers } from '../../hooks/use-session-stream.js';
+import { cancelDm } from '../../api/sessions.js';
+import { DM_END_REASON_LABELS } from '../../utils/constants.js';
+
+/** Tracks whether a cancel-DM request is currently in flight.
+ *  Module-level: shared across session views. If the user switches
+ *  sessions mid-request, the new session may briefly show "Stopping...". */
+const cancellingDm = signal(false);
 
 /**
  * Determine which "side" a message belongs to in the DM view.
@@ -77,6 +86,34 @@ function DmDivider({ text }) {
 }
 
 /**
+ * Return true when `thinkingText` is exactly equal (after trimming) to the
+ * `message` argument of any `send_message` tool call in `tools`. Used to
+ * suppress the thinking-text pane when the model emitted the reply text as
+ * a standalone text block immediately before calling `send_message` with
+ * the same content -- we do not want to render the same string both as the
+ * thinking pane and as the delivered DM bubble. (Fixes #738)
+ *
+ * Conservative: exact equality only, so legitimate reasoning that happens
+ * to echo the message as a substring is preserved.
+ *
+ * @param {string} thinkingText
+ * @param {Array<object>} tools
+ * @returns {boolean}
+ */
+function thinkingMatchesSendMessageContent(thinkingText, tools) {
+    if (!thinkingText) return false;
+    const trimmed = thinkingText.trim();
+    if (!trimmed) return false;
+    for (const t of tools || []) {
+        if (t.tool !== 'send_message') continue;
+        const msg = t.params && typeof t.params.message === 'string'
+            ? t.params.message.trim() : '';
+        if (msg && msg === trimmed) return true;
+    }
+    return false;
+}
+
+/**
  * Collapsible reasoning block for DM conversations.
  * Groups the agent's thinking text and tool calls for a single run.
  * Collapsed by default; expanding reveals thinking text and ToolRow components.
@@ -86,7 +123,15 @@ function DmReasoningBlock({ runId, agentName, thinkingText, tools, status, isLiv
 
     // For live blocks, read accumulated thinking text from the signal buffer.
     const liveThinking = isLive ? (dmThinkingBuffers.value.get(runId) || '') : '';
-    const displayThinking = thinkingText || liveThinking;
+    const rawThinking = thinkingText || liveThinking;
+
+    // Some models emit their reply as a plain text block AND then call
+    // `send_message` with the exact same string -- duplicating the content
+    // once as "thinking" and once as the delivered message. Detect that
+    // case and suppress the thinking display so the UI shows the message
+    // only once (as the DM bubble). Fixes #738.
+    const thinkingIsDuplicate = thinkingMatchesSendMessageContent(rawThinking, tools);
+    const displayThinking = thinkingIsDuplicate ? '' : rawThinking;
 
     // Visible tools: hide successful send_message (the DM bubble is already shown).
     // Show send_message while running (with spinner) or on failure.
@@ -129,6 +174,28 @@ function DmReasoningBlock({ runId, agentName, thinkingText, tools, status, isLiv
     `;
 }
 
+/**
+ * Cancel the active DM conversation on the current session.
+ * Calls POST /sessions/{session_id}/cancel-dm, disables the button
+ * while in flight, and lets the dm_conversation_ended SSE event
+ * handle clearing DM state.
+ */
+async function handleCancelDm() {
+    const sessionId = activeSessionId.value;
+    if (!sessionId || cancellingDm.value) return;
+    cancellingDm.value = true;
+    try {
+        await cancelDm(sessionId);
+        // Success -- the dm_conversation_ended SSE event will handle
+        // clearing activeRunId/dmPeer/agentPhase and appending the
+        // "conversation ended" banner.
+    } catch (err) {
+        console.error('[cancel-dm] failed:', err);
+    } finally {
+        cancellingDm.value = false;
+    }
+}
+
 export function DmConversationView() {
     const messagesRef = useRef(null);
     const participants = dmParticipants.value;
@@ -152,6 +219,13 @@ export function DmConversationView() {
         ? `${participants[0]} <-> ${participants[1]}`
         : 'DM conversation';
 
+    // Show the cancel button when the DM has an active run or dmPeer is set
+    // (meaning agents are conversing). The button is hidden when idle.
+    const hasActiveRun = !!activeRunId.value;
+    const hasDmPeer = !!dmPeer.value;
+    const showCancel = hasActiveRun || hasDmPeer;
+    const isCancelling = cancellingDm.value;
+
     return html`
         <div class="dm-view-header">
             <span class="dm-view-header-icon" aria-hidden="true">\u2194</span>
@@ -173,8 +247,7 @@ export function DmConversationView() {
                 if (m.type === 'notification') {
                     const md = m.metadata || {};
                     if (md.type === 'dm_ended_notification') {
-                        const reasonLabels = { 'ignored': 'no further replies', 'depth_exceeded': 'message limit reached' };
-                        const text = `DM with ${md.peer || 'unknown'} ended -- ${reasonLabels[md.reason] || md.reason || 'ended'}`;
+                        const text = `DM with ${md.peer || 'unknown'} ended -- ${DM_END_REASON_LABELS[md.reason] || md.reason || 'ended'}`;
                         return html`<${DmDivider} key=${m.id} text=${text} />`;
                     }
                     return html`<${DmDivider} key=${m.id} text=${m.text} />`;
@@ -189,7 +262,9 @@ export function DmConversationView() {
                     // Queued runs show a distinct message so the user knows
                     // the agent hasn't started processing yet. (#691)
                     let thinkLabel = 'Thinking\u2026';
-                    if (m.queuedBehind > 0) {
+                    if (m.pending) {
+                        thinkLabel = 'Sending\u2026';
+                    } else if (m.queuedBehind > 0) {
                         thinkLabel = 'Queued \u2014 waiting for agent\u2026';
                     } else if (m.source) {
                         // Show which agent is thinking when source info is available.
@@ -271,7 +346,21 @@ export function DmConversationView() {
             })}
         </div>
         <div class="dm-view-footer">
-            <span class="dm-view-footer-text">This is a read-only view of an agent-to-agent conversation.</span>
+            ${showCancel
+                ? html`
+                    <button class="dm-cancel-btn"
+                            disabled=${isCancelling}
+                            title="Stop this DM conversation"
+                            aria-label="Stop conversation"
+                            onClick=${handleCancelDm}>
+                        <span class="dm-cancel-btn-icon" aria-hidden="true">\u25A0</span>
+                        ${isCancelling ? 'Stopping\u2026' : 'Stop conversation'}
+                    </button>
+                `
+                : html`
+                    <span class="dm-view-footer-text">This is a read-only view of an agent-to-agent conversation.</span>
+                `
+            }
         </div>
     `;
 }

@@ -195,6 +195,7 @@ mod tests {
             TokenUsage {
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                ..TokenUsage::default()
             },
         );
 
@@ -269,6 +270,7 @@ mod tests {
             TokenUsage {
                 prompt_tokens: 1,
                 completion_tokens: 2,
+                ..TokenUsage::default()
             },
         );
         let completed_id = completed_run.run_id;
@@ -342,6 +344,7 @@ mod tests {
             TokenUsage {
                 prompt_tokens: 10,
                 completion_tokens: 20,
+                ..TokenUsage::default()
             },
         );
         store.save_run(&run).unwrap();

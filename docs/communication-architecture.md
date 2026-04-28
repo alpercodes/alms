@@ -20,7 +20,7 @@ Fully open source risks a larger company forking and outcompeting on distributio
 
 Backend: Rust
 Frontend: Preact
-Agent sandbox: WASM-based (Wasmtime), capability-based permissions
+Agent sandbox: native Rust tools with per-tool sandboxing (path canonicalization, shell permissions, Landlock on Linux), capability-based permissions
 Architecture: Pure tree agent hierarchy with ephemeral and persistent subagents, SSE-based observability
 
 No stack changes are planned. The existing foundation is solid for the target use case and enterprise ambitions.
@@ -225,7 +225,7 @@ The differentiation is not in any single feature but in the cohesive team simula
 
 Rust backend and Preact frontend
 Agent runtime and basic orchestration
-WASM-based sandbox with capability-based permissions
+Native tool registry with per-tool sandboxing (path canonicalization, shell permissions, Landlock on Linux) and capability-based permissions
 Pure tree agent hierarchy
 SSE-based observability
 

@@ -2,9 +2,10 @@
  * Agent status signal -- live phase indicator for the agent header bar.
  *
  * Driven by SSE `status` events (ephemeral, not persisted), `run_created`
- * events (for DM/peer awareness), and `tool_start`/`tool_end` events
- * (for per-tool granularity).  Cleared on run end, stream close, or
- * session switch.
+ * events (for DM/peer awareness), `tool_start`/`tool_end` events
+ * (for per-tool granularity), and cross-session `dm_activity_*` events
+ * (for global agent status visibility).  Cleared on session switch or
+ * DM conversation end.
  *
  * Phase-to-label mapping:
  *   building_context  -> "Building context..."
@@ -15,13 +16,17 @@
  *   dm                -> "Chatting with {detail}..."
  *   null              -> null (idle)
  *
- * DM phase tracking:
- *   When the run source is "peer:<name>", `dmPeer` is set to the peer name.
- *   The DM context is shown as a fallback when no more specific phase
- *   (e.g. tool execution) is active.  Backend status events (building_context,
- *   calling_llm) that would show generic "Thinking..." are replaced with
- *   "Chatting with {peer}..." to maintain DM awareness.  Tool execution
- *   phases are allowed through so users can see what tool is running.
+ * DM phase tracking (#688):
+ *   When the agent is in a DM conversation, "Chatting with {peer}..." is
+ *   STICKY -- it persists until the DM conversation ends, regardless of
+ *   internal tool use or phase changes.  The internal activity (tool
+ *   execution, LLM calls) is visible in the DM reasoning blocks within
+ *   the DM session view, not in the header bar.
+ *
+ *   Cross-session visibility (#703): when viewing the webchat session,
+ *   the agent's DM activity is shown via `dm_activity_started`,
+ *   `dm_activity_status`, `dm_activity_ended`, and `dm_conversation_ended`
+ *   events forwarded from the DM session by the backend.
  */
 
 import { signal, computed } from '../deps.js';

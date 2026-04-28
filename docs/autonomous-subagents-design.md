@@ -12,7 +12,7 @@ This is exactly how Claude Code's subagents work: launch a reviewer agent, it re
 
 | Capability | Status | How |
 |---|---|---|
-| Multi-iteration tool use | **Done** | `agent_loop` loops up to `max_iterations` — subagent already uses tools autonomously |
+| Multi-iteration tool use | **Done** | `agent_loop` loops until the LLM stops requesting tools (bounded by token budget, provider `max_tokens`, posture approvals, and run cancellation) — subagent already uses tools autonomously |
 | Persistent session across invocations | **Done** | `name` param on `invoke_agent` → UUID v5 deterministic identity → same session reused |
 | Background execution | **Done** | `background=true` → `dispatch_background()` → poll via `get_task_result` |
 | SSE event forwarding | **Done** | Subagent tool events forwarded into parent run's event stream |

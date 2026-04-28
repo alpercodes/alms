@@ -672,6 +672,9 @@ async fn run_subagent(
                         alms_core::TokenUsage {
                             prompt_tokens: output.usage.prompt_tokens,
                             completion_tokens: output.usage.completion_tokens,
+                            reasoning_tokens: output.usage.reasoning_tokens,
+                            cache_creation_input_tokens: output.usage.cache_creation_input_tokens,
+                            cache_read_input_tokens: output.usage.cache_read_input_tokens,
                         },
                     );
                 }
@@ -729,6 +732,9 @@ async fn run_subagent(
                 Some(TokenUsage {
                     prompt_tokens: output.usage.prompt_tokens,
                     completion_tokens: output.usage.completion_tokens,
+                    reasoning_tokens: output.usage.reasoning_tokens,
+                    cache_creation_input_tokens: output.usage.cache_creation_input_tokens,
+                    cache_read_input_tokens: output.usage.cache_read_input_tokens,
                 }),
             ),
             None => (None, None),
@@ -835,19 +841,69 @@ struct SubagentRecordConfig {
     model: Option<String>,
     posture: Option<String>,
     provider: Option<String>,
+    /// Per-named-subagent Anthropic extended-thinking budget override.
+    ///
+    /// Mirrors the top-level agent path in `apply_overrides` (gateway
+    /// `runs/mod.rs`): `Some(n)` (including `Some(0)`) is treated as an
+    /// explicit override; `None` inherits the parent's effective budget.
+    /// This keeps the three-layer precedence (per-run > per-agent >
+    /// server default) intact for named subagents too.
+    thinking_budget_tokens: Option<u32>,
+    /// Per-named-subagent OpenAI-compat reasoning-effort override (#768).
+    /// Mirrors `thinking_budget_tokens` for the OpenAI reasoning path:
+    /// `Some(effort)` wins over the parent; `None` inherits the parent's
+    /// effective effort.
+    reasoning_effort: Option<alms_core::config::ReasoningEffort>,
+    /// Per-named-subagent Gemini extended-thinking budget override (#794).
+    /// Same shape as `thinking_budget_tokens` and `reasoning_effort`:
+    /// `Some(n)` (including `Some(0)`) wins over the parent's effective
+    /// budget; `None` inherits it. Keeps the three-layer precedence
+    /// (per-run > per-agent > server default) intact for named
+    /// subagents on the Gemini path.
+    gemini_thinking_budget: Option<u32>,
+    /// Per-named-subagent summary provider override (#872). When the
+    /// subagent has its own `summary_provider`/`summary_model` pair set
+    /// on the registry record, those values override the parent's
+    /// effective summary config for this subagent's run. `None` (on
+    /// either field) inherits the parent's effective summary config —
+    /// which is itself the result of (parent's per-agent ?? server-
+    /// level). The pair-only invariant guarantees these arrive together
+    /// so the two-field overlay below is symmetric.
+    summary_provider: Option<String>,
+    /// Per-named-subagent summary model override (#872). See
+    /// [`SubagentRecordConfig::summary_provider`] for semantics.
+    summary_model: Option<String>,
 }
 
 /// Build an `AgentConfig` for a subagent. Named subagents get their config
 /// from the agent registry; ephemeral subagents use a default prompt.
-/// Both inherit sandbox, tool, and runtime settings (max_iterations,
-/// max_tokens, context_config) from the parent's base config.
+/// Both inherit sandbox, tool, and runtime settings (max_tokens,
+/// context_config) from the parent's base config.
 fn agent_config_for_subagent(
     record: Option<SubagentRecordConfig>,
     base: &AgentConfig,
 ) -> (AgentConfig, Option<String>, Option<String>) {
-    let (model, posture_str, provider) = match record {
-        Some(r) => (r.model, r.posture, r.provider),
-        None => (None, None, None),
+    let (
+        model,
+        posture_str,
+        provider,
+        thinking_budget_override,
+        reasoning_effort_override,
+        gemini_thinking_budget_override,
+        summary_provider_override,
+        summary_model_override,
+    ) = match record {
+        Some(r) => (
+            r.model,
+            r.posture,
+            r.provider,
+            r.thinking_budget_tokens,
+            r.reasoning_effort,
+            r.gemini_thinking_budget,
+            r.summary_provider,
+            r.summary_model,
+        ),
+        None => (None, None, None, None, None, None, None, None),
     };
 
     let posture = posture_str
@@ -855,17 +911,76 @@ fn agent_config_for_subagent(
         .and_then(|s| s.parse::<alms_runtime::Posture>().ok())
         .unwrap_or(alms_runtime::Posture::FullControl);
 
+    // Per-named-subagent Anthropic thinking budget override. `Some(0)` is a
+    // legitimate override meaning "disable extended thinking for this
+    // subagent even when the parent enables it", matching the gateway's
+    // top-level `apply_overrides` semantics. `None` inherits the parent's
+    // effective budget so unconfigured subagents stay consistent with their
+    // parent's extended-thinking policy.
+    let anthropic_thinking_budget =
+        thinking_budget_override.unwrap_or(base.anthropic_thinking_budget);
+
+    // Per-named-subagent OpenAI reasoning-effort override (#768). Same
+    // shape as the thinking budget: `Some(effort)` overrides the parent;
+    // `None` inherits the parent's effective value.
+    let openai_reasoning_effort = reasoning_effort_override.or(base.openai_reasoning_effort);
+
+    // Per-named-subagent Gemini thinking budget override (#794). Same
+    // shape as the Anthropic path: `Some(n)` (including `Some(0)`) is an
+    // explicit override; `None` inherits the parent's effective budget.
+    // Using `.or()` here rather than `.unwrap_or(base.gemini_thinking_budget)`
+    // because `base.gemini_thinking_budget` is itself `Option<u32>`, and
+    // we want the parent's `None` state (= "inherit server default") to
+    // propagate verbatim when the subagent record has no override.
+    let gemini_thinking_budget = gemini_thinking_budget_override.or(base.gemini_thinking_budget);
+
+    // Inherit the parent's effective context config (which already has
+    // per-agent summary overrides applied via `apply_overrides`), then
+    // overlay any summary_provider/summary_model the subagent's own
+    // registry record carries. The pair-only validator on `POST /agents`
+    // / `PATCH /agents/{id}` guarantees these arrive symmetric, so we
+    // honour each field independently — `Some` wins over the parent;
+    // `None` inherits.
+    let mut subagent_context_config = base.context_config.clone();
+    if let Some(provider) = summary_provider_override {
+        subagent_context_config.summary_provider = Some(provider);
+    }
+    if let Some(model) = summary_model_override {
+        subagent_context_config.summary_model = Some(model);
+    }
+
     let config = AgentConfig {
         system_prompt: DEFAULT_SUBAGENT_PROMPT.to_string(),
         posture,
         sandbox_root: base.sandbox_root.clone(),
         shell_policy: base.shell_policy.clone(),
+        shell_permissions: base.shell_permissions.clone(),
+        shell_classification_mode: base.shell_classification_mode,
+        // Subagents inherit the parent's spill policy so >30 KB shell output
+        // spills to disk for them too (issue #756). The actual spill directory
+        // is wired in at `run_agent_loop` via `with_shell_spill` using a
+        // per-subagent subdir (`{data_dir}/shell_output/sub-{task_id}/`), which
+        // keeps the retention sweep's directory walk well-defined.
+        shell_spill: base.shell_spill.clone(),
         enabled_tools: base.enabled_tools.clone(),
-        max_iterations: base.max_iterations,
+        fs_edit_fuzzy_match: base.fs_edit_fuzzy_match,
         max_tokens: base.max_tokens,
-        context_config: base.context_config.clone(),
+        context_config: subagent_context_config,
         prompts: base.prompts.clone(),
         debug_mode: false,
+        anthropic_thinking_budget,
+        // Prompt caching (#766) — server-level only, inherited verbatim
+        // by subagents so they benefit from the same cached prefix.
+        anthropic_prompt_cache_enabled: base.anthropic_prompt_cache_enabled,
+        openai_reasoning_effort,
+        // Gemini thinking (#794) — three-layer precedence: per-named-
+        // subagent > parent's effective budget > server default. Resolved
+        // above via `gemini_thinking_budget_override.or(base.gemini_thinking_budget)`.
+        gemini_thinking_budget,
+        // Gemini caching (#769) — server-level only, inherited verbatim
+        // by subagents so they share cache entries where possible.
+        gemini_cache_enabled: base.gemini_cache_enabled,
+        gemini_cache_ttl_seconds: base.gemini_cache_ttl_seconds,
     };
     (config, model, provider)
 }
@@ -952,6 +1067,11 @@ async fn run_agent_loop(
                     model: record.model,
                     posture: record.posture,
                     provider: record.provider,
+                    thinking_budget_tokens: record.thinking_budget_tokens,
+                    reasoning_effort: record.reasoning_effort,
+                    gemini_thinking_budget: record.gemini_thinking_budget,
+                    summary_provider: record.summary_provider,
+                    summary_model: record.summary_model,
                 }
             })
             .or_else(|| {
@@ -987,7 +1107,7 @@ async fn run_agent_loop(
     } else {
         // Ephemeral: fresh each invocation.
         // Still attach a workspace scoped to a temporary directory so that
-        // fs_read/fs_write/fs_list are narrowed (preventing project-root access).
+        // fs_read/fs_write/fs_list/fs_edit are narrowed (preventing project-root access).
         let (config, _, _) = agent_config_for_subagent(None, base_agent_config);
         (
             config, None, None, true, // attach an ephemeral workspace to restrict fs_* sandbox
@@ -1027,9 +1147,55 @@ async fn run_agent_loop(
         subagent_llm = subagent_llm.with_model(model);
     }
 
+    // Snapshot the subagent's spill policy before `config` is moved into the
+    // runtime — we need it below to wire `with_shell_spill` with the
+    // per-subagent run directory.
+    let subagent_spill_cfg = config.shell_spill.clone();
+
+    // #871: snapshot the subagent's `summary_provider` / `summary_model`
+    // before `config` is moved into the runtime so we can build a dedicated
+    // summary client and wire it via `with_summary_llm`. Subagents inherit
+    // the parent's `[context].summary_provider` through `base_agent_config`
+    // (cloned at spawn time via `self.base_agent_config.read().clone()`),
+    // but pre-#871 the field was silently ignored at the runtime level —
+    // the subagent loop fell back to its own `self.llm` for summarization,
+    // defeating the parent's "summary on a different provider" intent
+    // (Tim's review on PR #871, item 5).
+    let subagent_summary_provider = config.context_config.summary_provider.clone();
+    let subagent_summary_model = config.context_config.summary_model.clone();
+
+    // Build the dedicated summary client BEFORE `subagent_llm` is moved into
+    // `AgentRuntime::new`. Delegates to the shared `alms_runtime::build_summary_client`
+    // helper so the #866 + #871 leak-guard rules cannot drift between the
+    // gateway run path and this subagent inheritance path. When
+    // `summary_provider` is None the helper returns a clone we discard; we
+    // only call `with_summary_llm` when the user opted in.
+    let summary_llm_for_subagent: Option<alms_runtime::LlmClient> =
+        subagent_summary_provider.as_deref().map(|provider| {
+            let secrets_guard = secrets.as_ref().map(|s| s.read());
+            let summary_client = alms_runtime::build_summary_client(
+                &subagent_llm,
+                Some(provider),
+                subagent_summary_model.as_deref(),
+                secrets_guard.as_deref(),
+            );
+            info!(
+                task_id = %task_id.0,
+                agent_provider = %subagent_llm.provider(),
+                summary_provider = %provider,
+                summary_model = %subagent_summary_model.as_deref().unwrap_or("<inherit>"),
+                "Subagent inheriting parent summary_provider config (#871)"
+            );
+            summary_client
+        });
+
     let mut runtime = AgentRuntime::new(agent_id, config, subagent_llm)?
         .with_event_sender(sub_tx)
         .with_cancel_token(cancel_token);
+
+    if let Some(summary_client) = summary_llm_for_subagent {
+        runtime = runtime.with_summary_llm(summary_client);
+    }
 
     // Set agent name for perspective mapping in DM sessions.
     if let Some(ref name) = request.subagent_name {
@@ -1045,14 +1211,30 @@ async fn run_agent_loop(
         }
     }
 
+    // Inherit the parent's shell-output spill policy (issue #756). Subagents
+    // that produce >30 KB of shell output would otherwise get silently
+    // truncated with no spill file — a regression from the parent's
+    // behaviour. Each subagent gets its own per-subagent spill subdirectory
+    // (`{data_dir}/shell_output/sub-{task_id}/`) which is still walked by
+    // `sweep_expired` at gateway startup because that routine iterates every
+    // child of `{data_dir}/shell_output/`. Must be called *before*
+    // `with_workspace` so that workspace's re-registration of the fs_*
+    // read-extras includes the subagent's spill dir.
+    if let Some(dir) = data_dir {
+        let sub_run_dir = dir
+            .join(alms_runtime::spill::SPILL_DIR_NAME)
+            .join(format!("sub-{}", task_id.0));
+        runtime = runtime.with_shell_spill(sub_run_dir, subagent_spill_cfg.enabled);
+    }
+
     // Attach workspace to scope the fs_* sandbox.
     //
     // Named subagents:    {workspace_dir}/{name}/
     // Ephemeral subagents: {workspace_dir}/.ephemeral/{task_id}/
     //
     // Ephemeral subagents get a disposable workspace so their fs_read/fs_write/
-    // fs_list tools are sandboxed to a narrow directory instead of inheriting
-    // the project-root sandbox (which would expose data/secrets.json, the SQLite
+    // fs_list/fs_edit tools are sandboxed to a narrow directory instead of inheriting
+    // the project-root sandbox (which would expose sensitive state, the SQLite
     // database, and other agents' workspace files).
     if attach_workspace {
         if let Some(ws_dir) = workspace_dir {
@@ -1114,6 +1296,9 @@ async fn run_agent_loop(
                     }
                     RuntimeEvent::TokenDelta { delta, .. } => {
                         parent_fwd.forward_token_delta(delta, agent_label);
+                    }
+                    RuntimeEvent::ReasoningDelta { text, .. } => {
+                        parent_fwd.forward_reasoning_delta(text, agent_label);
                     }
                     // Suppress subagent status events -- they would overwrite
                     // the parent's thinking indicator with the subagent's phase,
@@ -1419,7 +1604,6 @@ mod tests {
     fn test_subagent_inherits_parent_config() {
         let parent = AgentConfig {
             system_prompt: "parent prompt".into(),
-            max_iterations: 42,
             max_tokens: 9999,
             context_config: alms_core::config::ContextConfig {
                 strategy: "sliding-summary".into(),
@@ -1432,6 +1616,10 @@ mod tests {
             posture: alms_runtime::Posture::Guarded,
             sandbox_root: "/sandbox".into(),
             shell_policy: "unrestricted".into(),
+            shell_spill: alms_core::config::ShellSpillConfig {
+                enabled: false,
+                retention_days: 42,
+            },
             enabled_tools: vec!["echo".into(), "math".into()],
             ..AgentConfig::default()
         };
@@ -1440,7 +1628,6 @@ mod tests {
         let (config, model, _provider) = agent_config_for_subagent(None, &parent);
         assert!(model.is_none());
         // Should inherit runtime settings from parent
-        assert_eq!(config.max_iterations, 42);
         assert_eq!(config.max_tokens, 9999);
         assert_eq!(config.context_config.strategy, "sliding-summary");
         assert_eq!(config.context_config.max_input_tokens, 50_000);
@@ -1449,6 +1636,9 @@ mod tests {
         assert_eq!(config.sandbox_root, "/sandbox");
         assert_eq!(config.shell_policy, "unrestricted");
         assert_eq!(config.enabled_tools, vec!["echo", "math"]);
+        // Should inherit the shell spill policy (issue #756 subagent inheritance)
+        assert!(!config.shell_spill.enabled);
+        assert_eq!(config.shell_spill.retention_days, 42);
         // system_prompt should be the default subagent prompt, not the parent's
         assert_eq!(config.system_prompt, DEFAULT_SUBAGENT_PROMPT);
 
@@ -1457,6 +1647,11 @@ mod tests {
             model: Some("gpt-5".into()),
             posture: Some("guarded".into()),
             provider: Some("anthropic".into()),
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
         };
         let (config2, model2, _provider2) = agent_config_for_subagent(Some(record), &parent);
         assert_eq!(model2.as_deref(), Some("gpt-5"));
@@ -1464,9 +1659,505 @@ mod tests {
         assert_eq!(config2.system_prompt, DEFAULT_SUBAGENT_PROMPT);
         assert_eq!(config2.posture, alms_runtime::Posture::Guarded);
         // Should still inherit runtime settings from parent
-        assert_eq!(config2.max_iterations, 42);
         assert_eq!(config2.max_tokens, 9999);
         assert_eq!(config2.context_config.max_input_tokens, 50_000);
+        // Shell spill policy still inherited through the registry-override path
+        assert!(!config2.shell_spill.enabled);
+        assert_eq!(config2.shell_spill.retention_days, 42);
+    }
+
+    // -- per-named-subagent summary provider/model overlay (issue #872) --------
+
+    /// When the parent has summary_provider / summary_model set on its
+    /// effective context config (per-agent ?? server-level resolved at
+    /// the gateway), the subagent inherits those values verbatim through
+    /// the `base.context_config.clone()` path. The subagent's own
+    /// registry record can then OVERRIDE them by setting both fields on
+    /// `SubagentRecordConfig`. `None` on the subagent record falls
+    /// through to the parent's effective values — which is what the
+    /// issue calls out as "subagents inherit the parent's effective
+    /// summary config (not parent's primary provider)".
+    #[test]
+    fn test_subagent_inherits_parent_effective_summary_config() {
+        let parent = AgentConfig {
+            context_config: alms_core::config::ContextConfig {
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                ..Default::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        // Ephemeral subagent: inherits the parent's effective summary
+        // config wholesale. No registry record means no override.
+        let (config, _, _) = agent_config_for_subagent(None, &parent);
+        assert_eq!(
+            config.context_config.summary_provider.as_deref(),
+            Some("openrouter")
+        );
+        assert_eq!(
+            config.context_config.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
+
+        // Named subagent with no per-agent summary fields: same
+        // inheritance as ephemeral.
+        let record = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (config2, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert_eq!(
+            config2.context_config.summary_provider.as_deref(),
+            Some("openrouter"),
+            "subagent without per-agent summary config inherits parent's effective summary_provider"
+        );
+        assert_eq!(
+            config2.context_config.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7"),
+            "subagent without per-agent summary config inherits parent's effective summary_model"
+        );
+    }
+
+    /// When the subagent's registry record carries its own
+    /// summary_provider / summary_model pair, those override the
+    /// parent's effective config. Pair-only invariant means both fields
+    /// are guaranteed symmetric by the time they reach the coordinator.
+    #[test]
+    fn test_subagent_summary_override_wins_over_parent_inherit() {
+        let parent = AgentConfig {
+            context_config: alms_core::config::ContextConfig {
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                ..Default::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        let record = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: Some("anthropic".into()),
+            summary_model: Some("claude-haiku-4".into()),
+        };
+        let (config, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert_eq!(
+            config.context_config.summary_provider.as_deref(),
+            Some("anthropic"),
+            "subagent's per-agent summary_provider must win over parent's effective value"
+        );
+        assert_eq!(
+            config.context_config.summary_model.as_deref(),
+            Some("claude-haiku-4"),
+            "subagent's per-agent summary_model must win over parent's effective value"
+        );
+    }
+
+    /// Both layers None: subagent inherits the both-None state. The
+    /// runtime-side `build_summary_client` short-circuits on
+    /// `summary_provider = None` to a clone of the agent's main LLM
+    /// client (the back-compat path), so no separate summary task runs.
+    /// This is the "neither set" path from the issue: clean inheritance,
+    /// no inadvertent provider switch.
+    #[test]
+    fn test_subagent_summary_all_none_stays_none() {
+        let parent = AgentConfig {
+            context_config: alms_core::config::ContextConfig {
+                summary_provider: None,
+                summary_model: None,
+                ..Default::default()
+            },
+            ..AgentConfig::default()
+        };
+
+        let (config, _, _) = agent_config_for_subagent(None, &parent);
+        assert!(config.context_config.summary_provider.is_none());
+        assert!(config.context_config.summary_model.is_none());
+    }
+
+    // -- (j-pre-2) subagent inherits shell spill policy (issue #756) ------------
+    //
+    // Regression guard for Tim's `[important]` finding on PR #761: subagents
+    // built via `agent_config_for_subagent` must carry the parent's
+    // `shell_spill` state so the coordinator's subagent spawn path can wire
+    // a spill directory into the subagent's ShellTool. Without this, a
+    // subagent whose shell command produces >30 KB of output gets silent
+    // truncation with no spill file — a regression from the parent's
+    // behaviour.
+    #[test]
+    fn test_subagent_inherits_shell_spill_policy() {
+        // Non-default spill config on the parent: flipped `enabled`, custom
+        // retention.  Both fields must copy through verbatim.
+        let parent = AgentConfig {
+            shell_spill: alms_core::config::ShellSpillConfig {
+                enabled: true,
+                retention_days: 14,
+            },
+            ..AgentConfig::default()
+        };
+
+        // Ephemeral subagent path
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert!(ephemeral.shell_spill.enabled);
+        assert_eq!(ephemeral.shell_spill.retention_days, 14);
+
+        // Named subagent path — registry overrides must not wipe the
+        // inherited spill config.
+        let record = SubagentRecordConfig {
+            model: Some("gpt-5".into()),
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert!(named.shell_spill.enabled);
+        assert_eq!(named.shell_spill.retention_days, 14);
+
+        // Opt-out must also propagate — an operator who disabled spill in
+        // `alms.toml` should see their subagents honour that too.
+        let disabled_parent = AgentConfig {
+            shell_spill: alms_core::config::ShellSpillConfig {
+                enabled: false,
+                retention_days: 1,
+            },
+            ..AgentConfig::default()
+        };
+        let (sub, _, _) = agent_config_for_subagent(None, &disabled_parent);
+        assert!(!sub.shell_spill.enabled);
+        assert_eq!(sub.shell_spill.retention_days, 1);
+    }
+
+    // -- (j-pre-3) subagent thinking-budget three-layer precedence (Tim S1) -----
+    //
+    // Parity with gateway `test_thinking_per_agent_zero_disables`: a named
+    // subagent registered with `thinking_budget_tokens = Some(0)` must
+    // honour its own registry override and disable extended thinking, even
+    // when the parent enables it with `Some(4096)`. Ephemeral subagents
+    // (record = None) still inherit the parent budget.
+    #[test]
+    fn test_subagent_thinking_budget_override() {
+        // Parent has extended thinking enabled at 4096 tokens.
+        let parent = AgentConfig {
+            anthropic_thinking_budget: 4096,
+            ..AgentConfig::default()
+        };
+
+        // Ephemeral subagent: no registry → inherit parent's 4096.
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert_eq!(
+            ephemeral.anthropic_thinking_budget, 4096,
+            "ephemeral subagents inherit the parent's thinking budget"
+        );
+
+        // Named subagent registered with Some(0): explicit per-agent opt-out
+        // must win over the parent's enabled-by-default 4096.
+        let record_zero = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: Some(0),
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (sub_zero, _, _) = agent_config_for_subagent(Some(record_zero), &parent);
+        assert_eq!(
+            sub_zero.anthropic_thinking_budget, 0,
+            "named subagent Some(0) must disable thinking even when parent enables it"
+        );
+
+        // Named subagent registered with Some(n > 0): explicit opt-in with a
+        // different budget overrides the parent's value.
+        let record_explicit = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: Some(8192),
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (sub_explicit, _, _) = agent_config_for_subagent(Some(record_explicit), &parent);
+        assert_eq!(
+            sub_explicit.anthropic_thinking_budget, 8192,
+            "named subagent Some(n) must override the parent's thinking budget"
+        );
+
+        // Named subagent registered with None: unconfigured → inherit parent.
+        let record_none = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
+        assert_eq!(
+            sub_none.anthropic_thinking_budget, 4096,
+            "named subagent with no override inherits the parent's budget"
+        );
+    }
+
+    // -- (j-pre-4) subagent reasoning-effort three-layer precedence (#768) ------
+    //
+    // Mirrors the Anthropic path above: a named subagent registered with
+    // `reasoning_effort = Some(Low)` must honour its own registry override
+    // and override the parent's `Some(High)`. Ephemeral subagents
+    // (record = None) still inherit the parent's effort.
+    #[test]
+    fn test_subagent_reasoning_effort_override() {
+        use alms_core::config::ReasoningEffort;
+
+        // Parent has reasoning set to High.
+        let parent = AgentConfig {
+            openai_reasoning_effort: Some(ReasoningEffort::High),
+            ..AgentConfig::default()
+        };
+
+        // Ephemeral subagent: no registry → inherit parent's High.
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert_eq!(
+            ephemeral.openai_reasoning_effort,
+            Some(ReasoningEffort::High),
+            "ephemeral subagents inherit the parent's reasoning effort"
+        );
+
+        // Named subagent registered with Some(Low): must override parent.
+        let record_low = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: Some(ReasoningEffort::Low),
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (sub_low, _, _) = agent_config_for_subagent(Some(record_low), &parent);
+        assert_eq!(
+            sub_low.openai_reasoning_effort,
+            Some(ReasoningEffort::Low),
+            "named subagent Some(Low) must override parent's High"
+        );
+
+        // Named subagent with None override: inherit parent's High.
+        let record_none = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
+        assert_eq!(
+            sub_none.openai_reasoning_effort,
+            Some(ReasoningEffort::High),
+            "named subagent with None override inherits the parent's effort"
+        );
+    }
+
+    /// Issue #766: Anthropic prompt caching is a server-level toggle
+    /// inherited verbatim by subagents. A parent with caching disabled
+    /// produces subagents with caching disabled, and vice versa — no
+    /// per-subagent override path.
+    #[test]
+    fn test_subagent_inherits_anthropic_prompt_cache_enabled() {
+        // Parent has caching DISABLED.
+        let parent = AgentConfig {
+            anthropic_prompt_cache_enabled: false,
+            ..AgentConfig::default()
+        };
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert!(
+            !ephemeral.anthropic_prompt_cache_enabled,
+            "ephemeral subagents must inherit parent's disabled caching"
+        );
+
+        let record = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert!(
+            !named.anthropic_prompt_cache_enabled,
+            "named subagents must inherit parent's disabled caching"
+        );
+
+        // Parent has caching ENABLED (the default).
+        let enabled_parent = AgentConfig {
+            anthropic_prompt_cache_enabled: true,
+            ..AgentConfig::default()
+        };
+        let (sub, _, _) = agent_config_for_subagent(None, &enabled_parent);
+        assert!(
+            sub.anthropic_prompt_cache_enabled,
+            "subagents inherit enabled caching"
+        );
+    }
+
+    /// Issue #769: Gemini context caching + thinking budget inherit
+    /// from the parent the same way Anthropic prompt caching does.
+    /// Caching is server-level only; the thinking budget gained a
+    /// per-named-subagent override in #794 (covered by the separate
+    /// `test_subagent_gemini_thinking_budget_override` below).
+    #[test]
+    fn test_subagent_inherits_gemini_cache_and_thinking_budget() {
+        // Parent disables caching and sets a thinking budget.
+        let parent = AgentConfig {
+            gemini_cache_enabled: false,
+            gemini_cache_ttl_seconds: 1800,
+            gemini_thinking_budget: Some(8192),
+            ..AgentConfig::default()
+        };
+        let (ephemeral, _, _) = agent_config_for_subagent(None, &parent);
+        assert!(
+            !ephemeral.gemini_cache_enabled,
+            "ephemeral subagents inherit parent's disabled Gemini caching"
+        );
+        assert_eq!(ephemeral.gemini_cache_ttl_seconds, 1800);
+        assert_eq!(ephemeral.gemini_thinking_budget, Some(8192));
+
+        // Named subagent with `None` override inherits the parent's
+        // effective budget and caching state verbatim (#794 propagation).
+        let record = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (named, _, _) = agent_config_for_subagent(Some(record), &parent);
+        assert!(!named.gemini_cache_enabled);
+        assert_eq!(named.gemini_cache_ttl_seconds, 1800);
+        assert_eq!(named.gemini_thinking_budget, Some(8192));
+
+        // Parent with caching enabled (the default) → subagent also
+        // enabled. `None` thinking budget on parent passes through.
+        let enabled_parent = AgentConfig {
+            gemini_cache_enabled: true,
+            gemini_cache_ttl_seconds: 300,
+            gemini_thinking_budget: None,
+            ..AgentConfig::default()
+        };
+        let (sub, _, _) = agent_config_for_subagent(None, &enabled_parent);
+        assert!(sub.gemini_cache_enabled);
+        assert_eq!(sub.gemini_cache_ttl_seconds, 300);
+        assert_eq!(sub.gemini_thinking_budget, None);
+    }
+
+    /// Issue #794: per-named-subagent Gemini thinking budget override
+    /// wins over the parent's effective budget, mirroring how the
+    /// Anthropic `thinking_budget_tokens` and OpenAI `reasoning_effort`
+    /// overrides work for named subagents. `Some(0)` is an explicit
+    /// disable; `None` falls through to the parent.
+    #[test]
+    fn test_subagent_gemini_thinking_budget_override() {
+        // Parent has Gemini thinking enabled at 4096.
+        let parent = AgentConfig {
+            gemini_thinking_budget: Some(4096),
+            ..AgentConfig::default()
+        };
+
+        // Named subagent explicitly sets Some(16384): must win.
+        let record_high = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: Some(16384),
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (sub_high, _, _) = agent_config_for_subagent(Some(record_high), &parent);
+        assert_eq!(
+            sub_high.gemini_thinking_budget,
+            Some(16384),
+            "named subagent Some(16384) must override parent's Some(4096)"
+        );
+
+        // Named subagent explicitly sets Some(0): must disable even
+        // though the parent would enable.
+        let record_zero = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: Some(0),
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (sub_zero, _, _) = agent_config_for_subagent(Some(record_zero), &parent);
+        assert_eq!(
+            sub_zero.gemini_thinking_budget,
+            Some(0),
+            "named subagent Some(0) must disable Gemini thinking even when parent enables"
+        );
+
+        // Named subagent with None: inherit parent's Some(4096).
+        let record_none = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (sub_none, _, _) = agent_config_for_subagent(Some(record_none), &parent);
+        assert_eq!(sub_none.gemini_thinking_budget, Some(4096));
+
+        // Parent with thinking disabled (None), subagent opts in with
+        // Some(8192): subagent wins.
+        let disabled_parent = AgentConfig {
+            gemini_thinking_budget: None,
+            ..AgentConfig::default()
+        };
+        let record_optin = SubagentRecordConfig {
+            model: None,
+            posture: None,
+            provider: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: Some(8192),
+            summary_provider: None,
+            summary_model: None,
+        };
+        let (sub_optin, _, _) = agent_config_for_subagent(Some(record_optin), &disabled_parent);
+        assert_eq!(sub_optin.gemini_thinking_budget, Some(8192));
     }
 
     // -- (j) get_completed_result on unknown task → None ------------------------

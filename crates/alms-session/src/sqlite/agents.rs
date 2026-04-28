@@ -28,8 +28,10 @@ impl SqliteStore {
 
         tx.execute(
             "INSERT INTO agents \
-             (id, name, description, model, posture, provider, telegram_token, is_default, created_at, last_active) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (id, name, description, model, posture, provider, telegram_token, \
+              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+              gemini_thinking_budget, summary_provider, summary_model) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 agent.id.0.to_string(),
                 &agent.name,
@@ -41,6 +43,11 @@ impl SqliteStore {
                 1i32,
                 agent.created_at.to_rfc3339(),
                 agent.last_active.to_rfc3339(),
+                agent.thinking_budget_tokens.map(i64::from),
+                agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
+                agent.gemini_thinking_budget.map(i64::from),
+                agent.summary_provider.as_deref(),
+                agent.summary_model.as_deref(),
             ],
         )
         .map_err(|e| AlmsError::Runtime(format!("SQLite create_agent_if_none_exist: {e}")))?;
@@ -56,8 +63,10 @@ impl SqliteStore {
             .lock()
             .execute(
                 "INSERT INTO agents \
-                 (id, name, description, model, posture, provider, telegram_token, is_default, created_at, last_active) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, name, description, model, posture, provider, telegram_token, \
+                  is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+                  gemini_thinking_budget, summary_provider, summary_model) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     agent.id.0.to_string(),
                     &agent.name,
@@ -69,6 +78,11 @@ impl SqliteStore {
                     agent.is_default as i32,
                     agent.created_at.to_rfc3339(),
                     agent.last_active.to_rfc3339(),
+                    agent.thinking_budget_tokens.map(i64::from),
+                    agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
+                    agent.gemini_thinking_budget.map(i64::from),
+                    agent.summary_provider.as_deref(),
+                    agent.summary_model.as_deref(),
                 ],
             )
             .map_err(|e| match &e {
@@ -92,13 +106,21 @@ impl SqliteStore {
             .lock()
             .execute(
                 "UPDATE agents SET description = ?1, model = ?2, \
-                 posture = ?3, provider = ?4, telegram_token = ?5, last_active = ?6 WHERE id = ?7",
+                 posture = ?3, provider = ?4, telegram_token = ?5, \
+                 thinking_budget_tokens = ?6, reasoning_effort = ?7, \
+                 gemini_thinking_budget = ?8, summary_provider = ?9, \
+                 summary_model = ?10, last_active = ?11 WHERE id = ?12",
                 params![
                     &agent.description,
                     agent.model.as_deref(),
                     agent.posture.as_deref(),
                     agent.provider.as_deref(),
                     agent.telegram_token.as_deref(),
+                    agent.thinking_budget_tokens.map(i64::from),
+                    agent.reasoning_effort.map(|e| e.as_wire_str().to_string()),
+                    agent.gemini_thinking_budget.map(i64::from),
+                    agent.summary_provider.as_deref(),
+                    agent.summary_model.as_deref(),
                     agent.last_active.to_rfc3339(),
                     agent.id.0.to_string(),
                 ],
@@ -115,7 +137,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active \
+             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+             gemini_thinking_budget, summary_provider, summary_model \
              FROM agents WHERE id = ?1",
             params![id.0.to_string()],
             parse_agent_row,
@@ -132,7 +155,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active \
+             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+             gemini_thinking_budget, summary_provider, summary_model \
              FROM agents WHERE name = ?1",
             params![name],
             parse_agent_row,
@@ -151,7 +175,8 @@ impl SqliteStore {
         let conn = self.conn.lock();
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
-             is_default, created_at, last_active \
+             is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+             gemini_thinking_budget, summary_provider, summary_model \
              FROM agents WHERE is_default = 1 LIMIT 1",
             [],
             parse_agent_row,
@@ -169,7 +194,8 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
-                 is_default, created_at, last_active \
+                 is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+                 gemini_thinking_budget, summary_provider, summary_model \
                  FROM agents ORDER BY created_at",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
@@ -197,7 +223,8 @@ impl SqliteStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
-                 is_default, created_at, last_active \
+                 is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
+                 gemini_thinking_budget, summary_provider, summary_model \
                  FROM agents WHERE telegram_token IS NOT NULL AND telegram_token != '' \
                  ORDER BY created_at",
             )
@@ -352,6 +379,11 @@ mod tests {
             posture: None,
             provider: None,
             telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
             is_default: false,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
@@ -714,6 +746,7 @@ mod tests {
                         params: Some(r#"{"text":"hello"}"#.to_string()),
                         result: None,
                         timestamp: chrono::Utc::now(),
+                        from_agent: None,
                     },
                     ToolCallRecord {
                         seq: 1,
@@ -723,6 +756,7 @@ mod tests {
                         params: None,
                         result: Some(r#""result_ok""#.to_string()),
                         timestamp: chrono::Utc::now(),
+                        from_agent: None,
                     },
                 ],
             )
@@ -742,6 +776,7 @@ mod tests {
                     params: Some(r#"{"text":"hello"}"#.to_string()),
                     result: None,
                     timestamp: chrono::Utc::now(),
+                    from_agent: None,
                 },
             )
             .unwrap();
@@ -774,6 +809,117 @@ mod tests {
         store.update_agent(&updated).unwrap();
         let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
         assert!(reloaded.telegram_token.is_none());
+    }
+
+    #[test]
+    fn test_agent_reasoning_effort_roundtrip() {
+        use alms_core::config::ReasoningEffort;
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("reasoner");
+        agent.reasoning_effort = Some(ReasoningEffort::High);
+        store.create_agent(&agent).unwrap();
+
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.reasoning_effort, Some(ReasoningEffort::High));
+
+        // Update to a different value.
+        let mut updated = loaded;
+        updated.reasoning_effort = Some(ReasoningEffort::Low);
+        store.update_agent(&updated).unwrap();
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(reloaded.reasoning_effort, Some(ReasoningEffort::Low));
+
+        // Each supported variant must survive round-trip.
+        for variant in [
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ] {
+            let mut a = reloaded.clone();
+            a.reasoning_effort = Some(variant);
+            store.update_agent(&a).unwrap();
+            let r = store.load_agent_by_id(agent.id).unwrap().unwrap();
+            assert_eq!(
+                r.reasoning_effort,
+                Some(variant),
+                "variant {variant:?} did not round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_gemini_thinking_budget_roundtrip() {
+        // Issue #794: per-agent Gemini thinking budget survives round-trip.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("gemini-thinker");
+        agent.gemini_thinking_budget = Some(16384);
+        store.create_agent(&agent).unwrap();
+
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.gemini_thinking_budget, Some(16384));
+
+        // Explicit disable via `Some(0)` must round-trip as `Some(0)`.
+        let mut updated = loaded;
+        updated.gemini_thinking_budget = Some(0);
+        store.update_agent(&updated).unwrap();
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(reloaded.gemini_thinking_budget, Some(0));
+
+        // Clearing to `None` (inherit server default) must round-trip.
+        let mut cleared = reloaded;
+        cleared.gemini_thinking_budget = None;
+        store.update_agent(&cleared).unwrap();
+        let final_state = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(final_state.gemini_thinking_budget, None);
+    }
+
+    #[test]
+    fn test_agent_summary_provider_model_roundtrip() {
+        // Issue #872: per-agent summary_provider / summary_model survive
+        // create → load → update → load → clear → load. Mirrors the
+        // round-trip shape of test_agent_gemini_thinking_budget_roundtrip.
+        // Both fields are NULL in the default new_agent fixture so the
+        // freshly-created record exercises the both-None path; subsequent
+        // update_agent calls exercise the both-Some path; the final
+        // clear-back-to-None step verifies the SQL UPDATE handles NULL
+        // for the new columns 9 / 10.
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut agent = new_agent("summary-cfg");
+        store.create_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(loaded.summary_provider.is_none());
+        assert!(loaded.summary_model.is_none());
+
+        // Set both together — pair-only invariant holds.
+        agent = loaded;
+        agent.summary_provider = Some("openrouter".into());
+        agent.summary_model = Some("minimax/minimax-m2.7".into());
+        store.update_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            loaded.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
+
+        // Update both to a different pair — both fields update together.
+        agent = loaded;
+        agent.summary_provider = Some("anthropic".into());
+        agent.summary_model = Some("claude-haiku-4".into());
+        store.update_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert_eq!(loaded.summary_provider.as_deref(), Some("anthropic"));
+        assert_eq!(loaded.summary_model.as_deref(), Some("claude-haiku-4"));
+
+        // Clear both — back to inheriting the server-level setting.
+        agent = loaded;
+        agent.summary_provider = None;
+        agent.summary_model = None;
+        store.update_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(loaded.summary_provider.is_none());
+        assert!(loaded.summary_model.is_none());
     }
 
     #[test]

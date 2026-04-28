@@ -1,4 +1,5 @@
 import { nextMsgId } from '../state/chat.js';
+import { DM_END_REASON_LABELS } from './constants.js';
 
 /**
  * Parse a persisted job notification marker into structured fields.
@@ -153,16 +154,12 @@ export function mapHistoryMessages(msgs, opts) {
             const isDmEndedMarker = m.metadata
                 && m.metadata.message_type === 'dm_ended';
             if (isDmEndedMarker) {
-                const reasonLabels = {
-                    'ignored': 'no further replies',
-                    'depth_exceeded': 'message limit reached',
-                };
                 const rawReason = m.metadata.reason || '';
                 pushEntry({
                     id: nextMsgId(),
                     type: 'dm_ended',
                     peer: m.metadata.ended_by || 'unknown',
-                    reason: reasonLabels[rawReason] || rawReason || 'conversation ended',
+                    reason: DM_END_REASON_LABELS[rawReason] || rawReason || 'conversation ended',
                 }, m.timestamp);
                 continue;
             }
@@ -287,6 +284,18 @@ export function mapHistoryMessages(msgs, opts) {
                 : isDm ? 'agent'
                 : (m.role === 'user' ? 'user' : 'agent');
 
+            // Reconstruct persisted extended-thinking / reasoning blocks
+            // (issue #767). Stored on the assistant-text message as
+            // `metadata.reasoning_blocks = [{text: "..."}]` by the runtime;
+            // the Message component consumes a single `reasoning` string.
+            let reasoning = undefined;
+            if (type === 'agent' && m.metadata && Array.isArray(m.metadata.reasoning_blocks)) {
+                reasoning = m.metadata.reasoning_blocks
+                    .map(b => (b && typeof b.text === 'string') ? b.text : '')
+                    .join('');
+                if (!reasoning) reasoning = undefined;
+            }
+
             pushEntry({
                 id: nextMsgId(),
                 type,
@@ -294,6 +303,7 @@ export function mapHistoryMessages(msgs, opts) {
                 text: m.content || '',
                 metadata: m.metadata || null,
                 sealed: true,
+                reasoning,
                 // Carry the sender name so Message can show it as the label.
                 fromAgent: isDm ? m.metadata.from_agent : undefined,
             }, m.timestamp);
@@ -348,8 +358,18 @@ export function mapHistoryMessages(msgs, opts) {
             // groupDmReasoningBlocks() can attribute tool-only groups
             // to the correct agent.  Fixes #692 — tool entries lacked
             // fromAgent, so groups with only tools had agentName: null.
-            const fromAgent = isReasoning && m.metadata && m.metadata.from_agent
+            //
+            // Fall back to the run_tool_calls record's from_agent column
+            // when session-level metadata is missing (fixes #696 — the
+            // fire-and-forget session-persistence path may drop metadata).
+            let fromAgent = isReasoning && m.metadata && m.metadata.from_agent
                 ? m.metadata.from_agent : undefined;
+            if (!fromAgent && callId && toolCallIndex.has(callId)) {
+                const enriched = toolCallIndex.get(callId);
+                fromAgent = (enriched.call && enriched.call.from_agent)
+                    || (enriched.result && enriched.result.from_agent)
+                    || undefined;
+            }
 
             pushEntry({
                 id: invocationId || callId || nextMsgId(),
@@ -428,6 +448,14 @@ export function mapHistoryMessages(msgs, opts) {
                 ok = true;
             }
 
+            // Propagate from_agent from the run_tool_calls record so that
+            // groupDmReasoningBlocks() can attribute reasoning blocks to
+            // the correct agent even when session-level message persistence
+            // was lost (fire-and-forget write failure). Fixes #696.
+            const fromAgent = pair.call.from_agent
+                || (pair.result && pair.result.from_agent)
+                || undefined;
+
             newToolEntries.push({
                 entry: {
                     id: toolId || nextMsgId(),
@@ -444,6 +472,7 @@ export function mapHistoryMessages(msgs, opts) {
                     // Fixes #687 -- tool calls missing from reasoning blocks
                     // after reload when session-level persistence was lost.
                     isReasoning: isDm || undefined,
+                    fromAgent,
                 },
                 ts: pair.call.timestamp || null,
             });

@@ -46,7 +46,7 @@ Any agent running inside ALMS can call the `invoke_agent` tool to spawn a subage
 - Results propagate up the tree via tool responses
 - Cancellation cascades downward (cancel parent → cancel all children)
 - Each subagent has its own tool registry, context window, and system prompt
-- Subagent runs a full `agent_loop` (multi-iteration tool use, up to `max_iterations`)
+- Subagent runs a full `agent_loop` (multi-iteration tool use; bounded by token budget, provider `max_tokens`, posture approvals, and run cancellation)
 
 ### Layer 2 — Peer-to-Peer Direct Messaging (Phase 1 + DM lifecycle implemented)
 
@@ -149,19 +149,24 @@ The episodic token budget (`run_summary_budget`, default: 2000) is hard-capped a
 
 Isolated tool execution used by every agent regardless of hierarchy level.
 
-**Built-in tools:** `echo`, `math`, `http_get`, `shell` (primary, `bash -c` command strings with persistent cwd, background execution, and 30KB output truncation; aliased as `shell_exec` for backward compatibility), `fs_read`, `fs_write`, `fs_list` (in alms-sandbox), `workspace_write` (in alms-runtime), `invoke_agent`, `read_subagent_session`, `send_message`, `list_agents`, `read_messages`, `ignore_message`, `list_my_sessions`, `read_session` (in alms-tools)
+**Built-in tools:** `echo`, `math`, `http_get`, `shell` (primary, `bash -c` command strings with persistent cwd, background execution, and 30KB output truncation; aliased as `shell_exec` for backward compatibility), `fs_read`, `fs_write`, `fs_list`, `fs_edit`, `fs_grep`, `fs_glob` (in alms-sandbox), `workspace_write` (in alms-runtime), `invoke_agent`, `read_subagent_session`, `send_message`, `list_agents`, `read_messages`, `ignore_message`, `list_my_sessions`, `read_session` (in alms-tools)
+
+**Read-before-write guard:** `fs_write` and `fs_edit` enforce a read-before-write policy via `FileStateCache` (per-run, shared across all fs tools). Existing files must be read via `fs_read` before they can be written or edited. The guard also detects external modifications (mtime + content-hash fallback) and rejects stale writes. New file creation bypasses the guard. See `crates/alms-sandbox/src/file_state_cache.rs`.
+
+**Sibling workspace reads (#242):** When a named agent is attached via `with_workspace()`, its read-family fs tools (`fs_read`, `fs_list`, `fs_grep`, `fs_glob`) gain an additional read-only root at the workspace parent directory, so a parent agent can read a subagent's `personality.md`/`goals.md`/`memories.md` without being able to modify them. Write-family tools (`fs_write`, `fs_edit`, `workspace_write`) stay scoped to the primary sandbox root. See the "Filesystem sandboxing" section of `docs/security-model.md` for the full trust model (including ephemeral subagent asymmetry).
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 
 ### LLM Client (`alms-runtime`)
 
-Multi-provider LLM support with streaming. Provider selected via `llm.provider` config or `ALMS_LLM_PROVIDER` env var.
+Multi-provider LLM support with streaming. Provider selected via `llm.provider` config or `ALMS_LLM_PROVIDER` env var. Providers are declared in `[llm.providers.<name>]` tables and looked up by name; the sugar names `anthropic`, `gemini`, `openai`, and `openrouter` are auto-populated so existing configs keep working.
 
-**Providers:**
-- **OpenAI / OpenRouter** — OpenAI-compatible chat completions API (default)
-- **Anthropic** — Messages API with full streaming, tool use, and response format mapping
+**Native adapters:**
+- **Anthropic** (`kind = "anthropic"`) — Anthropic Messages API with full streaming, tool use, and response format mapping.
+- **Gemini** (`kind = "gemini"`) — Google Gemini `generateContent` / `streamGenerateContent` API with `systemInstruction` extraction, `functionCall` / `functionResponse` tool parts, and OpenAI-style SSE streaming. Authenticates via the `x-goog-api-key` header.
+- **OpenAI-compatible** (`kind = "openai_compatible"`) — reaches any endpoint that speaks the OpenAI chat-completions protocol, with per-provider `base_url` / `auth_scheme` / `quirks`. Out of the box this covers OpenAI, OpenRouter, xAI, DeepSeek, Groq, Mistral, Ollama, LM Studio, self-hosted vLLM, Together, Fireworks, etc. — adding a new provider is a docs entry, not code.
 
-API keys loaded exclusively from `.alms/secrets.json` via `alms auth set`. Provider-aware key selection: each provider prefers its own key, falls back to others.
+See `docs/config.md` for copy-paste provider examples. API keys are resolved in order: (1) `SecretsStore` (`alms auth set <provider> <key>`), then (2) the provider entry's `api_key_env` / `api_key`. No keys are read from arbitrary env vars.
 
 ### Session Manager (`alms-session`)
 
@@ -235,9 +240,9 @@ Token cost is a first-class constraint:
 ## Implementation Status
 
 ### Completed ✅
-- Core types, session manager, agent runtime, WASM sandbox
+- Core types, session manager, agent runtime, native tool registry
 - HTTP gateway with SSE streaming, approval workflow, audit log
-- Built-in tools: echo, math, http_get, shell (primary name; bash -c, persistent cwd, background execution, 30KB truncation; shell_exec alias preserved), fs_read, fs_write, fs_list, workspace_write, invoke_agent, read_subagent_session, send_message, list_agents, read_messages, ignore_message, list_my_sessions, read_session
+- Built-in tools: echo, math, http_get, shell (primary name; bash -c, persistent cwd, background execution, 30KB truncation; shell_exec alias preserved), fs_read, fs_write, fs_list, fs_edit, fs_grep, fs_glob, workspace_write, invoke_agent, read_subagent_session, send_message, list_agents, read_messages, ignore_message, list_my_sessions, read_session
 - Cron/scheduler, SQLite persistence, web UI with agent selector
 - Coordinator with real AgentRuntime loops, foreground + background subagents
 - `invoke_agent` tool with `name` param for persistent subagent sessions (UUID v5 deterministic identity)
@@ -251,6 +256,10 @@ Token cost is a first-class constraint:
 - Peer-to-peer direct messaging via `send_message` tool + MessageBus + DM sessions with perspective mapping (Layer 2 Phase 1)
 - DM conversation lifecycle: `ignore_message` and depth-exceeded trigger `end_conversation` with `dm_ended` session markers, depth counter reset, `ConversationEnded` peer notification via `notifications:{agent}` sessions, and `dm_conversation_ended` SSE events (#384 Phases 1-7)
 - Cross-session episodic memory via run summaries (`session_summaries` table, heuristic + LLM modes, context injection with 15% budget cap)
+- Provider-neutral reasoning stream (#767, #768) — Anthropic extended-thinking and OpenAI-compat reasoning models share the same `RuntimeEvent::ReasoningDelta` / `reasoning_delta` SSE event / `ReasoningPanel` UI / `reasoning_blocks` persistence. Each provider family has a dedicated config knob:
+  - **Anthropic**: `[llm.anthropic].thinking_budget_tokens` — streams `thinking_delta` content blocks.
+  - **OpenAI-compat** (#768): `[llm.openai].reasoning_effort` — `"low"/"medium"/"high"/"minimal"`; serialized on the wire only for reasoning-capable models (OpenAI o-series / GPT-5 / xAI Grok reasoning variants). Stripped for non-reasoning OpenAI models (gpt-4o etc.) and for DeepSeek R1 (reasoning is implicit on `deepseek-reasoner`). Response-side, `reasoning_content` / `reasoning_summary` / `reasoning` wire fields all deserialize into the same `reasoning_content` channel with a priority ordering (canonical > summary > raw). OpenAI o-series `usage.completion_tokens_details.reasoning_tokens` and DeepSeek/xAI flat `usage.reasoning_tokens` both flow through `TokenUsage.reasoning_tokens`.
+  - Gemini thinking (#769) is still TBD and will layer on using the same event variant and UI component.
 
 ### Pending 🎯
 - Autonomous subagent loops — see `docs/autonomous-subagents-design.md`
@@ -273,7 +282,7 @@ crates/
                       #   SubagentDispatcher, MessageSender traits
                       #   EventForwarder trait for type-erased runtime event forwarding
   alms-session/       # Session state, SQLite persistence
-  alms-sandbox/       # Tool execution, WASM sandbox, builtin tools
+  alms-sandbox/       # Tool execution, native builtin tools, registry
   alms-channel/       # User-facing adapters (Telegram, web)
   alms-gateway/       # HTTP/SSE control plane
   alms-cli/           # CLI entrypoint

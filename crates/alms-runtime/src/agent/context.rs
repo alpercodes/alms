@@ -305,19 +305,25 @@ impl AgentRuntime {
             sum_messages.push(LlmMessage::user(transcript));
         }
 
+        // #866: select the summary client. When the gateway has wired a
+        // dedicated summary client (because `[context].summary_provider` is
+        // set on the resolved config), the summary task targets a different
+        // provider than the agent. Otherwise inherit the agent's `llm`.
+        let summary_client = self.summary_llm.as_ref().unwrap_or(&self.llm);
+
         let model = self
             .config
             .context_config
             .summary_model
             .as_deref()
-            .unwrap_or_else(|| self.llm.default_model());
+            .unwrap_or_else(|| summary_client.default_model());
 
         let request = CompletionRequest::new(model)
             .with_messages(sum_messages)
             .with_temperature(0.3) // lower temp for factual compression
             .with_max_tokens(512);
 
-        let response = self.llm.complete(request).await?;
+        let response = summary_client.complete(request).await?;
 
         let new_text = response
             .choices

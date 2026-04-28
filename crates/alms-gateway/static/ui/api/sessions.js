@@ -25,3 +25,11 @@ export const deleteSession = (sessionId) =>
  */
 export const getSessionToolCalls = (sessionId) =>
     get(`/sessions/${sessionId}/tool-calls`);
+
+/**
+ * Cancel an active DM conversation.
+ * Cancels in-flight runs and notifies both participating agents.
+ * Returns { ok, session_id, context_id, participants, runs_cancelled, reason }.
+ */
+export const cancelDm = (sessionId) =>
+    post(`/sessions/${sessionId}/cancel-dm`);

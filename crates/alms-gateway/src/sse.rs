@@ -97,6 +97,23 @@ impl SseEventData {
         )
     }
 
+    /// Provider-neutral reasoning / extended-thinking text delta.
+    ///
+    /// Emitted alongside `token_delta` when the model produces extended-
+    /// thinking output (Anthropic Claude 4.x, and future reasoning models).
+    /// Clients are expected to render these in a separate collapsible
+    /// panel that defaults to closed.
+    pub fn reasoning_delta(run_id: RunId, text: &str, source_agent: Option<String>) -> Self {
+        Self::new(
+            "reasoning_delta",
+            ReasoningDeltaData {
+                run_id: run_id.0.to_string(),
+                text: text.to_string(),
+                source_agent,
+            },
+        )
+    }
+
     pub fn tool_start(
         run_id: RunId,
         tool_invocation_id: ToolInvocationId,
@@ -178,6 +195,12 @@ impl SseEventData {
                 ok,
                 prompt_tokens: usage.prompt_tokens,
                 completion_tokens: usage.completion_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                // Cache tokens (#766) — only Anthropic populates these today;
+                // `skip_serializing_if` on the struct keeps the wire shape
+                // byte-identical to pre-#766 when unset.
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
                 ts: Utc::now(),
             },
         )
@@ -202,8 +225,8 @@ impl SseEventData {
         )
     }
 
-    /// Emit a `run_warning` event for non-fatal conditions like max iterations
-    /// reached. The frontend should style these as warnings (yellow), not
+    /// Emit a `run_warning` event for non-fatal conditions (e.g. DM text-only
+    /// retries). The frontend should style these as warnings (yellow), not
     /// errors (red).
     pub fn run_warning(
         run_id: RunId,
@@ -414,10 +437,10 @@ impl SseEventData {
     }
 
     /// Cross-session: a DM run status update, forwarded to the agent's
-    /// webchat session so the status bar can show tool execution details.
+    /// webchat session so the status bar can show DM activity.
     ///
-    /// Only key phases (`executing_tools`, `calling_llm`) are forwarded
-    /// to avoid noise.
+    /// All agent-loop phases are forwarded so the webchat session never
+    /// has a stale or blank status bar during a DM conversation.
     pub fn dm_activity_status(
         session_id: alms_core::SessionId,
         peer: &str,
@@ -431,6 +454,25 @@ impl SseEventData {
                 peer: peer.to_string(),
                 phase: phase.to_string(),
                 detail,
+                ts: Utc::now(),
+            },
+        )
+    }
+
+    /// Cross-session: a DM run has ended, forwarded to the agent's
+    /// webchat session so the status bar can update accordingly.
+    ///
+    /// Unlike `dm_conversation_ended` (which signals the entire DM
+    /// conversation is over), this signals that a single DM run has
+    /// finished.  The frontend uses this to decide whether to keep
+    /// showing "Chatting with {peer}..." (if more DM runs are expected)
+    /// or clear the status (if the conversation ended).
+    pub fn dm_activity_ended(session_id: alms_core::SessionId, peer: &str) -> Self {
+        Self::new(
+            "dm_activity_ended",
+            DmActivityEndedData {
+                session_id: session_id.0.to_string(),
+                peer: peer.to_string(),
                 ts: Utc::now(),
             },
         )
@@ -562,6 +604,23 @@ struct TokenDeltaData {
     source_agent: Option<String>,
 }
 
+/// Wire payload for a `reasoning_delta` SSE event — a chunk of the model's
+/// extended-thinking / chain-of-thought trace.
+///
+/// Provider-neutral: populated from Anthropic `thinking_delta` chunks today;
+/// future reasoning-capable providers (OpenAI o-series, DeepSeek R1, xAI
+/// Grok, Gemini) will emit the same event type and the UI will render them
+/// identically.
+#[derive(Debug, Serialize)]
+struct ReasoningDeltaData {
+    run_id: String,
+    /// Reasoning text chunk. The UI is expected to concatenate successive
+    /// chunks into a single collapsible block per assistant turn.
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct ToolStartData {
     run_id: String,
@@ -612,6 +671,21 @@ struct RunFinishedData {
     ok: bool,
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Chain-of-thought tokens when the provider reports them separately
+    /// (OpenAI o-series via `usage.completion_tokens_details.reasoning_tokens`,
+    /// DeepSeek / xAI via flat `usage.reasoning_tokens`). Absent from the
+    /// wire when `None` so non-reasoning runs stay byte-identical to pre-#768.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_tokens: Option<u32>,
+    /// Anthropic prompt caching (#766): tokens *written* to the cache on
+    /// this run. Absent from the wire when `None` so non-cached or
+    /// non-Anthropic runs stay byte-identical to pre-#766.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_creation_input_tokens: Option<u32>,
+    /// Anthropic prompt caching (#766): tokens *served from* the cache on
+    /// this run. Absent from the wire when `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_read_input_tokens: Option<u32>,
     ts: DateTime<Utc>,
 }
 
@@ -735,6 +809,13 @@ struct DmActivityStatusData {
     phase: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<String>,
+    ts: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct DmActivityEndedData {
+    session_id: String,
+    peer: String,
     ts: DateTime<Utc>,
 }
 
@@ -917,11 +998,18 @@ mod tests {
     #[test]
     fn test_run_warning_event() {
         let run_id = RunId::new();
-        let event =
-            SseEventData::run_warning(run_id, "MAX_ITERATIONS", "Max iterations reached", None);
+        let event = SseEventData::run_warning(
+            run_id,
+            "DM_TEXT_ONLY_RETRY",
+            "DM agent responded with text only",
+            None,
+        );
         assert_eq!(event.event_type, "run_warning");
-        assert_eq!(event.data["warning"]["code"], "MAX_ITERATIONS");
-        assert_eq!(event.data["warning"]["message"], "Max iterations reached");
+        assert_eq!(event.data["warning"]["code"], "DM_TEXT_ONLY_RETRY");
+        assert_eq!(
+            event.data["warning"]["message"],
+            "DM agent responded with text only"
+        );
     }
 
     #[test]
@@ -1064,6 +1152,17 @@ mod tests {
         assert_eq!(event_with_detail.data["peer"], "analyst");
         assert_eq!(event_with_detail.data["phase"], "executing_tools");
         assert_eq!(event_with_detail.data["detail"], "shell_exec, fs_read");
+    }
+
+    #[test]
+    fn test_dm_activity_ended_event() {
+        let session_id = alms_core::SessionId::new();
+        let event = SseEventData::dm_activity_ended(session_id, "researcher");
+
+        assert_eq!(event.event_type, "dm_activity_ended");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["peer"], "researcher");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
     }
 
     #[test]

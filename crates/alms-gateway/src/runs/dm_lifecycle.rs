@@ -2,8 +2,7 @@
 //!
 //! When a peer-triggered DM run completes, several steps must happen:
 //!
-//! 1. Detect whether `ignore_message` was called or the agent hit its
-//!    max-iterations limit without replying
+//! 1. Detect whether `ignore_message` was called
 //! 2. Resolve the peer agent from the `dm:` context ID
 //! 3. Call `end_conversation` on the `MessageBus` to reset depth counters
 //!    and emit `ConversationEnded` triggers to both agents
@@ -11,8 +10,7 @@
 //!
 //! Previously this logic was inlined in `execute_run()` (lifecycle.rs lines
 //! 1085-1180). This module consolidates it into a single entry point so there
-//! is exactly one code path for ignore-message-driven and
-//! max-iterations-driven conversation endings.
+//! is exactly one code path for ignore-message-driven conversation endings.
 //!
 //! The `ConversationEnded` trigger handling (depth-exceeded SSE events,
 //! web-chat forwarding, notification formatting) remains in `notifications.rs`
@@ -20,10 +18,16 @@
 //!
 //! See #628 and Tim's stability audit (#613) for background.
 
+use crate::api_error;
 use crate::server::AppState;
 use crate::sse::SseEventData;
-use alms_core::{AgentId, RunId, SessionId, ToolCallRecord};
+use alms_core::{AgentId, RunId, SessionId, ToolCallRecord, dm_participants};
 use alms_tools::message_sender::{ConversationEndReason, MessageSender as _};
+use axum::{
+    Json,
+    extract::{Path, State},
+    http::StatusCode,
+};
 use tracing::{debug, info, warn};
 
 use super::lifecycle::extract_peer_from_dm_context;
@@ -41,9 +45,6 @@ pub(super) struct DmRunCompletionContext<'a> {
     pub context_id: &'a str,
     pub is_peer_message: bool,
     pub tool_calls: &'a [ToolCallRecord],
-    /// Whether the run hit the agent loop's max-iterations limit.
-    /// Set to `true` when `output.response == MAX_ITERATIONS_SENTINEL`.
-    pub hit_max_iterations: bool,
 }
 
 /// Single entry point for DM post-run lifecycle handling.
@@ -56,15 +57,12 @@ pub(super) struct DmRunCompletionContext<'a> {
 /// Returns `true` if a conversation end was signalled, `false` otherwise
 /// (including when conditions are not met or an error occurs).
 ///
-/// # End conditions (checked in order)
+/// # End condition
 ///
 /// A conversation end is signalled when the run is a peer-triggered DM
-/// (`is_peer_message` and `context_id` starts with `"dm:"`) AND one of:
-///
-/// 1. `ignore_message` was successfully called during the run (verified via
-///    tool call records) -- reason: `Ignored`
-/// 2. The agent loop hit its max-iterations limit (`MAX_ITERATIONS_SENTINEL`
-///    response) -- reason: `MaxIterations`
+/// (`is_peer_message` and `context_id` starts with `"dm:"`) AND
+/// `ignore_message` was successfully called during the run (verified via
+/// tool call records) -- reason: `Ignored`.
 ///
 /// # Actions (in order)
 ///
@@ -79,24 +77,18 @@ pub(super) struct DmRunCompletionContext<'a> {
 /// trigger recipient. Emitting it here as well would cause duplicate markers.
 /// See #556.
 pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) -> bool {
-    // Determine the end reason, if any. Check ignore_message first, then
-    // max-iterations as a fallback.
+    // Determine the end reason, if any.
     let end_reason = if should_signal_dm_end(ctx.is_peer_message, ctx.tool_calls, ctx.context_id) {
         ConversationEndReason::Ignored
-    } else if should_signal_dm_end_max_iterations(
-        ctx.is_peer_message,
-        ctx.context_id,
-        ctx.hit_max_iterations,
-    ) {
-        ConversationEndReason::MaxIterations
     } else {
         return false;
     };
 
-    let reason_label = match end_reason {
+    let reason_label = match &end_reason {
         ConversationEndReason::Ignored => "ignore_message",
-        ConversationEndReason::MaxIterations => "max_iterations",
-        _ => "unknown",
+        ConversationEndReason::DepthExceeded => "depth_exceeded",
+        ConversationEndReason::UserCancelled => "user_cancelled",
+        ConversationEndReason::Errored { .. } => "errored",
     };
 
     let Some(agent_name) = ctx.agent_name else {
@@ -143,7 +135,13 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
     match ctx
         .state
         .message_bus
-        .end_conversation(agent_name, ctx.agent_id, &peer_name, peer_id, end_reason)
+        .end_conversation(
+            agent_name,
+            ctx.agent_id,
+            &peer_name,
+            peer_id,
+            end_reason.clone(),
+        )
         .await
     {
         Ok(()) => {
@@ -151,10 +149,9 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
             // so the web UI can show a "conversation ended" indicator.
             // Phase 6 of #384.
             //
-            // NOTE: This code path fires for both ignore_message and
-            // max_iterations reasons. The depth-exceeded reason emits this
-            // event from `run_trigger_loop` when processing the
-            // `ConversationEnded` trigger (#419).
+            // NOTE: This code path fires for the ignore_message reason. The
+            // depth-exceeded reason emits this event from `run_trigger_loop`
+            // when processing the `ConversationEnded` trigger (#419).
             //
             // NOTE: If both agents ignore simultaneously, end_conversation
             // returns Ok(()) for both callers (the second sees "already ended
@@ -196,6 +193,148 @@ pub(super) async fn handle_dm_run_completion(ctx: DmRunCompletionContext<'_>) ->
     }
 }
 
+/// Signal conversation end when a peer-triggered DM run failed or was
+/// cancelled mid-flight.
+///
+/// Mirrors [`handle_dm_run_completion`] for the four error arms in
+/// `execute_run()`:
+///
+/// - `AlmsError::Cancelled`
+/// - `AlmsError::CancelledWithToolCalls`
+/// - `AlmsError::FailedWithToolCalls`
+/// - generic `Err(_)`
+///
+/// Without this, a peer-triggered DM run that fails for any reason (LLM 5xx,
+/// rate-limit, tool panic, posture trip, `POST /runs/{id}/cancel` mid-flight)
+/// leaves the depth counter unreset, no `dm_ended` marker, and no
+/// `ConversationEnded` peer notification — the peer thinks the DM is still
+/// open until the 1800s `DEPTH_EXPIRY_SECS` sweep eventually clears it.
+///
+/// # End condition
+///
+/// A conversation end is signalled when the run is a peer-triggered DM
+/// (`is_peer_message` and `context_id` starts with `"dm:"`). Tool call
+/// records are NOT consulted here — we end the conversation purely on the
+/// run-level outcome, regardless of whether `ignore_message` was called.
+///
+/// # Reason mapping
+///
+/// Callers pass the reason directly:
+///
+/// - cancel arms (`Cancelled`, `CancelledWithToolCalls`) →
+///   [`ConversationEndReason::UserCancelled`]
+/// - failure arms (`FailedWithToolCalls`, generic `Err(_)`) →
+///   [`ConversationEndReason::Errored`] with the truncated `AlmsError`
+///   `Display` string
+///
+/// # Atomicity
+///
+/// `MessageBus::end_conversation()` uses `depths.remove()` as an atomicity
+/// guard (see `bus.rs:359`), so if the peer also independently calls
+/// `end_conversation` (e.g. their own happy-path `ignore_message`), only the
+/// first caller writes the `dm_ended` marker and emits the
+/// `ConversationEnded` trigger. Best-effort: a returned `Err` is logged but
+/// does not abort the surrounding error-arm bookkeeping.
+///
+/// Returns `Ok(())` on success or skip; returns `Err` only when the
+/// underlying `MessageBus::end_conversation` fails (the caller logs and
+/// continues).
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn handle_dm_run_failure(
+    state: &AppState,
+    run_id: &RunId,
+    session_id: &SessionId,
+    agent_id: AgentId,
+    agent_name: Option<&str>,
+    context_id: &str,
+    is_peer_message: bool,
+    reason: ConversationEndReason,
+) -> Result<(), alms_core::AlmsError> {
+    // Same gating as the happy path: only DM peer-triggered runs.
+    if !(is_peer_message && context_id.starts_with("dm:")) {
+        return Ok(());
+    }
+
+    let reason_label = match &reason {
+        ConversationEndReason::Ignored => "ignore_message",
+        ConversationEndReason::DepthExceeded => "depth_exceeded",
+        ConversationEndReason::UserCancelled => "user_cancelled",
+        ConversationEndReason::Errored { .. } => "errored",
+    };
+
+    let Some(agent_name) = agent_name else {
+        debug!(
+            reason = reason_label,
+            "DM run failure detected but agent name is not set — skipping conversation end"
+        );
+        return Ok(());
+    };
+
+    let Some(peer_name) = extract_peer_from_dm_context(context_id, agent_name) else {
+        debug!(
+            context_id = %context_id,
+            reason = reason_label,
+            "DM run failure detected but could not extract peer from context_id"
+        );
+        return Ok(());
+    };
+
+    // Resolve the peer's AgentId from the agent registry.
+    let peer_agent_id = state
+        .session_manager
+        .store()
+        .and_then(|store| store.load_agent_by_name(&peer_name).ok())
+        .flatten()
+        .map(|record| record.id);
+
+    let Some(peer_id) = peer_agent_id else {
+        warn!(
+            peer = %peer_name,
+            "Cannot signal conversation end on failure — peer agent not found in registry"
+        );
+        return Ok(());
+    };
+
+    info!(
+        agent = %agent_name,
+        peer = %peer_name,
+        reason = reason_label,
+        run_id = %run_id.0,
+        "DM run failed/cancelled — signalling conversation end ({reason_label})"
+    );
+
+    state
+        .message_bus
+        .end_conversation(agent_name, agent_id, &peer_name, peer_id, reason.clone())
+        .await
+        .map_err(|e| alms_core::AlmsError::Runtime(e.to_string()))?;
+
+    // Emit dm_conversation_ended SSE on the DM session stream so the web UI
+    // shows the "conversation ended" indicator regardless of run outcome.
+    //
+    // Atomicity: `MessageBus::end_conversation()` returns `Ok(())` even when
+    // the depth-counter remove was a no-op (already ended by peer). That
+    // means the peer-side helper may race in too. Frontend already tolerates
+    // duplicate `dm_conversation_ended` events — see the comment in
+    // `handle_dm_run_completion`.
+    state
+        .run_manager
+        .send_session_event(
+            *session_id,
+            *run_id,
+            SseEventData::dm_conversation_ended(
+                *session_id,
+                agent_name,
+                &peer_name,
+                &reason.to_string(),
+                context_id,
+            ),
+        )
+        .await;
+
+    Ok(())
+}
+
 /// Evaluate the three-way condition for ignore_message detection.
 ///
 /// Returns `true` when all conditions are met:
@@ -216,22 +355,146 @@ pub(super) fn should_signal_dm_end(
         && context_id.starts_with("dm:")
 }
 
-/// Detect whether a peer-triggered DM run ended because the agent loop hit
-/// its max-iterations limit without calling `send_message` or `ignore_message`.
+/// POST /sessions/{session_id}/cancel-dm — cancel an active DM conversation.
 ///
-/// Returns `true` when all conditions are met:
-/// 1. The run was triggered by a peer message (`is_peer_message`)
-/// 2. The context ID is a DM session (`dm:` prefix)
-/// 3. The run hit the max-iterations limit (`hit_max_iterations`)
+/// This endpoint gives the user direct control over ending a DM conversation
+/// between two agents. It performs these steps:
 ///
-/// When this returns `true`, the caller should signal conversation end with
-/// reason `MaxIterations` so the peer receives the `dm_ended` notification.
-pub(super) fn should_signal_dm_end_max_iterations(
-    is_peer_message: bool,
-    context_id: &str,
-    hit_max_iterations: bool,
-) -> bool {
-    is_peer_message && context_id.starts_with("dm:") && hit_max_iterations
+/// 1. Validates the session exists and is a DM session (`dm:` prefix)
+/// 2. Resolves both participant agent IDs from the registry
+/// 3. Cancels any active (queued/running) runs on the DM session
+/// 4. Calls `end_conversation` on the `MessageBus` with `UserCancelled` reason
+/// 5. Emits `dm_conversation_ended` SSE event so the frontend knows the DM ended
+///
+/// Returns 200 with cancellation details, or an error if the session is not a DM
+/// or agents cannot be resolved.
+///
+/// See issue #705.
+#[tracing::instrument(level = "info", skip(state), fields(session_id = %session_id.0))]
+pub async fn cancel_dm(
+    State(state): State<AppState>,
+    Path(session_id): Path<SessionId>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // 1. Look up the session.
+    let session = state
+        .session_manager
+        .get(session_id)
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "NOT_FOUND", "Session not found"))?;
+
+    // 2. Verify it is a DM session.
+    let (name_a, name_b) = dm_participants(&session.context_id).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "NOT_DM_SESSION",
+            "Session is not a DM conversation",
+        )
+    })?;
+
+    // 3. Resolve both agent IDs from the registry.
+    let store = state.session_manager.store().ok_or_else(|| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "NO_STORE",
+            "No agent registry available",
+        )
+    })?;
+
+    let agent_a = store
+        .load_agent_by_name(name_a)
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "REGISTRY_ERROR",
+                format!("Failed to look up agent '{name_a}': {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "AGENT_NOT_FOUND",
+                format!("Agent '{name_a}' not found in registry"),
+            )
+        })?;
+
+    let agent_b = store
+        .load_agent_by_name(name_b)
+        .map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "REGISTRY_ERROR",
+                format!("Failed to look up agent '{name_b}': {e}"),
+            )
+        })?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "AGENT_NOT_FOUND",
+                format!("Agent '{name_b}' not found in registry"),
+            )
+        })?;
+
+    // 4. Cancel any active runs on this DM session.
+    let runs_cancelled = state.run_manager.cancel_runs_for_session(session_id);
+
+    info!(
+        runs_cancelled = runs_cancelled,
+        agent_a = %name_a,
+        agent_b = %name_b,
+        "Cancelling DM conversation by user request"
+    );
+
+    // 5. Signal conversation end via the MessageBus.
+    //
+    // Use agent_a as the "sender" — the direction does not matter for
+    // UserCancelled since the user (not an agent) initiated the cancellation.
+    // Both agents will receive notifications.
+    let end_result = state
+        .message_bus
+        .end_conversation(
+            name_a,
+            agent_a.id,
+            name_b,
+            agent_b.id,
+            ConversationEndReason::UserCancelled,
+        )
+        .await;
+
+    if let Err(ref e) = end_result {
+        warn!(
+            error = %e,
+            "end_conversation returned error during user cancellation — \
+             continuing (runs already cancelled)"
+        );
+    }
+
+    // 6. Emit dm_conversation_ended SSE event on the DM session stream.
+    //
+    // Use a synthetic RunId since this cancellation is not associated with
+    // any particular run — it is a user-initiated action.
+    let synthetic_run_id = RunId::new();
+    state
+        .run_manager
+        .send_session_event(
+            session_id,
+            synthetic_run_id,
+            SseEventData::dm_conversation_ended(
+                session_id,
+                "user",
+                &format!("{name_a}, {name_b}"),
+                &ConversationEndReason::UserCancelled.to_string(),
+                &session.context_id,
+            ),
+        )
+        .await;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "session_id": session_id.0.to_string(),
+        "context_id": session.context_id,
+        "participants": [name_a, name_b],
+        "runs_cancelled": runs_cancelled,
+        "reason": "user_cancelled",
+    })))
 }
 
 #[cfg(test)]
@@ -254,6 +517,7 @@ mod tests {
             params: None,
             result: result.map(String::from),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         }
     }
 
@@ -424,61 +688,5 @@ mod tests {
             None,
         )];
         assert!(!should_signal_dm_end(true, &records, "dm:alice:bob"));
-    }
-
-    // -- Tests for should_signal_dm_end_max_iterations --
-
-    #[test]
-    fn max_iterations_in_dm_peer_signals_end() {
-        assert!(should_signal_dm_end_max_iterations(
-            true,
-            "dm:alice:bob",
-            true,
-        ));
-    }
-
-    #[test]
-    fn max_iterations_non_peer_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            false,
-            "dm:alice:bob",
-            true,
-        ));
-    }
-
-    #[test]
-    fn max_iterations_non_dm_context_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            true,
-            "session:abc123",
-            true,
-        ));
-    }
-
-    #[test]
-    fn no_max_iterations_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            true,
-            "dm:alice:bob",
-            false,
-        ));
-    }
-
-    #[test]
-    fn max_iterations_in_notification_context_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            true,
-            "notifications:bob",
-            true,
-        ));
-    }
-
-    #[test]
-    fn max_iterations_in_job_context_does_not_signal() {
-        assert!(!should_signal_dm_end_max_iterations(
-            true,
-            "job_some-uuid",
-            true,
-        ));
     }
 }

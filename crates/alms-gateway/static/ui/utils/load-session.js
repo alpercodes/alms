@@ -12,11 +12,14 @@
  *   4. If active run: append thinking indicator + reconstruct approvals
  *   5. Open SSE stream with lastEventId to skip event replay
  *   6. Restore agent phase (MUST be after step 5 — openSessionStream
- *      calls clearAgentPhase() internally during teardown)
+ *      calls clearAgentPhase() internally during teardown).
+ *      Includes cross-session DM visibility (#688): when viewing a non-DM
+ *      session and the agent is in a DM on another session, the status
+ *      bar shows "Chatting with {peer}..." via an async agent-runs check.
  */
 
 import { getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
-import { listRuns, listApprovals } from '../api/runs.js';
+import { listRuns, listApprovals, listAgentRuns } from '../api/runs.js';
 import { mapHistoryMessages, groupDmReasoningBlocks } from './history.js';
 import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
@@ -27,6 +30,38 @@ import { setAgentPhase, clearAgentPhase, setDmContext } from '../state/agent-sta
 import { sessions } from '../state/sessions.js';
 import { activeAgent } from '../state/agents.js';
 import { getPendingMessage, clearPendingMessage } from '../state/pending-messages.js';
+
+/**
+ * Maximum number of session runs to fetch when restoring active-run state.
+ *
+ * The backend `list_by_session` returns runs newest-first and truncates to
+ * the requested limit (`crates/alms-gateway/src/server/run_manager.rs:
+ * `list_by_session`). The active-run restore path needs to find a still-
+ * running run even when many newer queued / terminal runs exist in the
+ * same session, otherwise the run drops out of the fetch window and the
+ * UI silently fails to rehydrate the thinking indicator / approvals.
+ *
+ * 200 covers ordinary "agent has been busy for a while" cases without
+ * being unbounded; if a session genuinely accumulates more than 200
+ * newer runs in front of an older still-running one, the user has bigger
+ * problems than UI restoration. The history list itself can paginate
+ * later if/when we add a dedicated UI for it.  (#735)
+ */
+const SESSION_RUNS_RESTORE_LIMIT = 200;
+
+/**
+ * Maximum number of agent-scoped runs to fetch when restoring the global
+ * agent phase across sessions (the "Chatting with {peer}..." cross-session
+ * status, #688). Same truncation concern as `SESSION_RUNS_RESTORE_LIMIT`,
+ * but applied to `list_by_agent` (`crates/alms-gateway/src/server/
+ * run_manager.rs::list_by_agent`).
+ *
+ * Smaller than the per-session window because the cross-session restore
+ * is best-effort — if it misses, the next live SSE event will set the
+ * status correctly. 100 still comfortably exceeds the previous hardcoded
+ * 10 and covers realistic agent run rates. (#735)
+ */
+const AGENT_RUNS_RESTORE_LIMIT = 100;
 
 /**
  * Load a session's runs, chat history, pending approvals, and open SSE stream.
@@ -49,13 +84,23 @@ export async function loadSession(sessionId, opts) {
     // Step 1: Fetch runs and restore activeRunId for any in-progress run.
     // This must happen before history loading so that mapHistoryMessages
     // can mark unmatched tool_calls as 'running' instead of 'done'.
+    //
+    // Use a larger fetch window (SESSION_RUNS_RESTORE_LIMIT) for the
+    // active-run restore step so an older still-running run is not hidden
+    // behind a newer queued / terminal backlog. (#735)
     try {
-        const data = await listRuns(sessionId);
+        const data = await listRuns(sessionId, SESSION_RUNS_RESTORE_LIMIT);
         if (isStale()) return;
         const loaded = data.runs || [];
         runs.value = loaded;
 
-        const active = loaded.find(r => r.status === 'queued' || r.status === 'running');
+        // Prefer a `running` run over a `queued` one when both exist for
+        // this session. The backend returns runs newest-first, so without
+        // this preference a newer queued run would mask an older still-
+        // running run, leaving the UI showing queued/idle while work is
+        // already executing. (#735)
+        const active = loaded.find(r => r.status === 'running')
+            || loaded.find(r => r.status === 'queued');
         if (active) {
             activeRunId.value = active.run_id;
         }
@@ -114,10 +159,13 @@ export async function loadSession(sessionId, opts) {
             // message by checking the run's status.  The runs list was
             // fetched in step 1 and is available in runs.value.
             //
-            // If the pending entry has a runId, look up that run.  A run
-            // that has progressed past "queued" means the agent loop has
-            // started and will have persisted the user message to the
-            // session history -- so the loaded history is trustworthy.
+            // If the pending entry has a runId, look up that run.  The
+            // backend pre-persists the user's message to the session
+            // synchronously in `create_run`, BEFORE the run is enqueued,
+            // so the loaded history is already the source of truth for
+            // any run that exists in `runs.value` (queued, running, or
+            // terminal).  If the runId is present and the run is found,
+            // the message is guaranteed to be in the history.
             //
             // This avoids false-positive deduplication via text matching:
             // if the user sends identical text twice and switches away
@@ -126,11 +174,9 @@ export async function loadSession(sessionId, opts) {
             let alreadyPersisted = false;
             if (pending.runId) {
                 const run = runs.value.find(r => r.run_id === pending.runId);
-                // "running", "finished", "error", "cancelled" all mean the
-                // agent loop started (or completed) and the user message
-                // was persisted to the session DB.  Only "queued" means
-                // the message may not yet be in the history.
-                alreadyPersisted = run && run.status !== 'queued';
+                // Any known run means the backend received the request and
+                // pre-persisted the input -- the history reflects it.
+                alreadyPersisted = !!run;
             } else {
                 // runId not yet available (createRun response has not
                 // returned).  Fall back to text matching as a best-effort
@@ -266,10 +312,74 @@ export async function loadSession(sessionId, opts) {
         // else: queued -- leave header idle, SSE stream will provide
         // real status if/when the run starts on this session.
     } else {
-        // No active run — explicitly clear the phase so stale state from
-        // a previous session cannot leak through.  (This is also handled
-        // by closeSessionStream() above, but the explicit clear here
-        // serves as self-documentation of the invariant.)
+        // No active run on this session -- check if the agent is busy
+        // with a DM on a different session (cross-session visibility,
+        // #688 / #703).  This makes the "Chatting with..." status
+        // appear even when viewing the webchat session.
+        //
+        // The query is best-effort and async -- if it fails, the
+        // status bar stays idle until the next dm_activity_started
+        // SSE event arrives from the backend.
+        const agentId = activeAgent.value?.id;
+        if (agentId) {
+            restoreGlobalAgentPhase(agentId, sessionId, isStale, logPrefix)
+                .catch(err => console.warn(`[${logPrefix}] restoreGlobalAgentPhase uncaught:`, err));
+        } else {
+            clearAgentPhase();
+        }
+    }
+}
+
+/**
+ * Check if the agent has any active DM runs across all sessions and
+ * restore the "Chatting with..." status if so.
+ *
+ * This is a best-effort async call: if it fails or the session becomes
+ * stale, the status bar simply stays idle until the next live SSE event.
+ *
+ * @param {string} agentId - The agent to check
+ * @param {string} sessionId - The session being loaded (for DM peer derivation)
+ * @param {function} isStale - Staleness checker
+ * @param {string} logPrefix - Log label
+ */
+async function restoreGlobalAgentPhase(agentId, sessionId, isStale, logPrefix) {
+    try {
+        // Use AGENT_RUNS_RESTORE_LIMIT (not the previous hardcoded 10) so
+        // the still-running DM run is not hidden behind a backlog of newer
+        // queued / terminal runs for the same agent. (#735)
+        const data = await listAgentRuns(agentId, AGENT_RUNS_RESTORE_LIMIT);
+        if (isStale()) return;
+        const agentRuns = data.runs || [];
+
+        // Look for a running DM run (not queued) to derive the peer name.
+        const activeDmRun = agentRuns.find(
+            r => r.session_type === 'dm' && r.status === 'running'
+        );
+        if (activeDmRun && activeDmRun.context_id) {
+            // context_id is "dm:<name1>:<name2>" -- derive the peer name
+            // by finding the participant that is NOT the active agent.
+            const agentName = activeAgent.value?.name;
+            const parts = activeDmRun.context_id.split(':');
+            if (parts.length >= 3 && parts[0] === 'dm' && agentName) {
+                const peer = parts[1] === agentName ? parts[2] : parts[1];
+                if (peer) {
+                    setDmContext(peer);
+                    console.debug(`[${logPrefix}] restored cross-session DM status: Chatting with ${peer}`);
+                    return;
+                }
+            }
+        }
+
+        // No active DM run -- check for any non-DM running run.
+        const activeRun = agentRuns.find(r => r.status === 'running');
+        if (activeRun) {
+            setAgentPhase('calling_llm', null);
+        } else {
+            clearAgentPhase();
+        }
+    } catch (err) {
+        console.warn(`[${logPrefix}] Failed to check agent global status:`, err);
+        // Fall back to idle -- next SSE event will update it.
         clearAgentPhase();
     }
 }

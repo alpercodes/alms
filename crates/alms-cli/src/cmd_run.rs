@@ -1,7 +1,7 @@
 use alms_core::{CreateRunRequest, CreateRunResponse, RunInput, RunStatusResponse, SessionId};
 use clap::Subcommand;
 
-use crate::helpers::{api_get, api_post, fmt_time, short_id};
+use crate::helpers::{api_get, api_post, fmt_time, open_db, resolve_agent, short_id};
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RunCommands {
@@ -13,6 +13,9 @@ pub(crate) enum RunCommands {
         /// Input text for the agent
         #[arg(long)]
         input: String,
+        /// Agent name or UUID. Required when creating a run on a shared DM session.
+        #[arg(long)]
+        agent: Option<String>,
         /// Model override
         #[arg(long)]
         model: Option<String>,
@@ -45,6 +48,7 @@ pub(crate) async fn run_create(
     url: &str,
     session: &str,
     input: &str,
+    agent: Option<String>,
     model: Option<String>,
     max_tokens: Option<u32>,
     posture: Option<String>,
@@ -52,8 +56,15 @@ pub(crate) async fn run_create(
 ) -> anyhow::Result<()> {
     let session_uuid =
         uuid::Uuid::parse_str(session).map_err(|_| anyhow::anyhow!("Invalid session UUID"))?;
+    let agent_id = if let Some(agent) = agent {
+        let store = open_db()?;
+        Some(resolve_agent(&store, &agent)?.id)
+    } else {
+        None
+    };
     let req = CreateRunRequest {
         session_id: SessionId(session_uuid),
+        agent_id,
         input: RunInput::Text {
             text: input.to_string(),
         },
@@ -62,6 +73,9 @@ pub(crate) async fn run_create(
         posture,
         provider: None,
         debug_mode: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
     };
     let (_status, val) = api_post(client, url, "runs", &req).await?;
     if json {

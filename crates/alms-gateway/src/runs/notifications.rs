@@ -96,6 +96,7 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
             cancel_token,
             is_peer_message: false,
             is_system_triggered: true,
+            input_pre_persisted: false,
         },
     )
     .await;
@@ -283,7 +284,6 @@ pub(super) async fn notify_dm_ended_to_webchat(
     let reason_text = match reason {
         "ignored" => "no further replies".to_string(),
         "depth_exceeded" => "message limit reached".to_string(),
-        "max_iterations" => "agent iteration limit reached".to_string(),
         other => other.to_string(),
     };
     super::markers::persist_lifecycle_marker(
@@ -463,10 +463,27 @@ pub(crate) async fn completion_notification_loop(
                 meta["duration_ms"] = serde_json::json!(ms);
             }
             if let Some(ref usage) = completion.token_usage {
-                meta["token_usage"] = serde_json::json!({
+                let mut token_usage = serde_json::json!({
                     "prompt_tokens": usage.prompt_tokens,
                     "completion_tokens": usage.completion_tokens,
                 });
+                // Reasoning tokens only appear on the wire when the provider
+                // reports them separately (OpenAI o-series, DeepSeek, xAI).
+                // Absent otherwise so non-reasoning subagents stay
+                // byte-identical to pre-#768 completion markers.
+                if let Some(rt) = usage.reasoning_tokens {
+                    token_usage["reasoning_tokens"] = serde_json::json!(rt);
+                }
+                // Cache tokens (#766) only appear for Anthropic subagents.
+                // Same skip-when-None contract as reasoning_tokens — keeps
+                // non-Anthropic markers byte-identical to pre-#766.
+                if let Some(cc) = usage.cache_creation_input_tokens {
+                    token_usage["cache_creation_input_tokens"] = serde_json::json!(cc);
+                }
+                if let Some(cr) = usage.cache_read_input_tokens {
+                    token_usage["cache_read_input_tokens"] = serde_json::json!(cr);
+                }
+                meta["token_usage"] = token_usage;
             }
 
             super::markers::persist_lifecycle_marker(
@@ -525,7 +542,21 @@ async fn enqueue_triggered_run(
     let run_id = run.run_id;
     state.run_manager.insert_run(run);
 
-    let queued_behind = state.agent_queue.pending_count(&agent_id);
+    // Mirror the `create_run` reconstruction: `SessionQueue::pending_count`
+    // only counts items still *waiting* in the queue -- the currently-
+    // executing work item has already been dequeued and its counter
+    // decremented. Add 1 if the agent has a `Running` run so the UI gets
+    // an accurate `queued_behind` for notification/trigger runs too.
+    //
+    // Note: there is a narrow sub-millisecond TOCTOU window between
+    // `pending.fetch_sub(1)` inside the queue handler and
+    // `mark_run_as_running` in `execute_run`. During that window both
+    // signals read false and `queued_behind` may undercount by 1. The
+    // window is bounded by executor dispatch latency and is considered
+    // acceptable; closing it would require a separate in-flight counter
+    // inside `SessionQueue`.
+    let agent_running = state.run_manager.agent_has_running_run(agent_id);
+    let queued_behind = state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
     state
         .run_manager
         .send_session_event(
@@ -558,6 +589,10 @@ async fn enqueue_triggered_run(
                     // All runs via enqueue_triggered_run are system-triggered
                     // (no human watching), so Guarded posture is overridden.
                     is_system_triggered: true,
+                    // System-triggered runs persist their own input through
+                    // the notification or peer-message paths, so no gateway-
+                    // side pre-persistence is needed here.
+                    input_pre_persisted: false,
                 },
             )
             .await;
@@ -573,7 +608,7 @@ const SUBAGENT_COMPLETED_TEMPLATE: &str =
     include_str!("../../../alms-runtime/prompts/subagent_completed.md");
 
 /// Format a human-readable notification message for the parent agent.
-fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> String {
+pub(super) fn format_completion_notification(c: &alms_coordinator::SubagentCompletion) -> String {
     let status = match c.status {
         alms_coordinator::TaskStatus::Completed => "completed",
         alms_coordinator::TaskStatus::Failed => "failed",
@@ -628,7 +663,7 @@ pub(super) fn format_dm_ended_notification(
     reason: ConversationEndReason,
     conversation_history: Option<&str>,
 ) -> String {
-    let reason_text = match reason {
+    let reason_text = match &reason {
         ConversationEndReason::Ignored => {
             format!("Agent \"{from_name}\" ended the conversation (chose not to reply).")
         }
@@ -638,10 +673,13 @@ pub(super) fn format_dm_ended_notification(
                  because the maximum message depth was reached."
             )
         }
-        ConversationEndReason::MaxIterations => {
+        ConversationEndReason::UserCancelled => {
+            "The DM conversation was cancelled by the user.".to_string()
+        }
+        ConversationEndReason::Errored { message } => {
             format!(
-                "The conversation with agent \"{from_name}\" was terminated \
-                 because the agent hit its iteration limit while processing the DM."
+                "The conversation with agent \"{from_name}\" ended because \
+                 the run failed: {message}"
             )
         }
     };
@@ -812,7 +850,7 @@ pub(crate) async fn run_trigger_loop(
                 // has no access to SSE infrastructure. We emit the event
                 // here instead, since the ConversationEnded trigger
                 // carries all the information we need.
-                if *reason == ConversationEndReason::DepthExceeded {
+                if matches!(reason, ConversationEndReason::DepthExceeded) {
                     if let Some(ref peer_name) = peer_name_resolved {
                         let dm_context = alms_core::dm_context_id(from_name, peer_name);
                         let dm_session_id = SessionId::deterministic_dm(from_name, peer_name);
@@ -952,7 +990,7 @@ pub(crate) async fn run_trigger_loop(
                     // follow-up hint.
                     format_dm_ended_notification(
                         from_name,
-                        *reason,
+                        reason.clone(),
                         conversation_history.as_deref(),
                     ),
                     None,
@@ -1030,6 +1068,8 @@ pub(crate) async fn dm_event_loop(
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+// Reroute-prevention tests have been consolidated into integration_tests.rs.
+// See `notification_stays_on_invisible_session_when_no_source` and siblings.
 
 #[cfg(test)]
 mod tests {
@@ -1124,46 +1164,5 @@ mod tests {
 
         // Clean up: cancel the shutdown token so background tasks (if any) stop.
         shutdown_token.cancel();
-    }
-
-    #[test]
-    fn test_format_dm_ended_notification_max_iterations_with_history() {
-        let result = format_dm_ended_notification(
-            "bob",
-            ConversationEndReason::MaxIterations,
-            Some("[12:00] alice: hello\n[12:01] bob: working on it..."),
-        );
-        assert!(
-            result.contains("iteration limit"),
-            "MaxIterations reason text should mention iteration limit, got: {result}"
-        );
-        assert!(
-            result.contains("bob"),
-            "notification should mention the peer agent name, got: {result}"
-        );
-        assert!(
-            result.contains("[12:00] alice: hello"),
-            "notification should include conversation history, got: {result}"
-        );
-    }
-
-    #[test]
-    fn test_format_dm_ended_notification_max_iterations_without_history() {
-        let result =
-            format_dm_ended_notification("bob", ConversationEndReason::MaxIterations, None);
-        assert!(
-            result.contains("iteration limit"),
-            "MaxIterations reason text should mention iteration limit, got: {result}"
-        );
-        assert!(
-            result.contains("bob"),
-            "notification should mention the peer agent name, got: {result}"
-        );
-        // Without history, should fall back to the no-history template which
-        // directs the agent to use read_messages.
-        assert!(
-            result.contains("read_messages"),
-            "no-history fallback should reference read_messages tool, got: {result}"
-        );
     }
 }

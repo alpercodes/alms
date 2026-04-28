@@ -1,6 +1,6 @@
 # Tool Sandbox ABI (MVP Spec)
 
-**Status:** MVP draft
+**Status:** Design-only. The WASM substrate this ABI targeted was removed from the codebase (see commit history of `crates/alms-sandbox/src/sandbox.rs`). This spec is retained for reference in case WASM tooling is revived. Native builtin tools ship as compiled-in Rust and do not use this ABI.
 
 ## Goal
 Define a stable ABI for tool execution between ALMS runtime and WASM sandbox.

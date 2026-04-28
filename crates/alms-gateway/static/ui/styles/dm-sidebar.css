@@ -1,0 +1,19 @@
+/* ══════════════════════════════════════════════════════════════════════
+   DM Session — Sidebar Styling (#604)
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* DM session items — purple accent instead of green */
+.session-item-dm .session-label {
+  color: var(--text-muted);
+}
+.session-item-dm:hover .session-label {
+  color: var(--text-primary);
+}
+.session-item-dm.active {
+  color: var(--dm-accent);
+  border-left-color: var(--dm-accent);
+  background: var(--dm-accent-muted);
+}
+.session-item-dm.active .session-label {
+  color: var(--dm-accent);
+}

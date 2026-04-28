@@ -50,6 +50,24 @@ pub enum RuntimeEvent {
         /// When set, this delta originated from a subagent's LLM stream.
         source_agent: Option<String>,
     },
+    /// A chunk of *reasoning* text — provider-neutral "extended thinking" or
+    /// "chain-of-thought" content that the model emits before (or alongside)
+    /// its user-visible answer.
+    ///
+    /// Populated from Anthropic's `thinking_delta` stream events when the
+    /// extended-thinking feature is enabled; future providers (OpenAI
+    /// o-series, DeepSeek R1, xAI Grok, Gemini) will emit the same variant.
+    ///
+    /// The gateway forwards these as `reasoning_delta` SSE events so the UI
+    /// can render them in a collapsible panel under the assistant turn.
+    /// Reasoning text is NOT replayed back to the LLM in subsequent turns
+    /// (standard Anthropic mode does not require it, and the interleaved-
+    /// thinking beta is out of scope here).
+    ReasoningDelta {
+        text: String,
+        /// When set, this delta originated from a subagent's LLM stream.
+        source_agent: Option<String>,
+    },
     /// A status update indicating the current phase of the agent run.
     ///
     /// Emitted at key moments so the gateway can forward a `status` SSE event

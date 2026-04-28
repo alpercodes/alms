@@ -6,24 +6,93 @@ fn default_tool_call_type() -> String {
     "function".to_string()
 }
 
-/// LLM message for API calls
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// LLM message for API calls.
+///
+/// Uses a custom `Deserialize` implementation rather than serde's standard
+/// `alias` attribute for the reasoning field because OpenAI may emit both
+/// `reasoning` (raw chain-of-thought) and `reasoning_summary`
+/// (user-visible summary) on the same message; serde's `alias` rejects
+/// that as a duplicate-field error. The custom impl accepts all three
+/// field names and applies a priority rule: `reasoning_content` (the
+/// canonical name used by DeepSeek / xAI / OpenRouter) → `reasoning_summary`
+/// (OpenAI's preferred user-visible version) → `reasoning` (OpenAI's raw
+/// trace) — in that order. The first non-empty value wins, so the
+/// "prefer summary when both present" semantics required by #768 is
+/// preserved even across JSON field orderings.
+#[derive(Debug, Clone, Serialize)]
 pub struct LlmMessage {
     pub role: String,
     /// Content can be null when the LLM returns tool calls only
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Reasoning/thinking content returned by reasoning models (e.g. minimax,
-    /// deepseek-r1).  OpenRouter surfaces this as a separate field on the
-    /// message object.  We capture it so callers can fall back to it when
-    /// `content` is null (common when max_tokens is hit before the model
-    /// transitions from reasoning to output).
+    /// Reasoning/thinking content returned by reasoning models.
+    ///
+    /// Populated from whichever wire field the provider uses:
+    /// - `reasoning_content` — DeepSeek R1, xAI Grok reasoning variants,
+    ///   OpenRouter-normalized responses.
+    /// - `reasoning_summary` — OpenAI o-series user-visible summary
+    ///   (preferred when sent alongside raw `reasoning`).
+    /// - `reasoning` — OpenAI o-series raw chain-of-thought.
+    ///
+    /// Callers can fall back to this field when `content` is null (common
+    /// when `max_tokens` is hit before the model transitions from
+    /// reasoning to output).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for LlmMessage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Intermediate struct that collects every possible wire field
+        // name. Serde silently ignores unknown fields by default (we do
+        // NOT set `#[serde(deny_unknown_fields)]` here on purpose —
+        // OpenAI / xAI / DeepSeek add new response fields regularly, and
+        // breaking on unknowns would be fragile). The three reasoning
+        // fields below are enumerated explicitly so the priority logic
+        // that follows can pick the winner.
+        #[derive(Deserialize)]
+        struct Raw {
+            role: String,
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default)]
+            reasoning_content: Option<String>,
+            #[serde(default)]
+            reasoning_summary: Option<String>,
+            #[serde(default)]
+            reasoning: Option<String>,
+            #[serde(default)]
+            tool_calls: Option<Vec<ToolCall>>,
+            #[serde(default)]
+            tool_call_id: Option<String>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        // Priority: canonical `reasoning_content` first (what DeepSeek /
+        // xAI / OpenRouter send), then OpenAI's summary (user-visible),
+        // then OpenAI's raw trace. Only non-empty strings win — an empty
+        // string on one field still falls through to the next.
+        let reasoning_content = raw
+            .reasoning_content
+            .filter(|s| !s.is_empty())
+            .or_else(|| raw.reasoning_summary.filter(|s| !s.is_empty()))
+            .or_else(|| raw.reasoning.filter(|s| !s.is_empty()));
+
+        Ok(LlmMessage {
+            role: raw.role,
+            content: raw.content,
+            reasoning_content,
+            tool_calls: raw.tool_calls,
+            tool_call_id: raw.tool_call_id,
+        })
+    }
 }
 
 impl LlmMessage {
@@ -184,6 +253,90 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<StreamOptions>,
+    /// Extended-thinking budget, in tokens, for Anthropic Claude 4.x.
+    ///
+    /// - `None` or `Some(0)`: extended thinking is disabled for this request.
+    /// - `Some(n)` with `n > 0`: the Anthropic adapter injects
+    ///   `"thinking": {"type": "enabled", "budget_tokens": n}` into the
+    ///   outgoing request body.
+    ///
+    /// Never serialized on the wire as-is — the Anthropic adapter reads it
+    /// and rewrites it into the provider-shaped field; other providers
+    /// silently ignore it.
+    #[serde(skip)]
+    pub thinking_budget_tokens: Option<u32>,
+    /// OpenAI-compat reasoning effort — serialized as `reasoning_effort`
+    /// on the OpenAI chat-completions wire only when the effective
+    /// provider is OpenAI-compatible AND the model supports the field.
+    ///
+    /// The adapter in [`crate::llm_client`] is responsible for stripping
+    /// this value for:
+    /// - Non-OpenAI wire protocols (Anthropic, Gemini) — they use their
+    ///   own reasoning knobs and would 400 on the unknown field.
+    /// - DeepSeek R1 (`deepseek-reasoner`) — reasoning is implicit; the
+    ///   endpoint rejects `reasoning_effort`.
+    /// - Non-reasoning OpenAI models (gpt-4o, etc.) — reject unknown
+    ///   params.
+    ///
+    /// See `ReasoningEffort` and `[llm.openai].reasoning_effort` in
+    /// `alms.toml` for the server-default knob. (#768)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Opt-in to Anthropic prompt caching (#766).
+    ///
+    /// Consumed by the Anthropic adapter in [`crate::anthropic`] — when
+    /// `Some(true)`, the adapter attaches `cache_control` markers to the
+    /// last tool definition and the trailing system content block. Other
+    /// providers ignore the field.
+    ///
+    /// Populated by the agent loop from the server's
+    /// `[llm.anthropic].prompt_cache_enabled` config value. Never
+    /// serialized on the wire as-is — the adapter reads it and rewrites
+    /// the outgoing shape.
+    #[serde(skip)]
+    pub prompt_cache_enabled: Option<bool>,
+    /// Gemini thinking budget, in tokens (#769).
+    ///
+    /// Consumed by the Gemini adapter — when `Some(n)` with `n > 0`, the
+    /// adapter injects `generationConfig.thinkingConfig: { thinkingBudget: n,
+    /// includeThoughts: true }` into the outgoing request. `None` or
+    /// `Some(0)` disables extended thinking. Other providers ignore the
+    /// field.
+    ///
+    /// Populated by the agent loop from the server's
+    /// `[llm.gemini].thinking_budget` config value (with the three-layer
+    /// precedence chain applied by the gateway). Never serialized on the
+    /// wire as-is.
+    #[serde(skip)]
+    pub gemini_thinking_budget: Option<u32>,
+    /// Opt-in to Gemini explicit context caching (#769).
+    ///
+    /// Consumed by the Gemini adapter — when `Some(true)`, the adapter
+    /// looks up or creates a `cachedContents` resource keyed by
+    /// `session_id` + prefix hash, and references it on subsequent turns
+    /// via `cachedContent: "cachedContents/<id>"`. `None` or `Some(false)`
+    /// skips the cache interaction entirely. Other providers ignore the
+    /// field.
+    ///
+    /// Populated by the agent loop from the server's
+    /// `[llm.gemini].cache_enabled` config value.
+    #[serde(skip)]
+    pub gemini_cache_enabled: Option<bool>,
+    /// Gemini cache TTL in seconds (#769). Sent as `ttl` when creating a
+    /// new `cachedContents` entry. `None` falls back to Gemini's server
+    /// default (1 hour). Ignored when `gemini_cache_enabled` is not
+    /// `Some(true)` and by non-Gemini providers.
+    #[serde(skip)]
+    pub gemini_cache_ttl_seconds: Option<u64>,
+    /// Session ID for provider-scoped caches (#769).
+    ///
+    /// Gemini's context-caching adapter uses this as the key in the
+    /// in-process cache map so that two concurrent sessions don't share
+    /// a cache handle (prefixes differ per agent/session). `None`
+    /// disables cache reuse across turns, which falls back to the
+    /// no-cache behaviour.
+    #[serde(skip)]
+    pub session_id: Option<alms_core::SessionId>,
 }
 
 impl CompletionRequest {
@@ -196,6 +349,13 @@ impl CompletionRequest {
             max_tokens: None,
             stream: None,
             stream_options: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            prompt_cache_enabled: None,
+            gemini_thinking_budget: None,
+            gemini_cache_enabled: None,
+            gemini_cache_ttl_seconds: None,
+            session_id: None,
         }
     }
 
@@ -216,6 +376,60 @@ impl CompletionRequest {
 
     pub fn with_max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
+        self
+    }
+
+    /// Set the extended-thinking budget for this request. A value of `0`
+    /// disables extended thinking; see [`Self::thinking_budget_tokens`].
+    pub fn with_thinking_budget(mut self, budget_tokens: u32) -> Self {
+        self.thinking_budget_tokens = Some(budget_tokens);
+        self
+    }
+
+    /// Set the OpenAI-compat reasoning effort for this request.
+    ///
+    /// Value must be one of `"low" | "medium" | "high" | "minimal"` —
+    /// construct from [`alms_core::config::ReasoningEffort::as_wire_str`]
+    /// for compile-time validation. See [`Self::reasoning_effort`] for
+    /// when the field is actually emitted on the wire. (#768)
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
+        self
+    }
+
+    /// Enable Anthropic prompt caching for this request (#766).
+    ///
+    /// The Anthropic adapter reads this flag and attaches `cache_control`
+    /// markers to the last tool definition and the trailing system block.
+    /// Other provider adapters ignore the field.
+    pub fn with_prompt_cache_enabled(mut self, enabled: bool) -> Self {
+        self.prompt_cache_enabled = Some(enabled);
+        self
+    }
+
+    /// Set the Gemini thinking budget (#769). See [`Self::gemini_thinking_budget`].
+    pub fn with_gemini_thinking_budget(mut self, budget: u32) -> Self {
+        self.gemini_thinking_budget = Some(budget);
+        self
+    }
+
+    /// Enable Gemini explicit context caching for this request (#769).
+    /// See [`Self::gemini_cache_enabled`].
+    pub fn with_gemini_cache_enabled(mut self, enabled: bool) -> Self {
+        self.gemini_cache_enabled = Some(enabled);
+        self
+    }
+
+    /// Set the Gemini cache TTL in seconds (#769). See [`Self::gemini_cache_ttl_seconds`].
+    pub fn with_gemini_cache_ttl(mut self, secs: u64) -> Self {
+        self.gemini_cache_ttl_seconds = Some(secs);
+        self
+    }
+
+    /// Attach a session ID so provider-scoped caches can key off it (#769).
+    /// See [`Self::session_id`].
+    pub fn with_session_id(mut self, id: alms_core::SessionId) -> Self {
+        self.session_id = Some(id);
         self
     }
 }
@@ -241,12 +455,72 @@ pub struct Choice {
     pub finish_reason: Option<String>,
 }
 
+/// Nested OpenAI detail object: `usage.completion_tokens_details.reasoning_tokens`.
+///
+/// DeepSeek and xAI omit this nesting and may place `reasoning_tokens`
+/// directly on `usage`; we handle that shape via a sibling field on
+/// [`Usage`]. The first non-`None` of the two paths wins at read time via
+/// [`Usage::reasoning_tokens_effective`].
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+}
+
 /// Token usage
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    /// Flat `reasoning_tokens` field emitted directly on `usage` by
+    /// DeepSeek R1 and some xAI responses. OpenAI o-series nests the
+    /// count under `completion_tokens_details` instead — see
+    /// [`Usage::completion_tokens_details`] below. Callers should
+    /// consult [`Usage::reasoning_tokens_effective`] to get the
+    /// effective count regardless of wire shape.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+    /// OpenAI-shaped detail object carrying the reasoning-tokens count.
+    /// Absent on DeepSeek / xAI payloads; hence `Option`.
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    /// Anthropic prompt caching (#766): tokens *written* to the cache on
+    /// this request. Populated only by the Anthropic adapter; other
+    /// providers leave it as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    /// Prompt caching: tokens *served from* the cache on this request.
+    ///
+    /// **Provider-neutral field.** The name is historically Anthropic-coloured
+    /// (mirrors Anthropic's wire field) but this slot is shared across
+    /// providers that report "tokens served from cache". When an operator
+    /// sees this populated in a `run_finished` event, the provider can be
+    /// disambiguated via `llm.provider` on the run config or the run's
+    /// model name.
+    ///
+    /// - Anthropic (#766): populated from the response's
+    ///   `cache_read_input_tokens` field.
+    /// - Gemini (#769): populated from `usageMetadata.cachedContentTokenCount`
+    ///   when a `cachedContents` entry was referenced.
+    ///
+    /// `None` for non-caching providers, or when caching was disabled /
+    /// missed on this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
+}
+
+impl Usage {
+    /// Return the effective reasoning-token count, preferring OpenAI's
+    /// nested shape (`completion_tokens_details.reasoning_tokens`) when
+    /// present, falling back to the flat field used by DeepSeek / xAI.
+    /// Returns `None` when neither path carries a value.
+    pub fn reasoning_tokens_effective(&self) -> Option<u32> {
+        self.completion_tokens_details
+            .as_ref()
+            .and_then(|d| d.reasoning_tokens)
+            .or(self.reasoning_tokens)
+    }
 }
 
 /// Streaming chunk
@@ -270,16 +544,61 @@ pub struct StreamChoice {
     pub finish_reason: Option<String>,
 }
 
-/// Delta in streaming response
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Delta in streaming response.
+///
+/// Uses a custom `Deserialize` for the same reason as [`LlmMessage`] —
+/// OpenAI may emit `reasoning` and `reasoning_summary` deltas in
+/// separate SSE chunks or within the same delta object; the custom impl
+/// coalesces them into `reasoning_content` with priority ordering
+/// (canonical > summary > raw).
+#[derive(Debug, Clone, Default)]
 pub struct Delta {
     pub role: Option<String>,
     pub content: Option<String>,
-    /// Reasoning/thinking content delta from reasoning models.
-    #[serde(default)]
+    /// Reasoning/thinking content delta from reasoning models. See
+    /// `LlmMessage::reasoning_content` for wire-shape details. (#768)
     pub reasoning_content: Option<String>,
-    #[serde(default)]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+impl<'de> Deserialize<'de> for Delta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            role: Option<String>,
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default)]
+            reasoning_content: Option<String>,
+            #[serde(default)]
+            reasoning_summary: Option<String>,
+            #[serde(default)]
+            reasoning: Option<String>,
+            #[serde(default)]
+            tool_calls: Option<Vec<ToolCallDelta>>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        // Priority ordering matches `LlmMessage`: canonical field first,
+        // then OpenAI summary, then OpenAI raw. Empty strings fall
+        // through; only non-empty values win.
+        let reasoning_content = raw
+            .reasoning_content
+            .filter(|s| !s.is_empty())
+            .or_else(|| raw.reasoning_summary.filter(|s| !s.is_empty()))
+            .or_else(|| raw.reasoning.filter(|s| !s.is_empty()));
+
+        Ok(Delta {
+            role: raw.role,
+            content: raw.content,
+            reasoning_content,
+            tool_calls: raw.tool_calls,
+        })
+    }
 }
 
 /// Incremental tool call in streaming responses.
@@ -322,6 +641,22 @@ pub struct LlmConfig {
     pub mock: bool,
     /// Per-chunk read timeout for SSE streaming (seconds).
     pub stream_chunk_timeout_secs: u64,
+    /// How the API key is attached to each outgoing request. Defaults to
+    /// `Bearer` for OpenAI-compatible providers.
+    #[serde(default)]
+    pub auth_scheme: alms_core::config::AuthScheme,
+    /// Provider-specific behaviour tweaks applied at request-build time.
+    #[serde(default)]
+    pub quirks: alms_core::config::ProviderQuirks,
+    /// Snapshot of `[llm.providers]` from the unified `AlmsConfig`. Used
+    /// by `with_provider_and_secrets` so that switching to a different
+    /// configured provider picks up its `base_url` / `auth_scheme` / quirks.
+    #[serde(default)]
+    pub providers: std::collections::BTreeMap<String, alms_core::config::ProviderEntry>,
+    /// Snapshot of `[llm.anthropic]` from the unified `AlmsConfig`. Consumed
+    /// by the Anthropic adapter in `anthropic.rs`; ignored for other providers.
+    #[serde(default)]
+    pub anthropic: alms_core::config::AnthropicConfig,
 }
 
 impl Default for LlmConfig {
@@ -334,20 +669,47 @@ impl Default for LlmConfig {
             timeout_secs: 120,
             mock: false,
             stream_chunk_timeout_secs: 60,
+            auth_scheme: alms_core::config::AuthScheme::default(),
+            quirks: alms_core::config::ProviderQuirks::default(),
+            providers: std::collections::BTreeMap::new(),
+            anthropic: alms_core::config::AnthropicConfig::default(),
         }
     }
 }
 
 impl From<alms_core::config::LlmConfig> for LlmConfig {
     fn from(c: alms_core::config::LlmConfig) -> Self {
+        // Merge the resolved provider entry (if any) into the flat runtime
+        // LlmConfig. The provider entry's base_url / auth_scheme / quirks
+        // always win over the flat fields when present, because the
+        // generic form is strictly more expressive.
+        let entry = c.providers.get(&c.provider).cloned();
+
+        let (base_url, auth_scheme, quirks, model) = match entry {
+            Some(e) => {
+                let model = e.model.clone().unwrap_or_else(|| c.model.clone());
+                (e.base_url, e.auth_scheme, e.quirks, model)
+            }
+            None => (
+                c.base_url.clone(),
+                alms_core::config::AuthScheme::default(),
+                alms_core::config::ProviderQuirks::default(),
+                c.model.clone(),
+            ),
+        };
+
         Self {
             provider: c.provider,
             api_key: c.api_key.unwrap_or_default(),
-            base_url: c.base_url,
-            default_model: c.model,
+            base_url,
+            default_model: model,
             timeout_secs: c.timeout_secs,
             mock: c.mock,
             stream_chunk_timeout_secs: c.stream_chunk_timeout_secs,
+            auth_scheme,
+            quirks,
+            providers: c.providers,
+            anthropic: c.anthropic,
         }
     }
 }

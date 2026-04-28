@@ -46,13 +46,13 @@ export function AuditTab() {
     };
 
     if (!activeSessionId.value) {
-        return html`<div class="audit-empty">No session selected</div>`;
+        return html`<div class="empty-state">No session selected</div>`;
     }
     if (auditEvents.value === null) {
         return html`<div class="loading-state">Loading...</div>`;
     }
     if (auditEvents.value.length === 0) {
-        return html`<div class="audit-empty">No audit events</div>`;
+        return html`<div class="empty-state">No audit events</div>`;
     }
 
     // Show "Load more" if we got exactly the limit (more may exist)

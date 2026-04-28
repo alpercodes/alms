@@ -1,0 +1,278 @@
+/* ══════════════════════════════════════════════════════════════════════
+   Settings Modal
+   ══════════════════════════════════════════════════════════════════════ */
+
+.settings-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: var(--overlay-backdrop);
+  z-index: 200;
+  align-items: center;
+  justify-content: center;
+}
+.settings-overlay.open { display: flex; }
+.settings-modal {
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-xl);
+  padding: var(--space-6);
+  width: 480px;
+  max-width: 92vw;
+  max-height: 85vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  box-shadow: var(--shadow-overlay);
+}
+.settings-modal h2 { font-size: var(--text-xl); font-weight: 600; color: var(--text-primary); }
+.settings-row { display: flex; flex-direction: column; gap: var(--space-1); flex-shrink: 0; }
+.settings-label {
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.settings-hint { font-size: var(--text-2xs); color: var(--text-disabled); }
+/* Provider/model "disabled" hint sits directly under the Provider+Model
+   row (#865); pull it tight against the row above so it visually groups
+   with that pair instead of floating into the Max-tokens row below. */
+.settings-overrides-disabled-note {
+  margin-top: calc(-1 * var(--space-1));
+  margin-bottom: var(--space-2);
+}
+.settings-input, .settings-select {
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  outline: none;
+  width: 100%;
+  transition: border-color var(--duration-normal);
+}
+.settings-select option { background: var(--surface-1); }
+.settings-input:focus, .settings-select:focus { border-color: var(--accent); }
+.settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); flex-shrink: 0; }
+
+
+.api-key-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+  font-size: var(--text-xs);
+  flex-wrap: wrap;
+}
+.api-key-provider {
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 90px;
+  font-family: var(--font-mono);
+}
+.api-key-value {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  flex: 1;
+}
+.api-key-value.set { color: var(--success); }
+.api-key-value.unset { color: var(--text-disabled); font-style: italic; }
+.api-key-source {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  background: var(--surface-3);
+  padding: 1px var(--space-1);
+  border-radius: var(--radius-sm);
+}
+.api-key-actions { display: flex; gap: var(--space-1); }
+.api-key-btn {
+  font-size: var(--text-2xs);
+  font-family: var(--font-mono);
+  padding: 2px var(--space-2);
+  background: var(--surface-3);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+.api-key-btn:hover { background: var(--surface-4); color: var(--text-primary); }
+.api-key-btn.save { background: var(--accent); color: var(--text-inverse); border-color: var(--accent); }
+.api-key-btn.save:hover { background: var(--accent-hover); }
+.api-key-btn.remove { color: var(--error); }
+.api-key-btn.remove:hover { background: var(--error-muted); }
+.api-key-row .settings-input { flex: 1; min-width: 200px; }
+.settings-divider {
+  border-top: 1px solid var(--border-subtle);
+  margin: var(--space-1) 0;
+  flex-shrink: 0;
+}
+.settings-info {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  line-height: 1.8;
+}
+.settings-info-value {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+.settings-footer { display: flex; gap: var(--space-2); justify-content: flex-end; margin-top: var(--space-2); flex-shrink: 0; flex-wrap: wrap; }
+.settings-save {
+  padding: var(--space-2) var(--space-5);
+  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+  font-weight: 500;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--duration-fast);
+}
+.settings-save:hover { background: var(--accent-hover); }
+.settings-cancel {
+  padding: var(--space-2) var(--space-5);
+  font-size: var(--text-sm);
+  font-family: var(--font-mono);
+  font-weight: 500;
+  background: var(--surface-3);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--duration-normal);
+}
+.settings-cancel:hover { color: var(--text-primary); border-color: var(--border-strong); }
+#btn-settings.active { color: var(--warning); }
+
+/* Collapsible sections within settings modal */
+.settings-section {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  flex-shrink: 0;
+}
+.settings-section-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-1);
+  border: none;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  transition: background var(--duration-fast);
+}
+.settings-section-toggle:hover { background: var(--surface-3); }
+.settings-section-arrow {
+  font-size: 10px;
+  transition: transform var(--duration-fast);
+  color: var(--text-disabled);
+}
+.settings-section-arrow.open { transform: rotate(90deg); }
+.settings-section-title { flex: 1; text-align: left; }
+.settings-section-body {
+  padding: 0 var(--space-3);
+  max-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  transition: max-height var(--duration-normal) ease, padding var(--duration-normal) ease;
+}
+.settings-section-body.open {
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  max-height: 600px;
+  overflow: visible;
+}
+.settings-section-desc {
+  margin-bottom: var(--space-1);
+}
+
+/* LLM Providers section: provider sub-heading separator (#804 Slice A).
+   Rendered as <h4> for screen-reader landmark navigation; reset the
+   browser's default h4 margin so the rule's own spacing wins. */
+.settings-llm-subhead {
+  margin: var(--space-2) 0 0 0;
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: var(--space-2);
+}
+
+/* Read-only info rows within sections */
+.settings-info-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.settings-info-row-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.settings-info-row-label {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.settings-info-row-value {
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  color: var(--text-secondary);
+  text-align: right;
+  word-break: break-all;
+}
+
+/* Per-run overrides header */
+.settings-overrides-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Sub-section header within per-run overrides (e.g. Reasoning & thinking).
+   Visually lighter than the main overrides header — same flex-column shape
+   but with a top margin to separate it from the preceding grid. */
+.settings-overrides-subheader {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: var(--space-2);
+}
+
+/* Tri-state budget control (Inherit / Disable / Custom) — modal flavor.
+   Used by the shared <BudgetTriState> component when the modal supplies
+   its own className map. The select sits flush; the optional number
+   input renders inline next to it when mode === 'custom'. */
+.settings-tristate-group {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.settings-tristate-group .settings-select { flex: 1 1 auto; min-width: 0; }
+.settings-tristate-value { flex: 0 0 auto; max-width: 50%; }
+
+/* Effective value hint below each editable field */
+.settings-effective {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  font-family: var(--font-mono);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex-wrap: wrap;
+}

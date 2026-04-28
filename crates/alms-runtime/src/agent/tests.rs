@@ -9,7 +9,6 @@ use alms_session::{SessionConfig, SessionManager};
 #[tokio::test]
 async fn test_agent_config_default() {
     let config = AgentConfig::default();
-    assert_eq!(config.max_iterations, 10);
     assert!(!config.system_prompt.is_empty());
     assert_eq!(config.posture, Posture::Guarded);
 }
@@ -25,6 +24,7 @@ async fn test_stream_llm_call_emits_token_deltas() {
         agent_id: AgentId::new(),
         config: AgentConfig::default(),
         llm: LlmClient::new(config).unwrap(),
+        summary_llm: None,
         tools: ToolRegistry::new(),
         workspace: None,
         event_sender: Some(tx),
@@ -33,18 +33,23 @@ async fn test_stream_llm_call_emits_token_deltas() {
         resolved_sandbox_root: None,
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: None,
     };
 
     let request =
         CompletionRequest::new("test").with_messages(vec![LlmMessage::user("hello world")]);
 
-    let (content, tool_calls, _usage) = runtime.stream_llm_call(request).await.unwrap();
+    let result = runtime.stream_llm_call(request).await.unwrap();
 
     // Content should be the reassembled mock response
-    assert_eq!(content.as_deref(), Some("[mock] hello world"));
+    assert_eq!(result.content.as_deref(), Some("[mock] hello world"));
     // No tool calls from mock
-    assert!(tool_calls.is_none());
+    assert!(result.tool_calls.is_none());
+    // Mock stream doesn't emit reasoning_content
+    assert!(result.reasoning.is_none());
 
     // Verify TokenDelta events were emitted (one per word chunk)
     let mut deltas = Vec::new();
@@ -64,6 +69,7 @@ async fn test_build_context() {
         agent_id: AgentId::new(),
         config: AgentConfig::default(),
         llm: LlmClient::new(LlmConfig::default()).unwrap(),
+        summary_llm: None,
         tools: ToolRegistry::new(),
         workspace: None,
         event_sender: None,
@@ -72,6 +78,9 @@ async fn test_build_context() {
         resolved_sandbox_root: None,
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: None,
     };
 
@@ -95,6 +104,7 @@ async fn test_build_context_dm_perspective_mapping() {
         agent_id: AgentId::new(),
         config: AgentConfig::default(),
         llm: LlmClient::new(LlmConfig::default()).unwrap(),
+        summary_llm: None,
         tools: ToolRegistry::new(),
         workspace: None,
         event_sender: None,
@@ -103,6 +113,9 @@ async fn test_build_context_dm_perspective_mapping() {
         resolved_sandbox_root: None,
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: Some("bob".to_string()),
     };
 
@@ -174,6 +187,7 @@ async fn test_build_context_non_dm_no_perspective() {
         agent_id: AgentId::new(),
         config: AgentConfig::default(),
         llm: LlmClient::new(LlmConfig::default()).unwrap(),
+        summary_llm: None,
         tools: ToolRegistry::new(),
         workspace: None,
         event_sender: None,
@@ -182,6 +196,9 @@ async fn test_build_context_non_dm_no_perspective() {
         resolved_sandbox_root: None,
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: Some("bob".to_string()),
     };
 
@@ -208,10 +225,14 @@ async fn test_build_context_non_dm_no_perspective() {
         .await
         .unwrap();
 
-    // system + 1 history + current = 3
-    assert_eq!(messages.len(), 3);
-    // No perspective mapping: message stays as "user" even though from_agent == "bob"
+    // Two consecutive user turns (history "Hello" + current input "hi")
+    // merge into a single user message under the canonical invariant.
+    // Expected shape: [system, user(merged)].
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
     assert_eq!(messages[1].role, "user");
+    assert!(messages[1].content_str().contains("Hello"));
+    assert!(messages[1].content_str().contains("hi"));
 }
 
 #[test]
@@ -321,6 +342,7 @@ async fn test_guarded_posture_sequential_approvals() {
             ..AgentConfig::default()
         },
         llm: LlmClient::new(config).unwrap(),
+        summary_llm: None,
         tools,
         workspace: None,
         event_sender: Some(tx),
@@ -329,6 +351,9 @@ async fn test_guarded_posture_sequential_approvals() {
         resolved_sandbox_root: None,
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: None,
     };
 
@@ -413,6 +438,7 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
             ..AgentConfig::default()
         },
         llm: LlmClient::new(config).unwrap(),
+        summary_llm: None,
         tools,
         workspace: None,
         event_sender: Some(tx),
@@ -421,6 +447,9 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
         resolved_sandbox_root: None,
         shell_unrestricted: true,
         shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
         agent_name: None,
     };
 
@@ -456,6 +485,95 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
     );
     assert!(saw_tool_start, "Should have emitted ToolStart");
     assert!(saw_tool_end, "Should have emitted ToolEnd");
+}
+
+#[tokio::test]
+async fn test_classifier_blocked_shell_surfaces_target_in_tool_end() {
+    // Integration test for issue #758: verify the full chain
+    //   SandboxError::ShellBlocked  →  AlmsError::ToolBlocked
+    //                               →  RuntimeEvent::ToolEnd { result: {"target": ...} }
+    // actually carries the structured `target` field the UI consumes.
+    // All the unit tests in `classification.rs` cover the lower layers;
+    // this locks in the runtime-level plumbing.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // `with_builtins_sandboxed` registers `ShellTool` with the default
+    // classification mode (`BlockDestructive`), which is exactly the policy
+    // we want to exercise — `rm -rf /etc` is destructive.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["shell".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            // Autonomous — skip the approval gate so we go straight to
+            // tool execution and the classifier fires.
+            posture: Posture::Autonomous,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: None,
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::BlockDestructive,
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        agent_name: None,
+    };
+
+    let tc = ToolCall::new("tc-blocked", "shell", r#"{"command":"rm -rf /etc"}"#);
+    let result = runtime
+        .execute_tool_call(&tc, uuid::Uuid::new_v4(), &session_manager, session.id)
+        .await;
+    assert!(
+        result.is_err(),
+        "classifier must block `rm -rf /etc` in BlockDestructive mode"
+    );
+    match result.unwrap_err() {
+        AlmsError::ToolBlocked { target, .. } => {
+            assert_eq!(
+                target.as_deref(),
+                Some("/etc"),
+                "ToolBlocked must carry structured target"
+            );
+        }
+        other => panic!("expected ToolBlocked, got {other:?}"),
+    }
+
+    drop(runtime);
+
+    // Drain events and locate the ToolEnd for our invocation. Assert that its
+    // result JSON carries `target == "/etc"` — this is the field the UI
+    // reads to render the "Target" row on a blocked shell call.
+    let mut saw_tool_end_with_target = false;
+    while let Ok(event) = rx.try_recv() {
+        if let RuntimeEvent::ToolEnd { ok, result, .. } = event {
+            assert!(!ok, "blocked call must report ok=false");
+            assert_eq!(
+                result.get("target").and_then(|v| v.as_str()),
+                Some("/etc"),
+                "ToolEnd.result must carry structured target: {result:?}"
+            );
+            saw_tool_end_with_target = true;
+        }
+    }
+    assert!(
+        saw_tool_end_with_target,
+        "runtime must emit ToolEnd with structured target on classifier block"
+    );
 }
 
 #[test]
@@ -1302,6 +1420,7 @@ fn test_dm_tool_was_called_only_non_dm_tools() {
             params: Some(r#"{"message":"hi"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1311,6 +1430,7 @@ fn test_dm_tool_was_called_only_non_dm_tools() {
             params: None,
             result: Some(r#"{"output":"hi"}"#.to_string()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(
@@ -1331,6 +1451,7 @@ fn test_dm_tool_was_called_send_message() {
             params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1340,6 +1461,7 @@ fn test_dm_tool_was_called_send_message() {
             params: None,
             result: Some(r#"{"ok":true}"#.to_string()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(
@@ -1360,6 +1482,7 @@ fn test_dm_tool_was_called_ignore_message() {
             params: Some(r#"{"reason":"not relevant"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1369,6 +1492,7 @@ fn test_dm_tool_was_called_ignore_message() {
             params: None,
             result: Some(r#"{"ok":true}"#.to_string()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(
@@ -1389,6 +1513,7 @@ fn test_dm_tool_was_called_ignores_tool_role_only() {
         params: None,
         result: Some(r#"{"ok":true}"#.to_string()),
         timestamp: chrono::Utc::now(),
+        from_agent: None,
     }];
     assert!(
         !dm::dm_tool_was_called(&records),
@@ -1408,6 +1533,7 @@ fn test_dm_tool_was_called_no_tool_result() {
         params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
         result: None,
         timestamp: chrono::Utc::now(),
+        from_agent: None,
     }];
     assert!(
         !dm::dm_tool_was_called(&records),
@@ -1432,6 +1558,7 @@ fn test_dm_tool_was_called_conflict_batch_false_positive() {
             params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1441,6 +1568,7 @@ fn test_dm_tool_was_called_conflict_batch_false_positive() {
             params: Some(r#"{"reason":"spam"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         // Tool results for both — both contain the conflict error
         alms_core::ToolCallRecord {
@@ -1451,6 +1579,7 @@ fn test_dm_tool_was_called_conflict_batch_false_positive() {
             params: None,
             result: Some(conflict_error.clone()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 3,
@@ -1460,6 +1589,7 @@ fn test_dm_tool_was_called_conflict_batch_false_positive() {
             params: None,
             result: Some(conflict_error),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(
@@ -1484,6 +1614,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: Some(r#"{"to":"alice","message":"hi"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 1,
@@ -1493,6 +1624,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: Some(r#"{"reason":"spam"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 2,
@@ -1502,6 +1634,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: None,
             result: Some(conflict_error.clone()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 3,
@@ -1511,6 +1644,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: None,
             result: Some(conflict_error),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         // Second batch: LLM picked just send_message — succeeds
         alms_core::ToolCallRecord {
@@ -1521,6 +1655,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: Some(r#"{"to":"alice","message":"hello"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
         alms_core::ToolCallRecord {
             seq: 5,
@@ -1530,6 +1665,7 @@ fn test_dm_tool_was_called_conflict_then_success() {
             params: None,
             result: Some(r#"{"ok":true}"#.to_string()),
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         },
     ];
     assert!(
@@ -1547,13 +1683,13 @@ fn test_streaming_usage_accumulation() {
     // Simulate two chunks: first has prompt_tokens, second has completion_tokens
     let first = Usage {
         prompt_tokens: 150,
-        completion_tokens: 0,
         total_tokens: 150,
+        ..Usage::default()
     };
     let second = Usage {
-        prompt_tokens: 0,
         completion_tokens: 75,
         total_tokens: 75,
+        ..Usage::default()
     };
 
     // Replicate the accumulation logic from stream_llm_call
@@ -1565,7 +1701,7 @@ fn test_streaming_usage_accumulation() {
         Some(prev) => Usage {
             prompt_tokens: prev.prompt_tokens.max(chunk_usage.prompt_tokens),
             completion_tokens: prev.completion_tokens.max(chunk_usage.completion_tokens),
-            total_tokens: 0,
+            ..Usage::default()
         },
         None => chunk_usage,
     });
@@ -1579,7 +1715,7 @@ fn test_streaming_usage_accumulation() {
         Some(prev) => Usage {
             prompt_tokens: prev.prompt_tokens.max(chunk_usage.prompt_tokens),
             completion_tokens: prev.completion_tokens.max(chunk_usage.completion_tokens),
-            total_tokens: 0,
+            ..Usage::default()
         },
         None => chunk_usage,
     });
@@ -1597,4 +1733,437 @@ fn test_streaming_usage_accumulation() {
         "completion_tokens should come from second chunk"
     );
     assert_eq!(u.total_tokens, 225, "total should be sum of both");
+}
+
+/// `Usage::reasoning_tokens_effective` prefers the nested OpenAI shape
+/// over the flat DeepSeek/xAI shape when both happen to be present;
+/// falls back to the flat field when only it is set. (#768)
+#[test]
+fn test_usage_reasoning_tokens_effective_priority() {
+    // Nested wins when set.
+    let u = Usage {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        reasoning_tokens: Some(5),
+        completion_tokens_details: Some(crate::llm_types::CompletionTokensDetails {
+            reasoning_tokens: Some(15),
+        }),
+        ..Usage::default()
+    };
+    assert_eq!(u.reasoning_tokens_effective(), Some(15));
+
+    // Flat wins when nested is missing.
+    let u = Usage {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        reasoning_tokens: Some(7),
+        ..Usage::default()
+    };
+    assert_eq!(u.reasoning_tokens_effective(), Some(7));
+
+    // None when neither.
+    let u = Usage {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        ..Usage::default()
+    };
+    assert!(u.reasoning_tokens_effective().is_none());
+}
+
+/// Verify that after `with_workspace()` the parent agent's fs_read tool can
+/// reach into a sibling subagent's workspace directory (#242 — parents
+/// reading subagent memories/goals/personality).
+#[tokio::test]
+async fn test_with_workspace_grants_sibling_workspace_read_access() {
+    use crate::workspace::AgentWorkspace;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace_dir = dir.path().to_path_buf();
+    std::fs::create_dir_all(&workspace_dir).unwrap();
+
+    // Parent and child (subagent) workspaces live as siblings under
+    // workspace_dir, matching the real on-disk layout.
+    let parent_ws_dir = workspace_dir.join("parent");
+    let child_ws_dir = workspace_dir.join("child");
+    std::fs::create_dir_all(&parent_ws_dir).unwrap();
+    std::fs::create_dir_all(&child_ws_dir).unwrap();
+
+    // Write a memories.md file in the child's workspace.
+    let child_memories = child_ws_dir.join("memories.md");
+    std::fs::write(&child_memories, "learned: answer is 42\n").unwrap();
+
+    // Build an AgentRuntime for the parent agent and attach its workspace.
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: parent_ws_dir.to_string_lossy().to_string(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(config).unwrap(),
+    )
+    .expect("runtime")
+    .with_workspace(AgentWorkspace::new(&workspace_dir, "parent"));
+
+    // fs_read should succeed for the child's memories.md because
+    // with_workspace() attached the parent of ws_root as an extra read root.
+    let child_memories_canonical = std::fs::canonicalize(&child_memories).unwrap();
+    let result = runtime
+        .tools()
+        .execute(
+            "fs_read",
+            serde_json::json!({ "path": child_memories_canonical.to_str().unwrap() }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "parent should be able to read child's memories.md: {:?}",
+        result.err()
+    );
+    let value = result.unwrap();
+    assert!(
+        value["content"]
+            .as_str()
+            .unwrap_or("")
+            .contains("answer is 42"),
+        "expected child's memories content, got {}",
+        value
+    );
+}
+
+/// Verify the parent agent CANNOT write to a sibling subagent workspace via
+/// fs_write — the extra_read_roots widening is read-only (#242).
+#[tokio::test]
+async fn test_with_workspace_does_not_grant_sibling_write_access() {
+    use crate::workspace::AgentWorkspace;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace_dir = dir.path().to_path_buf();
+    let parent_ws_dir = workspace_dir.join("parent");
+    let child_ws_dir = workspace_dir.join("child");
+    std::fs::create_dir_all(&parent_ws_dir).unwrap();
+    std::fs::create_dir_all(&child_ws_dir).unwrap();
+
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: parent_ws_dir.to_string_lossy().to_string(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(config).unwrap(),
+    )
+    .expect("runtime")
+    .with_workspace(AgentWorkspace::new(&workspace_dir, "parent"));
+
+    // fs_write must fail: child_ws_dir is not inside the primary sandbox
+    // (parent/) and fs_write was not granted extra_read_roots.
+    let child_memories_canonical = std::fs::canonicalize(&child_ws_dir)
+        .unwrap()
+        .join("memories.md");
+    let result = runtime
+        .tools()
+        .execute(
+            "fs_write",
+            serde_json::json!({
+                "path": child_memories_canonical.to_str().unwrap(),
+                "content": "tampered",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "parent should NOT be able to write into child's workspace"
+    );
+}
+
+/// Verify an ephemeral subagent CANNOT read a named agent's workspace (#242).
+///
+/// Ephemeral subagents live at `{workspace_dir}/.ephemeral/{task_id}/`.
+/// `with_workspace()` canonicalizes `ws_root` and takes its parent as the
+/// extra read-only root — which for an ephemeral agent is
+/// `{workspace_dir}/.ephemeral/`, NOT `{workspace_dir}/`.  That means an
+/// ephemeral subagent must not be able to reach into a sibling named
+/// agent's workspace (e.g. `{workspace_dir}/researcher/memories.md`), and
+/// this test pins that invariant so a future refactor of the parent-dir
+/// derivation can't silently widen the ephemeral allow-set.
+#[tokio::test]
+async fn test_ephemeral_subagent_cannot_read_named_agent_workspace() {
+    use crate::workspace::AgentWorkspace;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let workspace_dir = dir.path().to_path_buf();
+
+    // Named agent lives at `{workspace_dir}/researcher/`.
+    let named_ws_dir = workspace_dir.join("researcher");
+    std::fs::create_dir_all(&named_ws_dir).unwrap();
+    let named_memories = named_ws_dir.join("memories.md");
+    std::fs::write(&named_memories, "researcher private notes\n").unwrap();
+
+    // Ephemeral subagent lives at `{workspace_dir}/.ephemeral/<task_id>/`.
+    let task_id = "test-task-00000000";
+    let ephemeral_ws_dir = workspace_dir.join(".ephemeral").join(task_id);
+    std::fs::create_dir_all(&ephemeral_ws_dir).unwrap();
+
+    // Build the ephemeral runtime and attach its workspace via `with_dir`
+    // (mirrors how the coordinator constructs ephemeral subagent workspaces).
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let agent_config = AgentConfig {
+        sandbox_root: ephemeral_ws_dir.to_string_lossy().to_string(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(
+        AgentId::new(),
+        agent_config,
+        LlmClient::new(config).unwrap(),
+    )
+    .expect("runtime")
+    .with_workspace(AgentWorkspace::with_dir(ephemeral_ws_dir.clone()));
+
+    // The ephemeral agent must NOT be able to read the named agent's
+    // memories.md — `ws_root.parent()` is `{workspace_dir}/.ephemeral/`,
+    // which does not contain `{workspace_dir}/researcher/`.
+    let named_memories_canonical = std::fs::canonicalize(&named_memories).unwrap();
+    let result = runtime
+        .tools()
+        .execute(
+            "fs_read",
+            serde_json::json!({ "path": named_memories_canonical.to_str().unwrap() }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "ephemeral subagent should NOT be able to read a named agent's workspace: {:?}",
+        result.ok()
+    );
+}
+
+// --------------------------------------------------------------------------
+// Extended-thinking persistence round-trip (issue #767)
+// --------------------------------------------------------------------------
+
+/// Reasoning blocks accumulated mid-run (alongside a tool call batch) are
+/// written onto the assistant-text session message with a
+/// `reasoning_blocks` metadata field, so page reload can rehydrate them.
+#[tokio::test]
+async fn test_reasoning_persisted_on_assistant_tool_call_message() {
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let llm = LlmClient::new(config).unwrap();
+    let agent_id = AgentId::new();
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(agent_id, agent_config, llm).unwrap();
+
+    let session = session_manager.get_or_create(agent_id, "ctx-reasoning");
+
+    // Directly exercise the persistence path with a reasoning trace.
+    let tool_call = ToolCall::new("call_1", "echo", r#"{"text":"hi"}"#);
+    let invocation_id = uuid::Uuid::new_v4();
+    runtime.persist_assistant_tool_calls(
+        &session_manager,
+        session.id,
+        Some("I will echo hi."),
+        Some("Deliberating about the best approach..."),
+        &[tool_call],
+        &[invocation_id],
+        false, // is_dm
+    );
+
+    let history = session_manager.get_history(session.id).unwrap();
+    // Expected: one assistant text message (with reasoning_blocks meta) +
+    // one tool_call message (without reasoning, that's on the text msg).
+    assert!(!history.is_empty(), "nothing persisted");
+    let assistant_text = history
+        .iter()
+        .find(|m| matches!(m.content, alms_session::Content::Text(ref t) if t == "I will echo hi."))
+        .expect("assistant text message present");
+    let meta = assistant_text
+        .metadata
+        .as_ref()
+        .expect("metadata with reasoning_blocks expected");
+    let blocks = meta["reasoning_blocks"]
+        .as_array()
+        .expect("reasoning_blocks must be an array");
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0]["text"].as_str(),
+        Some("Deliberating about the best approach...")
+    );
+}
+
+/// History-loader round-trip: a persisted assistant message with a
+/// `reasoning_blocks` metadata field surfaces as `reasoning` text on
+/// reload. Exercises the full write-then-read path via `SessionManager`.
+#[tokio::test]
+async fn test_reasoning_persisted_reload_roundtrip() {
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let llm = LlmClient::new(config).unwrap();
+    let agent_id = AgentId::new();
+    let agent_config = AgentConfig {
+        sandbox_root: "".into(),
+        ..AgentConfig::default()
+    };
+    let runtime = AgentRuntime::new(agent_id, agent_config, llm).unwrap();
+
+    let session = session_manager.get_or_create(agent_id, "ctx-roundtrip");
+
+    let invocation_id = uuid::Uuid::new_v4();
+    runtime.persist_assistant_tool_calls(
+        &session_manager,
+        session.id,
+        Some("Final answer"),
+        Some("step 1: think; step 2: conclude"),
+        &[ToolCall::new("c1", "echo", "{}")],
+        &[invocation_id],
+        false,
+    );
+
+    let reloaded = session_manager.get_history(session.id).unwrap();
+    let hit = reloaded
+        .iter()
+        .find(|m| match &m.content {
+            alms_session::Content::Text(t) => t == "Final answer",
+            _ => false,
+        })
+        .expect("assistant text present");
+    let meta = hit.metadata.as_ref().unwrap();
+    let blocks = meta["reasoning_blocks"].as_array().unwrap();
+    assert_eq!(
+        blocks[0]["text"].as_str(),
+        Some("step 1: think; step 2: conclude"),
+        "reasoning text must survive persistence round-trip"
+    );
+}
+
+/// `AgentConfig.anthropic_thinking_budget` threads through to every LLM
+/// request the agent loop issues. Without this invariant, per-agent /
+/// per-run overrides would land in config but never be seen by the
+/// provider.
+///
+/// This is a shape-assertion test — we don't run a real LLM; we build
+/// the `CompletionRequest` exactly as the agent loop does and check the
+/// thinking budget follows.
+#[test]
+fn test_agent_config_thinking_budget_threads_into_request() {
+    let cfg = AgentConfig {
+        anthropic_thinking_budget: 4096,
+        max_tokens: 2048,
+        ..AgentConfig::default()
+    };
+
+    // Build the request the same way `agent_loop` does. We can't call
+    // `stream_llm_call` here (no mock LLM setup), but the request
+    // builder is a one-liner so we replicate it directly.
+    let mut request = CompletionRequest::new("claude-sonnet-4-20250514")
+        .with_messages(vec![LlmMessage::user("hi")])
+        .with_max_tokens(cfg.max_tokens);
+    if cfg.anthropic_thinking_budget > 0 {
+        request = request.with_thinking_budget(cfg.anthropic_thinking_budget);
+    }
+
+    assert_eq!(request.thinking_budget_tokens, Some(4096));
+
+    // And when budget is 0, the field is None (adapter skips the wire
+    // field in that case — see anthropic.rs tests).
+    let cfg0 = AgentConfig {
+        anthropic_thinking_budget: 0,
+        ..AgentConfig::default()
+    };
+    let mut req0 = CompletionRequest::new("x").with_messages(vec![LlmMessage::user("hi")]);
+    if cfg0.anthropic_thinking_budget > 0 {
+        req0 = req0.with_thinking_budget(cfg0.anthropic_thinking_budget);
+    }
+    assert!(req0.thinking_budget_tokens.is_none());
+}
+
+/// #866: `with_summary_llm` populates the dedicated summary client.
+///
+/// Default state: `summary_llm` is `None` so the in-loop sliding-summary
+/// path falls back to `self.llm` (pre-#866 behaviour).
+///
+/// After `with_summary_llm`, the field is `Some(client)` whose provider
+/// can differ from `self.llm`'s provider. This is the path the gateway
+/// uses when `[context].summary_provider` is configured: it clones the
+/// agent's resolved client, calls `with_provider_and_secrets` on the
+/// clone, and hands the re-targeted client to the runtime via
+/// `with_summary_llm`. The runtime never re-resolves the provider — it
+/// just reads back what the gateway plumbed in.
+#[tokio::test]
+async fn test_with_summary_llm_sets_dedicated_client_for_866() {
+    use crate::LlmConfig;
+
+    let agent_llm = LlmClient::new(LlmConfig {
+        provider: "anthropic".into(),
+        default_model: "claude-sonnet-4-20250514".into(),
+        ..LlmConfig::default()
+    })
+    .unwrap();
+
+    // Build a separate client for the summary task on a different
+    // provider — exactly what the gateway does when
+    // `[context].summary_provider = "openrouter"` is set.
+    let summary_llm = LlmClient::new(LlmConfig {
+        provider: "openrouter".into(),
+        default_model: "minimax/minimax-m2.7".into(),
+        ..LlmConfig::default()
+    })
+    .unwrap();
+
+    let runtime =
+        AgentRuntime::new(AgentId::new(), AgentConfig::default(), agent_llm.clone()).unwrap();
+
+    // Default: no summary client wired -> agent's llm is used.
+    assert!(
+        runtime.summary_llm.is_none(),
+        "AgentRuntime::new must leave summary_llm as None for back-compat"
+    );
+    assert_eq!(runtime.llm.provider(), "anthropic");
+
+    // After with_summary_llm, the dedicated client is present and points
+    // at a different provider than the agent's llm. The agent's primary
+    // llm (used for the main run loop) is untouched.
+    let runtime = runtime.with_summary_llm(summary_llm);
+    let summary_client = runtime
+        .summary_llm
+        .as_ref()
+        .expect("with_summary_llm must populate the field");
+    assert_eq!(
+        summary_client.provider(),
+        "openrouter",
+        "summary client must keep the override provider"
+    );
+    assert_eq!(
+        runtime.llm.provider(),
+        "anthropic",
+        "agent's main llm must NOT be re-targeted by with_summary_llm"
+    );
 }

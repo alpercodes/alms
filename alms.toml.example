@@ -72,6 +72,24 @@ summary_interval = 30
 #   "llm"       - rich summary via agent's model (or summary_model if configured).
 # Override with: ALMS_RUN_SUMMARY_MODE=heuristic
 run_summary_mode = "off"
+# Optional cheaper model for the summary task (issue #866). Falls back to the
+# agent's default model when commented out.
+# summary_model = "minimax/minimax-m2.7"
+# Optional dedicated provider for the summary task. When set, the summary
+# client is re-targeted at this provider via `with_provider_and_secrets` so
+# `summary_model` can be a slug for a different provider than the agent
+# (e.g. agent on Anthropic, summary on OpenRouter). Must reference a
+# configured `[llm.providers.<name>]` block whose API key is resolvable.
+# Leave commented out to inherit the agent's resolved provider.
+#
+# IMPORTANT (#871): set `summary_model` and `summary_provider` together.
+# The agent's resolved model belongs to the AGENT's provider namespace
+# and is NOT a safe fallback for the summary provider's wire — `PATCH
+# /settings` rejects this combination, and the runtime applies a leak
+# guard for hand-edited TOML configs that clears the model so the wire
+# fails fast rather than 404'ing on the summary provider with the
+# agent provider's model name.
+# summary_provider = "openrouter"
 # Max tokens for episodic run summaries injected into context window.
 # Hard-capped at 15% of max_input_tokens — values above the cap are clamped.
 # Override with: ALMS_RUN_SUMMARY_BUDGET=4000

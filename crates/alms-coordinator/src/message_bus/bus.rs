@@ -199,26 +199,31 @@ impl MessageSender for MessageBus {
         // not overwrite the original source. We use `or_insert` to preserve
         // the first entry.
         //
-        // IMPORTANT: Only record a source session when the sender is running
-        // on a user-facing session (chat or telegram). An agent triggered by
-        // one DM may call send_message to a *different* peer, in which case
-        // sender_session_id is the first DM session — recording that would
-        // route the notification to the wrong DM instead of the agent's
-        // web-chat. The original guard only rejected the *same* DM session
-        // (`sid != dm_session_id`), which missed cross-DM scenarios. See #656.
+        // IMPORTANT: Record a source session unless it is (a) an internal
+        // non-conversational session (notification, subagent, episodic, job),
+        // or (b) the *same* DM session that this send creates — a DM session
+        // cannot be its own source.  Other DM sessions ARE valid sources
+        // (cross-DM scenario: Alice is in DM-with-Bob and sends to Charlie;
+        // the DM-with-Bob session is Alice's source for the Alice→Charlie DM).
+        // See #656 (original same-DM guard) and #680 (whitelist overcorrection).
         if let Some(sid) = sender_session_id {
-            let is_user_facing = self
+            let is_valid_source = self
                 .session_manager
                 .get(sid)
                 .ok()
                 .map(|s| {
-                    matches!(
-                        alms_core::classify_session_type(&s.context_id),
-                        "chat" | "telegram"
-                    )
+                    let session_type = alms_core::classify_session_type(&s.context_id);
+                    // Reject internal/non-conversational session types.
+                    let not_internal = !matches!(
+                        session_type,
+                        "notification" | "subagent" | "episodic" | "job"
+                    );
+                    // Reject the same DM session — it cannot be its own source.
+                    let not_same_dm = s.context_id != dm_context;
+                    not_internal && not_same_dm
                 })
                 .unwrap_or(false);
-            if is_user_facing {
+            if is_valid_source {
                 let key = (dm_context.clone(), sender_name.to_string());
                 // or_insert preserves the first entry. This matters when an
                 // agent's initial send_message is from a web-chat session, but
@@ -460,7 +465,7 @@ impl MessageSender for MessageBus {
             source: MessageSource::ConversationEnded {
                 from_agent: sender_agent_id,
                 from_name: sender_name.to_string(),
-                reason,
+                reason: reason.clone(),
                 source_session_id: peer_source_session,
             },
             context_id: target_context_id,

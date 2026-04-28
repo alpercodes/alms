@@ -347,6 +347,7 @@ mod tests {
             TokenUsage {
                 prompt_tokens: 100,
                 completion_tokens: 50,
+                ..TokenUsage::default()
             },
         );
         store.save_run(&run).unwrap();
@@ -380,6 +381,7 @@ mod tests {
             params: Some(r#"{"cmd":"ls"}"#.to_string()),
             result: None,
             timestamp: chrono::Utc::now(),
+            from_agent: None,
         };
         store.save_tool_call(run.run_id, &tc).unwrap();
 
@@ -406,6 +408,7 @@ mod tests {
                 TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    ..TokenUsage::default()
                 },
             );
             store.save_run(&run).unwrap();
@@ -429,6 +432,7 @@ mod tests {
                 TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    ..TokenUsage::default()
                 },
             );
             store.save_run(&run).unwrap();
@@ -558,6 +562,7 @@ mod tests {
                 TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    ..TokenUsage::default()
                 },
             );
             store.save_run(&run).unwrap();
@@ -765,6 +770,7 @@ mod tests {
                 TokenUsage {
                     prompt_tokens: 10,
                     completion_tokens: 5,
+                    ..TokenUsage::default()
                 },
             );
             store.save_run(&run).unwrap();
@@ -807,6 +813,7 @@ mod tests {
             TokenUsage {
                 prompt_tokens: 50,
                 completion_tokens: 20,
+                ..TokenUsage::default()
             },
         );
         store.save_run(&run).unwrap();

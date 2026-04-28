@@ -1,0 +1,149 @@
+/* ══════════════════════════════════════════════════════════════════════
+   Header
+   ══════════════════════════════════════════════════════════════════════ */
+
+header {
+  height: var(--header-height);
+  flex-shrink: 0;
+  padding: 0 var(--space-4);
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+header h1 {
+  font-size: var(--text-lg);
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.08em;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.header-sep {
+  color: var(--text-disabled);
+  font-size: var(--text-sm);
+  flex-shrink: 0;
+}
+
+.header-agent {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--text-primary);
+  cursor: pointer;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-md);
+  border: none;
+  background: none;
+  transition: background var(--duration-normal);
+}
+.header-agent:hover { background: var(--surface-3); color: var(--text-primary); }
+.header-agent svg { opacity: 0.5; }
+
+/* Agent select — terminal style */
+#agent-select {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--text-primary);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-1) var(--space-2);
+  cursor: pointer;
+  outline: none;
+  max-width: 200px;
+}
+#agent-select:hover { border-color: var(--border-strong); color: var(--text-primary); }
+#agent-select:focus { border-color: var(--accent); }
+#agent-select option { background: var(--surface-2); color: var(--text-primary); }
+
+.header-spacer { flex: 1; }
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--text-disabled);
+  flex-shrink: 0;
+}
+.status-dot.ok { background: var(--success); border-radius: var(--radius-full); }
+.status-dot.running { background: var(--warning); border-radius: var(--radius-full); animation: pulse 1.5s ease-in-out infinite; }
+.status-dot.error { background: var(--error); border-radius: 0; }
+
+#status {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+#posture-badge {
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--surface-3);
+  color: var(--text-muted);
+  flex-shrink: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+#posture-badge.guarded { color: var(--warning); background: var(--warning-muted); }
+#posture-badge.autonomous { color: var(--info); background: var(--info-muted); }
+
+.header-icon-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all var(--duration-normal);
+}
+.header-icon-btn:hover { background: var(--surface-3); color: var(--text-primary); }
+.header-icon-btn.active { color: var(--accent); }
+
+/* Legacy header buttons — restyle for compatibility */
+.header-btns { display: flex; gap: var(--space-1); }
+.hbtn {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  font-weight: 500;
+  background: none;
+  color: var(--text-muted);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: all var(--duration-normal);
+}
+.hbtn:hover { color: var(--text-primary); background: var(--surface-3); }
+.hbtn.active { color: var(--accent); background: var(--accent-muted); }
+
+/* Sidebar toggle — hidden on desktop, shown via media query */
+.sidebar-toggle-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all var(--duration-normal);
+  flex-shrink: 0;
+}
+.sidebar-toggle-btn:hover { background: var(--surface-3); color: var(--text-primary); }
+
+/* Sidebar backdrop — hidden by default, shown via media query when sidebar is open */
+.sidebar-backdrop { display: none; }

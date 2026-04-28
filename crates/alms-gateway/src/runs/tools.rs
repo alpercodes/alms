@@ -70,6 +70,12 @@ impl alms_tools::EventForwarder for RuntimeEventForwarder {
         });
     }
 
+    fn forward_reasoning_delta(&self, text: String, source_agent: Option<String>) {
+        let _ = self
+            .tx
+            .send(RuntimeEvent::ReasoningDelta { text, source_agent });
+    }
+
     fn forward_status(&self, phase: String, detail: Option<String>) {
         let _ = self.tx.send(RuntimeEvent::Status { phase, detail });
     }
@@ -131,6 +137,15 @@ pub(super) async fn forward_runtime_events(
                     )
                     .await;
             }
+            RuntimeEvent::ReasoningDelta { text, source_agent } => {
+                run_manager
+                    .send_event(
+                        run_id,
+                        session_id,
+                        SseEventData::reasoning_delta(run_id, &text, source_agent),
+                    )
+                    .await;
+            }
             RuntimeEvent::ToolStart {
                 invocation_id,
                 tool,
@@ -176,11 +191,12 @@ pub(super) async fn forward_runtime_events(
                     .await;
             }
             RuntimeEvent::Status { phase, detail } => {
-                // Cross-forward key DM status phases to the webchat session
-                // so the status bar stays up to date (#651).
-                if let Some(ref dm_info) = dm_cross_session
-                    && matches!(phase.as_str(), "calling_llm" | "executing_tools")
-                {
+                // Cross-forward ALL DM status phases to the webchat session
+                // so the status bar stays up to date (#651, #688).
+                // Previously only `calling_llm` and `executing_tools` were
+                // forwarded, causing the status bar to go blank during
+                // `building_context` and `summarizing` phases.
+                if let Some(ref dm_info) = dm_cross_session {
                     // Resolve the webchat session once and cache the result.
                     let webchat_sid = *cached_webchat_session.get_or_insert_with(|| {
                         super::find_user_facing_session(&session_manager, dm_info.agent_id)

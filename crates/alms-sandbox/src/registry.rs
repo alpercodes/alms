@@ -1,6 +1,5 @@
-use crate::sandbox::SandboxConfig;
 #[cfg(test)]
-use crate::{NativeTool, ToolDef, WasmTool};
+use crate::NativeTool;
 use crate::{SandboxError, Tool, error::SandboxResult};
 use dashmap::DashMap;
 use serde_json::Value;
@@ -12,10 +11,6 @@ use tracing::{debug, error, info, warn};
 pub struct ToolRegistry {
     /// Registered tools: name -> tool
     tools: Arc<DashMap<String, Arc<dyn Tool>>>,
-    /// Default sandbox config for WASM tools (currently only used in test builds;
-    /// will be used in production when WASM tool loading is wired).
-    #[allow(dead_code)]
-    default_config: SandboxConfig,
     /// When non-empty, only tools whose name appears in this list can be
     /// registered. This filter applies to **all** `register()` calls —
     /// both initial builtins and dynamically added tools (invoke_agent,
@@ -29,7 +24,6 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: Arc::new(DashMap::new()),
-            default_config: SandboxConfig::default(),
             enabled_filter: Arc::new(Vec::new()),
         }
     }
@@ -155,7 +149,8 @@ impl ToolRegistry {
         enabled: &[String],
     ) {
         use crate::builtin::{
-            DatetimeTool, EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
+            DatetimeTool, EchoTool, FsEditTool, FsGlobTool, FsGrepTool, FsListTool, FsReadTool,
+            FsWriteTool, HttpGetTool, MathTool,
         };
         use crate::shell::{SHELL_TOOL_ALIAS, SHELL_TOOL_NAME, ShellTool};
 
@@ -164,13 +159,23 @@ impl ToolRegistry {
             sandbox_root.clone(),
             shell_unrestricted,
         ));
-        let (fs_read, fs_write, fs_list) = match sandbox_root {
+        let (fs_read, fs_write, fs_list, fs_edit, fs_grep, fs_glob) = match sandbox_root {
             Some(ref root) => (
                 FsReadTool::sandboxed(root.clone()),
                 FsWriteTool::sandboxed(root.clone()),
                 FsListTool::sandboxed(root.clone()),
+                FsEditTool::sandboxed(root.clone()),
+                FsGrepTool::sandboxed(root.clone()),
+                FsGlobTool::sandboxed(root.clone()),
             ),
-            None => (FsReadTool::new(), FsWriteTool::new(), FsListTool::new()),
+            None => (
+                FsReadTool::new(),
+                FsWriteTool::new(),
+                FsListTool::new(),
+                FsEditTool::new(),
+                FsGrepTool::new(),
+                FsGlobTool::new(),
+            ),
         };
 
         let all_tools: Vec<Arc<dyn Tool>> = vec![
@@ -182,6 +187,9 @@ impl ToolRegistry {
             Arc::new(fs_read),
             Arc::new(fs_write),
             Arc::new(fs_list),
+            Arc::new(fs_edit),
+            Arc::new(fs_grep),
+            Arc::new(fs_glob),
         ];
 
         let builtin_names: Vec<String> = all_tools.iter().map(|t| t.name().to_string()).collect();
@@ -256,37 +264,12 @@ impl Default for ToolRegistry {
 
 #[cfg(test)]
 impl ToolRegistry {
-    /// Create a new registry with custom default config (test-only).
-    pub fn with_config(config: SandboxConfig) -> Self {
-        Self {
-            tools: Arc::new(DashMap::new()),
-            default_config: config,
-            enabled_filter: Arc::new(Vec::new()),
-        }
-    }
-
     /// Register a native tool (test-only).
     pub fn register_native<F>(&self, name: impl Into<String>, handler: F) -> SandboxResult<()>
     where
         F: Fn(Value) -> SandboxResult<Value> + Send + Sync + 'static,
     {
         let tool = NativeTool::new(name, handler);
-        self.register(Arc::new(tool))
-    }
-
-    /// Register a WASM tool from definition (test-only).
-    pub fn register_wasm(&self, def: ToolDef) -> SandboxResult<()> {
-        let tool = WasmTool::new(def, self.default_config.clone())?;
-        self.register(Arc::new(tool))
-    }
-
-    /// Register a WASM tool with custom config (test-only).
-    pub fn register_wasm_with_config(
-        &self,
-        def: ToolDef,
-        config: SandboxConfig,
-    ) -> SandboxResult<()> {
-        let tool = WasmTool::new(def, config)?;
         self.register(Arc::new(tool))
     }
 
@@ -309,15 +292,6 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// List WASM tools (test-only).
-    pub fn list_wasm(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .filter(|e| e.value().is_wasm())
-            .map(|e| e.key().clone())
-            .collect()
-    }
-
     /// Get the number of registered tools (test-only).
     pub fn len(&self) -> usize {
         self.tools.len()
@@ -332,16 +306,6 @@ impl ToolRegistry {
     pub fn clear(&self) {
         self.tools.clear();
         info!("Cleared all tools from registry");
-    }
-
-    /// Get the default sandbox config (test-only).
-    pub fn default_config(&self) -> &SandboxConfig {
-        &self.default_config
-    }
-
-    /// Set the default sandbox config (test-only).
-    pub fn set_default_config(&mut self, config: SandboxConfig) {
-        self.default_config = config;
     }
 }
 
@@ -448,8 +412,11 @@ mod tests {
         assert!(registry.contains("fs_read"));
         assert!(registry.contains("fs_write"));
         assert!(registry.contains("fs_list"));
-        // 8 builtins + 1 alias (shell_exec -> shell) = 9 entries
-        assert_eq!(registry.len(), 9);
+        assert!(registry.contains("fs_edit"));
+        assert!(registry.contains("fs_grep"));
+        assert!(registry.contains("fs_glob"));
+        // 11 builtins + 1 alias (shell_exec -> shell) = 12 entries
+        assert_eq!(registry.len(), 12);
     }
 
     #[test]
@@ -486,7 +453,7 @@ mod tests {
             .register_native("invoke_agent", |_| Ok(Value::Null))
             .unwrap();
         assert!(registry.contains("invoke_agent"));
-        assert_eq!(registry.len(), 10); // 8 builtins + 1 alias + 1 dynamic
+        assert_eq!(registry.len(), 13); // 11 builtins + 1 alias + 1 dynamic
     }
 
     #[test]

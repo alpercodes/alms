@@ -1,4 +1,6 @@
-use alms_core::config::ContextConfig;
+use alms_core::config::{
+    ContextConfig, ShellClassificationMode, ShellPermissions, ShellSpillConfig,
+};
 
 /// Execution posture: controls whether tools require approval before running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,8 +78,6 @@ pub struct AgentConfig {
     pub system_prompt: String,
     /// Staged system prompts for the agent loop.
     pub prompts: SystemPrompts,
-    /// Maximum iterations for tool loops
-    pub max_iterations: u32,
     /// Maximum tokens per response
     pub max_tokens: u32,
     /// Context window management config
@@ -88,12 +88,85 @@ pub struct AgentConfig {
     pub sandbox_root: String,
     /// Shell execution policy: "sandboxed" or "unrestricted".
     pub shell_policy: String,
+    /// Permission-based allow/deny list for shell commands.
+    /// Regex patterns matched against commands before execution.
+    pub shell_permissions: ShellPermissions,
+    /// Built-in risk classification mode for shell commands.
+    /// Layers with `shell_permissions` — both must pass before execution.
+    pub shell_classification_mode: ShellClassificationMode,
+    /// Large-output spill-to-disk policy for the shell tool (issue #756).
+    ///
+    /// Mirrors the plumbing of [`shell_permissions`]/[`shell_classification_mode`]:
+    /// populated from `[tools.shell_spill]` in the gateway's config assembly
+    /// and propagated to subagents in the coordinator so their shell tools
+    /// inherit the same spill policy as the parent. Config-file-only — not
+    /// mutable via `PATCH /settings`.
+    pub shell_spill: ShellSpillConfig,
     /// Enabled builtin tools. Empty = all enabled (backward compatible).
     pub enabled_tools: Vec<String>,
+    /// Enable the multi-stage fuzzy-match replacer cascade in `fs_edit`.
+    /// Off by default — opt-in per agent via `tools.fs_edit.fuzzy_match`
+    /// in `alms.toml`. See issue #755.
+    pub fs_edit_fuzzy_match: bool,
     /// When true, the runtime emits a `ContextDebug` event after building
     /// the context window, allowing the web UI to display exactly what the
     /// LLM sees (system prompt, history, tools, token counts).
     pub debug_mode: bool,
+    /// Extended-thinking budget for Anthropic Claude 4.x, in tokens.
+    ///
+    /// `0` disables extended thinking for this agent (no `thinking` field
+    /// on outgoing requests, no reasoning deltas). Non-zero values enable
+    /// it and govern how many tokens the model may spend on internal
+    /// reasoning before emitting its final response.
+    ///
+    /// Populated by the gateway via the three-layer precedence chain
+    /// (per-run > per-agent > server default from `[llm.anthropic]`).
+    /// Silently ignored when the effective provider is not Anthropic.
+    pub anthropic_thinking_budget: u32,
+    /// Anthropic prompt caching toggle (#766).
+    ///
+    /// Server-level only — no per-agent / per-run override per issue #766.
+    /// When `true`, the Anthropic adapter attaches `cache_control` markers
+    /// to the last tool and trailing system block on every request.
+    /// Defaults to `true` — prompt caching is free (Anthropic silently
+    /// ignores markers on prefixes below the minimum cacheable size), so
+    /// there's no downside to leaving it on.
+    ///
+    /// Populated from `[llm.anthropic].prompt_cache_enabled` in `alms.toml`
+    /// via the gateway's `AgentConfig` assembly. Inherited by subagents.
+    pub anthropic_prompt_cache_enabled: bool,
+    /// OpenAI-compat reasoning effort (#768). Applies when the effective
+    /// provider is OpenAI-compatible and the model is a reasoning model
+    /// (OpenAI o-series, GPT-5, xAI Grok reasoning variants). The adapter
+    /// in [`crate::llm_client`] strips the value for DeepSeek R1
+    /// (reasoning is implicit there) and non-reasoning OpenAI models
+    /// (gpt-4o etc. would 400 on the unknown param).
+    ///
+    /// Populated by the gateway via the three-layer precedence chain
+    /// (per-run > per-agent > server default from `[llm.openai]`).
+    pub openai_reasoning_effort: Option<alms_core::config::ReasoningEffort>,
+    /// Extended-thinking budget for Gemini 2.5+, in tokens (#769).
+    ///
+    /// `None` or `Some(0)` disables thinking (no `thinkingConfig` on the
+    /// wire). Non-zero values enable it and govern how many tokens the
+    /// model may spend on internal reasoning.
+    ///
+    /// Populated by the gateway via the three-layer precedence chain
+    /// (per-run > per-agent > server default from `[llm.gemini]`).
+    /// Silently ignored when the effective provider is not Gemini.
+    pub gemini_thinking_budget: Option<u32>,
+    /// Gemini explicit context-caching toggle (#769).
+    ///
+    /// Server-level only — no per-agent / per-run override per issue #769.
+    /// When `true`, the Gemini adapter creates a `cachedContents`
+    /// resource for the stable prefix (system instruction + tool
+    /// definitions) on the first turn of a session and references it on
+    /// subsequent turns. Populated from `[llm.gemini].cache_enabled` in
+    /// `alms.toml`; inherited verbatim by subagents.
+    pub gemini_cache_enabled: bool,
+    /// Gemini cache TTL in seconds (#769). Sent as `ttl` when creating a
+    /// new cache entry. Defaults to 300; see [`alms_core::config::GeminiConfig::cache_ttl_seconds`].
+    pub gemini_cache_ttl_seconds: u64,
 }
 
 impl Default for AgentConfig {
@@ -101,14 +174,30 @@ impl Default for AgentConfig {
         Self {
             system_prompt: include_str!("../../prompts/initial.md").trim().to_string(),
             prompts: SystemPrompts::default(),
-            max_iterations: 10,
             max_tokens: 100_000,
             context_config: ContextConfig::default(),
             posture: Posture::default(),
             sandbox_root: ".".into(),
             shell_policy: "sandboxed".into(),
+            shell_permissions: ShellPermissions::default(),
+            shell_classification_mode: ShellClassificationMode::default(),
+            shell_spill: ShellSpillConfig::default(),
             enabled_tools: Vec::new(),
+            fs_edit_fuzzy_match: false,
             debug_mode: false,
+            anthropic_thinking_budget: 0,
+            // Caching is on by default — matches `AnthropicConfig::default()`
+            // and is the right answer for every effective provider because
+            // non-Anthropic adapters ignore the flag entirely.
+            anthropic_prompt_cache_enabled: true,
+            openai_reasoning_effort: None,
+            // Gemini thinking is off by default, like Anthropic thinking.
+            gemini_thinking_budget: None,
+            // Gemini caching mirrors Anthropic caching — on by default;
+            // adapter is a no-op when the effective provider isn't Gemini.
+            gemini_cache_enabled: true,
+            // 5 minutes — mirrors Anthropic ephemeral caching.
+            gemini_cache_ttl_seconds: 300,
         }
     }
 }

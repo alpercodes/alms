@@ -9,6 +9,18 @@
 //! `is_synthetic_marker` in `alms-tools` can filter on with a single
 //! field check.
 //!
+//! # Markers are NOT part of the LLM context
+//!
+//! Markers exist for UI rendering and persistence only. The canonical
+//! message-shape invariant (see `alms-runtime::context` module docs, and
+//! `ContextBuilder::strip_mid_history_system_markers`) strips every
+//! `Role::System` message that appears after the first non-system entry
+//! before the message list reaches the provider adapter — so any marker
+//! written here will surface via SSE/UI but will never be fed to the LLM.
+//! The agent still receives the relevant payload via the
+//! `notification_input` user message that `lifecycle.rs` pre-persists
+//! alongside the marker.
+//!
 //! See issue #627 and Tim's architectural audit (#613).
 
 use alms_core::SessionId;

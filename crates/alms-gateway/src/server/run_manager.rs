@@ -314,6 +314,39 @@ impl RunManager {
         cancelled
     }
 
+    /// Cancel any active (queued/running) runs on a given session.
+    ///
+    /// Returns the number of runs cancelled. Used by the DM cancel endpoint
+    /// to stop in-progress DM runs before signalling conversation end.
+    pub fn cancel_runs_for_session(&self, target: SessionId) -> usize {
+        let active_run_ids: Vec<RunId> = self
+            .runs
+            .iter()
+            .filter(|entry| {
+                let run = entry.value();
+                run.session_id == target
+                    && matches!(
+                        run.status,
+                        alms_core::RunStatus::Queued | alms_core::RunStatus::Running
+                    )
+            })
+            .map(|entry| entry.key().to_owned())
+            .collect();
+
+        let mut cancelled = 0;
+        for run_id in active_run_ids {
+            if self.cancel_run(run_id) {
+                tracing::info!(
+                    run_id = %run_id.0,
+                    session_id = %target.0,
+                    "Cancelled in-progress run for DM cancellation"
+                );
+                cancelled += 1;
+            }
+        }
+        cancelled
+    }
+
     /// Returns `true` if any queued or running runs exist for the given session.
     pub fn has_active_runs(&self, session_id: SessionId) -> bool {
         self.runs.iter().any(|e| {
@@ -323,6 +356,22 @@ impl RunManager {
                     r.status,
                     alms_core::RunStatus::Queued | alms_core::RunStatus::Running
                 )
+        })
+    }
+
+    /// Returns `true` if any `Running` run exists for the given agent.
+    ///
+    /// Used by `create_run` to compute `queued_behind` accurately: the per-agent
+    /// `SessionQueue::pending_count` only counts items still waiting in the
+    /// queue (a currently-executing item has already been dequeued and its
+    /// pending counter decremented). Without this check, a user who sends a
+    /// message while the agent is running another task would see
+    /// `queued_behind == 0` and the UI would show "Thinking..." even though
+    /// the run is in fact queued behind the running one.
+    pub fn agent_has_running_run(&self, agent_id: alms_core::AgentId) -> bool {
+        self.runs.iter().any(|e| {
+            let r = e.value();
+            r.agent_id == agent_id && matches!(r.status, alms_core::RunStatus::Running)
         })
     }
 
@@ -669,6 +718,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_has_running_run_returns_true_for_running() {
+        let rm = RunManager::new();
+        let agent_id = AgentId::new();
+
+        // No runs at all — false.
+        assert!(!rm.agent_has_running_run(agent_id));
+
+        // Insert a Queued run — still false (only Running counts).
+        let queued = Run::new(SessionId::new(), agent_id, "queued".into());
+        let queued_id = queued.run_id;
+        rm.insert_run(queued);
+        assert!(
+            !rm.agent_has_running_run(agent_id),
+            "Queued run should not count"
+        );
+
+        // Mark it Running — now true.
+        rm.mark_run_as_running(queued_id);
+        assert!(rm.agent_has_running_run(agent_id));
+
+        // Mark it Completed — back to false.
+        rm.mark_run_as_completed(queued_id, "output".into(), Default::default());
+        assert!(!rm.agent_has_running_run(agent_id));
+    }
+
+    #[tokio::test]
+    async fn test_agent_has_running_run_isolates_by_agent() {
+        let rm = RunManager::new();
+        let agent_a = AgentId::new();
+        let agent_b = AgentId::new();
+
+        let run_a = Run::new(SessionId::new(), agent_a, "a".into());
+        let run_a_id = run_a.run_id;
+        rm.insert_run(run_a);
+        rm.mark_run_as_running(run_a_id);
+
+        // Agent A is running, agent B is not.
+        assert!(rm.agent_has_running_run(agent_a));
+        assert!(!rm.agent_has_running_run(agent_b));
+    }
+
+    #[tokio::test]
     async fn test_mark_run_as_cancelled() {
         let rm = RunManager::new();
         let run = Run::new(SessionId::new(), AgentId::new(), "test".to_string());
@@ -940,5 +1031,189 @@ mod tests {
         let rm = RunManager::new();
         let runs = rm.list_by_agent(AgentId::new(), 50);
         assert!(runs.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // #735 regression coverage
+    //
+    // The frontend's active-run restoration path uses these list functions
+    // (via GET /runs?session_id=... and ?agent_id=...) to find a still-
+    // running run after reload or session switch. Because the lists are
+    // newest-first and truncated, an older still-running run can be hidden
+    // behind a backlog of newer queued / terminal runs — leaving the UI
+    // unable to rehydrate the thinking indicator / approvals.
+    //
+    // The frontend now requests SESSION_RUNS_RESTORE_LIMIT (200) /
+    // AGENT_RUNS_RESTORE_LIMIT (100) for the restore step. These tests
+    // pin the data-layer contract that a sufficiently large limit DOES
+    // surface the older running run, and that the previous default
+    // (20 / 10) does not. Together with the ordering preference in
+    // load-session.js they form the regression coverage requested in
+    // the issue.
+    // -------------------------------------------------------------------
+
+    fn make_run_at(
+        session_id: SessionId,
+        agent_id: AgentId,
+        created_at: chrono::DateTime<chrono::Utc>,
+        status: alms_core::RunStatus,
+    ) -> Run {
+        let mut run = Run::new(session_id, agent_id, "test".into());
+        run.created_at = created_at;
+        run.status = status;
+        run
+    }
+
+    /// Regression #735 / scenario 1: a session with an older `running` run
+    /// and a newer `queued` run must surface the running run when the
+    /// frontend looks for an in-progress run to restore.
+    ///
+    /// `list_by_session` itself is order-only — the running-vs-queued
+    /// preference lives in the JS `loadSession()` (`load-session.js`).
+    /// This test asserts the data-layer invariant: both runs are present
+    /// in the returned slice so the JS preference can pick the correct
+    /// one. (Without this, the JS fix would be defeated by truncation.)
+    #[tokio::test]
+    async fn test_list_by_session_includes_older_running_with_newer_queued() {
+        let rm = RunManager::new();
+        let session_id = SessionId::new();
+        let agent_id = AgentId::new();
+        let base = chrono::Utc::now();
+
+        let older_running = make_run_at(
+            session_id,
+            agent_id,
+            base - chrono::Duration::seconds(10),
+            alms_core::RunStatus::Running,
+        );
+        let newer_queued = make_run_at(session_id, agent_id, base, alms_core::RunStatus::Queued);
+        let older_id = older_running.run_id;
+        let newer_id = newer_queued.run_id;
+
+        rm.insert_run(older_running);
+        rm.insert_run(newer_queued);
+
+        // Both runs are returned (limit is generous) and ordered newest-first.
+        let runs = rm.list_by_session(session_id, 200);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].run_id, newer_id, "newest first");
+        assert_eq!(runs[1].run_id, older_id);
+        assert_eq!(runs[1].status, alms_core::RunStatus::Running);
+
+        // The frontend prefers running over queued, so the running run
+        // is what activeRunId.value should resolve to. We assert that
+        // selection logic here as a data-layer cross-check.
+        let active = runs
+            .iter()
+            .find(|r| r.status == alms_core::RunStatus::Running)
+            .or_else(|| {
+                runs.iter()
+                    .find(|r| r.status == alms_core::RunStatus::Queued)
+            });
+        assert_eq!(active.map(|r| r.run_id), Some(older_id));
+    }
+
+    /// Regression #735 / scenario 2: a session where the running run is
+    /// older than 20 newer runs (the previous frontend default limit)
+    /// would have lost the running run; with the new larger limit it
+    /// must remain visible.
+    #[tokio::test]
+    async fn test_list_by_session_running_run_visible_beyond_old_default() {
+        let rm = RunManager::new();
+        let session_id = SessionId::new();
+        let agent_id = AgentId::new();
+        let base = chrono::Utc::now();
+
+        // Insert one OLD running run.
+        let old_running = make_run_at(
+            session_id,
+            agent_id,
+            base - chrono::Duration::seconds(60),
+            alms_core::RunStatus::Running,
+        );
+        let old_running_id = old_running.run_id;
+        rm.insert_run(old_running);
+
+        // Insert 25 newer terminal runs in front of it.
+        for i in 0..25 {
+            let run = make_run_at(
+                session_id,
+                agent_id,
+                base - chrono::Duration::seconds(50 - i),
+                alms_core::RunStatus::Completed,
+            );
+            rm.insert_run(run);
+        }
+
+        // Old (broken) behaviour: limit=20 truncates the running run away.
+        let small = rm.list_by_session(session_id, 20);
+        assert_eq!(small.len(), 20);
+        assert!(
+            !small.iter().any(|r| r.run_id == old_running_id),
+            "old default limit (20) hides the still-running run"
+        );
+
+        // New behaviour: SESSION_RUNS_RESTORE_LIMIT (200) keeps it visible.
+        let restored = rm.list_by_session(session_id, 200);
+        assert_eq!(restored.len(), 26);
+        assert!(
+            restored
+                .iter()
+                .any(|r| r.run_id == old_running_id && r.status == alms_core::RunStatus::Running),
+            "new restore limit (200) surfaces the still-running run"
+        );
+    }
+
+    /// Regression #735 / scenario 3: `restoreGlobalAgentPhase()` looks
+    /// for a running DM run for an agent across sessions. With the
+    /// previous hardcoded limit of 10, a still-running DM run that is
+    /// older than 10 newer runs would be lost, breaking the cross-session
+    /// "Chatting with {peer}..." status. The new limit (100) must keep
+    /// the active DM run visible.
+    #[tokio::test]
+    async fn test_list_by_agent_active_dm_visible_beyond_old_default() {
+        let rm = RunManager::new();
+        let agent_id = AgentId::new();
+        let dm_session_id = SessionId::new();
+        let base = chrono::Utc::now();
+
+        // The active DM run, which is older than the noise.
+        let dm_running = make_run_at(
+            dm_session_id,
+            agent_id,
+            base - chrono::Duration::seconds(120),
+            alms_core::RunStatus::Running,
+        );
+        let dm_running_id = dm_running.run_id;
+        rm.insert_run(dm_running);
+
+        // 15 newer non-DM runs across other sessions for the same agent.
+        for i in 0..15 {
+            let run = make_run_at(
+                SessionId::new(),
+                agent_id,
+                base - chrono::Duration::seconds(100 - i),
+                alms_core::RunStatus::Completed,
+            );
+            rm.insert_run(run);
+        }
+
+        // Old (broken) behaviour: limit=10 truncates the DM run away.
+        let small = rm.list_by_agent(agent_id, 10);
+        assert_eq!(small.len(), 10);
+        assert!(
+            !small.iter().any(|r| r.run_id == dm_running_id),
+            "old default limit (10) hides the active DM run"
+        );
+
+        // New behaviour: AGENT_RUNS_RESTORE_LIMIT (100) keeps it visible.
+        let restored = rm.list_by_agent(agent_id, 100);
+        assert_eq!(restored.len(), 16);
+        assert!(
+            restored
+                .iter()
+                .any(|r| r.run_id == dm_running_id && r.status == alms_core::RunStatus::Running),
+            "new restore limit (100) surfaces the active DM run"
+        );
     }
 }

@@ -1,25 +1,25 @@
-use alms_core::{AlmsError, AlmsResult};
 use serde_json::Value;
 use std::sync::Arc;
 
 pub mod builtin;
 pub mod error;
+pub mod file_state_cache;
 pub mod registry;
-pub mod sandbox;
 pub mod shell;
 
 pub use builtin::{
-    DatetimeTool, EchoTool, FsListTool, FsReadTool, FsWriteTool, HttpGetTool, MathTool,
+    DatetimeTool, EchoTool, FsEditTool, FsGlobTool, FsGrepTool, FsListTool, FsReadTool,
+    FsWriteTool, HttpGetTool, MathTool,
 };
 pub use error::{SandboxError, SandboxResult};
+pub use file_state_cache::FileStateCache;
 pub use registry::ToolRegistry;
-pub use sandbox::{Sandbox, SandboxConfig};
 pub use shell::ShellTool;
 
 /// Type alias for backward compatibility. Use [`ShellTool`] instead.
 pub type ShellExecTool = ShellTool;
 
-/// Tool trait - implemented by both WASM and native tools
+/// Tool trait — implemented by native tools registered with the runtime.
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync + std::fmt::Debug {
     /// Get the tool name
@@ -46,11 +46,6 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
         false
     }
 
-    /// Check if this is a WASM tool
-    fn is_wasm(&self) -> bool {
-        false
-    }
-
     /// Whether this tool bypasses the approval workflow in guarded posture.
     ///
     /// Tools that are inherently safe and read-only (e.g. `datetime`, `echo`,
@@ -60,89 +55,6 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
     /// Defaults to `false` — most tools require approval in guarded mode.
     fn is_auto_approved(&self) -> bool {
         false
-    }
-}
-
-// TODO(dead-code): zero current external consumers — real WASM infra, keep until wired
-/// Tool definition for registration
-#[derive(Debug, Clone)]
-pub struct ToolDef {
-    pub name: String,
-    pub description: String,
-    pub wasm_bytes: Option<Vec<u8>>,
-    pub entry_point: String,
-}
-
-impl ToolDef {
-    /// Create a new WASM tool definition
-    pub fn new_wasm(name: impl Into<String>, wasm_bytes: Vec<u8>) -> Self {
-        Self {
-            name: name.into(),
-            description: String::new(),
-            wasm_bytes: Some(wasm_bytes),
-            entry_point: "execute".to_string(),
-        }
-    }
-
-    /// Set the description
-    pub fn with_description(mut self, desc: impl Into<String>) -> Self {
-        self.description = desc.into();
-        self
-    }
-
-    /// Set the entry point function name
-    pub fn with_entry_point(mut self, entry: impl Into<String>) -> Self {
-        self.entry_point = entry.into();
-        self
-    }
-}
-
-/// WASM Tool implementation
-#[derive(Debug)]
-pub struct WasmTool {
-    name: String,
-    description: String,
-    wasm_bytes: Vec<u8>,
-    entry_point: String,
-    config: SandboxConfig,
-}
-
-impl WasmTool {
-    /// Create a new WASM tool
-    pub fn new(def: ToolDef, config: SandboxConfig) -> AlmsResult<Self> {
-        let wasm_bytes = def
-            .wasm_bytes
-            .ok_or_else(|| AlmsError::InvalidConfig("WASM bytes required".to_string()))?;
-
-        Ok(Self {
-            name: def.name,
-            description: def.description,
-            wasm_bytes,
-            entry_point: def.entry_point,
-            config,
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl Tool for WasmTool {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn is_wasm(&self) -> bool {
-        true
-    }
-
-    async fn execute(&self, params: Value) -> SandboxResult<Value> {
-        let sandbox = Sandbox::new(self.config.clone());
-        sandbox
-            .execute(&self.wasm_bytes, &self.entry_point, &self.name, params)
-            .await
     }
 }
 
@@ -221,17 +133,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, 42);
-    }
-
-    #[test]
-    fn test_tool_def() {
-        let def = ToolDef::new_wasm("my_tool", vec![1, 2, 3])
-            .with_description("A test tool")
-            .with_entry_point("run");
-
-        assert_eq!(def.name, "my_tool");
-        assert_eq!(def.description, "A test tool");
-        assert_eq!(def.entry_point, "run");
-        assert!(def.wasm_bytes.is_some());
     }
 }

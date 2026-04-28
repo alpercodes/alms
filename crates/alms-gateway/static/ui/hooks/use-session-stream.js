@@ -30,7 +30,7 @@
 
 import { batch, signal } from '../deps.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
-import { appendMessage, updateMessage, transformMessages } from '../state/chat-actions.js';
+import { appendMessage, updateMessage, filterMessages, transformMessages } from '../state/chat-actions.js';
 import { activeRunId, bumpRunListGeneration } from '../state/runs.js';
 import { trackSubagentStart, trackSubagentEnd, trackSubagentTool, findSubagentByToolInvocationId, setSubagentSessionId, activeSubagents } from '../state/subagents.js';
 import { agentPhase, setAgentPhase, clearAgentPhase, setDmContext, revertPhase, dmPeer } from '../state/agent-status.js';
@@ -40,6 +40,7 @@ import { activeAgent } from '../state/agents.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
 import { clearPendingMessage } from '../state/pending-messages.js';
+import { DM_END_REASON_LABELS } from '../utils/constants.js';
 
 /**
  * Per-run DM thinking text accumulation buffer.
@@ -382,17 +383,27 @@ export function openSessionStream(sessionId, opts) {
             // thinking indicator (added by startRun) with queue position.
             // Header bar keeps its current state (the agent's real
             // activity); the inline indicator shows queue status. (#693)
+            // Clear `pending` so it transitions from "Sending..." to
+            // "Queued..." immediately. (#704)
             batch(() => {
                 activeRunId.value = data.run_id;
                 updateMessage(
-                    m => m.type === 'thinking',
-                    m => ({ ...m, queuedBehind }),
+                    m => m.type === 'thinking' && m.pending,
+                    m => ({ ...m, queuedBehind, pending: false }),
                 );
             });
         } else {
-            activeRunId.value = data.run_id;
+            // User-initiated, queue empty -- clear `pending` so the
+            // indicator transitions from "Sending..." to "Thinking...".
+            // (#704)
+            batch(() => {
+                activeRunId.value = data.run_id;
+                updateMessage(
+                    m => m.type === 'thinking' && m.pending,
+                    m => ({ ...m, pending: false }),
+                );
+            });
         }
-        // else: user-initiated, queue empty -- thinking indicator from startRun is fine
     });
 
     // -- run_started: the run has been dequeued and is now executing --
@@ -459,19 +470,13 @@ export function openSessionStream(sessionId, opts) {
         const data = JSON.parse(e.data);
         console.debug('[status]', data.phase, data.detail || '');
 
-        // During DM runs, replace generic phases (building_context,
-        // calling_llm, summarizing) with the DM fallback so the user
-        // sees "Chatting with {peer}..." instead of "Thinking...".
-        // Tool execution phases are allowed through -- the user needs
-        // to see which tool is running even during DM conversations.
+        // During DM runs, ALL phases are replaced with "Chatting with
+        // {peer}..." (#688).  The internal tool use within a DM is
+        // irrelevant to the top-level status -- "Chatting with..." should
+        // persist until the DM conversation ends. Tool-level detail is
+        // visible in the DM reasoning blocks within the DM session view.
         if (dmPeer.value) {
-            if (data.phase === 'executing_tools') {
-                // Show tool names during DM tool execution
-                setAgentPhase(data.phase, data.detail || null);
-            } else {
-                // For non-tool phases in DM, keep showing "Chatting with..."
-                setAgentPhase('dm', dmPeer.value);
-            }
+            setAgentPhase('dm', dmPeer.value);
             return;
         }
         setAgentPhase(data.phase, data.detail || null);
@@ -500,6 +505,45 @@ export function openSessionStream(sessionId, opts) {
         sawTokenDelta = true;
         deltaBuffer += data.delta;
         scheduleFlush();
+    });
+
+    // -- reasoning_delta (issue #767) --
+    //
+    // Provider-neutral extended-thinking stream. Today only Anthropic's
+    // `thinking_delta` emits these; #768/#769 will add OpenAI/Gemini.
+    // Accumulate per-run reasoning text into a buffer attached to the
+    // live agent message so `ReasoningPanel` can render it collapsed.
+    on('reasoning_delta', (e) => {
+        const data = JSON.parse(e.data);
+        if (data.source_agent) return; // subagent reasoning is suppressed
+        const delta = data.text || '';
+        if (!delta) return;
+        transformMessages(prev => {
+            // Drop any transient "thinking" indicator like token_delta does,
+            // so the reasoning panel doesn't race with the pre-stream
+            // placeholder.
+            const msgs = prev.filter(m => m.type !== 'thinking');
+            const copy = [...msgs];
+            const last = copy[copy.length - 1];
+            if (last && last.type === 'agent' && !last.sealed) {
+                copy[copy.length - 1] = {
+                    ...last,
+                    reasoning: (last.reasoning || '') + delta,
+                };
+            } else {
+                // No live agent message yet — create a reasoning-only
+                // placeholder so the thinking panel is visible immediately.
+                copy.push({
+                    id: nextMsgId(),
+                    type: 'agent',
+                    role: 'assistant',
+                    text: '',
+                    reasoning: delta,
+                    sealed: false,
+                });
+            }
+            return copy;
+        });
     });
 
     // -- tool_start --
@@ -550,7 +594,8 @@ export function openSessionStream(sessionId, opts) {
                         isLive: true,
                     }];
                 });
-                setAgentPhase('tool_active', data.tool);
+                // DM tool starts do NOT update the header bar (#688).
+                // "Chatting with {peer}..." is sticky during DMs.
             } else if (data.tool === 'invoke_agent') {
                 sealLastAgent();
                 const name = data.params?.name || data.params?.subagent_name || 'subagent';
@@ -574,7 +619,11 @@ export function openSessionStream(sessionId, opts) {
                 // Update the header bar to show which specific tool is running.
                 // This provides per-tool granularity beyond the batch-level
                 // "executing_tools" status event from the backend.
-                setAgentPhase('tool_active', data.tool);
+                // Skip if DM context is active -- "Chatting with..." is
+                // sticky during DMs (#688).
+                if (!dmPeer.value) {
+                    setAgentPhase('tool_active', data.tool);
+                }
             }
         });
     });
@@ -810,11 +859,7 @@ export function openSessionStream(sessionId, opts) {
     on('dm_conversation_ended', (e) => {
         const data = JSON.parse(e.data);
         const peer = data.peer || 'unknown';
-        const reasonLabels = {
-            'ignored': 'no further replies',
-            'depth_exceeded': 'message limit reached',
-        };
-        const reason = reasonLabels[data.reason] || data.reason || 'conversation ended';
+        const reason = DM_END_REASON_LABELS[data.reason] || data.reason || 'conversation ended';
         appendMessage({
             id: nextMsgId(), type: 'dm_ended', peer, reason,
         });
@@ -834,35 +879,51 @@ export function openSessionStream(sessionId, opts) {
         }
     });
 
-    // -- dm_activity_status: DM run phase update forwarded to webchat (#659) --
-    // Maps DM phases to the agent status bar.  Replicates the DM-fallback
-    // logic from the main `status` handler: tool phases get per-tool
-    // granularity, non-tool phases (calling_llm, building_context, etc.)
-    // are replaced with "Chatting with {peer}..." so the user does not
-    // see generic "Thinking..." during a DM conversation.
+    // -- dm_activity_status: DM run phase update forwarded to webchat (#688) --
+    // ALWAYS maps to "Chatting with {peer}..." regardless of the phase.
+    // The internal tool use within a DM is irrelevant to the top-level
+    // status -- the user only cares that the agent is chatting with a peer.
+    // Tool-level detail (e.g. "Running shell...") is visible when viewing
+    // the DM session directly, not from the webchat session.
     on('dm_activity_status', (e) => {
         const data = JSON.parse(e.data);
-        if (data.phase === 'executing_tools' && data.detail) {
-            setAgentPhase('tool_active', data.detail);
-        } else {
-            // Non-tool phase during DM: show "Chatting with {peer}..."
-            // Prefer dmPeer (set by dm_activity_started), fall back to
-            // data.peer from the event payload.
-            const peer = dmPeer.value || data.peer;
-            if (peer) {
-                setAgentPhase('dm', peer);
-            } else {
-                setAgentPhase(data.phase, data.detail || null);
-            }
+        const peer = dmPeer.value || data.peer;
+        if (peer) {
+            setAgentPhase('dm', peer);
+        }
+    });
+
+    // -- dm_activity_ended: a single DM run finished (#688) --
+    // This does NOT clear the DM status -- the conversation may still
+    // have more turns. "Chatting with {peer}..." stays visible until
+    // dm_conversation_ended arrives (signalling the entire conversation
+    // is over) or until a non-DM run starts on this session.
+    on('dm_activity_ended', (e) => {
+        const data = JSON.parse(e.data);
+        const peer = dmPeer.value || data.peer;
+        // Keep showing "Chatting with..." -- the DM is still active
+        // (the peer agent may be formulating its next reply).
+        if (peer) {
+            setAgentPhase('dm', peer);
         }
     });
 
     // -- approval_resolved --
+    //
+    // Remove the approval card entirely so the live render matches the
+    // reload render (which never materialises approval cards for resolved
+    // approvals — listApprovals only returns pending ones, and session
+    // history has no approval records).  Dropping the card also lets the
+    // sibling tool rows collapse back into their parallel-tool group in
+    // app.js `groupMessages`, matching the reload layout.  (#800)
+    //
+    // The tool row itself is updated separately via the `tool_end` event
+    // emitted by the runtime after approve (success/fail based on tool
+    // execution) or immediately after deny (ok=false, "denied by user").
     on('approval_resolved', (e) => {
         const data = JSON.parse(e.data);
-        updateMessage(
-            m => m.type === 'approval' && m.approvalId === data.approval_id,
-            m => ({ ...m, resolved: true, decision: data.decision }),
+        filterMessages(
+            m => !(m.type === 'approval' && m.approvalId === data.approval_id),
         );
     });
 
@@ -914,8 +975,6 @@ export function openSessionStream(sessionId, opts) {
             // (approval resolution + appended status/error/token messages)
             // is collapsed into one write to avoid intermediate states.
             const endingRunId = data.run_id || null;
-            const decision = status === 'cancelled' ? 'cancelled'
-                : status === 'error' ? 'cancelled' : 'expired';
 
             // Read and save thinking text BEFORE deleting from buffer,
             // so the transformMessages callback below can use it.
@@ -934,14 +993,20 @@ export function openSessionStream(sessionId, opts) {
             transformMessages(prev => {
                 const toolCountBefore = prev.filter(m => m.type === 'tool').length;
 
-                // Resolve any pending approval cards for this run.
+                // Drop any pending approval cards for this run.
                 // When a run ends (cancelled, error, or finished), any unresolved
                 // approval prompts are stale and must be dismissed so the user is
                 // not left with dangling Approve/Deny buttons.  (Fixes #487 Bug 1)
                 //
                 // Scoped to the ending run's ID so concurrent runs (future) do not
                 // accidentally dismiss each other's approval cards.  Approval cards
-                // without a runId (legacy) are always resolved as a fallback.
+                // without a runId (legacy) are always dropped as a fallback.
+                //
+                // #800: removing the card instead of marking it resolved also
+                // matches the reload path — `listApprovals` only returns currently-
+                // pending approvals, so on reload these stale entries simply don't
+                // exist.  The accompanying tool row is cancelled via isStuckTool
+                // below, which matches the history render for an interrupted run.
                 const isStaleApproval = (m) =>
                     m.type === 'approval' && !m.resolved
                     && (!m.runId || !endingRunId || m.runId === endingRunId);
@@ -953,10 +1018,7 @@ export function openSessionStream(sessionId, opts) {
                 const isStuckTool = (m) =>
                     m.type === 'tool' && m.status === 'running';
 
-                let msgs = prev.map(m => {
-                    if (isStaleApproval(m)) {
-                        return { ...m, resolved: true, decision };
-                    }
+                let msgs = prev.filter(m => !isStaleApproval(m)).map(m => {
                     if (isStuckTool(m)) {
                         return { ...m, status: 'cancelled' };
                     }
@@ -1003,7 +1065,19 @@ export function openSessionStream(sessionId, opts) {
                 }
 
                 const usage = (data.prompt_tokens || data.completion_tokens)
-                    ? { prompt_tokens: data.prompt_tokens || 0, completion_tokens: data.completion_tokens || 0 }
+                    ? {
+                        prompt_tokens: data.prompt_tokens || 0,
+                        completion_tokens: data.completion_tokens || 0,
+                        // reasoning_tokens is optional (OpenAI o-series / DeepSeek /
+                        // xAI); stays undefined for non-reasoning runs and the
+                        // TokenBadge hides it in that case.
+                        reasoning_tokens: data.reasoning_tokens,
+                        // Cache metrics (#766) — Anthropic-only; absent on
+                        // other providers. TokenBadge and runs-tab hide
+                        // them when undefined.
+                        cache_creation_input_tokens: data.cache_creation_input_tokens,
+                        cache_read_input_tokens: data.cache_read_input_tokens,
+                    }
                     : data.usage;
                 if (usage) {
                     msgs = [...msgs, { id: nextMsgId(), type: 'tokens', usage }];
@@ -1018,7 +1092,17 @@ export function openSessionStream(sessionId, opts) {
                 return msgs;
             });
             activeRunId.value = null;
-            clearAgentPhase();
+
+            // Preserve DM context across runs (#688): when the agent is
+            // in a DM conversation, individual run endings should NOT
+            // clear the "Chatting with..." status. The status only clears
+            // when the entire DM conversation ends (dm_conversation_ended).
+            // For non-DM runs, clear the phase as before.
+            if (dmPeer.value) {
+                setAgentPhase('dm', dmPeer.value);
+            } else {
+                clearAgentPhase();
+            }
 
             // The run has ended -- the user message is either persisted
             // (finished/error after execution started) or was never

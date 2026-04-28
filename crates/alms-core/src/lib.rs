@@ -61,11 +61,6 @@ pub fn classify_session_type(context_id: &str) -> &'static str {
     }
 }
 
-/// Sentinel string returned by the agent loop when the max-iterations limit is
-/// hit.  Defined once so that the runtime (`agent.rs`) and the gateway
-/// (`runs.rs`) stay in sync.
-pub const MAX_ITERATIONS_SENTINEL: &str = "[Max iterations reached]";
-
 /// Error message returned to the LLM when both `send_message` and
 /// `ignore_message` appear in the same tool-call batch (DM conflict).
 ///
@@ -95,6 +90,14 @@ const ALMS_NAMESPACE: Uuid = Uuid::from_bytes([
 impl AgentId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    pub fn nil() -> Self {
+        Self(Uuid::nil())
+    }
+
+    pub fn is_nil(&self) -> bool {
+        self.0 == Uuid::nil()
     }
 
     /// Derive a deterministic AgentId from a parent agent ID and a subagent name.

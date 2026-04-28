@@ -2,31 +2,30 @@ import { html, useSignal, useEffect, computed } from '../deps.js';
 import { serverDefaults, localSettings, saveSettings, refreshServerDefaults } from '../state/settings.js';
 import { patchSettings } from '../api/settings.js';
 import { listKeys, setKey, removeKey } from '../api/auth.js';
+import {
+    MODEL_SUGGESTIONS,
+    ModelDisplay,
+    formatProviderLabel,
+} from '../utils/model-display.js';
+import { BudgetTriState } from './budget-tri-state.js';
 
-const PROVIDERS = ['openai', 'anthropic', 'openrouter'];
+const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
 
-/** Common models for datalist suggestions, grouped by provider. */
-const MODEL_SUGGESTIONS = [
-    // OpenAI
-    'gpt-4o',
-    'gpt-4o-mini',
-    'gpt-4.1',
-    'gpt-4.1-mini',
-    'gpt-4.1-nano',
-    'o3',
-    'o3-mini',
-    'o4-mini',
-    // Anthropic
-    'claude-sonnet-4-20250514',
-    'claude-opus-4-20250514',
-    'claude-3-7-sonnet-20250219',
-    'claude-3-5-haiku-20241022',
-    // OpenRouter (popular picks)
-    'google/gemini-2.5-pro-preview',
-    'google/gemini-2.5-flash-preview',
-    'deepseek/deepseek-r1',
-    'deepseek/deepseek-chat-v3-0324',
-];
+/**
+ * Modal-flavored class map for the shared <BudgetTriState>. Keeps the
+ * tri-state visually consistent with the rest of the modal's per-run
+ * section (settings-row / settings-label / settings-select) instead of
+ * the composer's `composer-advanced-*` classes.
+ */
+const MODAL_TRISTATE_CLASSES = {
+    row: 'settings-row',
+    label: 'settings-label',
+    group: 'settings-tristate-group',
+    select: 'settings-select',
+    input: 'settings-input settings-tristate-value',
+};
+
+const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'gemini'];
 
 /** Format large numbers with commas for readability. */
 function fmt(n) {
@@ -190,15 +189,35 @@ function ApiKeysSection() {
 
 /**
  * Count how many per-run overrides are currently active.
- * Exported so the header can show an indicator badge.
+ * Exported so the header (and composer Advanced expander) can show an
+ * indicator badge.
+ *
+ * Includes `max_tokens`, `posture`, `debug_mode`, and the three
+ * reasoning knobs (`thinking_budget_tokens`, `reasoning_effort`,
+ * `gemini_thinking_budget`). For the budget knobs, `Some(0)` (explicit
+ * disable) and any positive value both count as "active overrides";
+ * only `null`/`undefined` is "inherit". For `debug_mode`, both `true`
+ * and `false` count — `null` is inherit.
+ *
+ * NOTE: `provider` and `model` are intentionally NOT counted — chat UI
+ * no longer forwards those keys as per-run overrides (#865), so they
+ * have no effect on the wire and including them here would mislead the
+ * badge. Their controls remain visible-but-disabled in the modal /
+ * composer Advanced UIs until a deliberate "use this provider/model
+ * for this chat" UX exists.
  */
 export const activeOverrideCount = computed(() => {
     const s = localSettings.value;
     let count = 0;
-    if (s.provider) count++;
-    if (s.model) count++;
     if (s.max_tokens != null) count++;
     if (s.posture) count++;
+    // debug_mode is now tri-state on the composer (#818 nit follow-up):
+    // null = inherit, true = enable, false = explicit per-run disable.
+    // Both `true` and `false` count as active overrides.
+    if (s.debug_mode != null) count++;
+    if (s.thinking_budget_tokens != null) count++;
+    if (s.reasoning_effort) count++;
+    if (s.gemini_thinking_budget != null) count++;
     return count;
 });
 
@@ -207,7 +226,11 @@ export function SettingsModal({ open, onClose }) {
     const model = useSignal('');
     const maxTokens = useSignal('');
     const posture = useSignal('');
-    const debugMode = useSignal(false);
+    // debug_mode is tri-state to mirror the composer: '' = inherit
+    // (null), 'true' = enable, 'false' = explicit disable. The composer's
+    // tri-state introduced meaningful `false`, so the modal must round-trip
+    // it without collapsing back to `null` on Apply.
+    const debugMode = useSignal('');
     const saved = useSignal(false);
 
     // Server-level editable signals — Context
@@ -216,6 +239,10 @@ export function SettingsModal({ open, onClose }) {
     const ctxRecentWindow = useSignal('');
     const ctxSummaryInterval = useSignal('');
     const ctxSummaryModel = useSignal('');
+    // #866: dedicated provider for the summary task. '' = inherit agent
+    // provider (pre-#866 behaviour); non-empty re-targets the summary
+    // client at that provider via with_provider_and_secrets.
+    const ctxSummaryProvider = useSignal('');
 
     // Server-level editable signals — Session
     const sessMaxMessages = useSignal('');
@@ -230,6 +257,21 @@ export function SettingsModal({ open, onClose }) {
     const toolsTimeout = useSignal('');
     const toolsMaxOutput = useSignal('');
 
+    // Server-level editable signals — LLM provider-family (#809 / #804 Slice A).
+    // Numeric strings are the form representation; an empty string means
+    // "don't include this field in the PATCH body" (= leave server alone).
+    // Each field is sent on Apply only if it differs from the current
+    // server-reported value, mirroring the existing context/session/tools
+    // diff-on-Apply pattern.
+    const llmAnthropicThinking = useSignal('');
+    const llmAnthropicCache = useSignal(true);
+    const llmAnthropicCacheTouched = useSignal(false);
+    const llmOpenaiEffort = useSignal('');
+    const llmGeminiThinking = useSignal('');
+    const llmGeminiCache = useSignal(true);
+    const llmGeminiCacheTouched = useSignal(false);
+    const llmGeminiCacheTtl = useSignal('');
+
     // Feedback for server settings save
     const serverSaving = useSignal(false);
     const serverError = useSignal('');
@@ -240,14 +282,25 @@ export function SettingsModal({ open, onClose }) {
             const ctx = d.context || {};
             const sess = d.session || {};
             const tools = d.tools || {};
+            const llm = d.llm || {};
+            const llmAnth = llm.anthropic || {};
+            const llmOpen = llm.openai || {};
+            const llmGem = llm.gemini || {};
 
-            provider.value = localSettings.value.provider || '';
-            model.value = localSettings.value.model || '';
+            // provider / model inputs are disabled (#865) — keep their
+            // signals empty so the UI doesn't echo stale localStorage
+            // values back to the user. The "Effective" display next to
+            // each row pulls from `defaults` (server) and the agent
+            // record handles per-agent values, so an empty signal here
+            // is the truthful representation of "no per-run override".
+            provider.value = '';
+            model.value = '';
             maxTokens.value = localSettings.value.max_tokens != null
                 ? String(localSettings.value.max_tokens)
                 : '';
             posture.value = localSettings.value.posture || '';
-            debugMode.value = !!localSettings.value.debug_mode;
+            const dm = localSettings.value.debug_mode;
+            debugMode.value = dm == null ? '' : (dm ? 'true' : 'false');
 
             // Populate server-level fields
             ctxStrategy.value = ctx.strategy || 'truncate';
@@ -255,6 +308,7 @@ export function SettingsModal({ open, onClose }) {
             ctxRecentWindow.value = ctx.recent_window != null ? String(ctx.recent_window) : '';
             ctxSummaryInterval.value = ctx.summary_interval != null ? String(ctx.summary_interval) : '';
             ctxSummaryModel.value = ctx.summary_model || '';
+            ctxSummaryProvider.value = ctx.summary_provider || '';
 
             sessMaxMessages.value = sess.max_messages != null ? String(sess.max_messages) : '';
             sessMaxCtxTokens.value = sess.max_context_tokens != null ? String(sess.max_context_tokens) : '';
@@ -266,6 +320,27 @@ export function SettingsModal({ open, onClose }) {
             toolsSandboxRoot.value = tools.sandbox_root || '.';
             toolsTimeout.value = tools.timeout_secs != null ? String(tools.timeout_secs) : '';
             toolsMaxOutput.value = tools.max_output_bytes != null ? String(tools.max_output_bytes) : '';
+
+            // LLM provider-family populate. The wire shape always emits
+            // every key (with `null` for openai.reasoning_effort when
+            // unset), so we initialise from whatever the server reports
+            // and only PATCH fields the user actively changes.
+            llmAnthropicThinking.value = llmAnth.thinking_budget_tokens != null
+                ? String(llmAnth.thinking_budget_tokens) : '';
+            llmAnthropicCache.value = llmAnth.prompt_cache_enabled != null
+                ? !!llmAnth.prompt_cache_enabled : true;
+            llmAnthropicCacheTouched.value = false;
+            // OpenAI reasoning_effort: '' represents "no override" / "cleared"
+            // (server returns `null` here). When the user picks an empty
+            // option, we send `""` on the wire to clear an existing override.
+            llmOpenaiEffort.value = llmOpen.reasoning_effort || '';
+            llmGeminiThinking.value = llmGem.thinking_budget != null
+                ? String(llmGem.thinking_budget) : '';
+            llmGeminiCache.value = llmGem.cache_enabled != null
+                ? !!llmGem.cache_enabled : true;
+            llmGeminiCacheTouched.value = false;
+            llmGeminiCacheTtl.value = llmGem.cache_ttl_seconds != null
+                ? String(llmGem.cache_ttl_seconds) : '';
 
             saved.value = false;
 
@@ -280,14 +355,31 @@ export function SettingsModal({ open, onClose }) {
     const sess = defaults.session || {};
     const log = defaults.logging || {};
     const tools = defaults.tools || {};
+    const llm = defaults.llm || {};
+    const llmAnth = llm.anthropic || {};
+    const llmOpen = llm.openai || {};
+    const llmGem = llm.gemini || {};
 
     const onReset = () => {
-        saveSettings({ provider: null, model: null, max_tokens: null, posture: null, debug_mode: null });
+        // Clear all per-run overrides — including the three reasoning
+        // knobs added by #804 Slice C — so the modal's Reset button
+        // mirrors the composer Advanced expander's "Reset all". Both
+        // surfaces share the same eight localSettings keys.
+        saveSettings({
+            provider: null,
+            model: null,
+            max_tokens: null,
+            posture: null,
+            debug_mode: null,
+            thinking_budget_tokens: null,
+            reasoning_effort: null,
+            gemini_thinking_budget: null,
+        });
         provider.value = '';
         model.value = '';
         maxTokens.value = '';
         posture.value = '';
-        debugMode.value = false;
+        debugMode.value = '';
         saved.value = true;
         setTimeout(() => onClose(), 600);
     };
@@ -298,14 +390,26 @@ export function SettingsModal({ open, onClose }) {
         serverError.value = '';
         saved.value = false;
 
-        // 1. Always save per-run overrides to localStorage (this never fails)
-        const updates = {};
-        updates.provider = provider.value || null;
-        updates.model = model.value.trim() || null;
+        // 1. Always save per-run overrides to localStorage (this never fails).
+        //
+        // `provider` / `model` are intentionally NOT written here (#865).
+        // Their inputs are disabled in the UI; chat UI ignores those keys
+        // when forwarding per-run overrides to /runs. We also actively
+        // clear any pre-existing stale values so users affected by the
+        // pre-#865 silent-stamp bug get unblocked the first time they
+        // hit Apply (or Reset) on the upgraded build.
+        const updates = {
+            provider: null,
+            model: null,
+        };
         const mt = parseInt(maxTokens.value, 10);
         updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
         updates.posture = posture.value || null;
-        updates.debug_mode = debugMode.value || null;
+        // Tri-state debug_mode: '' = inherit (null), 'true' / 'false'
+        // round-trip as explicit booleans so the modal doesn't clobber an
+        // explicit `false` set from the composer.
+        if (debugMode.value === '') updates.debug_mode = null;
+        else updates.debug_mode = debugMode.value === 'true';
         saveSettings(updates);
 
         // 2. Build server settings patch — only include fields that changed from server defaults
@@ -329,6 +433,11 @@ export function SettingsModal({ open, onClose }) {
         }
         if (ctxSummaryModel.value !== (ctx.summary_model || '')) {
             ctxPatch.summary_model = ctxSummaryModel.value;
+        }
+        // #866: only PATCH summary_provider when the user actually changed
+        // it. Empty string clears back to "inherit agent provider".
+        if (ctxSummaryProvider.value !== (ctx.summary_provider || '')) {
+            ctxPatch.summary_provider = ctxSummaryProvider.value;
         }
         if (Object.keys(ctxPatch).length > 0) body.context = ctxPatch;
 
@@ -371,6 +480,62 @@ export function SettingsModal({ open, onClose }) {
         }
         if (Object.keys(toolsPatch).length > 0) body.tools = toolsPatch;
 
+        // LLM provider-family (#809 / #804 Slice A). Each provider sub-block
+        // is built independently and only attached if it has at least one
+        // changed field. Numeric "cleared" inputs (empty string) are treated
+        // as "leave server alone" — the field is omitted from the PATCH.
+        // Booleans are only sent when the user actively toggled them, since
+        // there's no `null` sentinel for booleans on this surface.
+        const llmPatch = {};
+
+        const anthPatch = {};
+        const newAnthThink = parseInt(llmAnthropicThinking.value, 10);
+        // Allow `0` (= explicit disable) — it differs from `''` (cleared form
+        // input = leave alone).
+        if (llmAnthropicThinking.value !== '' && !isNaN(newAnthThink)
+            && newAnthThink !== llmAnth.thinking_budget_tokens) {
+            anthPatch.thinking_budget_tokens = newAnthThink;
+        }
+        if (llmAnthropicCacheTouched.value
+            && llmAnthropicCache.value !== !!llmAnth.prompt_cache_enabled) {
+            anthPatch.prompt_cache_enabled = llmAnthropicCache.value;
+        }
+        if (Object.keys(anthPatch).length > 0) llmPatch.anthropic = anthPatch;
+
+        const openPatch = {};
+        // OpenAI reasoning_effort uses `""` as the explicit-clear sentinel.
+        // The form's empty option corresponds to "(unset)" -> send `""`
+        // to clear an existing PATCH'd value back to null. If the form
+        // value matches the server value (both empty, or both equal
+        // strings), we don't send the field.
+        const currentEffort = llmOpen.reasoning_effort || '';
+        if (llmOpenaiEffort.value !== currentEffort) {
+            openPatch.reasoning_effort = llmOpenaiEffort.value;
+        }
+        if (Object.keys(openPatch).length > 0) llmPatch.openai = openPatch;
+
+        const gemPatch = {};
+        const newGemThink = parseInt(llmGeminiThinking.value, 10);
+        if (llmGeminiThinking.value !== '' && !isNaN(newGemThink)
+            && newGemThink !== llmGem.thinking_budget) {
+            gemPatch.thinking_budget = newGemThink;
+        }
+        if (llmGeminiCacheTouched.value
+            && llmGeminiCache.value !== !!llmGem.cache_enabled) {
+            gemPatch.cache_enabled = llmGeminiCache.value;
+        }
+        const newGemTtl = parseInt(llmGeminiCacheTtl.value, 10);
+        // Pass `0` through to the backend so a 422 surfaces if the operator
+        // typed it intentionally — backend is the source-of-truth on
+        // validation; we no longer silently swallow it client-side.
+        if (llmGeminiCacheTtl.value !== '' && !isNaN(newGemTtl)
+            && newGemTtl !== llmGem.cache_ttl_seconds) {
+            gemPatch.cache_ttl_seconds = newGemTtl;
+        }
+        if (Object.keys(gemPatch).length > 0) llmPatch.gemini = gemPatch;
+
+        if (Object.keys(llmPatch).length > 0) body.llm = llmPatch;
+
         // 3. If there are server-level changes, PATCH them
         if (Object.keys(body).length > 0) {
             try {
@@ -400,8 +565,9 @@ export function SettingsModal({ open, onClose }) {
     const enabledTools = tools.enabled || defaults.enabled_tools || [];
 
     // Effective values: what the next run will actually use.
-    const effProvider = provider.value || defaults.provider || 'openai';
-    const effModel = model.value.trim() || defaults.model || 'unknown';
+    // (Provider/model rows are disabled here so they no longer render an
+    // "Effective:" line — see #865 / Tim's v0.2.3 note on PR #868. The
+    // context-summary <${ModelDisplay} below still uses ModelDisplay.)
     const effMaxTokens = maxTokens.value ? parseInt(maxTokens.value, 10) : (defaults.max_tokens || 100000);
     const effPosture = posture.value || defaults.posture || 'guarded';
 
@@ -428,31 +594,41 @@ export function SettingsModal({ open, onClose }) {
                         <label class="settings-label">Provider</label>
                         <select class="settings-select"
                                 value=${provider.value}
+                                disabled
+                                title="Per-run provider overrides are disabled. Configure provider on the agent (Agents panel) or as the server default."
                                 onChange=${e => { provider.value = e.target.value; }}>
-                            <option value="">Default (${defaults.provider || 'openai'})</option>
+                            <option value="">Default (${formatProviderLabel(defaults.provider || 'openai')})</option>
                             <option value="openai">OpenAI</option>
                             <option value="anthropic">Anthropic</option>
                             <option value="openrouter">OpenRouter</option>
                         </select>
-                        <span class="settings-effective">
-                            Effective: ${effProvider}
-                        </span>
+                        <!-- No "Effective:" row while the control is disabled.
+                             It would only ever show the server default and
+                             would lie for any agent with a per-agent override
+                             (Tim's v0.2.3 note on PR #868). Threading the
+                             active agent's provider/model through the modal
+                             is a separate, larger change tracked for v0.2.3. -->
                     </div>
 
                     <div class="settings-row">
                         <label class="settings-label">Model</label>
                         <input class="settings-input" type="text"
                                list="model-suggestions"
+                               disabled
+                               title="Per-run model overrides are disabled. Configure model on the agent (Agents panel) or as the server default."
                                placeholder=${defaults.model || 'server default'}
                                value=${model.value}
                                onInput=${e => { model.value = e.target.value; }} />
                         <datalist id="model-suggestions">
                             ${MODEL_SUGGESTIONS.map(m => html`<option value=${m} />`)}
                         </datalist>
-                        <span class="settings-effective">
-                            Effective: ${effModel}
-                        </span>
+                        <!-- No "Effective:" row while the control is disabled.
+                             Same rationale as the Provider row above — see
+                             Tim's v0.2.3 note on PR #868. -->
                     </div>
+                </div>
+                <div class="settings-hint settings-overrides-disabled-note">
+                    Provider and model are configured per-agent (Agents panel) or as the server default. Per-run overrides are disabled here to keep per-agent config from being silently squashed by stale localStorage values.
                 </div>
 
                 <div class="settings-grid">
@@ -486,17 +662,69 @@ export function SettingsModal({ open, onClose }) {
                 <div class="settings-grid">
                     <div class="settings-row">
                         <label class="settings-label">Debug mode</label>
-                        <label class="settings-toggle">
-                            <input type="checkbox"
-                                   checked=${debugMode.value}
-                                   onChange=${e => { debugMode.value = e.target.checked; }} />
-                            <span>${debugMode.value ? 'enabled' : 'disabled'}</span>
-                        </label>
+                        <select class="settings-select"
+                                value=${debugMode.value}
+                                onChange=${e => { debugMode.value = e.target.value; }}>
+                            <option value="">Inherit (default)</option>
+                            <option value="true">On</option>
+                            <option value="false">Off</option>
+                        </select>
                         <span class="settings-hint">
-                            When enabled, shows the full context window sent to the LLM before each response.
+                            When On, shows the full context window sent to the LLM before each response.
+                            Off explicitly disables it for the next run even if the agent has it enabled.
                         </span>
                     </div>
                 </div>
+
+                <!--
+                    Reasoning & thinking knobs (#804 Slice C parity).
+
+                    These three knobs were previously only surfaced via the
+                    composer's Advanced expander (#818). They share the same
+                    'localSettings' keys, so a value set from either surface
+                    is visible to both — this section just makes the modal a
+                    full editor too. Live-write to localSettings (no Apply
+                    needed for these specific rows) so changes round-trip
+                    through the same path as the composer.
+
+                    Wrapped in <Section> for visual parity with the
+                    Context / Session / Tools / LLM Providers / Logging
+                    sections below — defaultOpen=false matches siblings.
+                -->
+                <${Section} key="reasoning" title=${'Reasoning & thinking'} defaultOpen=${false}>
+                    <span class="settings-hint settings-section-desc">
+                        Provider-specific. Silently ignored when the effective provider doesn't support the knob.
+                        Applied immediately &mdash; Cancel does not revert these.
+                    </span>
+
+                    <div class="settings-grid">
+                        <${BudgetTriState}
+                            label="Anthropic thinking budget"
+                            wireValue=${localSettings.value.thinking_budget_tokens}
+                            onWrite=${(v) => saveSettings({ thinking_budget_tokens: v })}
+                            classNames=${MODAL_TRISTATE_CLASSES} />
+
+                        <div class="settings-row">
+                            <label class="settings-label">OpenAI reasoning effort</label>
+                            <select class="settings-select"
+                                    value=${localSettings.value.reasoning_effort || ''}
+                                    onChange=${e => saveSettings({ reasoning_effort: e.target.value || null })}>
+                                <option value="">Inherit (server default)</option>
+                                ${REASONING_EFFORTS.map(eff => html`
+                                    <option value=${eff} key=${eff}>${eff}</option>
+                                `)}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="settings-grid">
+                        <${BudgetTriState}
+                            label="Gemini thinking budget"
+                            wireValue=${localSettings.value.gemini_thinking_budget}
+                            onWrite=${(v) => saveSettings({ gemini_thinking_budget: v })}
+                            classNames=${MODAL_TRISTATE_CLASSES} />
+                    </div>
+                <//>
 
                 <div class="settings-divider"></div>
 
@@ -533,13 +761,47 @@ export function SettingsModal({ open, onClose }) {
                                value=${ctxSummaryInterval.value}
                                onInput=${e => { ctxSummaryInterval.value = e.target.value; }} />
                     <//>
+                <//>
+
+                <!-- Summary (server-level, editable) — controls BOTH the
+                     in-loop sliding-summary compaction AND the post-run
+                     episodic memory generation. Lifted out of the Context
+                     section to make the dual-path scope obvious. -->
+                <${Section} key="summary" title="Summary (sliding-summary compaction + episodic memory)" defaultOpen=${false}>
+                    <span class="settings-hint settings-section-desc">
+                        Optional dedicated provider/model for the summary task. Drives both the in-loop sliding-summary compaction
+                        (rolling context window) and the per-run episodic memory generation. Both fields must be set together — partial
+                        configurations are rejected so the user-supplied summary_model is never silently paired with the agent's primary provider.
+                        Per-agent overrides live on the agent record (Agents panel).
+                    </span>
                     <${EditRow} label="Summary model"
-                        desc="Optional cheaper model for generating summaries. Leave empty for default.">
+                        desc="Cheaper model for generating summaries. Set together with Summary provider, or leave both empty to use the agent's main LLM.">
                         <input class="settings-input settings-input-sm" type="text"
-                               placeholder="same as default"
+                               placeholder="leave empty to use the agent's main LLM"
                                list="model-suggestions"
                                value=${ctxSummaryModel.value}
                                onInput=${e => { ctxSummaryModel.value = e.target.value; }} />
+                        <span class="settings-effective">
+                            <${ModelDisplay} value=${ctxSummaryModel.value.trim()} defaultValue=${defaults.model} />
+                        </span>
+                    <//>
+                    <${EditRow} label="Summary provider"
+                        desc="Dedicated provider for the summary task. Must be configured under [llm.providers.<name>] with a resolvable API key. Set together with Summary model.">
+                        <select class="settings-select settings-input-sm"
+                                value=${ctxSummaryProvider.value}
+                                onChange=${e => { ctxSummaryProvider.value = e.target.value; }}>
+                            <option value="">Unset (no dedicated summary task)</option>
+                            ${(defaults.llm_providers && defaults.llm_providers.length > 0
+                                ? defaults.llm_providers
+                                : PROVIDERS).map(p => {
+                                    const known = formatProviderLabel(p);
+                                    // formatProviderLabel returns "Custom" for unknown
+                                    // names — fall back to the raw key so users can
+                                    // tell custom providers apart in the dropdown.
+                                    const label = known === 'Custom' ? p : known;
+                                    return html`<option value=${p} key=${p}>${label}</option>`;
+                                })}
+                        </select>
                     <//>
                 <//>
 
@@ -617,6 +879,76 @@ export function SettingsModal({ open, onClose }) {
                     <//>
                     <${InfoRow} label="Enabled tools" value=${`${enabledTools.length} tools`}
                         desc=${enabledTools.join(', ')} />
+                <//>
+
+                <!-- LLM Providers (server-level, editable) — #809 / #804 Slice A -->
+                <${Section} key="llm" title="LLM Providers" defaultOpen=${false}>
+                    <span class="settings-hint settings-section-desc">
+                        Server-level reasoning &amp; caching defaults. Mutations propagate to the next HTTP-triggered run without restart; Telegram-triggered runs use a boot-time snapshot until the daemon is restarted.
+                    </span>
+
+                    <h4 class="settings-llm-subhead">Anthropic</h4>
+                    <${EditRow} label="Thinking budget tokens"
+                        desc="0 = extended thinking off. Leave blank to keep the current server value. The wire surface has no clear sentinel — once PATCHed, revert by editing settings.json + restart.">
+                        <input class="settings-input settings-input-sm" type="number" min="0" step="1024"
+                               placeholder=${llmAnth.thinking_budget_tokens != null ? String(llmAnth.thinking_budget_tokens) : 'unset'}
+                               value=${llmAnthropicThinking.value}
+                               onInput=${e => { llmAnthropicThinking.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Prompt cache enabled"
+                        desc="Anthropic prefix caching (5-minute TTL). Server-level only.">
+                        <label class="settings-toggle">
+                            <input type="checkbox"
+                                   checked=${llmAnthropicCache.value}
+                                   onChange=${e => {
+                                       llmAnthropicCache.value = e.target.checked;
+                                       llmAnthropicCacheTouched.value = true;
+                                   }} />
+                            <span>${llmAnthropicCache.value ? 'enabled' : 'disabled'}</span>
+                        </label>
+                    <//>
+
+                    <h4 class="settings-llm-subhead">OpenAI / OpenRouter</h4>
+                    <${EditRow} label="Reasoning effort"
+                        desc="Applies to o-series, GPT-5, and reasoning-capable Grok models. Auto-stripped on non-reasoning models. Choose Unset to clear an existing override.">
+                        <select class="settings-select settings-input-sm"
+                                value=${llmOpenaiEffort.value}
+                                onChange=${e => { llmOpenaiEffort.value = e.target.value; }}>
+                            <option value="">Unset (no override)</option>
+                            <option value="minimal">minimal</option>
+                            <option value="low">low</option>
+                            <option value="medium">medium</option>
+                            <option value="high">high</option>
+                        </select>
+                    <//>
+
+                    <h4 class="settings-llm-subhead">Gemini</h4>
+                    <${EditRow} label="Thinking budget"
+                        desc="0 = extended thinking off. Leave blank to keep the current server value. Once PATCHed, this value can only be reverted by editing settings.json + restart.">
+                        <input class="settings-input settings-input-sm" type="number" min="0" step="1024"
+                               placeholder=${llmGem.thinking_budget != null ? String(llmGem.thinking_budget) : 'unset'}
+                               value=${llmGeminiThinking.value}
+                               onInput=${e => { llmGeminiThinking.value = e.target.value; }} />
+                    <//>
+                    <${EditRow} label="Cache enabled"
+                        desc="Gemini context caching via cachedContents. Server-level only.">
+                        <label class="settings-toggle">
+                            <input type="checkbox"
+                                   checked=${llmGeminiCache.value}
+                                   onChange=${e => {
+                                       llmGeminiCache.value = e.target.checked;
+                                       llmGeminiCacheTouched.value = true;
+                                   }} />
+                            <span>${llmGeminiCache.value ? 'enabled' : 'disabled'}</span>
+                        </label>
+                    <//>
+                    <${EditRow} label="Cache TTL (seconds)"
+                        desc="Lifetime of a Gemini cache entry. Must be > 0.">
+                        <input class="settings-input settings-input-sm" type="number" min="1" step="60"
+                               placeholder=${llmGem.cache_ttl_seconds != null ? String(llmGem.cache_ttl_seconds) : '300'}
+                               value=${llmGeminiCacheTtl.value}
+                               onInput=${e => { llmGeminiCacheTtl.value = e.target.value; }} />
+                    <//>
                 <//>
 
                 <!-- Logging (server-level, read-only) -->

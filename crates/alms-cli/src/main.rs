@@ -312,6 +312,9 @@ async fn main() -> anyhow::Result<()> {
                     model,
                     posture,
                     provider,
+                    thinking_budget_tokens,
+                    reasoning_effort,
+                    gemini_thinking_budget,
                     default,
                 } => {
                     let workspace_dir = config.server.workspace_dir();
@@ -323,6 +326,9 @@ async fn main() -> anyhow::Result<()> {
                             model,
                             posture,
                             provider,
+                            thinking_budget_tokens,
+                            reasoning_effort: reasoning_effort.map(Into::into),
+                            gemini_thinking_budget,
                             default,
                             json,
                             workspace_dir: Some(&workspace_dir),
@@ -344,6 +350,9 @@ async fn main() -> anyhow::Result<()> {
                     posture,
                     provider,
                     description,
+                    thinking_budget_tokens,
+                    reasoning_effort,
+                    gemini_thinking_budget,
                 } => {
                     cmd_agent::agent_config(
                         &store,
@@ -353,6 +362,9 @@ async fn main() -> anyhow::Result<()> {
                             posture,
                             provider,
                             description,
+                            thinking_budget_tokens,
+                            reasoning_effort: reasoning_effort.map(Into::into),
+                            gemini_thinking_budget,
                             json,
                         },
                     )?;
@@ -365,12 +377,13 @@ async fn main() -> anyhow::Result<()> {
                 RunCommands::Create {
                     session,
                     input,
+                    agent,
                     model,
                     max_tokens,
                     posture,
                 } => {
                     cmd_run::run_create(
-                        &client, &url, &session, &input, model, max_tokens, posture, json,
+                        &client, &url, &session, &input, agent, model, max_tokens, posture, json,
                     )
                     .await?;
                 }

@@ -21,6 +21,9 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
     let enabled = &agent.enabled_tools;
     let all_builtins: &[&str] = &[
         "echo",
+        "fs_edit",
+        "fs_glob",
+        "fs_grep",
         "fs_list",
         "fs_read",
         "fs_write",
@@ -92,6 +95,14 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         .as_ref()
         .map(|p| p.display().to_string());
 
+    // #871 (Tim's nit on PR #871): expose the configured provider names so
+    // the UI can populate the summary-provider dropdown from
+    // `state.llm_config.providers` instead of a hardcoded four-entry list.
+    // Names are sorted for deterministic UI ordering. Only the keys are
+    // exposed — base URLs / API keys never leave the server.
+    let mut llm_provider_names: Vec<String> = state.llm_config.providers.keys().cloned().collect();
+    llm_provider_names.sort();
+
     let ctx = &agent.context_config;
     let sess = state.session_config.read().clone();
     let log = &state.logging_config;
@@ -110,6 +121,10 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "agent_id": agent_id,
         "agents": agents_list,
         "workspace_dir": workspace_dir,
+        // #871 (Tim's nit): provider names from `[llm.providers.<name>]`,
+        // sorted alphabetically. UI uses this to populate the summary-provider
+        // dropdown so user-defined providers in alms.toml show up automatically.
+        "llm_providers": llm_provider_names,
         // Context settings
         "context": {
             "strategy": ctx.strategy,
@@ -117,6 +132,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
             "recent_window": ctx.recent_window,
             "summary_interval": ctx.summary_interval,
             "summary_model": ctx.summary_model,
+            "summary_provider": ctx.summary_provider,
             "run_summary_mode": ctx.run_summary_mode.to_string(),
             "run_summary_budget": ctx.run_summary_budget,
         },
@@ -143,6 +159,26 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
             "max_output_bytes": tools_cfg.max_output_bytes,
             "enabled": tools,
         },
+        // LLM provider-family settings (#809). Mirrors the shape of the
+        // `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` blocks in
+        // `alms.toml`. Server-level defaults only; per-agent overrides
+        // live on the agent registry, per-run overrides on `POST /runs`.
+        "llm": {
+            "anthropic": {
+                "thinking_budget_tokens": agent.anthropic_thinking_budget,
+                "prompt_cache_enabled": agent.anthropic_prompt_cache_enabled,
+            },
+            "openai": {
+                "reasoning_effort": agent.openai_reasoning_effort
+                    .as_ref()
+                    .map(|e| e.as_wire_str()),
+            },
+            "gemini": {
+                "thinking_budget": agent.gemini_thinking_budget,
+                "cache_enabled": agent.gemini_cache_enabled,
+                "cache_ttl_seconds": agent.gemini_cache_ttl_seconds,
+            },
+        },
     }))
 }
 
@@ -157,6 +193,10 @@ pub struct PatchContext {
     pub recent_window: Option<usize>,
     pub summary_interval: Option<usize>,
     pub summary_model: Option<String>,
+    /// Separate provider for the summary task (#866). Empty string clears
+    /// back to "inherit agent provider"; non-empty must reference a
+    /// configured `[llm.providers.<name>]` block whose API key is resolvable.
+    pub summary_provider: Option<String>,
 }
 
 /// Partial session config update.
@@ -180,6 +220,60 @@ pub struct PatchTools {
     pub max_output_bytes: Option<usize>,
 }
 
+/// Partial Anthropic LLM config update (#809).
+///
+/// Mirrors `[llm.anthropic]` in `alms.toml`. Fields that are `None` are
+/// untouched; fields that are `Some` overwrite the live server default.
+/// The provider-neutral `AgentConfig` (which is what the agent loop reads
+/// per run) is what the PATCH handler mutates — no restart required.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PatchLlmAnthropic {
+    pub thinking_budget_tokens: Option<u32>,
+    pub prompt_cache_enabled: Option<bool>,
+}
+
+/// Partial OpenAI-compat LLM config update (#809).
+///
+/// Mirrors `[llm.openai]` in `alms.toml`. `reasoning_effort = None` in the
+/// patch body means "leave unchanged"; to clear the server default back
+/// to "don't send the field on the wire", use an empty-string value —
+/// i.e. `{ "reasoning_effort": "" }` — which the handler treats as an
+/// explicit clear sentinel. This matches the existing pattern used by
+/// `PatchContext::summary_model`.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PatchLlmOpenai {
+    pub reasoning_effort: Option<String>,
+}
+
+/// Partial Gemini LLM config update (#809).
+///
+/// Mirrors `[llm.gemini]` in `alms.toml`. `thinking_budget = Some(0)` is
+/// a legitimate value meaning "disable extended thinking server-wide";
+/// it is not a clear sentinel. Three-layer precedence (per-run >
+/// per-agent > server default) still applies downstream.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PatchLlmGemini {
+    pub thinking_budget: Option<u32>,
+    pub cache_enabled: Option<bool>,
+    pub cache_ttl_seconds: Option<u64>,
+}
+
+/// Partial LLM config update (#809).
+///
+/// Nested under `llm` in the top-level PATCH /settings body. Each
+/// provider family has its own sub-object; absent sub-objects are
+/// untouched.
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+pub struct PatchLlm {
+    pub anthropic: Option<PatchLlmAnthropic>,
+    pub openai: Option<PatchLlmOpenai>,
+    pub gemini: Option<PatchLlmGemini>,
+}
+
 /// Top-level PATCH /settings request body.
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
@@ -187,13 +281,23 @@ pub struct PatchSettingsRequest {
     pub context: Option<PatchContext>,
     pub session: Option<PatchSession>,
     pub tools: Option<PatchTools>,
+    pub llm: Option<PatchLlm>,
 }
 
 /// PATCH /settings — apply partial config updates to the running server.
 ///
-/// Only context, session, and tools sections are mutable at runtime.
-/// Logging requires a restart and is not accepted here.
+/// The context, session, tools, and llm (#809) sections are mutable at
+/// runtime. Logging requires a restart and is not accepted here.
 /// Changes take effect on the next run (in-flight runs are unaffected).
+///
+/// Live-mutation propagation is **HTTP-path only**: mutations write through
+/// to the shared `Arc<RwLock<AgentConfig>>` referenced by the HTTP `POST
+/// /runs` and Coordinator paths. Telegram-triggered runs read from a
+/// boot-time clone held inside `Gateway` and continue to use the snapshot
+/// until the daemon restarts. See `gateway.rs::Gateway::run_telegram` for
+/// the inheritance site. This is pre-existing behaviour for the
+/// `context` / `session` / `tools` sections and is documented in
+/// `docs/api.md` § 10.2.
 pub async fn patch_settings(
     State(state): State<AppState>,
     Json(body): Json<PatchSettingsRequest>,
@@ -232,11 +336,97 @@ pub async fn patch_settings(
         if let Some(v) = ctx_patch.summary_interval {
             ctx.summary_interval = v;
         }
-        if let Some(ref v) = ctx_patch.summary_model {
-            if v.is_empty() {
-                ctx.summary_model = None;
-            } else {
-                ctx.summary_model = Some(v.clone());
+
+        // #866 / #871: `summary_model` and `summary_provider` are validated
+        // together because their post-PATCH combined state matters: when a
+        // dedicated summary provider is configured, the agent's resolved
+        // model name belongs to a different provider and must NOT be used
+        // as a fallback for the summary task's wire model. The runtime has
+        // a defense-in-depth leak guard in `runs/lifecycle.rs` that clears
+        // the inherited model in this shape, but we reject the combination
+        // up front so misconfigurations surface at PATCH time exactly like
+        // `SUMMARY_PROVIDER_UNKNOWN` / `SUMMARY_PROVIDER_MISSING_API_KEY`
+        // do (Option 1 philosophy from #866).
+        //
+        // Compute the would-be post-PATCH values without committing them,
+        // validate the combined invariant, then commit.
+        let next_summary_model: Option<String> = match ctx_patch.summary_model.as_ref() {
+            Some(v) if v.is_empty() => None,
+            Some(v) => Some(v.clone()),
+            None => ctx.summary_model.clone(),
+        };
+        // Validate `summary_provider` if the patch touches it. `Ok(Some(p))`
+        // = set to provider name `p`; `Ok(None)` = clear; per-field error
+        // pushed onto `errors` and the live value preserved for the cross-
+        // field check.
+        let next_summary_provider_resolved: Option<String> =
+            match ctx_patch.summary_provider.as_ref() {
+                None => ctx.summary_provider.clone(),
+                Some(v) if v.is_empty() => None,
+                Some(v) => {
+                    let entry = state.llm_config.providers.get(v);
+                    let entry_has_key = entry.is_some_and(|e| e.resolve_api_key().is_some());
+                    let secrets_has_key = state.secrets.read().resolve_key(v).is_some();
+                    if entry.is_none() {
+                        errors.push(format!(
+                            "SUMMARY_PROVIDER_UNKNOWN: context.summary_provider '{v}' \
+                         is not configured under [llm.providers.<name>] in alms.toml"
+                        ));
+                        ctx.summary_provider.clone()
+                    } else if !entry_has_key && !secrets_has_key {
+                        errors.push(format!(
+                            "SUMMARY_PROVIDER_MISSING_API_KEY: context.summary_provider '{v}' \
+                         has no resolvable API key — set one with `alms auth set {v}` or \
+                         configure `[llm.providers.{v}].api_key_env` / `api_key`"
+                        ));
+                        ctx.summary_provider.clone()
+                    } else {
+                        Some(v.clone())
+                    }
+                }
+            };
+
+        // #871 / #872 cross-field invariant: the summary provider/model
+        // pair must be symmetric — both set or both unset. The pre-#872
+        // shape only validated provider-set + model-missing, but the
+        // model-set + provider-missing direction is just as broken: the
+        // resolver used to silently pair the user's `summary_model` with
+        // the agent's primary provider (the exact misconfiguration that
+        // produced the `model: not found` 404 in #866), and the v0.2.2
+        // default config shipped in that asymmetric shape. Reject both
+        // directions at PATCH time, regardless of which field the patch
+        // touched.
+        let provider_set = next_summary_provider_resolved.is_some();
+        let model_set = next_summary_model.is_some();
+        if provider_set && !model_set {
+            errors.push(
+                "SUMMARY_PROVIDER_REQUIRES_MODEL: context.summary_provider is set but \
+                 context.summary_model is empty. The agent's resolved model belongs to \
+                 the AGENT's provider namespace and is not a safe fallback for the \
+                 summary provider's wire — set summary_model to a slug valid for the \
+                 summary provider, or clear summary_provider (use empty string) to \
+                 inherit the agent's provider/model."
+                    .to_string(),
+            );
+        } else if !provider_set && model_set {
+            errors.push(
+                "SUMMARY_MODEL_REQUIRES_PROVIDER: context.summary_model is set but \
+                 context.summary_provider is empty. The user-supplied summary_model \
+                 belongs to a specific provider's namespace; pairing it with the \
+                 agent's primary provider would 404 on the wire (#866 / #872). Set \
+                 summary_provider to the matching provider name, or clear summary_model \
+                 (use empty string) to inherit the agent's provider/model."
+                    .to_string(),
+            );
+        } else {
+            // Cross-field invariant holds — commit the would-be values for
+            // any field the patch touched. Per-field validation errors above
+            // already preserved the live value, so this is a no-op for those.
+            if ctx_patch.summary_model.is_some() {
+                ctx.summary_model = next_summary_model;
+            }
+            if ctx_patch.summary_provider.is_some() {
+                ctx.summary_provider = next_summary_provider_resolved;
             }
         }
 
@@ -245,6 +435,7 @@ pub async fn patch_settings(
             max_input_tokens = ctx.max_input_tokens,
             recent_window = ctx.recent_window,
             summary_interval = ctx.summary_interval,
+            summary_provider = ?ctx.summary_provider,
             "Updated context config via PATCH /settings"
         );
     }
@@ -329,10 +520,98 @@ pub async fn patch_settings(
         );
     }
 
-    // Persist current settings to disk so they survive restarts.
-    persist_settings(&state);
+    // ── LLM (provider-family defaults, #809) ──────────────────────────
+    //
+    // All six knobs live on the server-level `AgentConfig` which is the
+    // single source of truth for new runs (see `runs/mod.rs::apply_overrides`
+    // and `runs/lifecycle.rs::execute_run`). Mutating it under the same
+    // write lock as the other PATCH branches ensures the next `POST /runs`
+    // picks up the new value without a daemon restart.
+    if let Some(llm_patch) = &body.llm {
+        let mut agent = state.agent_config.write();
 
+        if let Some(ant) = &llm_patch.anthropic {
+            if let Some(v) = ant.thinking_budget_tokens {
+                agent.anthropic_thinking_budget = v;
+            }
+            if let Some(v) = ant.prompt_cache_enabled {
+                agent.anthropic_prompt_cache_enabled = v;
+            }
+        }
+
+        if let Some(oai) = &llm_patch.openai
+            && let Some(ref v) = oai.reasoning_effort
+        {
+            if v.is_empty() {
+                // Empty string = clear server default back to "don't
+                // send reasoning_effort on the wire".
+                agent.openai_reasoning_effort = None;
+            } else {
+                match v.parse::<alms_core::config::ReasoningEffort>() {
+                    Ok(effort) => {
+                        agent.openai_reasoning_effort = Some(effort);
+                    }
+                    Err(msg) => {
+                        errors.push(format!("llm.openai.reasoning_effort: {msg}"));
+                    }
+                }
+            }
+        }
+
+        if let Some(gem) = &llm_patch.gemini {
+            if let Some(v) = gem.thinking_budget {
+                // `Some(0)` is a legitimate server-level disable, not a
+                // clear sentinel — preserved verbatim.
+                agent.gemini_thinking_budget = Some(v);
+            }
+            if let Some(v) = gem.cache_enabled {
+                agent.gemini_cache_enabled = v;
+            }
+            if let Some(v) = gem.cache_ttl_seconds {
+                if v == 0 {
+                    errors.push("llm.gemini.cache_ttl_seconds must be > 0".into());
+                } else {
+                    agent.gemini_cache_ttl_seconds = v;
+                }
+            }
+        }
+
+        // Tag the log with the rejected-fields count so a partial-failure
+        // PATCH (e.g. one valid sub-field plus one rejected sub-field) is
+        // not misread as a clean success — the message still says "Updated"
+        // because some fields *did* land, but `errors_count > 0` is the
+        // signal that the response was 422 not 200.
+        info!(
+            anthropic_thinking_budget = agent.anthropic_thinking_budget,
+            anthropic_prompt_cache_enabled = agent.anthropic_prompt_cache_enabled,
+            openai_reasoning_effort = ?agent.openai_reasoning_effort,
+            gemini_thinking_budget = ?agent.gemini_thinking_budget,
+            gemini_cache_enabled = agent.gemini_cache_enabled,
+            gemini_cache_ttl_seconds = agent.gemini_cache_ttl_seconds,
+            errors_count = errors.len(),
+            "Updated LLM config via PATCH /settings"
+        );
+    }
+
+    // Persist current settings to disk so they survive restarts — but only
+    // when the request validates cleanly. A rejected PATCH (handler returns
+    // 422) must be side-effect-free at the persistence layer: otherwise an
+    // invalid request like `{ "llm": { "openai": { "reasoning_effort":
+    // "turbo" } } }` would still rewrite `settings.json` from the current
+    // live snapshot, and any field that *did* land before the validation
+    // error (or earlier PATCH-applied values still in memory) would be
+    // baked into the persisted snapshot — silently changing post-restart
+    // behaviour for a request the operator was told failed.
+    //
+    // Note: this only closes the persistence half. Live `AgentConfig`
+    // mutations are still applied inline above and a partial-failure 422
+    // can leave the in-memory config half-mutated until the next
+    // successful PATCH or a restart. That is the documented
+    // "status: partial" wire contract — fixing it would require buffering
+    // every mutation and applying atomically only after validation passes.
+    // See PR #810 for context.
     if errors.is_empty() {
+        persist_settings(&state);
         (StatusCode::OK, Json(serde_json::json!({ "status": "ok" })))
     } else {
         (
@@ -368,6 +647,12 @@ pub struct PersistedContextOverrides {
     pub summary_interval: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_model: Option<String>,
+    /// Persisted summary provider override (#866).
+    /// `None` means "fall through to TOML / env / code default" — typically
+    /// "inherit agent provider". `Some(provider)` re-targets the summary
+    /// task at that provider on every restart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub run_summary_mode: Option<alms_core::config::RunSummaryMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -392,6 +677,9 @@ impl PersistedContextOverrides {
         }
         if self.summary_model.is_some() {
             ctx.summary_model = self.summary_model.clone();
+        }
+        if self.summary_provider.is_some() {
+            ctx.summary_provider = self.summary_provider.clone();
         }
         if let Some(ref v) = self.run_summary_mode {
             ctx.run_summary_mode = v.clone();
@@ -471,6 +759,101 @@ impl PersistedToolsOverrides {
     }
 }
 
+/// Persisted Anthropic LLM overrides (#809).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedLlmAnthropicOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_enabled: Option<bool>,
+}
+
+/// Persisted OpenAI-compat LLM overrides (#809).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedLlmOpenaiOverrides {
+    /// Wire-string representation (`"low"` / `"medium"` / `"high"` /
+    /// `"minimal"`). We store the string rather than the enum so the
+    /// JSON on disk round-trips through JSON-anything without requiring
+    /// the reader to know about `ReasoningEffort`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+/// Persisted Gemini LLM overrides (#809).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedLlmGeminiOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_seconds: Option<u64>,
+}
+
+/// Persisted LLM overrides umbrella (#809).
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PersistedLlmOverrides {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anthropic: Option<PersistedLlmAnthropicOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openai: Option<PersistedLlmOpenaiOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gemini: Option<PersistedLlmGeminiOverrides>,
+}
+
+impl PersistedLlmOverrides {
+    /// Merge these overrides into the live `AgentConfig` on startup so
+    /// the PATCH /settings mutations survive a gateway restart.
+    ///
+    /// Semantics mirror the other `PersistedXOverrides::apply_to` impls:
+    /// fields that are `Some` overwrite the target; fields that are
+    /// `None` leave the target untouched. The one subtlety is
+    /// `openai.reasoning_effort`: because the target field is itself an
+    /// `Option<ReasoningEffort>`, we need a way to represent "cleared"
+    /// on disk. We use the empty string (`""`) for that — same trick
+    /// the rest of the API uses to clear a nullable value, and matching
+    /// the PATCH-wire shape of `PatchLlmOpenai::reasoning_effort`.
+    pub fn apply_to(&self, cfg: &mut alms_runtime::AgentConfig) {
+        if let Some(ant) = &self.anthropic {
+            if let Some(v) = ant.thinking_budget_tokens {
+                cfg.anthropic_thinking_budget = v;
+            }
+            if let Some(v) = ant.prompt_cache_enabled {
+                cfg.anthropic_prompt_cache_enabled = v;
+            }
+        }
+        if let Some(oai) = &self.openai
+            && let Some(ref v) = oai.reasoning_effort
+        {
+            if v.is_empty() {
+                cfg.openai_reasoning_effort = None;
+            } else if let Ok(effort) = v.parse::<alms_core::config::ReasoningEffort>() {
+                cfg.openai_reasoning_effort = Some(effort);
+            } else {
+                tracing::warn!(
+                    value = %v,
+                    "Ignoring unknown persisted openai.reasoning_effort value"
+                );
+            }
+        }
+        if let Some(gem) = &self.gemini {
+            if let Some(v) = gem.thinking_budget {
+                cfg.gemini_thinking_budget = Some(v);
+            }
+            if let Some(v) = gem.cache_enabled {
+                cfg.gemini_cache_enabled = v;
+            }
+            if let Some(v) = gem.cache_ttl_seconds {
+                cfg.gemini_cache_ttl_seconds = v;
+            }
+        }
+    }
+}
+
 /// On-disk representation of the mutable server-level settings.
 ///
 /// Written to `{data_dir}/settings.json` after every PATCH /settings and
@@ -495,6 +878,8 @@ pub struct PersistedSettings {
     pub session: Option<PersistedSessionOverrides>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<PersistedToolsOverrides>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm: Option<PersistedLlmOverrides>,
 }
 
 /// Return the canonical path for the persisted settings file.
@@ -522,6 +907,7 @@ fn persist_settings(state: &AppState) {
             recent_window: Some(ctx.recent_window),
             summary_interval: Some(ctx.summary_interval),
             summary_model: ctx.summary_model.clone(),
+            summary_provider: ctx.summary_provider.clone(),
             // run_summary_mode and run_summary_budget are NOT exposed in
             // PATCH /settings, so we never persist them. This ensures that
             // code-default changes and env-var overrides are always respected.
@@ -540,6 +926,38 @@ fn persist_settings(state: &AppState) {
             sandbox_root: Some(tools.sandbox_root.clone()),
             timeout_secs: Some(tools.timeout_secs),
             max_output_bytes: Some(tools.max_output_bytes),
+        }),
+        // LLM provider-family defaults (#809). We persist the full
+        // snapshot of each knob — they all live on `AgentConfig` as
+        // plain values with no "unset" sentinel at the struct level, so
+        // there's nothing to distinguish "user-set via PATCH" from
+        // "loaded from TOML / env on boot" anyway. On restart the
+        // persisted value wins over TOML / env (same precedence as the
+        // context / session / tools blocks above).
+        llm: Some(PersistedLlmOverrides {
+            anthropic: Some(PersistedLlmAnthropicOverrides {
+                thinking_budget_tokens: Some(agent.anthropic_thinking_budget),
+                prompt_cache_enabled: Some(agent.anthropic_prompt_cache_enabled),
+            }),
+            openai: Some(PersistedLlmOpenaiOverrides {
+                // Persist the wire string, or `""` to represent
+                // "explicitly cleared". `None` at this layer would mean
+                // "leave the TOML / env value alone on reload" which is
+                // NOT what we want after a PATCH clear — we want the
+                // clear to win on every subsequent boot.
+                reasoning_effort: Some(
+                    agent
+                        .openai_reasoning_effort
+                        .as_ref()
+                        .map(|e| e.as_wire_str().to_string())
+                        .unwrap_or_default(),
+                ),
+            }),
+            gemini: Some(PersistedLlmGeminiOverrides {
+                thinking_budget: agent.gemini_thinking_budget,
+                cache_enabled: Some(agent.gemini_cache_enabled),
+                cache_ttl_seconds: Some(agent.gemini_cache_ttl_seconds),
+            }),
         }),
     };
 
@@ -676,6 +1094,43 @@ mod tests {
         assert_eq!(ctx.summary_interval, 30);
     }
 
+    /// #866: `summary_provider` applies to ContextConfig when set in
+    /// overrides and is preserved when overrides leave it None.
+    #[test]
+    fn context_overrides_summary_provider_round_trip() {
+        let mut ctx = alms_core::config::ContextConfig::default();
+        assert_eq!(
+            ctx.summary_provider, None,
+            "default ContextConfig has summary_provider = None"
+        );
+
+        // Setting it on the override applies it.
+        let overrides = PersistedContextOverrides {
+            summary_provider: Some("openrouter".into()),
+            ..Default::default()
+        };
+        overrides.apply_to(&mut ctx);
+        assert_eq!(
+            ctx.summary_provider,
+            Some("openrouter".into()),
+            "summary_provider override should land on ContextConfig"
+        );
+
+        // Subsequent override with None on summary_provider must not clear
+        // the value (the persisted-overrides semantics: only Some fields
+        // overwrite; mirrors `summary_model`).
+        let no_op = PersistedContextOverrides {
+            strategy: Some("truncate".into()),
+            ..Default::default()
+        };
+        no_op.apply_to(&mut ctx);
+        assert_eq!(
+            ctx.summary_provider,
+            Some("openrouter".into()),
+            "PersistedContextOverrides with None summary_provider must not clear the live value"
+        );
+    }
+
     /// Session overrides with partial fields should only overwrite `Some` fields.
     #[test]
     fn session_overrides_apply_only_some_fields() {
@@ -726,11 +1181,13 @@ mod tests {
                 recent_window: Some(20),
                 summary_interval: Some(30),
                 summary_model: None,
+                summary_provider: None,
                 run_summary_mode: None,
                 run_summary_budget: None,
             }),
             session: None,
             tools: None,
+            llm: None,
         };
         let json = serde_json::to_string_pretty(&persisted).unwrap();
         assert!(
@@ -753,6 +1210,7 @@ mod tests {
                 recent_window: Some(10),
                 summary_interval: Some(15),
                 summary_model: Some("gpt-4o-mini".into()),
+                summary_provider: None,
                 run_summary_mode: None,
                 run_summary_budget: None,
             }),
@@ -769,6 +1227,7 @@ mod tests {
                 timeout_secs: Some(60),
                 max_output_bytes: Some(1_000_000),
             }),
+            llm: None,
         };
         let json = serde_json::to_string_pretty(&original).unwrap();
         let deserialized: PersistedSettings = serde_json::from_str(&json).unwrap();
@@ -794,6 +1253,7 @@ mod tests {
         assert!(persisted.context.is_none());
         assert!(persisted.session.is_none());
         assert!(persisted.tools.is_none());
+        assert!(persisted.llm.is_none());
     }
 
     /// Old format with full SessionConfig should still deserialize.
@@ -813,5 +1273,899 @@ mod tests {
         assert_eq!(sess.max_messages, Some(10_000));
         assert_eq!(sess.idle_timeout_secs, Some(86_400));
         assert_eq!(sess.auto_archive, Some(true));
+    }
+
+    // ==================================================================
+    // LLM provider-family surface (#809)
+    // ==================================================================
+
+    /// Old settings.json files predating #809 must still deserialize
+    /// cleanly — the new `llm` field must be optional.
+    #[test]
+    fn backward_compat_settings_json_without_llm() {
+        let old_json = r#"{
+            "context": { "strategy": "truncate", "max_input_tokens": 128000 },
+            "tools": { "shell_policy": "sandboxed" }
+        }"#;
+        let persisted: PersistedSettings = serde_json::from_str(old_json).unwrap();
+        assert!(persisted.llm.is_none(), "pre-#809 JSON should lack `llm`");
+        // And the other sections should still deserialize.
+        assert_eq!(persisted.context.unwrap().strategy, Some("truncate".into()));
+    }
+
+    /// A `PersistedSettings` with `llm: None` must NOT emit the key in
+    /// the serialized JSON — same `skip_serializing_if` pattern as the
+    /// other top-level sections.
+    #[test]
+    fn serialized_omits_llm_when_none() {
+        let persisted = PersistedSettings {
+            context: None,
+            session: None,
+            tools: None,
+            llm: None,
+        };
+        let json = serde_json::to_string_pretty(&persisted).unwrap();
+        assert!(
+            !json.contains("\"llm\""),
+            "JSON should not contain llm key when it is None: {json}"
+        );
+    }
+
+    /// `PersistedLlmOverrides::apply_to` must overwrite each field the
+    /// overrides populate and leave everything else untouched. Mirrors
+    /// the shape of the context/session/tools `apply_to` tests above.
+    #[test]
+    fn llm_overrides_apply_to_mutates_agent_config() {
+        let mut cfg = alms_runtime::AgentConfig::default();
+        // Baseline: caching on, no reasoning effort, no Gemini thinking.
+        assert!(cfg.anthropic_prompt_cache_enabled);
+        assert_eq!(cfg.anthropic_thinking_budget, 0);
+        assert!(cfg.openai_reasoning_effort.is_none());
+        assert!(cfg.gemini_thinking_budget.is_none());
+        assert!(cfg.gemini_cache_enabled);
+        assert_eq!(cfg.gemini_cache_ttl_seconds, 300);
+
+        let overrides = PersistedLlmOverrides {
+            anthropic: Some(PersistedLlmAnthropicOverrides {
+                thinking_budget_tokens: Some(8192),
+                prompt_cache_enabled: Some(false),
+            }),
+            openai: Some(PersistedLlmOpenaiOverrides {
+                reasoning_effort: Some("high".into()),
+            }),
+            gemini: Some(PersistedLlmGeminiOverrides {
+                thinking_budget: Some(4096),
+                cache_enabled: Some(false),
+                cache_ttl_seconds: Some(600),
+            }),
+        };
+        overrides.apply_to(&mut cfg);
+
+        assert_eq!(cfg.anthropic_thinking_budget, 8192);
+        assert!(!cfg.anthropic_prompt_cache_enabled);
+        assert_eq!(
+            cfg.openai_reasoning_effort,
+            Some(alms_core::config::ReasoningEffort::High)
+        );
+        assert_eq!(cfg.gemini_thinking_budget, Some(4096));
+        assert!(!cfg.gemini_cache_enabled);
+        assert_eq!(cfg.gemini_cache_ttl_seconds, 600);
+    }
+
+    /// Empty-string `reasoning_effort` on the persisted layer must clear
+    /// the live `AgentConfig.openai_reasoning_effort` back to `None`.
+    /// This is the only "clear sentinel" the /settings surface needs
+    /// for LLM knobs — the other two tri-state fields
+    /// (`gemini_thinking_budget`, `anthropic_thinking_budget` is plain
+    /// u32) don't need one because `Some(0)` is a legitimate disable
+    /// value for those.
+    #[test]
+    fn llm_overrides_empty_string_reasoning_effort_clears() {
+        let mut cfg = alms_runtime::AgentConfig {
+            openai_reasoning_effort: Some(alms_core::config::ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let overrides = PersistedLlmOverrides {
+            anthropic: None,
+            openai: Some(PersistedLlmOpenaiOverrides {
+                reasoning_effort: Some(String::new()),
+            }),
+            gemini: None,
+        };
+        overrides.apply_to(&mut cfg);
+        assert!(
+            cfg.openai_reasoning_effort.is_none(),
+            "empty-string reasoning_effort must clear to None"
+        );
+    }
+
+    /// Unknown `reasoning_effort` string (typo in persisted JSON) must
+    /// be ignored with a warning — never panic, never crash the apply.
+    #[test]
+    fn llm_overrides_unknown_reasoning_effort_ignored() {
+        let mut cfg = alms_runtime::AgentConfig {
+            openai_reasoning_effort: Some(alms_core::config::ReasoningEffort::Medium),
+            ..Default::default()
+        };
+        let overrides = PersistedLlmOverrides {
+            anthropic: None,
+            openai: Some(PersistedLlmOpenaiOverrides {
+                reasoning_effort: Some("turbo".into()),
+            }),
+            gemini: None,
+        };
+        overrides.apply_to(&mut cfg);
+        // Target is untouched on unknown input.
+        assert_eq!(
+            cfg.openai_reasoning_effort,
+            Some(alms_core::config::ReasoningEffort::Medium)
+        );
+    }
+
+    /// The `PatchLlm*` wire structs must all default cleanly — used by
+    /// axum's JSON body extractor to accept callers that omit the new
+    /// surface entirely.
+    #[test]
+    fn patch_llm_body_all_none_by_default() {
+        let body: PatchSettingsRequest = serde_json::from_str("{}").unwrap();
+        assert!(body.llm.is_none());
+    }
+
+    /// A PATCH body with `llm: { anthropic: { thinking_budget_tokens: 16384 } }`
+    /// must deserialize into the expected nested shape.
+    #[test]
+    fn patch_llm_body_parses_nested_shape() {
+        let json = r#"{
+            "llm": {
+                "anthropic": { "thinking_budget_tokens": 16384, "prompt_cache_enabled": false },
+                "openai": { "reasoning_effort": "high" },
+                "gemini": { "thinking_budget": 4096, "cache_enabled": false, "cache_ttl_seconds": 600 }
+            }
+        }"#;
+        let body: PatchSettingsRequest = serde_json::from_str(json).unwrap();
+        let llm = body.llm.expect("llm should be present");
+        let ant = llm.anthropic.expect("anthropic should be present");
+        assert_eq!(ant.thinking_budget_tokens, Some(16384));
+        assert_eq!(ant.prompt_cache_enabled, Some(false));
+        let oai = llm.openai.expect("openai should be present");
+        assert_eq!(oai.reasoning_effort.as_deref(), Some("high"));
+        let gem = llm.gemini.expect("gemini should be present");
+        assert_eq!(gem.thinking_budget, Some(4096));
+        assert_eq!(gem.cache_enabled, Some(false));
+        assert_eq!(gem.cache_ttl_seconds, Some(600));
+    }
+
+    /// Round-trip a full LLM-populated PersistedSettings through JSON
+    /// and back, verifying every field survives.
+    #[test]
+    fn llm_overrides_round_trip() {
+        let original = PersistedSettings {
+            context: None,
+            session: None,
+            tools: None,
+            llm: Some(PersistedLlmOverrides {
+                anthropic: Some(PersistedLlmAnthropicOverrides {
+                    thinking_budget_tokens: Some(8192),
+                    prompt_cache_enabled: Some(true),
+                }),
+                openai: Some(PersistedLlmOpenaiOverrides {
+                    reasoning_effort: Some("low".into()),
+                }),
+                gemini: Some(PersistedLlmGeminiOverrides {
+                    thinking_budget: Some(0),
+                    cache_enabled: Some(false),
+                    cache_ttl_seconds: Some(1800),
+                }),
+            }),
+        };
+        let json = serde_json::to_string_pretty(&original).unwrap();
+        let round_tripped: PersistedSettings = serde_json::from_str(&json).unwrap();
+        let llm = round_tripped.llm.unwrap();
+        let ant = llm.anthropic.unwrap();
+        assert_eq!(ant.thinking_budget_tokens, Some(8192));
+        assert_eq!(ant.prompt_cache_enabled, Some(true));
+        let oai = llm.openai.unwrap();
+        assert_eq!(oai.reasoning_effort, Some("low".into()));
+        let gem = llm.gemini.unwrap();
+        assert_eq!(gem.thinking_budget, Some(0));
+        assert_eq!(gem.cache_enabled, Some(false));
+        assert_eq!(gem.cache_ttl_seconds, Some(1800));
+    }
+
+    // ==================================================================
+    // PATCH /settings -> live `AgentConfig` mutation (#809 follow-up,
+    // Tim review item 1).
+    //
+    // The persistence-load and per-run-merge tests above prove the
+    // serde / business-logic layers, but the actual claim of #809 is
+    // that `patch_settings()` writes through to the live
+    // `Arc<RwLock<AgentConfig>>` shared with the HTTP run path. These
+    // end-to-end tests construct a real `AppState`, call
+    // `patch_settings()` as the axum handler, and read
+    // `state.agent_config.read()` afterwards to assert the mutation
+    // landed. They are the only tests that would catch a future
+    // refactor introducing a stale-clone in the handler.
+    // ==================================================================
+
+    /// Construct a minimal `AppState` with no SQLite, no LLM, fresh
+    /// channels — same shape as `runs::integration_tests::test_app_state`,
+    /// inlined here because that helper is private to its module.
+    fn settings_test_app_state() -> crate::server::AppState {
+        let gateway_config = crate::gateway::GatewayConfig::default();
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::server::AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token,
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn patch_llm_writes_through_to_live_agent_config() {
+        let state = settings_test_app_state();
+
+        // Seed a baseline different from the values we will PATCH so the
+        // assertions below distinguish the mutation from the default.
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.anthropic_thinking_budget = 0;
+            cfg.anthropic_prompt_cache_enabled = true;
+            cfg.openai_reasoning_effort = None;
+            cfg.gemini_thinking_budget = None;
+            cfg.gemini_cache_enabled = true;
+            cfg.gemini_cache_ttl_seconds = 300;
+        }
+
+        // PATCH every LLM knob to a non-default value.
+        let body = PatchSettingsRequest {
+            llm: Some(PatchLlm {
+                anthropic: Some(PatchLlmAnthropic {
+                    thinking_budget_tokens: Some(8192),
+                    prompt_cache_enabled: Some(false),
+                }),
+                openai: Some(PatchLlmOpenai {
+                    reasoning_effort: Some("high".into()),
+                }),
+                gemini: Some(PatchLlmGemini {
+                    thinking_budget: Some(4096),
+                    cache_enabled: Some(false),
+                    cache_ttl_seconds: Some(1800),
+                }),
+            }),
+            ..Default::default()
+        };
+        let _resp = patch_settings(axum::extract::State(state.clone()), Json(body)).await;
+
+        // Read the live config back through the shared lock.
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.anthropic_thinking_budget, 8192,
+            "PATCH must write through to live anthropic_thinking_budget"
+        );
+        assert!(
+            !cfg.anthropic_prompt_cache_enabled,
+            "PATCH must write through to live anthropic_prompt_cache_enabled"
+        );
+        assert_eq!(
+            cfg.openai_reasoning_effort,
+            Some(alms_core::config::ReasoningEffort::High),
+            "PATCH must write through to live openai_reasoning_effort"
+        );
+        assert_eq!(
+            cfg.gemini_thinking_budget,
+            Some(4096),
+            "PATCH must write through to live gemini_thinking_budget"
+        );
+        assert!(
+            !cfg.gemini_cache_enabled,
+            "PATCH must write through to live gemini_cache_enabled"
+        );
+        assert_eq!(
+            cfg.gemini_cache_ttl_seconds, 1800,
+            "PATCH must write through to live gemini_cache_ttl_seconds"
+        );
+    }
+
+    /// Empty-string `reasoning_effort` on the PATCH wire must clear the
+    /// live `openai_reasoning_effort` back to `None` — same clear-sentinel
+    /// behaviour as the persistence-load path.
+    #[tokio::test]
+    async fn patch_openai_empty_string_clears_live_reasoning_effort() {
+        let state = settings_test_app_state();
+        // Seed: high effort.
+        state.agent_config.write().openai_reasoning_effort =
+            Some(alms_core::config::ReasoningEffort::High);
+
+        let body = PatchSettingsRequest {
+            llm: Some(PatchLlm {
+                openai: Some(PatchLlmOpenai {
+                    reasoning_effort: Some(String::new()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _resp = patch_settings(axum::extract::State(state.clone()), Json(body)).await;
+
+        assert!(
+            state.agent_config.read().openai_reasoning_effort.is_none(),
+            "empty-string reasoning_effort must clear the live config to None"
+        );
+    }
+
+    /// `gemini.thinking_budget = Some(0)` on the PATCH wire must land as
+    /// `Some(0)` on the live config — it is "disable extended thinking",
+    /// not a clear sentinel. This is the asymmetry from the OpenAI knob
+    /// that the api.md table calls out.
+    #[tokio::test]
+    async fn patch_gemini_thinking_budget_zero_is_disable_not_clear() {
+        let state = settings_test_app_state();
+        state.agent_config.write().gemini_thinking_budget = Some(4096);
+
+        let body = PatchSettingsRequest {
+            llm: Some(PatchLlm {
+                gemini: Some(PatchLlmGemini {
+                    thinking_budget: Some(0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _resp = patch_settings(axum::extract::State(state.clone()), Json(body)).await;
+
+        assert_eq!(
+            state.agent_config.read().gemini_thinking_budget,
+            Some(0),
+            "gemini.thinking_budget = Some(0) is disable, not clear — \
+             must round-trip through the handler verbatim"
+        );
+    }
+
+    // ==================================================================
+    // Rejected PATCH must be side-effect-free at the persistence layer
+    // (#810 follow-up).
+    //
+    // Before the fix, `patch_settings` called `persist_settings(&state)`
+    // unconditionally — even when validation errors were collected and
+    // the handler was about to return 422. That meant any rejected
+    // request still rewrote `settings.json` from the current live
+    // snapshot, baking in pre-existing PATCH-applied values (and any
+    // sub-fields that landed before the rejected one) such that they
+    // would override `alms.toml` / env on the next daemon boot. This is
+    // the same shape as #814 (rejected fs_write leaving directories
+    // behind): the operationally damaging case is a *failed* request
+    // changing post-restart behaviour.
+    // ==================================================================
+
+    /// Rejected PATCH must NOT write `settings.json`. The handler returns
+    /// 422 and the persistence file does not exist on disk afterwards.
+    /// This is the load-bearing assertion for the #810 follow-up.
+    #[tokio::test]
+    async fn rejected_llm_patch_does_not_persist_settings_json() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        // Redirect persistence into a fresh tempdir so the assertion is
+        // self-contained and does not race with the cwd-relative
+        // `./.alms/settings.json` other tests in this module write to.
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let path = settings_path(&state.data_dir);
+        assert!(
+            !path.exists(),
+            "precondition: settings.json must not exist before the rejected PATCH"
+        );
+
+        // Seed the live config with a known baseline so we can also
+        // verify the per-knob ordering claim below.
+        let baseline_effort = Some(alms_core::config::ReasoningEffort::High);
+        state.agent_config.write().openai_reasoning_effort = baseline_effort;
+
+        // Send an invalid `reasoning_effort` — `"turbo"` is not one of
+        // minimal/low/medium/high so `ReasoningEffort::from_str` rejects
+        // it and `errors` ends up non-empty.
+        let body = PatchSettingsRequest {
+            llm: Some(PatchLlm {
+                openai: Some(PatchLlmOpenai {
+                    reasoning_effort: Some("turbo".into()),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+            .await
+            .into_response();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid reasoning_effort must produce 422"
+        );
+
+        // Core assertion: the rejected request did not write the
+        // persistence file. On the next daemon boot, `alms.toml` /
+        // env-var values for the LLM block will be honoured, not
+        // shadowed by a bogus snapshot the operator was told failed.
+        assert!(
+            !path.exists(),
+            "rejected PATCH must not persist settings.json — found at {}",
+            path.display(),
+        );
+
+        // Bonus: for this specific knob the validation happens *before*
+        // the live mutation (the parse() error path doesn't write to
+        // `agent.openai_reasoning_effort`), so the live config is also
+        // unchanged. This is the per-knob ordering #810 already had
+        // right; the persistence skip closes the broader bug surface.
+        assert_eq!(
+            state.agent_config.read().openai_reasoning_effort,
+            baseline_effort,
+            "rejected reasoning_effort must not mutate the live config either"
+        );
+    }
+
+    /// Same persistence-skip guarantee for the `context` sub-path. The
+    /// `errors` vec is shared across all PATCH branches so the single
+    /// `persist_settings` skip-on-error closes the same bug surface for
+    /// every section uniformly — this test pins that behaviour for
+    /// `context` so a future refactor that splits the error vec per
+    /// section can't quietly regress it.
+    #[tokio::test]
+    async fn rejected_context_patch_does_not_persist_settings_json() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        let path = settings_path(&state.data_dir);
+
+        // Invalid strategy — must be one of sliding-summary/full/truncate.
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                strategy: Some("nonsense".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            !path.exists(),
+            "rejected context PATCH must not persist settings.json"
+        );
+    }
+
+    /// Rejected PATCH on a fresh state must also not overwrite a
+    /// *pre-existing* `settings.json` from an earlier successful PATCH.
+    /// This is the operationally damaging case: prior overrides stay
+    /// intact, the rejected request is a true no-op on disk.
+    #[tokio::test]
+    async fn rejected_llm_patch_preserves_prior_settings_json() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        let path = settings_path(&state.data_dir);
+
+        // Step 1: a valid PATCH lands and writes settings.json with
+        // known values.
+        {
+            let body = PatchSettingsRequest {
+                llm: Some(PatchLlm {
+                    anthropic: Some(PatchLlmAnthropic {
+                        thinking_budget_tokens: Some(8192),
+                        prompt_cache_enabled: Some(false),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let prior_snapshot =
+            std::fs::read_to_string(&path).expect("first PATCH should have written settings.json");
+        assert!(
+            prior_snapshot.contains("8192"),
+            "sanity: prior snapshot must contain the previously-PATCHed thinking_budget"
+        );
+
+        // Step 2: a follow-up PATCH carries one valid mutation
+        // (anthropic.thinking_budget_tokens = 16384) AND one invalid
+        // mutation (openai.reasoning_effort = "turbo"). Pre-fix, this
+        // would still rewrite settings.json from the live snapshot
+        // (which now has 16384 baked in) — silently committing a
+        // mutation the operator was told was a partial-failure 422.
+        {
+            let body = PatchSettingsRequest {
+                llm: Some(PatchLlm {
+                    anthropic: Some(PatchLlmAnthropic {
+                        thinking_budget_tokens: Some(16384),
+                        prompt_cache_enabled: None,
+                    }),
+                    openai: Some(PatchLlmOpenai {
+                        reasoning_effort: Some("turbo".into()),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+
+        // Disk must still hold the prior snapshot byte-for-byte. The
+        // rejected request is a no-op at the persistence layer.
+        let after_snapshot = std::fs::read_to_string(&path)
+            .expect("settings.json must still exist from the prior successful PATCH");
+        assert_eq!(
+            after_snapshot, prior_snapshot,
+            "rejected PATCH must not rewrite settings.json — \
+             persisted snapshot drifted across a 422 response"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #871 cross-field validator: SUMMARY_PROVIDER_REQUIRES_MODEL
+    //
+    // Mirror of #861's leak-guard tests but at the PATCH layer. The
+    // validator rejects any combination that would leave the live config
+    // with `summary_provider = Some(...)` AND `summary_model = None`,
+    // regardless of which field the patch actually touched. The runtime
+    // leak guard in `lifecycle.rs::build_summary_client` is the second
+    // layer of defense for hand-edited TOML and any other path that
+    // bypasses PATCH validation.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build an `AppState` with `[llm.providers.openrouter]` configured
+    /// AND a usable API key in the secrets store, so the `summary_provider`
+    /// validator passes the `SUMMARY_PROVIDER_UNKNOWN` /
+    /// `SUMMARY_PROVIDER_MISSING_API_KEY` per-field checks. The
+    /// cross-field invariant is what we want to exercise.
+    fn settings_test_app_state_with_openrouter() -> crate::server::AppState {
+        let mut state = settings_test_app_state();
+        // Inject an `[llm.providers.openrouter]` entry so SUMMARY_PROVIDER_UNKNOWN
+        // does not fire. The base_url / kind don't matter for validation.
+        state.llm_config.providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        state
+            .secrets
+            .write()
+            .set_key("openrouter", "sk-or-test")
+            .unwrap();
+        state
+    }
+
+    /// Helper: read the `errors` array from a PATCH /settings 422 response.
+    async fn patch_and_read_errors(
+        state: crate::server::AppState,
+        body: PatchSettingsRequest,
+    ) -> (StatusCode, Vec<String>) {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+        let resp = patch_settings(axum::extract::State(state), Json(body))
+            .await
+            .into_response();
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let errors = json
+            .get("errors")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|s| s.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (status, errors)
+    }
+
+    /// Attempting to set `summary_provider` while `summary_model` is empty
+    /// (cleared in the SAME patch) must produce 422 and leave both fields
+    /// untouched in the live config.
+    #[tokio::test]
+    async fn patch_rejects_summary_provider_with_empty_summary_model() {
+        let state = settings_test_app_state_with_openrouter();
+        // Seed: both fields cleared so the pre-state is the default.
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = None;
+            agent.context_config.summary_model = None;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_PROVIDER_REQUIRES_MODEL")),
+            "expected SUMMARY_PROVIDER_REQUIRES_MODEL error, got: {errors:?}"
+        );
+
+        let cfg = state.agent_config.read();
+        assert!(
+            cfg.context_config.summary_provider.is_none(),
+            "rejected PATCH must not commit summary_provider"
+        );
+        assert!(
+            cfg.context_config.summary_model.is_none(),
+            "rejected PATCH must not commit summary_model"
+        );
+    }
+
+    /// Setting `summary_provider` alone when `summary_model` is already
+    /// `None` in the live config must produce 422 — the cross-field check
+    /// considers the would-be combined post-state, not just the patch
+    /// fields.
+    #[tokio::test]
+    async fn patch_rejects_summary_provider_when_live_model_is_none() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = None;
+            agent.context_config.summary_model = None;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some("openrouter".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_PROVIDER_REQUIRES_MODEL")),
+            "expected SUMMARY_PROVIDER_REQUIRES_MODEL error, got: {errors:?}"
+        );
+        assert!(
+            state
+                .agent_config
+                .read()
+                .context_config
+                .summary_provider
+                .is_none(),
+        );
+    }
+
+    /// Clearing `summary_model` (`""`) when the live `summary_provider`
+    /// is `Some(...)` must produce 422 — the operator is told to clear
+    /// both together, mirroring the validator's recommended remediation.
+    #[tokio::test]
+    async fn patch_rejects_clearing_model_while_provider_is_set() {
+        let state = settings_test_app_state_with_openrouter();
+        // Seed: both set together (the valid state).
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = Some("openrouter".into());
+            agent.context_config.summary_model = Some("minimax/minimax-m2.7".into());
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_model: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_PROVIDER_REQUIRES_MODEL")),
+            "expected SUMMARY_PROVIDER_REQUIRES_MODEL error, got: {errors:?}"
+        );
+
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.context_config.summary_provider,
+            Some("openrouter".into()),
+            "rejected PATCH must leave live summary_provider intact"
+        );
+        assert_eq!(
+            cfg.context_config.summary_model,
+            Some("minimax/minimax-m2.7".into()),
+            "rejected PATCH must leave live summary_model intact"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Symmetric pair-only validation (#872)
+    //
+    // The pre-#872 validator rejected only the (provider-set,
+    // model-missing) direction. The (model-set, provider-missing)
+    // direction was the original v0.2.2 default and silently paired
+    // the user's `summary_model` with the agent's primary provider —
+    // the exact misconfiguration that produced the 404 in #866. These
+    // tests lock down the symmetric reject path so the regression
+    // can't sneak back in.
+    // ------------------------------------------------------------------
+
+    /// Setting `summary_model` alone (provider untouched / unset) must
+    /// fire the new symmetric `SUMMARY_MODEL_REQUIRES_PROVIDER` error.
+    #[tokio::test]
+    async fn patch_rejects_summary_model_when_provider_is_unset() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = None;
+            agent.context_config.summary_model = None;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_MODEL_REQUIRES_PROVIDER")),
+            "expected SUMMARY_MODEL_REQUIRES_PROVIDER error, got: {errors:?}"
+        );
+        let cfg = state.agent_config.read();
+        assert!(
+            cfg.context_config.summary_provider.is_none(),
+            "rejected PATCH must not change summary_provider"
+        );
+        assert!(
+            cfg.context_config.summary_model.is_none(),
+            "rejected PATCH must not commit summary_model"
+        );
+    }
+
+    /// Clearing `summary_provider` (`""`) when the live `summary_model`
+    /// is `Some(...)` must produce 422 — symmetric to
+    /// `patch_rejects_clearing_model_while_provider_is_set`. Pre-#872
+    /// this combination was silently accepted, leaving the model
+    /// stranded with no matching provider.
+    #[tokio::test]
+    async fn patch_rejects_clearing_provider_while_model_is_set() {
+        let state = settings_test_app_state_with_openrouter();
+        // Seed: both set together (the valid state).
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = Some("openrouter".into());
+            agent.context_config.summary_model = Some("minimax/minimax-m2.7".into());
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, errors) = patch_and_read_errors(state.clone(), body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("SUMMARY_MODEL_REQUIRES_PROVIDER")),
+            "expected SUMMARY_MODEL_REQUIRES_PROVIDER error, got: {errors:?}"
+        );
+
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.context_config.summary_provider,
+            Some("openrouter".into()),
+            "rejected PATCH must leave live summary_provider intact"
+        );
+        assert_eq!(
+            cfg.context_config.summary_model,
+            Some("minimax/minimax-m2.7".into()),
+            "rejected PATCH must leave live summary_model intact"
+        );
+    }
+
+    /// Happy path: setting both fields together in one PATCH is accepted.
+    #[tokio::test]
+    async fn patch_accepts_summary_provider_and_model_together() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = None;
+            agent.context_config.summary_model = None;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        use axum::response::IntoResponse;
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.context_config.summary_provider,
+            Some("openrouter".into())
+        );
+        assert_eq!(
+            cfg.context_config.summary_model,
+            Some("minimax/minimax-m2.7".into())
+        );
+    }
+
+    /// Clearing both fields together is accepted — the cross-field
+    /// invariant ("provider set without model") is `false` so PATCH lands.
+    #[tokio::test]
+    async fn patch_accepts_clearing_both_summary_fields_together() {
+        let state = settings_test_app_state_with_openrouter();
+        {
+            let mut agent = state.agent_config.write();
+            agent.context_config.summary_provider = Some("openrouter".into());
+            agent.context_config.summary_model = Some("minimax/minimax-m2.7".into());
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                summary_provider: Some(String::new()),
+                summary_model: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        use axum::response::IntoResponse;
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.agent_config.read();
+        assert!(cfg.context_config.summary_provider.is_none());
+        assert!(cfg.context_config.summary_model.is_none());
     }
 }

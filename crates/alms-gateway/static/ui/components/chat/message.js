@@ -2,7 +2,45 @@ import { html, useSignal, renderMarkdown } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
 import { filterMessages } from '../../state/chat-actions.js';
 
-export function Message({ type, role, text, sealed, fromAgent }) {
+/**
+ * Provider-neutral reasoning / extended-thinking panel.
+ *
+ * Populated by the `reasoning_delta` SSE stream from the Anthropic
+ * extended-thinking adapter (issue #767). Designed so #768
+ * (OpenAI/DeepSeek/xAI) and #769 (Gemini) can reuse the same event type
+ * and component without changes — the only thing that varies between
+ * providers is where the text comes from.
+ *
+ * Defaults to **collapsed** per issue #767's UX requirement — extended
+ * thinking is usually noise the user doesn't want to see until they ask.
+ */
+export function ReasoningPanel({ text, live }) {
+    // Hooks must run on every render — never return above them.
+    const expanded = useSignal(false);
+    if (!text) return null;
+    const onToggle = () => { expanded.value = !expanded.value; };
+    const tokenHint = text.length > 0 ? ` (${text.length} chars)` : '';
+    const title = live ? 'Thinking\u2026' : 'Reasoning';
+    const arrow = expanded.value ? '\u25BC' : '\u25B6';
+    return html`
+        <div class="reasoning-panel ${live ? 'reasoning-panel--live' : ''} ${expanded.value ? 'reasoning-panel--open' : ''}">
+            <button class="reasoning-panel-toggle" onClick=${onToggle}
+                    aria-expanded=${expanded.value}>
+                <span class="reasoning-panel-arrow">${arrow}</span>
+                <span class="reasoning-panel-glyph">\u{1F4AD}</span>
+                <span class="reasoning-panel-title">${title}</span>
+                <span class="reasoning-panel-hint">${tokenHint}</span>
+            </button>
+            ${expanded.value && html`
+                <div class="reasoning-panel-body">
+                    <pre class="reasoning-panel-text">${text}</pre>
+                </div>
+            `}
+        </div>
+    `;
+}
+
+export function Message({ type, role, text, sealed, fromAgent, reasoning }) {
     const cls = type === 'user' ? 'user' : 'agent';
     const agentName = activeAgent.value?.name;
     // DM messages carry a fromAgent name — use it as the label so the
@@ -12,17 +50,34 @@ export function Message({ type, role, text, sealed, fromAgent }) {
         : fromAgent ? `${fromAgent} $`
         : (agentName ? `${agentName} $` : '$');
     const streaming = type === 'agent' && sealed === false;
+    // The reasoning panel renders above the visible text for both streaming
+    // and sealed messages. When empty it renders nothing, so we can
+    // include it unconditionally here.
+    const panel = (type === 'agent' && reasoning)
+        ? html`<${ReasoningPanel} text=${reasoning} live=${streaming} />`
+        : null;
+
+    // Reasoning-only assistant turns (extended thinking with no body text,
+    // e.g. when the model emits only thinking + tool_use blocks) would
+    // otherwise leave an empty `<div class="msg-body markdown-body">` below
+    // the reasoning panel — the .msg-body border-left + padding renders that
+    // empty element as an orphan white-line stub. Suppress the body element
+    // entirely when there's no text to show. (#853)
+    const hasBody = typeof text === 'string' && text.trim().length > 0;
 
     // Render Markdown for sealed (finished) agent messages only.
     // While streaming, use plain text with pre-wrap to avoid running
     // marked.parse() + DOMPurify.sanitize() on every animation frame.
     if (type === 'agent' && sealed) {
-        const rendered = renderMarkdown(text || '');
+        const rendered = hasBody ? renderMarkdown(text) : '';
         return html`
             <div class="msg ${cls}">
                 <div class="msg-label">${label}</div>
-                <div class="msg-body markdown-body"
-                     dangerouslySetInnerHTML=${{ __html: rendered }} />
+                ${panel}
+                ${hasBody && html`
+                    <div class="msg-body markdown-body"
+                         dangerouslySetInnerHTML=${{ __html: rendered }} />
+                `}
             </div>
         `;
     }
@@ -30,7 +85,10 @@ export function Message({ type, role, text, sealed, fromAgent }) {
     return html`
         <div class="msg ${cls}">
             <div class="msg-label">${label}</div>
-            <div class="msg-body ${streaming ? 'streaming-cursor' : ''}">${text}</div>
+            ${panel}
+            ${(hasBody || streaming) && html`
+                <div class="msg-body ${streaming ? 'streaming-cursor' : ''}">${text}</div>
+            `}
         </div>
     `;
 }
@@ -40,7 +98,12 @@ export function TokenBadge({ usage }) {
     const p = usage.prompt_tokens || 0;
     const c = usage.completion_tokens || 0;
     if (p + c === 0) return null;
-    return html`<div class="msg-tokens">${p}p + ${c}c tokens</div>`;
+    // reasoning_tokens is only present when the provider reports chain-of-thought
+    // usage separately (OpenAI o-series, DeepSeek R1, xAI reasoning variants).
+    // Absent for non-reasoning runs; in that case the badge keeps its old shape.
+    const r = usage.reasoning_tokens;
+    const reasoningPart = (typeof r === 'number' && r > 0) ? ` + ${r}r` : '';
+    return html`<div class="msg-tokens">${p}p + ${c}c${reasoningPart} tokens</div>`;
 }
 
 export function ErrorMessage({ text, code }) {

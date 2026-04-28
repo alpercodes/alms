@@ -47,6 +47,10 @@ pub(crate) fn sanitize_error_for_session(err: &AlmsError) -> String {
         AlmsError::InvalidConfig(_) => "Invalid configuration".to_string(),
         AlmsError::Cancelled => "Run cancelled by user".to_string(),
         AlmsError::Io(_) => "I/O error".to_string(),
+        // The classifier `reason` is public info — surface a distinct label
+        // so operators grepping session history can tell policy denials
+        // apart from generic internal errors.
+        AlmsError::ToolBlocked { .. } => "Tool blocked by policy".to_string(),
         _ => "Internal error".to_string(),
     }
 }

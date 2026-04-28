@@ -18,7 +18,7 @@ This document proposes a stack that makes the hard parts (state, isolation, conc
 
 ## 1) Recommendation in one line
 
-**Rust core daemon + SQLite state + WASM tool sandbox + HTTP + streaming (SSE/WS) API + TypeScript UI/SDK**.
+**Rust core daemon + SQLite state + native tool registry + HTTP + streaming (SSE/WS) API + TypeScript UI/SDK**.
 
 ### Why this is the best fit
 - **Correctness under concurrency** is core to an Agent Loop Management System (timeouts, cancellation, queues, subagent lifecycles).
@@ -173,12 +173,12 @@ These are implemented natively (Rust) but must still:
 - have strict resource limits
 - optionally require human approval
 
-**Plane B — Plugin tools (WASM)**
+**Plane B — Plugin tools** *(future direction; not currently implemented)*
 - third-party extensions
 - deterministic compute
 - transformations
 
-WASM helps isolate plugin code, but the host must enforce capabilities for any host calls.
+A plugin substrate (e.g. WASM) is not currently in the codebase; earlier wasmtime-based scaffolding was removed because no code called it. If/when plugin tooling returns, the host must still enforce capabilities for any host calls the plugin makes.
 
 ### Tool execution guardrails (minimum viable)
 For tools like `shell_exec`:
@@ -198,26 +198,7 @@ For tools like `shell_exec`:
 
 ---
 
-## 7) WASM sandbox stack
-
-### Why WASM
-- portable plugin format
-- controllable CPU/memory (fuel + limits)
-- isolates third-party code
-
-### Recommended
-- WASM runtime: **wasmtime**
-- Define a stable Tool ABI:
-  - param passing
-  - memory allocation protocol
-  - result encoding
-  - error semantics
-
-> Until the ABI is stable, treat sandbox as **prototype** and keep plugin execution behind a strict ABI gate.
-
----
-
-## 8) Networking posture (default-deny recommended)
+## 7) Networking posture (default-deny recommended)
 
 Network is a common exfiltration vector.
 
@@ -231,7 +212,7 @@ Recommended defaults:
 
 ---
 
-## 9) API: HTTP + streaming (SSE/WS)
+## 8) API: HTTP + streaming (SSE/WS)
 
 ### Why
 - stable boundary between daemon and UI/SDKs
@@ -254,7 +235,7 @@ Treat everything as an event stream with correlation IDs:
 
 ---
 
-## 10) UI/SDK stack (TypeScript)
+## 9) UI/SDK stack (TypeScript)
 
 ### Why TS here
 - rapid iteration
@@ -272,7 +253,7 @@ SDK:
 
 ---
 
-## 11) LLM providers
+## 10) LLM providers
 
 ### Strategy
 Implement one internal “OpenAI-style” interface; then add adapters:
@@ -288,7 +269,7 @@ Requirements:
 
 ---
 
-## 12) Hybrid: when it makes sense (and when it doesn’t)
+## 11) Hybrid: when it makes sense (and when it doesn’t)
 
 ### The hybrid that *does* make sense
 - **Rust daemon** (everything correctness/security-sensitive)
@@ -305,7 +286,7 @@ Splitting core backend logic across languages (e.g., Go services + Rust sandbox)
 
 ---
 
-## 13) Non-negotiables (if ALMS should beat OpenClaw)
+## 12) Non-negotiables (if ALMS should beat OpenClaw)
 
 1) **SQLite/real DB for state** (avoid file-lock races)
 2) **single capability model** (no parallel enums vs strings)
@@ -315,7 +296,7 @@ Splitting core backend logic across languages (e.g., Go services + Rust sandbox)
 
 ---
 
-## 14) Immediate next steps (practical)
+## 13) Immediate next steps (practical)
 
 1) Decide final shape: `almsd` + `alms` CLI + UI
 2) Make the gateway startup story coherent (single entrypoint)
@@ -341,7 +322,7 @@ A clean split that tends to work:
 
 ---
 
-## 15) Resource footprint: ALMS vs Node.js alternatives
+## 14) Resource footprint: ALMS vs Node.js alternatives
 
 ### The claim
 
@@ -371,4 +352,4 @@ ALMS should be able to run comfortably on hardware where OpenClaw struggles or i
 ---
 
 *Authored by Mesut (2026-02-10). Updated based on repo findings + proposal (same date).*
-*§15 added by Tesla (2026-03-15).*
+*§14 added by Tesla (2026-03-15).*

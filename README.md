@@ -26,7 +26,7 @@ alms/
 │   ├── alms-gateway/         # HTTP/SSE gateway, web UI
 │   ├── alms-runtime/         # Agent runtime, LLM client, context builder
 │   ├── alms-coordinator/     # Multi-agent orchestration
-│   ├── alms-sandbox/         # WASM tool sandbox
+│   ├── alms-sandbox/         # Native builtin tools + registry
 │   ├── alms-channel/         # Channel adapters (Telegram)
 │   └── alms-cli/             # Command-line interface
 ├── docs/                     # Design docs, reviews, task list
@@ -40,7 +40,7 @@ A single Rust binary runs the entire platform — HTTP gateway, agent runtime, t
 - **Gateway** — Axum HTTP server with SSE streaming, web UI, and REST API for agents, sessions, and runs
 - **Runtime** — Agent loop: builds context, calls LLM, executes tool results, manages workspace files (personality, goals, memories)
 - **Coordinator** — Multi-agent orchestration: hierarchy (subagents), peer messaging (DM), and message bus
-- **Sandbox** — WASM-based tool isolation with capability gating; builtin tools (shell, file I/O, datetime) run sandboxed per-agent
+- **Sandbox** — Native builtin tools (shell, file I/O, datetime) with per-agent capability gating, path canonicalization, shell permission gates, and Landlock filesystem restrictions on Linux
 - **Session** — SQLite persistence (WAL mode) for sessions, messages, tool calls, episodic summaries, and agent registry
 - **Channel** — Adapter layer for external transports (Telegram polling implemented)
 

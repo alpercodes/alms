@@ -20,15 +20,23 @@ pub struct DeliveryReceipt {
 /// Used by `end_conversation` to communicate why the conversation was
 /// terminated. The `MessageBus` writes this reason into the DM session
 /// metadata marker and includes it in the `RunTrigger` for peer notification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConversationEndReason {
     /// The agent called `ignore_message` (chose not to reply).
     Ignored,
     /// The DM depth limit (`MAX_DM_DEPTH`) was reached.
     DepthExceeded,
-    /// The agent's runtime iteration limit was reached during a DM run
-    /// without the agent calling `send_message` or `ignore_message`.
-    MaxIterations,
+    /// The user explicitly cancelled the DM conversation via the API.
+    UserCancelled,
+    /// The originating run failed (LLM error, tool panic, posture trip, etc.).
+    ///
+    /// `message` carries a short human-readable error string for the peer-side
+    /// notification (typically the `AlmsError` `Display` output, possibly
+    /// truncated). Introduced so that DM peer state stays consistent when a
+    /// peer-triggered run fails partway through — without this, the depth
+    /// counter, `dm_ended` marker, and `ConversationEnded` notification all
+    /// stayed unset until the 1800s `DEPTH_EXPIRY_SECS` sweep.
+    Errored { message: String },
 }
 
 impl std::fmt::Display for ConversationEndReason {
@@ -36,7 +44,8 @@ impl std::fmt::Display for ConversationEndReason {
         match self {
             Self::Ignored => write!(f, "ignored"),
             Self::DepthExceeded => write!(f, "depth_exceeded"),
-            Self::MaxIterations => write!(f, "max_iterations"),
+            Self::UserCancelled => write!(f, "user_cancelled"),
+            Self::Errored { .. } => write!(f, "errored"),
         }
     }
 }

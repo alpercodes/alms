@@ -10,7 +10,7 @@ async function resolveApproval(approvalId, decision) {
     }
 }
 
-export function ApprovalCard({ approvalId, tool, params, resolved, decision }) {
+export function ApprovalCard({ approvalId, tool, params }) {
     const submitting = useSignal(false);
 
     const onApprove = async () => {
@@ -31,22 +31,6 @@ export function ApprovalCard({ approvalId, tool, params, resolved, decision }) {
             submitting.value = false;
         }
     };
-
-    if (resolved) {
-        const icon = decision === 'approve' ? '\u2713'
-            : decision === 'cancelled' ? '\u2013'
-            : decision === 'expired' ? '\u2013'
-            : '\u2717';
-        const label = decision === 'approve' ? 'Approved'
-            : decision === 'cancelled' ? 'Cancelled'
-            : decision === 'expired' ? 'Expired'
-            : 'Denied';
-        return html`
-            <div class="approval-card resolved">
-                <span>${icon} ${label} \u2014 ${tool}</span>
-            </div>
-        `;
-    }
 
     const disabled = submitting.value;
     return html`

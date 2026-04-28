@@ -1,22 +1,29 @@
 //! Security checks for the shell tool.
 //!
 //! Preserves all existing security features from `ShellExecTool`:
-//! - Denied filenames (secrets.json, etc.)
 //! - Secret env var filtering
 //! - Platform-critical env var re-injection after `env_clear()`
 //!
 //! Adds:
 //! - Pattern-based command denylist (dangerous destructive commands)
-
-/// Filenames that must never be accessed by agent tools.
-///
-/// Single source of truth — imported by `builtin.rs` for fs_read/fs_write
-/// path validation and used here for shell command string checks.
-///
-/// These are checked against the final component of resolved paths in fs_read,
-/// fs_write, and against command strings in shell to prevent agents from
-/// reading secrets or other sensitive files.
-pub(crate) const DENIED_FILENAMES: &[&str] = &["secrets.json"];
+//!
+//! ## Denied-filename lists were removed
+//!
+//! An earlier version of this module hard-coded a one-element list
+//! (`["secrets.json"]`) that was substring-matched against shell command
+//! strings and basename-matched against `fs_*` tool paths. That list was
+//! removed in #744 because it projected a defensive posture it could not
+//! deliver: a single filename cannot represent a real secret-file policy,
+//! the list was not user-configurable, and substring/basename checks are
+//! trivially bypassable (symlinks, alternate paths, variable expansion,
+//! command substitution, base64-encoded names, reading a renamed copy).
+//!
+//! Users who need to block access to specific files have two better tools
+//! that *actually* enforce:
+//! - `[tools.shell_permissions]` in `alms.toml` (configurable allow/deny
+//!   regex — covers shell invocations and scales to arbitrary patterns).
+//! - Landlock (on Linux 5.13+) via the sandbox root — the kernel refuses
+//!   access regardless of the path the caller reaches the file through.
 
 /// Environment variable names that must never be injected into shell
 /// child processes. Belt-and-suspenders protection: `env_clear()` already
@@ -45,22 +52,6 @@ const DENIED_COMMAND_PATTERNS: &[&str] = &[
     "chmod -R 777 /",
     ":(){ :|:& };:", // fork bomb
 ];
-
-/// Check whether a command string references any denied filename.
-///
-/// This is a best-effort check: it catches obvious patterns like
-/// `cat data/secrets.json` or `cat /abs/path/secrets.json` and also catches
-/// `sh -c "cat secrets.json"` by scanning the command as a substring.
-/// It cannot prevent all indirect access (e.g. `cat $(echo secrets.json)`,
-/// base64 encoding, variable expansion). For true shell isolation, use a
-/// restricted OS user or Landlock.
-pub(crate) fn command_references_denied_file(command: &str) -> Option<&'static str> {
-    let lower = command.to_ascii_lowercase();
-    DENIED_FILENAMES
-        .iter()
-        .find(|denied| lower.contains(*denied))
-        .copied()
-}
 
 /// Check whether a command matches any denied destructive pattern.
 ///
@@ -103,24 +94,6 @@ pub(crate) fn platform_critical_env_vars() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_command_references_denied_file() {
-        assert_eq!(
-            command_references_denied_file("cat data/secrets.json"),
-            Some("secrets.json")
-        );
-        assert_eq!(
-            command_references_denied_file("cat /abs/path/secrets.json"),
-            Some("secrets.json")
-        );
-        assert_eq!(
-            command_references_denied_file("cat Secrets.JSON"),
-            Some("secrets.json")
-        );
-        assert_eq!(command_references_denied_file("ls -la"), None);
-        assert_eq!(command_references_denied_file("cat data.json"), None);
-    }
 
     #[test]
     fn test_command_matches_denylist() {

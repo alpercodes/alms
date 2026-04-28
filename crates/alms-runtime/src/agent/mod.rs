@@ -31,6 +31,12 @@ pub struct AgentRuntime {
     pub(crate) agent_id: AgentId,
     pub(crate) config: AgentConfig,
     pub(crate) llm: LlmClient,
+    /// Optional dedicated LLM client for in-loop sliding-summary generation
+    /// (#866). When `Some`, `maybe_summarize` uses this client instead of
+    /// `llm` so the summary task can target a different provider than the
+    /// agent (e.g. agent on Anthropic, summary on OpenRouter). When `None`,
+    /// summaries inherit the agent's `llm` (pre-#866 behaviour).
+    pub(crate) summary_llm: Option<LlmClient>,
     pub(crate) tools: ToolRegistry,
     pub(crate) workspace: Option<AgentWorkspace>,
     /// Optional channel for emitting runtime events to the gateway layer.
@@ -47,6 +53,19 @@ pub struct AgentRuntime {
     /// Default env vars injected into shell processes (e.g. ALMS_DATA_DIR).
     /// Retained so `with_workspace()` can pass them to the re-registered shell tool.
     pub(crate) shell_default_env: std::collections::HashMap<String, String>,
+    /// Permission-based allow/deny patterns for shell commands.
+    /// Retained so re-registrations of the shell tool preserve the policy.
+    pub(crate) shell_permissions: alms_core::config::ShellPermissions,
+    /// Built-in risk classification mode for shell commands.
+    /// Retained so re-registrations of the shell tool preserve the mode.
+    pub(crate) shell_classification_mode: alms_core::config::ShellClassificationMode,
+    /// Large-output spill-to-disk policy for the shell tool (issue #756).
+    /// Defaults to disabled; the gateway wires in an active policy once the
+    /// per-run spill directory (`{data_dir}/shell_output/{run_id}/`) is
+    /// known, via [`Self::with_shell_spill`]. Retained so re-registrations
+    /// of the shell tool (from `with_workspace`, `with_shell_default_env`,
+    /// etc.) preserve the policy.
+    pub(crate) shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy,
     /// Agent name for perspective mapping in DM sessions.
     /// When set and the context_id starts with "dm:", the context builder
     /// maps messages from this agent to `Role::Assistant` so the LLM sees
@@ -97,16 +116,21 @@ impl AgentRuntime {
             Some(canonical)
         };
         let shell_unrestricted = config.shell_policy == "unrestricted";
-        let tools = ToolRegistry::with_builtins_sandboxed(
+        let tools = ToolRegistry::with_builtins_sandboxed_ex(
             sandbox_root.clone(),
             shell_unrestricted,
             &config.enabled_tools,
+            config.fs_edit_fuzzy_match,
         );
 
-        Ok(Self {
+        let shell_permissions = config.shell_permissions.clone();
+        let shell_classification_mode = config.shell_classification_mode;
+
+        let mut runtime = Self {
             agent_id,
             config,
             llm,
+            summary_llm: None,
             tools,
             workspace: None,
             event_sender: None,
@@ -115,8 +139,22 @@ impl AgentRuntime {
             resolved_sandbox_root: sandbox_root,
             shell_unrestricted,
             shell_default_env: std::collections::HashMap::new(),
+            shell_permissions: shell_permissions.clone(),
+            shell_classification_mode,
+            shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
             agent_name: None,
-        })
+        };
+
+        // Apply shell permissions / classification to the initially registered
+        // shell tool. The shell tool is re-registered whenever
+        // with_workspace() or with_shell_default_env() is called, but we also
+        // need it on the initial tool so unnamed agents get the policy.
+        //
+        // Always re-register so that a non-default classification mode
+        // (e.g. Strict) takes effect even when no permission patterns are set.
+        runtime.apply_shell_permissions();
+
+        Ok(runtime)
     }
 
     /// Attach an agent workspace for persistent identity files.
@@ -167,26 +205,76 @@ impl AgentRuntime {
         let enabled = &self.config.enabled_tools;
         let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
 
-        // Re-register fs_read/fs_write/fs_list sandboxed to the workspace
-        // directory so file operations default to the agent's workspace
-        // instead of the project root.
+        // Parent directory of the workspace (e.g. `{workspace_dir}/`), which
+        // contains every named agent's workspace as a sibling subdirectory.
+        // Granting read-only access here lets a parent agent read a
+        // subagent's `memories.md`/`personality.md`/etc. without being able
+        // to modify them (see #242).  Writes remain gated by the primary
+        // sandbox root (`ws_root`) so agents still can't touch another
+        // agent's files.
+        //
+        // `ws_root` was canonicalized above, so `ws_root.parent()` is also
+        // canonical on all supported platforms — no further canonicalize
+        // call is needed.  If the parent can't be taken (workspace sits at
+        // a filesystem root), we fall back to an empty extras list so
+        // behaviour is unchanged.
+        //
+        // When the shell output spill policy is active (issue #756), the
+        // per-run spill dir is appended so `fs_read`/`fs_list`/`fs_grep`/
+        // `fs_glob` can open the spilled log file without operators having
+        // to grant extra filesystem permissions.
+        let mut sibling_workspaces_root: Vec<std::path::PathBuf> = match ws_root.parent() {
+            Some(parent) => vec![parent.to_path_buf()],
+            None => Vec::new(),
+        };
+        if let Some(spill_dir) = self.shell_spill_policy.run_dir.clone() {
+            sibling_workspaces_root.push(spill_dir);
+        }
+
+        // Re-register fs_read/fs_write/fs_list/fs_edit sandboxed to the
+        // workspace directory so file operations default to the agent's
+        // workspace instead of the project root.
+        // fs_read/fs_write/fs_edit get the file state cache for read-before-write guard.
+        // Read-family tools (fs_read/fs_list/fs_grep/fs_glob) also get the
+        // sibling-workspaces root as an extra read-only root so a parent
+        // agent can peek at a subagent's workspace files (#242).
+        let cache = self.tools.file_state_cache().clone();
         if tool_enabled("fs_read") {
-            self.tools
-                .register(std::sync::Arc::new(alms_sandbox::FsReadTool::sandboxed(
-                    ws_root.clone(),
-                )));
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsReadTool::sandboxed(ws_root.clone())
+                    .with_cache(cache.clone())
+                    .with_extra_read_roots(sibling_workspaces_root.clone()),
+            ));
         }
         if tool_enabled("fs_write") {
-            self.tools
-                .register(std::sync::Arc::new(alms_sandbox::FsWriteTool::sandboxed(
-                    ws_root.clone(),
-                )));
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsWriteTool::sandboxed(ws_root.clone()).with_cache(cache.clone()),
+            ));
         }
         if tool_enabled("fs_list") {
-            self.tools
-                .register(std::sync::Arc::new(alms_sandbox::FsListTool::sandboxed(
-                    ws_root.clone(),
-                )));
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsListTool::sandboxed(ws_root.clone())
+                    .with_extra_read_roots(sibling_workspaces_root.clone()),
+            ));
+        }
+        if tool_enabled("fs_edit") {
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsEditTool::sandboxed(ws_root.clone())
+                    .with_cache(cache.clone())
+                    .with_fuzzy_match(self.config.fs_edit_fuzzy_match),
+            ));
+        }
+        if tool_enabled("fs_grep") {
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsGrepTool::sandboxed(ws_root.clone())
+                    .with_extra_read_roots(sibling_workspaces_root.clone()),
+            ));
+        }
+        if tool_enabled("fs_glob") {
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsGlobTool::sandboxed(ws_root.clone())
+                    .with_extra_read_roots(sibling_workspaces_root.clone()),
+            ));
         }
 
         // Re-register shell tool with workspace dir as default cwd and
@@ -198,7 +286,10 @@ impl AgentRuntime {
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
-            .with_default_cwd(ws_root);
+            .with_default_cwd(ws_root)
+            .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone());
             if !self.shell_default_env.is_empty() {
                 shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
             }
@@ -216,6 +307,22 @@ impl AgentRuntime {
     /// Attach a runtime event sender so the gateway can observe tool events.
     pub fn with_event_sender(mut self, sender: RuntimeEventSender) -> Self {
         self.event_sender = Some(sender);
+        self
+    }
+
+    /// Attach a dedicated LLM client for in-loop sliding-summary generation
+    /// (#866).
+    ///
+    /// When set, the in-loop summarizer (`maybe_summarize`) uses this client
+    /// instead of `self.llm`. The gateway constructs this client by cloning
+    /// the agent's resolved `LlmClient` and re-applying a different provider
+    /// via `with_provider_and_secrets` when
+    /// [`ContextConfig::summary_provider`](alms_core::config::ContextConfig)
+    /// is set. Callers that do not set a separate summary provider should
+    /// leave this `None` so the summarizer transparently inherits the
+    /// agent's provider (pre-#866 behaviour).
+    pub fn with_summary_llm(mut self, llm: LlmClient) -> Self {
+        self.summary_llm = Some(llm);
         self
     }
 
@@ -256,6 +363,9 @@ impl AgentRuntime {
                 self.resolved_sandbox_root.clone(),
                 self.shell_unrestricted,
             )
+            .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone())
             .with_default_env(self.shell_default_env.clone());
             let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
             self.tools.register(std::sync::Arc::clone(&tool_arc));
@@ -275,6 +385,125 @@ impl AgentRuntime {
     pub fn with_agent_name(mut self, name: String) -> Self {
         self.agent_name = Some(name);
         self
+    }
+
+    /// Activate the shell-output spill policy for this runtime (issue #756).
+    ///
+    /// `run_dir` is the per-run directory
+    /// (`{data_dir}/shell_output/{run_id}/`) where spill files will be
+    /// written when shell output exceeds the truncation threshold. The
+    /// directory is created lazily on first spill.
+    ///
+    /// Re-registers the shell tool immediately so the updated policy takes
+    /// effect, and widens `fs_read`/`fs_list`/`fs_grep`/`fs_glob`'s
+    /// sandbox so the agent can `fs_read` the spilled file without operators
+    /// having to grant extra filesystem permissions.
+    ///
+    /// Must be called *after* `with_run_id()` — otherwise the caller cannot
+    /// compute the per-run directory path. Passing `enabled == false`
+    /// leaves the runtime in the default "spill disabled" state.
+    pub fn with_shell_spill(mut self, run_dir: std::path::PathBuf, enabled: bool) -> Self {
+        use alms_sandbox::shell::spill::ShellSpillPolicy;
+
+        let policy = if enabled {
+            ShellSpillPolicy::with_run_dir(run_dir.clone())
+        } else {
+            ShellSpillPolicy::disabled()
+        };
+        self.shell_spill_policy = policy;
+
+        // Re-register the shell tool under both its primary name and its
+        // legacy alias so the new policy is observed on the next tool call.
+        let enabled_tools = &self.config.enabled_tools;
+        let shell_enabled = enabled_tools.is_empty()
+            || enabled_tools
+                .iter()
+                .any(|t| t == "shell" || t == "shell_exec");
+        if shell_enabled && (self.tools.contains("shell") || self.tools.contains("shell_exec")) {
+            let mut shell_tool = alms_sandbox::ShellTool::with_policy(
+                self.resolved_sandbox_root.clone(),
+                self.shell_unrestricted,
+            )
+            .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone());
+            if !self.shell_default_env.is_empty() {
+                shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
+            }
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
+        }
+
+        // Widen the fs_* read roots so `fs_read` on the spill path resolves
+        // inside an allowed root. We only do this when a sandbox root is set
+        // and spill is active — otherwise there's nothing to widen against,
+        // and agents with unrestricted fs access already reach everywhere.
+        // The extras list intentionally only includes the per-run dir;
+        // sibling-workspace access (#242) is added separately in
+        // `with_workspace()`, so we avoid conflating the two features here.
+        if enabled && self.resolved_sandbox_root.is_some() {
+            let fs_tool_enabled =
+                |name: &str| enabled_tools.is_empty() || enabled_tools.iter().any(|t| t == name);
+            let extras = vec![run_dir];
+            let cache = self.tools.file_state_cache().clone();
+            let root = self
+                .resolved_sandbox_root
+                .clone()
+                .expect("guarded by is_some() above");
+            if fs_tool_enabled("fs_read") && self.tools.contains("fs_read") {
+                self.tools.register(std::sync::Arc::new(
+                    alms_sandbox::FsReadTool::sandboxed(root.clone())
+                        .with_cache(cache.clone())
+                        .with_extra_read_roots(extras.clone()),
+                ));
+            }
+            if fs_tool_enabled("fs_list") && self.tools.contains("fs_list") {
+                self.tools.register(std::sync::Arc::new(
+                    alms_sandbox::FsListTool::sandboxed(root.clone())
+                        .with_extra_read_roots(extras.clone()),
+                ));
+            }
+            if fs_tool_enabled("fs_grep") && self.tools.contains("fs_grep") {
+                self.tools.register(std::sync::Arc::new(
+                    alms_sandbox::FsGrepTool::sandboxed(root.clone())
+                        .with_extra_read_roots(extras.clone()),
+                ));
+            }
+            if fs_tool_enabled("fs_glob") && self.tools.contains("fs_glob") {
+                self.tools.register(std::sync::Arc::new(
+                    alms_sandbox::FsGlobTool::sandboxed(root.clone())
+                        .with_extra_read_roots(extras.clone()),
+                ));
+            }
+        }
+
+        self
+    }
+
+    /// Re-register the shell tool with the current `shell_permissions`.
+    ///
+    /// Used at construction time to apply permissions to the initial shell
+    /// tool registration. Later registrations (via `with_workspace()`,
+    /// `with_shell_default_env()`) also apply permissions explicitly.
+    fn apply_shell_permissions(&mut self) {
+        let enabled = &self.config.enabled_tools;
+        let shell_enabled =
+            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
+        if shell_enabled && (self.tools.contains("shell") || self.tools.contains("shell_exec")) {
+            let shell_tool = alms_sandbox::ShellTool::with_policy(
+                self.resolved_sandbox_root.clone(),
+                self.shell_unrestricted,
+            )
+            .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone());
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
+        }
     }
 
     /// Emit a status event to the gateway layer (best-effort, never fails).
@@ -352,7 +581,6 @@ impl AgentRuntime {
         fields(
             agent_id = %self.agent_id.0,
             context_id = %context_id.as_ref(),
-            max_iterations = %self.config.max_iterations
         )
     )]
     pub async fn run(
@@ -412,7 +640,6 @@ impl AgentRuntime {
             agent_id = %self.agent_id.0,
             session_id = %session_id.0,
             context_id = %context_id,
-            max_iterations = %self.config.max_iterations
         )
     )]
     pub async fn run_on_session(
@@ -493,14 +720,16 @@ impl AgentRuntime {
         };
 
         match result {
-            Ok((response, usage)) => {
+            Ok(loop_output) => {
+                let crate::agent::loop_impl::AgentLoopOutput {
+                    response,
+                    usage,
+                    reasoning,
+                } = loop_output;
+
                 // Skip persisting an assistant message when the response is
                 // empty. This happens when the agent used `ignore_message` to
                 // decline responding — there is nothing to record.
-                //
-                // Also skip persisting the max-iterations sentinel — it is
-                // surfaced as a `run_warning` SSE event by the gateway and
-                // should not appear as a normal assistant bubble on reload.
                 //
                 // For DM sessions: persist the final text response as
                 // reasoning (Role::User with message_type="reasoning") so
@@ -515,19 +744,24 @@ impl AgentRuntime {
                 // concatenates, resulting in doubled text on page reload.
                 // Skip persistence when tool calls were present.  (Fixes #687)
                 let dm_text_already_persisted = is_dm && !tool_calls.is_empty();
-                if !response.is_empty()
-                    && response != alms_core::MAX_ITERATIONS_SENTINEL
-                    && !dm_text_already_persisted
-                {
-                    let (role, metadata) = if is_dm {
-                        if let Some(meta) = self.dm_reasoning_metadata(is_dm) {
-                            (SessionRole::User, Some(meta))
-                        } else {
-                            (SessionRole::Assistant, None)
-                        }
+                if !response.is_empty() && !dm_text_already_persisted {
+                    let base_meta = if is_dm {
+                        self.dm_reasoning_metadata(is_dm)
                     } else {
-                        (SessionRole::Assistant, None)
+                        None
                     };
+                    let role = if is_dm && base_meta.is_some() {
+                        SessionRole::User
+                    } else {
+                        SessionRole::Assistant
+                    };
+                    // Attach the extended-thinking trace (if any) as
+                    // `reasoning_blocks` metadata on the final assistant
+                    // message, merged with any existing DM metadata.
+                    let metadata = crate::agent::loop_impl::merge_reasoning_blocks(
+                        base_meta,
+                        reasoning.as_deref(),
+                    );
                     let reply_msg = SessionMessage {
                         id: uuid::Uuid::new_v4().to_string(),
                         role,

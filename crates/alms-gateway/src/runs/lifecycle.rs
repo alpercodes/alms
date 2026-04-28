@@ -13,6 +13,7 @@ use alms_core::{
     RunStatusResponse, SessionId, classify_session_type,
 };
 use alms_runtime::RuntimeEvent;
+use alms_tools::message_sender::ConversationEndReason;
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -300,6 +301,27 @@ pub async fn create_run(
         RunInput::Text { text } => text,
     };
 
+    let session_agent_id = session.agent_id;
+    let is_shared_session = session_agent_id.is_nil();
+    let agent_id = match req.agent_id {
+        Some(requested) if requested != session_agent_id && !is_shared_session => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "AGENT_SESSION_MISMATCH",
+                "Session belongs to a different agent",
+            ));
+        }
+        Some(requested) => requested,
+        None if is_shared_session => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "AGENT_ID_REQUIRED",
+                "Shared sessions require agent_id so per-agent config can be resolved",
+            ));
+        }
+        None => session_agent_id,
+    };
+
     // Validate provider override early so the user gets a clear 400 instead
     // of a confusing "invalid API key" error from a wrong provider.
     if let Some(ref p) = req.provider {
@@ -312,8 +334,11 @@ pub async fn create_run(
         posture: req.posture.clone(),
         provider: req.provider.clone(),
         debug_mode: req.debug_mode,
+        thinking_budget_tokens: req.thinking_budget_tokens,
+        reasoning_effort: req.reasoning_effort,
+        gemini_thinking_budget: req.gemini_thinking_budget,
     };
-    let run = Run::new(session.id, session.agent_id, input_text);
+    let run = Run::new(session.id, agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
     let agent_id = run.agent_id;
@@ -332,10 +357,66 @@ pub async fn create_run(
 
     state.run_manager.insert_run(run.clone());
 
+    // Pre-persist the user's input message to the session BEFORE enqueueing
+    // the run.  Previously the input was only persisted inside
+    // `runtime.run()` (when the agent loop actually starts), which meant a
+    // page reload during the queued-wait window would find no trace of the
+    // user's message -- the UI had optimistically rendered it but the
+    // backend had never stored it.
+    //
+    // The stored message carries `pending_input: true` metadata so
+    // `execute_run` knows to skip re-persistence (via the new
+    // `input_pre_persisted` RunParams flag, which routes the run through
+    // `run_on_session` instead of `run`).  The metadata is informational
+    // only -- the frontend does NOT filter these out, because the user's
+    // message should be visible in the chat immediately after sending
+    // regardless of run status (queued, running, or completed).
+    let user_msg = alms_session::Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        role: alms_session::Role::User,
+        content: alms_session::Content::Text(run.input.clone()),
+        timestamp: alms_core::Timestamp::now(),
+        metadata: Some(serde_json::json!({ "pending_input": true })),
+    };
+    let input_pre_persisted = match state.session_manager.append_message(session_id, user_msg) {
+        Ok(()) => true,
+        Err(e) => {
+            // Non-fatal: fall back to the runtime's legacy persistence path
+            // so the input is not lost entirely.  The page-reload window is
+            // the only scenario where this matters, so the fallback is
+            // acceptable.
+            warn!(
+                "Failed to pre-persist user input for run {}: {}",
+                run_id.0, e
+            );
+            false
+        }
+    };
+
     // Notify session-level SSE subscribers that a new run was created.
-    // Check how many items are already queued for this agent so the UI
-    // can show "queued (N ahead)" instead of a misleading "Thinking...".
-    let queued_behind = state.agent_queue.pending_count(&agent_id);
+    //
+    // `queued_behind` tells the UI how many runs are ahead of this one so
+    // it can show "Queued -- waiting for agent..." instead of a misleading
+    // "Thinking...".
+    //
+    // `SessionQueue::pending_count` counts items still *waiting* to be
+    // picked up by the handler -- the currently-executing work item has
+    // already been dequeued and its counter decremented.  So we also add 1
+    // if the agent has a `Running` run, to catch the common case of a busy
+    // agent with nothing else queued behind it yet.
+    //
+    // Known residual race: there is a narrow sub-millisecond TOCTOU window
+    // between `pending.fetch_sub(1)` inside the queue handler and
+    // `mark_run_as_running` in `execute_run` (lifecycle.rs:~495). During
+    // that window both `pending_count` and `agent_has_running_run` read
+    // false, so a concurrent `create_run` can report `queued_behind = 0`
+    // and render "Thinking" instead of "Queued". The window is bounded by
+    // executor dispatch latency. Closing it would require a separate
+    // in-flight counter inside `SessionQueue` that is incremented on
+    // dequeue (before `work.await`) and decremented after the work
+    // future resolves; considered low priority.
+    let agent_running = state.run_manager.agent_has_running_run(agent_id);
+    let queued_behind = state.agent_queue.pending_count(&agent_id) + usize::from(agent_running);
     state
         .run_manager
         .send_session_event(
@@ -374,6 +455,7 @@ pub async fn create_run(
                     cancel_token,
                     is_peer_message: false,
                     is_system_triggered: false,
+                    input_pre_persisted,
                 },
             )
             .await;
@@ -429,6 +511,65 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Build the LLM client used for the per-run summary task (#866 + #871).
+///
+/// Thin wrapper around `alms_runtime::build_summary_client` that adds the
+/// gateway-side contextual `info!` log (the runtime helper is shared with the
+/// coordinator subagent path and stays log-agnostic so each caller can label
+/// with its own ID — `agent_id` here, `task_id` in the coordinator). All the
+/// leak-guard logic lives in the runtime helper so future drift is impossible.
+///
+/// See `alms_runtime::summary_client` for the full rule set.
+fn build_summary_client(
+    llm: &alms_runtime::LlmClient,
+    summary_provider: Option<&str>,
+    summary_model: Option<&str>,
+    secrets: &alms_core::secrets::SecretsStore,
+    agent_id: AgentId,
+) -> alms_runtime::LlmClient {
+    let switched =
+        alms_runtime::build_summary_client(llm, summary_provider, summary_model, Some(secrets));
+
+    if let Some(provider) = summary_provider {
+        info!(
+            agent_id = %agent_id,
+            agent_provider = %llm.provider(),
+            summary_provider = %provider,
+            summary_model = %summary_model.unwrap_or("<inherit>"),
+            "Using dedicated provider for summary task (#866)"
+        );
+    }
+
+    switched
+}
+
+/// Maximum bytes of an `AlmsError` Display string to embed in the
+/// `ConversationEndReason::Errored { message }` payload.
+///
+/// Bounds the size of the peer-side notification text so a verbose error
+/// (e.g. an LLM JSON dump) does not balloon the `dm_ended` marker / SSE
+/// frame. Truncation is done on a UTF-8 char boundary.
+const PEER_ERROR_MESSAGE_MAX_LEN: usize = 300;
+
+/// Build the human-readable error string carried in
+/// `ConversationEndReason::Errored { message }` for the peer-side
+/// notification. Truncated to [`PEER_ERROR_MESSAGE_MAX_LEN`] on a UTF-8
+/// char boundary; appends an ellipsis when truncated.
+fn truncate_error_for_peer(err: &dyn std::fmt::Display) -> String {
+    let s = err.to_string();
+    if s.len() <= PEER_ERROR_MESSAGE_MAX_LEN {
+        return s;
+    }
+    // Walk back from PEER_ERROR_MESSAGE_MAX_LEN to a char boundary.
+    let mut end = PEER_ERROR_MESSAGE_MAX_LEN;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = s[..end].to_string();
+    truncated.push_str("...");
+    truncated
+}
+
 /// Execute a run in background, forwarding runtime events to SSE.
 #[instrument(level = "info", skip(state, params), fields(run_id = %params.run_id.0, session_id = %params.session_id.0))]
 pub(super) async fn execute_run(state: AppState, params: RunParams) {
@@ -442,6 +583,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         cancel_token,
         is_peer_message,
         is_system_triggered,
+        input_pre_persisted,
     } = params;
     // Track this run for graceful shutdown drain.  The guard ensures the
     // counter is decremented even if this function panics.
@@ -507,15 +649,18 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // does not handle, so those stay inline.
     let merged = apply_overrides(resolved.agent_config, None, &overrides);
     let mut agent_config = merged.agent_config;
-    let mut llm = resolved.llm;
     if let Some(ref provider) = overrides.provider {
         info!("Run {} using provider override: {}", run_id.0, provider);
-        llm = llm.with_provider_and_secrets(provider, &state.secrets.read());
     }
-    if let Some(model) = merged.model_override {
+    if let Some(ref model) = overrides.model {
         info!("Run {} using model override: {}", run_id.0, model);
-        llm = llm.with_model(model);
     }
+    // Apply per-run LLM overrides (provider + model) via the shared helper
+    // in `runs/mod.rs::apply_per_run_llm_overrides`. The helper preserves
+    // the three-layer precedence (per-run > per-agent > server default) for
+    // model even when a per-run provider override would otherwise clobber
+    // the resolved per-agent model via `apply_provider` (#833).
+    let llm = super::apply_per_run_llm_overrides(resolved.llm, &overrides, &state.secrets.read());
 
     // System-triggered runs (peer DMs, notifications, subagent completions)
     // have no human in the loop, so Guarded posture would hang forever
@@ -585,18 +730,56 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // that when `summary_model` is None we fall back to the agent's configured
     // model, not the server default.  After this line `llm` is consumed by
     // `AgentRuntime::new` and no longer available.
+    //
+    // #871 leak guard (mirror of #860/#861 on the summary path): when
+    // `summary_provider` is configured AND `summary_model` is None, the
+    // agent's model name belongs to the AGENT's provider, not the summary
+    // provider. Falling back to it would leak the agent's model slug onto
+    // the summary provider's wire and produce a confusing 404 (the symptom
+    // #861 was meant to prevent, on the summary task this time). Pass `None`
+    // through to `generate_and_persist_summary` instead so it falls back to
+    // `llm_for_summary.default_model()` — which the leak guard below clears
+    // to "" so the wire fails fast with a clean missing-model error.
     let run_summary_mode = agent_config.context_config.run_summary_mode.clone();
     let summary_max_tokens = agent_config.context_config.summary_max_tokens;
-    let summary_model_resolved = agent_config
-        .context_config
-        .summary_model
-        .clone()
-        .or_else(|| Some(llm.default_model().to_string()));
+    let summary_provider_cfg = agent_config.context_config.summary_provider.clone();
+    let summary_model_cfg = agent_config.context_config.summary_model.clone();
+    let summary_model_resolved = if summary_provider_cfg.is_some() {
+        // Dedicated summary provider: only use an explicit summary_model.
+        // Never inherit the agent's resolved model — it belongs to a
+        // different provider's namespace. None falls through to the
+        // summary client's default_model in `generate_session_summary`,
+        // which the leak guard below has already cleared to "".
+        summary_model_cfg.clone()
+    } else {
+        // No provider switch: agent and summary share a wire, so the
+        // agent's resolved model is a safe fallback (pre-#871 behaviour).
+        summary_model_cfg
+            .clone()
+            .or_else(|| Some(llm.default_model().to_string()))
+    };
 
     // S6 fix: clone the per-agent resolved LLM client *before* AgentRuntime::new
     // consumes it.  The summary task needs the agent's provider/base_url/api_key,
     // not the server-default `state.llm`.
-    let llm_for_summary = llm.clone();
+    //
+    // #866: when `summary_provider` is configured, re-target the summary
+    // client at that provider via `with_provider_and_secrets`. This lets the
+    // summary task hit a different provider than the agent (e.g. agent on
+    // Anthropic, summary on OpenRouter). When `summary_provider` is None the
+    // client is byte-identical to the agent's `llm`, preserving pre-#866
+    // behaviour.
+    //
+    // The construction logic (including the #871 leak guard) lives in
+    // `build_summary_client` so it can be unit-tested without spinning up a
+    // full AppState. Here we just borrow `state.secrets` and forward it.
+    let llm_for_summary = build_summary_client(
+        &llm,
+        summary_provider_cfg.as_deref(),
+        summary_model_cfg.as_deref(),
+        &state.secrets.read(),
+        agent_id,
+    );
 
     let mut runtime = match alms_runtime::AgentRuntime::new(agent_id, agent_config, llm) {
         Ok(rt) => rt,
@@ -626,6 +809,16 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         runtime = runtime.with_agent_name(name.clone());
     }
 
+    // #866: when a separate summary provider is configured, wire the
+    // re-targeted client into the runtime so the in-loop sliding-summary path
+    // (`maybe_summarize`) hits the configured provider rather than the
+    // agent's. When `summary_provider` is None we leave the runtime's
+    // `summary_llm` as None — the summarizer transparently falls back to
+    // `self.llm` (pre-#866 behaviour).
+    if summary_provider_cfg.is_some() {
+        runtime = runtime.with_summary_llm(llm_for_summary.clone());
+    }
+
     // Inject ALMS_DATA_DIR and ALMS_WORKSPACE_DIR into shell_exec processes
     // so that CLI commands invoked by agents find the correct database and
     // workspace regardless of the sandboxed cwd.
@@ -637,6 +830,22 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         if !shell_env.is_empty() {
             runtime = runtime.with_shell_default_env(shell_env);
         }
+    }
+
+    // Wire the shell-output spill policy (issue #756) before `with_workspace`
+    // so the per-run spill directory is included in the agent's
+    // `fs_read`/`fs_list`/`fs_grep`/`fs_glob` extra_read_roots at run start.
+    // The directory itself is created lazily on first spill. Reads use the
+    // live `tools_config.shell_spill` so operators can tweak the TOML and
+    // restart, but values are NOT PATCH-mutable (consistent with
+    // shell_permissions).
+    {
+        let spill_cfg = state.tools_config.read().shell_spill.clone();
+        let run_dir = state
+            .data_dir
+            .join(alms_runtime::spill::SPILL_DIR_NAME)
+            .join(run_id.0.to_string());
+        runtime = runtime.with_shell_spill(run_dir, spill_cfg.enabled);
     }
 
     // Attach workspace if configured — registers the workspace_write tool for this run
@@ -787,14 +996,18 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     let forwarder_state = state.clone();
 
     // Build cross-session DM info when the run is on a DM session so that
-    // key status phases are echoed to the agent's webchat stream (#651).
-    let dm_cross_session = agent_name
+    // status phases are echoed to the agent's webchat stream (#651, #688).
+    let dm_peer_for_webchat = agent_name
         .as_deref()
-        .and_then(|name| extract_peer_from_dm_context(&context_id, name))
-        .map(|peer_name| super::tools::DmCrossSessionInfo {
-            agent_id,
-            peer_name,
-        });
+        .and_then(|name| extract_peer_from_dm_context(&context_id, name));
+
+    let dm_cross_session =
+        dm_peer_for_webchat
+            .as_deref()
+            .map(|peer_name| super::tools::DmCrossSessionInfo {
+                agent_id,
+                peer_name: peer_name.to_string(),
+            });
 
     let forwarder_handle = tokio::spawn(forward_runtime_events(
         runtime_rx,
@@ -827,40 +1040,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // message from a prior run (#434, Bug 1).
     let run_start_ts = alms_core::Timestamp::now();
 
-    // System-triggered notification runs (subagent completions, DM-ended
-    // notifications) that land on a user-facing session should NOT persist
-    // the verbose notification input as a normal Role::User message — that
-    // would show the internal LLM prompt as a "user" bubble on page reload.
+    // System-triggered notification runs (subagent completions, DM-ended)
+    // that land on a user-facing session pre-persist the notification as
+    // a `Role::User` message with `notification_input: true` metadata.
+    // The `notification_input` flag drives `get_session_messages` filtering
+    // so the internal prompt never shows as a "user" bubble on reload.
     //
-    // Instead, pre-persist the input as a Role::User message with
-    // `notification_input: true` metadata. This ensures:
-    //
-    //  1. The context builder includes it as a **user** message in the LLM
-    //     context window. This is required across all providers:
-    //
-    //     - **Anthropic (direct)**: The Anthropic Messages API extracts
-    //       system messages into the top-level `system` field. With the
-    //       previous Role::System approach, the messages array ended with
-    //       an assistant message from the prior conversation, causing API
-    //       rejection. Role::User ensures a valid trailing user turn.
-    //
-    //     - **OpenRouter (all models)**: OpenRouter uses the OpenAI chat
-    //       completions format. While the API technically accepts a
-    //       trailing system message, models are not trained to generate
-    //       responses to system messages without a subsequent user turn.
-    //       When proxying to Claude, OpenRouter performs the same system
-    //       message extraction as the direct Anthropic API, causing the
-    //       identical failure. For non-Claude models, a trailing system
-    //       message produces empty or confused responses. Role::User
-    //       ensures the notification is a clear conversation turn that
-    //       all models respond to naturally.
-    //
-    //  2. `get_session_messages` filters it out via the
-    //     `notification_input` metadata flag, making it invisible on page
-    //     reload.
-    //
-    // Then use `run_on_session` to skip the default Role::User persistence
-    // in `runtime.run()`.
+    // The `Role::User` choice is now a consequence of the canonical
+    // message-shape invariant enforced in `ContextBuilder::normalize_for_llm`
+    // (see #586): the invariant guarantees a trailing user turn regardless
+    // of this message's presence, so synthesising a placeholder would be
+    // redundant. Persisting as user keeps the real payload in history.
+    // Applies to Anthropic direct and OpenRouter-to-Claude proxying, which
+    // performs the same system-message extraction as the Anthropic API.
     let is_notification_on_user_session =
         is_system_triggered && !is_peer_message && !is_internal_context_id(&context_id);
 
@@ -872,25 +1064,21 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         runtime
             .run_on_session(&state.session_manager, session_id, &context_id, &input)
             .await
+    } else if input_pre_persisted {
+        // User-initiated run where `create_run` already pre-persisted the
+        // input to the session (so it survives a page reload during the
+        // queued-wait window). Use `run_on_session` to skip the default
+        // Role::User persistence in `runtime.run()` and avoid duplicating
+        // the message.
+        runtime
+            .run_on_session(&state.session_manager, session_id, &context_id, &input)
+            .await
     } else if is_notification_on_user_session {
-        // Notification run landing on a user-facing session.
-        //
-        // Pre-persist the input as Role::User with `notification_input`
-        // metadata so the context builder sees it as a user message.
-        // This is required for all providers — see the detailed comment
-        // above `is_notification_on_user_session` for the full rationale.
-        //
-        // `get_session_messages` filters it out on reload so the internal
-        // prompt never appears as a "user" bubble.
-        //
-        // Then use `run_on_session` to skip the default Role::User
-        // persistence in `runtime.run()`.
-        //
-        // Note: if `run_on_session` fails after the append, the orphaned
-        // message remains in the session. It is invisible on reload (the
-        // API filter hides it) but occupies tokens in the context window
-        // for future runs. This is acceptable — the failure case is rare
-        // and the impact is minor token waste.
+        // Notification run on a user-facing session: pre-persist the
+        // input as Role::User + `notification_input` metadata (see the
+        // comment above `is_notification_on_user_session` for why), then
+        // use `run_on_session` to skip `runtime.run()`'s default
+        // Role::User persistence and avoid a double-write.
         let notif_msg = alms_session::Message {
             id: uuid::Uuid::new_v4().to_string(),
             role: alms_session::Role::User,
@@ -954,28 +1142,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         Ok(output) => {
             persist_tool_calls(&output.tool_calls);
 
-            // Capture this flag before mark_run_as_completed moves the response.
-            let hit_max_iterations = output.response == alms_core::MAX_ITERATIONS_SENTINEL;
-
-            // Detect max-iterations sentinel and emit a warning event so the
-            // frontend can style it distinctly (yellow) instead of as a normal
-            // agent message.
-            if hit_max_iterations {
-                state
-                    .run_manager
-                    .send_event(
-                        run_id,
-                        session_id,
-                        SseEventData::run_warning(
-                            run_id,
-                            "MAX_ITERATIONS",
-                            "Max iterations reached — the agent hit its iteration limit before finishing. You can continue the conversation to pick up where it left off.",
-                            None,
-                        ),
-                    )
-                    .await;
-            }
-
             // token_delta events already emitted during streaming in the agent loop
             state
                 .run_manager
@@ -999,22 +1165,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     serde_json::json!({
                         "run_id": run_id.0.to_string(),
                         "status": "completed",
-                    }),
-                );
-            }
-
-            // Persist warning marker when MAX_ITERATIONS was hit, so it
-            // survives page reloads.
-            if hit_max_iterations && !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_warning",
-                    "Max iterations reached — the agent hit its iteration limit before finishing."
-                        .to_string(),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "code": "MAX_ITERATIONS",
                     }),
                 );
             }
@@ -1096,8 +1246,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
             // -- DM post-run lifecycle (consolidated in #628) --
             //
-            // Detect ignore_message or max-iterations, signal conversation
-            // end, emit SSE events.
+            // Detect ignore_message, signal conversation end, emit SSE events.
             // All logic lives in `dm_lifecycle::handle_dm_run_completion()`.
             super::dm_lifecycle::handle_dm_run_completion(
                 super::dm_lifecycle::DmRunCompletionContext {
@@ -1109,7 +1258,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     context_id: &context_id,
                     is_peer_message,
                     tool_calls: &output.tool_calls,
-                    hit_max_iterations,
                 },
             )
             .await;
@@ -1137,6 +1285,28 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
+            // Best-effort: notify the DM peer that the conversation ended
+            // because this run was cancelled mid-flight. Without this, the
+            // peer thinks the DM is still open until the 1800s
+            // `DEPTH_EXPIRY_SECS` sweep clears the depth counter.
+            if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                ConversationEndReason::UserCancelled,
+            )
+            .await
+            {
+                warn!(
+                    error = %e,
+                    "handle_dm_run_failure emitted error — DM peer state may be stale"
+                );
+            }
+
             info!("Run {} cancelled", run_id.0);
         }
         Err(alms_core::AlmsError::CancelledWithToolCalls { tool_calls }) => {
@@ -1160,6 +1330,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                         "run_id": run_id.0.to_string(),
                         "status": "cancelled",
                     }),
+                );
+            }
+
+            // Best-effort: see comment in the `Cancelled` arm.
+            if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                ConversationEndReason::UserCancelled,
+            )
+            .await
+            {
+                warn!(
+                    error = %e,
+                    "handle_dm_run_failure emitted error — DM peer state may be stale"
                 );
             }
 
@@ -1200,6 +1389,31 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
+            // Best-effort: notify the DM peer that the conversation ended
+            // due to a runtime error. The truncated `source` string is
+            // surfaced in the peer's `dm_ended` notification so the peer
+            // (and human user watching the DM) sees a useful reason instead
+            // of a stale "in-flight" indicator until the 1800s sweep.
+            if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                ConversationEndReason::Errored {
+                    message: truncate_error_for_peer(&source),
+                },
+            )
+            .await
+            {
+                warn!(
+                    error = %e,
+                    "handle_dm_run_failure emitted error — DM peer state may be stale"
+                );
+            }
+
             error!(
                 "Run {} failed ({} tool calls persisted): {}",
                 run_id.0,
@@ -1233,8 +1447,49 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
+            // Best-effort: see comment in the `FailedWithToolCalls` arm.
+            if let Err(end_err) = super::dm_lifecycle::handle_dm_run_failure(
+                &state,
+                &run_id,
+                &session_id,
+                agent_id,
+                agent_name.as_deref(),
+                &context_id,
+                is_peer_message,
+                ConversationEndReason::Errored {
+                    message: truncate_error_for_peer(&e),
+                },
+            )
+            .await
+            {
+                warn!(
+                    error = %end_err,
+                    "handle_dm_run_failure emitted error — DM peer state may be stale"
+                );
+            }
+
             error!("Run {} failed: {}", run_id.0, e);
         }
+    }
+
+    // Forward a `dm_activity_ended` event to the agent's webchat session
+    // so the frontend can update the status bar (#688).  This is distinct
+    // from `dm_conversation_ended` (which signals the entire DM conversation
+    // is over) — `dm_activity_ended` signals that a single DM run finished,
+    // allowing the frontend to keep "Chatting with..." visible if more DM
+    // runs are expected.
+    if let Some(ref peer_name) = dm_peer_for_webchat
+        && let Some(target) = super::find_user_facing_session(&state.session_manager, agent_id)
+    {
+        let dummy_run_id = RunId::new();
+        state
+            .run_manager
+            .send_session_event(
+                target.id,
+                dummy_run_id,
+                SseEventData::dm_activity_ended(target.id, peer_name),
+            )
+            .await;
     }
 
     // Update last_active on the agent record (non-fatal).
@@ -1356,5 +1611,230 @@ mod tests {
         // parent_run_id should win over context_id prefix
         let run = Run::for_subagent(SessionId::new(), AgentId::new(), "sub".into(), RunId::new());
         assert_eq!(derive_trigger(&run, "dm:a:b"), "subagent");
+    }
+
+    #[test]
+    fn test_truncate_error_for_peer_short_ascii_unchanged() {
+        // Short ASCII passes through unmodified (no ellipsis appended).
+        let s = "boom";
+        let out = truncate_error_for_peer(&s);
+        assert_eq!(out, "boom");
+    }
+
+    #[test]
+    fn test_truncate_error_for_peer_exact_boundary_unchanged() {
+        // Exactly PEER_ERROR_MESSAGE_MAX_LEN bytes -> no truncation, no ellipsis.
+        let s = "a".repeat(PEER_ERROR_MESSAGE_MAX_LEN);
+        let out = truncate_error_for_peer(&s);
+        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN);
+        assert!(!out.ends_with("..."));
+    }
+
+    #[test]
+    fn test_truncate_error_for_peer_oversize_ascii_truncates_with_ellipsis() {
+        // Oversize ASCII clips to PEER_ERROR_MESSAGE_MAX_LEN bytes + "..."
+        // (char-boundary walkback is a no-op for ASCII).
+        let s = "a".repeat(PEER_ERROR_MESSAGE_MAX_LEN + 50);
+        let out = truncate_error_for_peer(&s);
+        assert!(out.ends_with("..."));
+        // Body is exactly the max-len prefix; total len = max + 3 ("...").
+        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN + 3);
+    }
+
+    #[test]
+    fn test_truncate_error_for_peer_multibyte_walks_back_to_char_boundary() {
+        // "é" is 2 bytes in UTF-8. With 200 copies (400 bytes), the raw
+        // PEER_ERROR_MESSAGE_MAX_LEN=300 cut would land mid-codepoint at
+        // offset 300 (which IS a char boundary for 2-byte codepoints since
+        // 300 is even); construct a 3-byte char case that forces a walkback.
+        // "あ" is 3 bytes; 150 copies = 450 bytes. Cut at 300 -> 300 % 3 == 0,
+        // also a boundary. Use a mix: leading "a" then 3-byte chars so the
+        // cut lands inside a codepoint and must walk back.
+        let s = format!("a{}", "あ".repeat(200)); // 1 + 600 = 601 bytes
+        // Cut at 300: byte 0 is 'a', then "あ" starts at byte 1 (3 bytes each).
+        // Boundaries after byte 1 are at 1 + 3k. 300 - 1 = 299, not a multiple
+        // of 3, so 300 is mid-codepoint. Walk back: 300 -> 299 -> 298 (1+3*99=298).
+        let out = truncate_error_for_peer(&s);
+        assert!(out.ends_with("..."));
+        // The body must end at a UTF-8 char boundary (no panic on slicing).
+        let body = out.trim_end_matches("...");
+        assert!(body.is_char_boundary(body.len()));
+        // Body length is the largest valid char boundary <= 300.
+        assert!(body.len() <= PEER_ERROR_MESSAGE_MAX_LEN);
+        assert!(s.is_char_boundary(body.len()));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // build_summary_client (#866 + #871) — mirror of #860/#861 leak-guard
+    // tests in `runs/mod.rs::tests` but on the summary path.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Build an `LlmConfig` whose `[llm.providers.<name>]` map contains
+    /// (anthropic, openrouter) and an in-memory `SecretsStore` with keys
+    /// for both. Mirrors the fixture shape used by the #860/#861 tests in
+    /// `runs/mod.rs::tests`.
+    fn summary_test_fixtures(
+        anthropic_entry_model: Option<&str>,
+        openrouter_entry_model: Option<&str>,
+    ) -> (alms_runtime::LlmClient, alms_core::secrets::SecretsStore) {
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: openrouter_entry_model.map(str::to_string),
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: anthropic_entry_model.map(str::to_string),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let cfg = LlmConfig {
+            // Agent's resolved client is on Anthropic with a sonnet model.
+            provider: "anthropic".into(),
+            api_key: "sk-ant-runtime".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            default_model: "claude-sonnet-4-20250514".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let llm = alms_runtime::LlmClient::new(cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
+        secrets.set_key("openrouter", "sk-or-runtime").unwrap();
+        std::mem::forget(dir);
+        (llm, secrets)
+    }
+
+    /// Pre-#866 behaviour: when `summary_provider` is `None`, the helper
+    /// returns a clone of the agent's `llm` byte-identical to pre-#866
+    /// behaviour. Provider, default_model, and base_url all match.
+    #[test]
+    fn build_summary_client_no_provider_returns_agent_llm_clone() {
+        let (llm, secrets) = summary_test_fixtures(None, None);
+        let summary = build_summary_client(&llm, None, None, &secrets, AgentId::new());
+        assert_eq!(summary.provider(), llm.provider());
+        assert_eq!(summary.default_model(), llm.default_model());
+    }
+
+    /// #866 happy path: provider AND model both set. Both reach the wire
+    /// regardless of any provider-entry model field.
+    #[test]
+    fn build_summary_client_provider_and_model_set_both_apply() {
+        let (llm, secrets) = summary_test_fixtures(None, None);
+        let summary = build_summary_client(
+            &llm,
+            Some("openrouter"),
+            Some("minimax/minimax-m2.7"),
+            &secrets,
+            AgentId::new(),
+        );
+        assert_eq!(summary.provider(), "openrouter");
+        assert_eq!(summary.default_model(), "minimax/minimax-m2.7");
+    }
+
+    /// #866 + #871: provider set, no model, AND the new provider entry has
+    /// its own `model` field. `apply_provider` rewrites `default_model` to
+    /// the entry's model — that's the (provider, model) pair the user
+    /// configured, so the leak guard does NOT clear it. This shape is
+    /// rejected by the PATCH validator (`SUMMARY_PROVIDER_REQUIRES_MODEL`
+    /// fires when `summary_model` is None) but a hand-edited TOML can still
+    /// reach this branch — keep the property pinned.
+    #[test]
+    fn build_summary_client_provider_only_with_entry_model_uses_entry_model() {
+        let (llm, secrets) = summary_test_fixtures(None, Some("provider-default-model"));
+        let summary =
+            build_summary_client(&llm, Some("openrouter"), None, &secrets, AgentId::new());
+        assert_eq!(summary.provider(), "openrouter");
+        assert_eq!(
+            summary.default_model(),
+            "provider-default-model",
+            "provider-entry model should reach the wire when no \
+             summary_model is configured (#866)"
+        );
+    }
+
+    /// #871 leak guard (the bug Tim flagged): provider set, no model, AND
+    /// the new provider entry has NO `model` field. `apply_provider` leaves
+    /// `default_model` unchanged, so the cloned client carries the AGENT's
+    /// model slug ("claude-sonnet-4-...") into the new (openrouter) wire.
+    /// Pre-fix: the agent's slug reaches openrouter and produces a 404 (the
+    /// exact symptom #861 was meant to prevent on the agent path). Post-fix:
+    /// the leak guard clears `default_model` so the wire request fails fast
+    /// with a missing-model error rather than 404'ing on the wrong slug.
+    #[test]
+    fn build_summary_client_provider_only_no_entry_model_clears_to_fail_fast() {
+        let (llm, secrets) = summary_test_fixtures(None, None);
+        let agent_model = llm.default_model().to_string();
+        let summary =
+            build_summary_client(&llm, Some("openrouter"), None, &secrets, AgentId::new());
+        assert_eq!(summary.provider(), "openrouter");
+        assert_ne!(
+            summary.default_model(),
+            agent_model,
+            "summary_provider switch must NOT leak the agent's model slug \
+             onto the summary provider's wire (#871, mirror of #860/#861)"
+        );
+        assert_eq!(
+            summary.default_model(),
+            "",
+            "leak guard clears default_model when summary_provider is set, \
+             summary_model is None, and the provider entry has no model \
+             field — wire fails fast with a missing-model error (#871)"
+        );
+    }
+
+    /// #866 + #871: provider set, model set, and the new provider entry
+    /// also has its own `model` field. The explicit `summary_model`
+    /// override must win — same property as the per-agent #861 test
+    /// (`test_per_agent_provider_with_entry_model_does_not_drop_per_agent_model`).
+    #[test]
+    fn build_summary_client_explicit_model_wins_over_entry_model() {
+        let (llm, secrets) = summary_test_fixtures(None, Some("provider-default-model"));
+        let summary = build_summary_client(
+            &llm,
+            Some("openrouter"),
+            Some("user-chosen-summary-model"),
+            &secrets,
+            AgentId::new(),
+        );
+        assert_eq!(summary.provider(), "openrouter");
+        assert_eq!(
+            summary.default_model(),
+            "user-chosen-summary-model",
+            "explicit summary_model must reach the wire even when the \
+             provider entry has its own model field"
+        );
+    }
+
+    /// Back-compat: when both fields are unset and the agent has a normal
+    /// resolved client, the helper short-circuits to a clone with the same
+    /// provider+model+base_url. This is the byte-identical-to-pre-#866
+    /// guarantee.
+    #[test]
+    fn build_summary_client_back_compat_when_provider_and_model_both_none() {
+        let (llm, secrets) = summary_test_fixtures(None, None);
+        let summary = build_summary_client(&llm, None, None, &secrets, AgentId::new());
+        assert_eq!(summary.provider(), "anthropic");
+        assert_eq!(summary.default_model(), "claude-sonnet-4-20250514");
     }
 }

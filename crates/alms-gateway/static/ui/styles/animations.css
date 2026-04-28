@@ -1,0 +1,63 @@
+/* ══════════════════════════════════════════════════════════════════════
+   Streaming Cursor
+   ══════════════════════════════════════════════════════════════════════ */
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.streaming-cursor::after {
+  content: '\258C';
+  animation: blink 1s step-end infinite;
+  color: var(--accent);
+}
+
+/* ── Thinking indicator ── */
+@keyframes thinking-dots {
+  0%   { content: ''; }
+  25%  { content: '.'; }
+  50%  { content: '..'; }
+  75%  { content: '...'; }
+}
+
+.thinking-indicator {
+  color: var(--text-muted) !important;
+  font-style: italic;
+}
+.thinking-indicator::after {
+  content: '';
+  animation: thinking-dots 1.5s steps(1) infinite;
+}
+
+/* ── Queued indicator ── */
+@keyframes queued-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.5; }
+}
+.queued-indicator {
+  color: var(--text-muted) !important;
+  font-style: italic;
+  animation: queued-pulse 2s ease-in-out infinite;
+}
+
+/* ── Pending indicator (pre-SSE, optimistic placeholder) ── */
+.pending-indicator {
+  color: var(--text-muted) !important;
+  font-style: italic;
+}
+.pending-indicator::after {
+  content: '';
+  animation: thinking-dots 1.5s steps(1) infinite;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   Reduced Motion
+   ══════════════════════════════════════════════════════════════════════ */
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

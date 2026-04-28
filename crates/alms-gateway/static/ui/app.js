@@ -18,6 +18,7 @@ import { agents, activeAgent } from './state/agents.js';
 import { isDmSession, isNotificationSession, isInternalSession, activeSession } from './state/sessions.js';
 import { SubagentBar } from './components/chat/subagent-bar.js';
 import { parentSessionId, navigateToParentSession } from './state/subagents.js';
+import { DM_END_REASON_LABELS } from './utils/constants.js';
 import { AgentHeaderBar } from './components/chat/agent-header-bar.js';
 import { DmConversationView } from './components/chat/dm-conversation-view.js';
 import { scrollToBottom } from './utils/format.js';
@@ -161,7 +162,7 @@ function ChatView() {
                     }
                     const m = item;
                     if (m.type === 'user' || m.type === 'agent') {
-                        return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} fromAgent=${m.fromAgent} />`;
+                        return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} fromAgent=${m.fromAgent} reasoning=${m.reasoning} />`;
                     }
                     if (m.type === 'tool') {
                         return html`<${ToolRow} key=${m.id} ...${m} />`;
@@ -223,8 +224,7 @@ function ChatView() {
                         // Route to the correct visual component based on metadata.type.
                         const md = m.metadata || {};
                         if (md.type === 'dm_ended_notification') {
-                            const reasonLabels = { 'ignored': 'no further replies', 'depth_exceeded': 'message limit reached' };
-                            return html`<${DmEndedMessage} key=${m.id} peer=${md.peer || 'unknown'} reason=${reasonLabels[md.reason] || md.reason || 'conversation ended'} />`;
+                            return html`<${DmEndedMessage} key=${m.id} peer=${md.peer || 'unknown'} reason=${DM_END_REASON_LABELS[md.reason] || md.reason || 'conversation ended'} />`;
                         }
                         // Other synthetic markers: render as system message
                         return html`<${SystemMessage} key=${m.id} text=${m.text} />`;
@@ -235,7 +235,10 @@ function ChatView() {
                     if (m.type === 'thinking') {
                         let label = 'Thinking';
                         let indicatorClass = 'thinking-indicator';
-                        if (m.queuedBehind > 0) {
+                        if (m.pending) {
+                            label = 'Sending';
+                            indicatorClass = 'pending-indicator';
+                        } else if (m.queuedBehind > 0) {
                             label = 'Queued \u2014 waiting for agent\u2026';
                             indicatorClass = 'queued-indicator';
                         } else if (m.source && m.source.startsWith('peer:')) {

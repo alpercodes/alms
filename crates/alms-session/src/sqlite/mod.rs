@@ -103,17 +103,22 @@ CREATE TABLE IF NOT EXISTS context_summaries (
 );
 
 CREATE TABLE IF NOT EXISTS agents (
-    id              TEXT PRIMARY KEY,
-    name            TEXT NOT NULL UNIQUE,
-    description     TEXT NOT NULL DEFAULT '',
-    model           TEXT,
-    system_prompt   TEXT,
-    posture         TEXT,
-    provider        TEXT,
-    telegram_token  TEXT,
-    is_default      INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT NOT NULL,
-    last_active     TEXT NOT NULL
+    id                     TEXT PRIMARY KEY,
+    name                   TEXT NOT NULL UNIQUE,
+    description            TEXT NOT NULL DEFAULT '',
+    model                  TEXT,
+    system_prompt          TEXT,
+    posture                TEXT,
+    provider               TEXT,
+    telegram_token         TEXT,
+    is_default             INTEGER NOT NULL DEFAULT 0,
+    created_at             TEXT NOT NULL,
+    last_active            TEXT NOT NULL,
+    thinking_budget_tokens INTEGER,
+    reasoning_effort       TEXT,
+    gemini_thinking_budget INTEGER,
+    summary_provider       TEXT,
+    summary_model          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
@@ -147,7 +152,8 @@ CREATE TABLE IF NOT EXISTS run_tool_calls (
     tool_id    TEXT,
     params     TEXT,
     result     TEXT,
-    timestamp  TEXT NOT NULL
+    timestamp  TEXT NOT NULL,
+    from_agent TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run ON run_tool_calls(run_id, seq);
@@ -209,6 +215,32 @@ impl SqliteStore {
         );
         // Auto-migrate: add telegram_token column for per-agent Telegram bots.
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN telegram_token TEXT;");
+        // Auto-migrate: add thinking_budget_tokens column for per-agent
+        // Anthropic extended-thinking opt-in (issue #767). NULL means
+        // "inherit the server default from [llm.anthropic]"; any integer
+        // (including 0) is an explicit per-agent override.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN thinking_budget_tokens INTEGER;");
+        // Auto-migrate: add reasoning_effort column for per-agent
+        // OpenAI-compat reasoning-model opt-in (issue #768). NULL means
+        // "inherit the server default from [llm.openai]"; a string
+        // ("low"/"medium"/"high"/"minimal") is an explicit per-agent
+        // override. Stored as TEXT to match the `ReasoningEffort` enum's
+        // lowercase serde wire format.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN reasoning_effort TEXT;");
+        // Auto-migrate: add gemini_thinking_budget column for per-agent
+        // Gemini extended-thinking opt-in (issue #794). NULL means
+        // "inherit the server default from [llm.gemini]"; any integer
+        // (including 0) is an explicit per-agent override.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN gemini_thinking_budget INTEGER;");
+        // Auto-migrate: add summary_provider / summary_model columns for
+        // per-agent summary-task overrides (issue #872). NULL on either
+        // means "fall through to the server-level [context] settings";
+        // both must be set together (PATCH validator enforces the pair
+        // invariant). Additive, reversible: existing rows stay NULL on
+        // both columns and behave identically to today's server-level
+        // path.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN summary_provider TEXT;");
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN summary_model TEXT;");
         // Auto-migrate: add run_tool_calls table for per-run tool call storage.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS run_tool_calls (\
@@ -220,11 +252,16 @@ impl SqliteStore {
                  tool_id    TEXT, \
                  params     TEXT, \
                  result     TEXT, \
-                 timestamp  TEXT NOT NULL\
+                 timestamp  TEXT NOT NULL, \
+                 from_agent TEXT\
              ); \
              CREATE INDEX IF NOT EXISTS idx_run_tool_calls_run \
                  ON run_tool_calls(run_id, seq);",
         );
+        // Auto-migrate: add from_agent column to run_tool_calls for existing
+        // DBs so the frontend fallback merge path can attribute DM reasoning
+        // blocks to the correct agent (see #696).
+        let _ = conn.execute_batch("ALTER TABLE run_tool_calls ADD COLUMN from_agent TEXT;");
         // Auto-migrate: add session_summaries table for cross-session episodic memory.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_summaries (\
@@ -421,6 +458,43 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     let is_default: i32 = row.get(7)?;
     let created_at_str: String = row.get(8)?;
     let last_active_str: String = row.get(9)?;
+    // Per-agent Anthropic thinking budget (issue #767). Stored as INTEGER;
+    // parsed as i64 → saturating u32 so corrupt values don't crash the row
+    // parser. NULL maps to `None` (inherit the server default).
+    let thinking_budget_tokens: Option<u32> = row
+        .get::<_, Option<i64>>(10)?
+        .map(|v| v.clamp(0, i64::from(u32::MAX)) as u32);
+    // Per-agent OpenAI-compat reasoning effort (issue #768). Stored as
+    // TEXT; unrecognised values are logged and mapped to `None` (inherit
+    // the server default) rather than failing row parsing — follows the
+    // same defence-in-depth stance as the thinking budget above.
+    let reasoning_effort: Option<alms_core::config::ReasoningEffort> = row
+        .get::<_, Option<String>>(11)?
+        .and_then(|s| match s.parse() {
+            Ok(effort) => Some(effort),
+            Err(e) => {
+                tracing::warn!(
+                    stored = %s,
+                    error = %e,
+                    "Skipping unparseable reasoning_effort in agents row"
+                );
+                None
+            }
+        });
+    // Per-agent Gemini thinking budget (issue #794). Stored as INTEGER;
+    // parsed as i64 → saturating u32 so corrupt values don't crash the
+    // row parser. NULL maps to `None` (inherit the server default).
+    let gemini_thinking_budget: Option<u32> = row
+        .get::<_, Option<i64>>(12)?
+        .map(|v| v.clamp(0, i64::from(u32::MAX)) as u32);
+    // Per-agent summary-task provider / model (issue #872). Both stored
+    // as TEXT; NULL on either means "fall through to the server-level
+    // [context] settings". The PATCH validator and CRUD handlers
+    // enforce the pair invariant — at the parser level we just deserialize
+    // whatever is on disk and let the resolver flag invalid combinations
+    // when they're observed at run time.
+    let summary_provider: Option<String> = row.get(13)?;
+    let summary_model: Option<String> = row.get(14)?;
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -440,6 +514,11 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         posture,
         provider,
         telegram_token,
+        thinking_budget_tokens,
+        reasoning_effort,
+        gemini_thinking_budget,
+        summary_provider,
+        summary_model,
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),
@@ -504,6 +583,19 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         (Some(pt), Some(ct)) => Some(TokenUsage {
             prompt_tokens: u32::try_from(pt).unwrap_or(u32::MAX),
             completion_tokens: u32::try_from(ct).unwrap_or(u32::MAX),
+            // Reasoning tokens are not persisted on the `runs` table today.
+            // The live flow is: provider adapter -> `TokenUsage.reasoning_tokens`
+            // -> `RunOutput.usage` -> SSE `run_finished` event + `GET /runs/{id}`
+            // response (both carry the field when the provider reports it).
+            // Persisting a `reasoning_tokens` column to the `runs` table is a
+            // follow-up that requires a schema migration.
+            reasoning_tokens: None,
+            // Cache tokens (#766) are similarly not persisted on the
+            // `runs` table yet — they flow through the live SSE path and
+            // subagent completion markers, but a DB-level surface would
+            // need a schema migration.
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
         }),
         _ => None,
     };

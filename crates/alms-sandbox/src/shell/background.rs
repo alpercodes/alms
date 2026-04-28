@@ -5,6 +5,7 @@
 //! query the result by task ID.
 
 use super::exec::execute_command;
+use super::spill::ShellSpillPolicy;
 use super::types::{BackgroundTaskResult, ShellInput, ShellState};
 use crate::error::SandboxResult;
 use std::collections::HashMap;
@@ -25,6 +26,8 @@ pub(crate) async fn submit_background_task(
     sandbox_root: Option<PathBuf>,
     unrestricted: bool,
     default_env: HashMap<String, String>,
+    pwd_marker: String,
+    spill_policy: ShellSpillPolicy,
 ) -> SandboxResult<String> {
     let task_id = state.next_id().await;
     let command_display = input.command.clone();
@@ -35,6 +38,9 @@ pub(crate) async fn submit_background_task(
     let task_id_clone = task_id.clone();
     let command_clone = command_display.clone();
     let sandbox_root_ref = sandbox_root.clone();
+    // Use the generated background task id as the spill tool_call_id so
+    // spill files are grep-able against the ShellTool's task_id response.
+    let spill_tool_call_id = task_id.clone();
 
     tokio::spawn(async move {
         let result = execute_command(
@@ -43,6 +49,9 @@ pub(crate) async fn submit_background_task(
             sandbox_root_ref.as_deref(),
             unrestricted,
             &default_env,
+            &pwd_marker,
+            &spill_policy,
+            &spill_tool_call_id,
         )
         .await;
 
@@ -91,20 +100,6 @@ pub(crate) async fn check_background_task(
     tasks.remove(task_id)
 }
 
-/// List all completed background tasks without removing them.
-// TODO(dead-code): will be wired to a `list_tasks` action in the shell tool
-#[allow(dead_code)]
-pub(crate) async fn list_background_tasks(state: &ShellState) -> Vec<(String, bool)> {
-    let tasks = state.background_tasks.lock().await;
-    tasks
-        .iter()
-        .map(|(id, result)| {
-            let completed = result.output.is_some() || result.error.is_some();
-            (id.clone(), completed)
-        })
-        .collect()
-}
-
 /// Evict the oldest completed task from the map.
 ///
 /// Task IDs are formatted as `bg_N` where N is a monotonically increasing
@@ -141,9 +136,17 @@ mod tests {
             run_in_background: true,
         };
 
-        let task_id = submit_background_task(input, &state, None, true, HashMap::new())
-            .await
-            .unwrap();
+        let task_id = submit_background_task(
+            input,
+            &state,
+            None,
+            true,
+            HashMap::new(),
+            "__ALMS_PWD_TEST__".to_string(),
+            ShellSpillPolicy::disabled(),
+        )
+        .await
+        .unwrap();
 
         assert!(task_id.starts_with("bg_"));
 

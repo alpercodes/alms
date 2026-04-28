@@ -12,7 +12,7 @@ use crate::approvals::{list_approvals, resolve_approval};
 use crate::auth_keys;
 use crate::jobs::{cancel_job, create_job, get_job, list_jobs};
 use crate::runs::{
-    cancel_run, classify_session_type, create_run, get_run_status, get_run_tool_calls,
+    cancel_dm, cancel_run, classify_session_type, create_run, get_run_status, get_run_tool_calls,
     is_internal_context_id, list_runs, stream_run_events,
 };
 use crate::settings::{get_settings, patch_settings};
@@ -126,6 +126,7 @@ pub(crate) fn protected_router() -> Router<AppState> {
             "/sessions/{session_id}/events",
             get(crate::runs::stream_session_events),
         )
+        .route("/sessions/{session_id}/cancel-dm", post(cancel_dm))
         .route("/sessions/{agent_id}/{context_id}", get(get_session))
         // Runs (canonical API per spec)
         .route("/runs", get(list_runs).post(create_run))
