@@ -291,17 +291,46 @@ impl ShellTool {
         })
     }
 
+    /// Append the agent-visible `[full output spilled to: ...]` marker to
+    /// `stdout` when a spill file was written for this command. Returns the
+    /// stdout unchanged when no spill occurred.
+    ///
+    /// Shared between the foreground execution path and `handle_check_task`
+    /// so background-task results surface the same recovery convention as
+    /// foreground ones (issue #811). The path is rendered relative to the
+    /// workspace root (the shell tool's `sandbox_root`) when possible so the
+    /// agent can paste it straight into `fs_read`.
+    fn append_spill_marker(&self, stdout: &str, spill_path: Option<&PathBuf>) -> String {
+        match spill_path {
+            Some(path) => {
+                let workspace_root = self.sandbox_root.as_deref();
+                let rel = spill::relative_spill_path(path, workspace_root);
+                if stdout.is_empty() || stdout.ends_with('\n') {
+                    format!("{stdout}[full output spilled to: {rel}]")
+                } else {
+                    format!("{stdout}\n[full output spilled to: {rel}]")
+                }
+            }
+            None => stdout.to_string(),
+        }
+    }
+
     /// Handle a request to check background task status.
     async fn handle_check_task(&self, task_id: &str) -> SandboxResult<Value> {
         match background::check_background_task(&self.state, task_id).await {
             Some(result) => {
                 if let Some(ref output) = result.output {
+                    // Mirror the foreground spill-marker contract (issue #811):
+                    // background-task large outputs are spilled to disk too,
+                    // and the agent needs the path to recover them via fs_read.
+                    let stdout_with_marker =
+                        self.append_spill_marker(&output.stdout, output.spill_path.as_ref());
                     Ok(serde_json::json!({
                         "task_id": result.task_id,
                         "status": "completed",
                         "command": result.command,
                         "exit_code": output.exit_code,
-                        "stdout": output.stdout,
+                        "stdout": stdout_with_marker,
                         "stderr": output.stderr,
                     }))
                 } else if let Some(ref error) = result.error {
@@ -534,23 +563,11 @@ impl Tool for ShellTool {
 
         // If a spill file was written, append the agent-visible marker line
         // to stdout so the LLM sees the spill path in the normal tool result
-        // body and can `fs_read` it. The path is rendered relative to the
-        // default cwd when possible (see `spill::relative_spill_path`) so
-        // the agent can paste it straight into fs_read. We resolve the
-        // workspace root from the shell tool's sandbox_root — which is the
-        // same root fs_read uses — so relative paths line up.
-        let stdout_with_marker = match &output.spill_path {
-            Some(path) => {
-                let workspace_root = self.sandbox_root.as_deref();
-                let rel = spill::relative_spill_path(path, workspace_root);
-                if output.stdout.is_empty() || output.stdout.ends_with('\n') {
-                    format!("{}[full output spilled to: {}]", output.stdout, rel)
-                } else {
-                    format!("{}\n[full output spilled to: {}]", output.stdout, rel)
-                }
-            }
-            None => output.stdout,
-        };
+        // body and can `fs_read` it. See `append_spill_marker` for the path-
+        // resolution details. Background-task results go through the same
+        // helper from `handle_check_task` (issue #811).
+        let stdout_with_marker =
+            self.append_spill_marker(&output.stdout, output.spill_path.as_ref());
 
         Ok(serde_json::json!({
             "exit_code": output.exit_code,
@@ -1388,6 +1405,115 @@ mod tests {
         assert!(
             !run_dir.exists() || std::fs::read_dir(&run_dir).unwrap().next().is_none(),
             "no spill files should be written when spill is disabled"
+        );
+    }
+
+    /// Regression test for issue #811: background-task results must surface
+    /// the same `[full output spilled to: ...]` marker as the foreground
+    /// path when stdout exceeds the inline truncation budget. Without the
+    /// marker, the agent can't recover the full output from the spill file.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_background_task_includes_spill_marker() {
+        use crate::shell::spill::ShellSpillPolicy;
+        use crate::shell::types::MAX_OUTPUT_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run-bg-spill");
+        let tool =
+            ShellTool::new().with_spill_policy(ShellSpillPolicy::with_run_dir(run_dir.clone()));
+
+        let n = MAX_OUTPUT_BYTES + 5_000;
+        let cmd = format!("printf '%.0sx' $(seq 1 {n})");
+
+        // Submit as a background task.
+        let submit = tool
+            .execute(serde_json::json!({
+                "command": cmd,
+                "run_in_background": true,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(submit["status"], "submitted");
+        let task_id = submit["task_id"].as_str().unwrap().to_string();
+
+        // Wait for completion. The command itself is fast — half a second
+        // covers the spawn + write + finalize handshake even on slow CI.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let result = tool
+            .execute(serde_json::json!({"check_task": task_id}))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "completed");
+
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(
+            stdout.contains("[full output spilled to:"),
+            "background-task stdout must surface the spill marker; got (head): {}",
+            &stdout[..stdout.len().min(200)]
+        );
+
+        // The spill directory must contain exactly one `shell_*.log` file
+        // matching the path embedded in the marker, and that file must hold
+        // the pre-truncation bytes — proving the marker actually points at
+        // a readable artifact the agent can fs_read.
+        let entries: Vec<_> = std::fs::read_dir(&run_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1, "expected exactly one spill file");
+        let spill_path = entries.into_iter().next().unwrap().unwrap().path();
+        let spilled = std::fs::read(&spill_path).unwrap();
+        assert_eq!(
+            spilled.len(),
+            n,
+            "spill file must contain the full pre-truncation capture"
+        );
+
+        let file_name = spill_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            stdout.contains(&file_name),
+            "marker must reference the on-disk spill file; stdout tail: {}",
+            &stdout[stdout.len().saturating_sub(200)..]
+        );
+    }
+
+    /// Companion to `test_shell_background_task_includes_spill_marker`:
+    /// small-output background tasks must NOT gain a spurious spill marker.
+    /// Guards the `None` arm of `append_spill_marker`.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_background_task_no_marker_when_no_spill() {
+        use crate::shell::spill::ShellSpillPolicy;
+
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run-bg-small");
+        let tool =
+            ShellTool::new().with_spill_policy(ShellSpillPolicy::with_run_dir(run_dir.clone()));
+
+        let submit = tool
+            .execute(serde_json::json!({
+                "command": "echo small_bg_output",
+                "run_in_background": true,
+            }))
+            .await
+            .unwrap();
+        let task_id = submit["task_id"].as_str().unwrap().to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let result = tool
+            .execute(serde_json::json!({"check_task": task_id}))
+            .await
+            .unwrap();
+        assert_eq!(result["status"], "completed");
+        let stdout = result["stdout"].as_str().unwrap();
+        assert!(stdout.contains("small_bg_output"));
+        assert!(
+            !stdout.contains("[full output spilled to:"),
+            "small-output background tasks must not carry a spill marker; got: {stdout}"
         );
     }
 
