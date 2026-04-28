@@ -149,7 +149,8 @@ impl Tool for FsReadTool {
     fn description(&self) -> &str {
         "Read a file with line numbers (cat -n format). Supports partial reads via offset/limit. \
          Returns content with 1-based line numbers, has_more_before/has_more_after indicators, \
-         and total_lines when known (file read to EOF). Max file size: 256 KB."
+         and total_lines when known (file read to EOF). Whole-file reads are capped at 256 KB; \
+         pass offset and/or limit to read a slice of a larger file (slice is capped at 512 KB)."
     }
 
     fn is_builtin(&self) -> bool {
@@ -189,6 +190,14 @@ impl Tool for FsReadTool {
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
+
+        // Track whether the caller explicitly asked for a partial read.
+        // When either `offset` or `limit` is set we skip the whole-file
+        // size guard below — the response is gated on returned bytes via
+        // `MAX_OUTPUT_BYTES` instead.  See #813.
+        let offset_set = params.get("offset").is_some();
+        let limit_set = params.get("limit").is_some();
+        let partial_read_requested = offset_set || limit_set;
 
         let offset = match params.get("offset") {
             Some(v) => v.as_u64().ok_or_else(|| {
@@ -290,13 +299,20 @@ impl Tool for FsReadTool {
             )));
         }
 
-        // File size guard — reject files larger than 256 KiB.
-        if meta.len() > MAX_READ_BYTES {
+        // File size guard — reject files larger than 256 KiB **only** when
+        // the caller asked for the whole file (no `offset` / `limit`).  When
+        // either parameter is set the caller has opted into a partial read,
+        // and the response payload is gated on `MAX_OUTPUT_BYTES` further
+        // down via the per-line accumulator.  See #813.
+        if !partial_read_requested && meta.len() > MAX_READ_BYTES {
             return Err(SandboxError::InvalidParameters(format!(
-                "File '{}' is {} bytes, which exceeds the maximum read size of 256 KB. \
-                 Use offset and limit parameters to read a portion of the file.",
+                "File '{}' is {} bytes, which exceeds the maximum read size of {} bytes. \
+                 Pass `offset` and/or `limit` to read a slice of the file — \
+                 the {} byte cap applies to the returned slice, not the underlying file.",
                 path,
-                meta.len()
+                meta.len(),
+                MAX_READ_BYTES,
+                MAX_OUTPUT_BYTES
             )));
         }
 
@@ -442,10 +458,17 @@ impl Tool for FsReadTool {
         }
 
         // Populate the file state cache so subsequent fs_write/fs_edit calls
-        // can verify the file was read first.
-        if let Some(ref cache) = self.file_state_cache {
-            // Re-read raw bytes for hashing. The file is already verified to
-            // be <= 256KB so this is cheap.
+        // can verify the file was read first.  Skip cache population when the
+        // underlying file is larger than `MAX_READ_BYTES` — slurping a multi-MB
+        // file just to hash it would defeat the whole point of partial reads
+        // (#813).  Partial reads of huge files therefore fall through to the
+        // standard fs_write/fs_edit "read first" enforcement, which is the
+        // correct behaviour: the agent has not actually seen the full file.
+        if let Some(ref cache) = self.file_state_cache
+            && meta.len() <= MAX_READ_BYTES
+        {
+            // Re-read raw bytes for hashing. The file is verified to be
+            // <= 256KB so this is cheap.
             if let Ok(raw_bytes) = tokio::fs::read(&resolved).await {
                 let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                 let is_partial = offset > 0 || has_more_after;
@@ -735,8 +758,14 @@ mod tests {
             "got: {err_msg}"
         );
         assert!(
-            err_msg.contains("offset and limit"),
+            err_msg.contains("offset") && err_msg.contains("limit"),
             "error should suggest offset/limit, got: {err_msg}"
+        );
+        // The error must name the byte threshold so agents have concrete
+        // numbers, not just hand-waving — see #813 acceptance criteria.
+        assert!(
+            err_msg.contains(&(256 * 1024).to_string()),
+            "error should mention the 256 KiB byte threshold, got: {err_msg}"
         );
     }
 
@@ -1185,6 +1214,146 @@ mod tests {
             !err.contains("did you mean"),
             "should not suggest when parent can't be read: {err}"
         );
+    }
+
+    // ── Partial reads on large files (#813) ──────────────────────────────
+
+    /// A file larger than the 256 KiB whole-file cap must be readable
+    /// when the caller passes `offset` and `limit`.  This is the core
+    /// regression test for #813: the size guard previously fired before
+    /// the offset/limit application logic, leaving the advertised
+    /// partial-read affordance dead-on-arrival.
+    #[tokio::test]
+    async fn test_fs_read_offset_limit_succeeds_on_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        // 1 MiB worth of short lines — well over the 256 KiB whole-file cap.
+        let content: String = (1..=200_000).map(|i| format!("line-{i}\n")).collect();
+        assert!(content.len() > 256 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        // Slice request well under the response budget — should succeed.
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1000,
+                "limit": 5
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["lines_returned"], 5);
+        assert_eq!(result["has_more_before"], true);
+        assert_eq!(result["has_more_after"], true);
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("  1001\tline-1001"));
+        assert!(text.contains("  1005\tline-1005"));
+        assert!(!text.contains("line-1000\n"));
+        assert!(!text.contains("line-1006"));
+    }
+
+    /// Only `offset` set (no `limit`) on a file larger than the whole-file
+    /// cap must also succeed — the rejection should not fire whenever any
+    /// partial-read parameter is present.
+    #[tokio::test]
+    async fn test_fs_read_offset_only_succeeds_on_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_offset_only.txt");
+        let content: String = (1..=200_000).map(|i| format!("l{i}\n")).collect();
+        assert!(content.len() > 256 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 100
+            }))
+            .await
+            .unwrap();
+
+        // Default limit is 2000, so we get 2000 lines starting at index 100.
+        assert_eq!(result["lines_returned"], 2000);
+        assert_eq!(result["has_more_before"], true);
+        // The file has way more than offset+limit lines.
+        assert_eq!(result["has_more_after"], true);
+    }
+
+    /// Only `limit` set (no `offset`) on a file larger than the whole-file
+    /// cap must also succeed.
+    #[tokio::test]
+    async fn test_fs_read_limit_only_succeeds_on_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_limit_only.txt");
+        let content: String = (1..=200_000).map(|i| format!("l{i}\n")).collect();
+        assert!(content.len() > 256 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "limit": 50
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["lines_returned"], 50);
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(result["has_more_after"], true);
+    }
+
+    /// A slice request on a 1 MiB file with a `limit` so large that the
+    /// returned slice itself would exceed the response byte budget must
+    /// trip `byte_budget_exceeded` — the per-line accumulator gates the
+    /// payload even though the whole-file size guard was skipped.
+    #[tokio::test]
+    async fn test_fs_read_slice_exceeding_budget_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_slice.txt");
+        // ~1 MiB of short two-byte lines.
+        let content: String = (0..524_288).map(|_| "x\n").collect();
+        assert!(content.len() > 256 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 500_000
+            }))
+            .await
+            .unwrap();
+
+        // The slice asks for far more bytes than `MAX_OUTPUT_BYTES`, so
+        // the accumulator must trigger `byte_budget_exceeded` and stop
+        // collecting before the requested limit is reached.
+        assert_eq!(result["byte_budget_exceeded"], true);
+        let lines_returned = result["lines_returned"].as_u64().unwrap();
+        assert!(
+            lines_returned < 500_000,
+            "byte budget should truncate well before the requested limit, got {lines_returned}"
+        );
+        assert_eq!(result["has_more_after"], true);
+        assert!(result["note"].as_str().unwrap().contains("truncated"));
+    }
+
+    /// Whole-file reads of files over 256 KiB must still be rejected when
+    /// neither `offset` nor `limit` is passed — the new partial-read
+    /// affordance must not weaken the unaccompanied whole-file guard.
+    #[tokio::test]
+    async fn test_fs_read_no_params_still_rejects_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_full.txt");
+        let content = "x".repeat(256 * 1024 + 1);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exceeds the maximum read size"));
+        assert!(err.contains("offset"));
+        assert!(err.contains("limit"));
     }
 
     #[tokio::test]
