@@ -16,14 +16,12 @@ use crate::llm_types::*;
 use crate::tools::ToolRegistry;
 use crate::workspace::AgentWorkspace;
 use crate::workspace_tool::WorkspaceWriteTool;
-use alms_core::{AgentId, AlmsError, AlmsResult};
+use alms_core::{AgentId, AlmsError, AlmsResult, sanitize_error_for_session};
 use alms_session::{
     Content as SessionContent, Message as SessionMessage, Role as SessionRole, SessionManager,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{Span, info, instrument, warn};
-
-use helpers::sanitize_error_for_session;
 
 /// Agent runtime - executes agent loops
 #[derive(Debug)]

@@ -396,10 +396,38 @@ impl ContextBuilder {
         messages.extend(selected);
     }
 
+    /// Returns `true` when the message is an error marker persisted by
+    /// `persist_error_marker` in the gateway (issue #874).
+    ///
+    /// Error markers are `Role::System` synthetic markers tagged with
+    /// `metadata.kind == "error"`. They surface mid-run failures (LLM
+    /// 4xx/5xx, run cancellation, runtime construction error) into the
+    /// agent's context so a follow-up turn like "why did that fail?"
+    /// gives the LLM the error text without re-quoting.
+    fn is_error_marker(msg: &Message) -> bool {
+        if msg.role != Role::System {
+            return false;
+        }
+        msg.metadata
+            .as_ref()
+            .and_then(|m| m.get("kind"))
+            .and_then(|v| v.as_str())
+            == Some("error")
+    }
+
     /// Convert a session Message to an LlmMessage.
     /// Reconstructs structured tool call/result messages from persisted format
     /// so the LLM has full visibility of previous tool executions across runs.
     fn session_msg_to_llm(&self, msg: &Message) -> LlmMessage {
+        // Error markers (#874) are converted to a `user` message with a
+        // `[Error]` prefix BEFORE the per-role match below, so they
+        // survive `strip_mid_history_system_markers` and reach the LLM.
+        // Without this, the existing canonical-shape pass would drop
+        // them and the agent would never see the prior failure.
+        if Self::is_error_marker(msg) {
+            return LlmMessage::user(format!("[Error] {}", msg.content.to_display_string()));
+        }
+
         match (&msg.role, &msg.content) {
             // Reconstruct structured assistant message with tool_calls
             (Role::Assistant, Content::ToolCall { name, params }) => {
@@ -1962,6 +1990,176 @@ mod tests {
         assert!(
             messages[1..].iter().all(|m| m.role != "system"),
             "mid-history system marker must be stripped"
+        );
+    }
+
+    /// Helper: build an error-marker message matching the shape persisted
+    /// by `gateway::runs::markers::persist_error_marker` (#874).
+    fn make_error_marker(text: &str, status: &str, error: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::System,
+            content: Content::Text(text.to_string()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "synthetic": true,
+                "kind": "error",
+                "type": "run_boundary",
+                "status": status,
+                "error": error,
+            })),
+        }
+    }
+
+    /// Run-failed error markers (#874) must reach the LLM context as a
+    /// `user` message so a follow-up turn ("why did that fail?") gives the
+    /// agent the error text without re-quoting. Without the
+    /// `is_error_marker` rewrite in `session_msg_to_llm`, the standard
+    /// `strip_mid_history_system_markers` pass would drop the marker and
+    /// the agent would never see the prior failure.
+    #[test]
+    fn error_marker_survives_as_user_message() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "List files in /tmp"),
+            make_error_marker(
+                "(run failed) Anthropic 500: server error",
+                "failed",
+                "Anthropic 500: server error",
+            ),
+        ];
+
+        let messages = builder.build(
+            "You are a helpful agent.",
+            &history,
+            "why did that fail?",
+            None,
+        );
+
+        // No mid-history system messages survive normalization.
+        assert!(
+            messages[1..].iter().all(|m| m.role != "system"),
+            "no system message may appear after the system prefix"
+        );
+
+        // The error marker must reach the LLM as a user message tagged
+        // with the [Error] prefix so the agent can answer the follow-up.
+        let error_visible = messages.iter().any(|m| {
+            m.role == "user"
+                && m.content.as_deref().is_some_and(|s| {
+                    s.contains("[Error]") && s.contains("Anthropic 500: server error")
+                })
+        });
+        assert!(
+            error_visible,
+            "error marker must be rewritten to a `user` [Error] message so the LLM sees it; got: {:?}",
+            messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone().unwrap_or_default()))
+                .collect::<Vec<_>>()
+        );
+
+        // The trailing user-input invariant must hold: the user's actual
+        // follow-up question is the last message.
+        let last = messages.last().expect("non-empty");
+        assert_eq!(last.role, "user");
+        assert!(
+            last.content
+                .as_deref()
+                .is_some_and(|s| s.contains("why did that fail?")),
+            "trailing user message must be the fresh input, not the rewritten error marker"
+        );
+    }
+
+    /// Cancellation markers (#874) follow the same rewrite path as
+    /// run-failed markers — the `kind: "error"` flag is what matters,
+    /// not the specific `status`/`error_kind` value.
+    #[test]
+    fn cancelled_marker_survives_as_user_message() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "Run a long-running task"),
+            make_error_marker("(run cancelled)", "cancelled", "user cancelled"),
+        ];
+
+        let messages = builder.build("System.", &history, "try again", None);
+
+        let cancelled_visible = messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|s| s.contains("[Error]") && s.contains("(run cancelled)"))
+        });
+        assert!(
+            cancelled_visible,
+            "cancellation marker must be rewritten to [Error] user message"
+        );
+    }
+
+    /// Non-error system markers (e.g. job notifications, completed
+    /// run_boundary) must continue to be stripped — only `kind: "error"`
+    /// markers get the rewrite. This protects the existing canonical
+    /// invariant (no mid-history system messages reach the LLM).
+    #[test]
+    fn non_error_system_markers_still_stripped() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        // A completed run_boundary marker (no `kind: "error"`) should be
+        // stripped — only failed/cancelled markers carry `kind: "error"`.
+        let completed_marker = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::System,
+            content: Content::Text("(run completed)".to_string()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "synthetic": true,
+                "type": "run_boundary",
+                "status": "completed",
+            })),
+        };
+
+        let history = vec![
+            make_msg(Role::User, "hi"),
+            make_msg(Role::Assistant, "hello"),
+            completed_marker,
+        ];
+
+        let messages = builder.build("System.", &history, "next?", None);
+
+        // The completed marker must NOT appear in the context.
+        assert!(
+            !messages.iter().any(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|s| s.contains("(run completed)"))
+            }),
+            "non-error system markers must continue to be stripped"
         );
     }
 

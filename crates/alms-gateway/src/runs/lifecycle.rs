@@ -10,7 +10,7 @@ use crate::server::AppState;
 use crate::sse::SseEventData;
 use alms_core::{
     AgentId, CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus,
-    RunStatusResponse, SessionId, classify_session_type,
+    RunStatusResponse, SessionId, classify_session_type, sanitize_error_for_session,
 };
 use alms_runtime::RuntimeEvent;
 use alms_tools::message_sender::ConversationEndReason;
@@ -840,6 +840,34 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 )
                 .await;
             state.run_manager.mark_run_as_failed(run_id, e.to_string());
+
+            // Persist the runtime-construction failure so a follow-up
+            // turn ("why did that fail?") gives the agent the error in
+            // context (#874). Skipped for internal context IDs to mirror
+            // the run-boundary marker policy.
+            //
+            // The error text is run through `sanitize_error_for_session`
+            // before persistence so raw provider response bodies — which
+            // can contain API keys, internal hostnames, or request URLs —
+            // never reach session history or the LLM context on follow-up
+            // turns (#911). The same sanitiser already guards the
+            // runtime-layer fallback at `alms-runtime::agent::mod`.
+            if !is_internal_context_id(&context_id) {
+                let safe_reason = sanitize_error_for_session(&e);
+                super::markers::persist_error_marker(
+                    &state.session_manager,
+                    session_id,
+                    "runtime_init_error",
+                    format!("(runtime initialization failed) {safe_reason}"),
+                    serde_json::json!({
+                        "run_id": run_id.0.to_string(),
+                        "status": "failed",
+                        "error": safe_reason,
+                        "error_kind": "runtime_init",
+                    }),
+                );
+            }
+
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
@@ -1319,7 +1347,12 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             state.run_manager.mark_run_as_cancelled(run_id);
 
             if !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
+                // Tagged with `kind: "error"` so the runtime's
+                // `session_msg_to_llm` rewrites this marker into a `user`
+                // message on the next turn — the agent then sees the
+                // cancellation in its context and can answer follow-up
+                // questions like "why did that fail?" (issue #874).
+                super::markers::persist_error_marker(
                     &state.session_manager,
                     session_id,
                     "run_boundary",
@@ -1327,6 +1360,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     serde_json::json!({
                         "run_id": run_id.0.to_string(),
                         "status": "cancelled",
+                        "error_kind": "cancelled",
                     }),
                 );
             }
@@ -1367,7 +1401,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             state.run_manager.mark_run_as_cancelled(run_id);
 
             if !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
+                // See `kind: "error"` rationale in the `Cancelled` arm above
+                // (issue #874).
+                super::markers::persist_error_marker(
                     &state.session_manager,
                     session_id,
                     "run_boundary",
@@ -1375,6 +1411,7 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     serde_json::json!({
                         "run_id": run_id.0.to_string(),
                         "status": "cancelled",
+                        "error_kind": "cancelled",
                     }),
                 );
             }
@@ -1422,15 +1459,27 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 .mark_run_as_failed(run_id, source.to_string());
 
             if !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
+                // Tagged with `kind: "error"` so the runtime's
+                // `session_msg_to_llm` rewrites this marker into a `user`
+                // message on the next turn — the agent then sees the
+                // failure (and the partial tool calls already persisted
+                // by `persist_tool_calls`) and can answer follow-up
+                // questions like "why did that fail?" (issue #874).
+                //
+                // Sanitised before persistence so raw provider error
+                // bodies (API keys, hostnames, URLs) never reach session
+                // history or the LLM context on follow-up turns (#911).
+                let safe_reason = sanitize_error_for_session(&source);
+                super::markers::persist_error_marker(
                     &state.session_manager,
                     session_id,
                     "run_boundary",
-                    format!("(run failed) {source}"),
+                    format!("(run failed) {safe_reason}"),
                     serde_json::json!({
                         "run_id": run_id.0.to_string(),
                         "status": "failed",
-                        "error": source.to_string(),
+                        "error": safe_reason,
+                        "error_kind": "failed_with_tool_calls",
                     }),
                 );
             }
@@ -1480,15 +1529,27 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             state.run_manager.mark_run_as_failed(run_id, e.to_string());
 
             if !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
+                // Tagged with `kind: "error"` so the runtime's
+                // `session_msg_to_llm` rewrites this marker into a `user`
+                // message on the next turn — covers LLM 4xx/5xx,
+                // rate-limit, content-policy reject, runtime errors
+                // (context budget exceeded, summary generation failed),
+                // etc. (issue #874).
+                //
+                // Sanitised before persistence so raw provider error
+                // bodies (API keys, hostnames, URLs) never reach session
+                // history or the LLM context on follow-up turns (#911).
+                let safe_reason = sanitize_error_for_session(&e);
+                super::markers::persist_error_marker(
                     &state.session_manager,
                     session_id,
                     "run_boundary",
-                    format!("(run failed) {e}"),
+                    format!("(run failed) {safe_reason}"),
                     serde_json::json!({
                         "run_id": run_id.0.to_string(),
                         "status": "failed",
-                        "error": e.to_string(),
+                        "error": safe_reason,
+                        "error_kind": "failed",
                     }),
                 );
             }

@@ -235,56 +235,9 @@ async fn test_build_context_non_dm_no_perspective() {
     assert!(messages[1].content_str().contains("hi"));
 }
 
-#[test]
-fn test_sanitize_error_runtime_auth() {
-    let err = AlmsError::Runtime("HTTP 401 Unauthorized at https://api.example.com".into());
-    assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "LLM authentication error"
-    );
-}
-
-#[test]
-fn test_sanitize_error_runtime_rate_limit() {
-    let err = AlmsError::Runtime("429 Too Many Requests".into());
-    assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "LLM rate limit exceeded"
-    );
-}
-
-#[test]
-fn test_sanitize_error_runtime_timeout() {
-    let err = AlmsError::Runtime("request timed out after 60s".into());
-    assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "LLM request timed out"
-    );
-}
-
-#[test]
-fn test_sanitize_error_runtime_generic() {
-    let err = AlmsError::Runtime("some secret-key=abc123 in raw error".into());
-    assert_eq!(helpers::sanitize_error_for_session(&err), "Runtime error");
-}
-
-#[test]
-fn test_sanitize_error_tool_strips_output() {
-    let err = AlmsError::ToolExecution("shell_exec: secret output here".into());
-    assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "Tool execution failed: shell_exec"
-    );
-}
-
-#[test]
-fn test_sanitize_error_context_building() {
-    let err = AlmsError::Runtime("failed to build context window".into());
-    assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "Context building failed"
-    );
-}
+// `sanitize_error_for_session` lives in `alms-core` (issue #911) so both
+// the runtime and gateway can use it. Tests for it live alongside the
+// function in `alms-core::error`.
 
 #[tokio::test]
 async fn test_run_persists_user_message_on_failure() {

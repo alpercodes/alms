@@ -216,6 +216,12 @@ export function mapHistoryMessages(msgs, opts) {
             }
 
             // Run boundary markers -> run_boundary dividers between runs.
+            // Failed/cancelled boundaries also carry `metadata.kind == "error"`
+            // (issue #874) so the runtime backfills them into the LLM
+            // context, but the UI still renders them as run_boundary
+            // dividers (red border + label) — that visual treatment
+            // already conveys "this run failed" without a separate
+            // ErrorMessage block.
             if (isSynthetic && m.metadata.type === 'run_boundary') {
                 const runStatus = m.metadata.status || 'completed';
                 pushEntry({
@@ -225,6 +231,23 @@ export function mapHistoryMessages(msgs, opts) {
                     runId: m.metadata.run_id || null,
                     error: m.metadata.error || null,
                     text: m.content || '',
+                }, m.timestamp);
+                continue;
+            }
+
+            // Error markers that don't have a paired run_boundary —
+            // currently `runtime_init_error` for runs whose runtime failed
+            // to construct before the agent loop started (#874). Render
+            // them with the existing ErrorMessage component (red border,
+            // X icon) so they match the SSE-time error toast styling.
+            if (isSynthetic && m.metadata.kind === 'error') {
+                pushEntry({
+                    id: nextMsgId(),
+                    type: 'error',
+                    text: m.metadata.error
+                        ? `${m.content}\n\n${m.metadata.error}`.trim()
+                        : (m.content || 'Run error'),
+                    code: m.metadata.error_kind || m.metadata.type || null,
                 }, m.timestamp);
                 continue;
             }
