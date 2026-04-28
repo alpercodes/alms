@@ -153,6 +153,8 @@ Isolated tool execution used by every agent regardless of hierarchy level.
 
 **Read-before-write guard:** `fs_write` and `fs_edit` enforce a read-before-write policy via `FileStateCache` (per-run, shared across all fs tools). Existing files must be read via `fs_read` before they can be written or edited. The guard also detects external modifications (mtime + content-hash fallback) and rejects stale writes. New file creation bypasses the guard. See `crates/alms-sandbox/src/file_state_cache.rs`.
 
+**`fs_read` size limits:** Whole-file reads are capped at 256 KiB; passing `offset` or `limit` opts into a partial read that falls back to a 512 KiB output-byte budget instead (#813 / #901). Each individual line is capped at 256 KiB before being returned — over-cap lines are truncated with an inline marker and the surplus bytes are drained, so a pathological single-line file (e.g. minified bundles) cannot exhaust daemon memory (#902).
+
 **Sibling workspace reads (#242):** When a named agent is attached via `with_workspace()`, its read-family fs tools (`fs_read`, `fs_list`, `fs_grep`, `fs_glob`) gain an additional read-only root at the workspace parent directory, so a parent agent can read a subagent's `personality.md`/`goals.md`/`memories.md` without being able to modify them. Write-family tools (`fs_write`, `fs_edit`, `workspace_write`) stay scoped to the primary sandbox root. See the "Filesystem sandboxing" section of `docs/security-model.md` for the full trust model (including ephemeral subagent asymmetry).
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.

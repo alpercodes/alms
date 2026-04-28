@@ -4,7 +4,7 @@ use crate::{SandboxError, Tool};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
 
 use super::{
     check_sandbox_path_async, check_sandbox_path_with_extras_async, is_blocked_device_path,
@@ -97,6 +97,144 @@ fn did_you_mean(parent: &Path, missing: &str) -> Vec<String> {
         .take(DID_YOU_MEAN_LIMIT)
         .map(|(_, n)| n)
         .collect()
+}
+
+/// Maximum bytes retained from a single line before truncation (#902).
+///
+/// `BufReader::lines()` / `next_line()` allocate per line without any cap, so a
+/// pathological file (e.g. a multi-GB minified bundle with no newlines) would
+/// pull the entire file into one `String` and OOM the daemon process.  The
+/// 256 KiB whole-file gate used to incidentally cover this, but #813 / #901
+/// intentionally lift that gate when `offset` or `limit` is passed.  With
+/// partial reads now permitted on arbitrarily large files, we need an explicit
+/// per-line allocation cap.
+///
+/// The cap is 256 KiB — half of `MAX_OUTPUT_BYTES` (the 512 KiB response
+/// budget).  Sized so that even a maximally-truncated single line plus its
+/// inline marker still fits well within the response budget, leaving room
+/// for at least one more line of useful context (or several short follow-on
+/// lines) on a mixed-content read.  Higher caps tied to `MAX_OUTPUT_BYTES`
+/// were considered but rejected: a 512 KiB truncated line consumes the
+/// entire output budget on its own, dropping every following line via the
+/// existing per-output byte-budget check.  Bounded at 256 KiB the worst-case
+/// allocation per line stays at 256 KiB, regardless of the underlying file
+/// size.
+const MAX_LINE_BYTES: usize = 256 * 1024;
+
+/// Outcome of [`read_line_capped`].
+struct LineRead {
+    /// The line contents, capped at `MAX_LINE_BYTES`.  When `truncated` is
+    /// true an inline marker has already been appended.
+    line: String,
+    /// True if the line exceeded the cap and was truncated (with the rest of
+    /// the line drained so the next read starts at the following line).
+    truncated: bool,
+}
+
+/// Read a single line from `reader`, capping the buffered bytes at
+/// `MAX_LINE_BYTES`.  If the line is longer than the cap, the surplus bytes
+/// (up to the next `\n` or EOF) are drained and discarded, and an inline
+/// `[line truncated to N bytes; M bytes discarded]` marker is appended to the
+/// returned string.
+///
+/// Returns `Ok(None)` only at EOF before any byte was read.  UTF-8 invalid
+/// sequences in the truncated buffer are replaced with `U+FFFD` via
+/// [`String::from_utf8_lossy`] so we never split a multi-byte sequence.
+async fn read_line_capped<R>(reader: &mut R) -> std::io::Result<Option<LineRead>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut buf: Vec<u8> = Vec::new();
+
+    // Phase A: accumulate bytes up to the cap, watching for `\n`.
+    while buf.len() < MAX_LINE_BYTES {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            // Genuine EOF.  If we never wrote anything, signal end of file.
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            // EOF after a final un-newlined line — return what we have.
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            return Ok(Some(LineRead {
+                line,
+                truncated: false,
+            }));
+        }
+
+        // Look for a newline within the remaining capacity.
+        let remaining = MAX_LINE_BYTES - buf.len();
+        let take = available.len().min(remaining);
+        if let Some(nl_idx) = available[..take].iter().position(|&b| b == b'\n') {
+            // Newline reached within cap — copy through it (excluding `\n`)
+            // and consume the `\n` so the next call starts fresh.
+            buf.extend_from_slice(&available[..nl_idx]);
+            reader.consume(nl_idx + 1);
+            // Strip a trailing `\r` for CRLF normalisation, matching
+            // `BufReader::next_line()` behaviour.
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            return Ok(Some(LineRead {
+                line,
+                truncated: false,
+            }));
+        }
+
+        // No newline in this slice within the cap window — keep accumulating.
+        buf.extend_from_slice(&available[..take]);
+        reader.consume(take);
+    }
+
+    // Phase B: cap reached without seeing a newline — drain the rest of this
+    // line (or hit EOF) without growing the buffer further.  The number of
+    // bytes drained is reported back via the inline marker.
+    let drained_bytes = drain_to_newline(reader).await?;
+
+    // Strip a trailing `\r` if the cap landed right before the `\n` of CRLF.
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    let mut line = String::from_utf8_lossy(&buf).into_owned();
+    line.push_str(&format!(
+        "[line truncated to {} bytes; {} bytes discarded]",
+        buf.len(),
+        drained_bytes
+    ));
+
+    Ok(Some(LineRead {
+        line,
+        truncated: true,
+    }))
+}
+
+/// Read and discard bytes until the next `\n` (or EOF), returning the number
+/// of bytes drained (excluding the terminating `\n`).  Used by
+/// [`read_line_capped`] after the per-line cap is exhausted so the next read
+/// positions at the start of the next line.
+async fn drain_to_newline<R>(reader: &mut R) -> std::io::Result<u64>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut drained: u64 = 0;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(drained);
+        }
+        if let Some(idx) = available.iter().position(|&b| b == b'\n') {
+            drained += idx as u64;
+            reader.consume(idx + 1);
+            return Ok(drained);
+        }
+        let n = available.len();
+        drained += n as u64;
+        reader.consume(n);
+    }
 }
 
 /// Read a file from the filesystem.
@@ -344,8 +482,7 @@ impl Tool for FsReadTool {
         }
 
         // Reuse the same handle for the line reader — one open() total.
-        let reader = BufReader::new(file);
-        let mut lines_stream = reader.lines();
+        let mut reader = BufReader::new(file);
 
         let mut lines_read: usize = 0;
         let mut selected_lines: Vec<(usize, String)> = Vec::new();
@@ -353,16 +490,22 @@ impl Tool for FsReadTool {
         let mut output_bytes: usize = 0;
         let mut byte_budget_exceeded = false;
         let mut read_past_end = false;
+        let mut any_line_truncated = false;
 
         // Phase 1: skip lines before offset, collect lines in [offset, end), stop
-        // collecting once we've passed the requested range.
-        while let Some(line) = lines_stream
-            .next_line()
+        // collecting once we've passed the requested range.  Each line is read
+        // via `read_line_capped` which bounds buffered allocation to
+        // `MAX_LINE_BYTES` (#902) so a pathological single-line file can no
+        // longer pull the whole file into one allocation.
+        while let Some(LineRead { line, truncated }) = read_line_capped(&mut reader)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?
         {
             let line_idx = lines_read; // 0-based index
             lines_read += 1;
+            if truncated {
+                any_line_truncated = true;
+            }
 
             if line_idx >= offset && line_idx < end {
                 // Byte budget: estimate formatted line size (6-digit number + tab + content + newline).
@@ -392,12 +535,14 @@ impl Tool for FsReadTool {
             // If we naturally exhausted the range without reading past it
             // (i.e. file had exactly `offset + limit` lines), peek one more
             // line to see whether the file continues.
-            let peeked = lines_stream
-                .next_line()
+            let peeked = read_line_capped(&mut reader)
                 .await
                 .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
-            if peeked.is_some() {
+            if let Some(LineRead { truncated, .. }) = peeked {
                 lines_read += 1;
+                if truncated {
+                    any_line_truncated = true;
+                }
                 // There are more lines — don't count them all, just note we didn't hit EOF.
                 false
             } else {
@@ -447,6 +592,15 @@ impl Tool for FsReadTool {
         if has_more_before || has_more_after {
             result["offset"] = serde_json::json!(offset);
             result["limit"] = serde_json::json!(limit);
+        }
+
+        // Surface per-line truncation (#902).  At least one line in the file
+        // exceeded `MAX_LINE_BYTES` and was truncated with an inline marker.
+        // Independent of `byte_budget_exceeded` — both can be set on the same
+        // call.  The marker is already inlined in `content`; this flag lets
+        // callers programmatically detect truncation without scanning text.
+        if any_line_truncated {
+            result["line_truncated"] = serde_json::json!(true);
         }
 
         if byte_budget_exceeded {
@@ -1391,5 +1545,142 @@ mod tests {
             !err.contains("zzzzzzzz"),
             "furthest candidate should be dropped by cap: {err}"
         );
+    }
+
+    // ── Per-line byte cap (#902) ──────────────────────────────────────────
+
+    /// Regression guard for #902: a 1 MiB single-line file (no newlines)
+    /// must NOT pull the whole file into a single allocation.  The partial
+    /// read with `offset=0, limit=10` returns the truncated first line plus
+    /// the inline marker, sets `line_truncated: true`, and the daemon does
+    /// not OOM.  Pre-#902 the underlying `BufReader::next_line()` had no
+    /// per-line cap, so this same call would allocate ~1 MiB.  Post-#902 it
+    /// is bounded by `MAX_LINE_BYTES` (512 KiB).
+    #[tokio::test]
+    async fn test_fs_read_per_line_cap_huge_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("megaline.txt");
+        // 1 MiB of `x`s with no newlines — exceeds MAX_LINE_BYTES (512 KiB)
+        // by ~2x.  Picked over multi-GB to keep the test fast and CI-safe;
+        // the cap behaviour is identical at any size > MAX_LINE_BYTES.
+        let content = "x".repeat(1024 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 10,
+            }))
+            .await
+            .unwrap();
+
+        // The inline truncation marker must be present in the output.
+        let text = result["content"].as_str().unwrap();
+        assert!(
+            text.contains("[line truncated to"),
+            "expected truncation marker in output, got first 200 chars: {}",
+            &text.chars().take(200).collect::<String>()
+        );
+        // Programmatic flag for callers that don't want to scan text.
+        assert_eq!(
+            result["line_truncated"], true,
+            "line_truncated flag should be set on truncated reads"
+        );
+        // Exactly one line returned (the truncated megaline) — the file
+        // had no newlines so there is only one logical line.
+        assert_eq!(result["lines_returned"], 1);
+        // The retained portion of the line is bounded at MAX_LINE_BYTES
+        // (256 KiB), so the formatted line cannot exceed roughly that plus
+        // the marker.  Sanity check: should be far less than the original
+        // 1 MiB.
+        assert!(
+            text.len() < 300 * 1024,
+            "formatted output should be bounded near MAX_LINE_BYTES, got {} bytes",
+            text.len()
+        );
+    }
+
+    /// Multi-line files with all lines under the cap must read normally.
+    /// `line_truncated` is absent and no inline markers are inserted.
+    /// Regression guard against the per-line cap accidentally firing on
+    /// reasonable inputs.
+    #[tokio::test]
+    async fn test_fs_read_per_line_cap_normal_multiline_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("normal.txt");
+        // 500 lines, ~20 bytes each — well under MAX_LINE_BYTES.
+        let content: String = (1..=500).map(|i| format!("line number {i}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 100,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["lines_returned"], 100);
+        assert!(
+            result.get("line_truncated").is_none(),
+            "line_truncated must be absent when no line was truncated"
+        );
+        let text = result["content"].as_str().unwrap();
+        assert!(
+            !text.contains("[line truncated"),
+            "no truncation marker should appear in normal multi-line reads, got: {}",
+            &text.chars().take(200).collect::<String>()
+        );
+        // Spot-check first and last lines of the slice.
+        assert!(text.contains("     1\tline number 1"));
+        assert!(text.contains("   100\tline number 100"));
+        assert!(!text.contains("line number 101"));
+    }
+
+    /// A file containing one over-cap line followed by normal short lines
+    /// must truncate the offending line, set the flag, and continue
+    /// reading subsequent lines correctly.  Specifically guards the
+    /// `drain_to_newline` path inside `read_line_capped`.
+    #[tokio::test]
+    async fn test_fs_read_per_line_cap_truncates_then_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.txt");
+        // First line: 600 KiB of `x` (well over the 256 KiB cap).
+        // Subsequent lines: short, normal text.
+        let mut content = "x".repeat(600 * 1024);
+        content.push('\n');
+        content.push_str("short_line_2\n");
+        content.push_str("short_line_3\n");
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 10,
+            }))
+            .await
+            .unwrap();
+
+        let text = result["content"].as_str().unwrap();
+        assert_eq!(result["line_truncated"], true);
+        assert!(
+            text.contains("[line truncated to"),
+            "first line should carry the truncation marker"
+        );
+        // The follow-on lines must be present and intact — proving the
+        // drain-to-newline phase correctly re-positioned the reader.
+        assert!(
+            text.contains("short_line_2"),
+            "second line should be readable after truncation, got: {}",
+            &text.chars().take(200).collect::<String>()
+        );
+        assert!(
+            text.contains("short_line_3"),
+            "third line should be readable after truncation"
+        );
+        assert_eq!(result["lines_returned"], 3);
     }
 }
