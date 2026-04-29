@@ -1660,3 +1660,107 @@ reasoning_effort = "extreme"
         result.map(|c| c.llm.openai.reasoning_effort)
     );
 }
+
+// ---- Symmetric pair-only validation for [context].summary_* (#877) ----
+//
+// The PATCH /settings layer in alms-gateway already rejects asymmetric
+// updates with `SUMMARY_PROVIDER_REQUIRES_MODEL` /
+// `SUMMARY_MODEL_REQUIRES_PROVIDER`. The HTTP `POST /agents` /
+// `PUT /agents/{id}` validators do the same for per-agent overrides.
+// Issue #877 closed the remaining gap: a hand-edited `alms.toml` with
+// only one of the pair set used to start the daemon successfully and
+// only fail at run time. These tests pin the load-time rejection so
+// the validation gap can't sneak back in.
+
+#[test]
+fn test_validation_rejects_summary_provider_without_model() {
+    let mut config = AlmsConfig::default();
+    config.context.summary_provider = Some("openrouter".into());
+    config.context.summary_model = None;
+    let err = config.validate().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("summary_provider is set") && msg.contains("summary_model is empty"),
+        "expected pair-only error message about provider-without-model, got: {msg}"
+    );
+}
+
+#[test]
+fn test_validation_rejects_summary_model_without_provider() {
+    let mut config = AlmsConfig::default();
+    config.context.summary_provider = None;
+    config.context.summary_model = Some("minimax/minimax-m2.7".into());
+    let err = config.validate().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("summary_model is set") && msg.contains("summary_provider is empty"),
+        "expected pair-only error message about model-without-provider, got: {msg}"
+    );
+}
+
+#[test]
+fn test_validation_accepts_both_summary_fields_set() {
+    let mut config = AlmsConfig::default();
+    config.context.summary_provider = Some("openrouter".into());
+    config.context.summary_model = Some("minimax/minimax-m2.7".into());
+    assert!(
+        config.validate().is_ok(),
+        "both fields set together is the valid 'opt-in' shape"
+    );
+}
+
+#[test]
+fn test_validation_accepts_both_summary_fields_none() {
+    // Default config — both None — is the shipped baseline. Must
+    // continue to validate as OK so the daemon starts out of the box.
+    let config = AlmsConfig::default();
+    assert!(
+        config.context.summary_provider.is_none() && config.context.summary_model.is_none(),
+        "default config has both fields None"
+    );
+    assert!(config.validate().is_ok());
+}
+
+/// End-to-end: a hand-edited `alms.toml` with `[context]` set to the
+/// asymmetric (provider, no-model) shape must be rejected at config
+/// load — not later as a run-time error. The full `validate()` chain
+/// runs, so we call `ensure_builtin_providers()` first so the
+/// `[llm.providers.anthropic]` sugar entry is registered (mirroring
+/// the production `from_*()` paths in `mod.rs`).
+#[test]
+fn test_asymmetric_summary_toml_fails_at_load_time() {
+    let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet"
+
+[context]
+summary_provider = "openrouter"
+"#;
+    let mut cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    cfg.llm.ensure_builtin_providers();
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("summary_provider is set"),
+        "asymmetric TOML must be rejected at validate(), got: {err}"
+    );
+}
+
+#[test]
+fn test_asymmetric_summary_toml_other_direction_fails_at_load_time() {
+    let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet"
+
+[context]
+summary_model = "minimax/minimax-m2.7"
+"#;
+    let mut cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    cfg.llm.ensure_builtin_providers();
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("summary_model is set"),
+        "asymmetric TOML must be rejected at validate(), got: {err}"
+    );
+}

@@ -362,6 +362,42 @@ impl AlmsConfig {
             ));
         }
 
+        // Symmetric pair-only validation for `[context].summary_provider`
+        // / `[context].summary_model` (#877). The PATCH layer (and the
+        // per-agent CRUD path, see `validate_summary_pair` in
+        // `alms-gateway/src/agents.rs`) already reject asymmetric inputs,
+        // but a hand-edited `alms.toml` can land the daemon in that
+        // shape without going through PATCH. Validate at config-load
+        // time so the daemon refuses to start rather than silently
+        // shipping a half-configured summary path. Rule: both fields
+        // must be `Some` together or both `None` together — exactly
+        // one set is the broken case.
+        match (
+            self.context.summary_provider.as_deref(),
+            self.context.summary_model.as_deref(),
+        ) {
+            (Some(_), None) => {
+                return Err(AlmsError::InvalidConfig(
+                    "context.summary_provider is set but context.summary_model is empty. \
+                     Set both fields together — the summary provider's wire model namespace \
+                     is independent of the agent's primary provider, so partial settings \
+                     cannot be safely resolved. Either set both, or remove both to \
+                     fall through to the agent's primary provider/model."
+                        .into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(AlmsError::InvalidConfig(
+                    "context.summary_model is set but context.summary_provider is empty. \
+                     Set both fields together — leaving summary_provider unset would fall \
+                     through to the agent's primary provider, which may not match this \
+                     model's namespace. Either set both, or remove both."
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+
         // Cross-section validation: session storage must hold at least one
         // full context window, otherwise the ContextBuilder could request more
         // tokens than the session retains.
