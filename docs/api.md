@@ -1305,4 +1305,26 @@ Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
 ---
 
-*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response, new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`), `dm_conversation_ended` SSE event, and `notification:dm_ended` run source. Updated 2026-04-12 with `GET /sessions/{session_id}/tool-calls` endpoint (section 4.6). Updated 2026-04-12 with `GET /agents/{id_or_name}/timeline` endpoint (section 12) for cross-channel unified activity view (#608).*
+## 14) Built-in tool response shapes (selected)
+
+Most built-in tool response shapes are documented inline in the tool's `description()` (the surface the LLM sees) and on the `RuntimeEvent` payload. This section captures shapes whose nuances are easy to miss when reading per-call output.
+
+### 14.1 `fs_grep`
+
+`fs_grep` searches file contents using regex patterns. The response shape varies slightly across the three `output_mode` values (`files_with_matches`, `count`, `content`); all three share the truncation-reporting fields described below.
+
+**Common response fields**
+| Field             | Type    | Description |
+|-------------------|---------|-------------|
+| `matches`         | array   | Matching results — shape depends on `output_mode`. |
+| `total` / `total_matches` | int | Total result count (pre-pagination). |
+| `truncated`       | bool    | `true` when the file iteration was cut short by `head_limit` or the output cap. Files past the cutoff are *not* visited. |
+| `truncated_lines` | int     | Count of over-cap lines (per the 256 KiB per-line cap from #913) encountered across files actually scanned. See note below. |
+
+**`truncated_lines` semantics — important caveat.** `truncated_lines` reflects only files that were *actually visited* during the scan. When `head_limit` short-circuits the iteration (or the output-byte budget caps `files_with_matches` mode), files past the cutoff are not opened and any over-cap lines they contain are not counted. This matches the existing `truncated` flag's "results were cut short" semantic — `truncated: true` is the structural signal that the count is partial; `truncated_lines` reports only what the scan observed before stopping. To get a complete `truncated_lines` count, re-issue with `head_limit: 0` (unlimited) or paginate via `offset`.
+
+`truncated_lines` is `0` in `output_mode: "content"`, which uses a 1 MiB whole-file gate rather than the per-line cap (the field is emitted unconditionally for response-shape consistency).
+
+---
+
+*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response, new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`), `dm_conversation_ended` SSE event, and `notification:dm_ended` run source. Updated 2026-04-12 with `GET /sessions/{session_id}/tool-calls` endpoint (section 4.6). Updated 2026-04-12 with `GET /agents/{id_or_name}/timeline` endpoint (section 12) for cross-channel unified activity view (#608). Updated 2026-04-29 with `fs_grep` response-shape section (14.1) noting `truncated_lines` reflects only visited files when `head_limit` short-circuits the scan (#913 follow-up).*
