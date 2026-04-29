@@ -18,7 +18,7 @@ pub use types::{
     AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, FsEditConfig, GeminiConfig,
     LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry, ProviderKind, ProviderQuirks,
     ReasoningEffort, RunSummaryMode, ServerConfig, SessionConfig, ShellClassificationMode,
-    ShellPermissions, ShellSpillConfig, ToolsConfig,
+    ShellPermissions, ShellSpillConfig, ToolOutputTruncateConfig, ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};

@@ -908,8 +908,24 @@ impl AgentRuntime {
 
     /// Process tool execution results: push tool result messages into the
     /// conversation, persist to session, and collect per-run records.
+    ///
+    /// Every result is routed through the shared in-loop tool-output
+    /// truncation service (issue #851) before it lands in `messages` or
+    /// the session DB. When truncation fires, the *truncated* preview
+    /// (head + tail + spill-path hint) is what enters the conversation
+    /// AND what is persisted, so the rebuild path on the next run
+    /// observes the same bytes the live agent saw — no asymmetry between
+    /// "in-loop view" and "session-history view". The
+    /// `truncated_in_loop: true` flag in the message metadata tells
+    /// `session_msg_to_llm` to skip its own (smaller) re-truncation pass.
+    ///
+    /// Visible to test code (in this crate and `alms-coordinator`) so
+    /// integration tests can drive the truncation path without spinning
+    /// up a full LLM round trip. Not part of the public API surface —
+    /// `#[doc(hidden)]` keeps it out of generated docs.
+    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)] // Private helper; the parameters are clear and grouping them into a struct would add indirection without real benefit.
-    fn process_tool_results(
+    pub fn process_tool_results(
         &self,
         tool_calls: &[ToolCall],
         results: Vec<AlmsResult<serde_json::Value>>,
@@ -921,16 +937,48 @@ impl AgentRuntime {
         session_id: alms_core::SessionId,
         is_dm: bool,
     ) {
+        // Workspace root for relativising spill paths in the LLM-visible
+        // hint. When no workspace is attached (e.g. unit tests), fall back
+        // to the resolved sandbox root, then to None — `truncate` handles
+        // the None case by emitting the absolute path.
+        let workspace_root = self.workspace_root_for_truncate();
+
         for ((tool_call, result), invocation_id) in
             tool_calls.iter().zip(results).zip(invocation_ids)
         {
-            let (content, ok) = match result {
+            let (raw_content, ok) = match result {
                 Ok(value) => {
                     let ok = tool_result_ok(&value);
                     (value.to_string(), ok)
                 }
                 Err(e) => (format!("Error: {}", e), false),
             };
+
+            // Apply the shared in-loop truncation policy. When the policy
+            // is disabled (e.g. unit tests, gateway with the feature
+            // turned off in TOML), `truncate` is a pass-through.
+            let outcome = crate::tool_output_truncate::truncate(
+                &raw_content,
+                &self.tool_output_truncate_policy,
+                &tool_call.id,
+                workspace_root.as_deref(),
+            );
+            let content = outcome.content;
+            let truncated_in_loop = outcome.truncated;
+
+            if truncated_in_loop {
+                debug!(
+                    target: "agent::loop",
+                    tool = %tool_call.function.name,
+                    tool_call_id = %tool_call.id,
+                    original_bytes = outcome.original_bytes,
+                    original_lines = outcome.original_lines,
+                    preview_bytes = content.len(),
+                    spill_path = ?outcome.output_path,
+                    "Tool output truncated by in-loop service (#851)"
+                );
+            }
+
             messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
 
             // Persist tool result to session history.
@@ -946,11 +994,36 @@ impl AgentRuntime {
             // merged with the existing ok/tool_invocation_id fields. This
             // preserves the DM invariant (all shared-session messages are
             // Role::User) and enables UI reasoning block reconstruction.
+            //
+            // When the in-loop truncate fired, we mark the persisted row
+            // with `truncated_in_loop: true` so `session_msg_to_llm` skips
+            // its own 2000-byte re-truncation — the bytes already on disk
+            // are the bytes the agent saw live.
             {
-                let base_meta = serde_json::json!({
+                let mut base_meta = serde_json::json!({
                     "ok": ok,
                     "tool_invocation_id": invocation_id.to_string(),
                 });
+                if truncated_in_loop && let Some(obj) = base_meta.as_object_mut() {
+                    obj.insert(
+                        "truncated_in_loop".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                    obj.insert(
+                        "original_bytes".to_string(),
+                        serde_json::Value::Number(outcome.original_bytes.into()),
+                    );
+                    obj.insert(
+                        "original_lines".to_string(),
+                        serde_json::Value::Number(outcome.original_lines.into()),
+                    );
+                    if let Some(ref path) = outcome.output_path {
+                        obj.insert(
+                            "spill_path".to_string(),
+                            serde_json::Value::String(path.clone()),
+                        );
+                    }
+                }
                 let (role, metadata) = if is_dm {
                     (
                         SessionRole::User,
@@ -989,6 +1062,64 @@ impl AgentRuntime {
                 from_agent: self.agent_name.clone(),
             });
             *tool_seq += 1;
+        }
+    }
+
+    /// Resolve the workspace root for spill-path relativisation.
+    ///
+    /// Falls back to `resolved_sandbox_root` when no workspace is attached
+    /// (e.g. unnamed agents) and to `None` when the agent has neither (the
+    /// truncate service emits the absolute path in that case). Centralised so
+    /// `process_tool_results` and `truncate_for_emit` see the same root.
+    pub(crate) fn workspace_root_for_truncate(&self) -> Option<std::path::PathBuf> {
+        self.workspace
+            .as_ref()
+            .map(|w| w.dir().to_path_buf())
+            .or_else(|| self.resolved_sandbox_root.clone())
+    }
+
+    /// Truncate a tool result `Value` for emission on the audit log + the
+    /// `ToolEnd` SSE event (#921 review fix #4).
+    ///
+    /// The pre-#921 paths emitted the full untruncated `Value` regardless of
+    /// size — context-window protection was the only consumer of the in-loop
+    /// truncation service. Tim flagged that this still let a 10 MB tool
+    /// output saturate SSE bandwidth and audit-log disk even after the
+    /// in-loop messages vec was capped. Routing the audit + SSE payloads
+    /// through the same `truncate` service closes that gap.
+    ///
+    /// Behaviour:
+    /// - When the truncate policy is disabled OR the JSON-stringified value
+    ///   is inside both caps, the original `Value` is returned unchanged
+    ///   (preserves structured-JSON wire shape for small results).
+    /// - When truncation fires, returns a `Value::String(preview)` carrying
+    ///   the head+tail preview with the spill-path hint appended. Wire-shape
+    ///   for oversized results becomes a JSON string instead of a structured
+    ///   object — consumers that want the full bytes use the spill file.
+    ///
+    /// Visible across crates (`alms-coordinator` integration tests) but
+    /// `#[doc(hidden)]` so it stays off the public API surface.
+    #[doc(hidden)]
+    pub fn truncate_for_emit(
+        &self,
+        tool_call_id: &str,
+        value: &serde_json::Value,
+    ) -> serde_json::Value {
+        if !self.tool_output_truncate_policy.is_active() {
+            return value.clone();
+        }
+        let raw = value.to_string();
+        let workspace_root = self.workspace_root_for_truncate();
+        let outcome = crate::tool_output_truncate::truncate(
+            &raw,
+            &self.tool_output_truncate_policy,
+            tool_call_id,
+            workspace_root.as_deref(),
+        );
+        if outcome.truncated {
+            serde_json::Value::String(outcome.content)
+        } else {
+            value.clone()
         }
     }
 
@@ -1424,6 +1555,23 @@ impl AgentRuntime {
                     duration_ms = %elapsed.as_millis(),
                     "Tool execution succeeded"
                 );
+                // Route the audit-log + ToolEnd SSE payloads through the
+                // shared in-loop truncation service (#921 review fix #4).
+                // Pre-fix, an oversized tool result hit both the audit log
+                // and the SSE channel uncapped — eating audit-log disk and
+                // SSE bandwidth even though the in-loop messages vec was
+                // already capped by `process_tool_results`. The agent-visible
+                // preview, the audit log, and the SSE event now see the same
+                // truncated content + spill-path hint.
+                //
+                // The spill file is written here (and possibly again in
+                // `process_tool_results`); the second write is idempotent
+                // because both paths use the same deterministic
+                // `tool_<sanitized_call_id>.txt` filename and the same raw
+                // bytes. The `truncate` service falls through cheaply when
+                // the policy is disabled or the value is already inside the
+                // caps.
+                let emit_value = self.truncate_for_emit(&tool_call.id, value);
                 let _ = session_manager.append_audit(
                     session_id,
                     AuditEvent {
@@ -1432,7 +1580,7 @@ impl AgentRuntime {
                         tool: name.to_string(),
                         decision: AuditDecision::Allow,
                         params: args,
-                        result: Some(value.clone()),
+                        result: Some(emit_value.clone()),
                         error: None,
                         timestamp: alms_core::Timestamp::now(),
                     },
@@ -1443,7 +1591,7 @@ impl AgentRuntime {
                     let _ = sender.send(RuntimeEvent::ToolEnd {
                         invocation_id,
                         ok,
-                        result: value.clone(),
+                        result: emit_value,
                         source_agent: None,
                         task_id: None,
                     });

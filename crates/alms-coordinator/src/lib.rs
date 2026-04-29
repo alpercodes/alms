@@ -962,6 +962,11 @@ fn agent_config_for_subagent(
         // per-subagent subdir (`{data_dir}/shell_output/sub-{task_id}/`), which
         // keeps the retention sweep's directory walk well-defined.
         shell_spill: base.shell_spill.clone(),
+        // In-loop tool-output truncation (issue #851) is also inherited
+        // verbatim — same per-subagent directory layout, same retention
+        // sweep — so a subagent's tool calls cannot blow the context
+        // window any more than its parent's can.
+        tool_output_truncate: base.tool_output_truncate.clone(),
         enabled_tools: base.enabled_tools.clone(),
         fs_edit_fuzzy_match: base.fs_edit_fuzzy_match,
         max_tokens: base.max_tokens,
@@ -1151,6 +1156,9 @@ async fn run_agent_loop(
     // runtime — we need it below to wire `with_shell_spill` with the
     // per-subagent run directory.
     let subagent_spill_cfg = config.shell_spill.clone();
+    // Snapshot the in-loop tool-output truncation policy too (issue #851)
+    // so subagents inherit the same per-tool cap their parent has.
+    let subagent_trunc_cfg = config.tool_output_truncate.clone();
 
     // #871: snapshot the subagent's `summary_provider` / `summary_model`
     // before `config` is moved into the runtime so we can build a dedicated
@@ -1225,6 +1233,23 @@ async fn run_agent_loop(
             .join(alms_runtime::spill::SPILL_DIR_NAME)
             .join(format!("sub-{}", task_id.0));
         runtime = runtime.with_shell_spill(sub_run_dir, subagent_spill_cfg.enabled);
+    }
+
+    // Inherit the parent's in-loop tool-output truncation policy (issue
+    // #851). Same per-subagent layout
+    // (`{data_dir}/tool-output/sub-{task_id}/`) so the parent's
+    // gateway-startup retention sweep collects subagent spills the same
+    // way it collects parent spills.
+    if let Some(dir) = data_dir {
+        let sub_run_dir = dir
+            .join(alms_runtime::tool_output_truncate::TOOL_OUTPUT_DIR_NAME)
+            .join(format!("sub-{}", task_id.0));
+        runtime = runtime.with_tool_output_truncate(
+            sub_run_dir,
+            subagent_trunc_cfg.enabled,
+            subagent_trunc_cfg.max_bytes,
+            subagent_trunc_cfg.max_lines,
+        );
     }
 
     // Attach workspace to scope the fs_* sandbox.
@@ -1620,6 +1645,12 @@ mod tests {
                 enabled: false,
                 retention_days: 42,
             },
+            tool_output_truncate: alms_core::config::ToolOutputTruncateConfig {
+                enabled: true,
+                max_bytes: 16_384,
+                max_lines: 1500,
+                retention_days: 14,
+            },
             enabled_tools: vec!["echo".into(), "math".into()],
             ..AgentConfig::default()
         };
@@ -1639,6 +1670,12 @@ mod tests {
         // Should inherit the shell spill policy (issue #756 subagent inheritance)
         assert!(!config.shell_spill.enabled);
         assert_eq!(config.shell_spill.retention_days, 42);
+        // Should inherit the in-loop tool-output truncation policy
+        // (issue #851 subagent inheritance).
+        assert!(config.tool_output_truncate.enabled);
+        assert_eq!(config.tool_output_truncate.max_bytes, 16_384);
+        assert_eq!(config.tool_output_truncate.max_lines, 1500);
+        assert_eq!(config.tool_output_truncate.retention_days, 14);
         // system_prompt should be the default subagent prompt, not the parent's
         assert_eq!(config.system_prompt, DEFAULT_SUBAGENT_PROMPT);
 
@@ -1664,6 +1701,11 @@ mod tests {
         // Shell spill policy still inherited through the registry-override path
         assert!(!config2.shell_spill.enabled);
         assert_eq!(config2.shell_spill.retention_days, 42);
+        // Tool-output truncation policy still inherited through the
+        // registry-override path (issue #851 subagent inheritance).
+        assert!(config2.tool_output_truncate.enabled);
+        assert_eq!(config2.tool_output_truncate.max_bytes, 16_384);
+        assert_eq!(config2.tool_output_truncate.max_lines, 1500);
     }
 
     // -- per-named-subagent summary provider/model overlay (issue #872) --------
@@ -2460,5 +2502,163 @@ mod tests {
         assert!(truncated.ends_with("…[truncated]"));
         // Must not panic or produce invalid UTF-8
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    // -- (#921 review fix #5) subagent end-to-end truncation --------------------
+    //
+    // The unit-level test `test_subagent_inherits_parent_config` already
+    // pins the policy inheritance (max_bytes / max_lines / retention_days
+    // propagate from parent to subagent). This test exercises the *runtime*
+    // wiring: a subagent-shaped `AgentRuntime` constructed with the same
+    // builder calls used by `run_subagent` must (a) write spill files
+    // under `{data_dir}/tool-output/sub-{task_id}/`, (b) cap the in-loop
+    // preview to the configured byte budget, and (c) emit a bounded
+    // `truncate_for_emit` value for the audit log + ToolEnd SSE paths.
+    //
+    // Driving this through the full `Coordinator::dispatch` path is hard
+    // because the mock LLM can't synthesize tool calls, so we instead build
+    // the subagent runtime in the same shape `run_subagent` does and
+    // exercise `process_tool_results` + `truncate_for_emit` directly.
+
+    #[tokio::test]
+    async fn test_subagent_runtime_truncates_oversized_tool_output_to_sub_dir() {
+        use alms_core::{AgentId, ToolCallRecord};
+        use alms_runtime::AgentRuntime;
+        use alms_runtime::llm_types::{LlmConfig, LlmMessage, ToolCall};
+        use alms_session::{SessionConfig, SessionManager};
+
+        // Per-test data dir — gateway puts subagent spills under
+        // `{data_dir}/tool-output/sub-{task_id}/` so we mimic that layout.
+        let data_dir = tempfile::tempdir().unwrap();
+        let task_id = TaskId::new();
+
+        // Build the subagent's tool-output spill dir exactly the way
+        // `run_subagent` does at line ~1244-1252.
+        let sub_run_dir = data_dir
+            .path()
+            .join(alms_runtime::tool_output_truncate::TOOL_OUTPUT_DIR_NAME)
+            .join(format!("sub-{}", task_id.0));
+
+        // Build a subagent-shaped AgentConfig with truncation enabled and
+        // small caps so the test stays fast.
+        let config = AgentConfig {
+            tool_output_truncate: alms_core::config::ToolOutputTruncateConfig {
+                enabled: true,
+                max_bytes: 4 * 1024,
+                max_lines: 100,
+                retention_days: 7,
+            },
+            ..AgentConfig::default()
+        };
+
+        let llm_config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let llm = LlmClient::new(llm_config).unwrap();
+
+        // Same builder sequence as `run_subagent`:
+        //   AgentRuntime::new -> with_tool_output_truncate -> (no workspace
+        //   in this test, mirrors ephemeral subagent path with `data_dir`
+        //   set but `attach_workspace` false).
+        let runtime = AgentRuntime::new(AgentId::new(), config, llm)
+            .unwrap()
+            .with_tool_output_truncate(
+                sub_run_dir.clone(),
+                /* enabled */ true,
+                /* max_bytes */ 4 * 1024,
+                /* max_lines */ 100,
+            );
+
+        // Drive `process_tool_results` with a 100 KB tool result.
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(AgentId::new(), "subagent-test");
+
+        let tool_call = ToolCall::new("call_subagent_huge", "fake_tool", "{}");
+        let raw = "x".repeat(100 * 1024);
+        let result_value = serde_json::Value::String(raw.clone());
+
+        let mut messages: Vec<LlmMessage> = Vec::new();
+        let mut records: Vec<ToolCallRecord> = Vec::new();
+        let mut seq: u32 = 0;
+        let invocation_ids = vec![Uuid::new_v4()];
+
+        runtime.process_tool_results(
+            std::slice::from_ref(&tool_call),
+            vec![Ok(result_value.clone())],
+            &invocation_ids,
+            &mut messages,
+            &mut records,
+            &mut seq,
+            &session_manager,
+            session.id,
+            /* is_dm */ false,
+        );
+
+        // (a) The spill file must land under `tool-output/sub-{task_id}/`,
+        //     NOT directly under `tool-output/` and NOT under any other
+        //     per-run subdir. This is the key distinguishing layout for
+        //     subagents — the parent's gateway-startup retention sweep
+        //     walks every child of `tool-output/` so subagent spills get
+        //     swept the same way parent spills do.
+        let spill_path = sub_run_dir.join("tool_call_subagent_huge.txt");
+        assert!(
+            spill_path.exists(),
+            "subagent spill must land under tool-output/sub-{}/: {}",
+            task_id.0,
+            spill_path.display()
+        );
+        let spilled = std::fs::read_to_string(&spill_path).unwrap();
+        assert_eq!(
+            spilled,
+            result_value.to_string(),
+            "spill bytes must match the original JSON-stringified result"
+        );
+
+        // (b) The subagent's in-loop preview must be bounded by max_bytes
+        //     + the marker budget (4 KB cap + ~1 KB hint), not the original
+        //     100 KB.
+        assert_eq!(messages.len(), 1);
+        let preview = messages[0].content_str();
+        assert!(
+            preview.len() < 8 * 1024,
+            "subagent in-loop preview must be capped: {} bytes (cap = {} + hint)",
+            preview.len(),
+            4 * 1024
+        );
+
+        // (c) `truncate_for_emit` (used by audit log + ToolEnd SSE) must
+        //     also see a bounded value. This is the parent's view of the
+        //     subagent's tool result via the SSE forward / audit chain.
+        let emit_value = runtime.truncate_for_emit(&tool_call.id, &result_value);
+        let emit_str = emit_value
+            .as_str()
+            .expect("truncated emit value must be a JSON string");
+        assert!(
+            emit_str.len() < 8 * 1024,
+            "subagent truncate_for_emit must be capped: {} bytes",
+            emit_str.len()
+        );
+
+        // (d) The persisted session row must carry `truncated_in_loop:
+        //     true` so a follow-up subagent run on the same session sees
+        //     the truncated bytes (not the legacy 2000-byte re-truncated
+        //     ones) when the context builder reconstructs history.
+        let history = session_manager.get_history(session.id).unwrap();
+        let tool_msg = history
+            .iter()
+            .find(|m| matches!(m.role, alms_session::Role::Tool))
+            .expect("subagent tool result must be persisted");
+        let meta = tool_msg.metadata.as_ref().expect("metadata must be set");
+        assert_eq!(
+            meta.get("truncated_in_loop").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            meta.get("spill_path")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.contains("sub-")),
+            "persisted spill_path must reference the subagent dir: {meta:?}"
+        );
     }
 }

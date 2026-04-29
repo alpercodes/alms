@@ -313,6 +313,108 @@ The current implementation does not track parent/child invocation relationships,
 
 **Known limitation (non-Linux):** On platforms without Landlock support (Windows, macOS, older Linux kernels), shell sandboxing only restricts the cwd. The executed command itself (e.g. `cat /etc/passwd`) can still access any file the process user can read. Application-level command denylists are fundamentally bypassable. On Linux 5.13+, Landlock filesystem restrictions are applied to child processes (see section 4.5).
 
+### 4.5a Tool output handling — truncation + spill files (#756 + #851)
+
+Two layered caps prevent oversized tool output from blowing the LLM's
+context window, saturating the audit-log SQLite database, or flooding
+the SSE stream.
+
+**Layer A — `shell` tool internal spill (#756).** Inside the `shell`
+tool, `stdout` / `stderr` longer than 30 KB are truncated to a head + tail
+preview and the full pre-truncation bytes are written to
+`{data_dir}/shell_output/{run_id}/shell_<call_id>.txt`. The shell tool
+returns the *already-truncated* JSON result to the agent loop. The agent
+loop sees a 30 KB-bounded JSON value, never the full bytes. The spill
+file is readable by the agent's own `fs_read` / `fs_grep` because the
+gateway widens the agent's `extra_read_roots` to include the per-run
+shell-spill directory.
+
+Configured under `[tools.shell_spill]` in `alms.toml`. Subagents inherit
+the policy and write to `{data_dir}/shell_output/sub-{task_id}/` so the
+parent's startup retention sweep collects subagent spills the same way
+it collects parent spills.
+
+**Layer B — shared in-loop tool-output truncation (#851).** Every
+tool's result — `fs_read`, `http_get`, `read_session`, etc., not just
+`shell` — is routed through `tool_output_truncate::truncate` before it
+lands in:
+
+- the agent loop's live `Vec<LlmMessage>` (so the LLM sees a bounded
+  preview)
+- the session DB (so context rebuild on the next turn sees the same
+  bounded preview)
+- the audit log (so the SQLite `audit_events.result` column never
+  ingests megabyte-scale rows)
+- the `ToolEnd` SSE event (so the SSE stream never ships untruncated
+  bytes — the original 32-KB cap covered context-window protection but
+  left the SSE/audit paths uncapped pre-#921 review)
+
+Caps oversized outputs at **32 KB / 2000 lines** (whichever fires
+first) and writes the full pre-truncation bytes to
+`{data_dir}/tool-output/{run_id}/tool_<call_id>.txt`. The agent's
+recovery path is byte-perfect — the spill file is the *exact* original
+JSON-stringified output. The LLM-visible preview ends with a hint
+pointing at the spill file:
+
+```
+[The tool output was truncated to 32 KB. Full output saved to:
+`tool-output/<run_id>/tool_<call_id>.txt` (...). Use `fs_grep` to
+search the full content or `fs_read` with `offset`/`limit` to view
+specific sections.]
+```
+
+Configured under `[tools.tool_output_truncate]` in `alms.toml`:
+
+```toml
+[tools.tool_output_truncate]
+enabled = true       # Default: true
+max_bytes = 32768    # Default: 32 KB
+max_lines = 2000     # Default: 2000
+retention_days = 7   # Default: 7
+```
+
+**Trust model:**
+
+- Spill files for agent A's tool calls are **only** readable by agent A.
+  The gateway widens A's `fs_read`/`fs_list`/`fs_grep`/`fs_glob`
+  `extra_read_roots` to include the per-run spill directory, NOT the
+  whole `tool-output/` tree. Agent B cannot `fs_read` agent A's spilled
+  output because B's `extra_read_roots` only contains B's own per-run
+  spill directory.
+- Subagents under task ID T live at `tool-output/sub-{T}/` and receive
+  that subdirectory as their extra read root. Sibling subagents under
+  the same parent cannot read each other's spills.
+- The `tool_call_id` is sanitized into the spill filename
+  (non-alphanumeric chars replaced with `_`) before path construction,
+  so a malicious `tool_call_id` like `../../etc/passwd` cannot escape
+  the per-run directory.
+- Spill files inherit the daemon process's umask. Operators running on
+  a shared host should ensure `{data_dir}` itself is mode `0700` (or
+  similar) — `fs_*` tools cannot read outside the agent's allowed roots
+  in any case, but the spill files contain raw tool output and should
+  not be readable by unrelated OS users.
+
+**Retention:** Both layers run a single retention sweep at gateway
+startup that walks `{data_dir}/{shell_output|tool-output}/`, deletes
+any file with filesystem `mtime` older than `retention_days`, and
+removes empty per-run subdirectories. There is no background ticker —
+the sweep is a one-shot cost paid at boot.
+
+When a spill file expires after persistence, the context builder's
+`session_msg_to_llm` detects the missing path on the next context
+rebuild and rewrites the trailing recovery hint to a `[...retention
+period has expired. Only this preview survives.]` notice so the agent
+doesn't try to `fs_read` a non-existent path. The truncated head+tail
+preview itself stays in the session message indefinitely — only the
+recoverability hint is rewritten.
+
+**Operator tuning:** Both `[tools.shell_spill]` and
+`[tools.tool_output_truncate]` are config-file-only. They are
+deliberately NOT exposed via `PATCH /settings` because tightening or
+loosening these caps mid-flight could surprise running agents — operators
+edit the TOML and restart the daemon. The same model is applied to
+`[tools.shell_permissions]`.
+
 ### 4.5 Isolation roadmap
 
 **Current:** `bash -c` command strings + `env_clear()` + best-effort command denylist + `sandbox_root` path prefix enforcement for fs tools + persistent cwd restriction for shell (validated against sandbox root on each invocation) + **Landlock filesystem sandboxing on Linux 5.13+** (fail-closed: if Landlock is supported but enforcement fails, the command is aborted; only gracefully degrades on kernels without Landlock support).

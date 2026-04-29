@@ -64,6 +64,37 @@ pub struct AgentRuntime {
     /// of the shell tool (from `with_workspace`, `with_shell_default_env`,
     /// etc.) preserve the policy.
     pub(crate) shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy,
+    /// Shared in-loop tool-output truncation policy (issue #851).
+    ///
+    /// Mirrors [`shell_spill_policy`][Self::shell_spill_policy] but applies
+    /// to *every* tool's result, not just shell. Defaults to disabled; the
+    /// gateway wires in an active policy via [`Self::with_tool_output_truncate`]
+    /// once the per-run spill directory
+    /// (`{data_dir}/tool-output/{run_id}/`) is known. The agent loop runs
+    /// every tool's JSON result through
+    /// [`tool_output_truncate::truncate`][crate::tool_output_truncate::truncate]
+    /// before pushing it into the live `messages` vec or persisting to the
+    /// session DB so a single oversized tool output cannot blow the LLM's
+    /// context window.
+    pub(crate) tool_output_truncate_policy: crate::tool_output_truncate::ToolOutputTruncatePolicy,
+    /// Accumulator of additional read-only roots that the read-family `fs_*`
+    /// tools (`fs_read`, `fs_list`, `fs_grep`, `fs_glob`) should be allowed
+    /// to read from beyond `resolved_sandbox_root`.
+    ///
+    /// Populated by builder methods that introduce per-run spill directories
+    /// outside the agent's primary sandbox root:
+    /// - [`Self::with_shell_spill`] appends `{data_dir}/shell_output/{run_id}/`.
+    /// - [`Self::with_tool_output_truncate`] appends `{data_dir}/tool-output/{run_id}/`.
+    ///
+    /// [`Self::with_workspace`] reads the full accumulated list when it
+    /// re-registers the read-family fs tools, so the workspace registration
+    /// (which is the *last* fs_* registration in the gateway lifecycle order)
+    /// preserves every per-run spill dir as a read root. Without this single
+    /// source of truth, the spill-builder methods would have to re-register
+    /// fs_* tools themselves AND `with_workspace` would silently overwrite
+    /// those extras — the dead-code / footgun pattern Tim flagged on #921
+    /// review.
+    pub(crate) extra_fs_read_roots: Vec<std::path::PathBuf>,
     /// Agent name for perspective mapping in DM sessions.
     /// When set and the context_id starts with "dm:", the context builder
     /// maps messages from this agent to `Role::Assistant` so the LLM sees
@@ -140,6 +171,9 @@ impl AgentRuntime {
             shell_permissions: shell_permissions.clone(),
             shell_classification_mode,
             shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+            tool_output_truncate_policy:
+                crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+            extra_fs_read_roots: Vec::new(),
             agent_name: None,
         };
 
@@ -200,9 +234,6 @@ impl AgentRuntime {
             }
         };
 
-        let enabled = &self.config.enabled_tools;
-        let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
-
         // Parent directory of the workspace (e.g. `{workspace_dir}/`), which
         // contains every named agent's workspace as a sibling subdirectory.
         // Granting read-only access here lets a parent agent read a
@@ -217,68 +248,29 @@ impl AgentRuntime {
         // a filesystem root), we fall back to an empty extras list so
         // behaviour is unchanged.
         //
-        // When the shell output spill policy is active (issue #756), the
-        // per-run spill dir is appended so `fs_read`/`fs_list`/`fs_grep`/
-        // `fs_glob` can open the spilled log file without operators having
-        // to grant extra filesystem permissions.
-        let mut sibling_workspaces_root: Vec<std::path::PathBuf> = match ws_root.parent() {
+        // The per-run shell-spill (#756) and tool-output-truncate (#851)
+        // directories are picked up from `self.extra_fs_read_roots` below —
+        // any builder method that introduces a new spill dir pushes it onto
+        // that accumulator so the read-family fs_* tools always see every
+        // active spill root regardless of the order in which the builder
+        // methods were called. See the field doc on
+        // [`AgentRuntime::extra_fs_read_roots`] for the rationale (#921 fix).
+        let parent_root: Vec<std::path::PathBuf> = match ws_root.parent() {
             Some(parent) => vec![parent.to_path_buf()],
             None => Vec::new(),
         };
-        if let Some(spill_dir) = self.shell_spill_policy.run_dir.clone() {
-            sibling_workspaces_root.push(spill_dir);
-        }
 
-        // Re-register fs_read/fs_write/fs_list/fs_edit sandboxed to the
-        // workspace directory so file operations default to the agent's
-        // workspace instead of the project root.
-        // fs_read/fs_write/fs_edit get the file state cache for read-before-write guard.
-        // Read-family tools (fs_read/fs_list/fs_grep/fs_glob) also get the
-        // sibling-workspaces root as an extra read-only root so a parent
-        // agent can peek at a subagent's workspace files (#242).
-        let cache = self.tools.file_state_cache().clone();
-        if tool_enabled("fs_read") {
-            self.tools.register(std::sync::Arc::new(
-                alms_sandbox::FsReadTool::sandboxed(ws_root.clone())
-                    .with_cache(cache.clone())
-                    .with_extra_read_roots(sibling_workspaces_root.clone()),
-            ));
-        }
-        if tool_enabled("fs_write") {
-            self.tools.register(std::sync::Arc::new(
-                alms_sandbox::FsWriteTool::sandboxed(ws_root.clone()).with_cache(cache.clone()),
-            ));
-        }
-        if tool_enabled("fs_list") {
-            self.tools.register(std::sync::Arc::new(
-                alms_sandbox::FsListTool::sandboxed(ws_root.clone())
-                    .with_extra_read_roots(sibling_workspaces_root.clone()),
-            ));
-        }
-        if tool_enabled("fs_edit") {
-            self.tools.register(std::sync::Arc::new(
-                alms_sandbox::FsEditTool::sandboxed(ws_root.clone())
-                    .with_cache(cache.clone())
-                    .with_fuzzy_match(self.config.fs_edit_fuzzy_match),
-            ));
-        }
-        if tool_enabled("fs_grep") {
-            self.tools.register(std::sync::Arc::new(
-                alms_sandbox::FsGrepTool::sandboxed(ws_root.clone())
-                    .with_extra_read_roots(sibling_workspaces_root.clone()),
-            ));
-        }
-        if tool_enabled("fs_glob") {
-            self.tools.register(std::sync::Arc::new(
-                alms_sandbox::FsGlobTool::sandboxed(ws_root.clone())
-                    .with_extra_read_roots(sibling_workspaces_root.clone()),
-            ));
-        }
+        // Re-register fs_* tools with workspace as primary sandbox root and
+        // sibling-workspaces + accumulated spill dirs as extra read roots.
+        let extras = self.compose_fs_extra_read_roots(&parent_root);
+        self.register_fs_tools(Some(ws_root.clone()), &extras);
 
         // Re-register shell tool with workspace dir as default cwd and
         // gateway-provided default env vars (ALMS_DATA_DIR, etc.).
         // The tool is registered under both "shell" (primary) and "shell_exec" (alias).
-        let shell_enabled = tool_enabled("shell") || tool_enabled("shell_exec");
+        let enabled = &self.config.enabled_tools;
+        let shell_enabled =
+            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
         if shell_enabled {
             let mut shell_tool = alms_sandbox::ShellTool::with_policy(
                 self.resolved_sandbox_root.clone(),
@@ -300,6 +292,113 @@ impl AgentRuntime {
 
         self.workspace = Some(workspace);
         self
+    }
+
+    /// Compose the full extra-read-roots list to pass to the read-family
+    /// fs_* tools at registration time.
+    ///
+    /// Combines, in order:
+    /// 1. The caller-supplied prefix (typically the workspace parent dir for
+    ///    sibling-workspace reads — #242 — when `with_workspace` is the
+    ///    caller; empty otherwise).
+    /// 2. The accumulated [`Self::extra_fs_read_roots`] entries pushed by
+    ///    builder methods like [`Self::with_shell_spill`] and
+    ///    [`Self::with_tool_output_truncate`].
+    ///
+    /// Centralising this in one place ensures every fs_* re-registration
+    /// site sees the same set of read roots regardless of the order in
+    /// which builder methods were called — closing the dead-code / footgun
+    /// pattern Tim flagged on the #921 review.
+    fn compose_fs_extra_read_roots(
+        &self,
+        prefix: &[std::path::PathBuf],
+    ) -> Vec<std::path::PathBuf> {
+        let mut out: Vec<std::path::PathBuf> =
+            Vec::with_capacity(prefix.len() + self.extra_fs_read_roots.len());
+        out.extend(prefix.iter().cloned());
+        out.extend(self.extra_fs_read_roots.iter().cloned());
+        out
+    }
+
+    /// Re-register the read-family fs_* tools (`fs_read`, `fs_list`,
+    /// `fs_grep`, `fs_glob`) and the write-family (`fs_write`, `fs_edit`)
+    /// using `primary` as the primary sandbox root and `extras` as the
+    /// extra read roots.
+    ///
+    /// The write-family tools deliberately do NOT receive `extras` —
+    /// the read roots are read-only by design (#242). When `primary`
+    /// is `None`, the agent has no primary sandbox root (unrestricted)
+    /// and we leave the existing fs_* registrations as-is so the unrestricted
+    /// agent retains full filesystem access.
+    fn register_fs_tools(
+        &mut self,
+        primary: Option<std::path::PathBuf>,
+        extras: &[std::path::PathBuf],
+    ) {
+        let Some(root) = primary else {
+            return;
+        };
+
+        let enabled = &self.config.enabled_tools;
+        let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
+
+        let cache = self.tools.file_state_cache().clone();
+        let extras_vec = extras.to_vec();
+
+        if tool_enabled("fs_read") {
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsReadTool::sandboxed(root.clone())
+                    .with_cache(cache.clone())
+                    .with_extra_read_roots(extras_vec.clone()),
+            ));
+        }
+        if tool_enabled("fs_write") {
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsWriteTool::sandboxed(root.clone()).with_cache(cache.clone()),
+            ));
+        }
+        if tool_enabled("fs_list") {
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsListTool::sandboxed(root.clone())
+                    .with_extra_read_roots(extras_vec.clone()),
+            ));
+        }
+        if tool_enabled("fs_edit") {
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsEditTool::sandboxed(root.clone())
+                    .with_cache(cache.clone())
+                    .with_fuzzy_match(self.config.fs_edit_fuzzy_match),
+            ));
+        }
+        if tool_enabled("fs_grep") {
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsGrepTool::sandboxed(root.clone())
+                    .with_extra_read_roots(extras_vec.clone()),
+            ));
+        }
+        if tool_enabled("fs_glob") {
+            self.tools.register(std::sync::Arc::new(
+                alms_sandbox::FsGlobTool::sandboxed(root).with_extra_read_roots(extras_vec),
+            ));
+        }
+    }
+
+    /// Re-register read-family fs_* tools when no workspace is attached.
+    ///
+    /// Used by [`Self::with_shell_spill`] and
+    /// [`Self::with_tool_output_truncate`] to widen the agent's read roots
+    /// to include the per-run spill directory at the moment the policy
+    /// becomes active. When `with_workspace` is *also* called later, it
+    /// re-registers the fs_* tools again with the workspace as the primary
+    /// root, picking up the same accumulated extras via
+    /// [`Self::compose_fs_extra_read_roots`] — so the call order does not
+    /// matter, and the workspace registration cannot silently drop the
+    /// spill-dir extras (#921 review).
+    fn refresh_fs_tools_for_extras(&mut self) {
+        if let Some(root) = self.resolved_sandbox_root.clone() {
+            let extras = self.compose_fs_extra_read_roots(&[]);
+            self.register_fs_tools(Some(root), &extras);
+        }
     }
 
     /// Attach a runtime event sender so the gateway can observe tool events.
@@ -434,47 +533,64 @@ impl AgentRuntime {
                 .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
         }
 
-        // Widen the fs_* read roots so `fs_read` on the spill path resolves
-        // inside an allowed root. We only do this when a sandbox root is set
-        // and spill is active — otherwise there's nothing to widen against,
-        // and agents with unrestricted fs access already reach everywhere.
-        // The extras list intentionally only includes the per-run dir;
-        // sibling-workspace access (#242) is added separately in
-        // `with_workspace()`, so we avoid conflating the two features here.
-        if enabled && self.resolved_sandbox_root.is_some() {
-            let fs_tool_enabled =
-                |name: &str| enabled_tools.is_empty() || enabled_tools.iter().any(|t| t == name);
-            let extras = vec![run_dir];
-            let cache = self.tools.file_state_cache().clone();
-            let root = self
-                .resolved_sandbox_root
-                .clone()
-                .expect("guarded by is_some() above");
-            if fs_tool_enabled("fs_read") && self.tools.contains("fs_read") {
-                self.tools.register(std::sync::Arc::new(
-                    alms_sandbox::FsReadTool::sandboxed(root.clone())
-                        .with_cache(cache.clone())
-                        .with_extra_read_roots(extras.clone()),
-                ));
-            }
-            if fs_tool_enabled("fs_list") && self.tools.contains("fs_list") {
-                self.tools.register(std::sync::Arc::new(
-                    alms_sandbox::FsListTool::sandboxed(root.clone())
-                        .with_extra_read_roots(extras.clone()),
-                ));
-            }
-            if fs_tool_enabled("fs_grep") && self.tools.contains("fs_grep") {
-                self.tools.register(std::sync::Arc::new(
-                    alms_sandbox::FsGrepTool::sandboxed(root.clone())
-                        .with_extra_read_roots(extras.clone()),
-                ));
-            }
-            if fs_tool_enabled("fs_glob") && self.tools.contains("fs_glob") {
-                self.tools.register(std::sync::Arc::new(
-                    alms_sandbox::FsGlobTool::sandboxed(root.clone())
-                        .with_extra_read_roots(extras.clone()),
-                ));
-            }
+        // Push the per-run shell-spill dir onto the accumulated
+        // `extra_fs_read_roots` so `with_workspace`'s later fs_* registration
+        // also picks it up, and re-register the read-family fs_* tools now
+        // for the unnamed-agent path (where `with_workspace` is never
+        // called). See [`Self::extra_fs_read_roots`] for the rationale.
+        if enabled {
+            self.extra_fs_read_roots.push(run_dir);
+            self.refresh_fs_tools_for_extras();
+        }
+
+        self
+    }
+
+    /// Activate the shared in-loop tool-output truncation policy
+    /// (issue #851).
+    ///
+    /// `run_dir` is the per-run directory
+    /// (`{data_dir}/tool-output/{run_id}/`) where spill files will be
+    /// written when any tool's result exceeds either the byte cap or the
+    /// line cap (defaults defined in [`crate::tool_output_truncate`]). The
+    /// directory is created lazily on first spill.
+    ///
+    /// Like [`Self::with_shell_spill`], this widens the agent's
+    /// `fs_read`/`fs_list`/`fs_grep`/`fs_glob` extra read roots so the
+    /// agent can `fs_read` a spilled file without operators having to grant
+    /// extra filesystem permissions.
+    ///
+    /// Must be called *after* `with_run_id()` — otherwise the caller cannot
+    /// compute the per-run directory path. Passing `enabled == false`
+    /// leaves the runtime in the default "no truncation" state.
+    pub fn with_tool_output_truncate(
+        mut self,
+        run_dir: std::path::PathBuf,
+        enabled: bool,
+        max_bytes: usize,
+        max_lines: usize,
+    ) -> Self {
+        use crate::tool_output_truncate::ToolOutputTruncatePolicy;
+
+        let policy = if enabled {
+            let mut p = ToolOutputTruncatePolicy::with_run_dir(run_dir.clone());
+            p.max_bytes = max_bytes;
+            p.max_lines = max_lines;
+            p
+        } else {
+            ToolOutputTruncatePolicy::disabled()
+        };
+        self.tool_output_truncate_policy = policy;
+
+        // Push the per-run tool-output spill dir onto the accumulated
+        // `extra_fs_read_roots` so `with_workspace`'s later fs_*
+        // re-registration also picks it up, and re-register the read-family
+        // fs_* tools now for the unnamed-agent path. The accumulator is the
+        // single source of truth for all per-run spill dirs — see
+        // [`Self::extra_fs_read_roots`] for the rationale (#921 review fix).
+        if enabled {
+            self.extra_fs_read_roots.push(run_dir);
+            self.refresh_fs_tools_for_extras();
         }
 
         self

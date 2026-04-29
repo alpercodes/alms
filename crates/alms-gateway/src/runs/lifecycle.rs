@@ -922,6 +922,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         runtime = runtime.with_shell_spill(run_dir, spill_cfg.enabled);
     }
 
+    // Wire the shared in-loop tool-output truncation policy (issue #851).
+    // Mirrors `with_shell_spill` above — same lifecycle, same retention
+    // model, same fs_* read-root widening, but applied to *every* tool's
+    // output (not just shell). Must come before `with_workspace` so the
+    // per-run spill dir is included in the agent's extra_read_roots.
+    {
+        let trunc_cfg = state.tools_config.read().tool_output_truncate.clone();
+        let run_dir = state
+            .data_dir
+            .join(alms_runtime::tool_output_truncate::TOOL_OUTPUT_DIR_NAME)
+            .join(run_id.0.to_string());
+        runtime = runtime.with_tool_output_truncate(
+            run_dir,
+            trunc_cfg.enabled,
+            trunc_cfg.max_bytes,
+            trunc_cfg.max_lines,
+        );
+    }
+
     // Attach workspace if configured — registers the workspace_write tool for this run
     if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
         let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);

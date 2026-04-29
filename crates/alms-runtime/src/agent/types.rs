@@ -102,6 +102,14 @@ pub struct AgentConfig {
     /// inherit the same spill policy as the parent. Config-file-only — not
     /// mutable via `PATCH /settings`.
     pub shell_spill: ShellSpillConfig,
+    /// Shared in-loop tool-output truncation policy (issue #851).
+    ///
+    /// Mirrors `shell_spill`'s plumbing: populated from
+    /// `[tools.tool_output_truncate]` in the gateway's config assembly and
+    /// inherited by subagents through the coordinator so a parent and its
+    /// subagents see identical caps. Config-file-only — not mutable via
+    /// `PATCH /settings`.
+    pub tool_output_truncate: alms_core::config::ToolOutputTruncateConfig,
     /// Enabled builtin tools. Empty = all enabled (backward compatible).
     pub enabled_tools: Vec<String>,
     /// Enable the multi-stage fuzzy-match replacer cascade in `fs_edit`.
@@ -182,6 +190,7 @@ impl Default for AgentConfig {
             shell_permissions: ShellPermissions::default(),
             shell_classification_mode: ShellClassificationMode::default(),
             shell_spill: ShellSpillConfig::default(),
+            tool_output_truncate: alms_core::config::ToolOutputTruncateConfig::default(),
             enabled_tools: Vec::new(),
             fs_edit_fuzzy_match: false,
             debug_mode: false,

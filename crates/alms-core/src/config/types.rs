@@ -864,6 +864,22 @@ pub struct ToolsConfig {
     /// window affect disk usage and are considered operator-level policy.
     #[serde(default)]
     pub shell_spill: ShellSpillConfig,
+
+    /// Shared in-loop tool-output truncation policy (issue #851).
+    ///
+    /// The agent loop routes every tool's result through a single
+    /// truncation service before pushing it into the live messages vec
+    /// or persisting it to the session DB. Outputs larger than the byte
+    /// or line cap are truncated to a head+tail preview, with the full
+    /// pre-truncation bytes spilled to
+    /// `{data_dir}/tool-output/{run_id}/tool_<tool_call_id>.txt` for
+    /// recovery via `fs_read` / `fs_grep`. Mirrors `shell_spill` in
+    /// shape and retention semantics, but applies to *every* tool —
+    /// closing the multi-tool context-blowup hole reported in #851.
+    ///
+    /// Like [`shell_spill`], **config-file-only**.
+    #[serde(default)]
+    pub tool_output_truncate: ToolOutputTruncateConfig,
 }
 
 impl Default for ToolsConfig {
@@ -878,6 +894,7 @@ impl Default for ToolsConfig {
             shell_classification_mode: ShellClassificationMode::default(),
             fs_edit: FsEditConfig::default(),
             shell_spill: ShellSpillConfig::default(),
+            tool_output_truncate: ToolOutputTruncateConfig::default(),
         }
     }
 }
@@ -1066,6 +1083,63 @@ impl Default for ShellSpillConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            retention_days: 7,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ToolOutputTruncateConfig
+// ---------------------------------------------------------------------------
+
+/// Configuration for the shared in-loop tool-output truncation service
+/// (issue #851).
+///
+/// Every tool's result is routed through the truncation service before it
+/// lands in the agent loop's live message list or the session DB. When the
+/// result exceeds either [`max_bytes`][Self::max_bytes] or
+/// [`max_lines`][Self::max_lines], a head+tail preview is returned to the
+/// LLM and the full pre-truncation bytes are spilled to
+/// `{data_dir}/tool-output/{run_id}/tool_<tool_call_id>.txt`. The retention
+/// sweep runs once at gateway startup (filesystem-mtime check) and deletes
+/// spill files older than [`retention_days`][Self::retention_days].
+///
+/// **Config-file-only**: like [`ShellSpillConfig`] / [`ShellPermissions`],
+/// not exposed via `PATCH /settings`. Operators who need to tune truncation
+/// edit `alms.toml` and restart the gateway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolOutputTruncateConfig {
+    /// Whether the truncation service is enabled. Default: `true`.
+    ///
+    /// When disabled, the agent loop emits raw tool results into the
+    /// LLM's context with no per-result cap. Disable only if you have
+    /// per-tool caps tuned tightly enough to bound the worst case (and
+    /// understand that `http_get` + `read_session` had no caps at all
+    /// pre-#851).
+    pub enabled: bool,
+
+    /// Hard byte cap on the preview returned to the LLM. Outputs larger
+    /// than this trigger truncation + spill. Default: `32_768` (32 KB).
+    pub max_bytes: usize,
+
+    /// Hard line cap on the preview returned to the LLM. Outputs with more
+    /// than this many lines trigger truncation + spill, even if they fit
+    /// inside `max_bytes`. Default: `2000`.
+    pub max_lines: usize,
+
+    /// Number of days a spilled file is retained before the startup sweep
+    /// deletes it. Default: `7`. A value of `0` deletes every spill at the
+    /// next startup sweep regardless of age.
+    pub retention_days: u32,
+}
+
+impl Default for ToolOutputTruncateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: 32 * 1024,
+            max_lines: 2000,
             retention_days: 7,
         }
     }

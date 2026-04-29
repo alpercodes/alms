@@ -69,11 +69,35 @@ const CONTINUE_PLACEHOLDER: &str = "Please continue.";
 /// Builds the context window (Vec<LlmMessage>) for an LLM request.
 pub struct ContextBuilder {
     config: ContextConfig,
+    /// Workspace root used to resolve relative `spill_path` metadata when
+    /// rebuilding tool-result messages from session history. When the
+    /// referenced spill file no longer exists on disk (the per-run sweep
+    /// has expired it), `session_msg_to_llm` swaps the trailing recovery
+    /// hint for an "expired" notice so an agent reading an older session
+    /// doesn't get told to `fs_read` a path that returns ENOENT (#921 review
+    /// fix #3).
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 impl ContextBuilder {
     pub fn new(config: ContextConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            workspace_root: None,
+        }
+    }
+
+    /// Set the workspace root used to resolve spill-path metadata when
+    /// rebuilding tool-result messages from session history.
+    ///
+    /// Without a root, `session_msg_to_llm` cannot tell whether a spill
+    /// file referenced by a stored tool-result message has been swept
+    /// (>7d retention) and falls back to leaving the original recovery
+    /// hint intact — the LLM may try `fs_read` and get ENOENT, but the
+    /// degradation is graceful.
+    pub fn with_workspace_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.workspace_root = root;
+        self
     }
 
     /// Build the message list for an LLM call.
@@ -453,8 +477,43 @@ impl ContextBuilder {
             // Reconstruct tool result with correct tool_call_id
             (Role::Tool, Content::ToolResult { tool_id, result }) => {
                 let result_str = result.to_string();
-                // Truncate long tool outputs in context
-                let content = if result_str.len() > 2000 {
+                // When the in-loop truncation service (#851) already
+                // capped this message, the persisted bytes are exactly
+                // what the live agent saw. Skip the legacy 2000-byte
+                // re-truncation in that case — re-truncating would shrink
+                // the head+tail preview to ~2 KB and discard the spill-
+                // path hint the agent needs to recover the full bytes.
+                let truncated_in_loop = msg
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("truncated_in_loop"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let content = if truncated_in_loop {
+                    // Detect a swept spill file (#921 review fix #3): if the
+                    // recorded `spill_path` no longer exists on disk (>7 day
+                    // retention sweep has expired it), rewrite the trailing
+                    // recovery hint so the agent doesn't try to `fs_read` a
+                    // path that returns ENOENT.
+                    let spill_path = msg
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("spill_path"))
+                        .and_then(|v| v.as_str());
+                    if let Some(rel) = spill_path
+                        && let Some(ref root) = self.workspace_root
+                        && Self::spill_file_missing(root, rel)
+                    {
+                        Self::rewrite_hint_as_expired(&result_str, rel)
+                    } else {
+                        result_str
+                    }
+                } else if result_str.len() > 2000 {
+                    // Legacy fallback for tool-result messages persisted
+                    // before #851 (or when the in-loop service is
+                    // disabled by config). Keeps the pre-#851 wire shape
+                    // byte-identical so existing fixtures continue to
+                    // pass.
                     format!(
                         "{}... [truncated, {} bytes total]",
                         truncate_to_char_boundary(&result_str, 2000),
@@ -472,6 +531,53 @@ impl ContextBuilder {
                 LlmMessage::tool_result(msg.id.clone(), msg.content.to_display_string())
             }
         }
+    }
+
+    /// Resolve the relative `spill_path` from a tool-result message's
+    /// metadata against `workspace_root` and return `true` when the file
+    /// does NOT exist on disk (i.e. the retention sweep has expired it).
+    ///
+    /// `rel` is the path emitted by `tool_output_truncate::truncate` —
+    /// either workspace-relative (when a workspace root was passed in at
+    /// truncate time) or an absolute path (no workspace root). We try
+    /// `workspace_root.join(rel)` first; when that doesn't exist *and* the
+    /// raw `rel` parses as an absolute path, we try that too. Either path
+    /// existing is enough to consider the spill "live"; both missing means
+    /// it has been swept (or never made it to disk).
+    fn spill_file_missing(workspace_root: &std::path::Path, rel: &str) -> bool {
+        let joined = workspace_root.join(rel);
+        if joined.exists() {
+            return false;
+        }
+        let raw = std::path::Path::new(rel);
+        if raw.is_absolute() && raw.exists() {
+            return false;
+        }
+        true
+    }
+
+    /// Rewrite the trailing recovery hint in a head+tail-truncated tool
+    /// result to indicate the spill file is no longer available.
+    ///
+    /// `original` is the persisted preview that ends with the
+    /// `[The tool output was truncated to N KB. Full output saved to:
+    ///  \`<rel>\`...]` block produced by
+    /// `tool_output_truncate::build_preview`. We trim that trailing block
+    /// (everything from the last `[The tool output was truncated to`
+    /// occurrence onward) and append a short "expired" notice. When the
+    /// marker is absent for any reason we just append the notice — the
+    /// degradation is safe even if the original shape is unexpected.
+    fn rewrite_hint_as_expired(original: &str, rel: &str) -> String {
+        const MARKER: &str = "[The tool output was truncated to";
+        let trimmed = match original.rfind(MARKER) {
+            Some(idx) => original[..idx].trim_end_matches('\n').to_string(),
+            None => original.trim_end_matches('\n').to_string(),
+        };
+        format!(
+            "{trimmed}\n\n[The tool output was truncated. The full-output spill file \
+             (`{rel}`) is no longer available — retention period has expired. Only \
+             this preview survives.]\n"
+        )
     }
 
     /// Remove tool-result messages whose `tool_call_id` is not introduced by
@@ -2790,5 +2896,249 @@ mod tests {
         // Marker stripped, assistant tail detected, placeholder synthesised.
         assert_eq!(messages.last().unwrap().role, "user");
         assert!(messages[1..].iter().all(|m| m.role != "system"));
+    }
+
+    // -- #851: in-loop truncation interaction with session_msg_to_llm ---------
+
+    /// When a tool result message carries `truncated_in_loop: true` in its
+    /// metadata, `session_msg_to_llm` must NOT apply its legacy 2000-byte
+    /// re-truncation — the persisted bytes ARE the bytes the live agent
+    /// saw, including the spill-path hint, and re-truncating would shred
+    /// the recovery instructions.
+    #[test]
+    fn session_msg_to_llm_skips_re_truncation_when_in_loop_flag_set() {
+        let builder = default_builder();
+        let preview = format!("preview head\n{}\npreview tail", "x".repeat(3000));
+        // Sanity: the preview is well above 2000 bytes so the legacy path
+        // would trigger.
+        assert!(preview.len() > 2000);
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(preview.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+                "truncated_in_loop": true,
+                "spill_path": ".alms/tool-output/run1/tool_call_abc.txt",
+                "original_bytes": 100_000,
+                "original_lines": 1,
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        // The serialised tool-result string must contain the full preview
+        // body — no `... [truncated, N bytes total]` suffix.
+        assert!(
+            !llm.content_str().contains("[truncated,"),
+            "in-loop-truncated message must not be re-truncated by session_msg_to_llm"
+        );
+        assert!(
+            llm.content_str().len() > 2000,
+            "preview must survive past the legacy 2000-byte cap"
+        );
+    }
+
+    /// Symmetric counterpart: when the in-loop flag is absent, the legacy
+    /// 2000-byte re-truncation still fires. This pins the
+    /// backward-compatibility guarantee for tool result messages persisted
+    /// before #851 (or by deployments where the in-loop service is
+    /// disabled in `alms.toml`).
+    #[test]
+    fn session_msg_to_llm_still_truncates_when_flag_absent() {
+        let builder = default_builder();
+        let big = "x".repeat(5000);
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(big.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        let body = llm.content_str();
+        assert!(
+            body.contains("[truncated,"),
+            "legacy path must still truncate when truncated_in_loop is absent"
+        );
+        // 2000-byte preview + suffix string -> stays under, say, 2500
+        // bytes for the entire message.
+        assert!(
+            body.len() < 2500,
+            "legacy path caps at 2000 bytes plus suffix"
+        );
+    }
+
+    // -- #921 review fix #3: stale spill_path detection -----------------------
+
+    /// When a tool-result message references a `spill_path` that has been
+    /// swept (>7d retention), `session_msg_to_llm` must rewrite the
+    /// recovery hint to indicate the file is no longer available so the
+    /// LLM doesn't try to `fs_read` an ENOENT path.
+    #[test]
+    fn session_msg_to_llm_rewrites_hint_when_spill_file_missing() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let builder =
+            default_builder().with_workspace_root(Some(workspace_dir.path().to_path_buf()));
+
+        // Persisted preview with the full hint text from `build_preview`.
+        let preview = format!(
+            "head data\n\n... [50000 bytes / 1 lines omitted] ...\n\ntail data\n\n[The tool output \
+             was truncated to 32 KB. Full output saved to: `{rel}` (50000 bytes, 1 lines). Use \
+             `fs_grep` to search the full content or `fs_read` with `offset`/`limit` to view \
+             specific sections.]\n",
+            rel = "tool-output/run1/tool_call_abc.txt"
+        );
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(preview.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+                "truncated_in_loop": true,
+                // This relative path does NOT exist under workspace_dir.
+                "spill_path": "tool-output/run1/tool_call_abc.txt",
+                "original_bytes": 50_000,
+                "original_lines": 1,
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        let body = llm.content_str();
+        // The original "Use `fs_grep`..." hint must be gone.
+        assert!(
+            !body.contains("Use `fs_grep`"),
+            "stale fs_grep hint must be removed when spill is missing"
+        );
+        // The replacement notice must mention "retention" and "expired".
+        assert!(
+            body.contains("retention period has expired"),
+            "expired hint must be present: {body}"
+        );
+        // The head/tail body itself must survive the rewrite.
+        assert!(body.contains("head data"));
+        assert!(body.contains("tail data"));
+    }
+
+    /// Symmetric counterpart: when the spill file IS still present on
+    /// disk, the recovery hint must remain intact so the agent can
+    /// `fs_read` it normally.
+    #[test]
+    fn session_msg_to_llm_keeps_hint_when_spill_file_present() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        // Materialise the spill file under workspace_dir so the existence
+        // check passes.
+        let spill_dir = workspace_dir.path().join("tool-output").join("run1");
+        std::fs::create_dir_all(&spill_dir).unwrap();
+        let spill_file = spill_dir.join("tool_call_abc.txt");
+        std::fs::write(&spill_file, b"original payload").unwrap();
+
+        let builder =
+            default_builder().with_workspace_root(Some(workspace_dir.path().to_path_buf()));
+
+        let preview = format!(
+            "head data\n\n... omitted ...\n\ntail data\n\n[The tool output was truncated to 32 KB. \
+             Full output saved to: `{rel}` (50000 bytes, 1 lines). Use `fs_grep` to search the full \
+             content or `fs_read` with `offset`/`limit` to view specific sections.]\n",
+            rel = "tool-output/run1/tool_call_abc.txt"
+        );
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(preview.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+                "truncated_in_loop": true,
+                "spill_path": "tool-output/run1/tool_call_abc.txt",
+                "original_bytes": 50_000,
+                "original_lines": 1,
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        let body = llm.content_str();
+        // The recovery hint must be intact.
+        assert!(
+            body.contains("Use `fs_grep`"),
+            "fs_grep hint must survive when spill file exists"
+        );
+        // The expired notice must NOT appear.
+        assert!(!body.contains("retention period has expired"));
+    }
+
+    /// Without a workspace root configured the builder cannot resolve
+    /// relative spill paths, so it MUST leave the hint unchanged (graceful
+    /// degradation: the agent may try `fs_read` and fail, but the LLM is
+    /// not given an inaccurate "expired" notice).
+    #[test]
+    fn session_msg_to_llm_leaves_hint_alone_without_workspace_root() {
+        let builder = default_builder(); // no workspace_root
+
+        let preview =
+            "head\n\n... omitted ...\n\ntail\n\n[The tool output was truncated to 32 KB. \
+             Full output saved to: `tool-output/run1/tool_call_abc.txt` (50000 bytes, 1 lines). \
+             Use `fs_grep` to search the full content or `fs_read` with `offset`/`limit` to view \
+             specific sections.]\n"
+                .to_string();
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(preview.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+                "truncated_in_loop": true,
+                "spill_path": "tool-output/run1/tool_call_abc.txt",
+                "original_bytes": 50_000,
+                "original_lines": 1,
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        // Without a workspace root the existence check is skipped, so the
+        // hint must survive intact — including the spill path reference
+        // and the `Use \`fs_grep\`` recovery instruction. (The session
+        // round-trip JSON-encodes the inner string, so we only check that
+        // the original recovery hint substring is present, not byte
+        // equality with the bare preview.)
+        let body = llm.content_str();
+        assert!(
+            body.contains("Use `fs_grep`"),
+            "fs_grep hint must survive when workspace_root is unset: {body}"
+        );
+        assert!(
+            !body.contains("retention period has expired"),
+            "expired notice must NOT appear when workspace_root is unset"
+        );
     }
 }

@@ -88,6 +88,7 @@ impl GatewayConfig {
                 shell_permissions: config.tools.shell_permissions.clone(),
                 shell_classification_mode: config.tools.shell_classification_mode,
                 shell_spill: config.tools.shell_spill.clone(),
+                tool_output_truncate: config.tools.tool_output_truncate.clone(),
                 enabled_tools: config.tools.enabled.clone(),
                 fs_edit_fuzzy_match: config.tools.fs_edit.fuzzy_match,
                 // Server-default extended-thinking budget — can be
@@ -445,6 +446,30 @@ impl Gateway {
                         error = %e,
                         data_dir = %data_dir.display(),
                         "Shell output spill retention sweep failed at startup"
+                    );
+                }
+            }
+
+            // In-loop tool-output spill retention sweep (issue #851).
+            // Same lifecycle as the shell-output sweep above — startup-only,
+            // filesystem-mtime check, non-fatal on error. Removes expired
+            // `.alms/tool-output/*` files.
+            let trunc_retention = self.config.tools_config.tool_output_truncate.retention_days;
+            match alms_runtime::tool_output_truncate::sweep_expired(data_dir, trunc_retention) {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        info!(
+                            deleted,
+                            retention_days = trunc_retention,
+                            "Cleaned up expired tool-output spill files at startup"
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        data_dir = %data_dir.display(),
+                        "Tool-output spill retention sweep failed at startup"
                     );
                 }
             }

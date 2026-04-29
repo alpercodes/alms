@@ -206,6 +206,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dashmap",
+ "futures",
  "globset",
  "iana-time-zone",
  "landlock",

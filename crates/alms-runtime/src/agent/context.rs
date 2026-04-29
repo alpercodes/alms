@@ -117,7 +117,12 @@ impl AgentRuntime {
                 None
             };
 
-        let builder = ContextBuilder::new(self.config.context_config.clone());
+        // Wire the agent's workspace root into the builder so that
+        // `session_msg_to_llm` can detect tool-result messages that
+        // reference a swept spill file (#921 review fix #3) and swap the
+        // recovery hint for an "expired" notice.
+        let builder = ContextBuilder::new(self.config.context_config.clone())
+            .with_workspace_root(self.workspace_root_for_truncate());
 
         // For DM sessions, apply perspective mapping so the LLM sees its own
         // previous messages as Role::Assistant instead of Role::User.
