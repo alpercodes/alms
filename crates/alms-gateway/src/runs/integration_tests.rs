@@ -2530,6 +2530,330 @@ async fn pre_cancelled_run_emits_session_activity_ended() {
     shutdown_token.cancel();
 }
 
+/// Regression test for #895 (pre-cancel branch, interposer pattern):
+/// in the pre-cancel branch of `execute_run`, the run state must be
+/// flipped to `Cancelled` BEFORE the `run_cancelled` SSE event is
+/// broadcast. Otherwise a concurrent `GET /sessions` snapshot taken
+/// between broadcast and state flip sees `has_active_run: true` while
+/// the SSE feed has already moved past the `ended` event — a subsequent
+/// `last_event_id`-based reconnect won't replay it and the sidebar's
+/// "active" indicator stays stuck.
+///
+/// **Interposer pattern (Tim's review on PR #925):** the previous version
+/// of this test asserted on `has_active_runs` *after* `execute_run().await`
+/// returned, by which point both the broadcast and the flip have completed
+/// regardless of internal ordering — a regression of the production fix
+/// could not be detected. This version uses the producer's own suspension
+/// point as a synchronisation barrier:
+///
+/// - Spawn `execute_run` on a separate task so we can interleave with it.
+/// - Subscribe a session sender and `recv()` events as they arrive.
+/// - The pre-cancel branch fires `send_event(run_cancelled)` then
+///   `send_agent_event(session_activity_ended).await`. The latter awaits
+///   on `event_log.log_event(...)`, which is a real suspension point.
+/// - When our consumer task is woken by the `run_cancelled` enqueue, the
+///   producer has just suspended on that next `send_agent_event` await
+///   and has NOT yet called `mark_run_as_cancelled` (in the pre-fix
+///   order; in the post-fix order, the flip happened *before* the
+///   broadcast).
+/// - We probe `has_active_runs` synchronously upon recv. Post-fix:
+///   observes `false` (flip already done). Pre-fix: observes `true`
+///   (flip not yet done) — test fails.
+///
+/// **Reverting the four-site reorder in `lifecycle.rs` causes this test
+/// to fail.** The probe captures the cross-event-boundary state, not the
+/// terminal state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_cancelled_run_flips_state_before_broadcasting() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-895-pre-cancel");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "noop".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    cancel_token.cancel();
+
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    let exec_state = state.clone();
+    let exec_input = run.input.clone();
+    let exec_handle = tokio::spawn(async move {
+        super::lifecycle::execute_run(
+            exec_state,
+            super::RunParams {
+                run_id,
+                session_id,
+                agent_id,
+                input: exec_input,
+                overrides: super::RunOverrides::default(),
+                context_id: "test-895-pre-cancel".to_string(),
+                cancel_token,
+                is_peer_message: false,
+                is_system_triggered: false,
+                input_pre_persisted: false,
+            },
+        )
+        .await
+    });
+
+    // Interposer: the `recv()` future resolves the moment our test task
+    // is scheduled by tokio in response to the producer's session-fanout
+    // (the synchronous `senders.retain` inside `RunManager::send_event`).
+    // In single-threaded tokio the producer reaches its next suspension
+    // point — `send_agent_event(session_activity_ended).await` for the
+    // pre-cancel branch — before yielding to us. Pre-fix, the flip
+    // happens AFTER `send_agent_event` returns; post-fix, it happens
+    // BEFORE the original `send_event(run_cancelled)`. So at the
+    // moment we observe `run_cancelled`, the flip is either pending
+    // (pre-fix) or already done (post-fix), and `has_active_runs`
+    // reports the difference.
+    let mut probed_active: Option<bool> = None;
+    let mut saw_cancelled = false;
+    while let Some(event) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("test must observe events within timeout")
+    {
+        if event.event_type == "run_cancelled" {
+            saw_cancelled = true;
+            // SYNCHRONOUS probe at moment of receipt — no `.await`
+            // between recv() resolving and this read, so the producer
+            // is parked at its next suspension point and cannot have
+            // advanced past the broadcast.
+            probed_active = Some(state.run_manager.has_active_runs(session_id));
+            break;
+        }
+    }
+
+    // Drain remaining events so the producer can finish.
+    while session_rx.try_recv().is_ok() {}
+
+    exec_handle.await.expect("execute_run task must complete");
+
+    assert!(
+        saw_cancelled,
+        "expected a run_cancelled SSE event in pre-cancel path"
+    );
+    assert_eq!(
+        probed_active,
+        Some(false),
+        "has_active_runs must report false at the moment run_cancelled is \
+         observed by a session subscriber (pre-#895 race: probe sees \
+         has_active_runs=true while ended event has already fired). \
+         Reverting the lifecycle.rs reorder causes this assertion to fail."
+    );
+
+    let run_snapshot = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must exist after pre-cancellation");
+    assert_eq!(
+        run_snapshot.status,
+        RunStatus::Cancelled,
+        "run status must be Cancelled after the run completes"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Regression test for #895 (happy-path-start, interposer pattern): the
+/// run state must be flipped to `Running` BEFORE the `run_started` SSE
+/// event is broadcast. The four-site reorder in `lifecycle.rs` exists
+/// for symmetry with the `ended` paths so all `mark_run_as_*` sites
+/// have the same shape (the actual user-visible race lives on the
+/// `ended` side — see the issue body).
+///
+/// We can't pin the invariant via `has_active_runs` alone because both
+/// `Queued` and `Running` count as active, so the field is `true` in
+/// both pre-fix and post-fix orderings at this point. Instead we pin
+/// `run.status`, which differs: pre-fix the run is still `Queued` at
+/// broadcast time; post-fix it is already `Running`.
+///
+/// **Interposer pattern:** spawn `execute_run`, subscribe a session
+/// sender, and probe `run.status` synchronously the moment
+/// `run_started` arrives. Between `send_event(run_started)` and
+/// `mark_run_as_running` in pre-fix code there is a real suspension
+/// point — `send_agent_event(session_activity_started).await` — so the
+/// consumer task is scheduled BEFORE the producer reaches the flip.
+/// Multi-thread runtime is required so the consumer runs while the
+/// producer is suspended on that next await.
+///
+/// We don't need a working LLM — `runtime.run()` will fail with the
+/// dummy default LLM client, but the failure happens AFTER the
+/// `run_started` broadcast and the cancel-token below puts an upper
+/// bound on the test runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn happy_path_start_flips_state_before_broadcasting() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-895-happy-start");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "test".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    let exec_state = state.clone();
+    let exec_input = run.input.clone();
+    let exec_handle = tokio::spawn(async move {
+        super::lifecycle::execute_run(
+            exec_state,
+            super::RunParams {
+                run_id,
+                session_id,
+                agent_id,
+                input: exec_input,
+                overrides: super::RunOverrides::default(),
+                context_id: "test-895-happy-start".to_string(),
+                cancel_token,
+                is_peer_message: false,
+                is_system_triggered: false,
+                input_pre_persisted: false,
+            },
+        )
+        .await
+    });
+
+    // Interposer: synchronously probe `has_active_runs` the instant
+    // `run_started` lands on our session feed. The producer is parked
+    // at the next suspension point (the `send_agent_event(
+    // session_activity_started).await` inside `execute_run` in pre-fix
+    // code, which precedes `mark_run_as_running`). Post-fix, the flip
+    // happened before the broadcast, so the probe sees `true`. Pre-fix,
+    // the flip is still ahead of the producer's instruction pointer,
+    // so the probe sees `false`.
+    let mut probed_status: Option<RunStatus> = None;
+    let mut saw_started = false;
+    while let Some(event) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), session_rx.recv())
+            .await
+            .expect("test must observe run_started within timeout")
+    {
+        if event.event_type == "run_started" {
+            saw_started = true;
+            // SYNCHRONOUS probe — see comment in the pre-cancel test.
+            // We probe `run.status` rather than `has_active_runs` because
+            // both `Queued` and `Running` count as active, so the latter
+            // does not distinguish pre-fix (`Queued` at broadcast) from
+            // post-fix (`Running` at broadcast).
+            probed_status = state.run_manager.get_run(run_id).map(|r| r.status);
+            break;
+        }
+    }
+
+    assert!(
+        saw_started,
+        "expected a run_started SSE event in happy-path-start"
+    );
+    assert_eq!(
+        probed_status,
+        Some(RunStatus::Running),
+        "run.status must be Running at the moment run_started is observed \
+         by a session subscriber (pre-#895 race: probe sees status=Queued \
+         even though the started event has fired). Reverting the \
+         lifecycle.rs reorder causes this assertion to fail."
+    );
+
+    // Tear down the spawned execute_run. We've already proven the
+    // start-broadcast invariant; let the runtime fail/cancel out so the
+    // test exits promptly. The default LLM has no API key so
+    // `runtime.run()` will return an error within a few hundred ms;
+    // cancelling the run accelerates that.
+    state.run_manager.cancel_run(run_id);
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), exec_handle)
+        .await
+        .expect("execute_run task must complete within 15s after cancellation");
+
+    shutdown_token.cancel();
+}
+
+/// Smoke test (NOT a regression pin) covering the call sequence for the
+/// post-execute cancel arms (`Err(Cancelled)` and
+/// `Err(CancelledWithToolCalls)`) at the `RunManager` boundary. Driving
+/// this branch via `execute_run` requires a real LLM, and unlike the
+/// pre-cancel and happy-path-start branches there is no intermediate
+/// `send_agent_event(...)` between `send_event(run_cancelled)` and
+/// `mark_run_as_cancelled`, so the interposer pattern used in the two
+/// tests above cannot reach this branch deterministically without
+/// modifying production code.
+///
+/// What this test verifies: that callers using the post-#895 sequence
+/// (`mark_run_as_cancelled` then `send_event`) see `has_active_runs ==
+/// false` upon receiving the `run_cancelled` event. This is a sanity
+/// check that the call sequence itself is correct, NOT that the
+/// production code emits events in that sequence — the test mirrors the
+/// post-fix order in its own body, so reverting `lifecycle.rs` cannot
+/// break it. See the follow-up issue filed against v0.2.3 for an
+/// extension of #895 to the `mark_run_as_completed`/`mark_run_as_failed`
+/// sites that also need interposer-based regression pins.
+#[tokio::test]
+async fn smoke_post_execute_cancel_flips_state_at_run_manager_boundary() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-895-post-cancel");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "test".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+    assert!(state.run_manager.has_active_runs(session_id));
+
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    // Mirror the post-#895 ordering: flip state first, broadcast second.
+    state.run_manager.mark_run_as_cancelled(run_id);
+    state
+        .run_manager
+        .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
+        .await;
+
+    let event = session_rx
+        .recv()
+        .await
+        .expect("run_cancelled event must be delivered");
+    assert_eq!(event.event_type, "run_cancelled");
+
+    assert!(
+        !state.run_manager.has_active_runs(session_id),
+        "has_active_runs must be false after mark_run_as_cancelled \
+         (sanity check on the RunManager boundary, NOT a regression pin \
+         on lifecycle.rs ordering)"
+    );
+    let run_snapshot = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must exist after mark_run_as_cancelled");
+    assert_eq!(
+        run_snapshot.status,
+        RunStatus::Cancelled,
+        "run status must be Cancelled after mark_run_as_cancelled"
+    );
+
+    shutdown_token.cancel();
+}
+
 /// `GET /agents/{agent_id}/events` returns 404 when the `agent_id` does
 /// not resolve to a record in the registry, and crucially does NOT
 /// register a sender for the unknown agent (#887).

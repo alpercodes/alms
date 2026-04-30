@@ -598,6 +598,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // shutdown -- they would increment the in-flight counter and potentially
     // outlive the drain timeout.
     if cancel_token.is_cancelled() || state.shutdown_token.is_cancelled() {
+        // #895: flip the run state BEFORE broadcasting the SSE event.
+        // `RunManager::get_session_runs()` uses `RunState` membership to
+        // compute `has_active_run` for `GET /sessions` (#890 / #892). If we
+        // broadcast first and flip second, a concurrent client opening
+        // `GET /sessions` between the broadcast and the state flip observes
+        // `has_active_run: true` while the SSE feed has already moved past
+        // the `ended` event — a subsequent `last_event_id`-based reconnect
+        // won't replay it, and the sidebar's "active" indicator stays stuck
+        // until the next unrelated event clears it. Flipping first makes
+        // "a client that sees `has_active_run: true`" a strict prefix of
+        // "a client that has the started event but not the ended event,"
+        // closing the race. The change is internal to the gateway lock
+        // window — the SSE event ordering visible to clients is identical.
+        state.run_manager.mark_run_as_cancelled(run_id);
         state
             .run_manager
             .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
@@ -622,7 +636,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 SseEventData::session_activity_ended(session_id, run_id, agent_id),
             )
             .await;
-        state.run_manager.mark_run_as_cancelled(run_id);
         state.run_manager.remove_cancel_token(run_id);
         state.run_manager.remove_senders(run_id);
         info!("Run {} was cancelled before starting", run_id.0);
@@ -632,6 +645,16 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // Events are persisted to the event log regardless of whether an SSE
     // client is connected. The SSE client registers its own sender when it
     // calls GET /runs/{id}/events.
+
+    // #895: flip the run state BEFORE broadcasting `run_started`. See the
+    // pre-cancel branch above for the full rationale — broadcasting first
+    // leaves a narrow window where a concurrent `GET /sessions` observes
+    // `has_active_run: false` (the run hasn't been added to the running
+    // set yet) while the `started` event has already been delivered, so
+    // the sidebar misses the activity. Flipping first guarantees that
+    // any `has_active_run: true` observation is followed by an `ended`
+    // event the client will see.
+    state.run_manager.mark_run_as_running(run_id);
 
     state
         .run_manager
@@ -655,8 +678,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             SseEventData::session_activity_started(session_id, run_id, agent_id),
         )
         .await;
-
-    state.run_manager.mark_run_as_running(run_id);
 
     // Resolve per-agent config (model, posture) from the agent registry,
     // then layer per-run overrides on top.
@@ -1358,12 +1379,16 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             info!("Run {} completed successfully", run_id.0);
         }
         Err(alms_core::AlmsError::Cancelled) => {
+            // #895: flip the run state BEFORE broadcasting `run_cancelled`.
+            // See the pre-cancel branch at the top of this function for the
+            // full rationale; the same race applies to every started/ended
+            // boundary that uses `mark_run_as_*` to drive `has_active_run`.
+            state.run_manager.mark_run_as_cancelled(run_id);
+
             state
                 .run_manager
                 .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
                 .await;
-
-            state.run_manager.mark_run_as_cancelled(run_id);
 
             if !is_internal_context_id(&context_id) {
                 // Tagged with `kind: "error"` so the runtime's
@@ -1412,12 +1437,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // Persist partial tool call records even though the run was cancelled.
             persist_tool_calls(&tool_calls);
 
+            // #895: flip the run state BEFORE broadcasting `run_cancelled`.
+            // See the pre-cancel branch at the top of this function for the
+            // full rationale.
+            state.run_manager.mark_run_as_cancelled(run_id);
+
             state
                 .run_manager
                 .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
                 .await;
-
-            state.run_manager.mark_run_as_cancelled(run_id);
 
             if !is_internal_context_id(&context_id) {
                 // See `kind: "error"` rationale in the `Cancelled` arm above

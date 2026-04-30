@@ -1467,6 +1467,33 @@ impl AgentRuntime {
                         // `run_tool_calls` does not synthesise a duplicate
                         // (#846 protocol).
                         unregister_inflight(inflight, invocation_id);
+                        // #893: persist the cancellation to the audit log.
+                        // Sibling gap to #815 in the same approval gate. Without
+                        // this append, the audit trail cannot distinguish
+                        // "approval pending then run cancelled" from "approval
+                        // never happened" — operators see a `tool_start` with
+                        // no corresponding audit row. Using `AuditDecision::Deny`
+                        // (rather than introducing a new variant) keeps the
+                        // schema/wire shape stable; the error string is the
+                        // discriminator that lets log queries separate
+                        // user-denial (#815) from cancellation here.
+                        let cancel_reason = format!(
+                            "Tool '{}' approval cancelled by run cancellation",
+                            name
+                        );
+                        let _ = session_manager.append_audit(
+                            session_id,
+                            AuditEvent {
+                                session_id,
+                                run_id: self.run_id,
+                                tool: name.to_string(),
+                                decision: AuditDecision::Deny,
+                                params: args.clone(),
+                                result: None,
+                                error: Some(cancel_reason),
+                                timestamp: alms_core::Timestamp::now(),
+                            },
+                        );
                         let _ = sender.send(RuntimeEvent::ToolEnd {
                             invocation_id,
                             ok: false,
@@ -1481,15 +1508,37 @@ impl AgentRuntime {
                 match decision_rx.await {
                     Ok(v) => v,
                     Err(_) => {
-                        // Approval channel closed without resolution. This
-                        // is a structural error and the cancel-token branch
-                        // is not active here (`inflight` is `None`), so no
-                        // bookkeeping is required. Pre-existing behaviour:
-                        // the run unwinds without a matching ToolEnd. That
-                        // gap is out of scope for #846.
-                        return Err(alms_core::AlmsError::ToolExecution(
-                            "Approval channel closed".to_string(),
-                        ));
+                        // #894: persist the channel-closed unwind to the audit
+                        // log. Sibling gap to #815 / #893. Without this append,
+                        // a closed approval channel (approver disconnected,
+                        // gateway shutting down, channel adapter dropped the
+                        // receiver) leaves a `tool_start` with no audit row and
+                        // operators have to dig through logs to figure out why.
+                        // Using `AuditDecision::Deny` mirrors the pattern from
+                        // #815 (user denial) and #893 (cancellation) — the
+                        // error string is the discriminator. The cancel-token
+                        // branch is not active here (`inflight` is `None`), so
+                        // no inflight unregister is needed.
+                        //
+                        // The error string mirrors the `Tool '{name}'` prefix
+                        // shape used by #815 and #893 so log queries that
+                        // filter by tool-name prefix catch all three audit-
+                        // Deny paths (Tim's review on PR #925).
+                        let closed_reason = format!("Tool '{}' approval channel closed", name);
+                        let _ = session_manager.append_audit(
+                            session_id,
+                            AuditEvent {
+                                session_id,
+                                run_id: self.run_id,
+                                tool: name.to_string(),
+                                decision: AuditDecision::Deny,
+                                params: args.clone(),
+                                result: None,
+                                error: Some(closed_reason.clone()),
+                                timestamp: alms_core::Timestamp::now(),
+                            },
+                        );
+                        return Err(alms_core::AlmsError::ToolExecution(closed_reason));
                     }
                 }
             };

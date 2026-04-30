@@ -647,6 +647,274 @@ async fn test_cancel_during_approval_wait_emits_tool_end() {
     }
 }
 
+/// Regression test for #893: cancellation during approval-wait must append
+/// an audit entry. Sibling gap to #815 in the same approval gate. Without
+/// the fix, cancelling a run while the approval prompt is open emits a
+/// `tool_end` event but leaves the audit log silent — operators can't
+/// distinguish "approval pending then run cancelled" from "approval never
+/// happened".
+#[tokio::test]
+async fn test_cancel_during_approval_wait_appends_audit_entry() {
+    use alms_core::AuditDecision;
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // `math` is NOT auto-approved, so the approval gate fires.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+    let cancel_token = CancellationToken::new();
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: Some(cancel_token.clone()),
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+    };
+
+    let tool_call = ToolCall::new("tc-cancel", "math", r#"{"operation":"add","a":1,"b":2}"#);
+    let invocation_id = uuid::Uuid::new_v4();
+
+    // Wait for `ApprovalRequired`, then cancel without resolving the
+    // decision channel. Hold onto `decision_tx` so dropping it doesn't
+    // unblock the await as "denied" before the cancel arm fires.
+    let cancel_token_clone = cancel_token.clone();
+    let approval_handler = tokio::spawn(async move {
+        let mut held_tx = None;
+        while let Some(event) = rx.recv().await {
+            if let RuntimeEvent::ApprovalRequired { decision_tx, .. } = event {
+                held_tx = Some(decision_tx);
+                cancel_token_clone.cancel();
+                break;
+            }
+        }
+        held_tx
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call,
+            invocation_id,
+            &session_manager,
+            session.id,
+            None,
+        )
+        .await;
+
+    drop(runtime);
+
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+
+    let _held_tx = approval_handler.await.unwrap();
+
+    // The audit log must contain exactly one entry: a `Deny` decision for
+    // the `math` tool with a cancellation-shaped error string. Before the
+    // #893 fix this assertion failed with an empty audit log.
+    let audit = session_manager.get_audit(session.id).unwrap();
+    let deny_entries: Vec<_> = audit
+        .iter()
+        .filter(|e| matches!(e.decision, AuditDecision::Deny))
+        .collect();
+    assert_eq!(
+        deny_entries.len(),
+        1,
+        "expected exactly one Deny audit entry for the cancelled approval, \
+         got {} (full audit: {:#?})",
+        deny_entries.len(),
+        audit
+    );
+    let entry = deny_entries[0];
+    assert_eq!(entry.tool, "math", "deny entry must record tool name");
+    // VERBATIM equality on the error string (Tim's review on PR #925):
+    // the audit-log discriminator IS the error string text — log-query
+    // tooling that greps for "approval cancelled by run cancellation"
+    // would silently break under a future wording refactor if the test
+    // only asserted on a substring. Pin the wire shape exactly.
+    assert_eq!(
+        entry.error.as_deref(),
+        Some("Tool 'math' approval cancelled by run cancellation"),
+        "deny entry error string must match the exact #893 discriminator"
+    );
+    assert!(
+        entry.result.is_none(),
+        "deny entry must not carry a result payload, got {:?}",
+        entry.result
+    );
+    assert_eq!(
+        entry.params,
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+        "deny entry must record the parsed tool arguments"
+    );
+    // No `Allow` entry should sneak in for a cancelled call.
+    assert!(
+        !audit
+            .iter()
+            .any(|e| matches!(e.decision, AuditDecision::Allow)),
+        "cancelled call must not produce an Allow audit entry"
+    );
+}
+
+/// Regression test for #894: when the approval `decision_rx` is closed
+/// without a value (no cancel token branch active because `inflight`
+/// is `None`), the function returns `Err(ToolExecution("Approval channel
+/// closed"))` and must append an audit entry. Sibling gap to #815 / #893.
+/// Mirrors the shape of `test_denied_approval_appends_deny_audit_entry`.
+#[tokio::test]
+async fn test_approval_channel_closed_appends_audit_entry() {
+    use alms_core::AuditDecision;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+
+    // Note: `cancel_token: None` is critical here — the channel-closed
+    // branch only fires in the `else` arm of the cancel-token check.
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: None,
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+    };
+
+    let tool_call = ToolCall::new("tc-closed", "math", r#"{"operation":"add","a":1,"b":2}"#);
+
+    // Drop the approval `decision_tx` without sending a value. This closes
+    // the channel and triggers the `Err(_)` branch of `decision_rx.await`.
+    let close_handler = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let RuntimeEvent::ApprovalRequired { decision_tx, .. } = event {
+                drop(decision_tx);
+                break;
+            }
+        }
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call,
+            uuid::Uuid::new_v4(),
+            &session_manager,
+            session.id,
+            None,
+        )
+        .await;
+
+    close_handler.await.unwrap();
+
+    match &result {
+        Err(AlmsError::ToolExecution(msg)) => {
+            // VERBATIM equality on the wire-shape error string — see
+            // the analogous comment in
+            // `test_cancel_during_approval_wait_appends_audit_entry`
+            // and Tim's review on PR #925.
+            assert_eq!(
+                msg, "Tool 'math' approval channel closed",
+                "expected exact channel-closed error message, got {:?}",
+                msg
+            );
+        }
+        other => panic!(
+            "expected ToolExecution(\"Tool 'math' approval channel closed\"), got {:?}",
+            other
+        ),
+    }
+
+    let audit = session_manager.get_audit(session.id).unwrap();
+    let deny_entries: Vec<_> = audit
+        .iter()
+        .filter(|e| matches!(e.decision, AuditDecision::Deny))
+        .collect();
+    assert_eq!(
+        deny_entries.len(),
+        1,
+        "expected exactly one Deny audit entry for the channel-closed unwind, \
+         got {} (full audit: {:#?})",
+        deny_entries.len(),
+        audit
+    );
+    let entry = deny_entries[0];
+    assert_eq!(entry.tool, "math", "deny entry must record tool name");
+    // VERBATIM equality on the audit error string. The discriminator-by-
+    // error-string approach (#815 / #893 / #894) means log-query tooling
+    // depends on this exact text — pin it. See Tim's review on PR #925.
+    assert_eq!(
+        entry.error.as_deref(),
+        Some("Tool 'math' approval channel closed"),
+        "deny entry error string must match the exact #894 discriminator"
+    );
+    assert!(
+        entry.result.is_none(),
+        "deny entry must not carry a result payload, got {:?}",
+        entry.result
+    );
+    assert_eq!(
+        entry.params,
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+        "deny entry must record the parsed tool arguments"
+    );
+    assert!(
+        !audit
+            .iter()
+            .any(|e| matches!(e.decision, AuditDecision::Allow)),
+        "channel-closed call must not produce an Allow audit entry"
+    );
+}
+
 #[tokio::test]
 async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
     // Prove that an auto-approved tool (echo) executes successfully under
