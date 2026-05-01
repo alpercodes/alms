@@ -570,6 +570,50 @@ fn truncate_error_for_peer(err: &dyn std::fmt::Display) -> String {
     truncated
 }
 
+/// Broadcast a `run_queue_position` SSE event for every still-queued run on
+/// the given agent (#831).
+///
+/// Called when the head of the per-agent queue is about to advance — i.e. at
+/// every terminal exit of [`execute_run`]. For each remaining `Queued` run
+/// (FIFO-sorted), assigns a 1-indexed position matching the same semantic as
+/// `run_created.queued_behind` and fans the event out on both the per-run and
+/// per-session SSE feeds.
+///
+/// Position numbering: if any `Running` run still exists for the agent, the
+/// first queued run is position 1 (next up); otherwise the first queued run
+/// is position 0 and is **skipped** — `run_started` will fire for it shortly.
+/// Subsequent queued runs are numbered sequentially.
+///
+/// The broadcast also tolerates the narrow TOCTOU window between
+/// `pending.fetch_sub(1)` inside the queue handler and `mark_run_as_running`:
+/// in either ordering the FIFO-sorted Queued runs still produce monotonically
+/// decremented positions matching what a fresh `create_run` would compute via
+/// `pending_count + agent_has_running_run`.
+async fn broadcast_queue_advance(state: &AppState, agent_id: AgentId) {
+    let queued = state.run_manager.list_queued_for_agent(agent_id);
+    if queued.is_empty() {
+        return;
+    }
+    let running_offset = usize::from(state.run_manager.agent_has_running_run(agent_id));
+    for (idx, run) in queued.iter().enumerate() {
+        let position = idx + running_offset;
+        if position == 0 {
+            // First queued run is about to be picked up by the queue handler;
+            // `run_started` will fire for it shortly, so we don't emit a
+            // misleading position-zero event.
+            continue;
+        }
+        state
+            .run_manager
+            .send_event(
+                run.run_id,
+                run.session_id,
+                SseEventData::run_queue_position(run.run_id, run.session_id, agent_id, position),
+            )
+            .await;
+    }
+}
+
 /// Execute a run in background, forwarding runtime events to SSE.
 #[instrument(level = "info", skip(state, params), fields(run_id = %params.run_id.0, session_id = %params.session_id.0))]
 pub(super) async fn execute_run(state: AppState, params: RunParams) {
@@ -639,6 +683,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         state.run_manager.remove_cancel_token(run_id);
         state.run_manager.remove_senders(run_id);
         info!("Run {} was cancelled before starting", run_id.0);
+        // The queue head is advancing — fan out updated positions to any
+        // remaining queued runs on this agent (#831).
+        broadcast_queue_advance(&state, agent_id).await;
         return;
     }
 
@@ -892,6 +939,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
+            // The queue head is advancing — fan out updated positions to any
+            // remaining queued runs on this agent (#831).
+            broadcast_queue_advance(&state, agent_id).await;
             return;
         }
     }
@@ -1635,6 +1685,11 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     state.run_manager.remove_cancel_token(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
+    // The queue head is advancing — fan out updated positions to any
+    // remaining queued runs on this agent (#831). Emitted once per run
+    // regardless of which terminal arm was taken (Ok / Cancelled /
+    // CancelledWithToolCalls / FailedWithToolCalls / generic Err).
+    broadcast_queue_advance(&state, agent_id).await;
     // `_in_flight_guard` dropped here — signals drain waiters that this run is done.
 }
 
@@ -1645,10 +1700,32 @@ pub async fn get_run_status(
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
     match state.run_manager.get_run(run_id) {
         Some(run) => {
+            let agent_id = run.agent_id;
+            let is_queued = matches!(run.status, alms_core::RunStatus::Queued);
             let mut resp = RunStatusResponse::from(run);
             // Attach tool call count if SQLite is available.
             if let Some(store) = state.session_manager.store() {
                 resp.tool_call_count = store.count_tool_calls(run_id).ok();
+            }
+            // Attach the live 1-indexed queue position so a late-joining
+            // client (page reload, polling fallback) can render "Queued —
+            // position N" without waiting for the next SSE decrement (#831).
+            //
+            // Position uses the same FIFO-rank-among-Queued + running-offset
+            // formulation as the SSE `run_queue_position` broadcast, so the
+            // two surfaces always agree. `None` is returned when the run is
+            // running/terminal, or when the run somehow isn't in the queued
+            // set (defensive: shouldn't happen for status == Queued but the
+            // FIFO sort tolerates it gracefully).
+            if is_queued {
+                let queued = state.run_manager.list_queued_for_agent(agent_id);
+                let running_offset = usize::from(state.run_manager.agent_has_running_run(agent_id));
+                if let Some(idx) = queued.iter().position(|r| r.run_id == run_id) {
+                    let pos = idx + running_offset;
+                    if pos > 0 {
+                        resp.queue_position = Some(pos);
+                    }
+                }
             }
             Ok(Json(resp))
         }

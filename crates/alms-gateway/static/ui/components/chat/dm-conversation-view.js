@@ -278,7 +278,10 @@ export function DmConversationView() {
                     if (m.pending) {
                         thinkLabel = 'Sending\u2026';
                     } else if (m.queuedBehind > 0) {
-                        thinkLabel = 'Queued \u2014 waiting for agent\u2026';
+                        // 1-indexed: queuedBehind === 1 means "next up".
+                        // Source: run_created.queued_behind (initial) and
+                        // run_queue_position SSE decrements (#831).
+                        thinkLabel = `Queued \u2014 position ${m.queuedBehind}\u2026`;
                     } else if (m.source) {
                         // Show which agent is thinking when source info is available.
                         // DM thinking messages carry source like "peer:AgentName".

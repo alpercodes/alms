@@ -341,6 +341,17 @@ pub struct RunStatusResponse {
     /// Number of tool call records stored for this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_count: Option<u32>,
+    /// 1-indexed queue position when the run is `Queued` (#831).
+    ///
+    /// `Some(N)` means there are still N runs ahead of this one in the
+    /// per-agent queue (matching the same semantic as
+    /// `run_created.queued_behind` and `run_queue_position.position` SSE
+    /// events). `None` means the run is not currently queued (running,
+    /// completed, failed, cancelled, or queue lookup not available — for
+    /// example the bare `From<Run>` conversion which does not know about
+    /// the live queue depth).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<usize>,
 }
 
 impl From<Run> for RunStatusResponse {
@@ -361,6 +372,7 @@ impl From<Run> for RunStatusResponse {
             job_id: run.job_id,
             parent_run_id: run.parent_run_id,
             tool_call_count: None,
+            queue_position: None,
         }
     }
 }

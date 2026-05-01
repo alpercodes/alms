@@ -367,6 +367,26 @@ impl RunManager {
         })
     }
 
+    /// List `Queued` runs for an agent, sorted FIFO by `created_at` ASC.
+    ///
+    /// Used by the queue-position broadcast (#831) to compute each queued
+    /// run's 1-indexed position after the head of the per-agent queue
+    /// advances. The FIFO ordering matches the actual dispatch order
+    /// enforced by `SessionQueue`.
+    pub fn list_queued_for_agent(&self, agent_id: alms_core::AgentId) -> Vec<Run> {
+        let mut runs: Vec<Run> = self
+            .runs
+            .iter()
+            .filter(|e| {
+                let r = e.value();
+                r.agent_id == agent_id && matches!(r.status, alms_core::RunStatus::Queued)
+            })
+            .map(|e| e.value().clone())
+            .collect();
+        runs.sort_by_key(|r| r.created_at);
+        runs
+    }
+
     /// Returns `true` if any `Running` run exists for the given agent.
     ///
     /// Used by `create_run` to compute `queued_behind` accurately: the per-agent

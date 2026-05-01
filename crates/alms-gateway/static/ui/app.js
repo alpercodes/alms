@@ -242,7 +242,10 @@ function ChatView() {
                             label = 'Sending';
                             indicatorClass = 'pending-indicator';
                         } else if (m.queuedBehind > 0) {
-                            label = 'Queued \u2014 waiting for agent\u2026';
+                            // 1-indexed: queuedBehind === 1 means "next up".
+                            // Source: run_created.queued_behind (initial)
+                            // and run_queue_position SSE decrements (#831).
+                            label = `Queued \u2014 position ${m.queuedBehind}`;
                             indicatorClass = 'queued-indicator';
                         } else if (m.source && m.source.startsWith('peer:')) {
                             label = 'Replying to message from ' + m.source.slice(5);

@@ -405,6 +405,7 @@ Notes:
 - `usage` is `null` for failed/cancelled runs.
 - `parent_run_id` is present (as a UUID string) for subagent runs; absent for top-level runs (uses `skip_serializing_if = "Option::is_none"`).
 - `tool_call_count` (optional integer) — number of tool call records stored for this run. Present when SQLite persistence is enabled. Use `GET /runs/{run_id}/tool-calls` to retrieve the full records.
+- `queue_position` (optional integer, 1-indexed) — present and `>= 1` only while `status == "queued"`. Carries the same semantic as `run_created.queued_behind` and the live `run_queue_position` SSE event so a late-joining client (page reload, polling) can render the queued state without waiting for the next decrement. Absent for running/terminal runs.
 
 ### 5.3 Stream a run (SSE-first)
 `GET /runs/{run_id}/events`
@@ -453,6 +454,18 @@ The `source` field is omitted when not set. `is_notification` is `true` when the
 `run_started`
 ```json
 { "run_id": "<uuid>", "session_id": "<uuid>", "ts": "..." }
+```
+
+`run_queue_position`
+Emitted when the head of the per-agent queue advances (a run finishes, fails, or is cancelled) so still-queued runs can show a live decrementing position in the UI. The event fires once per remaining queued run on the same agent each time the head advances. `position` matches the same 1-indexed semantic as `run_created.queued_behind` — `1` means "next up" (one run still ahead). No event is emitted with `position == 0`; the existing `run_started` event signals that a run has left the queue and is now executing. Fanned out on both the per-run and per-session SSE feeds.
+```json
+{
+  "run_id": "<uuid>",
+  "session_id": "<uuid>",
+  "agent_id": "<uuid>",
+  "position": 1,
+  "ts": "..."
+}
 ```
 
 `token_delta`

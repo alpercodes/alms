@@ -3134,3 +3134,429 @@ async fn stream_agent_events_returns_404_for_unknown_agent_and_does_not_leak_sen
 
     shutdown_token.cancel();
 }
+
+// ---------------------------------------------------------------------------
+// #831 — queue position display
+//
+// `run_created.queued_behind` already carries the initial 1-indexed position
+// at enqueue time. The new `run_queue_position` SSE event broadcasts the
+// updated position to each remaining queued run on a per-agent queue when the
+// head advances (a run finishes / fails / is cancelled). `GET /runs/{id}`
+// also exposes the live position via the `queue_position` field so a
+// late-joining client can render the queued state without waiting for the
+// next decrement.
+// ---------------------------------------------------------------------------
+
+/// Helper: extract `position` field from a `run_queue_position` event for a
+/// given run_id. Returns `None` if no such event exists in the slice.
+fn find_position_event(events: &[SseEventData], run_id: alms_core::RunId) -> Option<u64> {
+    events
+        .iter()
+        .filter(|e| e.event_type == "run_queue_position")
+        .filter(|e| {
+            e.data
+                .get("run_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s == run_id.0.to_string())
+                .unwrap_or(false)
+        })
+        .filter_map(|e| e.data.get("position").and_then(|v| v.as_u64()))
+        .last()
+}
+
+/// When 3 runs are enqueued back-to-back against a busy agent, the
+/// `run_created.queued_behind` field carries each run's initial 1-indexed
+/// position: 1, 2, 3 (i.e. one run ahead of the first new one — the already-
+/// running one — two ahead of the second, three ahead of the third).
+///
+/// Acceptance: this is what frontend consumes via `data.queued_behind` to
+/// render the initial "Queued — position N" chip without waiting for the
+/// first decrement event.
+#[tokio::test]
+async fn three_back_to_back_queued_runs_get_distinct_initial_positions() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let session_id = session.id;
+
+    // Simulate an already-running run on this agent so subsequent
+    // create_run calls all see queued_behind > 0.
+    let running_run = Run::new(session_id, agent_id, "prior task".into());
+    let running_run_id = running_run.run_id;
+    state.run_manager.insert_run(running_run);
+    state.run_manager.mark_run_as_running(running_run_id);
+
+    // Park a never-completing work item on the per-agent SessionQueue so
+    // subsequent `create_run` calls actually queue behind it (the queue
+    // handler is otherwise idle and would dispatch them immediately).
+    let (_park_release_tx, park_release_rx) = tokio::sync::oneshot::channel::<()>();
+    state.agent_queue.enqueue(
+        agent_id,
+        Box::pin(async move {
+            let _ = park_release_rx.await;
+        }),
+    );
+    // Yield so the queue handler picks up the parked item.
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+
+    let mut rx = subscribe_session(&state, session_id);
+
+    let mut queued_behind_values = Vec::new();
+    for i in 0..3 {
+        let req = CreateRunRequest {
+            session_id,
+            agent_id: None,
+            input: RunInput::Text {
+                text: format!("queued message {i}"),
+            },
+            model: None,
+            max_tokens: None,
+            posture: None,
+            provider: None,
+            debug_mode: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+        };
+        let _ = super::lifecycle::create_run(State(state.clone()), Json(req))
+            .await
+            .expect("create_run should succeed");
+
+        // Drain the run_created event for this iteration before continuing.
+        // Each create_run synchronously emits its run_created on the session
+        // SSE feed before returning.
+        tokio::task::yield_now().await;
+        let events = drain_events(&mut rx);
+        let run_created = events
+            .iter()
+            .find(|e| e.event_type == "run_created")
+            .unwrap_or_else(|| panic!("expected run_created on iteration {i}"));
+        queued_behind_values.push(
+            run_created
+                .data
+                .get("queued_behind")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+        );
+    }
+
+    // Cancel shutdown so the spawned execute_run tasks exit fast.
+    shutdown_token.cancel();
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Each subsequent run sees +1 ahead of it. The exact starting value
+    // depends on whether the running run plus the parked queue item are
+    // both visible; what matters is monotonic distinct values.
+    assert_eq!(
+        queued_behind_values.len(),
+        3,
+        "expected 3 run_created events"
+    );
+    assert!(
+        queued_behind_values[0] >= 1,
+        "first queued run should be position >= 1; got {:?}",
+        queued_behind_values
+    );
+    assert!(
+        queued_behind_values[1] > queued_behind_values[0],
+        "second queued run should be deeper than first; got {:?}",
+        queued_behind_values
+    );
+    assert!(
+        queued_behind_values[2] > queued_behind_values[1],
+        "third queued run should be deeper than second; got {:?}",
+        queued_behind_values
+    );
+}
+
+/// Driving `execute_run` to a terminal exit advances the per-agent queue
+/// head and broadcasts `run_queue_position` for every still-queued run on
+/// the same agent with a freshly-decremented position.
+///
+/// Three runs queued on the same agent: A (running-then-finishing), B and C
+/// (still queued). When A's `execute_run` completes (with a runtime-init
+/// failure since no real LLM is wired up — we use the early-fail path),
+/// the broadcast fires `run_queue_position` for B and C with the new
+/// positions.
+#[tokio::test]
+async fn execute_run_terminal_broadcasts_decremented_positions_to_remaining_queued() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "queue-pos-test");
+    let session_id = session.id;
+
+    // Create three queued runs, A, B, C, in FIFO order.
+    let a = Run::new(session_id, agent_id, "A".into());
+    let a_id = a.run_id;
+    state.run_manager.insert_run(a);
+    // Sleep enough for `created_at` to differ deterministically.
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let b = Run::new(session_id, agent_id, "B".into());
+    let b_id = b.run_id;
+    state.run_manager.insert_run(b);
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let c = Run::new(session_id, agent_id, "C".into());
+    let c_id = c.run_id;
+    state.run_manager.insert_run(c);
+
+    let mut rx = subscribe_session(&state, session_id);
+
+    // Use the shutdown_token early-exit branch in execute_run: by cancelling
+    // shutdown, A's execute_run hits the early return and `broadcast_queue_advance`
+    // fires for the still-queued B and C without needing a real LLM.
+    shutdown_token.cancel();
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(a_id, cancel_token.clone());
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id: a_id,
+            session_id,
+            agent_id,
+            input: "A".to_string(),
+            overrides: super::RunOverrides::default(),
+            context_id: "queue-pos-test".to_string(),
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    // Drain SSE events.
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut rx);
+
+    // B is the next-up after A: position 1 (no Running anymore — A is now
+    // Cancelled — so B at idx 0 with running_offset=0 would be position 0,
+    // skipped). C is at idx 1, position 1.
+    //
+    // Wait: with no Running run, B (idx 0) gets position 0 (skipped) and C
+    // (idx 1) gets position 1. But that means B is missing a decrement
+    // event — which is correct: B is "about to dequeue" and `run_started`
+    // is the proper signal for B's transition out of the queue. The frontend
+    // already handles `run_started` to clear the queued chip.
+    let b_position = find_position_event(&events, b_id);
+    let c_position = find_position_event(&events, c_id);
+
+    assert_eq!(
+        b_position, None,
+        "B is the head of the remaining queue — no run_queue_position should fire \
+         (run_started will signal its dequeue); got: {b_position:?}"
+    );
+    assert_eq!(
+        c_position,
+        Some(1),
+        "C should receive run_queue_position with position 1 after the head advanced; \
+         got: {c_position:?}"
+    );
+
+    // A itself should NOT receive a position update (it's now terminal).
+    let a_position = find_position_event(&events, a_id);
+    assert_eq!(
+        a_position, None,
+        "A is terminal — no run_queue_position should fire for it"
+    );
+}
+
+/// `GET /runs/{id}` exposes the live `queue_position` for a queued run so
+/// late-joining clients (page reload, polling fallback) can render the
+/// queued chip without waiting for the next SSE decrement.
+#[tokio::test]
+async fn get_run_status_returns_queue_position_for_queued_run() {
+    use axum::extract::{Path, State};
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "queue-status-test");
+    let session_id = session.id;
+
+    // One running run + two queued runs.
+    let running = Run::new(session_id, agent_id, "running".into());
+    let running_id = running.run_id;
+    state.run_manager.insert_run(running);
+    state.run_manager.mark_run_as_running(running_id);
+
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let q1 = Run::new(session_id, agent_id, "q1".into());
+    let q1_id = q1.run_id;
+    state.run_manager.insert_run(q1);
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let q2 = Run::new(session_id, agent_id, "q2".into());
+    let q2_id = q2.run_id;
+    state.run_manager.insert_run(q2);
+
+    // Queued #1 should be position 1 (next up — one Running ahead).
+    let resp_q1 = super::lifecycle::get_run_status(State(state.clone()), Path(q1_id))
+        .await
+        .expect("get_run_status should succeed for q1");
+    assert_eq!(resp_q1.0.queue_position, Some(1));
+    assert_eq!(resp_q1.0.status, RunStatus::Queued);
+
+    // Queued #2 should be position 2.
+    let resp_q2 = super::lifecycle::get_run_status(State(state.clone()), Path(q2_id))
+        .await
+        .expect("get_run_status should succeed for q2");
+    assert_eq!(resp_q2.0.queue_position, Some(2));
+
+    // Running run has no queue_position.
+    let resp_running = super::lifecycle::get_run_status(State(state.clone()), Path(running_id))
+        .await
+        .expect("get_run_status should succeed for running run");
+    assert_eq!(resp_running.0.queue_position, None);
+    assert_eq!(resp_running.0.status, RunStatus::Running);
+
+    shutdown_token.cancel();
+}
+
+/// When the only queued run is cancelled (no further runs behind it), the
+/// broadcast helper is a no-op — there's nothing left to update. This
+/// confirms the early-empty guard prevents wasted work / spurious events.
+#[tokio::test]
+async fn broadcast_queue_advance_is_noop_when_no_queued_runs_remain() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "single-cancel-test");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "single".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+
+    let mut rx = subscribe_session(&state, session_id);
+
+    // Drive execute_run via the pre-cancel branch.
+    shutdown_token.cancel();
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: "single".to_string(),
+            overrides: super::RunOverrides::default(),
+            context_id: "single-cancel-test".to_string(),
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    tokio::task::yield_now().await;
+    let events = drain_events(&mut rx);
+    assert!(
+        !events.iter().any(|e| e.event_type == "run_queue_position"),
+        "no run_queue_position events should fire when the queue is empty after \
+         the head exits; got: {:?}",
+        events.iter().map(|e| &e.event_type).collect::<Vec<_>>()
+    );
+}
+
+/// The Telegram path enqueues against the same `agent_queue` as HTTP runs
+/// (gateway.rs:644 calls `agent_queue.enqueue(agent_id, ...)`), so any
+/// pending Telegram work item factors into the `pending_count` used by
+/// `create_run` to compute `queued_behind`. This is the closest the gateway
+/// can come to "Telegram parity" without spinning up a real Telegram bot —
+/// the queue is shared and the position math sees the same number.
+#[tokio::test]
+async fn http_run_sees_pending_telegram_style_work_in_queued_behind() {
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let session_id = session.id;
+
+    // Park two opaque work items on the agent queue (mimicking Telegram-
+    // submitted messages, which use the same `state.agent_queue.enqueue`
+    // call site). The first one becomes the head; the second sits in the
+    // queue's mpsc channel as a true "pending" item.
+    let (_release_tx_1, release_rx_1) = tokio::sync::oneshot::channel::<()>();
+    let (_release_tx_2, release_rx_2) = tokio::sync::oneshot::channel::<()>();
+    state.agent_queue.enqueue(
+        agent_id,
+        Box::pin(async move {
+            let _ = release_rx_1.await;
+        }),
+    );
+    state.agent_queue.enqueue(
+        agent_id,
+        Box::pin(async move {
+            let _ = release_rx_2.await;
+        }),
+    );
+    // Let the queue handler pick up the head.
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+
+    let mut rx = subscribe_session(&state, session_id);
+
+    let req = CreateRunRequest {
+        session_id,
+        agent_id: None,
+        input: RunInput::Text {
+            text: "behind two telegram-style items".into(),
+        },
+        model: None,
+        max_tokens: None,
+        posture: None,
+        provider: None,
+        debug_mode: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+    };
+    let _ = super::lifecycle::create_run(State(state.clone()), Json(req))
+        .await
+        .expect("create_run should succeed");
+
+    shutdown_token.cancel();
+    tokio::task::yield_now().await;
+
+    let events = drain_events(&mut rx);
+    let run_created = events
+        .iter()
+        .find(|e| e.event_type == "run_created")
+        .expect("run_created should fire");
+    let queued_behind = run_created
+        .data
+        .get("queued_behind")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    // At minimum: the second parked item still sits as `pending` (not yet
+    // dequeued), giving queued_behind >= 1. The head item's status is not
+    // tracked via `Run` records (it's a raw work item, not a `Run`), so
+    // the +1-for-running term doesn't apply — but the `pending_count` term
+    // alone is enough to prove the shared queue is honoured.
+    assert!(
+        queued_behind >= 1,
+        "HTTP run behind parked queue items should see queued_behind >= 1; \
+         got {queued_behind}"
+    );
+}

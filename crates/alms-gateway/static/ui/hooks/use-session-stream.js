@@ -343,8 +343,14 @@ export function openSessionStream(sessionId, opts) {
                     // showing the agent's current activity (e.g. a DM with
                     // another peer).  The inline thinking indicator handles
                     // the queued state via queuedBehind. (#693)
+                    //
+                    // runId is stored on the thinking message so the
+                    // `run_queue_position` SSE handler (#831) can locate
+                    // the right indicator to decrement when an upstream
+                    // run completes.
                     appendMessage({
-                        id: nextMsgId(), type: 'thinking', source: data.source, queuedBehind,
+                        id: nextMsgId(), type: 'thinking', source: data.source,
+                        queuedBehind, runId: data.run_id,
                     });
                 });
             } else {
@@ -377,10 +383,15 @@ export function openSessionStream(sessionId, opts) {
             // show thinking indicator with source context. The inline
             // indicator handles queue state via queuedBehind; the header
             // bar keeps showing the agent's current activity. (#693)
+            //
+            // runId is stored on the thinking message so the
+            // `run_queue_position` SSE handler (#831) can locate the right
+            // indicator to decrement when an upstream run completes.
             batch(() => {
                 activeRunId.value = data.run_id;
                 appendMessage({
-                    id: nextMsgId(), type: 'thinking', source: data.source, queuedBehind,
+                    id: nextMsgId(), type: 'thinking', source: data.source,
+                    queuedBehind, runId: data.run_id,
                 });
             });
         } else if (queuedBehind > 0) {
@@ -390,11 +401,15 @@ export function openSessionStream(sessionId, opts) {
             // activity); the inline indicator shows queue status. (#693)
             // Clear `pending` so it transitions from "Sending..." to
             // "Queued..." immediately. (#704)
+            //
+            // runId is stamped onto the thinking message so the
+            // `run_queue_position` SSE handler (#831) can locate the right
+            // indicator to decrement when an upstream run completes.
             batch(() => {
                 activeRunId.value = data.run_id;
                 updateMessage(
                     m => m.type === 'thinking' && m.pending,
-                    m => ({ ...m, queuedBehind, pending: false }),
+                    m => ({ ...m, queuedBehind, pending: false, runId: data.run_id }),
                 );
             });
         } else {
@@ -464,6 +479,30 @@ export function openSessionStream(sessionId, opts) {
             setAgentPhase('calling_llm', null);
         }
         bumpRunListGeneration();
+    });
+
+    // -- run_queue_position: live queue-position decrement (#831) --
+    //
+    // Fires every time a run ahead of this one in the per-agent queue
+    // finishes, fails, or is cancelled. `position` is 1-indexed and
+    // matches the semantic of `run_created.queued_behind` ("1 = next up").
+    // Position 0 is never emitted -- the existing `run_started` handler
+    // clears the chip when this run is dequeued.
+    //
+    // The run is identified by `data.run_id`, which both the `run_created`
+    // SSE handler and the `loadSession` reload path stamp onto the
+    // thinking-indicator message. A defensive `!m.runId` fallback handles
+    // any legacy / unstamped indicator (sessions only ever have one queued
+    // run on screen at a time, so the fallback can't update the wrong row).
+    on('run_queue_position', (e) => {
+        const data = JSON.parse(e.data);
+        const position = typeof data.position === 'number' ? data.position : 0;
+        if (position <= 0) return; // defensive -- backend never emits 0
+        updateMessage(
+            m => m.type === 'thinking' && m.queuedBehind > 0
+                && (m.runId === data.run_id || !m.runId),
+            m => ({ ...m, queuedBehind: position }),
+        );
     });
 
     // -- status: agent phase update (live indicator in header bar) --

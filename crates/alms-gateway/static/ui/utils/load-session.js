@@ -19,7 +19,7 @@
  */
 
 import { getSessionMessages, getSessionToolCalls } from '../api/sessions.js';
-import { listRuns, listApprovals, listAgentRuns } from '../api/runs.js';
+import { listRuns, listApprovals, listAgentRuns, getRun } from '../api/runs.js';
 import { mapHistoryMessages, groupDmReasoningBlocks } from './history.js';
 import { normalizeApproval } from './approvals.js';
 import { chatMessages, nextMsgId } from '../state/chat.js';
@@ -227,10 +227,40 @@ export async function loadSession(sessionId, opts) {
         if (!chatMessages.value.some(m => m.type === 'thinking')) {
             const activeRun = runs.value.find(r => r.run_id === activeRunId.value);
             const isQueued = activeRun && activeRun.status === 'queued';
-            // For queued runs, set queuedBehind to at least 1 so the
-            // indicator shows the queued state. The exact count is not
-            // available from the runs list, but >0 triggers the label.
-            appendMessage({ id: nextMsgId(), type: 'thinking', queuedBehind: isQueued ? 1 : 0 });
+            // For queued runs, fetch the live queue_position from the
+            // single-run endpoint so the chip shows "Queued — position N"
+            // immediately on reload instead of "position 1" until the next
+            // SSE decrement arrives. (#831)
+            //
+            // GET /runs/{id} returns `queue_position: Option<usize>` —
+            // skip_serializing_if = "Option::is_none" — present and >= 1
+            // only while the run is still queued. listRuns() does not
+            // expose this field today, so the secondary fetch is required.
+            //
+            // Falls back to position 1 ("next up") if:
+            //   - the run is queued but the fetch fails
+            //   - the run has no queue_position (race: dequeued between
+            //     listRuns and getRun) — `>0` triggers the chip and
+            //     run_started will clear it microseconds later anyway
+            let queuedBehind = isQueued ? 1 : 0;
+            if (isQueued) {
+                try {
+                    const runDetail = await getRun(activeRunId.value);
+                    if (isStale()) return;
+                    if (typeof runDetail?.queue_position === 'number'
+                        && runDetail.queue_position > 0) {
+                        queuedBehind = runDetail.queue_position;
+                    }
+                } catch (err) {
+                    console.warn(`[${logPrefix}] Failed to load queue position:`, err);
+                }
+            }
+            // Stamp runId so the live `run_queue_position` SSE handler can
+            // locate this indicator and decrement it in place.
+            appendMessage({
+                id: nextMsgId(), type: 'thinking',
+                queuedBehind, runId: activeRunId.value,
+            });
         }
 
         try {

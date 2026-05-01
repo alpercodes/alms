@@ -304,6 +304,39 @@ impl SseEventData {
         )
     }
 
+    /// Session-level + per-run: a queued run's position has changed.
+    ///
+    /// Emitted when the head of the per-agent queue advances (a run finishes,
+    /// fails, or is cancelled), so still-queued runs can show a live
+    /// decrementing position in the chat UI.
+    ///
+    /// `position` is **1-indexed**: position 1 means "next up" (one run still
+    /// ahead — typically the one that just started running). `position` always
+    /// matches the same number that `run_created.queued_behind` carried when
+    /// the run was first enqueued.
+    ///
+    /// No event is emitted with `position == 0`; the existing
+    /// `run_started` event is the signal that the run has left the queue and
+    /// is now executing. Once a queued run reaches a terminal state (cancelled
+    /// before dispatch), no further position events fire for that run.
+    pub fn run_queue_position(
+        run_id: RunId,
+        session_id: alms_core::SessionId,
+        agent_id: alms_core::AgentId,
+        position: usize,
+    ) -> Self {
+        Self::new(
+            "run_queue_position",
+            RunQueuePositionData {
+                run_id: run_id.0.to_string(),
+                session_id: session_id.0.to_string(),
+                agent_id: agent_id.0.to_string(),
+                position,
+                ts: Utc::now(),
+            },
+        )
+    }
+
     /// Session-level: a background subagent completed.
     pub fn subagent_completed(
         session_id: alms_core::SessionId,
@@ -787,6 +820,24 @@ struct RunCreatedData {
     /// Number of runs ahead of this one in the agent's queue.
     /// 0 means the run will start immediately.
     queued_behind: usize,
+    ts: DateTime<Utc>,
+}
+
+/// Wire payload for a `run_queue_position` SSE event — an updated 1-indexed
+/// queue position for a still-queued run after the head of the per-agent
+/// queue advanced.
+///
+/// `position` carries the same semantic as `run_created.queued_behind`
+/// (number of runs ahead of this one). The frontend can treat the two
+/// fields interchangeably for display purposes.
+#[derive(Debug, Serialize)]
+struct RunQueuePositionData {
+    run_id: String,
+    session_id: String,
+    agent_id: String,
+    /// 1-indexed: 1 means "next up" (one run still ahead), 2 means
+    /// "one queued ahead plus the running one," etc.
+    position: usize,
     ts: DateTime<Utc>,
 }
 
