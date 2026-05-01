@@ -8,8 +8,25 @@ import {
     formatProviderLabel,
 } from '../utils/model-display.js';
 import { BudgetTriState } from './budget-tri-state.js';
+import { activeAgent } from '../state/agents.js';
+import { OverrideMarker as SharedOverrideMarker } from '../utils/override-marker.js';
 
 const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
+
+/**
+ * Modal-flavoured wrapper around the shared <OverrideMarker> (#857
+ * follow-up). Hard-codes the modal's `settings-override-marker` class so
+ * existing call sites stay byte-identical; the composer surface uses its
+ * own wrapper with `composer-advanced-override-marker` instead. The
+ * tooltip-text generator and the underlying span markup live exactly once
+ * in `utils/override-marker.js`.
+ */
+function OverrideMarker({ active, label }) {
+    return html`<${SharedOverrideMarker}
+        active=${active}
+        label=${label}
+        className="settings-override-marker" />`;
+}
 
 /**
  * Modal-flavored class map for the shared <BudgetTriState>. Keeps the
@@ -188,9 +205,10 @@ function ApiKeysSection() {
 }
 
 /**
- * Count how many per-run overrides are currently active.
- * Exported so the header (and composer Advanced expander) can show an
- * indicator badge.
+ * Set of localSettings keys that currently carry a per-run override.
+ * Exported alongside activeOverrideCount so the badge counter (header
+ * gear, composer Advanced expander) and the per-field markers (settings
+ * modal, composer Advanced) draw from a single source of truth (#857).
  *
  * Includes `max_tokens`, `posture`, `debug_mode`, and the three
  * reasoning knobs (`thinking_budget_tokens`, `reasoning_effort`,
@@ -206,20 +224,42 @@ function ApiKeysSection() {
  * composer Advanced UIs until a deliberate "use this provider/model
  * for this chat" UX exists.
  */
-export const activeOverrideCount = computed(() => {
+export const activeOverrideKeys = computed(() => {
     const s = localSettings.value;
-    let count = 0;
-    if (s.max_tokens != null) count++;
-    if (s.posture) count++;
-    // debug_mode is now tri-state on the composer (#818 nit follow-up):
+    const keys = new Set();
+    if (s.max_tokens != null) keys.add('max_tokens');
+    if (s.posture) keys.add('posture');
+    // debug_mode is tri-state on the composer (#818 nit follow-up):
     // null = inherit, true = enable, false = explicit per-run disable.
     // Both `true` and `false` count as active overrides.
-    if (s.debug_mode != null) count++;
-    if (s.thinking_budget_tokens != null) count++;
-    if (s.reasoning_effort) count++;
-    if (s.gemini_thinking_budget != null) count++;
-    return count;
+    if (s.debug_mode != null) keys.add('debug_mode');
+    if (s.thinking_budget_tokens != null) keys.add('thinking_budget_tokens');
+    if (s.reasoning_effort) keys.add('reasoning_effort');
+    if (s.gemini_thinking_budget != null) keys.add('gemini_thinking_budget');
+    return keys;
 });
+
+/**
+ * Count how many per-run overrides are currently active.
+ * Exported so the header (and composer Advanced expander) can show an
+ * indicator badge. Backed by activeOverrideKeys so badge + per-field
+ * markers stay in lock-step (#857).
+ */
+export const activeOverrideCount = computed(() => activeOverrideKeys.value.size);
+
+/**
+ * Human-friendly labels for the keys in `activeOverrideKeys`. Used by
+ * the badge tooltip so hovering "5 overrides active" reveals exactly
+ * which knobs the count comes from (#857).
+ */
+export const OVERRIDE_LABELS = {
+    max_tokens: 'Max tokens',
+    posture: 'Posture',
+    debug_mode: 'Debug mode',
+    thinking_budget_tokens: 'Anthropic thinking budget',
+    reasoning_effort: 'OpenAI reasoning effort',
+    gemini_thinking_budget: 'Gemini thinking budget',
+};
 
 export function SettingsModal({ open, onClose }) {
     const provider = useSignal('');
@@ -564,12 +604,46 @@ export function SettingsModal({ open, onClose }) {
 
     const enabledTools = tools.enabled || defaults.enabled_tools || [];
 
+    // Per-run override marker set (#857) — drives the small accent dot
+    // next to each field label so the badge counter is traceable.
+    const overrideKeys = activeOverrideKeys.value;
+
+    // Active agent — threaded through the modal so the "Effective"
+    // display tells the truth about what the next run will use (#870).
+    // Resolution order matches the runtime's three-layer precedence:
+    //   per-run (localSettings) > per-agent (activeAgent) > server default.
+    const agent = activeAgent.value || {};
+
     // Effective values: what the next run will actually use.
-    // (Provider/model rows are disabled here so they no longer render an
-    // "Effective:" line — see #865 / Tim's v0.2.3 note on PR #868. The
-    // context-summary <${ModelDisplay} below still uses ModelDisplay.)
-    const effMaxTokens = maxTokens.value ? parseInt(maxTokens.value, 10) : (defaults.max_tokens || 100000);
-    const effPosture = posture.value || defaults.posture || 'guarded';
+    // Provider / model are disabled controls, so per-run never wins;
+    // for those two we fall through to per-agent then server default
+    // (#870 — restoring the Effective rows for these fields).
+    const effProvider = agent.provider || defaults.provider || 'openai';
+    const providerSource = agent.provider ? 'per-agent' : 'server default';
+    const effModel = agent.model || defaults.model || '';
+    const modelSource = agent.model ? 'per-agent' : 'server default';
+
+    // max_tokens: per-run > server default. There is no per-agent layer —
+    // `AgentRecord` does not (and has never) carried a `max_tokens` field
+    // (`agent_to_json` in agents.rs emits model / posture / provider /
+    // reasoning knobs but not max_tokens), so the runtime's three-layer
+    // precedence collapses to two layers for this knob. Tim's PR #926
+    // review caught the original three-layer treatment as dead defensive
+    // code referencing a field that has never existed on the wire.
+    const perRunMaxTokens = maxTokens.value ? parseInt(maxTokens.value, 10) : null;
+    const effMaxTokens = perRunMaxTokens != null
+        ? perRunMaxTokens
+        : (defaults.max_tokens || 100000);
+    const maxTokensSource = perRunMaxTokens != null ? 'per-run' : 'server default';
+
+    // Posture: per-run > per-agent > server default.
+    const effPosture = posture.value
+        || agent.posture
+        || defaults.posture
+        || 'guarded';
+    const postureSource = posture.value
+        ? 'per-run'
+        : (agent.posture ? 'per-agent' : 'server default');
 
     return html`
         <div class="settings-overlay open" onClick=${onOverlayClick}>
@@ -602,12 +676,15 @@ export function SettingsModal({ open, onClose }) {
                             <option value="anthropic">Anthropic</option>
                             <option value="openrouter">OpenRouter</option>
                         </select>
-                        <!-- No "Effective:" row while the control is disabled.
-                             It would only ever show the server default and
-                             would lie for any agent with a per-agent override
-                             (Tim's v0.2.3 note on PR #868). Threading the
-                             active agent's provider/model through the modal
-                             is a separate, larger change tracked for v0.2.3. -->
+                        <!-- Effective row threads activeAgent through so the
+                             value reflects per-agent overrides instead of
+                             always echoing the server default (#870). -->
+                        <span class="settings-effective">
+                            Effective: ${formatProviderLabel(effProvider)}
+                            <span class="settings-effective-source ${providerSource === 'per-agent' ? 'is-per-agent' : ''}">
+                                (${providerSource})
+                            </span>
+                        </span>
                     </div>
 
                     <div class="settings-row">
@@ -622,9 +699,15 @@ export function SettingsModal({ open, onClose }) {
                         <datalist id="model-suggestions">
                             ${MODEL_SUGGESTIONS.map(m => html`<option value=${m} />`)}
                         </datalist>
-                        <!-- No "Effective:" row while the control is disabled.
-                             Same rationale as the Provider row above — see
-                             Tim's v0.2.3 note on PR #868. -->
+                        <!-- Effective row threads activeAgent through so the
+                             value reflects per-agent overrides instead of
+                             being silent / echoing the server default (#870). -->
+                        <span class="settings-effective">
+                            Effective: ${effModel || '(unset)'}
+                            <span class="settings-effective-source ${modelSource === 'per-agent' ? 'is-per-agent' : ''}">
+                                (${modelSource})
+                            </span>
+                        </span>
                     </div>
                 </div>
                 <div class="settings-hint settings-overrides-disabled-note">
@@ -633,35 +716,50 @@ export function SettingsModal({ open, onClose }) {
 
                 <div class="settings-grid">
                     <div class="settings-row">
-                        <label class="settings-label">Max tokens</label>
+                        <label class="settings-label">
+                            Max tokens
+                            <${OverrideMarker} active=${overrideKeys.has('max_tokens')} label="Max tokens" />
+                        </label>
                         <input class="settings-input" type="number" min="1" step="1000"
                                placeholder=${defaults.max_tokens || 100000}
                                value=${maxTokens.value}
                                onInput=${e => { maxTokens.value = e.target.value; }} />
                         <span class="settings-effective">
                             Effective: ${fmt(effMaxTokens)}
+                            <span class="settings-effective-source ${maxTokensSource === 'per-run' ? 'is-per-run' : ''}">
+                                (${maxTokensSource})
+                            </span>
                         </span>
                     </div>
 
                     <div class="settings-row">
-                        <label class="settings-label">Posture</label>
+                        <label class="settings-label">
+                            Posture
+                            <${OverrideMarker} active=${overrideKeys.has('posture')} label="Posture" />
+                        </label>
                         <select class="settings-select"
                                 value=${posture.value}
                                 onChange=${e => { posture.value = e.target.value; }}>
-                            <option value="">Default (${defaults.posture || 'guarded'})</option>
+                            <option value="">Default (${agent.posture || defaults.posture || 'guarded'})</option>
                             <option value="full_control">full_control</option>
                             <option value="guarded">guarded</option>
                             <option value="autonomous">autonomous</option>
                         </select>
                         <span class="settings-effective">
                             Effective: ${effPosture}
+                            <span class="settings-effective-source ${postureSource === 'per-run' ? 'is-per-run' : postureSource === 'per-agent' ? 'is-per-agent' : ''}">
+                                (${postureSource})
+                            </span>
                         </span>
                     </div>
                 </div>
 
                 <div class="settings-grid">
                     <div class="settings-row">
-                        <label class="settings-label">Debug mode</label>
+                        <label class="settings-label">
+                            Debug mode
+                            <${OverrideMarker} active=${overrideKeys.has('debug_mode')} label="Debug mode" />
+                        </label>
                         <select class="settings-select"
                                 value=${debugMode.value}
                                 onChange=${e => { debugMode.value = e.target.value; }}>
@@ -699,13 +797,16 @@ export function SettingsModal({ open, onClose }) {
 
                     <div class="settings-grid">
                         <${BudgetTriState}
-                            label="Anthropic thinking budget"
+                            label=${html`Anthropic thinking budget <${OverrideMarker} active=${overrideKeys.has('thinking_budget_tokens')} label="Anthropic thinking budget" />`}
                             wireValue=${localSettings.value.thinking_budget_tokens}
                             onWrite=${(v) => saveSettings({ thinking_budget_tokens: v })}
                             classNames=${MODAL_TRISTATE_CLASSES} />
 
                         <div class="settings-row">
-                            <label class="settings-label">OpenAI reasoning effort</label>
+                            <label class="settings-label">
+                                OpenAI reasoning effort
+                                <${OverrideMarker} active=${overrideKeys.has('reasoning_effort')} label="OpenAI reasoning effort" />
+                            </label>
                             <select class="settings-select"
                                     value=${localSettings.value.reasoning_effort || ''}
                                     onChange=${e => saveSettings({ reasoning_effort: e.target.value || null })}>
@@ -719,7 +820,7 @@ export function SettingsModal({ open, onClose }) {
 
                     <div class="settings-grid">
                         <${BudgetTriState}
-                            label="Gemini thinking budget"
+                            label=${html`Gemini thinking budget <${OverrideMarker} active=${overrideKeys.has('gemini_thinking_budget')} label="Gemini thinking budget" />`}
                             wireValue=${localSettings.value.gemini_thinking_budget}
                             onWrite=${(v) => saveSettings({ gemini_thinking_budget: v })}
                             classNames=${MODAL_TRISTATE_CLASSES} />

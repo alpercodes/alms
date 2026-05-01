@@ -5,7 +5,8 @@ import { localSettings, serverDefaults } from '../state/settings.js';
 import { theme, toggleTheme } from '../state/theme.js';
 import { switchAgent } from '../hooks/use-boot.js';
 import { IconGear, IconSun, IconMoon, IconMenu, IconX } from '../utils/icons.js';
-import { activeOverrideCount } from './settings-modal.js';
+import { activeOverrideCount, activeOverrideKeys, OVERRIDE_LABELS } from './settings-modal.js';
+import { overrideTooltip as sharedOverrideTooltip } from '../utils/override-marker.js';
 import { bootRetryAvailable, runBoot } from '../state/loading.js';
 
 /** Sidebar open/close state — shared so Sidebar and backdrop can react */
@@ -29,6 +30,16 @@ const effectivePosture = computed(() => {
     const server = serverDefaults.value.posture;
     return local || server || 'guarded';
 });
+
+/**
+ * Local alias for the shared `overrideTooltip` (#857 / PR #926
+ * follow-up). The composer Advanced badge tooltip uses the same wording,
+ * so the generator lives once in `utils/override-marker.js` and both
+ * surfaces stay in lock-step automatically.
+ */
+function overrideTooltip(count, keys) {
+    return sharedOverrideTooltip(count, keys, OVERRIDE_LABELS);
+}
 
 export function Header({ onOpenSettings, status }) {
     const onAgentChange = (e) => {
@@ -96,7 +107,10 @@ export function Header({ onOpenSettings, status }) {
                     onClick=${onOpenSettings}>
                 <${IconGear} />
                 ${activeOverrideCount.value > 0 && html`
-                    <span class="settings-override-badge">${activeOverrideCount.value}</span>
+                    <span class="settings-override-badge"
+                          title=${overrideTooltip(activeOverrideCount.value, activeOverrideKeys.value)}>
+                        ${activeOverrideCount.value}
+                    </span>
                 `}
             </button>
         </header>

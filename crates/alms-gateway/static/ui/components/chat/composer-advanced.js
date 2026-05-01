@@ -1,8 +1,39 @@
 import { html, useSignal } from '../../deps.js';
 import { localSettings, saveSettings, serverDefaults } from '../../state/settings.js';
-import { activeOverrideCount } from '../settings-modal.js';
+import { activeOverrideCount, activeOverrideKeys, OVERRIDE_LABELS } from '../settings-modal.js';
+import { activeAgent } from '../../state/agents.js';
 import { IconChevronDown } from '../../utils/icons.js';
 import { BudgetTriState } from '../budget-tri-state.js';
+import {
+    OverrideMarker as SharedOverrideMarker,
+    overrideTooltip as sharedOverrideTooltip,
+} from '../../utils/override-marker.js';
+import { formatProviderLabel } from '../../utils/model-display.js';
+
+/**
+ * Composer-flavoured wrapper around the shared <OverrideMarker> (PR #926
+ * follow-up). Hard-codes the composer's `composer-advanced-override-marker`
+ * class so existing call sites stay byte-identical; the modal surface
+ * uses its own wrapper with `settings-override-marker` instead. The
+ * tooltip-text generator and the underlying span markup live exactly once
+ * in `utils/override-marker.js`.
+ */
+function OverrideMarker({ active, label }) {
+    return html`<${SharedOverrideMarker}
+        active=${active}
+        label=${label}
+        className="composer-advanced-override-marker" />`;
+}
+
+/**
+ * Thin local alias for the shared `overrideTooltip` so call sites don't
+ * have to thread `OVERRIDE_LABELS` at every invocation. Identical wording
+ * to the header's badge tooltip — the shared helper keeps the two
+ * surfaces in lock-step automatically.
+ */
+function overrideTooltip(count, keys) {
+    return sharedOverrideTooltip(count, keys, OVERRIDE_LABELS);
+}
 
 /**
  * Common model suggestions for the datalist (mirrors settings-modal.js).
@@ -43,6 +74,38 @@ export function ComposerAdvanced() {
     const s = localSettings.value;
     const defaults = serverDefaults.value || {};
     const overrideCount = activeOverrideCount.value;
+    const overrideKeys = activeOverrideKeys.value;
+
+    // Active agent — threaded through so the "Inherit (...)" placeholder
+    // on each dropdown reflects what the next run will actually use when
+    // the user picks the inherit option (PR #926 follow-up). Without
+    // this, the placeholder echoes the server default and lies for any
+    // agent with a per-agent override — exactly the dishonesty #870
+    // already fixed on the modal's Effective rows. Resolution mirrors the
+    // runtime's three-layer precedence: per-run > per-agent > server
+    // default. Per-run is the row's own value, so the inherit-target is
+    // per-agent ?? server default.
+    const agent = activeAgent.value || {};
+    // Source-suffix convention (PR #926 Tim re-review nit 1): only the
+    // per-agent layer carries an explicit suffix on the inherit hint.
+    // Server-default is the silent fallback — the word "Inherit" plus
+    // the section header ("Empty/Inherit falls back to the per-agent
+    // value (when set) or the server default") already convey that, so
+    // annotating "— server default" on every default-state row would
+    // just be redundant noise. Per-agent stays explicit because that's
+    // the unusual case the operator actually needs to notice.
+    const inheritProvider = agent.provider || defaults.provider || 'server default';
+    const inheritProviderFromAgent = !!agent.provider;
+    const inheritModel = agent.model || defaults.model || 'inherit';
+    const inheritPosture = agent.posture || defaults.posture || 'guarded';
+    const inheritPostureFromAgent = !!agent.posture;
+
+    // Reasoning knobs: per-agent layer is per-knob (#794, #768, #767).
+    // The composer mirrors the same three-layer precedence; per-run
+    // tri-state already handles `Some(0)` (explicit disable) vs `null`
+    // (inherit), so we only need a hint string for the inherit option.
+    const inheritReasoningEffort = agent.reasoning_effort || (defaults.llm?.openai?.reasoning_effort) || '';
+    const inheritReasoningEffortFromAgent = !!agent.reasoning_effort;
 
     // Provider / model per-run overrides are disabled (#865). The
     // controls remain visible-but-inert until a deliberate
@@ -107,7 +170,7 @@ export function ComposerAdvanced() {
                 <span class="composer-advanced-label">Advanced</span>
                 ${overrideCount > 0 && html`
                     <span class="composer-advanced-badge"
-                          title=${`${overrideCount} per-run override${overrideCount === 1 ? '' : 's'} active`}>
+                          title=${overrideTooltip(overrideCount, overrideKeys)}>
                         ${overrideCount}
                     </span>
                 `}
@@ -116,7 +179,7 @@ export function ComposerAdvanced() {
             ${open.value && html`
                 <div class="composer-advanced-panel">
                     <div class="composer-advanced-hint">
-                        Per-run overrides applied to every new message until reset. Empty/Inherit falls back to the server default.
+                        Per-run overrides applied to every new message until reset. Empty/Inherit falls back to the per-agent value (when set) or the server default.
                     </div>
 
                     <div class="composer-advanced-grid">
@@ -127,7 +190,7 @@ export function ComposerAdvanced() {
                                     disabled
                                     title="Per-run provider overrides are disabled. Configure provider on the agent."
                                     onChange=${onProviderChange}>
-                                <option value="">Inherit (${defaults.provider || 'server default'})</option>
+                                <option value="">Inherit (${formatProviderLabel(inheritProvider)}${inheritProviderFromAgent ? ' — from agent' : ''})</option>
                                 <option value="openai">openai</option>
                                 <option value="anthropic">anthropic</option>
                                 <option value="openrouter">openrouter</option>
@@ -140,8 +203,10 @@ export function ComposerAdvanced() {
                                    type="text"
                                    list="composer-advanced-models"
                                    disabled
-                                   title="Per-run model overrides are disabled. Configure model on the agent."
-                                   placeholder=${defaults.model || 'inherit'}
+                                   title=${agent.model
+                                       ? `Per-run model overrides are disabled. Inherit target: ${agent.model} (from agent).`
+                                       : "Per-run model overrides are disabled. Configure model on the agent."}
+                                   placeholder=${inheritModel}
                                    value=""
                                    onChange=${onModelChange} />
                             <datalist id="composer-advanced-models">
@@ -150,7 +215,10 @@ export function ComposerAdvanced() {
                         </label>
 
                         <label class="composer-advanced-row">
-                            <span class="composer-advanced-row-label">Max tokens</span>
+                            <span class="composer-advanced-row-label">
+                                Max tokens
+                                <${OverrideMarker} active=${overrideKeys.has('max_tokens')} label="Max tokens" />
+                            </span>
                             <input class="composer-advanced-input"
                                    type="number"
                                    min="1"
@@ -161,11 +229,14 @@ export function ComposerAdvanced() {
                         </label>
 
                         <label class="composer-advanced-row">
-                            <span class="composer-advanced-row-label">Posture</span>
+                            <span class="composer-advanced-row-label">
+                                Posture
+                                <${OverrideMarker} active=${overrideKeys.has('posture')} label="Posture" />
+                            </span>
                             <select class="composer-advanced-input"
                                     value=${s.posture || ''}
                                     onChange=${onPostureChange}>
-                                <option value="">Inherit (${defaults.posture || 'guarded'})</option>
+                                <option value="">Inherit (${inheritPosture}${inheritPostureFromAgent ? ' — from agent' : ''})</option>
                                 <option value="full_control">full_control</option>
                                 <option value="guarded">guarded</option>
                                 <option value="autonomous">autonomous</option>
@@ -183,16 +254,21 @@ export function ComposerAdvanced() {
 
                     <div class="composer-advanced-grid">
                         <${BudgetTriState}
-                            label="Anthropic thinking budget"
+                            label=${html`Anthropic thinking budget <${OverrideMarker} active=${overrideKeys.has('thinking_budget_tokens')} label="Anthropic thinking budget" />`}
                             wireValue=${s.thinking_budget_tokens}
                             onWrite=${writeThinking} />
 
                         <label class="composer-advanced-row">
-                            <span class="composer-advanced-row-label">OpenAI reasoning effort</span>
+                            <span class="composer-advanced-row-label">
+                                OpenAI reasoning effort
+                                <${OverrideMarker} active=${overrideKeys.has('reasoning_effort')} label="OpenAI reasoning effort" />
+                            </span>
                             <select class="composer-advanced-input"
                                     value=${s.reasoning_effort || ''}
                                     onChange=${onReasoningEffort}>
-                                <option value="">Inherit</option>
+                                <option value="">Inherit${inheritReasoningEffort
+                                    ? ` (${inheritReasoningEffort}${inheritReasoningEffortFromAgent ? ' — from agent' : ''})`
+                                    : ''}</option>
                                 ${REASONING_EFFORTS.map(e => html`
                                     <option value=${e} key=${e}>${e}</option>
                                 `)}
@@ -200,12 +276,15 @@ export function ComposerAdvanced() {
                         </label>
 
                         <${BudgetTriState}
-                            label="Gemini thinking budget"
+                            label=${html`Gemini thinking budget <${OverrideMarker} active=${overrideKeys.has('gemini_thinking_budget')} label="Gemini thinking budget" />`}
                             wireValue=${s.gemini_thinking_budget}
                             onWrite=${writeGemini} />
 
                         <label class="composer-advanced-row">
-                            <span class="composer-advanced-row-label">Debug mode</span>
+                            <span class="composer-advanced-row-label">
+                                Debug mode
+                                <${OverrideMarker} active=${overrideKeys.has('debug_mode')} label="Debug mode" />
+                            </span>
                             <select class="composer-advanced-input"
                                     value=${debugWireStr}
                                     onChange=${onDebugChange}>

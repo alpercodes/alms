@@ -33,7 +33,7 @@ export async function startRun(text, opts) {
     }
 
     appendMessage(
-        { id: nextMsgId(), type: 'user', role: 'user', text },
+        { id: nextMsgId(), type: 'user', role: 'user', text, ts: new Date().toISOString() },
         { id: nextMsgId(), type: 'thinking', pending: true },
     );
 

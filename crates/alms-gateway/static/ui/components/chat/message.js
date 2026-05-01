@@ -1,6 +1,21 @@
 import { html, useSignal, renderMarkdown } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
 import { filterMessages } from '../../state/chat-actions.js';
+import { fmtMessageTime } from '../../utils/format.js';
+
+/**
+ * Per-message timestamp (#855) — small grey text rendered next to the
+ * author label. The full ISO string is exposed as a `title` attribute so
+ * hovering reveals precise debug info. Returns null when no timestamp is
+ * available, so callers can render unconditionally without leaving an
+ * empty span behind.
+ */
+export function MessageTimestamp({ ts }) {
+    if (!ts) return null;
+    const formatted = fmtMessageTime(ts);
+    if (!formatted) return null;
+    return html`<span class="msg-timestamp" title=${ts}>${formatted}</span>`;
+}
 
 /**
  * Provider-neutral reasoning / extended-thinking panel.
@@ -40,7 +55,7 @@ export function ReasoningPanel({ text, live }) {
     `;
 }
 
-export function Message({ type, role, text, sealed, fromAgent, reasoning }) {
+export function Message({ type, role, text, sealed, fromAgent, reasoning, ts }) {
     const cls = type === 'user' ? 'user' : 'agent';
     const agentName = activeAgent.value?.name;
     // DM messages carry a fromAgent name — use it as the label so the
@@ -65,6 +80,13 @@ export function Message({ type, role, text, sealed, fromAgent, reasoning }) {
     // entirely when there's no text to show. (#853)
     const hasBody = typeof text === 'string' && text.trim().length > 0;
 
+    // Per-message timestamp (#855) sits in the same row as the author
+    // label so it stays unobtrusive and matches the conventional
+    // Slack/Discord pattern. Suppressed while a message is still streaming
+    // — the agent hasn't actually "spoken" yet, so the timestamp would
+    // attach itself to a partial response.
+    const showTs = ts && !streaming;
+
     // Render Markdown for sealed (finished) agent messages only.
     // While streaming, use plain text with pre-wrap to avoid running
     // marked.parse() + DOMPurify.sanitize() on every animation frame.
@@ -72,7 +94,10 @@ export function Message({ type, role, text, sealed, fromAgent, reasoning }) {
         const rendered = hasBody ? renderMarkdown(text) : '';
         return html`
             <div class="msg ${cls}">
-                <div class="msg-label">${label}</div>
+                <div class="msg-label-row">
+                    <div class="msg-label">${label}</div>
+                    ${showTs && html`<${MessageTimestamp} ts=${ts} />`}
+                </div>
                 ${panel}
                 ${hasBody && html`
                     <div class="msg-body markdown-body"
@@ -84,7 +109,10 @@ export function Message({ type, role, text, sealed, fromAgent, reasoning }) {
 
     return html`
         <div class="msg ${cls}">
-            <div class="msg-label">${label}</div>
+            <div class="msg-label-row">
+                <div class="msg-label">${label}</div>
+                ${showTs && html`<${MessageTimestamp} ts=${ts} />`}
+            </div>
             ${panel}
             ${(hasBody || streaming) && html`
                 <div class="msg-body ${streaming ? 'streaming-cursor' : ''}">${text}</div>

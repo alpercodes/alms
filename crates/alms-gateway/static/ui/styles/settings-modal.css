@@ -276,3 +276,40 @@
   gap: var(--space-1);
   flex-wrap: wrap;
 }
+
+/* Source pill on the Effective row (#870): tells the user whether the
+   resolved value comes from the per-run override, the per-agent record,
+   or the server default. The is-per-agent / is-per-run accents pull
+   the operator's eye toward "you've actively customised this". */
+.settings-effective-source {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  font-style: italic;
+}
+.settings-effective-source.is-per-agent { color: var(--accent-text); }
+.settings-effective-source.is-per-run { color: var(--accent-text); font-weight: 600; }
+
+/* Override marker dot (#857): tiny accent pip next to a settings-row
+   label so the user can see at a glance which fields contribute to the
+   per-run overrides badge counter. Mirrors the existing
+   .settings-override-badge accent for consistency.
+
+   The dot is a 6×6 colored circle next to the uppercase field label.
+   It inherits the tooltip from a `title` attribute on the parent span,
+   so screen readers announce it as "overridden" via aria-label and
+   sighted users see the field-specific tooltip on hover. */
+.settings-override-marker {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: var(--space-1);
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+.settings-label .settings-override-marker {
+  /* Tighten alignment within uppercase 2xs labels. */
+  margin-left: var(--space-1);
+  margin-bottom: 1px;
+}

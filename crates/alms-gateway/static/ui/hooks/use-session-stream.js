@@ -143,7 +143,12 @@ function flushDeltaBuffer() {
         if (last && last.type === 'agent' && !last.sealed) {
             copy[copy.length - 1] = { ...last, text: last.text + pending };
         } else {
-            copy.push({ id: nextMsgId(), type: 'agent', role: 'assistant', text: pending, sealed: false });
+            // Capture the timestamp of the first delta so the per-message
+            // timestamp (#855) reflects when the agent started speaking.
+            copy.push({
+                id: nextMsgId(), type: 'agent', role: 'assistant',
+                text: pending, sealed: false, ts: new Date().toISOString(),
+            });
         }
         // Defensive check: log if tool messages were lost during buffer flush.
         // The only messages that should be removed are 'thinking' indicators.
@@ -565,6 +570,9 @@ export function openSessionStream(sessionId, opts) {
                     text: '',
                     reasoning: delta,
                     sealed: false,
+                    // Per-message timestamp (#855) — captured at the start
+                    // of the assistant turn (first reasoning delta).
+                    ts: new Date().toISOString(),
                 });
             }
             return copy;
@@ -876,6 +884,10 @@ export function openSessionStream(sessionId, opts) {
                 fromAgent: data.from_agent,
                 fromAgentId: data.from_agent_id,
                 sealed: true,
+                // Per-message timestamp (#855) — prefer the SSE-supplied
+                // event ts so the rendered time matches the persisted
+                // message timestamp on the server side.
+                ts: data.ts || new Date().toISOString(),
             });
         });
     });

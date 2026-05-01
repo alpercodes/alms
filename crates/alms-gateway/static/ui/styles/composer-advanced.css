@@ -186,3 +186,18 @@
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* Override marker dot (#857): tiny accent pip next to a composer field
+   label so the user can see at a glance which fields contribute to the
+   per-run overrides badge counter. Mirrors the modal's .settings-override-marker
+   so both surfaces use the same visual language. */
+.composer-advanced-override-marker {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-left: var(--space-1);
+  vertical-align: middle;
+  flex-shrink: 0;
+}

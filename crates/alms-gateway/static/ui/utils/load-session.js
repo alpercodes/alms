@@ -197,6 +197,11 @@ export async function loadSession(sessionId, opts) {
                     role: 'user',
                     text: pending.text,
                     sealed: true,
+                    // Per-message timestamp (#855) — best-effort: the
+                    // pending message has no server timestamp yet, so use
+                    // the moment the message was queued (Date.now() saved
+                    // on `pending`) when available, falling back to "now".
+                    ts: pending.ts || new Date().toISOString(),
                 });
                 console.debug(`[${logPrefix}] re-injected pending user message for session`, sessionId);
             }

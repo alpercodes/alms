@@ -329,6 +329,10 @@ export function mapHistoryMessages(msgs, opts) {
                 reasoning,
                 // Carry the sender name so Message can show it as the label.
                 fromAgent: isDm ? m.metadata.from_agent : undefined,
+                // Per-message timestamp (#855) — passed through to the
+                // Message component so each chat row can render a discreet
+                // grey time stamp with the full ISO available on hover.
+                ts: m.timestamp || null,
             }, m.timestamp);
         } else if (m.type === 'tool_call') {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;
@@ -410,6 +414,8 @@ export function mapHistoryMessages(msgs, opts) {
                 runId: enrichedRunId || undefined,
                 isReasoning: isReasoning || undefined,
                 fromAgent,
+                // Per-message timestamp (#855) for tool rows.
+                ts: m.timestamp || null,
             }, m.timestamp);
         } else if (m.type === 'image') {
             // DM image messages use the same metadata pattern as text. (#546)
@@ -424,6 +430,8 @@ export function mapHistoryMessages(msgs, opts) {
                 alt: m.alt || '',
                 sealed: true,
                 fromAgent: isDmImg ? m.metadata.from_agent : undefined,
+                // Per-message timestamp (#855) for image rows.
+                ts: m.timestamp || null,
             }, m.timestamp);
         }
         // tool_result entries are consumed via resultMap -- skip them here
@@ -496,6 +504,8 @@ export function mapHistoryMessages(msgs, opts) {
                     // after reload when session-level persistence was lost.
                     isReasoning: isDm || undefined,
                     fromAgent,
+                    // Per-message timestamp (#855).
+                    ts: pair.call.timestamp || null,
                 },
                 ts: pair.call.timestamp || null,
             });
