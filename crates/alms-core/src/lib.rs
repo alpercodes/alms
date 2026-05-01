@@ -19,8 +19,9 @@ pub use registry::{
     migrate_workspace_dirs, validate_agent_name,
 };
 pub use run::{
-    CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunRegistrar, RunStatus,
-    RunStatusResponse, TokenUsage, ToolCallRecord, ToolCallRole, ran_ignore_message_successfully,
+    CreateRunRequest, CreateRunResponse, ResolvedRunConfig, Run, RunId, RunInput, RunRegistrar,
+    RunStatus, RunStatusResponse, TokenUsage, ToolCallRecord, ToolCallRole,
+    ran_ignore_message_successfully,
 };
 pub use source_label::{derive_source_label, truncate_to_char_boundary};
 

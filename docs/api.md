@@ -395,7 +395,15 @@ Why not `POST /agent/run`?
   "ts": "2026-02-11T07:52:05Z",
   "job_id": null,
   "parent_run_id": null,
-  "tool_call_count": 6
+  "tool_call_count": 6,
+  "resolved_config": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 4096,
+    "posture": "guarded",
+    "debug_mode": false,
+    "thinking_budget_tokens": 0
+  }
 }
 ```
 
@@ -406,6 +414,7 @@ Notes:
 - `parent_run_id` is present (as a UUID string) for subagent runs; absent for top-level runs (uses `skip_serializing_if = "Option::is_none"`).
 - `tool_call_count` (optional integer) — number of tool call records stored for this run. Present when SQLite persistence is enabled. Use `GET /runs/{run_id}/tool-calls` to retrieve the full records.
 - `queue_position` (optional integer, 1-indexed) — present and `>= 1` only while `status == "queued"`. Carries the same semantic as `run_created.queued_behind` and the live `run_queue_position` SSE event so a late-joining client (page reload, polling) can render the queued state without waiting for the next decrement. Absent for running/terminal runs.
+- `resolved_config` (optional object, #837) — snapshot of the **fully layered** (per-run > per-agent > server-default) config the run committed to at start-time. Absent for runs still queued, runs that never advanced past `queued` (e.g. queued-then-cancelled fast-path), and pre-#837 SQLite rows. Fields: `provider`, `model`, `max_tokens`, `posture`, `debug_mode` (always present); `thinking_budget_tokens` (Anthropic, `0` = disabled, always present as `u32`); `reasoning_effort` (OpenAI-compat, `"low"`/`"medium"`/`"high"`/`"minimal"`, omitted on the wire when no value reached the adapter); `gemini_thinking_budget` (Gemini, omitted on the wire when no value reached the adapter). The reasoning / thinking shape asymmetry is intentional — see the `ResolvedRunConfig` field docs in `crates/alms-core/src/run.rs` for the rationale (each field mirrors its underlying `AgentConfig` shape so the snapshot is a faithful projection of what the adapter saw).
 
 ### 5.3 Stream a run (SSE-first)
 `GET /runs/{run_id}/events`
@@ -453,8 +462,22 @@ The `source` field is omitted when not set. `is_notification` is `true` when the
 
 `run_started`
 ```json
-{ "run_id": "<uuid>", "session_id": "<uuid>", "ts": "..." }
+{
+  "run_id": "<uuid>",
+  "session_id": "<uuid>",
+  "ts": "...",
+  "resolved_config": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 4096,
+    "posture": "guarded",
+    "debug_mode": false,
+    "thinking_budget_tokens": 0
+  }
+}
 ```
+
+`resolved_config` (optional object, #837) carries the same snapshot surfaced on `GET /runs/{run_id}`. It is absent on the wire (uses `skip_serializing_if = "Option::is_none"`, **not** emitted as `null`) when the snapshot wasn't built — for example a queued-then-cancelled fast-path that never reached the `Queued -> Running` transition. Replay of `run_started` via SSE reconnect (`Last-Event-ID`) carries the same field identically to the live broadcast. See `GET /runs/{run_id}` notes above for the field shape and the rationale for the per-knob shape asymmetry.
 
 `run_queue_position`
 Emitted when the head of the per-agent queue advances (a run finishes, fails, or is cancelled) so still-queued runs can show a live decrementing position in the UI. The event fires once per remaining queued run on the same agent each time the head advances. `position` matches the same 1-indexed semantic as `run_created.queued_behind` — `1` means "next up" (one run still ahead). No event is emitted with `position == 0`; the existing `run_started` event signals that a run has left the queue and is now executing. Fanned out on both the per-run and per-session SSE feeds.

@@ -207,6 +207,30 @@ impl RunManager {
         self.persist_snapshot(run_id, snapshot);
     }
 
+    /// Atomically transition a run to `Running` AND attach the layered
+    /// run-config snapshot (#837), persisting both in a single SQLite
+    /// upsert.
+    ///
+    /// Mirrors [`Self::mark_run_as_running`] for the state-flip side and
+    /// adds [`alms_core::Run::set_resolved_config`] inside the same
+    /// DashMap-locked closure so the persisted snapshot always reflects
+    /// the new `Running` status with the snapshot present, never a torn
+    /// intermediate state. Used by `lifecycle::execute_run` after the
+    /// per-run > per-agent > server-default layering has settled and the
+    /// notification-run debug-flip has applied — i.e. the values the LLM
+    /// adapter actually uses on the wire.
+    pub fn mark_run_as_running_with_config(
+        &self,
+        run_id: RunId,
+        resolved_config: alms_core::ResolvedRunConfig,
+    ) {
+        let snapshot = self.modify_and_snapshot(run_id, |r| {
+            r.mark_running();
+            r.set_resolved_config(resolved_config);
+        });
+        self.persist_snapshot(run_id, snapshot);
+    }
+
     /// Atomically transition a run to Completed state and persist the snapshot.
     pub fn mark_run_as_completed(
         &self,

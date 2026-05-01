@@ -82,6 +82,31 @@ impl SseEventData {
                 run_id: run_id.0.to_string(),
                 session_id: session_id.0.to_string(),
                 ts: Utc::now(),
+                resolved_config: None,
+            },
+        )
+    }
+
+    /// `run_started` carrying the layered run-config snapshot (#837).
+    ///
+    /// Same shape as [`SseEventData::run_started`] plus a `resolved_config`
+    /// object identifying the provider / model / posture / budgets the
+    /// run actually committed to. Live observers can use this to confirm
+    /// "I set model X but Y was used"-class reports without log
+    /// correlation. Older clients that don't know about the new field
+    /// simply ignore it — the wire shape stays additive.
+    pub fn run_started_with_config(
+        run_id: RunId,
+        session_id: alms_core::SessionId,
+        resolved_config: alms_core::ResolvedRunConfig,
+    ) -> Self {
+        Self::new(
+            "run_started",
+            RunStartedData {
+                run_id: run_id.0.to_string(),
+                session_id: session_id.0.to_string(),
+                ts: Utc::now(),
+                resolved_config: Some(resolved_config),
             },
         )
     }
@@ -673,6 +698,13 @@ struct RunStartedData {
     run_id: String,
     session_id: String,
     ts: DateTime<Utc>,
+    /// Layered run-config snapshot (#837). `None` for pre-#837 callers
+    /// (and for the fallback `run_started` constructor that didn't have
+    /// a snapshot to attach). Skipped entirely on the wire when `None`
+    /// so the pre-#837 `run_started` payload stays byte-identical for
+    /// clients that haven't migrated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_config: Option<alms_core::ResolvedRunConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -981,6 +1013,57 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("run_started"));
         assert!(json.contains(&run_id.0.to_string()));
+    }
+
+    /// `run_started` without a layered config snapshot serializes
+    /// **without** the `resolved_config` field — pinned so older clients
+    /// that don't know about #837 see a byte-identical pre-#837 wire
+    /// shape (no stray `"resolved_config": null`).
+    #[test]
+    fn test_run_started_without_config_skips_resolved_config_field() {
+        let event = SseEventData::run_started(RunId::new(), alms_core::SessionId::new());
+        let value = serde_json::to_value(&event).unwrap();
+        let data = value
+            .get("data")
+            .and_then(|v| v.as_object())
+            .expect("event.data should be an object");
+        assert!(
+            data.get("resolved_config").is_none(),
+            "resolved_config must be skipped when None — got {value}"
+        );
+    }
+
+    /// `run_started_with_config` carries the layered snapshot on the
+    /// wire under the field names the issue specifies (#837).
+    #[test]
+    fn test_run_started_with_config_includes_snapshot() {
+        let event = SseEventData::run_started_with_config(
+            RunId::new(),
+            alms_core::SessionId::new(),
+            alms_core::ResolvedRunConfig {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-20250514".into(),
+                max_tokens: 4096,
+                posture: "guarded".into(),
+                debug_mode: false,
+                thinking_budget_tokens: 0,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+            },
+        );
+        let value = serde_json::to_value(&event).unwrap();
+        let cfg = &value["data"]["resolved_config"];
+        assert_eq!(cfg["provider"], "anthropic");
+        assert_eq!(cfg["model"], "claude-sonnet-4-20250514");
+        assert_eq!(cfg["max_tokens"], 4096);
+        assert_eq!(cfg["posture"], "guarded");
+        assert_eq!(cfg["debug_mode"], false);
+        assert_eq!(cfg["thinking_budget_tokens"], 0);
+        // Optional fields skip-serialize when None — pinned so the wire
+        // doesn't gain stray nulls for runs that didn't engage Gemini /
+        // OpenAI reasoning.
+        assert!(cfg.get("reasoning_effort").is_none());
+        assert!(cfg.get("gemini_thinking_budget").is_none());
     }
 
     #[test]

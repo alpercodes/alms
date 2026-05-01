@@ -308,6 +308,39 @@ struct MergedConfig {
     model_override: Option<String>,
 }
 
+/// Snapshot the **fully layered** run config for triage persistence (#837).
+///
+/// Called from `lifecycle::execute_run` after `apply_overrides`,
+/// `apply_per_run_llm_overrides`, `resolve_posture_for_run`, and the
+/// system-triggered notification debug-flip have all settled — i.e. the
+/// `agent_config` and `llm` passed in here carry the values the LLM
+/// adapter is about to send on the wire.
+///
+/// Reads `provider()` and `default_model()` from the resolved
+/// [`alms_runtime::LlmClient`] (which threaded per-agent and per-run
+/// model / provider overrides through `with_provider_and_secrets` and
+/// `with_model`); the remaining fields come from the merged
+/// [`alms_runtime::AgentConfig`].
+///
+/// Pure function — kept here next to `apply_overrides` /
+/// `apply_per_run_llm_overrides` so the layering primitives all live in
+/// one place and can be unit-tested without spinning up an `AppState`.
+pub(crate) fn build_resolved_config(
+    agent_config: &alms_runtime::AgentConfig,
+    llm: &alms_runtime::LlmClient,
+) -> alms_core::ResolvedRunConfig {
+    alms_core::ResolvedRunConfig {
+        provider: llm.provider().to_string(),
+        model: llm.default_model().to_string(),
+        max_tokens: agent_config.max_tokens,
+        posture: agent_config.posture.to_string(),
+        debug_mode: agent_config.debug_mode,
+        thinking_budget_tokens: agent_config.anthropic_thinking_budget,
+        reasoning_effort: agent_config.openai_reasoning_effort,
+        gemini_thinking_budget: agent_config.gemini_thinking_budget,
+    }
+}
+
 /// Pure config merging: server defaults -> per-agent overrides -> per-run overrides.
 ///
 /// Returns the merged `AgentConfig` and an optional model override string.
@@ -2510,6 +2543,170 @@ mod tests {
         assert!(
             find_user_facing_session(&mgr, agent_id).is_none(),
             "should return None when no sessions exist at all"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_resolved_config tests (#837)
+    //
+    // These mirror the model-override tests above (`resolve_agent_config` +
+    // `apply_per_run_llm_overrides` end-to-end) but run the result through
+    // `build_resolved_config` to confirm the snapshot reflects the
+    // **effective** values the LLM adapter will actually use. Crucial for
+    // triage of "I set model X but Y was used"-class reports — the snapshot
+    // must agree with the adapter, not with the raw per-run override.
+    // -----------------------------------------------------------------------
+
+    /// Per-agent model lands on the snapshot after layering. This is the
+    /// scenario the issue's first acceptance test exercises: PATCH a per-
+    /// agent model, start a run, confirm the snapshot's `model` matches
+    /// the PATCHed value.
+    #[test]
+    fn test_resolved_config_snapshots_per_agent_model() {
+        let mut record = test_agent(Some("per-agent-claude-sonnet-4"), None);
+        record.is_default = true;
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+        let server_llm = server_default_llm("server-default-model");
+        let secrets = empty_secrets();
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let llm = apply_per_run_llm_overrides(resolved.llm, &RunOverrides::default(), &secrets);
+        let merged = apply_overrides(resolved.agent_config, None, &RunOverrides::default());
+
+        let snapshot = build_resolved_config(&merged.agent_config, &llm);
+        assert_eq!(
+            snapshot.model, "per-agent-claude-sonnet-4",
+            "snapshot.model must reflect the per-agent override (the value the adapter sends on the wire)"
+        );
+        // Provider falls through unchanged because the agent record has
+        // no provider override; pinned so the snapshot's provider field
+        // tracks the effective wire provider.
+        assert_eq!(snapshot.provider, "openai");
+    }
+
+    /// Per-run model override beats per-agent in the snapshot. The
+    /// issue's second acceptance test: pass per-run model, confirm the
+    /// snapshot reflects the per-run value, not the per-agent fallback.
+    #[test]
+    fn test_resolved_config_snapshots_per_run_model_over_per_agent() {
+        let mut record = test_agent(Some("per-agent-model"), None);
+        record.is_default = true;
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+        let server_llm = server_default_llm("server-default-model");
+        let secrets = empty_secrets();
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let overrides = RunOverrides {
+            model: Some("per-run-model".into()),
+            ..RunOverrides::default()
+        };
+        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
+        let merged = apply_overrides(resolved.agent_config, None, &overrides);
+
+        let snapshot = build_resolved_config(&merged.agent_config, &llm);
+        assert_eq!(
+            snapshot.model, "per-run-model",
+            "snapshot.model must reflect the per-run override (highest precedence)"
+        );
+    }
+
+    /// No overrides at any layer surfaces the server default in the
+    /// snapshot. Pinned so the `From<Run>` / `GET /runs/{id}` triage
+    /// surface always agrees with the adapter's view of "what model was
+    /// actually used".
+    #[test]
+    fn test_resolved_config_snapshots_server_default_when_no_overrides() {
+        let mut record = test_agent(None, None);
+        record.is_default = true;
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+        let server_llm = server_default_llm("server-default-model");
+        let secrets = empty_secrets();
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let overrides = RunOverrides::default();
+        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
+        let merged = apply_overrides(resolved.agent_config, None, &overrides);
+
+        let snapshot = build_resolved_config(&merged.agent_config, &llm);
+        assert_eq!(snapshot.model, "server-default-model");
+        assert_eq!(snapshot.provider, "openai");
+    }
+
+    /// The snapshot's posture / max_tokens / debug_mode reflect the
+    /// merged `AgentConfig`. Per-run posture beats per-agent posture
+    /// here, exactly the layering pattern the issue calls out.
+    #[test]
+    fn test_resolved_config_snapshots_posture_and_max_tokens_layering() {
+        let agent = test_agent(None, Some("guarded"));
+        let overrides = RunOverrides {
+            max_tokens: Some(7777),
+            posture: Some("autonomous".into()),
+            debug_mode: Some(true),
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(base_config(), Some(&agent), &overrides);
+        let server_llm = server_default_llm("any-model");
+
+        let snapshot = build_resolved_config(&merged.agent_config, &server_llm);
+        assert_eq!(snapshot.posture, "autonomous", "per-run posture wins");
+        assert_eq!(snapshot.max_tokens, 7777, "per-run max_tokens wins");
+        assert!(snapshot.debug_mode, "per-run debug_mode wins");
+    }
+
+    /// Reasoning / thinking budgets layer through to the snapshot in
+    /// exactly the same per-run > per-agent > server-default order
+    /// (#767 / #768 / #794). These three knobs are the long-tail of
+    /// "config got dropped between layer X and the wire" bugs the
+    /// snapshot is meant to triage.
+    #[test]
+    fn test_resolved_config_snapshots_reasoning_and_thinking_budgets() {
+        use alms_core::config::ReasoningEffort;
+
+        let mut agent = test_agent(None, None);
+        agent.thinking_budget_tokens = Some(2048); // per-agent Anthropic
+        agent.reasoning_effort = Some(ReasoningEffort::Low); // per-agent OpenAI
+        agent.gemini_thinking_budget = Some(1024); // per-agent Gemini
+
+        // Per-run overrides beat per-agent for all three knobs.
+        let overrides = RunOverrides {
+            thinking_budget_tokens: Some(8192),
+            reasoning_effort: Some(ReasoningEffort::High),
+            gemini_thinking_budget: Some(4096),
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(base_config(), Some(&agent), &overrides);
+        let server_llm = server_default_llm("any-model");
+
+        let snapshot = build_resolved_config(&merged.agent_config, &server_llm);
+        assert_eq!(snapshot.thinking_budget_tokens, 8192);
+        assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::High));
+        assert_eq!(snapshot.gemini_thinking_budget, Some(4096));
+    }
+
+    /// `Some(0)` per-run thinking budget is an explicit per-run disable
+    /// (not "use default" — see comment in `apply_overrides`). Snapshot
+    /// must record the literal `0` so triage can confirm the disable
+    /// engaged. Mirrors the wire-format invariant pinned by #767/#794.
+    #[test]
+    fn test_resolved_config_snapshots_explicit_zero_thinking_budget() {
+        let mut agent = test_agent(None, None);
+        agent.thinking_budget_tokens = Some(8192); // per-agent enabled
+
+        let overrides = RunOverrides {
+            thinking_budget_tokens: Some(0), // per-run explicit disable
+            ..RunOverrides::default()
+        };
+        let merged = apply_overrides(base_config(), Some(&agent), &overrides);
+        let server_llm = server_default_llm("any-model");
+
+        let snapshot = build_resolved_config(&merged.agent_config, &server_llm);
+        assert_eq!(
+            snapshot.thinking_budget_tokens, 0,
+            "per-run Some(0) must surface as a literal 0 in the snapshot, \
+             confirming the disable reached the wire"
         );
     }
 }

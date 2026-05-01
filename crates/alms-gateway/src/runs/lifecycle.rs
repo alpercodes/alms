@@ -693,38 +693,31 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // client is connected. The SSE client registers its own sender when it
     // calls GET /runs/{id}/events.
 
-    // #895: flip the run state BEFORE broadcasting `run_started`. See the
-    // pre-cancel branch above for the full rationale — broadcasting first
-    // leaves a narrow window where a concurrent `GET /sessions` observes
-    // `has_active_run: false` (the run hasn't been added to the running
-    // set yet) while the `started` event has already been delivered, so
-    // the sidebar misses the activity. Flipping first guarantees that
-    // any `has_active_run: true` observation is followed by an `ended`
-    // event the client will see.
-    state.run_manager.mark_run_as_running(run_id);
-
-    state
-        .run_manager
-        .send_event(
-            run_id,
-            session_id,
-            SseEventData::run_started(run_id, session_id),
-        )
-        .await;
-
-    // Mirror onto the agent-scoped session-activity feed (#856) so the
-    // web UI sidebar can surface activity on sessions other than the
-    // currently-viewed one. Covers both regular runs and DM runs because
-    // every run goes through this point.
-    state
-        .run_manager
-        .send_agent_event(
-            agent_id,
-            run_id,
-            session_id,
-            SseEventData::session_activity_started(session_id, run_id, agent_id),
-        )
-        .await;
+    // ---------------------------------------------------------------------
+    // Resolve the layered run config UP FRONT (#837).
+    //
+    // The full per-run > per-agent > server-default merge — including the
+    // bootstrap-prompt swap and the system-triggered notification
+    // debug-flip — happens here, **before** the `Queued` → `Running`
+    // transition fires. Two reasons:
+    //
+    // 1. Triage: the resolved snapshot is persisted alongside the
+    //    `Running` state and broadcast on the `run_started` SSE so live
+    //    observers and post-hoc `GET /runs/{id}` calls can confirm the
+    //    provider / model / posture / budgets the run actually committed
+    //    to. This makes "I set model X but Y was used" reports falsifiable
+    //    from stored data alone (#833).
+    // 2. Atomicity: marking the run `Running` and attaching its snapshot
+    //    in a single `mark_run_as_running_with_config` call means SQLite
+    //    never observes a torn state where status is `Running` but the
+    //    snapshot is absent.
+    //
+    // The intermediate work between this block and the `mark_run_as_running`
+    // call below (state + SSE) used to live higher up; the reorder is safe
+    // because resolution is pure config plumbing and depends only on
+    // `state.*` / `overrides` / `agent_id`, all available since
+    // `execute_run` started.
+    // ---------------------------------------------------------------------
 
     // Resolve per-agent config (model, posture) from the agent registry,
     // then layer per-run overrides on top.
@@ -776,18 +769,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     }
     agent_config.posture = resolved;
 
-    // Create a runtime event channel so we can forward tool events to SSE.
-    // A second sender (`invoke_agent_tx`) is created for the InvokeAgentTool
-    // so subagent events are forwarded into the same SSE stream.  It is moved
-    // directly into the tool (not cloned) so no orphaned sender lingers in
-    // this scope -- when the runtime drops its sender and the tool drops its
-    // sender, the channel closes and the forwarder task completes.
-    let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
-    let invoke_agent_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
-        std::sync::Arc::new(RuntimeEventForwarder::new(runtime_tx.clone()));
-
     // Override system prompt with bootstrap prompt for first-time agents.
     // Must come after per-agent overrides so bootstrap takes precedence.
+    // Only mutates `system_prompt`; the layered fields the snapshot tracks
+    // (provider/model/posture/budgets/debug) are unaffected.
     let agent_config =
         if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
             let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);
@@ -811,6 +796,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // persisted), so the cost is negligible — and it lets users inspect the
     // LLM context for notification runs without special client-side plumbing.
     // (#546 — debug_mode for notification runs)
+    //
+    // The flip happens before the snapshot is taken so the persisted
+    // `resolved_config.debug_mode` reflects the value the runtime actually
+    // uses, not the raw per-run override.
     let agent_config = if is_system_triggered
         && !is_peer_message
         && !is_internal_context_id(&context_id)
@@ -826,6 +815,59 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     } else {
         agent_config
     };
+
+    // Snapshot the fully-layered config now that all post-resolution
+    // transforms have settled. Fed into both the persisted `Run` row and
+    // the `run_started` SSE payload below (#837).
+    let resolved_config = super::build_resolved_config(&agent_config, &llm);
+
+    // #895: flip the run state BEFORE broadcasting `run_started`. See the
+    // pre-cancel branch above for the full rationale — broadcasting first
+    // leaves a narrow window where a concurrent `GET /sessions` observes
+    // `has_active_run: false` (the run hasn't been added to the running
+    // set yet) while the `started` event has already been delivered, so
+    // the sidebar misses the activity. Flipping first guarantees that
+    // any `has_active_run: true` observation is followed by an `ended`
+    // event the client will see.
+    //
+    // Atomic-with-snapshot variant (#837): the layered config is stored
+    // alongside the status flip in a single SQLite upsert.
+    state
+        .run_manager
+        .mark_run_as_running_with_config(run_id, resolved_config.clone());
+
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::run_started_with_config(run_id, session_id, resolved_config),
+        )
+        .await;
+
+    // Mirror onto the agent-scoped session-activity feed (#856) so the
+    // web UI sidebar can surface activity on sessions other than the
+    // currently-viewed one. Covers both regular runs and DM runs because
+    // every run goes through this point.
+    state
+        .run_manager
+        .send_agent_event(
+            agent_id,
+            run_id,
+            session_id,
+            SseEventData::session_activity_started(session_id, run_id, agent_id),
+        )
+        .await;
+
+    // Create a runtime event channel so we can forward tool events to SSE.
+    // A second sender (`invoke_agent_tx`) is created for the InvokeAgentTool
+    // so subagent events are forwarded into the same SSE stream.  It is moved
+    // directly into the tool (not cloned) so no orphaned sender lingers in
+    // this scope -- when the runtime drops its sender and the tool drops its
+    // sender, the channel closes and the forwarder task completes.
+    let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+    let invoke_agent_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
+        std::sync::Arc::new(RuntimeEventForwarder::new(runtime_tx.clone()));
 
     // Capture summary config before agent_config and llm are consumed.
     // C1 fix: resolve the summary model *from the per-agent LLM client* so
