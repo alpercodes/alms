@@ -9,7 +9,7 @@ use crate::api_error;
 use crate::server::AppState;
 use crate::sse::SseEventData;
 use alms_core::{
-    AgentId, CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus,
+    AgentId, AlmsError, CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus,
     RunStatusResponse, SessionId, classify_session_type, sanitize_error_for_session,
 };
 use alms_runtime::RuntimeEvent;
@@ -553,10 +553,24 @@ const PEER_ERROR_MESSAGE_MAX_LEN: usize = 300;
 
 /// Build the human-readable error string carried in
 /// `ConversationEndReason::Errored { message }` for the peer-side
-/// notification. Truncated to [`PEER_ERROR_MESSAGE_MAX_LEN`] on a UTF-8
-/// char boundary; appends an ellipsis when truncated.
-fn truncate_error_for_peer(err: &dyn std::fmt::Display) -> String {
-    let s = err.to_string();
+/// notification.
+///
+/// Routes the error through [`sanitize_error_for_session`] first so any
+/// raw provider details (URLs, API keys, response bodies) are collapsed
+/// to a category label before reaching the peer agent's notification
+/// context. This closes the same threat surface that #911 / #930 closed
+/// on the failing agent's own session — see issue #931. Sanitisation is
+/// inlined (rather than bolted onto the call sites) so future callers
+/// of this helper cannot accidentally skip it.
+///
+/// After sanitisation the result is truncated to
+/// [`PEER_ERROR_MESSAGE_MAX_LEN`] on a UTF-8 char boundary and an
+/// ellipsis is appended when truncated. In practice the sanitiser
+/// already collapses to a short fixed label, so the truncation step is
+/// effectively a no-op — but it remains a safety net in case the
+/// sanitiser's contract widens in the future.
+fn truncate_error_for_peer(err: &AlmsError) -> String {
+    let s = sanitize_error_for_session(err);
     if s.len() <= PEER_ERROR_MESSAGE_MAX_LEN {
         return s;
     }
@@ -1348,20 +1362,17 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         Ok(output) => {
             persist_tool_calls(&output.tool_calls);
 
-            // token_delta events already emitted during streaming in the agent loop
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_finished(run_id, true, output.usage),
-                )
-                .await;
-
             // Persist a run-boundary marker so page reloads show "(run
             // completed)" separators. Only for user-facing sessions to
             // avoid cluttering internal sessions (jobs, subagents, DMs,
             // notifications).
+            //
+            // Note: this writes to the session store, not to the SSE feed,
+            // so its position relative to the state-flip / broadcast
+            // ordering below is not load-bearing. Kept above
+            // `mark_run_as_completed` for the same reason as before — it's
+            // a synchronous SQLite write that sequences naturally before
+            // both branches.
             if !is_internal_context_id(&context_id) {
                 super::markers::persist_lifecycle_marker(
                     &state.session_manager,
@@ -1375,7 +1386,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
-            // Clone the response before mark_run_as_completed consumes it.
+            // Compute the summary text BEFORE `mark_run_as_completed`
+            // consumes `output.response` (#927 reorder preserves the
+            // original consume-then-clone shape, just rolls it earlier).
             //
             // For DM runs the agent's actual outbound reply is sent via the
             // `send_message` tool and persisted to the shared DM session —
@@ -1414,9 +1427,34 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 output.response.clone()
             });
 
+            // #927 (extends #895): flip the run state to `Completed`
+            // BEFORE broadcasting `run_finished`. Pre-fix, a concurrent
+            // `GET /sessions` snapshot taken between the broadcast and
+            // the flip could observe `has_active_run: true` while the SSE
+            // feed had already moved past the terminal event —
+            // `last_event_id`-based reconnect would never replay it,
+            // leaving the sidebar's activity indicator stuck.
+            //
+            // The usage payload is `Copy` (TokenUsage is a small struct
+            // of u32/u64), so the broadcast can read it after the flip
+            // consumes the original via `mark_run_as_completed`. We
+            // capture it here for clarity and to avoid relying on a
+            // post-move value.
+            let usage_for_broadcast = output.usage;
+
             state
                 .run_manager
                 .mark_run_as_completed(run_id, output.response, output.usage);
+
+            // token_delta events already emitted during streaming in the agent loop
+            state
+                .run_manager
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_finished(run_id, true, usage_for_broadcast),
+                )
+                .await;
 
             // Fire-and-forget episodic summary generation.
             // Runs in a separate task so it never blocks the SSE cleanup path.
@@ -1568,6 +1606,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // Persist partial tool call records even though the run failed.
             persist_tool_calls(&tool_calls);
 
+            // #927 (extends #895): flip the run state to `Failed` BEFORE
+            // broadcasting `run_error`. See the `Ok` arm above and the
+            // pre-cancel branch at the top of this function for the full
+            // rationale; the same race applies to every started/ended
+            // boundary that uses `mark_run_as_*` to drive `has_active_run`.
+            state
+                .run_manager
+                .mark_run_as_failed(run_id, source.to_string());
+
             state
                 .run_manager
                 .send_event(
@@ -1576,10 +1623,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     SseEventData::run_error(run_id, &source.to_string()),
                 )
                 .await;
-
-            state
-                .run_manager
-                .mark_run_as_failed(run_id, source.to_string());
 
             // Issue #912 — DO NOT persist a lifecycle-layer
             // `(run failed) ...` error marker here.  The runtime layer
@@ -1630,6 +1673,11 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             );
         }
         Err(e) => {
+            // #927 (extends #895): flip the run state to `Failed` BEFORE
+            // broadcasting `run_error`. See the `Ok` and
+            // `FailedWithToolCalls` arms for the full rationale.
+            state.run_manager.mark_run_as_failed(run_id, e.to_string());
+
             state
                 .run_manager
                 .send_event(
@@ -1638,8 +1686,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     SseEventData::run_error(run_id, &e.to_string()),
                 )
                 .await;
-
-            state.run_manager.mark_run_as_failed(run_id, e.to_string());
 
             // Issue #912 — see the `FailedWithToolCalls` arm above.
             // This generic-error arm covers LLM 4xx/5xx, rate-limit,
@@ -1862,54 +1908,159 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_error_for_peer_short_ascii_unchanged() {
-        // Short ASCII passes through unmodified (no ellipsis appended).
-        let s = "boom";
-        let out = truncate_error_for_peer(&s);
-        assert_eq!(out, "boom");
-    }
-
-    #[test]
-    fn test_truncate_error_for_peer_exact_boundary_unchanged() {
-        // Exactly PEER_ERROR_MESSAGE_MAX_LEN bytes -> no truncation, no ellipsis.
-        let s = "a".repeat(PEER_ERROR_MESSAGE_MAX_LEN);
-        let out = truncate_error_for_peer(&s);
-        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN);
+    fn test_truncate_error_for_peer_short_label_unchanged() {
+        // The sanitiser collapses Runtime errors to short fixed category
+        // labels well under PEER_ERROR_MESSAGE_MAX_LEN — the helper passes
+        // them through with no truncation and no ellipsis.
+        let err = AlmsError::Runtime("429 Too Many Requests".into());
+        let out = truncate_error_for_peer(&err);
+        assert_eq!(out, "LLM rate limit exceeded");
         assert!(!out.ends_with("..."));
+        assert!(out.len() <= PEER_ERROR_MESSAGE_MAX_LEN);
     }
 
     #[test]
-    fn test_truncate_error_for_peer_oversize_ascii_truncates_with_ellipsis() {
-        // Oversize ASCII clips to PEER_ERROR_MESSAGE_MAX_LEN bytes + "..."
-        // (char-boundary walkback is a no-op for ASCII).
-        let s = "a".repeat(PEER_ERROR_MESSAGE_MAX_LEN + 50);
-        let out = truncate_error_for_peer(&s);
-        assert!(out.ends_with("..."));
-        // Body is exactly the max-len prefix; total len = max + 3 ("...").
-        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN + 3);
+    fn test_truncate_error_for_peer_cancelled_passes_through() {
+        // The Cancelled label is also bounded and passes through unchanged.
+        let err = AlmsError::Cancelled;
+        let out = truncate_error_for_peer(&err);
+        assert_eq!(out, "Run cancelled by user");
     }
 
+    /// Regression test for #931: a `Runtime` error whose Display string
+    /// embeds an API key, hostname, header, or bearer token must NOT
+    /// reach the peer agent's notification context. Before the fix,
+    /// `truncate_error_for_peer` was a length-only UTF-8 truncator and
+    /// the raw provider error would land verbatim in the peer's
+    /// `dm_ended` notification body.
+    ///
+    /// Mirrors the `sanitize_runtime_auth_strips_url_and_keys` test in
+    /// `alms-core/src/error.rs` but at the gateway-layer helper boundary
+    /// — so a future change that swaps the sanitiser call out (or wires
+    /// the helper to a non-sanitising path) is caught here.
+    #[test]
+    fn test_truncate_error_for_peer_strips_secrets_for_dm_peer() {
+        let err = AlmsError::Runtime(
+            "HTTP 401 Unauthorized at https://api.example.com (authorization: Bearer sk-test-12345)"
+                .into(),
+        );
+        let out = truncate_error_for_peer(&err);
+        // The sanitiser collapses 401/403 Runtime errors to a fixed label.
+        assert_eq!(out, "LLM authentication error");
+        for needle in [
+            "sk-test-",
+            "api.example.com",
+            "Bearer",
+            "authorization",
+            "Unauthorized",
+        ] {
+            assert!(
+                !out.contains(needle),
+                "DM peer notification text must not contain {needle:?}, got {out:?}"
+            );
+        }
+    }
+
+    /// Regression test for #931: also exercise the
+    /// `AlmsError::FailedWithToolCalls` shape used by one of the two
+    /// production call sites — the inner `source` is what reaches
+    /// `truncate_error_for_peer` after a `&Box<AlmsError>` deref-coerce.
+    /// A raw 500-internal-error body containing leaked secrets must not
+    /// survive sanitisation through that path either.
+    #[test]
+    fn test_truncate_error_for_peer_failed_with_tool_calls_path_strips_secrets() {
+        let inner = AlmsError::Runtime(
+            "provider 500 internal error: secret-key=sk-test-12345 leaked in body".into(),
+        );
+        // Mirror the production call site shape: `&source` where
+        // `source: Box<AlmsError>` deref-coerces to `&AlmsError`.
+        let source: Box<AlmsError> = Box::new(inner);
+        let out = truncate_error_for_peer(&source);
+        assert_eq!(out, "Runtime error");
+        assert!(
+            !out.contains("sk-test-12345"),
+            "API key from inner Runtime body must not survive sanitisation: got {out:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Truncation + UTF-8 char-boundary walkback path (#931 / #936 follow-up)
+    //
+    // The sanitiser collapses every error variant *except* `ToolExecution`
+    // to a short fixed-length category label, so in practice the truncation
+    // step is a no-op for those variants. `ToolExecution` is the one
+    // variant whose sanitised output length scales with caller input
+    // (`format!("Tool execution failed: {}", msg.split(':').next())`), so
+    // it is the only path through which the truncation + char-boundary
+    // walkback can fire on production data. These tests pin that path so a
+    // future "this code is dead, remove it" refactor either preserves the
+    // behaviour or notices it has live callers.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Pins the truncation arm on the only sanitiser output that can
+    /// exceed `PEER_ERROR_MESSAGE_MAX_LEN`: a `ToolExecution` error whose
+    /// pre-`:` segment is large enough that `"Tool execution failed: <name>"`
+    /// overflows the cap. The truncated body must end with `"..."` and the
+    /// total length must be exactly `PEER_ERROR_MESSAGE_MAX_LEN + 3`
+    /// because the input is pure ASCII (no walkback required).
+    #[test]
+    fn test_truncate_error_for_peer_oversize_ascii_tool_truncates_with_ellipsis() {
+        // 400 ASCII chars with no ':' means the sanitiser keeps the full
+        // tool name, producing `"Tool execution failed: aaaa..."` of total
+        // length 22 + 400 = 422 > PEER_ERROR_MESSAGE_MAX_LEN (300).
+        let long_name = "a".repeat(400);
+        let err = AlmsError::ToolExecution(long_name);
+        let out = truncate_error_for_peer(&err);
+        assert!(
+            out.ends_with("..."),
+            "oversize sanitiser output must be truncated and ellipsis-terminated, got {out:?}"
+        );
+        // Body length is exactly PEER_ERROR_MESSAGE_MAX_LEN for pure ASCII
+        // (char-boundary walkback is a no-op); total = max + 3 ("...").
+        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN + 3);
+        assert!(out.starts_with("Tool execution failed: "));
+    }
+
+    /// Pins the UTF-8 char-boundary walkback inside the truncation arm.
+    /// Constructs a `ToolExecution` error whose sanitised output places a
+    /// multibyte codepoint *across* byte offset `PEER_ERROR_MESSAGE_MAX_LEN`,
+    /// so a naive `&s[..PEER_ERROR_MESSAGE_MAX_LEN]` would panic. The
+    /// helper must walk back to the nearest char boundary at or below the
+    /// cap and append `"..."`.
+    ///
+    /// Without the walkback, slicing `String` on a non-boundary panics —
+    /// so this test would fail by panicking, not by producing wrong output.
     #[test]
     fn test_truncate_error_for_peer_multibyte_walks_back_to_char_boundary() {
-        // "é" is 2 bytes in UTF-8. With 200 copies (400 bytes), the raw
-        // PEER_ERROR_MESSAGE_MAX_LEN=300 cut would land mid-codepoint at
-        // offset 300 (which IS a char boundary for 2-byte codepoints since
-        // 300 is even); construct a 3-byte char case that forces a walkback.
-        // "あ" is 3 bytes; 150 copies = 450 bytes. Cut at 300 -> 300 % 3 == 0,
-        // also a boundary. Use a mix: leading "a" then 3-byte chars so the
-        // cut lands inside a codepoint and must walk back.
-        let s = format!("a{}", "あ".repeat(200)); // 1 + 600 = 601 bytes
-        // Cut at 300: byte 0 is 'a', then "あ" starts at byte 1 (3 bytes each).
-        // Boundaries after byte 1 are at 1 + 3k. 300 - 1 = 299, not a multiple
-        // of 3, so 300 is mid-codepoint. Walk back: 300 -> 299 -> 298 (1+3*99=298).
-        let out = truncate_error_for_peer(&s);
+        // The sanitiser prefix `"Tool execution failed: "` is 23 ASCII
+        // bytes. Pad the start of the tool name so that the cap (300)
+        // lands inside a 3-byte codepoint — concretely: 23 prefix bytes
+        // + N filler ASCII bytes + a run of 3-byte CJK chars, with N
+        // chosen so that 300 - (23 + N) is not a multiple of 3.
+        //
+        // Use N = 1 ("x"): prefix runs 23..24, then "あ" (0xE3 0x81 0x82,
+        // 3 bytes each) starts at byte 24. Codepoint boundaries after
+        // byte 24 are at 24 + 3k. 300 - 24 = 276, which IS a multiple
+        // of 3, so 300 is on a boundary. Use N = 2 instead: 23 + 2 = 25,
+        // boundaries at 25 + 3k, 300 - 25 = 275, not a multiple of 3.
+        // Walkback must land at the nearest boundary <= 300, which is
+        // 25 + 3*91 = 298.
+        let mut tool_name = "xx".to_string();
+        tool_name.push_str(&"あ".repeat(200)); // 600 bytes; total >> 300
+        let err = AlmsError::ToolExecution(tool_name);
+        let out = truncate_error_for_peer(&err);
         assert!(out.ends_with("..."));
-        // The body must end at a UTF-8 char boundary (no panic on slicing).
         let body = out.trim_end_matches("...");
-        assert!(body.is_char_boundary(body.len()));
-        // Body length is the largest valid char boundary <= 300.
+        // Body must end at a UTF-8 char boundary (otherwise `&s[..end]`
+        // panics inside the helper, never reaching this assertion).
+        assert!(
+            body.is_char_boundary(body.len()),
+            "truncated body must end on a UTF-8 char boundary"
+        );
         assert!(body.len() <= PEER_ERROR_MESSAGE_MAX_LEN);
-        assert!(s.is_char_boundary(body.len()));
+        // The walkback should land ON the largest valid boundary <= 300,
+        // not arbitrarily earlier. With our padding, that boundary is 298.
+        assert_eq!(body.len(), 298);
     }
 
     // ─────────────────────────────────────────────────────────────────────

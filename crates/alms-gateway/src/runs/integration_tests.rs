@@ -159,6 +159,84 @@ fn test_app_state_with_failing_llm() -> (
     )
 }
 
+/// Build an `AppState` whose LLM client points at a TCP listener that
+/// ACCEPTS connections but never sends a response, combined with a
+/// 1-second client timeout. The HTTP request hangs on the read side
+/// until the timeout fires, giving the test a deterministic ~1s window
+/// between `run_started` (producer's startup broadcast) and the
+/// generic `Err(_)` terminal arm.
+///
+/// Used by the #927 Err-arm interposer test that needs a wider gap
+/// than the port-1 ECONNREFUSED helper provides — port 1 fails almost
+/// instantly, leaving no room for the test to acquire its DashMap
+/// barrier guard between the producer's `mark_run_as_running`
+/// (early in `execute_run`) and the producer's terminal-arm
+/// `mark_run_as_failed`.
+///
+/// Returns `(state, shutdown_token, completion_rx, trigger_rx,
+/// dm_event_rx, listener_join)`. The listener task runs until the test
+/// drops `state`.
+async fn test_app_state_with_hanging_llm() -> (
+    AppState,
+    CancellationToken,
+    mpsc::UnboundedReceiver<SubagentCompletion>,
+    mpsc::UnboundedReceiver<RunTrigger>,
+    mpsc::UnboundedReceiver<DmEvent>,
+) {
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+    // Spawn an accept loop that holds connections without responding.
+    // The test runtime will drop the listener when the AppState drops.
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            // Hold the connection forever (or until the client
+            // times out). Spawn a task to keep the socket alive.
+            tokio::spawn(async move {
+                let _sock = sock;
+                // Park indefinitely.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let llm_config = alms_runtime::LlmConfig {
+        base_url,
+        api_key: "fake-key-for-test".to_string(),
+        timeout_secs: 1,
+        stream_chunk_timeout_secs: 1,
+        ..alms_runtime::LlmConfig::default()
+    };
+
+    let gateway_config = GatewayConfig {
+        llm_config,
+        ..GatewayConfig::default()
+    };
+    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let scheduler = Arc::new(alms_runtime::Scheduler::new());
+    let shutdown_token = CancellationToken::new();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
+    let (dm_event_tx, dm_event_rx) = mpsc::unbounded_channel();
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        trigger_tx,
+        dm_event_tx,
+    )
+    .unwrap();
+    (
+        state,
+        shutdown_token,
+        completion_rx,
+        trigger_rx,
+        dm_event_rx,
+    )
+}
+
 /// Seed two agents (`alice` and `bob`) into the SQLite-backed agent registry
 /// so that peer-name resolution works in `handle_dm_run_failure` and
 /// related lifecycle helpers.
@@ -2901,6 +2979,447 @@ async fn smoke_post_execute_cancel_flips_state_at_run_manager_boundary() {
         run_snapshot.status,
         RunStatus::Cancelled,
         "run status must be Cancelled after mark_run_as_cancelled"
+    );
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// #927: extend #895 state-flip-before-broadcast to completed/failed paths
+// ---------------------------------------------------------------------------
+//
+// Tim's review on PR #925 flagged that the four-site reorder in #895 closed
+// the SSE-vs-state race for the cancel/start paths but missed the symmetric
+// race on the success/failure terminator paths in `execute_run`. The
+// production fix lives in `crates/alms-gateway/src/runs/lifecycle.rs` —
+// each of the three terminal arms (`Ok`, `FailedWithToolCalls`, generic
+// `Err`) now calls `mark_run_as_*` BEFORE the
+// `send_event(run_finished | run_error)` broadcast.
+//
+// Pinning the invariant: unlike the four #895 sites — where the next
+// `send_agent_event(...).await` between the broadcast and the flip
+// provided a natural suspension barrier the consumer task could ride on —
+// the Ok / FailedWithToolCalls / Err arms in pre-fix code call
+// `mark_run_as_*` SYNCHRONOUSLY immediately after `send_event` returns,
+// then `.await` further downstream (e.g. `dm_lifecycle::handle_dm_run_*`).
+// The next natural suspension lies BEYOND the flip in pre-fix order, so
+// the natural-barrier trick from #895 does not distinguish pre-fix from
+// post-fix here.
+//
+// Instead the failure-arm test below uses the `RunManager::runs` DashMap
+// as an explicit synchronisation barrier: the test acquires a
+// `runs.get_mut(&run_id)` write guard AFTER the producer's startup
+// `mark_run_as_running` (signalled by the arrival of `run_started` on
+// the session feed) but BEFORE the producer's terminal-arm `mark_run_as_*`
+// runs. `mark_run_as_*` calls `runs.get_mut(&run_id)` internally (see
+// `modify_and_snapshot` in `RunManager`), so the held guard parks the
+// terminal flip on the parking_lot RwLock. `send_event` touches only
+// `event_senders` and `session_senders`, so the broadcast remains
+// unaffected by the barrier.
+//
+// - **Pre-fix order** (broadcast then flip): the producer reaches
+//   `send_event(run_error)` first, the consumer receives the event, then
+//   the producer parks on the held DashMap guard. The test sees the
+//   broadcast and the assertion FAILS.
+// - **Post-fix order** (flip then broadcast): the producer parks on the
+//   guard at `mark_run_as_failed` and never reaches `send_event`. The
+//   test does not see the broadcast within the timeout and the assertion
+//   PASSES.
+//
+// Note on which arm is exercised end-to-end: `AgentRuntime::finish_run`
+// wraps every non-Cancelled error returned by `agent_loop` into
+// `AlmsError::FailedWithToolCalls { source, tool_calls }` — even when
+// `tool_calls` is empty. So an end-to-end run with a failing LLM lands
+// in the `FailedWithToolCalls` arm of `execute_run`, NOT the generic
+// `Err(_)` arm. The interposer test below therefore exercises the
+// `FailedWithToolCalls` arm (which is the production-relevant path for
+// any LLM 4xx/5xx, rate-limit, content-policy reject, timeout, or
+// stream-parse failure).
+//
+// **Reverting the `FailedWithToolCalls`-arm reorder in `lifecycle.rs`
+// causes `failed_with_tool_calls_arm_flips_state_before_broadcasting`
+// to fail**, because the broadcast is then on the producer's pre-flip
+// side of the held guard and the consumer receives it inside the
+// timeout window.
+//
+// The Ok arm and generic Err arm rely on the same production fix
+// (identical structural shape) but cannot be exercised by the
+// gap-based interposer:
+// - The Ok arm requires a fast-completing LLM (mock mode), but with
+//   mock mode the window between `run_started` (consumer wake) and the
+//   terminal flip is too small for the test to deterministically wedge
+//   a guard acquisition into. Wiring a slow-responding HTTP fixture
+//   into `LlmClient` from the gateway crate is out of scope for this
+//   fix — see #927 follow-up.
+// - The generic `Err(_)` arm is unreachable through `runtime.run()`
+//   because `finish_run` re-wraps every error into
+//   `FailedWithToolCalls`. It exists to handle direct
+//   `AgentRuntime`-bypass paths and synthetic test inputs.
+//
+// They are covered by smoke tests at the `RunManager` boundary that
+// mirror the post-fix call order in the test body (matching the
+// precedent set by `smoke_post_execute_cancel_*` for #895). Those tests
+// do NOT regression-pin the `lifecycle.rs` ordering; the
+// `FailedWithToolCalls`-arm interposer test is the load-bearing pin
+// that makes the bundle revert detectable.
+
+/// Regression test for #927 (`FailedWithToolCalls` arm,
+/// interposer-via-DashMap-barrier): in the
+/// `Err(FailedWithToolCalls { ... })` arm of `execute_run`,
+/// `mark_run_as_failed` must be called BEFORE `send_event(run_error)`.
+///
+/// This arm is the end-to-end production path for any LLM call failure
+/// (4xx/5xx, rate-limit, content-policy reject, timeout, stream-parse
+/// error, etc.) because `AgentRuntime::finish_run` re-wraps every
+/// non-Cancelled error from `agent_loop` into `FailedWithToolCalls`
+/// regardless of whether tool calls actually executed.
+///
+/// **Pin mechanism (gap-based DashMap barrier):**
+///
+/// 1. Spawn `execute_run` with the hanging-LLM helper. The producer
+///    reaches `mark_run_as_running` (no guard held → succeeds), then
+///    fires `send_event(run_started)` and enters the LLM call which
+///    will fail after the 1s `timeout_secs` budget the helper sets.
+/// 2. The consumer task observes `run_started` on the session SSE feed
+///    and acquires a `runs.get_mut(&run_id)` write guard. The hanging
+///    LLM (TCP listener that never responds) opens a deterministic
+///    ~1-2s window between `run_started` and the terminal-arm flip,
+///    plenty of time for the consumer to wedge in.
+/// 3. The producer's `runtime.run()` returns `Err(FailedWithToolCalls
+///    { source, tool_calls })` and the producer enters the
+///    `FailedWithToolCalls` arm of `execute_run`.
+///    - **Post-fix:** `mark_run_as_failed` runs first → blocks on the
+///      held DashMap guard. `send_event(run_error)` never fires within
+///      the timeout. The consumer's `run_error` recv times out, the
+///      test asserts no event observed, PASSES.
+///    - **Pre-fix:** `send_event(run_error)` runs first → broadcast
+///      lands on the consumer feed. `mark_run_as_failed` then blocks on
+///      the held guard. The consumer's `run_error` recv succeeds, the
+///      assertion FAILS.
+/// 4. The test releases the guard so the producer can complete teardown.
+///
+/// **Reverting the `FailedWithToolCalls`-arm reorder in
+/// `lifecycle.rs` causes this test to fail** — verified locally by
+/// reverting the production change and observing the assertion fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_with_tool_calls_arm_flips_state_before_broadcasting() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_hanging_llm().await;
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-927-err-arm");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "trigger LLM failure".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    let runs_clone = state.run_manager.runs.clone();
+
+    let exec_state = state.clone();
+    let exec_input = run.input.clone();
+    let exec_handle = tokio::spawn(async move {
+        super::lifecycle::execute_run(
+            exec_state,
+            super::RunParams {
+                run_id,
+                session_id,
+                agent_id,
+                input: exec_input,
+                overrides: super::RunOverrides::default(),
+                context_id: "test-927-err-arm".to_string(),
+                cancel_token,
+                is_peer_message: false,
+                is_system_triggered: false,
+                input_pre_persisted: false,
+            },
+        )
+        .await
+    });
+
+    // Wait for `run_started` (which fires AFTER `mark_run_as_running`,
+    // so the early DashMap write has already completed and won't be
+    // blocked by our guard).
+    let started_deadline = tokio::time::sleep(std::time::Duration::from_secs(2));
+    tokio::pin!(started_deadline);
+    let mut saw_started = false;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut started_deadline => break,
+            event = session_rx.recv() => {
+                match event {
+                    Some(e) if e.event_type == "run_started" => {
+                        saw_started = true;
+                        break;
+                    }
+                    Some(_) => continue,
+                    None => break,
+                }
+            }
+        }
+    }
+    assert!(
+        saw_started,
+        "expected `run_started` SSE event before LLM failure window opens"
+    );
+
+    // Acquire the DashMap write guard. The producer is now between
+    // `mark_run_as_running` (already done) and the terminal arm
+    // (~1-2s away while the hanging LLM times out). Holding this guard
+    // blocks the producer's terminal `mark_run_as_*`.
+    //
+    // **Note for future maintainers (Tim's PR #936 review):** this is a
+    // synchronous (parking_lot) lock guard held across `.await` points
+    // below. That is *intentional* and not a deadlock risk:
+    //
+    // - DashMap v6 shards are `parking_lot::RwLock`s and the guard is a
+    //   sync lock, not a Tokio async lock — it is not aware of task
+    //   suspension and never yields to the runtime.
+    // - The await we hold across is `session_rx.recv()` on a
+    //   *different* task's broadcast channel; the lock is acquired by
+    //   this test task and contended by the producer task only via
+    //   `runs.get_mut(&run_id)` inside `mark_run_as_*`. There is no
+    //   reentrancy from this task into the same shard, so no
+    //   self-deadlock is possible.
+    // - The point of the test IS to wedge that contention: the held
+    //   guard is the synchronisation barrier that pins
+    //   broadcast-vs-flip ordering. "Fixing" the held-across-await
+    //   shape (e.g. dropping the guard before the recv loop, or
+    //   swapping to a tokio mutex) would dismantle the regression pin.
+    let _guard = runs_clone
+        .get_mut(&run_id)
+        .expect("run must exist after insert_run");
+
+    // Wait for `run_error` to land. In post-fix code the producer is
+    // blocked on the guard at `mark_run_as_failed` and the broadcast
+    // never fires; we time out without seeing the event. In pre-fix
+    // code the broadcast runs first, the consumer receives `run_error`
+    // immediately, and the assertion below fails.
+    //
+    // Use a generous timeout (5s) so the hanging-LLM helper has time
+    // to time out (1s × 2 attempts via stream-then-buffer fallback) and
+    // the producer has time to reach the terminal arm. Pre-fix code
+    // delivers the event well within this window in practice.
+    //
+    // **One-sided false-pass risk on slow CI (Tim's PR #936 review):**
+    // this is a "absence of event" assertion, so any environment where
+    // the producer takes longer than 5s to reach the terminal arm
+    // (hanging-LLM timeout + scheduling slack on a heavily-loaded
+    // runner) will pass for the *wrong* reason — the broadcast simply
+    // hasn't fired yet, regardless of pre-/post-fix order. The window
+    // is sized for the 1s hanging-LLM timeout × 2 attempts plus headroom
+    // and has been stable in CI to date; if this test ever starts
+    // flaking on slow CI the right move is a deterministic barrier
+    // (e.g. a tap on the `mark_run_as_failed` call rather than a wall
+    // clock), not a longer timeout — bumping the timeout widens the
+    // false-pass window without strengthening the pin.
+    let mut saw_error = false;
+    let err_deadline = tokio::time::sleep(std::time::Duration::from_secs(5));
+    tokio::pin!(err_deadline);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut err_deadline => break,
+            event = session_rx.recv() => {
+                match event {
+                    Some(e) if e.event_type == "run_error" => {
+                        saw_error = true;
+                        break;
+                    }
+                    Some(_) => continue,
+                    None => break,
+                }
+            }
+        }
+    }
+
+    assert!(
+        !saw_error,
+        "pre-#927 race: `run_error` was broadcast BEFORE \
+         `mark_run_as_failed` flipped the run state. Holding the \
+         DashMap write guard blocks the flip; in pre-fix code the \
+         broadcast runs to completion while the producer is parked on \
+         the lock. Post-fix code blocks at the flip first and never \
+         reaches the broadcast within the 5s timeout window. Reverting \
+         the `FailedWithToolCalls`-arm reorder in lifecycle.rs causes \
+         this assertion to fail."
+    );
+
+    // Release the DashMap guard so the producer can complete and the
+    // test can shut down cleanly.
+    drop(_guard);
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(15), exec_handle)
+        .await
+        .expect("execute_run task must complete within 15s after guard drop");
+
+    shutdown_token.cancel();
+}
+
+/// Smoke test (NOT a regression pin) covering the call sequence for the
+/// `Ok(_)` arm at the `RunManager` boundary. Driving `execute_run`'s
+/// `Ok(_)` arm requires a fast-completing LLM (mock mode), but the
+/// window between `run_started` and the terminal flip with mock mode is
+/// too small for the gap-based DashMap-barrier interposer used by
+/// `failed_with_tool_calls_arm_flips_state_before_broadcasting` above
+/// to wedge a guard acquisition reliably.
+///
+/// What this test verifies: that callers using the post-#927 sequence
+/// (`mark_run_as_completed` then `send_event(run_finished)`) see
+/// `has_active_runs == false` upon receiving the `run_finished` event.
+/// This is a sanity check on the call sequence itself, NOT that the
+/// production code emits events in that sequence — the test mirrors the
+/// post-fix order in its own body, so reverting `lifecycle.rs` cannot
+/// break it.
+///
+/// Mirrors `smoke_post_execute_cancel_flips_state_at_run_manager_boundary`
+/// for #895.
+#[tokio::test]
+async fn smoke_ok_arm_flips_state_at_run_manager_boundary() {
+    use alms_core::TokenUsage;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-927-smoke-ok");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "test".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+    assert!(state.run_manager.has_active_runs(session_id));
+
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    // Mirror the post-#927 ordering: flip state first, broadcast second.
+    state
+        .run_manager
+        .mark_run_as_completed(run_id, "ok".to_string(), TokenUsage::default());
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::run_finished(run_id, true, TokenUsage::default()),
+        )
+        .await;
+
+    let event = session_rx
+        .recv()
+        .await
+        .expect("run_finished event must be delivered");
+    assert_eq!(event.event_type, "run_finished");
+
+    assert!(
+        !state.run_manager.has_active_runs(session_id),
+        "has_active_runs must be false after mark_run_as_completed \
+         (sanity check on the RunManager boundary, NOT a regression pin \
+         on lifecycle.rs ordering — see \
+         `failed_with_tool_calls_arm_flips_state_before_broadcasting` \
+         for the load-bearing interposer pin)"
+    );
+    let run_snapshot = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must exist after mark_run_as_completed");
+    assert_eq!(
+        run_snapshot.status,
+        RunStatus::Completed,
+        "run status must be Completed after mark_run_as_completed"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Smoke test (NOT a regression pin) covering the call sequence for the
+/// generic `Err(_)` arm at the `RunManager` boundary. The generic
+/// `Err(_)` arm is unreachable through `runtime.run()` because
+/// `AgentRuntime::finish_run` re-wraps every error from `agent_loop`
+/// into `AlmsError::FailedWithToolCalls { ... }` — even when no tool
+/// calls executed. The arm exists in `lifecycle.rs` to handle direct
+/// `AgentRuntime`-bypass paths (e.g. construction-time failures before
+/// the loop starts) and synthetic test inputs that pre-construct a
+/// non-`FailedWithToolCalls` error variant.
+///
+/// What this test verifies: that callers using the post-#927 sequence
+/// (`mark_run_as_failed` then `send_event(run_error)`) see
+/// `has_active_runs == false` upon receiving the `run_error` event.
+/// Mirrors the smoke-test pattern of
+/// `smoke_post_execute_cancel_flips_state_at_run_manager_boundary` for
+/// #895 and `smoke_ok_arm_flips_state_at_run_manager_boundary` above.
+///
+/// The generic `Err(_)` arm in `lifecycle.rs` shares the exact post-fix
+/// structural shape of the `FailedWithToolCalls` arm (flip then
+/// broadcast, no intervening logic). The
+/// `failed_with_tool_calls_arm_flips_state_before_broadcasting`
+/// interposer test is the load-bearing pin that makes the bundle revert
+/// detectable for both arms — a regression that reordered the
+/// `FailedWithToolCalls` arm without reordering generic `Err(_)` would
+/// be inconsistent with the pattern and rejected at code review, and a
+/// regression that reordered both would be caught by the interposer
+/// test.
+#[tokio::test]
+async fn smoke_err_arm_flips_state_at_run_manager_boundary() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-927-smoke-err");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "test".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run);
+    state.run_manager.mark_run_as_running(run_id);
+    assert!(state.run_manager.has_active_runs(session_id));
+
+    let mut session_rx = subscribe_session(&state, session_id);
+
+    // Mirror the post-#927 ordering: flip state first, broadcast second.
+    state
+        .run_manager
+        .mark_run_as_failed(run_id, "synthetic generic failure".to_string());
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::run_error(run_id, "synthetic generic failure"),
+        )
+        .await;
+
+    let event = session_rx
+        .recv()
+        .await
+        .expect("run_error event must be delivered");
+    assert_eq!(event.event_type, "run_error");
+
+    assert!(
+        !state.run_manager.has_active_runs(session_id),
+        "has_active_runs must be false after mark_run_as_failed \
+         (sanity check on the RunManager boundary, NOT a regression pin \
+         on lifecycle.rs ordering — see \
+         `failed_with_tool_calls_arm_flips_state_before_broadcasting` \
+         for the load-bearing interposer pin)"
+    );
+    let run_snapshot = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must exist after mark_run_as_failed");
+    assert_eq!(
+        run_snapshot.status,
+        RunStatus::Failed,
+        "run status must be Failed after mark_run_as_failed"
     );
 
     shutdown_token.cancel();
