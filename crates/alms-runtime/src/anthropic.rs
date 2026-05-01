@@ -592,7 +592,7 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
         messages,
         system,
         tools,
-        max_tokens: req.max_tokens.unwrap_or(100_000),
+        max_tokens: req.max_tokens.unwrap_or(32_000),
         stream: req.stream,
         thinking,
     }

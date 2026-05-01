@@ -10,11 +10,17 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 /// Maximum bytes retained from a single line before truncation.
 ///
-/// The cap is 256 KiB — half of `fs_read`'s 512 KiB output budget.  Sized so
-/// that even a maximally-truncated single line plus its inline marker still
-/// fits well within the response budget, leaving room for at least one more
-/// line of useful context.  Higher caps were considered but rejected: a 512
-/// KiB truncated line consumes the entire output budget on its own.
+/// The cap is 256 KiB.  Originally sized as half of `fs_read`'s 512 KiB
+/// output budget so a maximally-truncated single line plus its inline marker
+/// would still leave room for additional lines.  After #917 lowered
+/// `fs_read::MAX_OUTPUT_BYTES` to 64 KiB the relationship inverted — a
+/// fully-capped single line now exceeds the response budget on its own and
+/// is rejected by `fs_read`'s per-line accumulator (which is the correct
+/// behaviour for that case: the agent should re-read with `offset`/`limit`
+/// to paginate). The 256 KiB allocation cap stays unchanged because its job
+/// is to bound *daemon memory* on pathological single-line files (#902);
+/// shrinking it further would force more truncations on legitimately long
+/// lines that fs_grep needs to evaluate against.
 pub(super) const MAX_LINE_BYTES: usize = 256 * 1024;
 
 /// Outcome of [`read_line_capped`].

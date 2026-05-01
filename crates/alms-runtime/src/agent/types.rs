@@ -182,7 +182,12 @@ impl Default for AgentConfig {
         Self {
             system_prompt: include_str!("../../prompts/initial.md").trim().to_string(),
             prompts: SystemPrompts::default(),
-            max_tokens: 100_000,
+            // 32K matches prevailing agent-tool defaults (#918) — covers ~95-99%
+            // of agent turns (most finish under 8K), reasoning models'
+            // hidden-thinking budgets, and long code-gen flows.
+            // Operators can override per-agent or per-run for code-gen or
+            // long-form writing workflows that need more headroom.
+            max_tokens: 32_000,
             context_config: ContextConfig::default(),
             posture: Posture::default(),
             sandbox_root: ".".into(),

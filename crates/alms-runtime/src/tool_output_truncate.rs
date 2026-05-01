@@ -11,7 +11,7 @@
 //! ## Why at the loop boundary
 //!
 //! Pre-#851 each tool was responsible for capping its own output and the caps
-//! varied wildly (`shell` 30 KB, `fs_grep` 20 KB, `fs_read` 512 KB, `http_get`
+//! varied wildly (`shell` 30 KB, `fs_grep` 20 KB, `fs_read` 64 KB (was 512 KB until #917), `http_get`
 //! none at all, `read_session` none at all). A single 200 KB `fs_read` plus a
 //! parallel 200 KB `http_get` could push a turn's input above 256 K tokens and
 //! blow the provider's context window. Routing every tool's result through

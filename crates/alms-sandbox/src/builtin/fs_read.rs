@@ -151,9 +151,14 @@ impl Tool for FsReadTool {
         "Read a file with line numbers (cat -n format). Supports partial reads via offset/limit. \
          Returns content with 1-based line numbers, has_more_before/has_more_after indicators, \
          and total_lines when known (file read to EOF). Whole-file reads are capped at 256 KB; \
-         pass offset and/or limit to read a slice of a larger file (slice is capped at 512 KB). \
+         pass offset and/or limit to read a slice of a larger file (slice is capped at 64 KB). \
          Individual lines longer than 256 KB are truncated with an inline marker; check \
-         `line_truncated: true` in the response to detect this programmatically."
+         `line_truncated: true` in the response to detect this programmatically. \
+         When the response would exceed the 64 KB output budget — whether from one \
+         oversized line or accumulated smaller lines — `byte_budget_exceeded: true` is \
+         set with `has_more_after: true`. If `lines_returned: 0`, paginate past the \
+         offending line by setting `offset = current_offset + 1`; otherwise resume from \
+         `offset = current_offset + lines_returned`."
     }
 
     fn is_builtin(&self) -> bool {
@@ -186,8 +191,13 @@ impl Tool for FsReadTool {
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
         /// Maximum file size we will attempt to read (256 KiB).
         const MAX_READ_BYTES: u64 = 256 * 1024;
-        /// Maximum accumulated bytes in the formatted output (512 KiB).
-        const MAX_OUTPUT_BYTES: usize = 512 * 1024;
+        /// Maximum accumulated bytes in the formatted output (64 KiB).
+        ///
+        /// Lowered from 512 KiB in #917 to match prevailing agent-tool caps and to
+        /// reduce pre-truncation bloat now that the in-loop tool-output
+        /// truncate (#851) caps at 32 KB / 2000 lines anyway. Bigger reads
+        /// must use `offset` + `limit` to paginate explicitly.
+        const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
         let path = params
             .get("path")
@@ -1424,12 +1434,17 @@ mod tests {
     // ── Per-line byte cap (#902) ──────────────────────────────────────────
 
     /// Regression guard for #902: a 1 MiB single-line file (no newlines)
-    /// must NOT pull the whole file into a single allocation.  The partial
-    /// read with `offset=0, limit=10` returns the truncated first line plus
-    /// the inline marker, sets `line_truncated: true`, and the daemon does
-    /// not OOM.  Pre-#902 the underlying `BufReader::next_line()` had no
-    /// per-line cap, so this same call would allocate ~1 MiB.  Post-#902 it
-    /// is bounded by `MAX_LINE_BYTES` (256 KiB).
+    /// must NOT pull the whole file into a single allocation.  Pre-#902 the
+    /// underlying `BufReader::next_line()` had no per-line cap, so this
+    /// same call would allocate ~1 MiB.  Post-#902 the line allocation is
+    /// bounded by `MAX_LINE_BYTES` (256 KiB) — the surplus bytes are
+    /// drained without growing the buffer.
+    ///
+    /// After #917 lowered `MAX_OUTPUT_BYTES` to 64 KiB, the truncated line
+    /// (256 KiB + marker) no longer fits in the response budget, so the
+    /// per-line accumulator now trips `byte_budget_exceeded` and the
+    /// over-cap line is rejected from the response — but the daemon still
+    /// does not OOM, which is the point of this regression guard.
     #[tokio::test]
     async fn test_fs_read_per_line_cap_huge_single_line() {
         let dir = tempfile::tempdir().unwrap();
@@ -1449,28 +1464,23 @@ mod tests {
             .await
             .unwrap();
 
-        // The inline truncation marker must be present in the output.
+        // Post-#917 the truncated line (256 KiB) exceeds the 64 KiB output
+        // budget, so the byte-budget gate fires before the line is added
+        // to the response.  The line is dropped from `selected_lines`, so
+        // `lines_returned` is 0 and `line_truncated` stays absent.
+        assert_eq!(
+            result["lines_returned"], 0,
+            "over-budget truncated line must be rejected from response"
+        );
+        assert_eq!(
+            result["byte_budget_exceeded"], true,
+            "byte-budget guard must fire when the per-line-truncated line exceeds the output cap"
+        );
+        // Sanity check on the recovery hint — no megaline content leaked.
         let text = result["content"].as_str().unwrap();
         assert!(
-            text.contains("[line truncated to"),
-            "expected truncation marker in output, got first 200 chars: {}",
-            &text.chars().take(200).collect::<String>()
-        );
-        // Programmatic flag for callers that don't want to scan text.
-        assert_eq!(
-            result["line_truncated"], true,
-            "line_truncated flag should be set on truncated reads"
-        );
-        // Exactly one line returned (the truncated megaline) — the file
-        // had no newlines so there is only one logical line.
-        assert_eq!(result["lines_returned"], 1);
-        // The retained portion of the line is bounded at MAX_LINE_BYTES
-        // (256 KiB), so the formatted line cannot exceed roughly that plus
-        // the marker.  Sanity check: should be far less than the original
-        // 1 MiB.
-        assert!(
-            text.len() < 300 * 1024,
-            "formatted output should be bounded near MAX_LINE_BYTES, got {} bytes",
+            text.len() < 1024,
+            "content should be empty/short — over-budget line must not leak, got {} bytes",
             text.len()
         );
     }
@@ -1513,10 +1523,18 @@ mod tests {
         assert!(!text.contains("line number 101"));
     }
 
-    /// A file containing one over-cap line followed by normal short lines
-    /// must truncate the offending line, set the flag, and continue
-    /// reading subsequent lines correctly.  Specifically guards the
-    /// `drain_to_newline` path inside `read_line_capped`.
+    /// A file containing one over-cap line followed by normal short lines.
+    /// The first line gets allocation-capped to MAX_LINE_BYTES (256 KiB)
+    /// inside `read_line_capped` — its drain-to-newline phase positions the
+    /// reader at the start of line 2 — but post-#917 the 256 KiB truncated
+    /// line exceeds the 64 KiB output budget and trips
+    /// `byte_budget_exceeded` before being added to the response, so the
+    /// follow-on short lines are not collected either.  The agent is
+    /// expected to paginate past the offending line via `offset=1`.
+    ///
+    /// This test still guards the drain-to-newline path indirectly: if the
+    /// drain were broken, `read_line_capped` would either OOM the test
+    /// process or fail to terminate, neither of which happens here.
     #[tokio::test]
     async fn test_fs_read_per_line_cap_truncates_then_continues() {
         let dir = tempfile::tempdir().unwrap();
@@ -1529,6 +1547,7 @@ mod tests {
         content.push_str("short_line_3\n");
         std::fs::write(&path, &content).unwrap();
 
+        // Phase 1: offset=0 — over-cap first line trips the byte budget.
         let result = FsReadTool::new()
             .execute(serde_json::json!({
                 "path": path.to_str().unwrap(),
@@ -1538,24 +1557,38 @@ mod tests {
             .await
             .unwrap();
 
-        let text = result["content"].as_str().unwrap();
-        assert_eq!(result["line_truncated"], true);
-        assert!(
-            text.contains("[line truncated to"),
-            "first line should carry the truncation marker"
+        assert_eq!(
+            result["lines_returned"], 0,
+            "over-budget truncated first line must be rejected from response"
         );
-        // The follow-on lines must be present and intact — proving the
-        // drain-to-newline phase correctly re-positioned the reader.
+        assert_eq!(
+            result["byte_budget_exceeded"], true,
+            "byte-budget guard must fire when the truncated line exceeds the output cap"
+        );
+        assert_eq!(result["has_more_after"], true);
+
+        // Phase 2: offset=1 — drain-to-newline must have correctly
+        // positioned the reader, so subsequent reads pick up from line 2.
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": 10,
+            }))
+            .await
+            .unwrap();
+
+        let text = result["content"].as_str().unwrap();
         assert!(
             text.contains("short_line_2"),
-            "second line should be readable after truncation, got: {}",
+            "second line should be readable when paginating past the over-cap line, got: {}",
             &text.chars().take(200).collect::<String>()
         );
         assert!(
             text.contains("short_line_3"),
-            "third line should be readable after truncation"
+            "third line should be readable when paginating past the over-cap line"
         );
-        assert_eq!(result["lines_returned"], 3);
+        assert_eq!(result["lines_returned"], 2);
     }
 
     /// Regression guard for #914: when an over-cap line lives past the

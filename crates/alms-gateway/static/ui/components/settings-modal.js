@@ -633,7 +633,7 @@ export function SettingsModal({ open, onClose }) {
     const perRunMaxTokens = maxTokens.value ? parseInt(maxTokens.value, 10) : null;
     const effMaxTokens = perRunMaxTokens != null
         ? perRunMaxTokens
-        : (defaults.max_tokens || 100000);
+        : (defaults.max_tokens || 32000);
     const maxTokensSource = perRunMaxTokens != null ? 'per-run' : 'server default';
 
     // Posture: per-run > per-agent > server default.
@@ -721,7 +721,7 @@ export function SettingsModal({ open, onClose }) {
                             <${OverrideMarker} active=${overrideKeys.has('max_tokens')} label="Max tokens" />
                         </label>
                         <input class="settings-input" type="number" min="1" step="1000"
-                               placeholder=${defaults.max_tokens || 100000}
+                               placeholder=${defaults.max_tokens || 32000}
                                value=${maxTokens.value}
                                onInput=${e => { maxTokens.value = e.target.value; }} />
                         <span class="settings-effective">
