@@ -1390,24 +1390,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
                 .await;
 
-            if !is_internal_context_id(&context_id) {
-                // Tagged with `kind: "error"` so the runtime's
-                // `session_msg_to_llm` rewrites this marker into a `user`
-                // message on the next turn — the agent then sees the
-                // cancellation in its context and can answer follow-up
-                // questions like "why did that fail?" (issue #874).
-                super::markers::persist_error_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_boundary",
-                    "(run cancelled)".to_string(),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "status": "cancelled",
-                        "error_kind": "cancelled",
-                    }),
-                );
-            }
+            // Issue #912 — DO NOT persist a lifecycle-layer
+            // `(run cancelled)` error marker here.  The runtime layer
+            // (`alms_runtime::AgentRuntime::finish_run`) already wrote a
+            // `[Run cancelled by user]` text message at
+            // `Role::Assistant` (or `Role::User` with `from_agent`
+            // metadata in DM sessions).  That runtime-layer record is
+            // the canonical source of truth: it survives
+            // `strip_mid_history_system_markers` natively and reaches
+            // the next-turn LLM context as a regular conversation turn,
+            // satisfying the #874 follow-up-visibility requirement.
+            // Persisting a second `kind: "error"` marker here would
+            // duplicate the same conceptual event in both chat history
+            // and LLM context — see Atlas + Alper's decision recorded
+            // on issue #912.
 
             // Best-effort: notify the DM peer that the conversation ended
             // because this run was cancelled mid-flight. Without this, the
@@ -1447,21 +1443,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
                 .await;
 
-            if !is_internal_context_id(&context_id) {
-                // See `kind: "error"` rationale in the `Cancelled` arm above
-                // (issue #874).
-                super::markers::persist_error_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_boundary",
-                    "(run cancelled)".to_string(),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "status": "cancelled",
-                        "error_kind": "cancelled",
-                    }),
-                );
-            }
+            // Issue #912 — see the `Cancelled` arm above.  The
+            // runtime-layer `[Run cancelled by user]` write is the
+            // canonical record; no lifecycle-layer marker is persisted.
 
             // Best-effort: see comment in the `Cancelled` arm.
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
@@ -1505,31 +1489,21 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 .run_manager
                 .mark_run_as_failed(run_id, source.to_string());
 
-            if !is_internal_context_id(&context_id) {
-                // Tagged with `kind: "error"` so the runtime's
-                // `session_msg_to_llm` rewrites this marker into a `user`
-                // message on the next turn — the agent then sees the
-                // failure (and the partial tool calls already persisted
-                // by `persist_tool_calls`) and can answer follow-up
-                // questions like "why did that fail?" (issue #874).
-                //
-                // Sanitised before persistence so raw provider error
-                // bodies (API keys, hostnames, URLs) never reach session
-                // history or the LLM context on follow-up turns (#911).
-                let safe_reason = sanitize_error_for_session(&source);
-                super::markers::persist_error_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_boundary",
-                    format!("(run failed) {safe_reason}"),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "status": "failed",
-                        "error": safe_reason,
-                        "error_kind": "failed_with_tool_calls",
-                    }),
-                );
-            }
+            // Issue #912 — DO NOT persist a lifecycle-layer
+            // `(run failed) ...` error marker here.  The runtime layer
+            // (`alms_runtime::AgentRuntime::finish_run`) already wrote a
+            // `[Run failed: <safe_reason>]` text message at
+            // `Role::Assistant` (or `Role::User` with `from_agent`
+            // metadata in DM sessions), already passed through
+            // `sanitize_error_for_session` (#911).  That runtime-layer
+            // record is the canonical source of truth: it survives
+            // `strip_mid_history_system_markers` natively and reaches
+            // the next-turn LLM context as a regular conversation turn,
+            // satisfying the #874 follow-up-visibility requirement.
+            // Persisting a second `kind: "error"` marker here would
+            // duplicate the same conceptual event in both chat history
+            // and LLM context — see Atlas + Alper's decision recorded
+            // on issue #912.
 
             // Best-effort: notify the DM peer that the conversation ended
             // due to a runtime error. The truncated `source` string is
@@ -1575,31 +1549,14 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
 
             state.run_manager.mark_run_as_failed(run_id, e.to_string());
 
-            if !is_internal_context_id(&context_id) {
-                // Tagged with `kind: "error"` so the runtime's
-                // `session_msg_to_llm` rewrites this marker into a `user`
-                // message on the next turn — covers LLM 4xx/5xx,
-                // rate-limit, content-policy reject, runtime errors
-                // (context budget exceeded, summary generation failed),
-                // etc. (issue #874).
-                //
-                // Sanitised before persistence so raw provider error
-                // bodies (API keys, hostnames, URLs) never reach session
-                // history or the LLM context on follow-up turns (#911).
-                let safe_reason = sanitize_error_for_session(&e);
-                super::markers::persist_error_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_boundary",
-                    format!("(run failed) {safe_reason}"),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "status": "failed",
-                        "error": safe_reason,
-                        "error_kind": "failed",
-                    }),
-                );
-            }
+            // Issue #912 — see the `FailedWithToolCalls` arm above.
+            // This generic-error arm covers LLM 4xx/5xx, rate-limit,
+            // content-policy reject, and runtime errors (context budget
+            // exceeded, summary generation failed) — all of which the
+            // runtime layer has already persisted as a sanitised
+            // `[Run failed: <safe_reason>]` text message via
+            // `finish_run`'s `Err(e)` branch.  The lifecycle-layer
+            // marker would be a duplicate.
 
             // Best-effort: see comment in the `FailedWithToolCalls` arm.
             if let Err(end_err) = super::dm_lifecycle::handle_dm_run_failure(

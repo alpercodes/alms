@@ -188,4 +188,96 @@ mod tests {
             "Tool blocked by policy"
         );
     }
+
+    /// Regression test for #911: a Runtime error whose `Display` output
+    /// embeds an absolute filesystem path (cwd, home dir, internal config
+    /// paths, etc.) must not leak that path into the session-persisted
+    /// form. The sanitiser collapses every Runtime error to one of a
+    /// fixed set of category labels, so any absolute path baked into the
+    /// underlying message is dropped on the way to session history /
+    /// LLM context.
+    #[test]
+    fn sanitize_runtime_strips_absolute_file_paths() {
+        // Cover both POSIX-style and Windows-style absolute paths so the
+        // test exercises the sanitiser's "drop the whole message body"
+        // contract rather than any platform-specific escape.
+        let cases = [
+            "internal error reading /home/alper/.config/alms/secrets.toml",
+            "internal error reading /etc/alms/config.toml entry api_key=sk-test-12345",
+            "internal error reading C:\\Users\\Alper\\AppData\\Local\\alms\\auth.token",
+        ];
+
+        for raw in cases {
+            let err = AlmsError::Runtime(raw.to_string());
+            let sanitized = sanitize_error_for_session(&err);
+            assert_eq!(
+                sanitized, "Runtime error",
+                "Runtime errors must collapse to category label, got {sanitized:?} for raw {raw:?}"
+            );
+            for needle in [
+                "/home/",
+                "/etc/",
+                "C:\\Users",
+                ".config/",
+                "secrets.toml",
+                "auth.token",
+                "sk-test-12345",
+            ] {
+                assert!(
+                    !sanitized.contains(needle),
+                    "absolute path or secret {needle:?} must not survive sanitisation: got {sanitized:?} (raw: {raw:?})"
+                );
+            }
+        }
+    }
+
+    /// Regression test for #911: a Runtime error containing a long
+    /// stack-trace-shaped body (multi-line, internal frame addresses,
+    /// arbitrary length) must not flood the session / LLM context. The
+    /// sanitiser's category-label contract bounds the persisted form to
+    /// a short fixed string regardless of how large the underlying
+    /// message is, so a multi-KB trace ends up as a 13-byte label.
+    #[test]
+    fn sanitize_runtime_strips_long_stack_traces() {
+        // Build a long, stack-trace-shaped body (not a real backtrace —
+        // we just need something multi-line and arbitrarily large that a
+        // panic-converted-to-error or a provider 500 echo could plausibly
+        // contain).
+        let mut trace = String::from("internal panic: something went wrong\n");
+        for i in 0..200 {
+            trace.push_str(&format!(
+                "  at frame_{i} in /home/alper/dev/alms/crates/alms-runtime/src/agent/loop_impl.rs:{}\n",
+                100 + i
+            ));
+        }
+        assert!(
+            trace.len() > 5000,
+            "test fixture should be large enough to demonstrate the bound"
+        );
+
+        let err = AlmsError::Runtime(trace.clone());
+        let sanitized = sanitize_error_for_session(&err);
+
+        // The sanitised form is a short fixed category label, regardless
+        // of input size.
+        assert_eq!(sanitized, "Runtime error");
+        assert!(
+            sanitized.len() < 64,
+            "sanitised form must be bounded to a category label, got {} bytes",
+            sanitized.len()
+        );
+        // None of the noisy frame contents survive.
+        for needle in [
+            "frame_0",
+            "frame_199",
+            "loop_impl.rs",
+            "/home/alper",
+            "internal panic",
+        ] {
+            assert!(
+                !sanitized.contains(needle),
+                "stack-trace fragment {needle:?} must not survive sanitisation: got {sanitized:?}"
+            );
+        }
+    }
 }

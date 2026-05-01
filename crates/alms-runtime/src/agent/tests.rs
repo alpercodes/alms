@@ -251,6 +251,139 @@ async fn test_build_context_non_dm_no_perspective() {
 // the runtime and gateway can use it. Tests for it live alongside the
 // function in `alms-core::error`.
 
+/// Regression test for #912 — when a run fails, the runtime layer's
+/// `finish_run` is the single place that persists the failure record
+/// to the session.  Before #912 the gateway's lifecycle layer also
+/// wrote a `(run failed) ...` `Role::System` marker tagged with
+/// `kind: "error"`; both records reached the LLM context on the next
+/// turn and double-spent the agent's attention budget on the same
+/// event.  Atlas + Alper's decision (recorded on issue #912) was to
+/// keep this runtime-layer write — the canonical record that lands as
+/// `Role::Assistant` text and survives `strip_mid_history_system_markers`
+/// natively — and remove the duplicate lifecycle-layer marker.
+///
+/// This test pins the runtime-layer invariant: a failed run produces
+/// exactly ONE error-flavoured record in the session.  Together with
+/// the lifecycle-layer removal in `crates/alms-gateway/src/runs/lifecycle.rs`
+/// it locks in "one failed-run record per `run_id`, not two".
+#[tokio::test]
+async fn finish_run_persists_exactly_one_error_record_on_failure() {
+    use crate::llm_types::LlmMessage;
+
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let llm = LlmClient::new(config).unwrap();
+    let agent_id = AgentId::new();
+    let runtime = AgentRuntime::new(agent_id, AgentConfig::default(), llm).unwrap();
+
+    // Pre-populate the session with a user turn so the failure record
+    // is visible in a realistic history shape.
+    let session = session_manager.get_or_create(agent_id, "test-dedup");
+    session_manager
+        .append_message(
+            session.id,
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: alms_session::Role::User,
+                content: alms_session::Content::Text("do something".to_string()),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: None,
+            },
+        )
+        .unwrap();
+
+    // Drive `finish_run` down its `Err(_)` arm by passing a synthetic
+    // history error — this is exactly the path triggered by an LLM
+    // 401/429/500, a context-build failure, or any other run-level
+    // error caught by `agent_loop` / `build_context`.
+    let history: AlmsResult<Vec<LlmMessage>> = Err(AlmsError::Runtime(
+        "simulated provider 500: server error".into(),
+    ));
+    let result = runtime
+        .finish_run(&session_manager, session.id, "test-dedup", history)
+        .await;
+
+    // The runtime layer surfaces the error to the caller wrapped in
+    // `FailedWithToolCalls` so the gateway can persist partial tool
+    // call records.  The key invariant for #912 is the side effect on
+    // the session, not the return value shape.
+    assert!(
+        matches!(result, Err(AlmsError::FailedWithToolCalls { .. })),
+        "finish_run on Err(_) history must surface FailedWithToolCalls; got {result:?}"
+    );
+
+    let history = session_manager.get_history(session.id).unwrap();
+
+    // Count every record that smells like a run-failure marker:
+    //   - the runtime-layer `[Run failed: ...]` text (Role::Assistant)
+    //   - any synthetic `(run failed) ...` marker from a hypothetical
+    //     lifecycle-layer write (Role::System with kind=error)
+    let run_failed_records: Vec<_> = history
+        .iter()
+        .filter(|m| match &m.content {
+            alms_session::Content::Text(t) => {
+                t.contains("[Run failed:") || t.contains("(run failed)")
+            }
+            _ => false,
+        })
+        .collect();
+
+    assert_eq!(
+        run_failed_records.len(),
+        1,
+        "exactly one run-failed record per run is required (issue #912); got {} records: {:#?}",
+        run_failed_records.len(),
+        run_failed_records
+            .iter()
+            .map(|m| match &m.content {
+                alms_session::Content::Text(t) => (m.role, t.clone()),
+                _ => (m.role, "<non-text>".to_string()),
+            })
+            .collect::<Vec<_>>()
+    );
+
+    // The single record is the runtime-layer `[Run failed: ...]` text
+    // at `Role::Assistant`, sanitised via `sanitize_error_for_session`.
+    let only = run_failed_records[0];
+    assert_eq!(only.role, alms_session::Role::Assistant);
+    if let alms_session::Content::Text(t) = &only.content {
+        assert!(
+            t.starts_with("[Run failed:"),
+            "runtime-layer marker must use the `[Run failed: ...]` shape; got {t:?}"
+        );
+        // Confirm the raw error body did not survive sanitisation —
+        // overlapping defence with #911's coverage in alms-core.
+        assert!(
+            !t.contains("provider 500: server error"),
+            "raw provider body must not leak into the persisted marker; got {t:?}"
+        );
+    } else {
+        panic!("expected text content on the run-failed record");
+    }
+
+    // No `Role::System` markers carrying `kind: "error"` — the
+    // lifecycle-layer write removed in #912 was the only path that
+    // produced those during a normal run failure.
+    let system_error_markers = history
+        .iter()
+        .filter(|m| {
+            m.role == alms_session::Role::System
+                && m.metadata
+                    .as_ref()
+                    .and_then(|md| md.get("kind"))
+                    .and_then(|v| v.as_str())
+                    == Some("error")
+        })
+        .count();
+    assert_eq!(
+        system_error_markers, 0,
+        "runtime-layer finish_run must not write Role::System kind=error markers (issue #912)"
+    );
+}
+
 #[tokio::test]
 async fn test_run_persists_user_message_on_failure() {
     // Use mock LLM that will produce a response, but we can verify

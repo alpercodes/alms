@@ -107,6 +107,58 @@ fn test_app_state_with_sqlite() -> (
     )
 }
 
+/// Build an `AppState` whose LLM client points at an unreachable local
+/// address with a 1-second timeout, so any `execute_run` that reaches the
+/// runtime LLM call fails quickly and deterministically through the
+/// generic `Err(_)` arm.  Used by the #912 follow-up regression test
+/// (PR #930) that asserts the gateway lifecycle no longer writes a
+/// duplicate `(run failed) ...` `kind: "error"` marker.
+fn test_app_state_with_failing_llm() -> (
+    AppState,
+    CancellationToken,
+    mpsc::UnboundedReceiver<SubagentCompletion>,
+    mpsc::UnboundedReceiver<RunTrigger>,
+    mpsc::UnboundedReceiver<DmEvent>,
+) {
+    // Port 1 is reserved (`tcpmux`) and almost universally unbound on
+    // CI / dev machines, so `connect()` fails immediately with
+    // ECONNREFUSED rather than hanging.  Combined with a 1-second
+    // request timeout this caps the test runtime at ~1s even in the
+    // pathological case where the kernel is slow to refuse.
+    let mut llm_config = alms_runtime::LlmConfig::default();
+    llm_config.base_url = "http://127.0.0.1:1".to_string();
+    llm_config.api_key = "fake-key-for-test".to_string();
+    llm_config.timeout_secs = 1;
+    llm_config.stream_chunk_timeout_secs = 1;
+
+    let gateway_config = GatewayConfig {
+        llm_config,
+        ..GatewayConfig::default()
+    };
+    let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+    let scheduler = Arc::new(alms_runtime::Scheduler::new());
+    let shutdown_token = CancellationToken::new();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let (trigger_tx, trigger_rx) = mpsc::unbounded_channel();
+    let (dm_event_tx, dm_event_rx) = mpsc::unbounded_channel();
+    let state = AppState::new(
+        gateway,
+        scheduler,
+        shutdown_token.clone(),
+        completion_tx,
+        trigger_tx,
+        dm_event_tx,
+    )
+    .unwrap();
+    (
+        state,
+        shutdown_token,
+        completion_rx,
+        trigger_rx,
+        dm_event_rx,
+    )
+}
+
 /// Seed two agents (`alice` and `bob`) into the SQLite-backed agent registry
 /// so that peer-name resolution works in `handle_dm_run_failure` and
 /// related lifecycle helpers.
@@ -2849,6 +2901,147 @@ async fn smoke_post_execute_cancel_flips_state_at_run_manager_boundary() {
         run_snapshot.status,
         RunStatus::Cancelled,
         "run status must be Cancelled after mark_run_as_cancelled"
+    );
+
+    shutdown_token.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// #912 follow-up (PR #930 review F1): gateway lifecycle does not write a
+// duplicate error marker on the four removed arms
+// ---------------------------------------------------------------------------
+
+/// Gateway-side regression pin for PR #930 follow-up F1 — Tim's "test
+/// scope is narrower than the dedup contract" finding.
+///
+/// The runtime-layer test in `alms_runtime::agent::tests` drives
+/// `finish_run` directly with a synthetic `Err(_)` history and asserts
+/// exactly one `[Run failed: ...]` record persists.  That covers the
+/// runtime side of the contract but doesn't independently verify the
+/// gateway lifecycle layer no longer writes its own
+/// `persist_error_marker` call.  Compile-time absence of those four
+/// calls in `lifecycle.rs` is the first line of defence — but a future
+/// refactor could accidentally re-add one and the runtime-layer test
+/// would still pass.  This test closes that gap end-to-end: it drives
+/// `execute_run` down the generic `Err(_)` arm with a real
+/// `AgentRuntime` and a deliberately unreachable LLM, then asserts on
+/// the persisted session shape.
+///
+/// We pick the generic `Err(_)` arm as the most representative — the
+/// four arms #912 removed (`Cancelled`, `CancelledWithToolCalls`,
+/// `FailedWithToolCalls`, generic `Err(_)`) share the same dedup
+/// logic, so one end-to-end pin is enough.  The `FailedWithToolCalls`
+/// arm requires a synthetic tool-call sequence to drive deterministically
+/// (it fires only when the LLM returned tool calls before failing); the
+/// generic `Err(_)` arm fires on any LLM-call failure and is the
+/// default failure mode for production deployments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execute_run_failed_arm_persists_no_lifecycle_error_marker() {
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_failing_llm();
+    let agent_id = AgentId::new();
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "test-912-no-dup-marker");
+    let session_id = session.id;
+
+    let run = Run::new(session_id, agent_id, "trigger LLM failure".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: run.input,
+            overrides: super::RunOverrides::default(),
+            context_id: "test-912-no-dup-marker".to_string(),
+            cancel_token,
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    // The run must have terminated through the failed arm — the LLM
+    // is unreachable so it cannot complete normally.  We check the
+    // RunManager rather than asserting on a specific terminal status
+    // string because the failure could surface as either a connection
+    // refused, a timeout, or a stream parse error depending on the
+    // host's TCP stack — all three land in the same generic `Err(_)`
+    // arm of `execute_run`.
+    let final_run = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must still exist after execute_run returns");
+    assert_eq!(
+        final_run.status,
+        RunStatus::Failed,
+        "run must reach Failed status when the LLM is unreachable; got {:?} (error={:?})",
+        final_run.status,
+        final_run.error,
+    );
+
+    // CORE INVARIANT for issue #912: NO `Role::System` `kind: "error"`
+    // marker may be persisted on the four removed arms.  Pre-#912 the
+    // gateway wrote a `(run failed) ...` `kind: "error"` system marker
+    // here (after the runtime had already written `[Run failed: ...]`
+    // as `Role::Assistant` text); post-#912 the runtime-layer write is
+    // the only error record.
+    let history = state.session_manager.get_history(session_id).unwrap();
+    let lifecycle_error_markers: Vec<_> = history
+        .iter()
+        .filter(|m| {
+            m.role == alms_session::Role::System
+                && m.metadata
+                    .as_ref()
+                    .and_then(|md| md.get("kind"))
+                    .and_then(|v| v.as_str())
+                    == Some("error")
+        })
+        .collect();
+    assert_eq!(
+        lifecycle_error_markers.len(),
+        0,
+        "lifecycle layer must NOT persist a `Role::System kind=error` marker on the generic `Err(_)` arm (issue #912); got {} markers: {:#?}",
+        lifecycle_error_markers.len(),
+        lifecycle_error_markers
+            .iter()
+            .map(|m| match &m.content {
+                alms_session::Content::Text(t) => t.clone(),
+                _ => "<non-text>".to_string(),
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    // Sanity-check the runtime-layer write IS present — we want to be
+    // sure we drove `execute_run` deeply enough to reach the failure
+    // path, not exit early before the runtime tried the LLM call.
+    let runtime_failure_records: Vec<_> = history
+        .iter()
+        .filter(|m| match &m.content {
+            alms_session::Content::Text(t) => t.starts_with("[Run failed:"),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        runtime_failure_records.len(),
+        1,
+        "exactly one runtime-layer `[Run failed: ...]` record must persist (the canonical record kept by #912); got {} records in history of len {}",
+        runtime_failure_records.len(),
+        history.len(),
+    );
+    assert_eq!(
+        runtime_failure_records[0].role,
+        alms_session::Role::Assistant,
+        "runtime-layer failure record must be `Role::Assistant` (the bubble shape kept as canonical by #912)"
     );
 
     shutdown_token.cancel();
