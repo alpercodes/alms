@@ -28,6 +28,12 @@ test-golden:
 	@echo "==> Running golden tests"
 	cargo test --package alms-gateway --test sse_golden_tests
 
+# Parse-sweep every static UI module (#829 — guards against shipping
+# syntactically broken JS that browsers would reject).
+test-static-assets:
+	@echo "==> Parse-checking static/ui JS modules"
+	cargo test --package alms-gateway --test static_assets_parse
+
 # Run checks without building (fast)
 check:
 	@echo "==> Running cargo check"

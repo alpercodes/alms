@@ -28,6 +28,10 @@ make test
 
 # Run golden tests specifically
 make test-golden
+
+# Parse-check every static UI JS module (catches the bug class
+# from PR #828 — see issue #829)
+make test-static-assets
 ```
 
 ### Code Style
@@ -35,6 +39,12 @@ make test-golden
 - **Formatting**: Use `cargo fmt` (enforced in CI)
 - **Linting**: All clippy warnings must be resolved (enforced in CI)
 - **Testing**: All tests must pass (enforced in CI)
+- **Static UI**: Every `*.js` / `*.mjs` under `crates/alms-gateway/static/ui/`
+  is parsed in module mode by `tests/static_assets_parse.rs` as part of
+  `cargo test --all`. Module-syntax bugs (unterminated template literals,
+  malformed `import` / `export`, stray tokens) fail CI before they ship.
+  Module-resolution, runtime, and type errors are out of scope for this
+  check — see issue #829.
 
 ### Git Workflow
 
@@ -65,7 +75,8 @@ The CI pipeline (`.github/workflows/ci.yml`) runs:
 
 1. `cargo fmt --all -- --check` - Ensures consistent formatting
 2. `cargo clippy --all-targets --all-features -- -D warnings` - Static analysis
-3. `cargo test --all` - Runs all tests including golden tests
+3. `cargo test --all` - Runs all tests including golden tests and the
+   static-asset JS parse-sweep (`tests/static_assets_parse.rs`, #829)
 4. `cargo build --release` - Verifies release build works
 
 `make ci` runs all of these steps locally for parity.
