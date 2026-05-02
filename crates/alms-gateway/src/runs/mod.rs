@@ -514,6 +514,10 @@ mod tests {
         );
     }
 
+    // Guard: passes pre-fix because `resolve_agent_config` already calls
+    // `with_model(merged.model_override)` after the provider switch, so the
+    // per-agent model override survives the cross-provider hop. Pinned here
+    // to catch a future refactor that drops the post-switch re-application.
     /// Regression test for #860 -- when a per-agent `provider` override is
     /// set together with a per-agent `model` override, the per-agent model
     /// must reach the wire even though the server-default provider entry
@@ -591,6 +595,10 @@ mod tests {
         assert_eq!(resolved.llm.provider(), "anthropic");
     }
 
+    // Guard: passes pre-fix for the same reason as the previous test --
+    // `resolve_agent_config` re-applies the per-agent `with_model` after the
+    // provider switch, so the new provider entry's own `model` field never
+    // wins. Pinned to catch a future refactor that reorders those steps.
     /// Companion regression for #860 -- the most pernicious shape, where the
     /// new provider's entry has its own `model` field that would clobber
     /// `default_model` inside `apply_provider`. The per-agent `with_model`
@@ -663,6 +671,12 @@ mod tests {
         assert_eq!(resolved.llm.provider(), "anthropic");
     }
 
+    // Regression: fails pre-fix on the exact #860 leak shape -- the
+    // server-default OpenRouter `kimi-k2.6` model survives the per-agent
+    // provider switch to Anthropic and reaches the wire, producing a
+    // confusing 404 from Anthropic referencing `moonshotai/kimi-k2.6`. The
+    // post-fix leak guard clears `default_model` so the failure is fast
+    // and obvious instead of routed-to-wrong-provider.
     /// Hypothetical: per-agent provider only, no per-agent model. The
     /// server-default model leaks through to the new provider when the new
     /// provider's `[llm.providers.<name>]` entry has no `model` field.
