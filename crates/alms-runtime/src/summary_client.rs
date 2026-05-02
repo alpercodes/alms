@@ -25,7 +25,7 @@
 //!   new provider entry has no `model` field), clear `default_model` so
 //!   the wire fails fast with a missing-model error rather than leaking the
 //!   agent provider's model slug onto the summary provider's wire — the
-//!   same shape as #860/#861 on the per-agent / per-run paths.
+//!   same shape as #860/#861 on the per-agent path.
 //!
 //! The PATCH validator in `alms-gateway::settings` rejects the
 //! `(provider set + model missing)` shape at write time

@@ -1,10 +1,7 @@
 //! Run creation, execution, and completion — the core run lifecycle.
 
 use super::tools::{RuntimeEventForwarder, forward_runtime_events};
-use super::{
-    RunOverrides, RunParams, apply_overrides, is_internal_context_id, resolve_agent_config,
-    validate_provider,
-};
+use super::{RunParams, is_internal_context_id, resolve_agent_config};
 use crate::api_error;
 use crate::server::AppState;
 use crate::sse::SseEventData;
@@ -322,22 +319,6 @@ pub async fn create_run(
         None => session_agent_id,
     };
 
-    // Validate provider override early so the user gets a clear 400 instead
-    // of a confusing "invalid API key" error from a wrong provider.
-    if let Some(ref p) = req.provider {
-        validate_provider(p)?;
-    }
-
-    let overrides = RunOverrides {
-        model: req.model.clone(),
-        max_tokens: req.max_tokens,
-        posture: req.posture.clone(),
-        provider: req.provider.clone(),
-        debug_mode: req.debug_mode,
-        thinking_budget_tokens: req.thinking_budget_tokens,
-        reasoning_effort: req.reasoning_effort,
-        gemini_thinking_budget: req.gemini_thinking_budget,
-    };
     let run = Run::new(session.id, agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
@@ -450,7 +431,6 @@ pub async fn create_run(
                     session_id,
                     agent_id,
                     input: run.input,
-                    overrides,
                     context_id,
                     cancel_token,
                     is_peer_message: false,
@@ -636,7 +616,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         session_id,
         agent_id,
         input,
-        overrides,
         context_id,
         cancel_token,
         is_peer_message,
@@ -710,10 +689,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // ---------------------------------------------------------------------
     // Resolve the layered run config UP FRONT (#837).
     //
-    // The full per-run > per-agent > server-default merge — including the
-    // bootstrap-prompt swap and the system-triggered notification
-    // debug-flip — happens here, **before** the `Queued` → `Running`
-    // transition fires. Two reasons:
+    // The per-agent > server-default merge — including the bootstrap-prompt
+    // swap and the system-triggered notification debug-flip — happens here,
+    // **before** the `Queued` → `Running` transition fires. Two reasons:
     //
     // 1. Triage: the resolved snapshot is persisted alongside the
     //    `Running` state and broadcast on the `run_started` SSE so live
@@ -726,15 +704,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     //    never observes a torn state where status is `Running` but the
     //    snapshot is absent.
     //
-    // The intermediate work between this block and the `mark_run_as_running`
-    // call below (state + SSE) used to live higher up; the reorder is safe
-    // because resolution is pure config plumbing and depends only on
-    // `state.*` / `overrides` / `agent_id`, all available since
-    // `execute_run` started.
+    // Per-run config overrides were removed in the #941 pivot — the run
+    // config is determined entirely by `resolve_agent_config` (per-agent
+    // > server default). Operators change agent config via `PATCH
+    // /agents/{id}` (or server defaults via `PATCH /settings`) before
+    // starting the run; `POST /runs` carries no config knobs. Removing
+    // the per-run path closes the leak family at #833 / #860 / #863 /
+    // #939 by deleting the pathway that produced them.
     // ---------------------------------------------------------------------
 
-    // Resolve per-agent config (model, posture) from the agent registry,
-    // then layer per-run overrides on top.
+    // Resolve per-agent config (model, posture, provider, reasoning
+    // budgets, summary provider/model) from the agent registry on top of
+    // the server default. The returned `LlmClient` already carries the
+    // per-agent provider switch (with secrets re-resolved) and any
+    // per-agent model override.
     let base_agent_config = state.agent_config.read().clone();
     let resolved = resolve_agent_config(
         agent_id,
@@ -751,37 +734,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         );
     }
 
-    // Apply per-run overrides (highest precedence) on top of the resolved config.
-    // Uses `apply_overrides()` for the common fields (max_tokens, posture,
-    // debug_mode) to avoid duplicating the logic that lives in runs/mod.rs.
-    // Provider and model require LLM client mutations which `apply_overrides()`
-    // does not handle, so those stay inline.
-    let merged = apply_overrides(resolved.agent_config, None, &overrides);
-    let mut agent_config = merged.agent_config;
-    if let Some(ref provider) = overrides.provider {
-        info!("Run {} using provider override: {}", run_id.0, provider);
-    }
-    if let Some(ref model) = overrides.model {
-        info!("Run {} using model override: {}", run_id.0, model);
-    }
-    // Apply per-run LLM overrides (provider + model) via the shared helper
-    // in `runs/mod.rs::apply_per_run_llm_overrides`. The helper preserves
-    // the three-layer precedence (per-run > per-agent > server default) for
-    // model even when a per-run provider override would otherwise clobber
-    // the resolved per-agent model via `apply_provider` (#833).
-    let llm = super::apply_per_run_llm_overrides(resolved.llm, &overrides, &state.secrets.read());
+    let mut agent_config = resolved.agent_config;
+    let llm = resolved.llm;
 
     // System-triggered runs (peer DMs, notifications, subagent completions)
     // have no human in the loop, so Guarded posture would hang forever
     // waiting for approval.  Force Autonomous posture for these runs.
-    let resolved = resolve_posture_for_run(agent_config.posture, is_system_triggered);
-    if resolved != agent_config.posture {
+    let posture_resolved = resolve_posture_for_run(agent_config.posture, is_system_triggered);
+    if posture_resolved != agent_config.posture {
         info!(
             "Run {} is system-triggered — overriding {:?} posture to {:?}",
-            run_id.0, agent_config.posture, resolved
+            run_id.0, agent_config.posture, posture_resolved
         );
     }
-    agent_config.posture = resolved;
+    agent_config.posture = posture_resolved;
 
     // Override system prompt with bootstrap prompt for first-time agents.
     // Must come after per-agent overrides so bootstrap takes precedence.

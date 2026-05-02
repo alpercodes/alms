@@ -1,12 +1,10 @@
 import { h, html, computed, signal } from '../deps.js';
 import { agents, activeAgentId } from '../state/agents.js';
 import { activePanel, togglePanel } from '../state/panel.js';
-import { localSettings, serverDefaults } from '../state/settings.js';
+import { serverDefaults } from '../state/settings.js';
 import { theme, toggleTheme } from '../state/theme.js';
 import { switchAgent } from '../hooks/use-boot.js';
 import { IconGear, IconSun, IconMoon, IconMenu, IconX } from '../utils/icons.js';
-import { activeOverrideCount, activeOverrideKeys, OVERRIDE_LABELS } from './settings-modal.js';
-import { overrideTooltip as sharedOverrideTooltip } from '../utils/override-marker.js';
 import { bootRetryAvailable, runBoot } from '../state/loading.js';
 
 /** Sidebar open/close state — shared so Sidebar and backdrop can react */
@@ -25,21 +23,15 @@ export function closeSidebar() {
 // Audit remains here — it's session-scoped, not agent-scoped.
 const TABS = ['agents', 'jobs', 'audit'];
 
-const effectivePosture = computed(() => {
-    const local = localSettings.value.posture;
-    const server = serverDefaults.value.posture;
-    return local || server || 'guarded';
-});
-
 /**
- * Local alias for the shared `overrideTooltip` (#857 / PR #926
- * follow-up). The composer Advanced badge tooltip uses the same wording,
- * so the generator lives once in `utils/override-marker.js` and both
- * surfaces stay in lock-step automatically.
+ * Posture badge in the header reflects the **server default** (the
+ * single layer that's globally visible from the header). Per-agent
+ * posture is shown on the agent's record in the Agents panel; per-run
+ * overrides were removed in the #941 pivot.
  */
-function overrideTooltip(count, keys) {
-    return sharedOverrideTooltip(count, keys, OVERRIDE_LABELS);
-}
+const effectivePosture = computed(() => {
+    return serverDefaults.value.posture || 'guarded';
+});
 
 export function Header({ onOpenSettings, status }) {
     const onAgentChange = (e) => {
@@ -106,12 +98,6 @@ export function Header({ onOpenSettings, status }) {
             <button class="header-icon-btn settings-btn" title="Settings" aria-label="Settings"
                     onClick=${onOpenSettings}>
                 <${IconGear} />
-                ${activeOverrideCount.value > 0 && html`
-                    <span class="settings-override-badge"
-                          title=${overrideTooltip(activeOverrideCount.value, activeOverrideKeys.value)}>
-                        ${activeOverrideCount.value}
-                    </span>
-                `}
             </button>
         </header>
     `;

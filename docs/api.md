@@ -355,15 +355,17 @@ Notes:
 ```json
 {
   "session_id": "<uuid>",
+  "agent_id": "<uuid>",
   "input": {
     "type": "text",
     "text": "Hello"
-  },
-  "mode": {
-    "kind": "non_stream" 
   }
 }
 ```
+
+`agent_id` is optional for normal sessions (the gateway resolves it from the session's owning agent) and **required** for shared DM sessions. The request body carries no config knobs — per-run overrides were removed in the #941 pivot. Operators change model / provider / posture / reasoning budgets via `PATCH /agents/{id}` (or `PATCH /settings` for server defaults) before starting the run.
+
+**Forward compatibility.** Unknown fields on the request body are silently ignored — the deserializer does NOT use `deny_unknown_fields`. UI clients on stale builds that still send `model`, `max_tokens`, `posture`, `provider`, `debug_mode`, `thinking_budget_tokens`, `reasoning_effort`, or `gemini_thinking_budget` will continue to function: the gateway accepts the request, drops the stale fields on the floor, and runs with the agent's resolved config.
 
 **Response 201**
 ```json
@@ -414,7 +416,7 @@ Notes:
 - `parent_run_id` is present (as a UUID string) for subagent runs; absent for top-level runs (uses `skip_serializing_if = "Option::is_none"`).
 - `tool_call_count` (optional integer) — number of tool call records stored for this run. Present when SQLite persistence is enabled. Use `GET /runs/{run_id}/tool-calls` to retrieve the full records.
 - `queue_position` (optional integer, 1-indexed) — present and `>= 1` only while `status == "queued"`. Carries the same semantic as `run_created.queued_behind` and the live `run_queue_position` SSE event so a late-joining client (page reload, polling) can render the queued state without waiting for the next decrement. Absent for running/terminal runs.
-- `resolved_config` (optional object, #837) — snapshot of the **fully layered** (per-run > per-agent > server-default) config the run committed to at start-time. Absent for runs still queued, runs that never advanced past `queued` (e.g. queued-then-cancelled fast-path), and pre-#837 SQLite rows. Fields: `provider`, `model`, `max_tokens`, `posture`, `debug_mode` (always present); `thinking_budget_tokens` (Anthropic, `0` = disabled, always present as `u32`); `reasoning_effort` (OpenAI-compat, `"low"`/`"medium"`/`"high"`/`"minimal"`, omitted on the wire when no value reached the adapter); `gemini_thinking_budget` (Gemini, omitted on the wire when no value reached the adapter). The reasoning / thinking shape asymmetry is intentional — see the `ResolvedRunConfig` field docs in `crates/alms-core/src/run.rs` for the rationale (each field mirrors its underlying `AgentConfig` shape so the snapshot is a faithful projection of what the adapter saw).
+- `resolved_config` (optional object, #837) — snapshot of the layered (per-agent > server-default) config the run committed to at start-time. Per-run config overrides were removed in the #941 pivot, so the snapshot now reflects a two-layer chain instead of three. Absent for runs still queued, runs that never advanced past `queued` (e.g. queued-then-cancelled fast-path), and pre-#837 SQLite rows. Fields: `provider`, `model`, `max_tokens`, `posture`, `debug_mode` (always present); `thinking_budget_tokens` (Anthropic, `0` = disabled, always present as `u32`); `reasoning_effort` (OpenAI-compat, `"low"`/`"medium"`/`"high"`/`"minimal"`, omitted on the wire when no value reached the adapter); `gemini_thinking_budget` (Gemini, omitted on the wire when no value reached the adapter). The reasoning / thinking shape asymmetry is intentional — see the `ResolvedRunConfig` field docs in `crates/alms-core/src/run.rs` for the rationale (each field mirrors its underlying `AgentConfig` shape so the snapshot is a faithful projection of what the adapter saw).
 
 ### 5.3 Stream a run (SSE-first)
 `GET /runs/{run_id}/events`
@@ -1023,10 +1025,11 @@ is asking for two contradictory things, so we reject rather than silently
 pick one. `clear_*: false` is equivalent to omitting the field entirely
 (the stored value is unchanged).
 
-After a successful clear, a subsequent `POST /runs` with no per-run
-override for that knob resolves to the server default from
-`[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]`, completing the
-three-layer precedence chain (per-run > per-agent > server default).
+After a successful clear, a subsequent `POST /runs` resolves to the
+server default from `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]`,
+completing the two-layer precedence chain (per-agent > server default).
+Per-run overrides were removed in the #941 pivot; agents are the single
+per-tenant config surface.
 
 **Response 200** — updated `AgentRecord`
 **Response 400 CLEAR_AND_VALUE_CONFLICT** — both a value and the matching `clear_*` flag were sent for the same reasoning knob.
@@ -1115,7 +1118,7 @@ Returns current server defaults for UI pre-population.
 }
 ```
 
-Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved for backward compatibility alongside the new nested objects (`context`, `session`, `logging`, `tools`, `llm`). The nested objects contain the same data in a structured form. New consumers should prefer the nested objects. The `llm` block (added in #809) mirrors the `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` sections of `alms.toml` — these are the *server-level* defaults that feed the three-layer precedence chain for per-agent and per-run overrides.
+Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved for backward compatibility alongside the new nested objects (`context`, `session`, `logging`, `tools`, `llm`). The nested objects contain the same data in a structured form. New consumers should prefer the nested objects. The `llm` block (added in #809) mirrors the `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` sections of `alms.toml` — these are the *server-level* defaults that feed the two-layer precedence chain (per-agent > server default; per-run overrides were removed in #941).
 
 ### 10.2 Update server settings
 `PATCH /settings`
@@ -1128,7 +1131,7 @@ Partially update server-level configuration at runtime. The `context`, `session`
 
 Within `tools`, only `shell_policy`, `sandbox_root`, `timeout_secs`, and `max_output_bytes` are dynamically mutable. **`tools.shell_permissions` is configured in `alms.toml` only** — its allow/deny regex patterns are compiled once at startup and baked into each `ShellTool` instance (see `docs/agent-runtime-design.md` for the config schema and `docs/security-model.md` § 4.3 for the policy semantics). This applies to every field in the block: `allowed_commands`, `denied_commands`, and `classifier_overrides` are all config-file-only and are **not** PATCH-mutable. Sending `shell_permissions` in a `PATCH /settings` body is ignored; restart the gateway to pick up new patterns.
 
-Within `llm`, each provider-family sub-block mirrors the shape of `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` in `alms.toml`. Mutations feed the server-default layer of the three-layer precedence chain (per-run > per-agent > server default) and are picked up on the next `POST /runs` without a restart. All provider-family sub-blocks and fields are optional; fields that are `None` in the patch body are left unchanged. API keys and endpoints are **not** in scope — those live under a separate security surface.
+Within `llm`, each provider-family sub-block mirrors the shape of `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` in `alms.toml`. Mutations feed the server-default layer of the two-layer precedence chain (per-agent > server default; per-run overrides were removed in #941) and are picked up on the next `POST /runs` without a restart. All provider-family sub-blocks and fields are optional; fields that are `None` in the patch body are left unchanged. API keys and endpoints are **not** in scope — those live under a separate security surface.
 
 #### `llm` field semantics — clear sentinels and wire shape
 

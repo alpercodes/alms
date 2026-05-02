@@ -8,8 +8,8 @@ use uuid::Uuid;
 /// Snapshot of the **fully layered** configuration that a run committed to
 /// at start-time (#837).
 ///
-/// The gateway's three-layer precedence chain (per-run > per-agent > server
-/// default) is implemented in
+/// The gateway's two-layer precedence chain (per-agent > server default)
+/// is implemented in
 /// [`alms-gateway::runs::lifecycle`](../../../alms-gateway/src/runs/lifecycle.rs)
 /// and the values resolved there are the ones the LLM adapter actually
 /// uses on the wire. Persisting them here makes "I set model X but Y was
@@ -17,6 +17,11 @@ use uuid::Uuid;
 /// need to correlate the original PATCH request, the registry state at
 /// run-start, and the server config at run-start across log files that may
 /// have rotated out.
+///
+/// Per-run overrides were removed in the #941 pivot — agents are now the
+/// single per-tenant config surface. Operators change agent config via
+/// `PATCH /agents/{id}` (or server defaults via `PATCH /settings`) before
+/// starting a run, never per-run.
 ///
 /// All fields snapshot the **effective** value: the post-layering result,
 /// not the raw per-run override. `provider` and `model` come from the
@@ -62,9 +67,9 @@ pub struct ResolvedRunConfig {
     /// `"gemini"`, ...). Read from the resolved `LlmClient::provider()`.
     pub provider: String,
     /// Effective model slug. Read from the resolved
-    /// `LlmClient::default_model()` after per-run / per-agent / server-default
+    /// `LlmClient::default_model()` after per-agent / server-default
     /// layering and any `apply_provider`-driven model rewrites have settled.
-    /// May be empty when a per-run provider switch with no per-run / per-agent
+    /// May be empty when a per-agent provider switch with no per-agent
     /// model and no provider-entry model triggered the #860 leak guard —
     /// the empty string is preserved here so triage can confirm the fail-fast
     /// path actually engaged.
@@ -273,12 +278,11 @@ pub struct Run {
     /// Set when this run is a subagent execution spawned by another run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<RunId>,
-    /// Snapshot of the fully layered config (per-run > per-agent > server
-    /// default) the run committed to at start-time (#837). `None` for runs
-    /// created before the snapshot was wired up (old SQLite rows) or for
-    /// runs that never advanced past the queued state. Populated once at
-    /// the transition from `Queued` to `Running` and never mutated
-    /// afterwards.
+    /// Snapshot of the layered config (per-agent > server default) the run
+    /// committed to at start-time (#837). `None` for runs created before
+    /// the snapshot was wired up (old SQLite rows) or for runs that never
+    /// advanced past the queued state. Populated once at the transition
+    /// from `Queued` to `Running` and never mutated afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_config: Option<ResolvedRunConfig>,
 }
@@ -329,11 +333,11 @@ impl Run {
         self.started_at = Some(Utc::now());
     }
 
-    /// Attach the fully layered config snapshot (#837).
+    /// Attach the layered config snapshot (#837).
     ///
     /// Called at the `Queued` → `Running` transition by the gateway after
-    /// per-run, per-agent, and server-default config has been merged and
-    /// any system-triggered notification-run debug-flip has settled.
+    /// per-agent and server-default config has been merged and any
+    /// system-triggered notification-run debug-flip has settled.
     /// Idempotent over-writes are allowed but only the first call should
     /// occur in practice.
     pub fn set_resolved_config(&mut self, config: ResolvedRunConfig) {
@@ -359,7 +363,14 @@ impl Run {
     }
 }
 
-/// Request to create a run
+/// Request to create a run.
+///
+/// Per-run config overrides were removed in the #941 pivot. The agent
+/// is now the single per-tenant config surface — operators set
+/// model/provider/posture/budgets via `PATCH /agents/{id}` before starting
+/// the run. Stale per-run override fields sent by older clients are
+/// silently ignored on the wire (no `#[serde(deny_unknown_fields)]`) so
+/// in-flight UI bundles on stale builds keep working with no migration.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRunRequest {
     pub session_id: SessionId,
@@ -371,50 +382,6 @@ pub struct CreateRunRequest {
     #[serde(default)]
     pub agent_id: Option<AgentId>,
     pub input: RunInput,
-    /// Optional model override — uses server default when absent.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Optional max_tokens override.
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
-    /// Optional posture override: "full_control" | "guarded" | "autonomous".
-    #[serde(default)]
-    pub posture: Option<String>,
-    /// Optional provider override: "openai" | "anthropic" | "openrouter".
-    #[serde(default)]
-    pub provider: Option<String>,
-    /// When true, the runtime emits a `context_debug` SSE event with the
-    /// full assembled context window before calling the LLM. Used by the
-    /// web UI to inspect exactly what the LLM sees.
-    #[serde(default)]
-    pub debug_mode: Option<bool>,
-    /// Optional per-run Anthropic extended-thinking budget override.
-    ///
-    /// `Some(0)` explicitly disables extended thinking for just this run
-    /// even when per-agent or server config would enable it. Omitting the
-    /// field falls through to the per-agent override (or server default).
-    /// Silently ignored when the effective provider is not Anthropic.
-    #[serde(default)]
-    pub thinking_budget_tokens: Option<u32>,
-    /// Optional per-run OpenAI-compat reasoning-effort override (#768).
-    ///
-    /// Three-layer precedence: per-run > per-agent > server default from
-    /// `[llm.openai].reasoning_effort`. Silently ignored when the effective
-    /// provider is not OpenAI-compatible or the model isn't a reasoning
-    /// model.
-    #[serde(default)]
-    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
-    /// Optional per-run Gemini extended-thinking budget override (#794).
-    ///
-    /// `Some(0)` explicitly disables extended thinking for just this run
-    /// even when per-agent or server config would enable it. Omitting the
-    /// field falls through to the per-agent override (or server default).
-    /// Silently ignored when the effective provider is not Gemini.
-    ///
-    /// Three-layer precedence: per-run > per-agent > server default from
-    /// `[llm.gemini].thinking_budget`.
-    #[serde(default)]
-    pub gemini_thinking_budget: Option<u32>,
 }
 
 /// Input to a run

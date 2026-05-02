@@ -162,7 +162,8 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         // LLM provider-family settings (#809). Mirrors the shape of the
         // `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` blocks in
         // `alms.toml`. Server-level defaults only; per-agent overrides
-        // live on the agent registry, per-run overrides on `POST /runs`.
+        // live on the agent registry. Per-run overrides were removed in
+        // #941 — agents are the single per-tenant config surface.
         "llm": {
             "anthropic": {
                 "thinking_budget_tokens": agent.anthropic_thinking_budget,
@@ -523,8 +524,9 @@ pub async fn patch_settings(
     // ── LLM (provider-family defaults, #809) ──────────────────────────
     //
     // All six knobs live on the server-level `AgentConfig` which is the
-    // single source of truth for new runs (see `runs/mod.rs::apply_overrides`
-    // and `runs/lifecycle.rs::execute_run`). Mutating it under the same
+    // single source of truth for new runs (see
+    // `runs/mod.rs::resolve_agent_config` and
+    // `runs/lifecycle.rs::execute_run`). Mutating it under the same
     // write lock as the other PATCH branches ensures the next `POST /runs`
     // picks up the new value without a daemon restart.
     if let Some(llm_patch) = &body.llm {

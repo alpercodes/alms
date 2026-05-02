@@ -85,25 +85,6 @@ html[data-theme='light'] .model-provider-badge--groq     { color: #b91c1c; backg
 html[data-theme='light'] .model-provider-badge--ollama   { color: #0f766e; background: rgba(15, 118, 110, 0.10); }
 html[data-theme='light'] .model-provider-badge--google   { color: #1a73e8; background: rgba(26, 115, 232, 0.10); }
 
-/* Override count badge on the settings gear button */
-.settings-btn { position: relative; }
-.settings-override-badge {
-  position: absolute;
-  top: 2px;
-  right: 2px;
-  min-width: 14px;
-  height: 14px;
-  padding: 0 3px;
-  border-radius: 7px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 9px;
-  font-weight: 700;
-  line-height: 14px;
-  text-align: center;
-  pointer-events: none;
-}
-
 /* Small inline input for editable settings rows */
 .settings-input-sm {
   max-width: 180px;

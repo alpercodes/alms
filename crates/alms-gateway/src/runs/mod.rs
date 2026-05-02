@@ -40,62 +40,8 @@ pub use self::config::{ResolvedAgentConfig, resolve_agent_config};
 // Shared types (used by multiple submodules)
 // ---------------------------------------------------------------------------
 
-use crate::api_error;
 use alms_core::{RunId, SessionId};
-use axum::{Json, http::StatusCode};
 use tokio_util::sync::CancellationToken;
-
-/// Valid LLM provider identifiers accepted in per-run overrides.
-///
-/// This is intentionally separate from `alms_core::secrets::VALID_PROVIDERS`
-/// which also includes non-LLM keys like `"telegram"`.
-const VALID_LLM_PROVIDERS: &[&str] = &["openai", "anthropic", "openrouter"];
-
-/// Validate that a provider string is a known LLM provider.
-///
-/// Returns `Ok(())` if valid, or an API error tuple suitable for returning
-/// from an Axum handler if the provider is unrecognised.
-fn validate_provider(provider: &str) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    if VALID_LLM_PROVIDERS.contains(&provider) {
-        Ok(())
-    } else {
-        Err(api_error(
-            StatusCode::BAD_REQUEST,
-            "INVALID_PROVIDER",
-            format!(
-                "Unknown provider '{}'. Valid providers: {}",
-                provider,
-                VALID_LLM_PROVIDERS.join(", ")
-            ),
-        ))
-    }
-}
-
-/// Per-run overrides that can be sent by the client to customise a single run.
-#[derive(Debug, Default)]
-struct RunOverrides {
-    model: Option<String>,
-    max_tokens: Option<u32>,
-    posture: Option<String>,
-    provider: Option<String>,
-    debug_mode: Option<bool>,
-    /// Per-run Anthropic extended-thinking budget override. `Some(0)`
-    /// explicitly disables extended thinking for just this run even when
-    /// both the per-agent and server default would enable it.
-    thinking_budget_tokens: Option<u32>,
-    /// Per-run OpenAI-compat reasoning-effort override (#768). Three-layer
-    /// precedence: per-run > per-agent > server default from `[llm.openai]`.
-    /// Silently ignored when the effective provider is not OpenAI-compatible
-    /// or the model isn't a reasoning model.
-    reasoning_effort: Option<alms_core::config::ReasoningEffort>,
-    /// Per-run Gemini extended-thinking budget override (#794). `Some(0)`
-    /// explicitly disables extended thinking for just this run even when
-    /// both the per-agent and server default would enable it. Three-layer
-    /// precedence: per-run > per-agent > server default from
-    /// `[llm.gemini].thinking_budget`. Silently ignored when the effective
-    /// provider is not Gemini.
-    gemini_thinking_budget: Option<u32>,
-}
 
 /// Bundled parameters for [`lifecycle::execute_run`], avoiding a long positional argument list.
 struct RunParams {
@@ -103,7 +49,6 @@ struct RunParams {
     session_id: SessionId,
     agent_id: alms_core::AgentId,
     input: String,
-    overrides: RunOverrides,
     context_id: String,
     cancel_token: CancellationToken,
     /// When true, the input message has already been persisted to the session
@@ -182,10 +127,27 @@ mod config {
 
     /// Resolve per-agent config overrides from the agent registry.
     ///
-    /// Looks up the agent record by ID, applies model/posture overrides on top
-    /// of the base config. Returns the merged config, LLM client with model
-    /// override, and agent name for workspace resolution.
-    /// No per-run overrides are applied — callers layer those on top.
+    /// Looks up the agent record by ID, layers per-agent overrides
+    /// (model/posture/provider/reasoning/thinking budgets/summary
+    /// provider+model) on top of the server-default `base_config`, and
+    /// returns the merged `AgentConfig`, an `LlmClient` retargeted at the
+    /// per-agent provider (with secrets re-resolved), and the agent's
+    /// registry name for workspace resolution.
+    ///
+    /// **Two-layer precedence** (per-agent > server default). Per-run
+    /// overrides were removed in the #941 pivot — agents are the single
+    /// per-tenant config surface. Operators set values via `PATCH
+    /// /agents/{id}` before starting the run; `POST /runs` carries no
+    /// config knobs.
+    ///
+    /// **#860 model-leak guard.** When a per-agent `provider` override
+    /// switches the effective provider AND neither a per-agent `model` nor
+    /// a `[llm.providers.<name>].model` entry supplies a model for the
+    /// new provider, `apply_provider` leaves `default_model` pointing at
+    /// the OLD provider's default. That stale model would 404 on the new
+    /// provider's wire. The guard clears `default_model` to `""` so the
+    /// agent loop's wire request fails fast with a clean "missing model"
+    /// error.
     pub fn resolve_agent_config(
         agent_id: alms_core::AgentId,
         session_manager: &alms_session::SessionManager,
@@ -210,23 +172,62 @@ mod config {
 
         let agent_name = agent_record.as_ref().map(|r| r.name.clone());
 
-        let merged = super::apply_overrides(
-            base_config.clone(),
-            agent_record.as_ref(),
-            &super::RunOverrides::default(),
-        );
+        // Layer per-agent overrides onto the base config.
+        let mut cfg = base_config.clone();
+        let mut per_agent_model: Option<String> = None;
+        if let Some(record) = agent_record.as_ref() {
+            if let Some(ref m) = record.model {
+                per_agent_model = Some(m.clone());
+            }
+            if let Some(ref p) = record.posture
+                && let Ok(posture) = p.parse::<alms_runtime::Posture>()
+            {
+                cfg.posture = posture;
+            }
+            // Per-agent Anthropic thinking budget. `Some(0)` is a legitimate
+            // per-agent override meaning "disable extended thinking for this
+            // agent even when the server default enables it", so we honour
+            // any `Some` value here.
+            if let Some(budget) = record.thinking_budget_tokens {
+                cfg.anthropic_thinking_budget = budget;
+            }
+            // Per-agent OpenAI-compat reasoning effort (#768). `Some(effort)`
+            // wins over the server default; `None` falls through.
+            if let Some(effort) = record.reasoning_effort {
+                cfg.openai_reasoning_effort = Some(effort);
+            }
+            // Per-agent Gemini thinking budget (#794). `Some(n)` (including
+            // `Some(0)`) is a legitimate per-agent override — same shape as
+            // Anthropic `thinking_budget_tokens` above.
+            if let Some(budget) = record.gemini_thinking_budget {
+                cfg.gemini_thinking_budget = Some(budget);
+            }
+            // Per-agent summary provider/model overrides (#872). The
+            // validator on `POST /agents` / `PATCH /agents/{id}` enforces
+            // the pair-only invariant (both fields set together or both
+            // unset) so by the time we get here the per-agent values are
+            // guaranteed symmetric. `None` falls through to the
+            // server-level setting already on `cfg.context_config`.
+            if let Some(ref provider) = record.summary_provider {
+                cfg.context_config.summary_provider = Some(provider.clone());
+            }
+            if let Some(ref model) = record.summary_model {
+                cfg.context_config.summary_model = Some(model.clone());
+            }
+        }
 
-        // Apply per-agent provider override first (changes base_url + api_key),
-        // then ALWAYS re-resolve the API key from secrets for the effective
-        // provider. This ensures keys set at runtime (via UI or CLI) are picked
-        // up even for the default agent which has no per-agent provider field.
+        // Apply per-agent provider override first (changes base_url +
+        // api_key), then ALWAYS re-resolve the API key from secrets for the
+        // effective provider. This ensures keys set at runtime (via UI or
+        // CLI) are picked up even for the default agent which has no
+        // per-agent provider field.
         //
         // Snapshot the previous provider AND model so the leak guard below
-        // can detect a per-agent provider switch where neither layer (per-
-        // agent model nor provider-entry model) supplies a model for the new
-        // provider. In that case `apply_provider` leaves `default_model`
-        // unchanged from the OLD provider's default -- and that wrong-
-        // provider model name reaches the wire (#860).
+        // can detect a per-agent provider switch where neither layer
+        // (per-agent model nor provider-entry model) supplies a model for
+        // the new provider. In that case `apply_provider` leaves
+        // `default_model` unchanged from the OLD provider's default — and
+        // that wrong-provider model name reaches the wire (#860).
         let previous_provider = llm.provider().to_string();
         let previous_default_model = llm.default_model().to_string();
         let mut llm = llm.clone();
@@ -265,9 +266,9 @@ mod config {
         }
 
         // Apply the per-agent model. When set this overrides any value
-        // `apply_provider` left on `default_model` -- the per-agent override
+        // `apply_provider` left on `default_model` — the per-agent override
         // is the user's explicit choice and must reach the wire.
-        if let Some(model) = merged.model_override {
+        if let Some(model) = per_agent_model {
             llm = llm.with_model(model);
         } else if llm.provider() != previous_provider
             && llm.default_model() == previous_default_model
@@ -294,37 +295,28 @@ mod config {
         }
 
         ResolvedAgentConfig {
-            agent_config: merged.agent_config,
+            agent_config: cfg,
             llm,
             agent_name,
         }
     }
 }
 
-/// Result of merging server defaults + per-agent + per-run overrides.
-struct MergedConfig {
-    agent_config: alms_runtime::AgentConfig,
-    /// If set, override the LLM client's default model.
-    model_override: Option<String>,
-}
-
-/// Snapshot the **fully layered** run config for triage persistence (#837).
+/// Snapshot the layered run config for triage persistence (#837).
 ///
-/// Called from `lifecycle::execute_run` after `apply_overrides`,
-/// `apply_per_run_llm_overrides`, `resolve_posture_for_run`, and the
-/// system-triggered notification debug-flip have all settled — i.e. the
-/// `agent_config` and `llm` passed in here carry the values the LLM
-/// adapter is about to send on the wire.
+/// Called from `lifecycle::execute_run` after `resolve_agent_config`,
+/// `resolve_posture_for_run`, and the system-triggered notification
+/// debug-flip have all settled — i.e. the `agent_config` and `llm` passed
+/// in here carry the values the LLM adapter is about to send on the wire.
 ///
 /// Reads `provider()` and `default_model()` from the resolved
-/// [`alms_runtime::LlmClient`] (which threaded per-agent and per-run
-/// model / provider overrides through `with_provider_and_secrets` and
-/// `with_model`); the remaining fields come from the merged
-/// [`alms_runtime::AgentConfig`].
+/// [`alms_runtime::LlmClient`] (which threaded per-agent model / provider
+/// overrides through `with_provider_and_secrets` and `with_model`); the
+/// remaining fields come from the merged [`alms_runtime::AgentConfig`].
 ///
-/// Pure function — kept here next to `apply_overrides` /
-/// `apply_per_run_llm_overrides` so the layering primitives all live in
-/// one place and can be unit-tested without spinning up an `AppState`.
+/// Pure function — kept here next to `resolve_agent_config` so the
+/// layering primitives all live in one place and can be unit-tested
+/// without spinning up an `AppState`.
 pub(crate) fn build_resolved_config(
     agent_config: &alms_runtime::AgentConfig,
     llm: &alms_runtime::LlmClient,
@@ -339,179 +331,6 @@ pub(crate) fn build_resolved_config(
         reasoning_effort: agent_config.openai_reasoning_effort,
         gemini_thinking_budget: agent_config.gemini_thinking_budget,
     }
-}
-
-/// Pure config merging: server defaults -> per-agent overrides -> per-run overrides.
-///
-/// Returns the merged `AgentConfig` and an optional model override string.
-/// The caller is responsible for applying the model override to the `LlmClient`.
-fn apply_overrides(
-    base: alms_runtime::AgentConfig,
-    agent_record: Option<&alms_core::AgentRecord>,
-    overrides: &RunOverrides,
-) -> MergedConfig {
-    let mut cfg = base;
-
-    // -- Model: per-run > per-agent (server default is in LlmClient) --
-    let model_override = if overrides.model.is_some() {
-        overrides.model.clone()
-    } else {
-        agent_record.and_then(|r| r.model.clone())
-    };
-
-    // -- Per-agent overrides (middle layer) --
-    if let Some(record) = agent_record {
-        if let Some(ref p) = record.posture
-            && let Ok(posture) = p.parse::<alms_runtime::Posture>()
-        {
-            cfg.posture = posture;
-        }
-        // Per-agent Anthropic thinking budget. `Some(0)` is a legitimate
-        // per-agent override meaning "disable extended thinking for this
-        // agent even when the server default enables it", so we honour any
-        // `Some` value here.
-        if let Some(budget) = record.thinking_budget_tokens {
-            cfg.anthropic_thinking_budget = budget;
-        }
-        // Per-agent OpenAI-compat reasoning effort (#768). `Some(effort)`
-        // wins over the server default; `None` falls through.
-        if let Some(effort) = record.reasoning_effort {
-            cfg.openai_reasoning_effort = Some(effort);
-        }
-        // Per-agent Gemini thinking budget (#794). `Some(n)` (including
-        // `Some(0)`) is a legitimate per-agent override meaning "disable
-        // extended thinking for this agent even when the server default
-        // enables it", so we honour any `Some` value here — same shape as
-        // Anthropic `thinking_budget_tokens` above.
-        if let Some(budget) = record.gemini_thinking_budget {
-            cfg.gemini_thinking_budget = Some(budget);
-        }
-        // Per-agent summary provider/model overrides (#872). `Some(_)`
-        // overrides the server-level `[context].summary_provider` /
-        // `summary_model` for this agent's runs. The validator on
-        // `POST /agents` / `PATCH /agents/{id}` enforces the pair-only
-        // invariant (both fields set together or both unset) so by the
-        // time we get here the per-agent values are guaranteed
-        // symmetric. `None` falls through to the server-level setting
-        // already on `cfg.context_config`.
-        if let Some(ref provider) = record.summary_provider {
-            cfg.context_config.summary_provider = Some(provider.clone());
-        }
-        if let Some(ref model) = record.summary_model {
-            cfg.context_config.summary_model = Some(model.clone());
-        }
-    }
-
-    // -- Per-run overrides (highest precedence) --
-    if let Some(m) = overrides.max_tokens.filter(|&m| m > 0) {
-        cfg.max_tokens = m;
-    }
-    if let Some(ref p) = overrides.posture
-        && let Ok(posture) = p.parse::<alms_runtime::Posture>()
-    {
-        cfg.posture = posture;
-    }
-    if let Some(debug) = overrides.debug_mode {
-        cfg.debug_mode = debug;
-    }
-    // Same semantics as per-agent: `Some(0)` is an explicit per-run
-    // disable, not a "use default" sentinel.
-    if let Some(budget) = overrides.thinking_budget_tokens {
-        cfg.anthropic_thinking_budget = budget;
-    }
-    // Per-run OpenAI-compat reasoning effort (#768) wins over per-agent
-    // and server default.
-    if let Some(effort) = overrides.reasoning_effort {
-        cfg.openai_reasoning_effort = Some(effort);
-    }
-    // Per-run Gemini thinking budget (#794) wins over per-agent and
-    // server default. Same semantics as Anthropic `thinking_budget_tokens`:
-    // `Some(0)` is an explicit per-run disable, not a "use default"
-    // sentinel.
-    if let Some(budget) = overrides.gemini_thinking_budget {
-        cfg.gemini_thinking_budget = Some(budget);
-    }
-
-    MergedConfig {
-        agent_config: cfg,
-        model_override,
-    }
-}
-
-/// Apply per-run LLM overrides (provider + model) on top of the resolved
-/// per-agent `LlmClient`, preserving the three-layer precedence
-/// (per-run > per-agent > server default) for the model field.
-///
-/// The non-trivial bit is the interaction between `provider` and `model`:
-///
-/// 1. `with_provider_and_secrets` calls `apply_provider`, which rewrites
-///    `LlmConfig::default_model` to the new provider entry's `model` field
-///    when one is configured in `[llm.providers.<name>]`.
-/// 2. Without protection, that silently drops a per-agent model that
-///    `resolve_agent_config` had already applied to the resolved client.
-///
-/// We snapshot the resolved client's `default_model()` before the provider
-/// switch and re-apply it afterwards if the switch clobbered the value.
-/// The per-run model still wins last when set, so explicit overrides are
-/// honored regardless. Closes #833.
-///
-/// #860 leak guard: when a per-run `provider` override fires AND neither a
-/// per-run model nor a per-agent model is set AND the new provider entry
-/// has no `model` field, the snapshot is the OLD provider's server default
-/// — a model name that does not belong to the new provider. We clear
-/// `default_model` in that case so the wire request fails fast with a
-/// clear "missing model" error rather than a confusing 404 from the new
-/// provider naming the wrong model. The per-agent path plugs the same leak
-/// inside `resolve_agent_config`; the guard here covers the case where the
-/// switch happens at the per-run layer with no per-agent override.
-fn apply_per_run_llm_overrides(
-    resolved_llm: alms_runtime::LlmClient,
-    overrides: &RunOverrides,
-    secrets: &alms_core::secrets::SecretsStore,
-) -> alms_runtime::LlmClient {
-    let resolved_model = resolved_llm.default_model().to_string();
-    let resolved_provider = resolved_llm.provider().to_string();
-    let mut llm = resolved_llm;
-    if let Some(ref provider) = overrides.provider {
-        llm = llm.with_provider_and_secrets(provider, secrets);
-        let provider_changed = llm.provider() != resolved_provider;
-        if llm.default_model() != resolved_model {
-            // #833 path: `apply_provider` overwrote `default_model` with the
-            // new provider entry's `model`. Restore the previously resolved
-            // model so per-agent overrides are not silently dropped. The
-            // per-run model still wins last when set.
-            tracing::info!(
-                provider = %provider,
-                clobbered_model = %llm.default_model(),
-                preserved_model = %resolved_model,
-                "Per-run provider switch rewrote default_model from a provider entry; \
-                 restoring resolved per-agent / server-default model (#833)"
-            );
-            llm = llm.with_model(resolved_model.clone());
-        } else if provider_changed && overrides.model.is_none() && !resolved_model.is_empty() {
-            // #860 path: provider changed but `apply_provider` left
-            // `default_model` unchanged because the new provider entry has
-            // no `model` field. The snapshot is the OLD provider's default
-            // -- wrong for the new provider's wire. Clear `default_model`
-            // so the wire request fails fast with a clear "missing model"
-            // error instead of 404'ing on the new provider with the wrong
-            // model name.
-            tracing::warn!(
-                old_provider = %resolved_provider,
-                new_provider = %llm.provider(),
-                stale_model = %resolved_model,
-                "Per-run provider switch with no per-run / per-agent model and no \
-                 provider-entry model -- clearing inherited model so the run \
-                 fails fast instead of sending the previous provider's default \
-                 model to the new provider's wire (#860)"
-            );
-            llm = llm.with_model(String::new());
-        }
-    }
-    if let Some(ref model) = overrides.model {
-        llm = llm.with_model(model.clone());
-    }
-    llm
 }
 
 // ---------------------------------------------------------------------------
@@ -561,708 +380,6 @@ mod tests {
     }
 
     #[test]
-    fn test_no_overrides() {
-        let base = base_config();
-        let merged = apply_overrides(base.clone(), None, &RunOverrides::default());
-        assert_eq!(merged.agent_config.system_prompt, "server default prompt");
-        assert_eq!(merged.agent_config.max_tokens, 100_000);
-        assert!(matches!(merged.agent_config.posture, Posture::FullControl));
-        assert!(merged.model_override.is_none());
-    }
-
-    #[test]
-    fn test_per_agent_overrides() {
-        let agent = test_agent(Some("custom-model"), Some("guarded"));
-        let merged = apply_overrides(base_config(), Some(&agent), &RunOverrides::default());
-        assert!(matches!(merged.agent_config.posture, Posture::Guarded));
-        assert_eq!(merged.model_override.as_deref(), Some("custom-model"));
-        // max_tokens not overridden by agent
-        assert_eq!(merged.agent_config.max_tokens, 100_000);
-        // system_prompt is never overridden by agent — always server default
-        assert_eq!(merged.agent_config.system_prompt, "server default prompt");
-    }
-
-    #[test]
-    fn test_per_run_overrides_beat_per_agent() {
-        let agent = test_agent(Some("agent-model"), Some("guarded"));
-        let overrides = RunOverrides {
-            model: Some("run-model".into()),
-            max_tokens: Some(8192),
-            posture: Some("full_control".into()),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(base_config(), Some(&agent), &overrides);
-        // Per-run model wins over per-agent
-        assert_eq!(merged.model_override.as_deref(), Some("run-model"));
-        // Per-run posture wins over per-agent
-        assert!(matches!(merged.agent_config.posture, Posture::FullControl));
-        // Per-run max_tokens applied
-        assert_eq!(merged.agent_config.max_tokens, 8192);
-        // system_prompt always stays as server default
-        assert_eq!(merged.agent_config.system_prompt, "server default prompt");
-    }
-
-    #[test]
-    fn test_per_run_only() {
-        let overrides = RunOverrides {
-            model: Some("run-model".into()),
-            max_tokens: Some(256),
-            posture: Some("guarded".into()),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(base_config(), None, &overrides);
-        assert_eq!(merged.model_override.as_deref(), Some("run-model"));
-        assert_eq!(merged.agent_config.max_tokens, 256);
-        assert!(matches!(merged.agent_config.posture, Posture::Guarded));
-        // system_prompt stays as server default
-        assert_eq!(merged.agent_config.system_prompt, "server default prompt");
-    }
-
-    #[test]
-    fn test_max_tokens_zero_ignored() {
-        let overrides = RunOverrides {
-            max_tokens: Some(0),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(base_config(), None, &overrides);
-        assert_eq!(merged.agent_config.max_tokens, 100_000); // unchanged
-    }
-
-    #[test]
-    fn test_unknown_posture_ignored() {
-        let agent = test_agent(None, Some("yolo"));
-        let merged = apply_overrides(base_config(), Some(&agent), &RunOverrides::default());
-        // Unknown posture keeps server default
-        assert!(matches!(merged.agent_config.posture, Posture::FullControl));
-    }
-
-    #[test]
-    fn test_unknown_posture_per_run_ignored() {
-        let overrides = RunOverrides {
-            posture: Some("yolo".to_string()),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(base_config(), None, &overrides);
-        // Unknown per-run posture keeps server default
-        assert!(matches!(merged.agent_config.posture, Posture::FullControl));
-    }
-
-    #[test]
-    fn test_debug_mode_override() {
-        // Off by default
-        let merged = apply_overrides(base_config(), None, &RunOverrides::default());
-        assert!(!merged.agent_config.debug_mode);
-
-        // Enabled via per-run override
-        let overrides = RunOverrides {
-            debug_mode: Some(true),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(base_config(), None, &overrides);
-        assert!(merged.agent_config.debug_mode);
-    }
-
-    // -----------------------------------------------------------------
-    // Anthropic extended-thinking three-layer precedence (issue #767)
-    // -----------------------------------------------------------------
-
-    fn base_config_with_thinking(budget: u32) -> AgentConfig {
-        AgentConfig {
-            system_prompt: "server default prompt".into(),
-            max_tokens: 100_000,
-            posture: Posture::FullControl,
-            anthropic_thinking_budget: budget,
-            ..AgentConfig::default()
-        }
-    }
-
-    fn agent_with_thinking(budget: Option<u32>) -> AgentRecord {
-        let now = Utc::now();
-        AgentRecord {
-            id: AgentId::new(),
-            name: "thinker".into(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: budget,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            is_default: false,
-            created_at: now,
-            last_active: now,
-        }
-    }
-
-    #[test]
-    fn test_thinking_server_default_inherited() {
-        // No per-agent or per-run override: server default (4096) wins.
-        let merged = apply_overrides(
-            base_config_with_thinking(4096),
-            None,
-            &RunOverrides::default(),
-        );
-        assert_eq!(merged.agent_config.anthropic_thinking_budget, 4096);
-    }
-
-    #[test]
-    fn test_thinking_per_agent_overrides_server_default() {
-        // Server default = 0 (disabled), agent opts in with 8192.
-        let agent = agent_with_thinking(Some(8192));
-        let merged = apply_overrides(
-            base_config_with_thinking(0),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(merged.agent_config.anthropic_thinking_budget, 8192);
-    }
-
-    #[test]
-    fn test_thinking_per_agent_zero_disables() {
-        // Server default = 4096 (enabled). Agent explicitly sets 0 to
-        // opt out. This must WIN over the server default.
-        let agent = agent_with_thinking(Some(0));
-        let merged = apply_overrides(
-            base_config_with_thinking(4096),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged.agent_config.anthropic_thinking_budget, 0,
-            "per-agent Some(0) must disable thinking even when server default enables it"
-        );
-    }
-
-    #[test]
-    fn test_thinking_per_run_beats_per_agent() {
-        let agent = agent_with_thinking(Some(2048));
-        let overrides = RunOverrides {
-            thinking_budget_tokens: Some(16384),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(base_config_with_thinking(4096), Some(&agent), &overrides);
-        assert_eq!(merged.agent_config.anthropic_thinking_budget, 16384);
-    }
-
-    #[test]
-    fn test_thinking_per_agent_none_falls_through_to_server() {
-        // Agent doesn't care — server default (4096) wins.
-        let agent = agent_with_thinking(None);
-        let merged = apply_overrides(
-            base_config_with_thinking(4096),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(merged.agent_config.anthropic_thinking_budget, 4096);
-    }
-
-    // ------------------------------------------------------------------
-    // Reasoning-effort precedence (issue #768)
-    //
-    // Three-layer chain (per-run > per-agent > server default) mirrors the
-    // Anthropic `thinking_budget_tokens` path above. `None` at any layer
-    // falls through; `Some(effort)` wins.
-    // ------------------------------------------------------------------
-
-    fn base_config_with_reasoning(
-        effort: Option<alms_core::config::ReasoningEffort>,
-    ) -> AgentConfig {
-        AgentConfig {
-            system_prompt: "server default prompt".into(),
-            max_tokens: 100_000,
-            posture: Posture::FullControl,
-            openai_reasoning_effort: effort,
-            ..AgentConfig::default()
-        }
-    }
-
-    fn agent_with_reasoning(effort: Option<alms_core::config::ReasoningEffort>) -> AgentRecord {
-        let now = Utc::now();
-        AgentRecord {
-            id: AgentId::new(),
-            name: "reasoner".into(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: effort,
-            gemini_thinking_budget: None,
-            summary_provider: None,
-            summary_model: None,
-            is_default: false,
-            created_at: now,
-            last_active: now,
-        }
-    }
-
-    #[test]
-    fn test_reasoning_server_default_inherited() {
-        use alms_core::config::ReasoningEffort;
-        let merged = apply_overrides(
-            base_config_with_reasoning(Some(ReasoningEffort::Medium)),
-            None,
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged.agent_config.openai_reasoning_effort,
-            Some(ReasoningEffort::Medium)
-        );
-    }
-
-    #[test]
-    fn test_reasoning_per_agent_overrides_server_default() {
-        use alms_core::config::ReasoningEffort;
-        let agent = agent_with_reasoning(Some(ReasoningEffort::High));
-        let merged = apply_overrides(
-            base_config_with_reasoning(Some(ReasoningEffort::Low)),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged.agent_config.openai_reasoning_effort,
-            Some(ReasoningEffort::High),
-            "per-agent reasoning_effort must override server default"
-        );
-    }
-
-    #[test]
-    fn test_reasoning_per_run_beats_per_agent() {
-        use alms_core::config::ReasoningEffort;
-        let agent = agent_with_reasoning(Some(ReasoningEffort::Low));
-        let overrides = RunOverrides {
-            reasoning_effort: Some(ReasoningEffort::High),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(
-            base_config_with_reasoning(Some(ReasoningEffort::Medium)),
-            Some(&agent),
-            &overrides,
-        );
-        assert_eq!(
-            merged.agent_config.openai_reasoning_effort,
-            Some(ReasoningEffort::High),
-            "per-run override must win over per-agent and server"
-        );
-    }
-
-    #[test]
-    fn test_reasoning_per_agent_none_falls_through_to_server() {
-        use alms_core::config::ReasoningEffort;
-        let agent = agent_with_reasoning(None);
-        let merged = apply_overrides(
-            base_config_with_reasoning(Some(ReasoningEffort::Medium)),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged.agent_config.openai_reasoning_effort,
-            Some(ReasoningEffort::Medium)
-        );
-    }
-
-    #[test]
-    fn test_reasoning_all_none_leaves_none() {
-        let merged = apply_overrides(
-            base_config_with_reasoning(None),
-            None,
-            &RunOverrides::default(),
-        );
-        assert!(merged.agent_config.openai_reasoning_effort.is_none());
-    }
-
-    // ------------------------------------------------------------------
-    // Gemini thinking-budget precedence (issue #794)
-    //
-    // Mirrors the Anthropic `thinking_budget_tokens` path above: three-
-    // layer chain (per-run > per-agent > server default), `Some(n)` at
-    // any layer wins (including `Some(0)` as an explicit disable), `None`
-    // falls through. `None` on the `AgentConfig` is a valid terminal
-    // state — it means "inherit the server default at wire-emission
-    // time", matching the behaviour documented on
-    // `AgentConfig::gemini_thinking_budget`.
-    // ------------------------------------------------------------------
-
-    fn base_config_with_gemini_thinking(budget: Option<u32>) -> AgentConfig {
-        AgentConfig {
-            system_prompt: "server default prompt".into(),
-            max_tokens: 100_000,
-            posture: Posture::FullControl,
-            gemini_thinking_budget: budget,
-            ..AgentConfig::default()
-        }
-    }
-
-    fn agent_with_gemini_thinking(budget: Option<u32>) -> AgentRecord {
-        let now = Utc::now();
-        AgentRecord {
-            id: AgentId::new(),
-            name: "gemini-thinker".into(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: budget,
-            summary_provider: None,
-            summary_model: None,
-            is_default: false,
-            created_at: now,
-            last_active: now,
-        }
-    }
-
-    #[test]
-    fn test_gemini_thinking_server_default_inherited() {
-        // No per-agent or per-run override: server default (4096) wins.
-        let merged = apply_overrides(
-            base_config_with_gemini_thinking(Some(4096)),
-            None,
-            &RunOverrides::default(),
-        );
-        assert_eq!(merged.agent_config.gemini_thinking_budget, Some(4096));
-    }
-
-    #[test]
-    fn test_gemini_thinking_per_agent_overrides_server_default() {
-        // Server default = None (disabled), agent opts in with 8192.
-        let agent = agent_with_gemini_thinking(Some(8192));
-        let merged = apply_overrides(
-            base_config_with_gemini_thinking(None),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(merged.agent_config.gemini_thinking_budget, Some(8192));
-    }
-
-    #[test]
-    fn test_gemini_thinking_per_agent_zero_disables() {
-        // Server default = 4096 (enabled). Agent explicitly sets 0 to
-        // opt out. This must WIN over the server default.
-        let agent = agent_with_gemini_thinking(Some(0));
-        let merged = apply_overrides(
-            base_config_with_gemini_thinking(Some(4096)),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged.agent_config.gemini_thinking_budget,
-            Some(0),
-            "per-agent Some(0) must disable Gemini thinking even when server default enables it"
-        );
-    }
-
-    #[test]
-    fn test_gemini_thinking_per_run_beats_per_agent() {
-        let agent = agent_with_gemini_thinking(Some(2048));
-        let overrides = RunOverrides {
-            gemini_thinking_budget: Some(16384),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(
-            base_config_with_gemini_thinking(Some(4096)),
-            Some(&agent),
-            &overrides,
-        );
-        assert_eq!(
-            merged.agent_config.gemini_thinking_budget,
-            Some(16384),
-            "per-run override must win over per-agent and server"
-        );
-    }
-
-    #[test]
-    fn test_gemini_thinking_per_run_zero_disables_over_everything() {
-        // Server + per-agent both enable; per-run explicitly disables
-        // with `Some(0)` — must win.
-        let agent = agent_with_gemini_thinking(Some(8192));
-        let overrides = RunOverrides {
-            gemini_thinking_budget: Some(0),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(
-            base_config_with_gemini_thinking(Some(4096)),
-            Some(&agent),
-            &overrides,
-        );
-        assert_eq!(
-            merged.agent_config.gemini_thinking_budget,
-            Some(0),
-            "per-run Some(0) must disable Gemini thinking even when both lower layers enable it"
-        );
-    }
-
-    #[test]
-    fn test_gemini_thinking_per_agent_none_falls_through_to_server() {
-        // Agent doesn't care — server default (4096) wins.
-        let agent = agent_with_gemini_thinking(None);
-        let merged = apply_overrides(
-            base_config_with_gemini_thinking(Some(4096)),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(merged.agent_config.gemini_thinking_budget, Some(4096));
-    }
-
-    #[test]
-    fn test_gemini_thinking_all_none_leaves_none() {
-        // Everyone defers to the next layer — ends as `None` (which the
-        // Gemini adapter treats as "no thinkingConfig on the wire").
-        let merged = apply_overrides(
-            base_config_with_gemini_thinking(None),
-            None,
-            &RunOverrides::default(),
-        );
-        assert!(merged.agent_config.gemini_thinking_budget.is_none());
-    }
-
-    // ------------------------------------------------------------------
-    // Per-agent summary provider/model overlay (issue #872)
-    //
-    // `apply_overrides` overlays the per-agent `summary_provider` /
-    // `summary_model` from the `AgentRecord` onto the inherited
-    // `context_config`. Resolution: per-agent ?? server-level. When
-    // both are None at the per-agent layer the server-level setting
-    // (already on `cfg.context_config`) shines through — preserving
-    // the back-compat path described in #872. The pair-only invariant
-    // is enforced upstream in the HTTP handler so by the time the
-    // record reaches `apply_overrides` the two fields are guaranteed
-    // symmetric.
-    // ------------------------------------------------------------------
-
-    fn base_config_with_server_summary(
-        summary_provider: Option<&str>,
-        summary_model: Option<&str>,
-    ) -> AgentConfig {
-        AgentConfig {
-            context_config: alms_core::config::ContextConfig {
-                summary_provider: summary_provider.map(str::to_string),
-                summary_model: summary_model.map(str::to_string),
-                ..alms_core::config::ContextConfig::default()
-            },
-            ..AgentConfig::default()
-        }
-    }
-
-    fn agent_with_summary(provider: Option<&str>, model: Option<&str>) -> AgentRecord {
-        let now = Utc::now();
-        AgentRecord {
-            id: AgentId::new(),
-            name: "summary-agent".into(),
-            description: String::new(),
-            model: None,
-            posture: None,
-            provider: None,
-            telegram_token: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
-            summary_provider: provider.map(str::to_string),
-            summary_model: model.map(str::to_string),
-            is_default: false,
-            created_at: now,
-            last_active: now,
-        }
-    }
-
-    #[test]
-    fn test_summary_per_agent_overrides_server_default() {
-        // Server default points the summary task at OpenRouter; agent
-        // overrides to Anthropic. Per-agent must win.
-        let agent = agent_with_summary(Some("anthropic"), Some("claude-haiku-4"));
-        let merged = apply_overrides(
-            base_config_with_server_summary(Some("openrouter"), Some("minimax/minimax-m2.7")),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged
-                .agent_config
-                .context_config
-                .summary_provider
-                .as_deref(),
-            Some("anthropic")
-        );
-        assert_eq!(
-            merged.agent_config.context_config.summary_model.as_deref(),
-            Some("claude-haiku-4")
-        );
-    }
-
-    #[test]
-    fn test_summary_per_agent_none_falls_through_to_server() {
-        // Per-agent both-None: the server-level summary config inherited
-        // via `context_config.clone()` wins. Identical to today's
-        // server-level path — the back-compat guarantee from #872.
-        let agent = agent_with_summary(None, None);
-        let merged = apply_overrides(
-            base_config_with_server_summary(Some("openrouter"), Some("minimax/minimax-m2.7")),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged
-                .agent_config
-                .context_config
-                .summary_provider
-                .as_deref(),
-            Some("openrouter")
-        );
-        assert_eq!(
-            merged.agent_config.context_config.summary_model.as_deref(),
-            Some("minimax/minimax-m2.7")
-        );
-    }
-
-    #[test]
-    fn test_summary_all_none_stays_none() {
-        // Both layers unset → the merged config has both fields None.
-        // The runtime-side `build_summary_client` short-circuits on
-        // `summary_provider = None` to a clone of the agent's main
-        // LLM client (the back-compat path), so no separate summary
-        // task runs.
-        let agent = agent_with_summary(None, None);
-        let merged = apply_overrides(
-            base_config_with_server_summary(None, None),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert!(
-            merged
-                .agent_config
-                .context_config
-                .summary_provider
-                .is_none()
-        );
-        assert!(merged.agent_config.context_config.summary_model.is_none());
-    }
-
-    #[test]
-    fn test_summary_per_agent_overrides_when_server_unset() {
-        // Server default is unset (the post-#872 default); per-agent
-        // opts in. Per-agent reaches the merged config exactly as set.
-        let agent = agent_with_summary(Some("openrouter"), Some("minimax/minimax-m2.7"));
-        let merged = apply_overrides(
-            base_config_with_server_summary(None, None),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged
-                .agent_config
-                .context_config
-                .summary_provider
-                .as_deref(),
-            Some("openrouter")
-        );
-        assert_eq!(
-            merged.agent_config.context_config.summary_model.as_deref(),
-            Some("minimax/minimax-m2.7")
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // Clear-sentinel precedence (#809)
-    //
-    // After `PATCH /agents/{id}` with `clear_*: true`, the stored
-    // `AgentRecord` has `None` for that knob. A subsequent `POST /runs`
-    // with no per-run override must therefore resolve to the server
-    // default — NOT the cleared per-agent value, and NOT `None` on the
-    // wire. These tests lock down that behaviour for all three knobs.
-    // The SQLite round-trip that produces the `None` record is covered
-    // in `agents.rs::tests::clear_sentinels_round_trip_through_sqlite`.
-    // ------------------------------------------------------------------
-
-    #[test]
-    fn test_clear_sentinel_thinking_budget_falls_through_to_server_default() {
-        // Simulates the post-clear state: agent record has
-        // `thinking_budget_tokens = None`. A subsequent run with no
-        // per-run override must resolve to the server default (4096).
-        let agent = agent_with_thinking(None);
-        let merged = apply_overrides(
-            base_config_with_thinking(4096),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged.agent_config.anthropic_thinking_budget, 4096,
-            "after clear, per-agent None must fall through to server default"
-        );
-    }
-
-    #[test]
-    fn test_clear_sentinel_reasoning_effort_falls_through_to_server_default() {
-        use alms_core::config::ReasoningEffort;
-        // Simulates the post-clear state: agent record has
-        // `reasoning_effort = None`. Server default (Medium) must win
-        // on the next run.
-        let agent = agent_with_reasoning(None);
-        let merged = apply_overrides(
-            base_config_with_reasoning(Some(ReasoningEffort::Medium)),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged.agent_config.openai_reasoning_effort,
-            Some(ReasoningEffort::Medium),
-            "after clear, per-agent None must fall through to server default"
-        );
-    }
-
-    #[test]
-    fn test_clear_sentinel_gemini_thinking_budget_falls_through_to_server_default() {
-        // Simulates the post-clear state: agent record has
-        // `gemini_thinking_budget = None`. Server default (4096) must
-        // win on the next run.
-        let agent = agent_with_gemini_thinking(None);
-        let merged = apply_overrides(
-            base_config_with_gemini_thinking(Some(4096)),
-            Some(&agent),
-            &RunOverrides::default(),
-        );
-        assert_eq!(
-            merged.agent_config.gemini_thinking_budget,
-            Some(4096),
-            "after clear, per-agent None must fall through to server default"
-        );
-    }
-
-    #[test]
-    fn test_validate_provider_accepts_valid_providers() {
-        assert!(validate_provider("openai").is_ok());
-        assert!(validate_provider("anthropic").is_ok());
-        assert!(validate_provider("openrouter").is_ok());
-    }
-
-    #[test]
-    fn test_validate_provider_rejects_unknown() {
-        let err = validate_provider("anthrpoic").unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        let body = err.1.0;
-        assert_eq!(body["error"]["code"], "INVALID_PROVIDER");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("anthrpoic"),
-            "error message should mention the invalid provider"
-        );
-    }
-
-    #[test]
-    fn test_validate_provider_rejects_telegram() {
-        // telegram is a valid secret key but NOT a valid LLM provider
-        let err = validate_provider("telegram").unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
     fn test_system_triggered_overrides_guarded_to_autonomous() {
         let result = resolve_posture_for_run(Posture::Guarded, true);
         assert_eq!(
@@ -1302,60 +419,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_per_run_provider_override_wires_through() {
-        // Verify that setting provider in RunOverrides is carried through
-        // to execute_run's LlmClient reconfiguration. We test the building
-        // block (with_provider_and_secrets) since execute_run requires full
-        // AppState; the wiring in execute_run is:
-        //   if let Some(ref provider) = overrides.provider {
-        //       llm = llm.with_provider_and_secrets(provider, &secrets);
-        //   }
-        use alms_runtime::LlmClient;
-        use alms_runtime::llm_types::LlmConfig;
-
-        let config = LlmConfig {
-            provider: "openai".into(),
-            api_key: "openai-key".into(),
-            base_url: "https://api.openai.com/v1".into(),
-            ..LlmConfig::default()
-        };
-        let client = LlmClient::new(config).unwrap();
-        assert_eq!(client.provider(), "openai");
-
-        // Simulate what execute_run does when overrides.provider is Some
-        let dir = tempfile::tempdir().unwrap();
-        let secrets_path = dir.path().join("secrets.json");
-        let mut secrets = alms_core::secrets::SecretsStore::load(secrets_path)
-            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
-        secrets.set_key("anthropic", "sk-ant-override").unwrap();
-
-        let overrides = RunOverrides {
-            provider: Some("anthropic".into()),
-            ..RunOverrides::default()
-        };
-
-        // Apply provider override the same way execute_run does
-        let mut llm = client;
-        if let Some(ref provider) = overrides.provider {
-            llm = llm.with_provider_and_secrets(provider, &secrets);
-        }
-
-        assert_eq!(llm.provider(), "anthropic");
-    }
-
     // -----------------------------------------------------------------------
-    // Model-override end-to-end tests (#833)
+    // Model-override end-to-end tests (#833 / #860)
     //
-    // These exercise resolve_agent_config -> lifecycle.rs:569-578 layering at
-    // the LlmClient::default_model() level so a regression in the three-layer
-    // precedence (per-run > per-agent > server default) cannot slip past the
-    // apply_overrides-only unit tests like test_per_run_overrides_beat_per_agent.
+    // These exercise `resolve_agent_config` at the `LlmClient::default_model()`
+    // level so a regression in the per-agent layering (per-agent > server
+    // default) cannot slip past the helpers. Per-run overrides were removed
+    // in the #941 pivot; the leak guards that lived in
+    // `apply_per_run_llm_overrides` are no longer needed because there is no
+    // per-run path for them to guard. The remaining per-agent leak guard
+    // (#860) stays inside `resolve_agent_config` and is exercised by
+    // `test_per_agent_provider_only_no_per_agent_model_does_not_leak_server_default`.
     // -----------------------------------------------------------------------
 
     /// Build an `LlmClient` whose snapshot matches a typical server default
-    /// so the model-override regression tests can layer per-agent and
-    /// per-run overrides on top.
+    /// so the model-override regression tests can layer per-agent overrides
+    /// on top (per-run overrides were removed in #941; the remaining merge
+    /// surface is per-agent > server default).
     fn server_default_llm(model: &str) -> alms_runtime::LlmClient {
         use alms_runtime::llm_types::LlmConfig;
         let mut providers = std::collections::BTreeMap::new();
@@ -1432,130 +512,6 @@ mod tests {
             "claude-haiku-4-5-20251001",
             "per-agent model must land on the LlmClient -- the value loop_impl.rs:153 reads"
         );
-    }
-
-    /// Per-run model override beats the per-agent model in the resolved
-    /// `LlmClient`, mirroring the layering at `lifecycle.rs:569-578`.
-    #[test]
-    fn test_per_run_model_beats_per_agent_at_llm_client() {
-        let mut record = test_agent(Some("per-agent-model"), None);
-        record.is_default = true;
-        let mgr = manager_with_agent(&record);
-        let base = base_config();
-        let server_llm = server_default_llm("server-default-model");
-        let secrets = empty_secrets();
-
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
-
-        let overrides = RunOverrides {
-            model: Some("per-run-model".into()),
-            ..RunOverrides::default()
-        };
-        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
-        assert_eq!(
-            llm.default_model(),
-            "per-run-model",
-            "per-run model must beat per-agent model"
-        );
-    }
-
-    /// No overrides means the resolved client falls back to server default.
-    #[test]
-    fn test_no_overrides_falls_through_to_server_default_at_llm_client() {
-        let mut record = test_agent(None, None);
-        record.is_default = true;
-        let mgr = manager_with_agent(&record);
-        let base = base_config();
-        let server_llm = server_default_llm("server-default-model");
-        let secrets = empty_secrets();
-
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
-        let overrides = RunOverrides::default();
-        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
-        assert_eq!(
-            llm.default_model(),
-            "server-default-model",
-            "no overrides at any layer must fall through to server default"
-        );
-    }
-
-    /// Regression test for #833 -- when a per-run `provider` override is set
-    /// without a per-run `model`, the per-agent model must still reach the
-    /// wire. Before the fix this scenario silently dropped the per-agent
-    /// model because `with_provider_and_secrets` re-runs `apply_provider`,
-    /// which can overwrite `default_model` from a custom
-    /// `[llm.providers.<name>].model` entry, and the lifecycle only
-    /// re-applies `with_model` when the per-run `model` field is set.
-    #[test]
-    fn test_per_run_provider_does_not_drop_per_agent_model() {
-        let mut record = test_agent(Some("claude-haiku-4-5-20251001"), None);
-        record.is_default = true;
-        let mgr = manager_with_agent(&record);
-        let base = base_config();
-
-        use alms_runtime::llm_types::LlmConfig;
-        let mut providers = std::collections::BTreeMap::new();
-        providers.insert(
-            "anthropic".into(),
-            alms_core::config::ProviderEntry {
-                kind: alms_core::config::ProviderKind::Anthropic,
-                base_url: "https://api.anthropic.com/v1".into(),
-                api_key_env: None,
-                api_key: None,
-                // The bug trigger: provider entry has its own model that
-                // would overwrite per-agent model when the per-run code
-                // re-applies the provider via with_provider_and_secrets.
-                model: Some("claude-sonnet-from-provider-entry".into()),
-                auth_scheme: alms_core::config::AuthScheme::Header {
-                    name: "x-api-key".into(),
-                },
-                quirks: alms_core::config::ProviderQuirks::default(),
-            },
-        );
-        providers.insert(
-            "openai".into(),
-            alms_core::config::ProviderEntry {
-                kind: alms_core::config::ProviderKind::OpenAiCompatible,
-                base_url: "https://api.openai.com/v1".into(),
-                api_key_env: None,
-                api_key: None,
-                model: None,
-                auth_scheme: alms_core::config::AuthScheme::Bearer,
-                quirks: alms_core::config::ProviderQuirks::default(),
-            },
-        );
-        let server_cfg = LlmConfig {
-            provider: "openai".into(),
-            api_key: "openai-key".into(),
-            base_url: "https://api.openai.com/v1".into(),
-            default_model: "server-default-model".into(),
-            providers,
-            ..LlmConfig::default()
-        };
-        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
-            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
-        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
-        std::mem::forget(dir);
-
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
-        assert_eq!(resolved.llm.default_model(), "claude-haiku-4-5-20251001");
-
-        let overrides = RunOverrides {
-            provider: Some("anthropic".into()),
-            ..RunOverrides::default()
-        };
-        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
-
-        assert_eq!(
-            llm.default_model(),
-            "claude-haiku-4-5-20251001",
-            "per-run provider override must NOT clobber per-agent model"
-        );
-        // Sanity: provider switch did happen.
-        assert_eq!(llm.provider(), "anthropic");
     }
 
     /// Regression test for #860 -- when a per-agent `provider` override is
@@ -1788,89 +744,6 @@ mod tests {
              produces no model from any layer (#860)"
         );
         assert_eq!(resolved.llm.provider(), "anthropic");
-    }
-
-    /// Sibling of the per-agent leak: when a per-run `provider` override
-    /// is set with no per-run model and the agent has no per-agent model,
-    /// the server-default model of the OLD provider leaks through to the
-    /// new provider when the new provider entry has no `model` field.
-    /// Pre-fix this passes only because #841's snapshot+restore happens to
-    /// also paper over the leak; the post-fix behaviour pins the property.
-    #[test]
-    fn test_per_run_provider_only_no_model_does_not_leak_server_default() {
-        let record = test_agent(None, None); // no per-agent model, no per-agent provider
-        let mgr = manager_with_agent(&record);
-        let base = base_config();
-
-        use alms_runtime::llm_types::LlmConfig;
-        let mut providers = std::collections::BTreeMap::new();
-        providers.insert(
-            "openrouter".into(),
-            alms_core::config::ProviderEntry {
-                kind: alms_core::config::ProviderKind::OpenAiCompatible,
-                base_url: "https://openrouter.ai/api/v1".into(),
-                api_key_env: None,
-                api_key: None,
-                model: None,
-                auth_scheme: alms_core::config::AuthScheme::Bearer,
-                quirks: alms_core::config::ProviderQuirks::default(),
-            },
-        );
-        providers.insert(
-            "anthropic".into(),
-            alms_core::config::ProviderEntry {
-                kind: alms_core::config::ProviderKind::Anthropic,
-                base_url: "https://api.anthropic.com/v1".into(),
-                api_key_env: None,
-                api_key: None,
-                model: None,
-                auth_scheme: alms_core::config::AuthScheme::Header {
-                    name: "x-api-key".into(),
-                },
-                quirks: alms_core::config::ProviderQuirks::default(),
-            },
-        );
-        let server_cfg = LlmConfig {
-            provider: "openrouter".into(),
-            api_key: "openrouter-key".into(),
-            base_url: "https://openrouter.ai/api/v1".into(),
-            default_model: "moonshotai/kimi-k2.6".into(),
-            providers,
-            ..LlmConfig::default()
-        };
-        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
-            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
-        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
-        std::mem::forget(dir);
-
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
-
-        let overrides = RunOverrides {
-            provider: Some("anthropic".into()),
-            ..RunOverrides::default()
-        };
-        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
-
-        // Same property as #860 but on the per-run path. Pre-fix this also
-        // leaks moonshotai/kimi-k2.6 because the new anthropic entry has no
-        // model field of its own. Post-fix the per-run leak guard clears
-        // default_model so the wire request fails fast.
-        assert_ne!(
-            llm.default_model(),
-            "moonshotai/kimi-k2.6",
-            "per-run provider switch with no model overrides must NOT leak \
-             the server-default model of the previous provider (#860)"
-        );
-        assert_eq!(
-            llm.default_model(),
-            "",
-            "per-run leak guard clears default_model when no layer supplies \
-             a model for the new provider (#860)"
-        );
-        assert_eq!(llm.provider(), "anthropic");
     }
 
     // -----------------------------------------------------------------------
@@ -2549,12 +1422,13 @@ mod tests {
     // -----------------------------------------------------------------------
     // build_resolved_config tests (#837)
     //
-    // These mirror the model-override tests above (`resolve_agent_config` +
-    // `apply_per_run_llm_overrides` end-to-end) but run the result through
+    // These run the result of `resolve_agent_config` through
     // `build_resolved_config` to confirm the snapshot reflects the
     // **effective** values the LLM adapter will actually use. Crucial for
-    // triage of "I set model X but Y was used"-class reports — the snapshot
-    // must agree with the adapter, not with the raw per-run override.
+    // triage of "I set model X but Y was used"-class reports — the
+    // snapshot must agree with the adapter. Per-run overrides were removed
+    // in the #941 pivot, so the layering this snapshot reflects is just
+    // per-agent > server default.
     // -----------------------------------------------------------------------
 
     /// Per-agent model lands on the snapshot after layering. This is the
@@ -2571,10 +1445,8 @@ mod tests {
         let secrets = empty_secrets();
 
         let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
-        let llm = apply_per_run_llm_overrides(resolved.llm, &RunOverrides::default(), &secrets);
-        let merged = apply_overrides(resolved.agent_config, None, &RunOverrides::default());
 
-        let snapshot = build_resolved_config(&merged.agent_config, &llm);
+        let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
         assert_eq!(
             snapshot.model, "per-agent-claude-sonnet-4",
             "snapshot.model must reflect the per-agent override (the value the adapter sends on the wire)"
@@ -2585,37 +1457,9 @@ mod tests {
         assert_eq!(snapshot.provider, "openai");
     }
 
-    /// Per-run model override beats per-agent in the snapshot. The
-    /// issue's second acceptance test: pass per-run model, confirm the
-    /// snapshot reflects the per-run value, not the per-agent fallback.
-    #[test]
-    fn test_resolved_config_snapshots_per_run_model_over_per_agent() {
-        let mut record = test_agent(Some("per-agent-model"), None);
-        record.is_default = true;
-        let mgr = manager_with_agent(&record);
-        let base = base_config();
-        let server_llm = server_default_llm("server-default-model");
-        let secrets = empty_secrets();
-
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
-        let overrides = RunOverrides {
-            model: Some("per-run-model".into()),
-            ..RunOverrides::default()
-        };
-        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
-        let merged = apply_overrides(resolved.agent_config, None, &overrides);
-
-        let snapshot = build_resolved_config(&merged.agent_config, &llm);
-        assert_eq!(
-            snapshot.model, "per-run-model",
-            "snapshot.model must reflect the per-run override (highest precedence)"
-        );
-    }
-
-    /// No overrides at any layer surfaces the server default in the
-    /// snapshot. Pinned so the `From<Run>` / `GET /runs/{id}` triage
-    /// surface always agrees with the adapter's view of "what model was
-    /// actually used".
+    /// No per-agent overrides surfaces the server default in the snapshot.
+    /// Pinned so the `From<Run>` / `GET /runs/{id}` triage surface always
+    /// agrees with the adapter's view of "what model was actually used".
     #[test]
     fn test_resolved_config_snapshots_server_default_when_no_overrides() {
         let mut record = test_agent(None, None);
@@ -2626,86 +1470,94 @@ mod tests {
         let secrets = empty_secrets();
 
         let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
-        let overrides = RunOverrides::default();
-        let llm = apply_per_run_llm_overrides(resolved.llm, &overrides, &secrets);
-        let merged = apply_overrides(resolved.agent_config, None, &overrides);
 
-        let snapshot = build_resolved_config(&merged.agent_config, &llm);
+        let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
         assert_eq!(snapshot.model, "server-default-model");
         assert_eq!(snapshot.provider, "openai");
     }
 
     /// The snapshot's posture / max_tokens / debug_mode reflect the
-    /// merged `AgentConfig`. Per-run posture beats per-agent posture
-    /// here, exactly the layering pattern the issue calls out.
+    /// merged `AgentConfig`. Per-agent posture wins over the server
+    /// default; `max_tokens` and `debug_mode` track the server default
+    /// because the agent record carries no overrides for those fields.
     #[test]
     fn test_resolved_config_snapshots_posture_and_max_tokens_layering() {
-        let agent = test_agent(None, Some("guarded"));
-        let overrides = RunOverrides {
-            max_tokens: Some(7777),
-            posture: Some("autonomous".into()),
-            debug_mode: Some(true),
-            ..RunOverrides::default()
+        let mut record = test_agent(None, Some("autonomous"));
+        record.is_default = true;
+        let mgr = manager_with_agent(&record);
+        let base = AgentConfig {
+            max_tokens: 7777,
+            debug_mode: true,
+            ..base_config()
         };
-        let merged = apply_overrides(base_config(), Some(&agent), &overrides);
         let server_llm = server_default_llm("any-model");
+        let secrets = empty_secrets();
 
-        let snapshot = build_resolved_config(&merged.agent_config, &server_llm);
-        assert_eq!(snapshot.posture, "autonomous", "per-run posture wins");
-        assert_eq!(snapshot.max_tokens, 7777, "per-run max_tokens wins");
-        assert!(snapshot.debug_mode, "per-run debug_mode wins");
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
+        assert_eq!(snapshot.posture, "autonomous", "per-agent posture wins");
+        assert_eq!(
+            snapshot.max_tokens, 7777,
+            "server-default max_tokens reaches the snapshot"
+        );
+        assert!(
+            snapshot.debug_mode,
+            "server-default debug_mode reaches the snapshot"
+        );
     }
 
-    /// Reasoning / thinking budgets layer through to the snapshot in
-    /// exactly the same per-run > per-agent > server-default order
-    /// (#767 / #768 / #794). These three knobs are the long-tail of
-    /// "config got dropped between layer X and the wire" bugs the
-    /// snapshot is meant to triage.
+    /// Reasoning / thinking budgets layer through to the snapshot via the
+    /// per-agent > server-default chain (#767 / #768 / #794). These three
+    /// knobs are the long-tail of "config got dropped between layer X and
+    /// the wire" bugs the snapshot is meant to triage.
     #[test]
     fn test_resolved_config_snapshots_reasoning_and_thinking_budgets() {
         use alms_core::config::ReasoningEffort;
 
-        let mut agent = test_agent(None, None);
-        agent.thinking_budget_tokens = Some(2048); // per-agent Anthropic
-        agent.reasoning_effort = Some(ReasoningEffort::Low); // per-agent OpenAI
-        agent.gemini_thinking_budget = Some(1024); // per-agent Gemini
-
-        // Per-run overrides beat per-agent for all three knobs.
-        let overrides = RunOverrides {
-            thinking_budget_tokens: Some(8192),
-            reasoning_effort: Some(ReasoningEffort::High),
-            gemini_thinking_budget: Some(4096),
-            ..RunOverrides::default()
-        };
-        let merged = apply_overrides(base_config(), Some(&agent), &overrides);
+        let mut record = test_agent(None, None);
+        record.is_default = true;
+        record.thinking_budget_tokens = Some(8192); // per-agent Anthropic
+        record.reasoning_effort = Some(ReasoningEffort::High); // per-agent OpenAI
+        record.gemini_thinking_budget = Some(4096); // per-agent Gemini
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
         let server_llm = server_default_llm("any-model");
+        let secrets = empty_secrets();
 
-        let snapshot = build_resolved_config(&merged.agent_config, &server_llm);
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
         assert_eq!(snapshot.thinking_budget_tokens, 8192);
         assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(snapshot.gemini_thinking_budget, Some(4096));
     }
 
-    /// `Some(0)` per-run thinking budget is an explicit per-run disable
-    /// (not "use default" — see comment in `apply_overrides`). Snapshot
-    /// must record the literal `0` so triage can confirm the disable
-    /// engaged. Mirrors the wire-format invariant pinned by #767/#794.
+    /// `Some(0)` per-agent thinking budget is an explicit per-agent
+    /// disable (not "use default" — `Some(0)` is a meaningful value).
+    /// Snapshot must record the literal `0` so triage can confirm the
+    /// disable reached the wire. Mirrors the wire-format invariant pinned
+    /// by #767/#794.
     #[test]
     fn test_resolved_config_snapshots_explicit_zero_thinking_budget() {
-        let mut agent = test_agent(None, None);
-        agent.thinking_budget_tokens = Some(8192); // per-agent enabled
-
-        let overrides = RunOverrides {
-            thinking_budget_tokens: Some(0), // per-run explicit disable
-            ..RunOverrides::default()
+        let mut record = test_agent(None, None);
+        record.is_default = true;
+        record.thinking_budget_tokens = Some(0); // per-agent explicit disable
+        let mgr = manager_with_agent(&record);
+        // Server default enables thinking; per-agent must override to 0.
+        let base = AgentConfig {
+            anthropic_thinking_budget: 8192,
+            ..base_config()
         };
-        let merged = apply_overrides(base_config(), Some(&agent), &overrides);
         let server_llm = server_default_llm("any-model");
+        let secrets = empty_secrets();
 
-        let snapshot = build_resolved_config(&merged.agent_config, &server_llm);
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
         assert_eq!(
             snapshot.thinking_budget_tokens, 0,
-            "per-run Some(0) must surface as a literal 0 in the snapshot, \
+            "per-agent Some(0) must surface as a literal 0 in the snapshot, \
              confirming the disable reached the wire"
         );
     }

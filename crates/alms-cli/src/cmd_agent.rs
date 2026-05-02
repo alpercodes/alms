@@ -51,7 +51,7 @@ pub(crate) enum AgentCommands {
         /// Anthropic extended-thinking budget in tokens (Claude 4.x).
         /// `0` explicitly disables thinking for this agent even when the
         /// server default enables it. Omit the flag to inherit the server
-        /// default (three-layer precedence: per-run > per-agent > server).
+        /// default (two-layer precedence: per-agent > server).
         #[arg(long)]
         thinking_budget_tokens: Option<u32>,
         /// OpenAI-compat reasoning effort for reasoning models (OpenAI
@@ -65,7 +65,7 @@ pub(crate) enum AgentCommands {
         /// Gemini extended-thinking budget in tokens (Gemini 2.5+).
         /// `0` explicitly disables thinking for this agent even when the
         /// server default enables it. Omit the flag to inherit the server
-        /// default (three-layer precedence: per-run > per-agent > server).
+        /// default (two-layer precedence: per-agent > server).
         /// Non-Gemini providers silently ignore the value. (#794)
         #[arg(long)]
         gemini_thinking_budget: Option<u32>,

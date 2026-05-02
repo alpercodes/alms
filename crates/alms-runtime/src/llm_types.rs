@@ -304,9 +304,9 @@ pub struct CompletionRequest {
     /// field.
     ///
     /// Populated by the agent loop from the server's
-    /// `[llm.gemini].thinking_budget` config value (with the three-layer
-    /// precedence chain applied by the gateway). Never serialized on the
-    /// wire as-is.
+    /// `[llm.gemini].thinking_budget` config value (with the two-layer
+    /// precedence chain — per-agent > server default — applied by the
+    /// gateway). Never serialized on the wire as-is.
     #[serde(skip)]
     pub gemini_thinking_budget: Option<u32>,
     /// Opt-in to Gemini explicit context caching (#769).

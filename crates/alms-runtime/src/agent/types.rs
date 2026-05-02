@@ -127,8 +127,8 @@ pub struct AgentConfig {
     /// it and govern how many tokens the model may spend on internal
     /// reasoning before emitting its final response.
     ///
-    /// Populated by the gateway via the three-layer precedence chain
-    /// (per-run > per-agent > server default from `[llm.anthropic]`).
+    /// Populated by the gateway via the two-layer precedence chain
+    /// (per-agent > server default from `[llm.anthropic]`).
     /// Silently ignored when the effective provider is not Anthropic.
     pub anthropic_thinking_budget: u32,
     /// Anthropic prompt caching toggle (#766).
@@ -150,8 +150,8 @@ pub struct AgentConfig {
     /// (reasoning is implicit there) and non-reasoning OpenAI models
     /// (gpt-4o etc. would 400 on the unknown param).
     ///
-    /// Populated by the gateway via the three-layer precedence chain
-    /// (per-run > per-agent > server default from `[llm.openai]`).
+    /// Populated by the gateway via the two-layer precedence chain
+    /// (per-agent > server default from `[llm.openai]`).
     pub openai_reasoning_effort: Option<alms_core::config::ReasoningEffort>,
     /// Extended-thinking budget for Gemini 2.5+, in tokens (#769).
     ///
@@ -159,8 +159,8 @@ pub struct AgentConfig {
     /// wire). Non-zero values enable it and govern how many tokens the
     /// model may spend on internal reasoning.
     ///
-    /// Populated by the gateway via the three-layer precedence chain
-    /// (per-run > per-agent > server default from `[llm.gemini]`).
+    /// Populated by the gateway via the two-layer precedence chain
+    /// (per-agent > server default from `[llm.gemini]`).
     /// Silently ignored when the effective provider is not Gemini.
     pub gemini_thinking_budget: Option<u32>,
     /// Gemini explicit context-caching toggle (#769).
@@ -185,8 +185,8 @@ impl Default for AgentConfig {
             // 32K matches prevailing agent-tool defaults (#918) — covers ~95-99%
             // of agent turns (most finish under 8K), reasoning models'
             // hidden-thinking budgets, and long code-gen flows.
-            // Operators can override per-agent or per-run for code-gen or
-            // long-form writing workflows that need more headroom.
+            // Operators can override per-agent for code-gen or long-form
+            // writing workflows that need more headroom.
             max_tokens: 32_000,
             context_config: ContextConfig::default(),
             posture: Posture::default(),

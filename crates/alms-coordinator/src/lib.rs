@@ -843,11 +843,11 @@ struct SubagentRecordConfig {
     provider: Option<String>,
     /// Per-named-subagent Anthropic extended-thinking budget override.
     ///
-    /// Mirrors the top-level agent path in `apply_overrides` (gateway
-    /// `runs/mod.rs`): `Some(n)` (including `Some(0)`) is treated as an
-    /// explicit override; `None` inherits the parent's effective budget.
-    /// This keeps the three-layer precedence (per-run > per-agent >
-    /// server default) intact for named subagents too.
+    /// Mirrors the top-level agent path in `resolve_agent_config`
+    /// (gateway `runs/mod.rs`): `Some(n)` (including `Some(0)`) is
+    /// treated as an explicit override; `None` inherits the parent's
+    /// effective budget. This keeps the two-layer precedence (per-agent
+    /// > server default) intact for named subagents too.
     thinking_budget_tokens: Option<u32>,
     /// Per-named-subagent OpenAI-compat reasoning-effort override (#768).
     /// Mirrors `thinking_budget_tokens` for the OpenAI reasoning path:
@@ -857,9 +857,9 @@ struct SubagentRecordConfig {
     /// Per-named-subagent Gemini extended-thinking budget override (#794).
     /// Same shape as `thinking_budget_tokens` and `reasoning_effort`:
     /// `Some(n)` (including `Some(0)`) wins over the parent's effective
-    /// budget; `None` inherits it. Keeps the three-layer precedence
-    /// (per-run > per-agent > server default) intact for named
-    /// subagents on the Gemini path.
+    /// budget; `None` inherits it. Keeps the two-layer precedence
+    /// (per-agent > server default) intact for named subagents on the
+    /// Gemini path.
     gemini_thinking_budget: Option<u32>,
     /// Per-named-subagent summary provider override (#872). When the
     /// subagent has its own `summary_provider`/`summary_model` pair set
@@ -914,9 +914,9 @@ fn agent_config_for_subagent(
     // Per-named-subagent Anthropic thinking budget override. `Some(0)` is a
     // legitimate override meaning "disable extended thinking for this
     // subagent even when the parent enables it", matching the gateway's
-    // top-level `apply_overrides` semantics. `None` inherits the parent's
-    // effective budget so unconfigured subagents stay consistent with their
-    // parent's extended-thinking policy.
+    // top-level `resolve_agent_config` semantics. `None` inherits the
+    // parent's effective budget so unconfigured subagents stay consistent
+    // with their parent's extended-thinking policy.
     let anthropic_thinking_budget =
         thinking_budget_override.unwrap_or(base.anthropic_thinking_budget);
 
@@ -935,12 +935,12 @@ fn agent_config_for_subagent(
     let gemini_thinking_budget = gemini_thinking_budget_override.or(base.gemini_thinking_budget);
 
     // Inherit the parent's effective context config (which already has
-    // per-agent summary overrides applied via `apply_overrides`), then
-    // overlay any summary_provider/summary_model the subagent's own
-    // registry record carries. The pair-only validator on `POST /agents`
-    // / `PATCH /agents/{id}` guarantees these arrive symmetric, so we
-    // honour each field independently — `Some` wins over the parent;
-    // `None` inherits.
+    // per-agent summary overrides applied via `resolve_agent_config`),
+    // then overlay any summary_provider/summary_model the subagent's
+    // own registry record carries. The pair-only validator on
+    // `POST /agents` / `PATCH /agents/{id}` guarantees these arrive
+    // symmetric, so we honour each field independently — `Some` wins
+    // over the parent; `None` inherits.
     let mut subagent_context_config = base.context_config.clone();
     if let Some(provider) = summary_provider_override {
         subagent_context_config.summary_provider = Some(provider);
@@ -978,9 +978,10 @@ fn agent_config_for_subagent(
         // by subagents so they benefit from the same cached prefix.
         anthropic_prompt_cache_enabled: base.anthropic_prompt_cache_enabled,
         openai_reasoning_effort,
-        // Gemini thinking (#794) — three-layer precedence: per-named-
-        // subagent > parent's effective budget > server default. Resolved
-        // above via `gemini_thinking_budget_override.or(base.gemini_thinking_budget)`.
+        // Gemini thinking (#794) — two-layer precedence: per-named-
+        // subagent > parent's effective budget (which is itself
+        // per-agent > server default). Resolved above via
+        // `gemini_thinking_budget_override.or(base.gemini_thinking_budget)`.
         gemini_thinking_budget,
         // Gemini caching (#769) — server-level only, inherited verbatim
         // by subagents so they share cache entries where possible.
@@ -1883,9 +1884,11 @@ mod tests {
         assert_eq!(sub.shell_spill.retention_days, 1);
     }
 
-    // -- (j-pre-3) subagent thinking-budget three-layer precedence (Tim S1) -----
+    // -- (j-pre-3) subagent thinking-budget override precedence (Tim S1) --------
     //
-    // Parity with gateway `test_thinking_per_agent_zero_disables`: a named
+    // Subagent precedence: subagent-record override > parent-effective config.
+    // (Parent-effective is itself resolved from per-agent > server-default on
+    // the gateway side; per-run overrides were removed in #941.) A named
     // subagent registered with `thinking_budget_tokens = Some(0)` must
     // honour its own registry override and disable extended thinking, even
     // when the parent enables it with `Some(4096)`. Ephemeral subagents
@@ -1959,12 +1962,14 @@ mod tests {
         );
     }
 
-    // -- (j-pre-4) subagent reasoning-effort three-layer precedence (#768) ------
+    // -- (j-pre-4) subagent reasoning-effort override precedence (#768) ---------
     //
-    // Mirrors the Anthropic path above: a named subagent registered with
-    // `reasoning_effort = Some(Low)` must honour its own registry override
-    // and override the parent's `Some(High)`. Ephemeral subagents
-    // (record = None) still inherit the parent's effort.
+    // Mirrors the Anthropic path above (subagent-record > parent-effective;
+    // parent-effective itself is per-agent > server-default after #941): a
+    // named subagent registered with `reasoning_effort = Some(Low)` must
+    // honour its own registry override and override the parent's
+    // `Some(High)`. Ephemeral subagents (record = None) still inherit the
+    // parent's effort.
     #[test]
     fn test_subagent_reasoning_effort_override() {
         use alms_core::config::ReasoningEffort;

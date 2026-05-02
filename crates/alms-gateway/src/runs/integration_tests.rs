@@ -125,11 +125,13 @@ fn test_app_state_with_failing_llm() -> (
     // ECONNREFUSED rather than hanging.  Combined with a 1-second
     // request timeout this caps the test runtime at ~1s even in the
     // pathological case where the kernel is slow to refuse.
-    let mut llm_config = alms_runtime::LlmConfig::default();
-    llm_config.base_url = "http://127.0.0.1:1".to_string();
-    llm_config.api_key = "fake-key-for-test".to_string();
-    llm_config.timeout_secs = 1;
-    llm_config.stream_chunk_timeout_secs = 1;
+    let llm_config = alms_runtime::LlmConfig {
+        base_url: "http://127.0.0.1:1".to_string(),
+        api_key: "fake-key-for-test".to_string(),
+        timeout_secs: 1,
+        stream_chunk_timeout_secs: 1,
+        ..alms_runtime::LlmConfig::default()
+    };
 
     let gateway_config = GatewayConfig {
         llm_config,
@@ -341,7 +343,6 @@ async fn cancelled_before_execution_emits_cancelled_event() {
             session_id,
             agent_id,
             input: run.input,
-            overrides: super::RunOverrides::default(),
             context_id: "test-cancel".to_string(),
             cancel_token,
             is_peer_message: false,
@@ -404,7 +405,6 @@ async fn cancelled_during_shutdown_emits_cancelled_event() {
             session_id,
             agent_id,
             input: run.input,
-            overrides: super::RunOverrides::default(),
             context_id: "test-shutdown".to_string(),
             cancel_token,
             is_peer_message: false,
@@ -1772,14 +1772,6 @@ async fn create_run_pre_persists_user_input_to_session() {
         input: RunInput::Text {
             text: "hello from the user".into(),
         },
-        model: None,
-        max_tokens: None,
-        posture: None,
-        provider: None,
-        debug_mode: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
     };
 
     // Call the handler directly. We do NOT await the spawned execute_run -- we
@@ -1832,6 +1824,61 @@ async fn create_run_pre_persists_user_input_to_session() {
     );
 }
 
+/// Wire-compat regression for the #941 pivot.
+///
+/// UI clients on stale builds may still send the removed per-run override
+/// fields (`model`, `max_tokens`, `posture`, `provider`, `debug_mode`,
+/// `thinking_budget_tokens`, `reasoning_effort`, `gemini_thinking_budget`)
+/// on the `POST /runs` body. The deserializer must silently ignore them
+/// instead of returning a 400, otherwise every UI client on a pre-#941
+/// bundle would 400 on send-message until the user reloads. This pins
+/// "ignore" semantics by deserializing a request payload that carries
+/// every removed field and confirming the gateway accepts it and
+/// produces a queued run with the agent's resolved config.
+#[tokio::test]
+async fn create_run_ignores_stale_per_run_override_fields() {
+    use alms_core::CreateRunRequest;
+    use axum::Json;
+    use axum::extract::State;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state();
+    let agent_id = AgentId::new();
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let session_id = session.id;
+
+    // Build a JSON payload with every removed per-run override field set
+    // to a value that would have been honoured pre-#941. The gateway
+    // must deserialize this into the new (knob-less) `CreateRunRequest`
+    // and drop the extra fields without error.
+    let stale_payload = serde_json::json!({
+        "session_id": session_id.0.to_string(),
+        "input": { "type": "text", "text": "stale per-run fields" },
+        "model": "definitely-not-the-agent-model",
+        "max_tokens": 1234,
+        "posture": "autonomous",
+        "provider": "anthropic",
+        "debug_mode": true,
+        "thinking_budget_tokens": 9999,
+        "reasoning_effort": "high",
+        "gemini_thinking_budget": 8888,
+    });
+
+    let req: CreateRunRequest = serde_json::from_value(stale_payload)
+        .expect("deserializer must silently ignore removed per-run override fields");
+
+    // Sanity: the parsed request only has the new fields.
+    assert_eq!(req.session_id, session_id);
+
+    let (status, _resp) = match super::lifecycle::create_run(State(state.clone()), Json(req)).await
+    {
+        Ok(ok) => ok,
+        Err((code, body)) => panic!("create_run failed: status={code:?} body={:?}", body.0),
+    };
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+
+    shutdown_token.cancel();
+}
+
 #[tokio::test]
 async fn create_run_rejects_agent_session_mismatch() {
     use alms_core::{CreateRunRequest, RunInput};
@@ -1849,14 +1896,6 @@ async fn create_run_rejects_agent_session_mismatch() {
         input: RunInput::Text {
             text: "hello".into(),
         },
-        model: None,
-        max_tokens: None,
-        posture: None,
-        provider: None,
-        debug_mode: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
     };
 
     let Err((status, body)) = super::lifecycle::create_run(State(state), Json(req)).await else {
@@ -1884,14 +1923,6 @@ async fn create_run_requires_agent_id_for_shared_session() {
         input: RunInput::Text {
             text: "hello".into(),
         },
-        model: None,
-        max_tokens: None,
-        posture: None,
-        provider: None,
-        debug_mode: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
     };
 
     let Err((status, body)) = super::lifecycle::create_run(State(state), Json(req)).await else {
@@ -1947,14 +1978,6 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
         input: RunInput::Text {
             text: "hello".into(),
         },
-        model: None,
-        max_tokens: None,
-        posture: None,
-        provider: None,
-        debug_mode: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
     };
 
     let (status, resp) = match super::lifecycle::create_run(State(state.clone()), Json(req)).await {
@@ -2018,14 +2041,6 @@ async fn create_run_reports_queued_behind_when_agent_is_running() {
         input: RunInput::Text {
             text: "second message".into(),
         },
-        model: None,
-        max_tokens: None,
-        posture: None,
-        provider: None,
-        debug_mode: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
     };
 
     match super::lifecycle::create_run(State(state.clone()), Json(req)).await {
@@ -2612,7 +2627,6 @@ async fn pre_cancelled_run_emits_session_activity_ended() {
             session_id,
             agent_id,
             input: run.input,
-            overrides: super::RunOverrides::default(),
             context_id: "test-pre-cancel".to_string(),
             cancel_token,
             is_peer_message: false,
@@ -2724,7 +2738,6 @@ async fn pre_cancelled_run_flips_state_before_broadcasting() {
                 session_id,
                 agent_id,
                 input: exec_input,
-                overrides: super::RunOverrides::default(),
                 context_id: "test-895-pre-cancel".to_string(),
                 cancel_token,
                 is_peer_message: false,
@@ -2851,7 +2864,6 @@ async fn happy_path_start_flips_state_before_broadcasting() {
                 session_id,
                 agent_id,
                 input: exec_input,
-                overrides: super::RunOverrides::default(),
                 context_id: "test-895-happy-start".to_string(),
                 cancel_token,
                 is_peer_message: false,
@@ -3133,7 +3145,6 @@ async fn failed_with_tool_calls_arm_flips_state_before_broadcasting() {
                 session_id,
                 agent_id,
                 input: exec_input,
-                overrides: super::RunOverrides::default(),
                 context_id: "test-927-err-arm".to_string(),
                 cancel_token,
                 is_peer_message: false,
@@ -3479,7 +3490,6 @@ async fn execute_run_failed_arm_persists_no_lifecycle_error_marker() {
             session_id,
             agent_id,
             input: run.input,
-            overrides: super::RunOverrides::default(),
             context_id: "test-912-no-dup-marker".to_string(),
             cancel_token,
             is_peer_message: false,
@@ -3680,7 +3690,7 @@ fn find_position_event(events: &[SseEventData], run_id: alms_core::RunId) -> Opt
                 .unwrap_or(false)
         })
         .filter_map(|e| e.data.get("position").and_then(|v| v.as_u64()))
-        .last()
+        .next_back()
 }
 
 /// When 3 runs are enqueued back-to-back against a busy agent, the
@@ -3734,14 +3744,6 @@ async fn three_back_to_back_queued_runs_get_distinct_initial_positions() {
             input: RunInput::Text {
                 text: format!("queued message {i}"),
             },
-            model: None,
-            max_tokens: None,
-            posture: None,
-            provider: None,
-            debug_mode: None,
-            thinking_budget_tokens: None,
-            reasoning_effort: None,
-            gemini_thinking_budget: None,
         };
         let _ = super::lifecycle::create_run(State(state.clone()), Json(req))
             .await
@@ -3845,7 +3847,6 @@ async fn execute_run_terminal_broadcasts_decremented_positions_to_remaining_queu
             session_id,
             agent_id,
             input: "A".to_string(),
-            overrides: super::RunOverrides::default(),
             context_id: "queue-pos-test".to_string(),
             cancel_token,
             is_peer_message: false,
@@ -3974,7 +3975,6 @@ async fn broadcast_queue_advance_is_noop_when_no_queued_runs_remain() {
             session_id,
             agent_id,
             input: "single".to_string(),
-            overrides: super::RunOverrides::default(),
             context_id: "single-cancel-test".to_string(),
             cancel_token,
             is_peer_message: false,
@@ -4042,14 +4042,6 @@ async fn http_run_sees_pending_telegram_style_work_in_queued_behind() {
         input: RunInput::Text {
             text: "behind two telegram-style items".into(),
         },
-        model: None,
-        max_tokens: None,
-        posture: None,
-        provider: None,
-        debug_mode: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
     };
     let _ = super::lifecycle::create_run(State(state.clone()), Json(req))
         .await

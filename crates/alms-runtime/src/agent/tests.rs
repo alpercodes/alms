@@ -2720,9 +2720,8 @@ async fn test_reasoning_persisted_reload_roundtrip() {
 }
 
 /// `AgentConfig.anthropic_thinking_budget` threads through to every LLM
-/// request the agent loop issues. Without this invariant, per-agent /
-/// per-run overrides would land in config but never be seen by the
-/// provider.
+/// request the agent loop issues. Without this invariant, per-agent
+/// overrides would land in config but never be seen by the provider.
 ///
 /// This is a shape-assertion test — we don't run a real LLM; we build
 /// the `CompletionRequest` exactly as the agent loop does and check the

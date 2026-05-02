@@ -5,11 +5,9 @@ import { activeRunId, runs } from '../../state/runs.js';
 import { nextMsgId } from '../../state/chat.js';
 import { appendMessage, transformMessages } from '../../state/chat-actions.js';
 import { messageQueue } from '../../state/queue.js';
-import { localSettings } from '../../state/settings.js';
 import { createRun, cancelRun as apiCancelRun } from '../../api/runs.js';
 import { savePendingMessage, setPendingRunId, clearPendingMessage } from '../../state/pending-messages.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
-import { ComposerAdvanced } from './composer-advanced.js';
 
 /**
  * Start a new run with the given text.
@@ -46,41 +44,15 @@ export async function startRun(text, opts) {
     }
 
     try {
+        // Per-run config overrides were removed in the #941 pivot — the
+        // run body carries only session, agent, and input. Operators
+        // change model / provider / posture / budgets via the agent
+        // record (Agents panel) or server defaults (Settings modal).
         const runBody = {
             session_id: sessionId,
             agent_id: agentId,
             input: { type: 'text', text },
         };
-        const settings = localSettings.value;
-        // Per-run `provider` / `model` are intentionally NOT forwarded
-        // from `localSettings` (#865). The settings modal and composer
-        // Advanced expander both write these keys to localStorage, and
-        // stale values silently squashed per-agent overrides on every
-        // run (per-run > per-agent in resolution precedence). Until a
-        // deliberate "use this provider/model for this chat" UX exists,
-        // provider/model resolution is owned by per-agent + server
-        // defaults only. Other per-run overrides remain forwarded —
-        // they aren't the bug source and don't share this footgun.
-        if (settings.max_tokens != null) runBody.max_tokens = settings.max_tokens;
-        if (settings.posture) runBody.posture = settings.posture;
-        // debug_mode is tri-state on the composer (Inherit / On / Off):
-        // null -> omit (inherit), true -> enable, false -> explicitly
-        // disable (overrides an agent-level `true` for this one run).
-        if (settings.debug_mode != null) runBody.debug_mode = !!settings.debug_mode;
-        // Reasoning / thinking overrides (#804 Slice C). Send `0` on the
-        // wire as an explicit-disable signal — only `null`/`undefined`
-        // means "inherit per-agent / server default". This preserves the
-        // `None` vs `Some(0)` distinction the backend three-layer
-        // precedence relies on.
-        if (settings.thinking_budget_tokens != null) {
-            runBody.thinking_budget_tokens = settings.thinking_budget_tokens;
-        }
-        if (settings.reasoning_effort) {
-            runBody.reasoning_effort = settings.reasoning_effort;
-        }
-        if (settings.gemini_thinking_budget != null) {
-            runBody.gemini_thinking_budget = settings.gemini_thinking_budget;
-        }
 
         const runResp = await createRun(runBody);
         // Attach the run ID to the pending message so reconciliation can
@@ -151,7 +123,6 @@ export function InputArea() {
 
     return html`
         <div id="input-area">
-            <${ComposerAdvanced} />
             <div class="input-container">
                 <textarea id="prompt" ref=${promptRef} rows="1"
                           placeholder=${placeholder}

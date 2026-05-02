@@ -841,9 +841,9 @@ mod tests {
     /// End-to-end round trip through SQLite: insert an agent with all
     /// three reasoning knobs set, PATCH with all three `clear_*: true`,
     /// reload from the store, verify all three are `None`. This is what
-    /// the `apply_overrides` precedence test relies on: once the SQLite
-    /// record's knob is `None`, the agent-layer precedence falls through
-    /// to the server default.
+    /// the `resolve_agent_config` precedence test relies on: once the
+    /// SQLite record's knob is `None`, the agent-layer precedence falls
+    /// through to the server default.
     #[test]
     fn clear_sentinels_round_trip_through_sqlite() {
         let store = SqliteStore::open_in_memory().unwrap();
@@ -865,9 +865,9 @@ mod tests {
         store.update_agent(&loaded).unwrap();
 
         // Reload and verify all three are None — this is what
-        // `apply_overrides` will see on a subsequent POST /runs, and
-        // that's what makes the precedence fall through to the server
-        // default.
+        // `resolve_agent_config` will see on a subsequent POST /runs,
+        // and that's what makes the precedence fall through to the
+        // server default.
         let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
         assert!(reloaded.thinking_budget_tokens.is_none());
         assert!(reloaded.reasoning_effort.is_none());

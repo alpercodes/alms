@@ -92,16 +92,15 @@ impl GatewayConfig {
                 enabled_tools: config.tools.enabled.clone(),
                 fs_edit_fuzzy_match: config.tools.fs_edit.fuzzy_match,
                 // Server-default extended-thinking budget — can be
-                // overridden per-agent in the registry and per-run in
-                // the run-create API.
+                // overridden per-agent in the registry.
                 anthropic_thinking_budget: config.llm.anthropic.thinking_budget_tokens,
                 // Anthropic prompt caching (#766) — server-level only,
                 // no per-agent / per-run override per issue #766.
                 anthropic_prompt_cache_enabled: config.llm.anthropic.prompt_cache_enabled,
                 // Server-default OpenAI-compat reasoning effort (#768) —
-                // three-layer precedence (per-run > per-agent > server).
+                // two-layer precedence (per-agent > server).
                 openai_reasoning_effort: config.llm.openai.reasoning_effort,
-                // Server-default Gemini thinking budget (#769) — three-layer
+                // Server-default Gemini thinking budget (#769) — two-layer
                 // precedence mirrors Anthropic/OpenAI. Silently ignored
                 // when the effective provider is not Gemini.
                 gemini_thinking_budget: config.llm.gemini.thinking_budget,
