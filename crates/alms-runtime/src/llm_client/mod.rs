@@ -757,6 +757,28 @@ impl LlmClient {
         &self.config.provider
     }
 
+    /// Get the wire-shape kind of the configured provider.
+    ///
+    /// Returns the [`ProviderKind`] for the active provider — looked up
+    /// from `[llm.providers.<name>].kind` when available, otherwise
+    /// inferred from the sugar-name fallback used by `apply_provider`
+    /// (`anthropic` → `Anthropic`, `gemini` → `Gemini`, anything else →
+    /// `OpenAiCompatible`).
+    ///
+    /// Used by `resolve_agent_config` to detect cross-namespace per-agent
+    /// model leaks (#942) — a per-agent model whose prefix doesn't belong
+    /// to the new provider's wire shape would otherwise 404 downstream.
+    pub fn provider_kind(&self) -> ProviderKind {
+        if let Some(entry) = self.config.providers.get(&self.config.provider) {
+            return entry.kind;
+        }
+        match self.config.provider.as_str() {
+            "anthropic" => ProviderKind::Anthropic,
+            "gemini" => ProviderKind::Gemini,
+            _ => ProviderKind::OpenAiCompatible,
+        }
+    }
+
     /// Get default model name
     pub fn default_model(&self) -> &str {
         &self.config.default_model

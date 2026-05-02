@@ -115,7 +115,41 @@ fn find_user_facing_session(
 // ---------------------------------------------------------------------------
 
 mod config {
+    use alms_core::config::ProviderKind;
     use tracing::{info, warn};
+
+    /// Does `model` belong to the wire-shape namespace of `kind`?
+    ///
+    /// Used by the #942 cross-namespace drop in [`resolve_agent_config`] to
+    /// decide whether a per-agent `model` field carried over from before a
+    /// per-agent provider switch is safe to apply on the new provider's
+    /// wire. The check is intentionally asymmetric:
+    ///
+    /// - **`OpenAiCompatible`** is permissive — the kind is a giant tent.
+    ///   OpenAI accepts `gpt-*` / `o*`, OpenRouter accepts vendor-prefixed
+    ///   names from every namespace (`anthropic/claude-*`, `google/gemini-*`,
+    ///   `deepseek/deepseek-*`, …), DeepSeek accepts `deepseek-*`. We do
+    ///   not have enough information at this layer to tell them apart, so
+    ///   we accept every model name and let the wire 404 surface speak.
+    /// - **`Anthropic`** wires only accept `claude-*`. Stable prefix.
+    /// - **`Gemini`** wires only accept `gemini-*` (the bare form returned
+    ///   by `models.list`) or `models/gemini-*` (the qualified form some
+    ///   docs use).
+    ///
+    /// Match is case-insensitive (defensive — provider model lists are all
+    /// lowercase today, but a user-typed config with mixed case shouldn't
+    /// silently drop). Mirrors the lowercase sugar-name handling in
+    /// `apply_provider`.
+    pub(super) fn model_belongs_to_kind(model: &str, kind: ProviderKind) -> bool {
+        let model = model.to_ascii_lowercase();
+        match kind {
+            ProviderKind::OpenAiCompatible => true,
+            ProviderKind::Anthropic => model.starts_with("claude-"),
+            ProviderKind::Gemini => {
+                model.starts_with("gemini-") || model.starts_with("models/gemini-")
+            }
+        }
+    }
 
     /// Result of resolving per-agent config from the agent registry.
     pub struct ResolvedAgentConfig {
@@ -140,14 +174,34 @@ mod config {
     /// /agents/{id}` before starting the run; `POST /runs` carries no
     /// config knobs.
     ///
-    /// **#860 model-leak guard.** When a per-agent `provider` override
-    /// switches the effective provider AND neither a per-agent `model` nor
-    /// a `[llm.providers.<name>].model` entry supplies a model for the
-    /// new provider, `apply_provider` leaves `default_model` pointing at
-    /// the OLD provider's default. That stale model would 404 on the new
-    /// provider's wire. The guard clears `default_model` to `""` so the
-    /// agent loop's wire request fails fast with a clean "missing model"
-    /// error.
+    /// **#860 model-leak guard (no per-agent model).** When a per-agent
+    /// `provider` override switches the effective provider AND neither a
+    /// per-agent `model` nor a `[llm.providers.<name>].model` entry
+    /// supplies a model for the new provider, `apply_provider` leaves
+    /// `default_model` pointing at the OLD provider's default. That stale
+    /// model would 404 on the new provider's wire. The guard clears
+    /// `default_model` to `""` so the agent loop's wire request fails
+    /// fast with a clean "missing model" error.
+    ///
+    /// **#942 cross-namespace per-agent model drop.** When a per-agent
+    /// provider override switches the effective provider AND the per-agent
+    /// `model` field carries a name from the OLD provider's namespace
+    /// (e.g. agent record has `provider: anthropic` and `model: gpt-4o`,
+    /// or `provider: gemini` and `model: claude-3.5-sonnet`), applying
+    /// that stale model produces an opaque downstream 404. The
+    /// cross-namespace check below drops the per-agent model on the floor
+    /// before it reaches `with_model`; the run then falls through to the
+    /// `[llm.providers.<new>].model` entry (if any) or to the #860
+    /// empty-clear fail-fast (if not). Namespace check is keyed on
+    /// [`ProviderKind`]: `Anthropic` requires a `claude-` prefix, `Gemini`
+    /// requires `gemini-` / `models/gemini-`, and `OpenAiCompatible` is
+    /// permissive (the kind is a giant tent — OpenAI / OpenRouter /
+    /// DeepSeek all share the wire format and accept different model
+    /// namespaces). Side-effect closes #863: empty-string `with_model("")`
+    /// no longer fires when an Anthropic-namespace per-agent model is
+    /// silently dropped, because the post-fix path either preserves the
+    /// (in-namespace) per-agent model or clears via the #860 guard with a
+    /// distinct `agent_id` log line operators can grep for.
     pub fn resolve_agent_config(
         agent_id: alms_core::AgentId,
         session_manager: &alms_session::SessionManager,
@@ -268,11 +322,37 @@ mod config {
         // Apply the per-agent model. When set this overrides any value
         // `apply_provider` left on `default_model` — the per-agent override
         // is the user's explicit choice and must reach the wire.
-        if let Some(model) = per_agent_model {
+        //
+        // Cross-namespace drop (#942): if the per-agent provider override
+        // changed the effective wire kind AND the per-agent model belongs
+        // to the OLD provider's namespace, drop it on the floor. Falling
+        // through to the #860 leak-guard branch lets `[llm.providers.<new>]
+        // .model` (if any) supply a fallback or clears `default_model` to
+        // `""` for fail-fast.
+        let provider_changed = llm.provider() != previous_provider;
+        let effective_per_agent_model = match per_agent_model {
+            None => None,
+            Some(ref model) if !provider_changed => Some(model.clone()),
+            Some(ref model) if model_belongs_to_kind(model, llm.provider_kind()) => {
+                Some(model.clone())
+            }
+            Some(stale) => {
+                warn!(
+                    agent_id = %agent_id,
+                    old_provider = %previous_provider,
+                    new_provider = %llm.provider(),
+                    stale_per_agent_model = %stale,
+                    "Per-agent provider switch with cross-namespace per-agent model -- \
+                     dropping the stale model so the run does not 404 on the new \
+                     provider's wire with a previous-namespace model name (#942)"
+                );
+                None
+            }
+        };
+
+        if let Some(model) = effective_per_agent_model {
             llm = llm.with_model(model);
-        } else if llm.provider() != previous_provider
-            && llm.default_model() == previous_default_model
-        {
+        } else if provider_changed && llm.default_model() == previous_default_model {
             // #860 leak guard: per-agent provider switch fired AND neither
             // a per-agent model nor a `[llm.providers.<new_provider>].model`
             // entry supplied a model for the new provider, so `default_model`
@@ -758,6 +838,291 @@ mod tests {
              produces no model from any layer (#860)"
         );
         assert_eq!(resolved.llm.provider(), "anthropic");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-namespace per-agent model drop tests (#942)
+    //
+    // These exercise the post-#860 sibling guard: when a per-agent provider
+    // override switches the effective wire kind AND the per-agent `model`
+    // field carries a name from the OLD namespace (e.g. agent record has
+    // `provider: anthropic` and `model: gpt-4o` after the operator swapped
+    // the provider but forgot to update the model), the per-agent model is
+    // dropped before reaching `with_model` and the run falls through to
+    // either a `[llm.providers.<new>].model` fallback or the #860
+    // empty-clear fail-fast.
+    //
+    // Namespace check is keyed on `ProviderKind` (Anthropic / Gemini are
+    // strict, OpenAiCompatible is permissive — see `model_belongs_to_kind`).
+    // Closes #942; closes #863 as a side-effect because the post-fix path
+    // no longer silently drops an Anthropic-namespace per-agent model.
+    // -----------------------------------------------------------------------
+
+    /// The canonical #942 leak shape. Agent record carries `provider:
+    /// anthropic` and `model: gpt-4o-mini` (a stale openai-namespace
+    /// model — typical operator workflow: swap provider via PATCH /agents,
+    /// forget to update the model). Server default is openai with
+    /// `gpt-4o-mini`. Pre-fix: the per-agent `with_model("gpt-4o-mini")`
+    /// runs after `apply_provider("anthropic")` and the wire request goes
+    /// to Anthropic with `model: gpt-4o-mini` → 404. Post-fix: the
+    /// cross-namespace check drops the per-agent model, the anthropic
+    /// entry has no `model` field, so the #860 leak guard fires and
+    /// `default_model` is cleared to "" for fail-fast.
+    #[test]
+    fn test_per_agent_provider_switch_drops_per_agent_model_from_old_provider_namespace() {
+        let mut record = test_agent(Some("gpt-4o-mini"), None);
+        record.is_default = true;
+        record.provider = Some("anthropic".into());
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openai".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // No model field on the anthropic entry, so after the
+                // per-agent stale-model is dropped the #860 guard fires.
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let server_cfg = LlmConfig {
+            provider: "openai".into(),
+            api_key: "openai-key".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            default_model: "gpt-4o-mini".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
+        std::mem::forget(dir);
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        // Pre-fix: default_model() == "gpt-4o-mini" (the per-agent model
+        // applied via `with_model` even though it is from the openai
+        // namespace and the new provider is anthropic). Wire request 404s.
+        // Post-fix: cross-namespace drop fires, no fallback model on the
+        // anthropic entry, #860 guard clears to "" for fail-fast.
+        assert_ne!(
+            resolved.llm.default_model(),
+            "gpt-4o-mini",
+            "per-agent provider switch must NOT apply a stale per-agent \
+             model from the OLD provider namespace -- the #942 leak"
+        );
+        assert_eq!(
+            resolved.llm.default_model(),
+            "",
+            "after dropping the cross-namespace per-agent model, the #860 \
+             empty-clear fail-fast fires because the new provider entry \
+             has no fallback model (#942 + #860 chain)"
+        );
+        assert_eq!(resolved.llm.provider(), "anthropic");
+    }
+
+    /// Companion: per-agent provider override switches Anthropic → Gemini
+    /// (or any non-OpenAiCompatible direction), the per-agent model field
+    /// carries a Gemini-namespace name. Same shape as #860 but on the
+    /// drop branch — the cross-namespace check should NOT fire because
+    /// the model is in the new provider's namespace.
+    #[test]
+    fn test_per_agent_provider_switch_keeps_per_agent_model_when_namespace_matches() {
+        let mut record = test_agent(Some("gemini-2.0-flash"), None);
+        record.is_default = true;
+        record.provider = Some("gemini".into());
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openai".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "gemini".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Gemini,
+                base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-goog-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let server_cfg = LlmConfig {
+            provider: "openai".into(),
+            api_key: "openai-key".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            default_model: "gpt-4o-mini".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("gemini", "AIza-test").unwrap();
+        std::mem::forget(dir);
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+
+        assert_eq!(
+            resolved.llm.default_model(),
+            "gemini-2.0-flash",
+            "per-agent gemini-namespace model must be preserved on a cross-provider \
+             switch INTO gemini (the namespace check is asymmetric -- it only drops \
+             models from the OLD namespace, not models that happen to match the new one)"
+        );
+        assert_eq!(resolved.llm.provider(), "gemini");
+    }
+
+    /// Sanity: `model_belongs_to_kind` is case-insensitive. Provider
+    /// model lists are all lowercase today, but a user-typed config with
+    /// mixed case (`Claude-3-haiku-20240307`) shouldn't silently get
+    /// dropped by the cross-namespace guard. Tim flagged this as a nit
+    /// on #944.
+    #[test]
+    fn test_model_belongs_to_kind_is_case_insensitive() {
+        use alms_core::config::ProviderKind;
+        use config::model_belongs_to_kind;
+
+        assert!(model_belongs_to_kind(
+            "Claude-3-haiku-20240307",
+            ProviderKind::Anthropic
+        ));
+        assert!(model_belongs_to_kind(
+            "CLAUDE-3-OPUS",
+            ProviderKind::Anthropic
+        ));
+        assert!(model_belongs_to_kind(
+            "Gemini-1.5-pro",
+            ProviderKind::Gemini
+        ));
+        assert!(model_belongs_to_kind(
+            "Models/Gemini-1.5-pro",
+            ProviderKind::Gemini
+        ));
+        // Negative: still rejects out-of-namespace regardless of case.
+        assert!(!model_belongs_to_kind(
+            "GPT-4o",
+            ProviderKind::Anthropic
+        ));
+    }
+
+    /// Symmetric snapshot test against `build_resolved_config`: pin that
+    /// the persisted #837 triage snapshot reflects the post-fix wire
+    /// model, not the leaked stale-namespace value. This is the surface
+    /// operators read via `GET /runs/{id}.resolved_config.model` to
+    /// confirm "what model was actually sent" — if the snapshot drifts
+    /// from the wire, triage breaks.
+    #[test]
+    fn test_resolved_config_snapshot_reflects_dropped_per_agent_model() {
+        let mut record = test_agent(Some("gpt-4o-mini"), None);
+        record.is_default = true;
+        record.provider = Some("anthropic".into());
+        let mgr = manager_with_agent(&record);
+        let base = base_config();
+
+        use alms_runtime::llm_types::LlmConfig;
+        let mut providers = std::collections::BTreeMap::new();
+        providers.insert(
+            "openai".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::Anthropic,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                // Anthropic entry pins a fallback model so the snapshot
+                // shows the in-namespace fallback (not the empty-clear
+                // path -- that one is exercised by the test above).
+                model: Some("claude-haiku-4-5-20251001".into()),
+                auth_scheme: alms_core::config::AuthScheme::Header {
+                    name: "x-api-key".into(),
+                },
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        let server_cfg = LlmConfig {
+            provider: "openai".into(),
+            api_key: "openai-key".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            default_model: "gpt-4o-mini".into(),
+            providers,
+            ..LlmConfig::default()
+        };
+        let server_llm = alms_runtime::LlmClient::new(server_cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut secrets = alms_core::secrets::SecretsStore::load(dir.path().join("secrets.json"))
+            .unwrap_or_else(|_| alms_core::secrets::SecretsStore::empty());
+        secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
+        std::mem::forget(dir);
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
+
+        assert_ne!(
+            snapshot.model, "gpt-4o-mini",
+            "snapshot must NOT carry the dropped stale per-agent model -- \
+             that would mislead triage to think the wire request used it"
+        );
+        assert_eq!(
+            snapshot.model, "claude-haiku-4-5-20251001",
+            "snapshot must reflect the post-drop fallback (the anthropic \
+             provider entry's model) -- the value the wire request actually \
+             carries (#837 triage invariant)"
+        );
+        assert_eq!(snapshot.provider, "anthropic");
     }
 
     // -----------------------------------------------------------------------
