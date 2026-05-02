@@ -2,7 +2,7 @@ import { html, useEffect, useSignal } from '../../deps.js';
 import { activeAgentId } from '../../state/agents.js';
 import { wsFiles } from '../../state/workspace.js';
 import { activePanelTab } from '../../state/panel.js';
-import { getWorkspace, updateWorkspaceFile } from '../../api/workspace.js';
+import { getWorkspace, openWorkspaceInExplorer, updateWorkspaceFile } from '../../api/workspace.js';
 
 const WS_FILES = ['personality', 'goals', 'memories', 'user'];
 
@@ -21,6 +21,83 @@ async function loadWorkspace() {
             wsFiles.value = 'error';
         }
     }
+}
+
+/**
+ * #858: ask the gateway to open the agent's workspace directory in the host
+ * file explorer. The button stays inline at the top of the workspace panel
+ * so it's discoverable next to the file list it acts on. Success flashes a
+ * brief "Opened" pill that fades on its own; errors persist until the user
+ * clicks again so the failure mode is impossible to miss.
+ *
+ * Exported so the JS test harness in `tests/ui/` can drive the click handler
+ * directly without spinning up a Preact tree.
+ */
+export function OpenInExplorerButton({ agentId, doOpen }) {
+    const busy = useSignal(false);
+    const flash = useSignal(null); // { kind: 'ok' | 'err', text }
+
+    const onClick = async () => {
+        if (busy.value || !agentId) return;
+        busy.value = true;
+        flash.value = null;
+        try {
+            await doOpen(agentId);
+            flash.value = { kind: 'ok', text: 'Opened' };
+            setTimeout(() => {
+                if (flash.value?.kind === 'ok') flash.value = null;
+            }, 2000);
+        } catch (err) {
+            const code = err?.error?.code;
+            const msg = err?.error?.message || err?.message || 'Failed to open workspace';
+            // Map known error codes to slightly friendlier short labels — the
+            // full server message still goes in the title attribute so the
+            // operator can hover for details.
+            let label = msg;
+            if (code === 'NOT_CONFIGURED') {
+                label = 'Workspace dir not configured';
+            } else if (code === 'WORKSPACE_PATH_MISSING') {
+                label = 'Workspace path is missing on disk';
+            } else if (code === 'LAUNCHER_FAILED') {
+                label = 'Failed to launch file explorer';
+            }
+            flash.value = { kind: 'err', text: label, full: msg };
+        } finally {
+            busy.value = false;
+        }
+    };
+
+    const onKeyDown = (e) => {
+        // Native <button> already activates on Enter/Space, but htm props
+        // sometimes route through a wrapper that swallows the default —
+        // pin Enter/Space here defensively so the keyboard-accessibility
+        // acceptance criterion is closed-by-construction.
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            onClick();
+        }
+    };
+
+    return html`
+        <div class="ws-open-row">
+            <button class="ws-open-btn"
+                    type="button"
+                    onClick=${onClick}
+                    onKeyDown=${onKeyDown}
+                    disabled=${busy.value || !agentId}
+                    title="Open this agent's workspace directory in the host file explorer"
+                    aria-label="Open workspace in file explorer">
+                ${busy.value ? 'Opening...' : 'Open in Explorer'}
+            </button>
+            ${flash.value && html`
+                <span class="ws-flash ${flash.value.kind === 'ok' ? 'ok' : 'err'}"
+                      title=${flash.value.full || ''}
+                      role=${flash.value.kind === 'err' ? 'alert' : 'status'}>
+                    ${flash.value.text}
+                </span>
+            `}
+        </div>
+    `;
 }
 
 function FileEditor({ agentId, filename, content }) {
@@ -58,7 +135,7 @@ function FileEditor({ agentId, filename, content }) {
                     ${saving.value ? 'Saving...' : 'Save'}
                 </button>
                 ${flash.value && html`
-                    <span class="ws-flash" style="color:${flash.value.startsWith('Error') ? 'var(--error)' : 'var(--success)'}">
+                    <span class="ws-flash ${flash.value.startsWith('Error') ? 'err' : 'ok'}">
                         ${flash.value}
                     </span>
                 `}
@@ -79,6 +156,9 @@ export function WorkspaceTab() {
         return html`<div class="loading-state">Loading...</div>`;
     }
     if (wsFiles.value === 'unavailable') {
+        // Workspace dir is not configured server-side OR the agent record
+        // doesn't have a workspace yet. The Open-in-Explorer button is
+        // intentionally NOT shown here — there's no path to open.
         return html`<div class="ws-notice">Workspace not configured for this agent</div>`;
     }
     if (wsFiles.value === 'error') {
@@ -87,6 +167,9 @@ export function WorkspaceTab() {
 
     return html`
         <div>
+            <${OpenInExplorerButton}
+                agentId=${activeAgentId.value}
+                doOpen=${openWorkspaceInExplorer} />
             ${WS_FILES.map(f => html`
                 <${FileEditor}
                     key=${f}

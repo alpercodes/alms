@@ -16,7 +16,7 @@ use crate::runs::{
     is_internal_context_id, list_runs, stream_run_events,
 };
 use crate::settings::{get_settings, patch_settings};
-use crate::workspace::{get_workspace, update_workspace_file};
+use crate::workspace::{get_workspace, open_workspace, update_workspace_file};
 use alms_core::{AgentId, SessionId, dm_participants};
 use alms_session::{Content, Role};
 use axum::{
@@ -153,6 +153,13 @@ pub(crate) fn protected_router() -> Router<AppState> {
         .route("/agents/{id_or_name}/default", post(agents::set_default))
         // Workspace (agent identity files)
         .route("/agents/{id_or_name}/workspace", get(get_workspace))
+        // #858: open the workspace dir in the host file explorer.
+        // Registered BEFORE the `{file}` PUT route so axum's path matcher
+        // resolves `/workspace/open` to this handler instead of treating
+        // "open" as a file slug — a PUT on `/workspace/open` would have
+        // hit the file-overwrite handler with `file = "open"` and 404'd
+        // anyway, but POST is unambiguous either way.
+        .route("/agents/{id_or_name}/workspace/open", post(open_workspace))
         .route(
             "/agents/{id_or_name}/workspace/{file}",
             axum::routing::put(update_workspace_file),

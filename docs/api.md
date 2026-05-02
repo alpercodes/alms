@@ -1238,6 +1238,33 @@ Updates a single workspace file. `{file}` is one of: `personality.md`, `goals.md
 
 **Response 200** — `{ "ok": true }`
 
+### 11.3 Open workspace in host file explorer
+`POST /agents/{id_or_name}/workspace/open`
+
+Spawns the host's native file explorer at the agent's workspace directory (Windows Explorer / Finder / `xdg-open`). Operator-trust: the gateway is expected to run on the same host as the operator's browser, so the existing bearer-auth gate is the only privilege check. Bearer auth applies as on other write endpoints.
+
+The endpoint takes no client-supplied path — the workspace path is resolved server-side from the agent registry record and the configured `ALMS_WORKSPACE_DIR`. Path-traversal is closed-by-construction by `validate_agent_name`, which restricts agent names to ASCII lowercase + digits + hyphens.
+
+The launcher process is fire-and-forget — the response returns as soon as the OS accepts the spawn. The launcher itself is expected to outlive the request (the file explorer window should stay open until the user closes it).
+
+**Request** — empty body.
+
+**Response 200**
+```json
+{ "ok": true, "path": "/abs/path/to/agents/<name>" }
+```
+
+**Errors**
+- `503 NOT_CONFIGURED` — `ALMS_WORKSPACE_DIR` is unset.
+- `404 NOT_FOUND` — agent not found.
+- `500 WORKSPACE_PATH_MISSING` — workspace dir does not exist on disk (the agent record exists but its workspace dir was never created or has been deleted).
+- `500 LAUNCHER_FAILED` — could not spawn the launcher binary (e.g., `xdg-open` not on PATH on a server-only Linux box).
+
+**Platform notes**
+- **Windows**: launches `explorer.exe`. `explorer.exe` exits with status 1 even on a successful folder-open, so the gateway does NOT inspect the launcher exit code on any platform — successful `Command::spawn` is treated as success.
+- **macOS**: launches `open`.
+- **Linux / other Unix**: launches `xdg-open` (relies on `xdg-utils`).
+
 ---
 
 ## 12) Timeline (cross-channel unified activity view)

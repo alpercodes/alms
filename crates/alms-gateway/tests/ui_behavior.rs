@@ -92,3 +92,20 @@ fn run_node_test(file: &str) {
 fn history_js_behaviour() {
     run_node_test("history.test.mjs");
 }
+
+/// Pinned regression for issue #858: the "Open in Explorer" button in the
+/// workspace panel relies on `openWorkspaceInExplorer` from
+/// `static/ui/api/workspace.js` issuing a `POST /agents/{id}/workspace/open`
+/// — which in turn relies on the matching axum route in `routes.rs`. The
+/// JS-side test mocks `fetch` and asserts the request URL + method + body
+/// shape so a future refactor of the API client wrapper can't silently
+/// drift from the registered route.
+///
+/// Also covers the error-code → friendly-label mapping that the click
+/// handler uses on failure, against the structured-error codes that the
+/// backend handler returns (`NOT_CONFIGURED`, `WORKSPACE_PATH_MISSING`,
+/// `LAUNCHER_FAILED`).
+#[test]
+fn workspace_open_js_behaviour() {
+    run_node_test("workspace-open.test.mjs");
+}
