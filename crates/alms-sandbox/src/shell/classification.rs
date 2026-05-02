@@ -1240,23 +1240,23 @@ fn check_filesystem(head: &str, args: &[&str], frag: &str, out: &mut Classificat
                 },
             );
         }
-        "truncate" => {
+        "truncate"
             // truncate -s 0 /etc/* etc.
-            if args.iter().any(|a| *a == "-s" || a.starts_with("--size")) {
-                // Skip the -s <size> / --size=N argument pair to find the
-                // actual file target.
-                let target = truncate_target(args);
-                add_finding(
-                    out,
-                    Finding {
-                        category: RiskCategory::FilesystemDestructive,
-                        level: RiskLevel::Moderate,
-                        reason: "`truncate -s` can zero existing files".into(),
-                        fragment: frag.to_string(),
-                        target,
-                    },
-                );
-            }
+            if args.iter().any(|a| *a == "-s" || a.starts_with("--size")) =>
+        {
+            // Skip the -s <size> / --size=N argument pair to find the
+            // actual file target.
+            let target = truncate_target(args);
+            add_finding(
+                out,
+                Finding {
+                    category: RiskCategory::FilesystemDestructive,
+                    level: RiskLevel::Moderate,
+                    reason: "`truncate -s` can zero existing files".into(),
+                    fragment: frag.to_string(),
+                    target,
+                },
+            );
         }
         _ => {}
     }
@@ -1411,84 +1411,78 @@ fn check_git(head: &str, args: &[&str], frag: &str, out: &mut Classification) {
     let joined_lower = joined.to_ascii_lowercase();
 
     match sub {
-        "push" => {
+        "push"
             if joined_lower.contains("--force")
                 || joined_lower.contains(" -f ")
                 || joined_lower.ends_with(" -f")
-                || joined_lower.contains("+")
-            {
-                add_finding(
-                    out,
-                    Finding {
-                        category: RiskCategory::GitDestructive,
-                        level: RiskLevel::Moderate,
-                        reason: "`git push --force` rewrites remote history".into(),
-                        fragment: frag.to_string(),
-                        target: None,
-                    },
-                );
-            }
+                || joined_lower.contains("+") =>
+        {
+            add_finding(
+                out,
+                Finding {
+                    category: RiskCategory::GitDestructive,
+                    level: RiskLevel::Moderate,
+                    reason: "`git push --force` rewrites remote history".into(),
+                    fragment: frag.to_string(),
+                    target: None,
+                },
+            );
         }
-        "reset" => {
-            if joined_lower.contains("--hard") {
-                add_finding(
-                    out,
-                    Finding {
-                        category: RiskCategory::GitDestructive,
-                        level: RiskLevel::Moderate,
-                        reason: "`git reset --hard` discards local changes".into(),
-                        fragment: frag.to_string(),
-                        target: None,
-                    },
-                );
-            }
+        "reset" if joined_lower.contains("--hard") => {
+            add_finding(
+                out,
+                Finding {
+                    category: RiskCategory::GitDestructive,
+                    level: RiskLevel::Moderate,
+                    reason: "`git reset --hard` discards local changes".into(),
+                    fragment: frag.to_string(),
+                    target: None,
+                },
+            );
         }
-        "clean" => {
+        "clean"
             if joined_lower.contains("-f")
                 || joined_lower.contains("--force")
                 || joined_lower.contains("-x")
-                || joined_lower.contains("-d")
-            {
-                add_finding(
-                    out,
-                    Finding {
-                        category: RiskCategory::GitDestructive,
-                        level: RiskLevel::Moderate,
-                        reason: "`git clean -f/-fd/-fdx` deletes untracked files".into(),
-                        fragment: frag.to_string(),
-                        target: None,
-                    },
-                );
-            }
+                || joined_lower.contains("-d") =>
+        {
+            add_finding(
+                out,
+                Finding {
+                    category: RiskCategory::GitDestructive,
+                    level: RiskLevel::Moderate,
+                    reason: "`git clean -f/-fd/-fdx` deletes untracked files".into(),
+                    fragment: frag.to_string(),
+                    target: None,
+                },
+            );
         }
-        "checkout" => {
+        "checkout"
             // `git checkout .` or `git checkout -- .`
-            if args.iter().any(|a| *a == "." || *a == "--") {
-                add_finding(
-                    out,
-                    Finding {
-                        category: RiskCategory::GitDestructive,
-                        level: RiskLevel::Moderate,
-                        reason: "`git checkout .` discards local changes".into(),
-                        fragment: frag.to_string(),
-                        target: None,
-                    },
-                );
-            }
+            if args.iter().any(|a| *a == "." || *a == "--") =>
+        {
+            add_finding(
+                out,
+                Finding {
+                    category: RiskCategory::GitDestructive,
+                    level: RiskLevel::Moderate,
+                    reason: "`git checkout .` discards local changes".into(),
+                    fragment: frag.to_string(),
+                    target: None,
+                },
+            );
         }
-        "branch" => {
-            if joined_lower.contains("-d") {
-                add_finding(
-                    out,
-                    Finding {
-                        category: RiskCategory::GitDestructive,
-                        level: RiskLevel::Moderate,
-                        reason: "`git branch -D` force-deletes a branch".into(),
-                        fragment: frag.to_string(),
-                        target: None,
-                    },
-                );
-            }
+        "branch" if joined_lower.contains("-d") => {
+            add_finding(
+                out,
+                Finding {
+                    category: RiskCategory::GitDestructive,
+                    level: RiskLevel::Moderate,
+                    reason: "`git branch -D` force-deletes a branch".into(),
+                    fragment: frag.to_string(),
+                    target: None,
+                },
+            );
         }
         _ => {}
     }
@@ -1578,19 +1572,19 @@ fn check_package_manager(head: &str, args: &[&str], frag: &str, out: &mut Classi
         .unwrap_or("");
     match head {
         "apt" | "apt-get" | "dpkg" | "yum" | "dnf" | "pacman" | "zypper" | "apk" | "brew"
-        | "snap" | "flatpak" => {
-            if mutating(sub) {
-                add_finding(
-                    out,
-                    Finding {
-                        category: RiskCategory::PackageManagement,
-                        level: RiskLevel::Moderate,
-                        reason: format!("`{head} {sub}` changes installed packages"),
-                        fragment: frag.to_string(),
-                        target: None,
-                    },
-                );
-            }
+        | "snap" | "flatpak"
+            if mutating(sub) =>
+        {
+            add_finding(
+                out,
+                Finding {
+                    category: RiskCategory::PackageManagement,
+                    level: RiskLevel::Moderate,
+                    reason: format!("`{head} {sub}` changes installed packages"),
+                    fragment: frag.to_string(),
+                    target: None,
+                },
+            );
         }
         "npm" | "yarn" | "pnpm" => {
             if matches!(sub, "install" | "i" | "add" | "uninstall" | "remove" | "rm") {

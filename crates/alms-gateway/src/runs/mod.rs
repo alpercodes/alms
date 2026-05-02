@@ -1041,10 +1041,7 @@ mod tests {
             ProviderKind::Gemini
         ));
         // Negative: still rejects out-of-namespace regardless of case.
-        assert!(!model_belongs_to_kind(
-            "GPT-4o",
-            ProviderKind::Anthropic
-        ));
+        assert!(!model_belongs_to_kind("GPT-4o", ProviderKind::Anthropic));
     }
 
     /// Symmetric snapshot test against `build_resolved_config`: pin that
