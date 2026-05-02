@@ -168,13 +168,30 @@ export function mapHistoryMessages(msgs, opts) {
             // These are the agent's internal thinking text, stored as
             // Role::User with message_type="reasoning". Map them to a
             // special type that groupDmReasoningBlocks() can collect.
+            //
+            // For reasoning-capable models (Anthropic thinking_budget_tokens,
+            // OpenAI reasoning_effort, Gemini thinking_budget — see #767/
+            // #768/#769) the runtime persists the visible assistant text in
+            // `content` and the extended-thinking trace in
+            // `metadata.reasoning_blocks` (see `merge_reasoning_blocks` in
+            // loop_impl.rs). Prefer the trace when present so the reload
+            // render matches the live thinking pane (#897). Fall back to
+            // `m.content` for non-reasoning models that have no
+            // `reasoning_blocks` metadata. Fixes #898.
             const isReasoningText = m.metadata
                 && m.metadata.message_type === 'reasoning';
             if (isReasoningText) {
+                let text = '';
+                if (Array.isArray(m.metadata.reasoning_blocks)) {
+                    text = m.metadata.reasoning_blocks
+                        .map(b => (b && typeof b.text === 'string') ? b.text : '')
+                        .join('');
+                }
+                if (!text) text = m.content || '';
                 pushEntry({
                     id: nextMsgId(),
                     type: 'dm_reasoning_text',
-                    text: m.content || '',
+                    text,
                     fromAgent: m.metadata.from_agent || null,
                     runId: m.metadata.run_id || null,
                 }, m.timestamp);
