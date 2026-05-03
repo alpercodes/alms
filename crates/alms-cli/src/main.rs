@@ -35,6 +35,11 @@ enum Commands {
         /// Bind address (defaults to config value or 127.0.0.1:8080)
         #[arg(short, long)]
         bind: Option<String>,
+        /// Project root — the agent's filesystem sandbox boundary (#945).
+        /// Defaults to `ALMS_PROJECT_ROOT` env var, then `current_dir()`.
+        /// `fs_*` and `shell` tools all enforce against this single root.
+        #[arg(long, value_name = "PATH")]
+        project: Option<std::path::PathBuf>,
     },
     /// Check system health
     Health {
@@ -195,15 +200,24 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     match cli.command {
-        Commands::Gateway { bind } => {
+        Commands::Gateway { bind, project } => {
+            // Apply CLI `--project <path>` override before resolving the
+            // project root via env / cwd (#945). Writing through the
+            // shared `ServerConfig.project_root` field keeps the gateway
+            // honest about the precedence chain CLI > env > current_dir
+            // — `ServerConfig::resolved_project_root` reads this field
+            // first when non-empty.
+            let mut config = config;
+            if let Some(p) = project {
+                config.server.project_root = alms_core::resolve_to_absolute(&p);
+            }
+
             // Ensure the data directory exists (creates .alms/ on first run).
             config.ensure_data_dir();
 
             info!(
                 data_dir = %config.server.data_dir,
-                workspace = %std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| ".".into()),
+                project_root = %config.server.resolved_project_root().display(),
                 "Starting ALMS Gateway"
             );
 
@@ -319,7 +333,7 @@ async fn main() -> anyhow::Result<()> {
                     summary_model,
                     default,
                 } => {
-                    let workspace_dir = config.server.workspace_dir();
+                    let workspace_dir = config.server.agents_dir();
                     cmd_agent::agent_create(
                         &store,
                         cmd_agent::AgentCreateOpts {

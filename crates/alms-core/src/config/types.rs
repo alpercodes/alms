@@ -76,6 +76,31 @@ pub struct ServerConfig {
     /// `cd` into your project directory, run `alms gateway`, and all
     /// instance-specific state lives under `.alms/` in the project root.
     pub data_dir: String,
+    /// Effective project root — the directory the agent's filesystem
+    /// sandbox is rooted at (#945, the workspace v2 redesign).
+    ///
+    /// Empty string means "resolve at boot from env / current_dir". The CLI's
+    /// `--project` flag writes the absolute path here directly so the
+    /// downstream gateway sees a single source of truth. Populated by
+    /// [`apply_env_overrides`](super::AlmsConfig::apply_env_overrides) from
+    /// `ALMS_PROJECT_ROOT` when no CLI override is in play. Resolved to an
+    /// absolute path via [`Self::resolved_project_root`] before flowing into
+    /// `GatewayConfig` / `AppState`.
+    ///
+    /// Precedence at boot is:
+    /// 1. CLI `--project <path>` flag (highest — written directly into this
+    ///    field by the CLI before `serve_with_config`).
+    /// 2. `ALMS_PROJECT_ROOT` env var (handled by `apply_env_overrides`).
+    /// 3. `std::env::current_dir()` (the fallback used by
+    ///    [`Self::resolved_project_root`] when this field is empty).
+    ///
+    /// Skipped from serde so the `Default::default()` (= "" → current_dir)
+    /// behaviour is the canonical "no project root configured" state and a
+    /// hand-edited `alms.toml` cannot accidentally pin the project root to a
+    /// stale absolute path. Operators who want to override the cwd fallback
+    /// should set `ALMS_PROJECT_ROOT` or pass `--project`.
+    #[serde(skip)]
+    pub project_root: String,
     /// Bearer token for API authentication — loaded from env only
     #[serde(skip)]
     pub auth_token: Option<String>,
@@ -86,6 +111,7 @@ impl Default for ServerConfig {
         Self {
             bind: "127.0.0.1:8080".into(),
             data_dir: "./.alms".into(),
+            project_root: String::new(),
             auth_token: None,
         }
     }
@@ -111,13 +137,54 @@ impl ServerConfig {
         })
     }
 
-    /// Return the resolved path to the agent workspace directory.
+    /// Return the resolved path to the agents-metadata directory under
+    /// the project root (#945).
     ///
-    /// Precedence: `ALMS_WORKSPACE_DIR` env var > `{data_dir}/workspace`.
-    pub fn workspace_dir(&self) -> PathBuf {
-        std::env::var("ALMS_WORKSPACE_DIR")
-            .map(Into::into)
-            .unwrap_or_else(|_| Path::new(&self.data_dir).join("workspace"))
+    /// Resolution: `<project_root>/.alms/agents/`. This is the new layout
+    /// — flat, one level under `.alms/`, sibling to `alms.db`. Each agent's
+    /// `personality.md`/`goals.md`/`memories.md`/`user/` lives in
+    /// `<agents_dir>/<name>/`.
+    ///
+    /// Precedence:
+    /// 1. `ALMS_WORKSPACE_DIR` env var (legacy override — kept so operators
+    ///    can pin agent metadata to a custom location).
+    /// 2. `<project_root>/.alms/agents/` (the v2 default).
+    pub fn agents_dir(&self) -> PathBuf {
+        if let Ok(val) = std::env::var("ALMS_WORKSPACE_DIR") {
+            return PathBuf::from(val);
+        }
+        self.resolved_project_root().join(".alms").join("agents")
+    }
+
+    /// Return the resolved project root — the directory the agent's
+    /// filesystem sandbox is rooted at (#945).
+    ///
+    /// Precedence:
+    /// 1. `self.project_root` if non-empty (CLI `--project` flag, written
+    ///    directly into this field by the CLI before
+    ///    `serve_with_config`).
+    /// 2. `ALMS_PROJECT_ROOT` env var (also written into `self.project_root`
+    ///    by `AlmsConfig::apply_env_overrides`; this branch handles the case
+    ///    where the field was cleared by a fresh `Default::default()`).
+    /// 3. `std::env::current_dir()` (the fallback every default install hits).
+    /// 4. `PathBuf::from(".")` if the cwd lookup fails — same final fallback
+    ///    as [`crate::resolve_to_absolute`].
+    ///
+    /// The returned path is NOT canonicalized here; callers that need a
+    /// canonical path (the gateway's sandbox-root resolution at agent
+    /// construction time) call `std::fs::canonicalize` themselves so they
+    /// can fail-closed when the path doesn't exist (see
+    /// `AgentRuntime::new`).
+    pub fn resolved_project_root(&self) -> PathBuf {
+        if !self.project_root.is_empty() {
+            return PathBuf::from(&self.project_root);
+        }
+        if let Ok(val) = std::env::var("ALMS_PROJECT_ROOT")
+            && !val.is_empty()
+        {
+            return PathBuf::from(val);
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 }
 

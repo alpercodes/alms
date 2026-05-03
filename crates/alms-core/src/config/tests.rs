@@ -324,33 +324,112 @@ fn test_default_max_context_tokens_larger_than_max_input_tokens() {
 }
 
 #[test]
-fn test_workspace_dir_default() {
+fn test_agents_dir_default_uses_resolved_project_root() {
+    // After #945 the agent metadata directory lives under the project
+    // root rather than the data directory: `<project>/.alms/agents/`.
+    // The default `ServerConfig` resolves the project root from
+    // `current_dir()`, so the agents-dir suffix is what we pin here.
     let _lock = ENV_LOCK.lock().unwrap();
-    let _guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
+    let _ws_guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
+    let _project_guard = SingleEnvGuard::remove("ALMS_PROJECT_ROOT");
 
     let config = ServerConfig::default();
-    assert_eq!(config.workspace_dir(), PathBuf::from("./.alms/workspace"));
+    let agents = config.agents_dir();
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(agents, cwd.join(".alms").join("agents"));
 }
 
 #[test]
-fn test_workspace_dir_env_override() {
+fn test_agents_dir_legacy_workspace_env_override_still_wins() {
+    // `ALMS_WORKSPACE_DIR` is the legacy override knob; #945 keeps it as
+    // the highest-precedence agents-dir override so operators can pin
+    // metadata to a custom location even after the default layout flip.
     let _lock = ENV_LOCK.lock().unwrap();
-    let _guard = SingleEnvGuard::set("ALMS_WORKSPACE_DIR", "/custom/workspace");
+    let _ws_guard = SingleEnvGuard::set("ALMS_WORKSPACE_DIR", "/custom/workspace");
 
     let config = ServerConfig::default();
-    assert_eq!(config.workspace_dir(), PathBuf::from("/custom/workspace"));
+    assert_eq!(config.agents_dir(), PathBuf::from("/custom/workspace"));
 }
 
 #[test]
-fn test_workspace_dir_uses_data_dir() {
+fn test_project_root_precedence_explicit_field_wins() {
+    // Precedence: `self.project_root` (CLI) > env > current_dir.
+    // The CLI flag writes the absolute path into the field directly,
+    // so a non-empty field beats the env var.
     let _lock = ENV_LOCK.lock().unwrap();
-    let _guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
+    let _env_guard = SingleEnvGuard::set("ALMS_PROJECT_ROOT", "/from/env");
 
     let config = ServerConfig {
-        data_dir: "/my/data".into(),
+        project_root: "/from/cli".into(),
         ..Default::default()
     };
-    assert_eq!(config.workspace_dir(), PathBuf::from("/my/data/workspace"));
+    assert_eq!(
+        config.resolved_project_root(),
+        PathBuf::from("/from/cli"),
+        "explicit project_root field (CLI flag) must beat the env var"
+    );
+}
+
+#[test]
+fn test_project_root_precedence_env_wins_over_cwd() {
+    // No CLI override (field empty) → env var wins over `current_dir`.
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _env_guard = SingleEnvGuard::set("ALMS_PROJECT_ROOT", "/from/env");
+
+    let config = ServerConfig::default();
+    assert_eq!(
+        config.resolved_project_root(),
+        PathBuf::from("/from/env"),
+        "ALMS_PROJECT_ROOT must beat the current_dir fallback"
+    );
+}
+
+#[test]
+fn test_project_root_precedence_cwd_fallback() {
+    // No CLI override and no env var → `current_dir` fallback.
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _env_guard = SingleEnvGuard::remove("ALMS_PROJECT_ROOT");
+
+    let config = ServerConfig::default();
+    let resolved = config.resolved_project_root();
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(
+        resolved, cwd,
+        "with no CLI override and no env var, project_root falls back to current_dir"
+    );
+}
+
+#[test]
+fn test_project_root_precedence_empty_env_falls_through_to_cwd() {
+    // An explicit empty `ALMS_PROJECT_ROOT="" ` should NOT pin the project
+    // root to `""` — the resolver treats an empty env value the same as
+    // an unset variable so the cwd fallback wins. Mirrors the empty-field
+    // discipline (`if !self.project_root.is_empty()` in the resolver).
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _env_guard = SingleEnvGuard::set("ALMS_PROJECT_ROOT", "");
+
+    let config = ServerConfig::default();
+    let resolved = config.resolved_project_root();
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(resolved, cwd);
+}
+
+#[test]
+fn test_agents_dir_follows_project_root() {
+    // With no `ALMS_WORKSPACE_DIR` and an explicit project_root, the
+    // agents directory anchors at `<project_root>/.alms/agents/`.
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _ws_guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
+    let _project_guard = SingleEnvGuard::remove("ALMS_PROJECT_ROOT");
+
+    let config = ServerConfig {
+        project_root: "/my/project".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        config.agents_dir(),
+        PathBuf::from("/my/project").join(".alms").join("agents")
+    );
 }
 
 #[test]

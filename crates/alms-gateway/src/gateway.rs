@@ -33,7 +33,15 @@ pub struct GatewayConfig {
     /// Propagated as `ALMS_DATA_DIR` to shell_exec so agent CLI commands
     /// find the right database regardless of sandbox cwd.
     pub data_dir: Option<std::path::PathBuf>,
-    /// Base directory for agent workspace files (None = workspace API disabled)
+    /// Absolute path to the project root — the agent's filesystem sandbox
+    /// boundary (#945). Resolved at gateway construction time from
+    /// [`ServerConfig::resolved_project_root`]; the CLI `--project` flag
+    /// writes through to that field before this struct is built.
+    pub project_root: Option<std::path::PathBuf>,
+    /// Base directory for agent workspace files (None = workspace API
+    /// disabled). After #945 this is `<project_root>/.alms/agents/` —
+    /// flat, sibling to `alms.db` rather than nested under
+    /// `<data_dir>/workspace/`.
     pub workspace_dir: Option<std::path::PathBuf>,
     /// Explicit agent ID (None = resolve from sidecar file or generate new)
     pub agent_id: Option<AgentId>,
@@ -55,6 +63,7 @@ impl Default for GatewayConfig {
             session_config: SessionConfig::default(),
             db_path: None,
             data_dir: None,
+            project_root: None,
             workspace_dir: None,
             agent_id: None,
             auth_token: None,
@@ -119,6 +128,7 @@ impl GatewayConfig {
             },
             db_path: None,
             data_dir: None,
+            project_root: None,
             workspace_dir: None,
             agent_id: None,
             auth_token: config.server.auth_token.clone(),
@@ -128,19 +138,20 @@ impl GatewayConfig {
     }
 
     /// Build GatewayConfig from a pre-loaded AlmsConfig, applying
-    /// environment-variable overrides for db_path, workspace_dir, and
-    /// agent_id.
+    /// environment-variable overrides for db_path, workspace_dir,
+    /// project_root, and agent_id.
     ///
     /// The data directory is resolved from `config.server.data_dir` (which
     /// itself respects the `ALMS_DATA_DIR` env var). Individual paths can
     /// still be overridden with `ALMS_DB_PATH` and `ALMS_WORKSPACE_DIR`.
+    /// The project root (#945) follows its own precedence chain via
+    /// [`ServerConfig::resolved_project_root`].
     pub fn from_alms_config_with_env(config: &AlmsConfig) -> Self {
         let mut gateway_config = Self::from_alms_config(config);
 
         let data_dir = &config.server.data_dir;
 
         gateway_config.db_path = Some(config.server.db_path());
-        gateway_config.workspace_dir = Some(config.server.workspace_dir());
 
         // Ensure data dir exists before SQLite tries to open files there.
         if let Err(e) = std::fs::create_dir_all(data_dir) {
@@ -150,6 +161,25 @@ impl GatewayConfig {
         // data_dir is already resolved to an absolute path by
         // AlmsConfig::load(). Store it for shell_exec env injection.
         gateway_config.data_dir = Some(std::path::PathBuf::from(data_dir));
+
+        // Resolve the project root (#945) and ensure it exists. This is the
+        // single source of truth for the agent's filesystem-sandbox
+        // boundary in v2 — fs_*, shell, fs_grep, fs_glob all share it.
+        let project_root = config.server.resolved_project_root();
+        if let Err(e) = std::fs::create_dir_all(&project_root) {
+            tracing::warn!(
+                "Could not create project root {}: {}",
+                project_root.display(),
+                e
+            );
+        }
+        gateway_config.project_root = Some(project_root);
+
+        // Agent metadata directory (#945): `<project_root>/.alms/agents/`.
+        // Workspace files for each agent live in `<agents_dir>/<name>/`,
+        // flat and sibling to `alms.db` instead of nested under the data
+        // directory.
+        gateway_config.workspace_dir = Some(config.server.agents_dir());
 
         gateway_config.agent_id = Some(resolve_default_agent_id(Path::new(data_dir)));
 
@@ -630,6 +660,14 @@ impl Gateway {
                             runtime = runtime.with_shell_default_env(shell_env);
                         }
                     }
+                    // Pin the agent's sandbox at the project root (#945).
+                    // Mirror the HTTP path so Telegram-triggered runs see
+                    // the same single-root model. Must precede
+                    // `with_workspace` so the project-root re-registration
+                    // of fs_* / shell happens before workspace attachment.
+                    if let Some(project_root) = self.config.project_root.clone() {
+                        runtime = runtime.with_project_root(project_root);
+                    }
                     // Attach workspace so agent personality/goals/memories
                     // are prepended to the system prompt (same as HTTP path).
                     if let Some(ws_dir) = &self.config.workspace_dir {
@@ -719,7 +757,14 @@ impl Gateway {
         self.config.data_dir.as_deref()
     }
 
-    /// Get workspace base directory (None = workspace API disabled)
+    /// Get the absolute path to the project root (#945) — the agent's
+    /// filesystem sandbox boundary.
+    pub fn project_root(&self) -> Option<&std::path::Path> {
+        self.config.project_root.as_deref()
+    }
+
+    /// Get workspace base directory (None = workspace API disabled).
+    /// After #945 this is `<project_root>/.alms/agents/`.
     pub fn workspace_dir(&self) -> Option<&std::path::Path> {
         self.config.workspace_dir.as_deref()
     }

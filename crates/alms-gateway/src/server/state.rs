@@ -21,11 +21,17 @@ pub struct AppState {
     pub gateway: Arc<tokio::sync::Mutex<Gateway>>,
     pub run_manager: RunManager,
     pub approval_store: ApprovalStore,
-    /// Base directory for agent workspace files (None = workspace API disabled)
+    /// Base directory for agent workspace files (None = workspace API
+    /// disabled). After #945 this is `<project_root>/.alms/agents/`.
     pub workspace_dir: Option<std::path::PathBuf>,
     /// Absolute path to the gateway's data directory. Propagated to shell_exec
     /// as `ALMS_DATA_DIR` so CLI commands invoked by agents find the right DB.
     pub data_dir: std::path::PathBuf,
+    /// Absolute path to the project root (#945) — the agent's filesystem
+    /// sandbox boundary. Resolved once at gateway start with precedence
+    /// CLI `--project` > `ALMS_PROJECT_ROOT` > `current_dir()`. Both
+    /// `fs_*` and `shell` tools enforce against this single root.
+    pub project_root: std::path::PathBuf,
     /// Job store for scheduled jobs
     pub job_store: Arc<JobStore>,
     /// Scheduler for firing jobs at the right time
@@ -83,6 +89,17 @@ impl AppState {
                 std::env::current_dir()
                     .map(|cwd| cwd.join(".alms"))
                     .unwrap_or_else(|_| std::path::PathBuf::from("./.alms"))
+            });
+        // Project root (#945): the agent's filesystem-sandbox boundary.
+        // The gateway always populates this in production
+        // (`from_alms_config_with_env`); fall back to cwd for in-process
+        // tests that build a `GatewayConfig` directly without the env
+        // resolver. Mirrors `data_dir`'s defensive fallback above.
+        let project_root = gateway
+            .project_root()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
         let session_manager = gateway.session_manager().clone();
         let llm = gateway.llm().clone();
@@ -162,6 +179,12 @@ impl AppState {
             coord = coord.with_workspace_dir(ws_dir.clone());
         }
         coord = coord.with_data_dir(data_dir.clone());
+        // Plumb the project root (#945) into the coordinator so subagents
+        // inherit the parent's filesystem-sandbox boundary. Without this,
+        // subagents fall through to whatever sandbox their `AgentConfig`
+        // resolves at construction time, which after #945 would break the
+        // single-root invariant.
+        coord = coord.with_project_root(project_root.clone());
 
         // Share the Gateway's secrets store so runtime key changes are visible
         // to both HTTP handlers and the Telegram message loop.
@@ -208,6 +231,7 @@ impl AppState {
             approval_store: ApprovalStore::new(),
             workspace_dir,
             data_dir,
+            project_root,
             job_store,
             scheduler,
             coordinator,

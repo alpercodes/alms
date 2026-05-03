@@ -88,10 +88,18 @@ impl AlmsConfig {
         config.apply_env_overrides();
 
         // Resolve data_dir to an absolute path so that downstream consumers
-        // (db_path(), workspace_dir(), shell_exec env) never interpret it
+        // (db_path(), agents_dir(), shell_exec env) never interpret it
         // relative to a changed cwd. This is the canonical fix for issue #300
         // (stray data/alms.db inside agent workspace directories).
         config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
+
+        // Resolve project_root (#945) only when explicitly configured. An
+        // empty value defers resolution to runtime so a fresh `Default` does
+        // not silently pin a stale cwd into the config.
+        if !config.server.project_root.is_empty() {
+            config.server.project_root =
+                crate::resolve_to_absolute(Path::new(&config.server.project_root));
+        }
 
         // Check for legacy ./data directory and warn about migration.
         config.warn_legacy_data_dir();
@@ -207,6 +215,15 @@ impl AlmsConfig {
         config.llm.ensure_builtin_providers();
         config.apply_env_overrides();
         config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
+        // Resolve project_root (#945) only when the field is non-empty —
+        // an empty value means "fall back to current_dir at the moment a
+        // gateway / runtime asks". Pre-resolving an empty value here would
+        // pin a stale cwd onto the config, which is exactly the behaviour
+        // we want `resolved_project_root()` to side-step.
+        if !config.server.project_root.is_empty() {
+            config.server.project_root =
+                crate::resolve_to_absolute(Path::new(&config.server.project_root));
+        }
         config.warn_legacy_data_dir();
         config.context.normalize_episodic();
 
@@ -306,6 +323,14 @@ impl AlmsConfig {
         }
         if let Ok(data_dir) = std::env::var("ALMS_DATA_DIR") {
             self.server.data_dir = data_dir;
+        }
+        // Project root (#945) — the workspace v2 sandbox boundary.
+        // Stored as the raw string here; the gateway resolves it to an
+        // absolute path via `ServerConfig::resolved_project_root`. CLI
+        // `--project <path>` overrides by writing into this same field
+        // before `serve_with_config` runs.
+        if let Ok(project_root) = std::env::var("ALMS_PROJECT_ROOT") {
+            self.server.project_root = project_root;
         }
         if let Ok(token) = std::env::var("ALMS_AUTH_TOKEN") {
             self.server.auth_token = Some(token);

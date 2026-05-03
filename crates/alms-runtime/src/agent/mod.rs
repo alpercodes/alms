@@ -189,11 +189,105 @@ impl AgentRuntime {
         Ok(runtime)
     }
 
+    /// Set the project root — the agent's filesystem sandbox boundary
+    /// (#945, the workspace v2 redesign).
+    ///
+    /// This re-registers `fs_read`, `fs_write`, `fs_list`, `fs_edit`,
+    /// `fs_grep`, `fs_glob`, and `shell` (plus its `shell_exec` alias) so
+    /// every file-touching tool enforces against the same single root.
+    /// `shell`'s persistent cwd is also rooted at `project_root` so the
+    /// agent's mental model is "I am working on the project."
+    ///
+    /// Sibling-workspace reads (#242) keep working without an extras list
+    /// here: every agent's metadata lives at
+    /// `<project_root>/.alms/agents/<name>/`, which is naturally inside
+    /// the project-root sandbox, so `fs_read('.alms/agents/<sibling>/personality.md')`
+    /// resolves under the primary root by construction. The
+    /// `extra_fs_read_roots` accumulator still threads through for
+    /// per-run spill directories (`with_shell_spill`,
+    /// `with_tool_output_truncate`) so the gateway can wire those *before*
+    /// `with_project_root` and the read-family tools pick them up here.
+    ///
+    /// Canonicalises the path so Windows `\\?\` prefix mismatches do not
+    /// trip `check_sandbox_path`'s `starts_with` comparison. Falls back to
+    /// the as-is path with a warning if canonicalisation fails — same
+    /// fail-soft behaviour `with_workspace` used pre-#945.
+    pub fn with_project_root(mut self, project_root: std::path::PathBuf) -> Self {
+        // Make sure the directory exists before canonicalising — the
+        // gateway already calls `create_dir_all` on the project root, but
+        // unit-test paths sometimes pass a tempdir-relative subpath.
+        if let Err(e) = std::fs::create_dir_all(&project_root) {
+            warn!(
+                error = %e,
+                project_root = %project_root.display(),
+                "Failed to create project root — fs tools may not work correctly"
+            );
+        }
+
+        let canonical_root = match std::fs::canonicalize(&project_root) {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    project_root = %project_root.display(),
+                    "Cannot canonicalize project root — using as-is"
+                );
+                project_root.clone()
+            }
+        };
+
+        self.resolved_sandbox_root = Some(canonical_root.clone());
+
+        // Re-register fs_* tools with the project root as the single
+        // primary sandbox root. Per-run spill dirs threaded through
+        // `extra_fs_read_roots` come along for the ride via
+        // `compose_fs_extra_read_roots`.
+        let extras = self.compose_fs_extra_read_roots(&[]);
+        self.register_fs_tools(Some(canonical_root.clone()), &extras);
+
+        // Re-register shell with the project root as both sandbox root
+        // and default cwd. The tool is registered under both "shell"
+        // (primary) and "shell_exec" (alias).
+        let enabled = &self.config.enabled_tools;
+        let shell_enabled =
+            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
+        if shell_enabled {
+            let mut shell_tool = alms_sandbox::ShellTool::with_policy(
+                Some(canonical_root.clone()),
+                self.shell_unrestricted,
+            )
+            .with_default_cwd(canonical_root)
+            .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone());
+            if !self.shell_default_env.is_empty() {
+                shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
+            }
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
+        }
+
+        self
+    }
+
     /// Attach an agent workspace for persistent identity files.
     ///
-    /// Also registers the `workspace_write` tool so the agent can update
-    /// its `goals.md` and `memories.md` during runs, and re-registers
-    /// the shell tool with the workspace directory as default cwd.
+    /// Registers the `workspace_write` tool so the agent can update its
+    /// `personality.md` / `goals.md` / `memories.md` / `user.md` during
+    /// runs. Ensures the workspace directory exists.
+    ///
+    /// Pre-#945 this method also re-targeted the filesystem sandbox at
+    /// the workspace dir; v2 collapses the two-root model so the
+    /// project-root sandbox set by [`Self::with_project_root`] is the
+    /// single source of truth and `with_workspace` no longer touches
+    /// sandbox paths or default cwds. The agent's metadata lives at
+    /// `<project_root>/.alms/agents/<name>/` — naturally inside the
+    /// project-root sandbox — so the previous parent-dir
+    /// `extra_read_roots` shim for sibling reads (#242) is also gone:
+    /// `fs_read('.alms/agents/<sibling>/personality.md')` resolves
+    /// directly under the primary root.
     ///
     /// **Note**: `workspace_write` registration goes through `ToolRegistry::register()`,
     /// which checks the `enabled_filter`. If the operator has set `tools.enabled`
@@ -205,89 +299,15 @@ impl AgentRuntime {
         // Subject to enabled_filter — see doc comment above.
         self.tools.register(std::sync::Arc::new(tool));
 
-        // Ensure the workspace directory exists before canonicalizing.
-        // Without this, canonicalize() fails on non-existent paths and the
-        // sandbox root falls back to a relative path — causing
-        // starts_with() mismatches on Windows (\\?\ prefix vs relative)
-        // and potential hangs in fs_write (see #273).
+        // Ensure the workspace directory exists so `workspace_write` and
+        // `read_file` calls don't trip on a missing directory. Failure is
+        // non-fatal — the tool surfaces the IO error on first use.
         if let Err(e) = workspace.ensure_dir() {
             warn!(
                 error = %e,
                 workspace_dir = %workspace.dir().display(),
-                "Failed to create workspace directory — fs tools may not work correctly"
+                "Failed to create workspace directory — workspace tools may fail at runtime"
             );
-        }
-
-        // Canonicalize the workspace path so the sandbox root is always
-        // absolute. This prevents Windows \\?\ prefix mismatches when
-        // check_sandbox_path compares the sandbox root against resolved
-        // file paths.
-        let ws_root = match std::fs::canonicalize(workspace.dir()) {
-            Ok(canonical) => canonical,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    workspace_dir = %workspace.dir().display(),
-                    "Cannot canonicalize workspace dir — using as-is"
-                );
-                workspace.dir().to_path_buf()
-            }
-        };
-
-        // Parent directory of the workspace (e.g. `{workspace_dir}/`), which
-        // contains every named agent's workspace as a sibling subdirectory.
-        // Granting read-only access here lets a parent agent read a
-        // subagent's `memories.md`/`personality.md`/etc. without being able
-        // to modify them (see #242).  Writes remain gated by the primary
-        // sandbox root (`ws_root`) so agents still can't touch another
-        // agent's files.
-        //
-        // `ws_root` was canonicalized above, so `ws_root.parent()` is also
-        // canonical on all supported platforms — no further canonicalize
-        // call is needed.  If the parent can't be taken (workspace sits at
-        // a filesystem root), we fall back to an empty extras list so
-        // behaviour is unchanged.
-        //
-        // The per-run shell-spill (#756) and tool-output-truncate (#851)
-        // directories are picked up from `self.extra_fs_read_roots` below —
-        // any builder method that introduces a new spill dir pushes it onto
-        // that accumulator so the read-family fs_* tools always see every
-        // active spill root regardless of the order in which the builder
-        // methods were called. See the field doc on
-        // [`AgentRuntime::extra_fs_read_roots`] for the rationale (#921 fix).
-        let parent_root: Vec<std::path::PathBuf> = match ws_root.parent() {
-            Some(parent) => vec![parent.to_path_buf()],
-            None => Vec::new(),
-        };
-
-        // Re-register fs_* tools with workspace as primary sandbox root and
-        // sibling-workspaces + accumulated spill dirs as extra read roots.
-        let extras = self.compose_fs_extra_read_roots(&parent_root);
-        self.register_fs_tools(Some(ws_root.clone()), &extras);
-
-        // Re-register shell tool with workspace dir as default cwd and
-        // gateway-provided default env vars (ALMS_DATA_DIR, etc.).
-        // The tool is registered under both "shell" (primary) and "shell_exec" (alias).
-        let enabled = &self.config.enabled_tools;
-        let shell_enabled =
-            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
-        if shell_enabled {
-            let mut shell_tool = alms_sandbox::ShellTool::with_policy(
-                self.resolved_sandbox_root.clone(),
-                self.shell_unrestricted,
-            )
-            .with_default_cwd(ws_root)
-            .with_permissions(&self.shell_permissions)
-            .with_classification_mode(self.shell_classification_mode)
-            .with_spill_policy(self.shell_spill_policy.clone());
-            if !self.shell_default_env.is_empty() {
-                shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
-            }
-            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
-            self.tools.register(std::sync::Arc::clone(&tool_arc));
-            // Also register under legacy alias for backward compatibility
-            self.tools
-                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
         }
 
         self.workspace = Some(workspace);

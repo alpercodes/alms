@@ -1018,8 +1018,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // Wire the shared in-loop tool-output truncation policy (issue #851).
     // Mirrors `with_shell_spill` above — same lifecycle, same retention
     // model, same fs_* read-root widening, but applied to *every* tool's
-    // output (not just shell). Must come before `with_workspace` so the
-    // per-run spill dir is included in the agent's extra_read_roots.
+    // output (not just shell). Must come before `with_project_root` so
+    // the per-run spill dir is included in the agent's extra_read_roots.
     {
         let trunc_cfg = state.tools_config.read().tool_output_truncate.clone();
         let run_dir = state
@@ -1034,7 +1034,20 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         );
     }
 
-    // Attach workspace if configured — registers the workspace_write tool for this run
+    // Pin the agent's filesystem-sandbox boundary at the project root
+    // (#945). After this call `fs_*` and `shell` enforce against the same
+    // root and the shell's persistent cwd defaults to the project root —
+    // the workspace v2 single-root model. Must come AFTER the spill /
+    // tool-output-truncate builders so the accumulated `extra_fs_read_roots`
+    // are reflected in the read-family fs_* tool registrations.
+    runtime = runtime.with_project_root(state.project_root.clone());
+
+    // Attach workspace if configured — registers the workspace_write tool for this run.
+    // After #945 this no longer changes the sandbox root or default cwd —
+    // it only ensures the agent's metadata directory exists and binds the
+    // `workspace_write` tool. The metadata lives at
+    // `<project_root>/.alms/agents/<name>/`, naturally inside the
+    // project-root sandbox.
     if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
         let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);
         runtime = runtime.with_workspace(workspace);
