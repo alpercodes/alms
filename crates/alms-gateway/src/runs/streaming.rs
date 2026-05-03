@@ -1,9 +1,9 @@
-//! SSE event streaming — per-run and per-session event streams.
+//! SSE event streaming — per-run, per-session, and per-agent event streams.
 
 use crate::api_error;
 use crate::server::AppState;
 use crate::sse::{RunEventStream, SseEventData, event_channel};
-use alms_core::{RunId, RunStatus, SessionId};
+use alms_core::{AgentId, RunId, RunStatus, SessionId};
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -211,6 +211,104 @@ pub async fn stream_session_events(
             "Replaying {} session events for {}",
             replay_events.len(),
             session_id.0
+        );
+    }
+
+    Ok(RunEventStream::stream_with_replay(rx, replay_events).into_response())
+}
+
+/// GET /agents/{agent_id}/events — agent-scoped SSE feed (#856).
+///
+/// Currently carries `session_activity_started` / `session_activity_ended`
+/// events for runs belonging to the given agent, across **all** sessions
+/// (regular chat, jobs, notifications, DMs). Backs the web UI's session
+/// sidebar so it can light up the "active" indicator on any session —
+/// not just the currently-viewed one. Future per-agent events (e.g. DM
+/// activity in #886) will share this same feed.
+///
+/// Filtering is performed by the broadcast layer
+/// (`RunManager::send_agent_event`): each agent gets its own sender map
+/// entry, so subscribers to one agent's feed never see events for any
+/// other agent.
+///
+/// Supports `Last-Event-Id` header for browser auto-reconnect plus
+/// `?last_event_id=<n>` query parameter for the initial connection.
+/// IDs are scoped to the agent's event log (separate counter from the
+/// per-run / per-session logs).
+///
+/// Returns `404 NOT_FOUND` when the `agent_id` does not resolve to a
+/// known agent in the registry (#887). The check happens **before** any
+/// sender is registered, so unknown-agent connections never insert an
+/// orphan entry into the in-memory `agent_senders` map. Without this
+/// guard, a misbehaving client could slowly grow that map by repeatedly
+/// connecting with random UUIDs — the entries are only pruned on
+/// `send_agent_event` fanout, which never fires for an agent that never
+/// emits, so disconnected senders accumulate until process restart.
+///
+/// When no SQLite store is configured (test fixtures or store-less
+/// deployments), agent existence cannot be verified and the request is
+/// allowed through. In that mode the registry concept does not exist,
+/// so there is no "unknown agent" to leak against.
+#[instrument(level = "info", skip(state, headers, query), fields(agent_id = %agent_id.0))]
+pub async fn stream_agent_events(
+    State(state): State<AppState>,
+    Path(agent_id): Path<AgentId>,
+    headers: HeaderMap,
+    Query(query): Query<SessionEventsQuery>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    // Validate the agent exists *before* registering a sender so
+    // unknown-agent UUIDs never insert orphan entries into
+    // `agent_senders` (#887). When no store is configured (test
+    // fixtures), skip the check and proceed.
+    if let Some(store) = state.session_manager.store() {
+        match store.load_agent_by_id(agent_id) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Err(api_error(
+                    StatusCode::NOT_FOUND,
+                    "NOT_FOUND",
+                    format!("Agent not found: {}", agent_id.0),
+                ));
+            }
+            Err(e) => {
+                return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e));
+            }
+        }
+    }
+
+    // Query parameter takes precedence over header (the header is only
+    // sent by the browser on automatic reconnects).
+    let last_event_id = query
+        .last_event_id
+        .as_deref()
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| {
+            headers
+                .get("last-event-id")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+        });
+    let from_id = last_event_id.map(|id| id + 1).unwrap_or(0);
+
+    let (tx, rx) = event_channel();
+    state.run_manager.register_agent_sender(agent_id, tx);
+
+    let logged_events = state.run_manager.agent_events_from(agent_id, from_id).await;
+    let replay_events: Vec<SseEventData> = logged_events
+        .into_iter()
+        .map(|e| SseEventData {
+            event_type: e.event_type,
+            data: e.data,
+            ts: e.ts,
+            event_id: Some(e.event_id),
+        })
+        .collect();
+
+    if !replay_events.is_empty() {
+        info!(
+            "Replaying {} agent-scoped events for agent {}",
+            replay_events.len(),
+            agent_id.0
         );
     }
 

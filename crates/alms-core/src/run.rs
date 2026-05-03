@@ -1,9 +1,111 @@
 //! Run types and status for ALMS
 
-use crate::{AgentId, SessionId, job::JobId};
+use crate::{AgentId, SessionId, config::ReasoningEffort, job::JobId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// Snapshot of the **fully layered** configuration that a run committed to
+/// at start-time (#837).
+///
+/// The gateway's two-layer precedence chain (per-agent > server default)
+/// is implemented in
+/// [`alms-gateway::runs::lifecycle`](../../../alms-gateway/src/runs/lifecycle.rs)
+/// and the values resolved there are the ones the LLM adapter actually
+/// uses on the wire. Persisting them here makes "I set model X but Y was
+/// used" reports falsifiable from stored data alone — operators no longer
+/// need to correlate the original PATCH request, the registry state at
+/// run-start, and the server config at run-start across log files that may
+/// have rotated out.
+///
+/// Per-run overrides were removed in the #941 pivot — agents are now the
+/// single per-tenant config surface. Operators change agent config via
+/// `PATCH /agents/{id}` (or server defaults via `PATCH /settings`) before
+/// starting a run, never per-run.
+///
+/// All fields snapshot the **effective** value: the post-layering result,
+/// not the raw per-run override. `provider` and `model` come from the
+/// resolved [`crate::AgentConfig`]'s LLM client (`provider()` /
+/// `default_model()`); the remaining fields come from the resolved
+/// [`crate::AgentConfig`] itself.
+///
+/// Serialized with `skip_serializing_if = "Option::is_none"` on the
+/// optional reasoning / thinking fields so a snapshot that didn't engage
+/// (e.g. a Gemini-only field on an Anthropic run) stays absent on the
+/// wire rather than emitting `null`.
+///
+/// **Per-knob shape asymmetry (intentional).** The three reasoning /
+/// thinking-budget fields below carry deliberately different shapes:
+/// - `thinking_budget_tokens` (Anthropic) — `u32`, never absent on the wire.
+/// - `reasoning_effort` (OpenAI-compat) — `Option<ReasoningEffort>`,
+///   skip-serialized when `None`.
+/// - `gemini_thinking_budget` (Gemini) — `Option<u32>`, skip-serialized
+///   when `None`.
+///
+/// Each field mirrors its underlying [`alms_runtime::AgentConfig`] shape
+/// (`anthropic_thinking_budget: u32`, `openai_reasoning_effort:
+/// Option<ReasoningEffort>`, `gemini_thinking_budget: Option<u32>`), so
+/// the snapshot is a faithful projection of what the LLM adapter saw — not
+/// a uniformized re-statement. A future reader who tries to "fix" the
+/// asymmetry by promoting Anthropic to `Option<u32>` would lose information:
+/// at the merged-`AgentConfig` layer Anthropic has no `None`-vs-`Some(0)`
+/// semantic — `0` is the genuine "disabled" value — whereas Gemini
+/// distinguishes `None` (inherit from server default) from `Some(0)`
+/// (explicit per-layer disable). For the Anthropic case the snapshot
+/// collapses two distinct origins (`server default of 0` vs `explicit
+/// per-layer Some(0)`) into the same `0`. That's a known triage
+/// limitation of the snapshot, not a bug to "uniformize" away — the
+/// snapshot's job is to record the merged `AgentConfig` value the
+/// adapter committed to (the input to its wire-shape decision), not the
+/// literal wire bytes. (The Anthropic adapter, for example, omits the
+/// `thinking` block entirely when the budget is `0` — so a literal-wire
+/// reading of the snapshot would have no field to record. Recording the
+/// merged value preserves the operator-visible "I asked for 0" answer.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedRunConfig {
+    /// Effective LLM provider (`"openai"`, `"anthropic"`, `"openrouter"`,
+    /// `"gemini"`, ...). Read from the resolved `LlmClient::provider()`.
+    pub provider: String,
+    /// Effective model slug. Read from the resolved
+    /// `LlmClient::default_model()` after per-agent / server-default
+    /// layering and any `apply_provider`-driven model rewrites have settled.
+    /// May be empty when a per-agent provider switch with no per-agent
+    /// model and no provider-entry model triggered the #860 leak guard —
+    /// the empty string is preserved here so triage can confirm the fail-fast
+    /// path actually engaged.
+    pub model: String,
+    /// Effective `max_tokens` cap — the value the adapter sends as the
+    /// `max_tokens` field on the request body.
+    pub max_tokens: u32,
+    /// Effective execution posture: `"full_control"`, `"guarded"`, or
+    /// `"autonomous"`. Stored as a string for wire stability — matches the
+    /// shape of [`CreateRunRequest::posture`] and survives potential future
+    /// posture additions without breaking older clients.
+    pub posture: String,
+    /// Effective `debug_mode` flag. Reflects the value the runtime actually
+    /// uses, including the system-triggered notification-run flip
+    /// (#546) — i.e. the post-flip, post-bootstrap value, not the raw
+    /// per-run override.
+    pub debug_mode: bool,
+    /// Effective Anthropic extended-thinking budget in tokens (#767).
+    /// `0` means extended thinking is disabled for this run; non-zero is
+    /// the budget the adapter sent on the wire. Persisted as a `u32`
+    /// (matching [`crate::AgentConfig::anthropic_thinking_budget`]'s
+    /// shape) rather than `Option<u32>` because `0` is a meaningful
+    /// state, not absence.
+    pub thinking_budget_tokens: u32,
+    /// Effective OpenAI-compat reasoning effort (#768). `None` means the
+    /// adapter did not send `reasoning_effort` on the wire (either the
+    /// effective provider isn't OpenAI-compatible, the model isn't a
+    /// reasoning model, or no value was configured at any layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Effective Gemini extended-thinking budget in tokens (#794). `None`
+    /// or `Some(0)` means extended thinking is disabled; non-zero is the
+    /// budget the adapter sent on the wire as `thinkingConfig.thinkingBudget`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gemini_thinking_budget: Option<u32>,
+}
 
 /// Accumulated token usage for a run.
 ///
@@ -176,6 +278,13 @@ pub struct Run {
     /// Set when this run is a subagent execution spawned by another run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<RunId>,
+    /// Snapshot of the layered config (per-agent > server default) the run
+    /// committed to at start-time (#837). `None` for runs created before
+    /// the snapshot was wired up (old SQLite rows) or for runs that never
+    /// advanced past the queued state. Populated once at the transition
+    /// from `Queued` to `Running` and never mutated afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_config: Option<ResolvedRunConfig>,
 }
 
 impl Run {
@@ -194,6 +303,7 @@ impl Run {
             ended_at: None,
             job_id: None,
             parent_run_id: None,
+            resolved_config: None,
         }
     }
 
@@ -223,6 +333,17 @@ impl Run {
         self.started_at = Some(Utc::now());
     }
 
+    /// Attach the layered config snapshot (#837).
+    ///
+    /// Called at the `Queued` → `Running` transition by the gateway after
+    /// per-agent and server-default config has been merged and any
+    /// system-triggered notification-run debug-flip has settled.
+    /// Idempotent over-writes are allowed but only the first call should
+    /// occur in practice.
+    pub fn set_resolved_config(&mut self, config: ResolvedRunConfig) {
+        self.resolved_config = Some(config);
+    }
+
     pub fn mark_completed(&mut self, output: String, usage: TokenUsage) {
         self.status = RunStatus::Completed;
         self.output = Some(output);
@@ -242,7 +363,14 @@ impl Run {
     }
 }
 
-/// Request to create a run
+/// Request to create a run.
+///
+/// Per-run config overrides were removed in the #941 pivot. The agent
+/// is now the single per-tenant config surface — operators set
+/// model/provider/posture/budgets via `PATCH /agents/{id}` before starting
+/// the run. Stale per-run override fields sent by older clients are
+/// silently ignored on the wire (no `#[serde(deny_unknown_fields)]`) so
+/// in-flight UI bundles on stale builds keep working with no migration.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateRunRequest {
     pub session_id: SessionId,
@@ -254,50 +382,6 @@ pub struct CreateRunRequest {
     #[serde(default)]
     pub agent_id: Option<AgentId>,
     pub input: RunInput,
-    /// Optional model override — uses server default when absent.
-    #[serde(default)]
-    pub model: Option<String>,
-    /// Optional max_tokens override.
-    #[serde(default)]
-    pub max_tokens: Option<u32>,
-    /// Optional posture override: "full_control" | "guarded" | "autonomous".
-    #[serde(default)]
-    pub posture: Option<String>,
-    /// Optional provider override: "openai" | "anthropic" | "openrouter".
-    #[serde(default)]
-    pub provider: Option<String>,
-    /// When true, the runtime emits a `context_debug` SSE event with the
-    /// full assembled context window before calling the LLM. Used by the
-    /// web UI to inspect exactly what the LLM sees.
-    #[serde(default)]
-    pub debug_mode: Option<bool>,
-    /// Optional per-run Anthropic extended-thinking budget override.
-    ///
-    /// `Some(0)` explicitly disables extended thinking for just this run
-    /// even when per-agent or server config would enable it. Omitting the
-    /// field falls through to the per-agent override (or server default).
-    /// Silently ignored when the effective provider is not Anthropic.
-    #[serde(default)]
-    pub thinking_budget_tokens: Option<u32>,
-    /// Optional per-run OpenAI-compat reasoning-effort override (#768).
-    ///
-    /// Three-layer precedence: per-run > per-agent > server default from
-    /// `[llm.openai].reasoning_effort`. Silently ignored when the effective
-    /// provider is not OpenAI-compatible or the model isn't a reasoning
-    /// model.
-    #[serde(default)]
-    pub reasoning_effort: Option<crate::config::ReasoningEffort>,
-    /// Optional per-run Gemini extended-thinking budget override (#794).
-    ///
-    /// `Some(0)` explicitly disables extended thinking for just this run
-    /// even when per-agent or server config would enable it. Omitting the
-    /// field falls through to the per-agent override (or server default).
-    /// Silently ignored when the effective provider is not Gemini.
-    ///
-    /// Three-layer precedence: per-run > per-agent > server default from
-    /// `[llm.gemini].thinking_budget`.
-    #[serde(default)]
-    pub gemini_thinking_budget: Option<u32>,
 }
 
 /// Input to a run
@@ -341,6 +425,25 @@ pub struct RunStatusResponse {
     /// Number of tool call records stored for this run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_count: Option<u32>,
+    /// 1-indexed queue position when the run is `Queued` (#831).
+    ///
+    /// `Some(N)` means there are still N runs ahead of this one in the
+    /// per-agent queue (matching the same semantic as
+    /// `run_created.queued_behind` and `run_queue_position.position` SSE
+    /// events). `None` means the run is not currently queued (running,
+    /// completed, failed, cancelled, or queue lookup not available — for
+    /// example the bare `From<Run>` conversion which does not know about
+    /// the live queue depth).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_position: Option<usize>,
+    /// Snapshot of the fully layered config the run committed to at
+    /// start-time (#837). `None` when the run is still queued or was
+    /// created before the snapshot was wired up (old SQLite rows).
+    /// Surfaced here so `GET /runs/{id}` is a one-shot triage source for
+    /// "I set model X but Y was used"-class reports without log
+    /// correlation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_config: Option<ResolvedRunConfig>,
 }
 
 impl From<Run> for RunStatusResponse {
@@ -361,6 +464,8 @@ impl From<Run> for RunStatusResponse {
             job_id: run.job_id,
             parent_run_id: run.parent_run_id,
             tool_call_count: None,
+            queue_position: None,
+            resolved_config: run.resolved_config,
         }
     }
 }
@@ -685,6 +790,170 @@ mod tests {
             !ran_ignore_message_successfully(&records),
             "ignore_message that returned an error should not count as successful"
         );
+    }
+
+    /// `Run` with no `resolved_config` (the default for newly-constructed
+    /// runs and for old SQLite rows hydrated by callers that have not
+    /// migrated yet) must serialize **without** the `resolved_config`
+    /// field — not as `"resolved_config": null`. Pinned here so the
+    /// `RunStatusResponse` and SSE wire shapes stay backward-compatible
+    /// for clients that don't know about #837 yet.
+    #[test]
+    fn test_run_serializes_without_resolved_config_when_none() {
+        let run = Run::new(SessionId::new(), AgentId::new(), "hello".into());
+        assert!(run.resolved_config.is_none());
+        let value = serde_json::to_value(&run).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(
+            obj.get("resolved_config").is_none(),
+            "resolved_config must be skipped when None — got {value}"
+        );
+    }
+
+    /// Same wire-compat invariant for `RunStatusResponse`: a queued run
+    /// (or any run that never advanced past `Queued`) must surface as
+    /// `resolved_config` absent, not `null`. Triage clients learn the
+    /// run is missing a snapshot from the field's absence.
+    #[test]
+    fn test_run_status_response_skips_resolved_config_when_none() {
+        let run = Run::new(SessionId::new(), AgentId::new(), "hello".into());
+        let resp: RunStatusResponse = run.into();
+        assert!(resp.resolved_config.is_none());
+        let value = serde_json::to_value(&resp).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(
+            obj.get("resolved_config").is_none(),
+            "resolved_config must be skipped when None"
+        );
+    }
+
+    /// Symmetric to the `None` case above: a `Run` carrying a populated
+    /// `resolved_config` must propagate the snapshot through the
+    /// `From<Run> for RunStatusResponse` conversion **and** surface it
+    /// on the wire under the field names the issue specifies. Pinned so
+    /// the trivial direct field assignment in `From<Run>` doesn't
+    /// silently break the `GET /runs/{id}` triage surface — the whole
+    /// point of #837 is that operators can read the snapshot off this
+    /// endpoint without log correlation.
+    #[test]
+    fn test_run_status_response_propagates_resolved_config_when_some() {
+        let mut run = Run::new(SessionId::new(), AgentId::new(), "hello".into());
+        let snapshot = ResolvedRunConfig {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            max_tokens: 4096,
+            posture: "guarded".into(),
+            debug_mode: false,
+            thinking_budget_tokens: 2048,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+        };
+        run.set_resolved_config(snapshot.clone());
+
+        let resp: RunStatusResponse = run.into();
+        assert_eq!(
+            resp.resolved_config.as_ref(),
+            Some(&snapshot),
+            "From<Run> must propagate the populated snapshot verbatim"
+        );
+
+        // Wire shape: nested object under `resolved_config` with the
+        // issue-specified field names.
+        let value = serde_json::to_value(&resp).unwrap();
+        let cfg = value
+            .get("resolved_config")
+            .and_then(|v| v.as_object())
+            .expect("resolved_config must be present as an object on the wire");
+        assert_eq!(
+            cfg.get("provider").and_then(|v| v.as_str()),
+            Some("anthropic")
+        );
+        assert_eq!(
+            cfg.get("model").and_then(|v| v.as_str()),
+            Some("claude-sonnet-4-20250514")
+        );
+        assert_eq!(cfg.get("max_tokens").and_then(|v| v.as_u64()), Some(4096));
+        assert_eq!(cfg.get("posture").and_then(|v| v.as_str()), Some("guarded"));
+        assert_eq!(cfg.get("debug_mode").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            cfg.get("thinking_budget_tokens").and_then(|v| v.as_u64()),
+            Some(2048)
+        );
+        // Optional reasoning fields stay absent on the wire when None,
+        // matching the per-field `skip_serializing_if` contract pinned
+        // by `test_resolved_run_config_serde_roundtrip_minimal`.
+        assert!(cfg.get("reasoning_effort").is_none());
+        assert!(cfg.get("gemini_thinking_budget").is_none());
+    }
+
+    /// A populated `ResolvedRunConfig` round-trips through serde with
+    /// the field names the issue specifies, and optional fields stay
+    /// absent when `None`.
+    #[test]
+    fn test_resolved_run_config_serde_roundtrip_minimal() {
+        let cfg = ResolvedRunConfig {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            max_tokens: 4096,
+            posture: "guarded".into(),
+            debug_mode: false,
+            thinking_budget_tokens: 0,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+        };
+        let value = serde_json::to_value(&cfg).unwrap();
+        let obj = value.as_object().unwrap();
+        // Required fields present with the issue's wire names.
+        assert_eq!(
+            obj.get("provider").and_then(|v| v.as_str()),
+            Some("anthropic")
+        );
+        assert_eq!(
+            obj.get("model").and_then(|v| v.as_str()),
+            Some("claude-sonnet-4-20250514")
+        );
+        assert_eq!(obj.get("max_tokens").and_then(|v| v.as_u64()), Some(4096));
+        assert_eq!(obj.get("posture").and_then(|v| v.as_str()), Some("guarded"));
+        assert_eq!(obj.get("debug_mode").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(
+            obj.get("thinking_budget_tokens").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        // Optional fields skip-serialize when None — pinned so the wire
+        // doesn't gain stray nulls for runs that didn't engage Gemini /
+        // OpenAI reasoning.
+        assert!(obj.get("reasoning_effort").is_none());
+        assert!(obj.get("gemini_thinking_budget").is_none());
+
+        let parsed: ResolvedRunConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, cfg);
+    }
+
+    /// Populated optional fields surface on the wire. Pinned so the
+    /// triage UI / log scrapers can rely on the field names.
+    #[test]
+    fn test_resolved_run_config_serde_with_optionals() {
+        let cfg = ResolvedRunConfig {
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            max_tokens: 16_000,
+            posture: "autonomous".into(),
+            debug_mode: true,
+            thinking_budget_tokens: 0,
+            reasoning_effort: Some(crate::config::ReasoningEffort::High),
+            gemini_thinking_budget: Some(8192),
+        };
+        let value = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            value.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("high")
+        );
+        assert_eq!(
+            value.get("gemini_thinking_budget").and_then(|v| v.as_u64()),
+            Some(8192)
+        );
+        let parsed: ResolvedRunConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed, cfg);
     }
 
     /// Any `"Error:"` prefix in the tool result should prevent the call

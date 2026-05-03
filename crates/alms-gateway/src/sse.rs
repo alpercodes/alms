@@ -82,6 +82,31 @@ impl SseEventData {
                 run_id: run_id.0.to_string(),
                 session_id: session_id.0.to_string(),
                 ts: Utc::now(),
+                resolved_config: None,
+            },
+        )
+    }
+
+    /// `run_started` carrying the layered run-config snapshot (#837).
+    ///
+    /// Same shape as [`SseEventData::run_started`] plus a `resolved_config`
+    /// object identifying the provider / model / posture / budgets the
+    /// run actually committed to. Live observers can use this to confirm
+    /// "I set model X but Y was used"-class reports without log
+    /// correlation. Older clients that don't know about the new field
+    /// simply ignore it — the wire shape stays additive.
+    pub fn run_started_with_config(
+        run_id: RunId,
+        session_id: alms_core::SessionId,
+        resolved_config: alms_core::ResolvedRunConfig,
+    ) -> Self {
+        Self::new(
+            "run_started",
+            RunStartedData {
+                run_id: run_id.0.to_string(),
+                session_id: session_id.0.to_string(),
+                ts: Utc::now(),
+                resolved_config: Some(resolved_config),
             },
         )
     }
@@ -304,6 +329,39 @@ impl SseEventData {
         )
     }
 
+    /// Session-level + per-run: a queued run's position has changed.
+    ///
+    /// Emitted when the head of the per-agent queue advances (a run finishes,
+    /// fails, or is cancelled), so still-queued runs can show a live
+    /// decrementing position in the chat UI.
+    ///
+    /// `position` is **1-indexed**: position 1 means "next up" (one run still
+    /// ahead — typically the one that just started running). `position` always
+    /// matches the same number that `run_created.queued_behind` carried when
+    /// the run was first enqueued.
+    ///
+    /// No event is emitted with `position == 0`; the existing
+    /// `run_started` event is the signal that the run has left the queue and
+    /// is now executing. Once a queued run reaches a terminal state (cancelled
+    /// before dispatch), no further position events fire for that run.
+    pub fn run_queue_position(
+        run_id: RunId,
+        session_id: alms_core::SessionId,
+        agent_id: alms_core::AgentId,
+        position: usize,
+    ) -> Self {
+        Self::new(
+            "run_queue_position",
+            RunQueuePositionData {
+                run_id: run_id.0.to_string(),
+                session_id: session_id.0.to_string(),
+                agent_id: agent_id.0.to_string(),
+                position,
+                ts: Utc::now(),
+            },
+        )
+    }
+
     /// Session-level: a background subagent completed.
     pub fn subagent_completed(
         session_id: alms_core::SessionId,
@@ -477,6 +535,52 @@ impl SseEventData {
             },
         )
     }
+
+    /// Agent-scoped: a run started on a session belonging to this agent.
+    ///
+    /// Mirrors the per-session `run_started` event onto the agent-scoped
+    /// SSE feed (`GET /agents/{agent_id}/events`) so the web UI's session
+    /// sidebar can show an "active" indicator for any session — not just
+    /// the currently-viewed one (#856).
+    ///
+    /// Emitted from the standard run lifecycle so it covers both regular
+    /// runs (chat, job, notification) and DM runs.
+    pub fn session_activity_started(
+        session_id: alms_core::SessionId,
+        run_id: RunId,
+        agent_id: alms_core::AgentId,
+    ) -> Self {
+        Self::new(
+            "session_activity_started",
+            SessionActivityStartedData {
+                session_id: session_id.0.to_string(),
+                run_id: run_id.0.to_string(),
+                agent_id: agent_id.0.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
+
+    /// Agent-scoped: a run on a session belonging to this agent ended
+    /// (completed, failed, or cancelled).
+    ///
+    /// Pair to [`session_activity_started`].  See that method for the
+    /// design rationale.
+    pub fn session_activity_ended(
+        session_id: alms_core::SessionId,
+        run_id: RunId,
+        agent_id: alms_core::AgentId,
+    ) -> Self {
+        Self::new(
+            "session_activity_ended",
+            SessionActivityEndedData {
+                session_id: session_id.0.to_string(),
+                run_id: run_id.0.to_string(),
+                agent_id: agent_id.0.to_string(),
+                ts: Utc::now(),
+            },
+        )
+    }
 }
 
 /// SSE event stream wrapper
@@ -594,6 +698,13 @@ struct RunStartedData {
     run_id: String,
     session_id: String,
     ts: DateTime<Utc>,
+    /// Layered run-config snapshot (#837). `None` for pre-#837 callers
+    /// (and for the fallback `run_started` constructor that didn't have
+    /// a snapshot to attach). Skipped entirely on the wire when `None`
+    /// so the pre-#837 `run_started` payload stays byte-identical for
+    /// clients that haven't migrated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolved_config: Option<alms_core::ResolvedRunConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -744,6 +855,24 @@ struct RunCreatedData {
     ts: DateTime<Utc>,
 }
 
+/// Wire payload for a `run_queue_position` SSE event — an updated 1-indexed
+/// queue position for a still-queued run after the head of the per-agent
+/// queue advanced.
+///
+/// `position` carries the same semantic as `run_created.queued_behind`
+/// (number of runs ahead of this one). The frontend can treat the two
+/// fields interchangeably for display purposes.
+#[derive(Debug, Serialize)]
+struct RunQueuePositionData {
+    run_id: String,
+    session_id: String,
+    agent_id: String,
+    /// 1-indexed: 1 means "next up" (one run still ahead), 2 means
+    /// "one queued ahead plus the running one," etc.
+    position: usize,
+    ts: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 struct SubagentCompletedData {
     session_id: String,
@@ -819,6 +948,25 @@ struct DmActivityEndedData {
     ts: DateTime<Utc>,
 }
 
+/// Wire payload for the agent-scoped `session_activity_started` event
+/// emitted on `GET /agents/{agent_id}/events` (#856).
+#[derive(Debug, Serialize)]
+struct SessionActivityStartedData {
+    session_id: String,
+    run_id: String,
+    agent_id: String,
+    ts: DateTime<Utc>,
+}
+
+/// Wire payload for the agent-scoped `session_activity_ended` event.
+#[derive(Debug, Serialize)]
+struct SessionActivityEndedData {
+    session_id: String,
+    run_id: String,
+    agent_id: String,
+    ts: DateTime<Utc>,
+}
+
 /// Classify an error message into an error code for the frontend.
 ///
 /// The code is used by the UI to pick appropriate styling:
@@ -865,6 +1013,57 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("run_started"));
         assert!(json.contains(&run_id.0.to_string()));
+    }
+
+    /// `run_started` without a layered config snapshot serializes
+    /// **without** the `resolved_config` field — pinned so older clients
+    /// that don't know about #837 see a byte-identical pre-#837 wire
+    /// shape (no stray `"resolved_config": null`).
+    #[test]
+    fn test_run_started_without_config_skips_resolved_config_field() {
+        let event = SseEventData::run_started(RunId::new(), alms_core::SessionId::new());
+        let value = serde_json::to_value(&event).unwrap();
+        let data = value
+            .get("data")
+            .and_then(|v| v.as_object())
+            .expect("event.data should be an object");
+        assert!(
+            data.get("resolved_config").is_none(),
+            "resolved_config must be skipped when None — got {value}"
+        );
+    }
+
+    /// `run_started_with_config` carries the layered snapshot on the
+    /// wire under the field names the issue specifies (#837).
+    #[test]
+    fn test_run_started_with_config_includes_snapshot() {
+        let event = SseEventData::run_started_with_config(
+            RunId::new(),
+            alms_core::SessionId::new(),
+            alms_core::ResolvedRunConfig {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-20250514".into(),
+                max_tokens: 4096,
+                posture: "guarded".into(),
+                debug_mode: false,
+                thinking_budget_tokens: 0,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+            },
+        );
+        let value = serde_json::to_value(&event).unwrap();
+        let cfg = &value["data"]["resolved_config"];
+        assert_eq!(cfg["provider"], "anthropic");
+        assert_eq!(cfg["model"], "claude-sonnet-4-20250514");
+        assert_eq!(cfg["max_tokens"], 4096);
+        assert_eq!(cfg["posture"], "guarded");
+        assert_eq!(cfg["debug_mode"], false);
+        assert_eq!(cfg["thinking_budget_tokens"], 0);
+        // Optional fields skip-serialize when None — pinned so the wire
+        // doesn't gain stray nulls for runs that didn't engage Gemini /
+        // OpenAI reasoning.
+        assert!(cfg.get("reasoning_effort").is_none());
+        assert!(cfg.get("gemini_thinking_budget").is_none());
     }
 
     #[test]
@@ -1162,6 +1361,36 @@ mod tests {
         assert_eq!(event.event_type, "dm_activity_ended");
         assert_eq!(event.data["session_id"], session_id.0.to_string());
         assert_eq!(event.data["peer"], "researcher");
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+    }
+
+    #[test]
+    fn test_session_activity_started_event() {
+        let session_id = alms_core::SessionId::new();
+        let run_id = RunId::new();
+        let agent_id = alms_core::AgentId::new();
+        let event = SseEventData::session_activity_started(session_id, run_id, agent_id);
+
+        assert_eq!(event.event_type, "session_activity_started");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["run_id"], run_id.0.to_string());
+        assert_eq!(event.data["agent_id"], agent_id.0.to_string());
+        assert!(event.data["ts"].is_string(), "ts should be a string");
+        let ts_str = event.data["ts"].as_str().unwrap();
+        assert!(ts_str.contains("T"), "ts should be ISO8601/RFC3339");
+    }
+
+    #[test]
+    fn test_session_activity_ended_event() {
+        let session_id = alms_core::SessionId::new();
+        let run_id = RunId::new();
+        let agent_id = alms_core::AgentId::new();
+        let event = SseEventData::session_activity_ended(session_id, run_id, agent_id);
+
+        assert_eq!(event.event_type, "session_activity_ended");
+        assert_eq!(event.data["session_id"], session_id.0.to_string());
+        assert_eq!(event.data["run_id"], run_id.0.to_string());
+        assert_eq!(event.data["agent_id"], agent_id.0.to_string());
         assert!(event.data["ts"].is_string(), "ts should be a string");
     }
 

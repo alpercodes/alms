@@ -51,7 +51,7 @@ pub(crate) enum AgentCommands {
         /// Anthropic extended-thinking budget in tokens (Claude 4.x).
         /// `0` explicitly disables thinking for this agent even when the
         /// server default enables it. Omit the flag to inherit the server
-        /// default (three-layer precedence: per-run > per-agent > server).
+        /// default (two-layer precedence: per-agent > server).
         #[arg(long)]
         thinking_budget_tokens: Option<u32>,
         /// OpenAI-compat reasoning effort for reasoning models (OpenAI
@@ -65,10 +65,25 @@ pub(crate) enum AgentCommands {
         /// Gemini extended-thinking budget in tokens (Gemini 2.5+).
         /// `0` explicitly disables thinking for this agent even when the
         /// server default enables it. Omit the flag to inherit the server
-        /// default (three-layer precedence: per-run > per-agent > server).
+        /// default (two-layer precedence: per-agent > server).
         /// Non-Gemini providers silently ignore the value. (#794)
         #[arg(long)]
         gemini_thinking_budget: Option<u32>,
+        /// Per-agent summary-task provider override (#872, #876). Must be
+        /// set together with `--summary-model`; setting one without the
+        /// other is rejected with `SUMMARY_PROVIDER_REQUIRES_MODEL` /
+        /// `SUMMARY_MODEL_REQUIRES_PROVIDER`. Omit both flags to inherit
+        /// the server-level `[context].summary_provider` /
+        /// `[context].summary_model`.
+        #[arg(long)]
+        summary_provider: Option<String>,
+        /// Per-agent summary-task model override (#872, #876). Must be set
+        /// together with `--summary-provider`. The model slug belongs to
+        /// the summary provider's namespace, not the agent's primary
+        /// provider — pairing a model slug with the wrong provider is
+        /// rejected at create/PATCH time.
+        #[arg(long)]
+        summary_model: Option<String>,
         /// Set as the default agent
         #[arg(long)]
         default: bool,
@@ -125,6 +140,34 @@ pub(crate) enum AgentCommands {
         /// semantics on `thinking_budget_tokens` (#794).
         #[arg(long)]
         gemini_thinking_budget: Option<u32>,
+        /// Per-agent summary-task provider override (#872, #876). Omit
+        /// to leave the current value unchanged. Empty string is rejected
+        /// — use `--clear-summary-provider` to clear the override (the
+        /// pair-only invariant requires unambiguous wire shapes; see
+        /// `--clear-summary-provider`). Must be paired with
+        /// `--summary-model` so the post-update record satisfies the
+        /// pair-only invariant; setting one without the other is rejected.
+        #[arg(long)]
+        summary_provider: Option<String>,
+        /// Per-agent summary-task model override (#872, #876). Omit to
+        /// leave the current value unchanged. Empty string is rejected —
+        /// use `--clear-summary-model` to clear. Must be paired with
+        /// `--summary-provider`.
+        #[arg(long)]
+        summary_model: Option<String>,
+        /// Clear the per-agent `summary_provider` override back to "inherit
+        /// server default". Mutually exclusive with `--summary-provider`
+        /// (sending both returns `CLEAR_AND_VALUE_CONFLICT`). Should
+        /// usually be sent together with `--clear-summary-model` so the
+        /// post-update record stays paired (or both already unset).
+        #[arg(long)]
+        clear_summary_provider: bool,
+        /// Clear the per-agent `summary_model` override back to "inherit
+        /// server default". Mutually exclusive with `--summary-model`.
+        /// Should usually be sent together with
+        /// `--clear-summary-provider`.
+        #[arg(long)]
+        clear_summary_model: bool,
     },
 }
 
@@ -178,6 +221,16 @@ pub(crate) struct AgentCreateOpts<'a> {
     /// from `[llm.gemini]`. Matches the HTTP API semantics on
     /// `POST /agents` (#794).
     pub gemini_thinking_budget: Option<u32>,
+    /// Per-agent summary-task provider override (#872, #876). `None`
+    /// inherits the server-level `[context].summary_provider`. Must be
+    /// set together with `summary_model` — partial pairs are rejected
+    /// at construction time below to mirror the HTTP API's pair-only
+    /// invariant.
+    pub summary_provider: Option<String>,
+    /// Per-agent summary-task model override (#872, #876). `None`
+    /// inherits the server-level `[context].summary_model`. Must be
+    /// set together with `summary_provider`.
+    pub summary_model: Option<String>,
     pub default: bool,
     pub json: bool,
     pub workspace_dir: Option<&'a std::path::Path>,
@@ -193,12 +246,66 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         thinking_budget_tokens,
         reasoning_effort,
         gemini_thinking_budget,
+        summary_provider,
+        summary_model,
         default,
         json,
         workspace_dir,
     } = opts;
 
     validate_agent_name(&name)?;
+
+    // Reject empty / whitespace-only summary values up front (S2 follow-up
+    // on #876). The HTTP `PUT /agents/{id}` path returns `SUMMARY_FIELD_EMPTY`
+    // for these inputs, and `POST /agents` normalizes them to `None` for
+    // back-compat. The CLI used to silently let `Some("")` / `Some("  ")`
+    // through to the registry — both halves of the pair would pass the
+    // pair-check below as `(Some, Some)` and persist as empty strings,
+    // diverging from both HTTP shapes. Reject outright instead so all
+    // surfaces (CLI + HTTP CRUD) treat empty-as-clear ambiguously and
+    // direct operators to omit the flags entirely on `agent create`.
+    if matches!(summary_provider.as_deref().map(str::trim), Some("")) {
+        anyhow::bail!(
+            "--summary-provider cannot be an empty or whitespace-only string. \
+             Omit the flag entirely to inherit the server-level \
+             [context].summary_provider, or pair it with --summary-model and a \
+             non-empty value."
+        );
+    }
+    if matches!(summary_model.as_deref().map(str::trim), Some("")) {
+        anyhow::bail!(
+            "--summary-model cannot be an empty or whitespace-only string. \
+             Omit the flag entirely to inherit the server-level \
+             [context].summary_model, or pair it with --summary-provider and a \
+             non-empty value."
+        );
+    }
+
+    // Pair-only invariant for the per-agent summary fields (#872, #876).
+    // Mirrors the HTTP `POST /agents` validator — setting one without the
+    // other is meaningless and would silently fall through to the
+    // server-level `[context].summary_*`. Surface a clear CLI error here
+    // rather than letting the user discover the mismatch only when the
+    // summary task fires at run time.
+    match (summary_provider.as_deref(), summary_model.as_deref()) {
+        (Some(_), None) => {
+            anyhow::bail!(
+                "--summary-provider is set but --summary-model is empty. \
+                 Set both flags together — the summary provider's wire model \
+                 namespace is independent of the agent's primary provider, so \
+                 partial settings cannot be safely resolved."
+            );
+        }
+        (None, Some(_)) => {
+            anyhow::bail!(
+                "--summary-model is set but --summary-provider is empty. \
+                 Set both flags together — leaving --summary-provider unset \
+                 would fall through to the server-level [context].summary_provider, \
+                 which may not match this model's namespace."
+            );
+        }
+        _ => {}
+    }
 
     let now = chrono::Utc::now();
     let agent = AgentRecord {
@@ -212,14 +319,16 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         thinking_budget_tokens,
         reasoning_effort,
         gemini_thinking_budget,
-        // Per-agent summary overrides (#872) are not surfaced via the
-        // `alms agent create` CLI today — the CLI is operator-friendly
-        // and tracks the most-common knobs. Operators that need this
-        // can set both fields via `alms agent config <name>` once we
-        // surface the flag, or via the HTTP `PATCH /agents/{name}`
-        // endpoint which already supports them.
-        summary_provider: None,
-        summary_model: None,
+        // Per-agent summary overrides (#872, #876). The empty /
+        // whitespace-only rejection and the pair-only invariant are
+        // both enforced above, so at this point both fields are either
+        // `Some(non_empty)` together or both `None`. Values reach the
+        // registry without further trimming — the HTTP layers (POST
+        // back-compat normalize, PUT trim-on-apply) do their own
+        // trimming, and a CLI operator who explicitly typed a value
+        // with surrounding whitespace probably means it.
+        summary_provider,
+        summary_model,
         is_default: default,
         created_at: now,
         last_active: now,
@@ -319,6 +428,26 @@ pub(crate) fn agent_show(store: &SqliteStore, name_or_id: &str, json: bool) -> a
         None => "(server default)".to_string(),
     };
     println!("Gemini Think:  {gemini_thinking_display}");
+    // Per-agent summary provider/model overrides (#872, #876). Both
+    // fields are either Some-together or None-together (the pair-only
+    // invariant is enforced at create/PATCH time). `(server default)`
+    // means the agent inherits `[context].summary_provider` /
+    // `[context].summary_model` from `alms.toml`.
+    // Use "Sum Provider:" / "Sum Model:" rather than "Summary Prov:" /
+    // "Summary Model:" so the truncation lands on the prefix word rather
+    // than the field role — symmetric with how `Gemini Think:` truncates
+    // `Gemini Thinking:` above. Reads less oddly than mid-word truncation.
+    println!(
+        "Sum Provider:  {}",
+        agent
+            .summary_provider
+            .as_deref()
+            .unwrap_or("(server default)")
+    );
+    println!(
+        "Sum Model:     {}",
+        agent.summary_model.as_deref().unwrap_or("(server default)")
+    );
     println!(
         "Default:       {}",
         if agent.is_default { "yes" } else { "no" }
@@ -392,6 +521,24 @@ pub(crate) struct AgentConfigOpts<'a> {
     /// leaves the stored value unchanged — matches the HTTP `PATCH
     /// /agents` semantics on `gemini_thinking_budget` (#794).
     pub gemini_thinking_budget: Option<u32>,
+    /// Per-agent summary-task provider override (#872, #876).
+    /// `Some(value)` writes through; `None` leaves the stored value
+    /// unchanged. Empty string is rejected (use `clear_summary_provider`
+    /// instead). Mutually exclusive with `clear_summary_provider: true`.
+    pub summary_provider: Option<String>,
+    /// Per-agent summary-task model override (#872, #876). Same shape
+    /// as `summary_provider` above.
+    pub summary_model: Option<String>,
+    /// When `true`, clear the per-agent `summary_provider` override
+    /// back to `None` (inherit server default). Mutually exclusive
+    /// with `summary_provider: Some(_)` — passing both returns
+    /// `CLEAR_AND_VALUE_CONFLICT`. Should usually be paired with
+    /// `clear_summary_model: true` so the post-update record stays
+    /// paired (or both `None`).
+    pub clear_summary_provider: bool,
+    /// When `true`, clear the per-agent `summary_model` override.
+    /// Mutually exclusive with `summary_model: Some(_)`.
+    pub clear_summary_model: bool,
     pub json: bool,
 }
 
@@ -405,8 +552,50 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
         thinking_budget_tokens,
         reasoning_effort,
         gemini_thinking_budget,
+        summary_provider,
+        summary_model,
+        clear_summary_provider,
+        clear_summary_model,
         json,
     } = opts;
+
+    // CLEAR_AND_VALUE_CONFLICT for the summary fields (#872, #876).
+    // Mirrors the HTTP `PATCH /agents/{id}` semantics — sending both a
+    // value and a clear flag for the same field is ambiguous and
+    // rejected. Surface the same error code at the CLI layer so users
+    // who scripted against the HTTP path see consistent diagnostics.
+    if summary_provider.is_some() && clear_summary_provider {
+        anyhow::bail!(
+            "CLEAR_AND_VALUE_CONFLICT: cannot send both --summary-provider \
+             and --clear-summary-provider in the same command"
+        );
+    }
+    if summary_model.is_some() && clear_summary_model {
+        anyhow::bail!(
+            "CLEAR_AND_VALUE_CONFLICT: cannot send both --summary-model \
+             and --clear-summary-model in the same command"
+        );
+    }
+
+    // Reject empty / whitespace-only summary values up front. The HTTP
+    // `PUT /agents/{id}` path returns `SUMMARY_FIELD_EMPTY` after
+    // trimming, because empty-string-as-clear would conflict with the
+    // explicit `clear_*` sentinel; mirror that here for parity (and
+    // also reject pure whitespace, which would trim to empty server-
+    // side anyway).
+    if matches!(summary_provider.as_deref().map(str::trim), Some("")) {
+        anyhow::bail!(
+            "--summary-provider cannot be an empty or whitespace-only string \
+             — use --clear-summary-provider to reset back to inheriting the \
+             server-level [context].summary_provider"
+        );
+    }
+    if matches!(summary_model.as_deref().map(str::trim), Some("")) {
+        anyhow::bail!(
+            "--summary-model cannot be an empty or whitespace-only string \
+             — use --clear-summary-model to reset"
+        );
+    }
 
     let mut agent = resolve_agent(store, name_or_id)?;
 
@@ -444,6 +633,55 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
         agent.gemini_thinking_budget = Some(budget);
     }
 
+    // Per-agent summary fields (#872, #876). The clear flags reset to
+    // `None`; non-empty values write through (trimmed to mirror the
+    // HTTP layer's `apply_update_request` behaviour). The pair-only
+    // invariant is enforced AFTER applying both halves so a single
+    // command setting both fields stays valid even when the
+    // pre-existing record was already paired.
+    if clear_summary_provider {
+        agent.summary_provider = None;
+    } else if let Some(provider) = summary_provider {
+        agent.summary_provider = Some(provider.trim().to_string());
+    }
+    if clear_summary_model {
+        agent.summary_model = None;
+    } else if let Some(model) = summary_model {
+        agent.summary_model = Some(model.trim().to_string());
+    }
+
+    // Pair-only invariant on the post-update record state. Mirrors the
+    // HTTP `PUT /agents/{id}` validator — setting one field without the
+    // other (whether by patching just one half or by clearing one half
+    // when the other is already set) is rejected. Note the HTTP layer
+    // ALSO validates the provider against `[llm.providers.<name>]` and
+    // the secrets store; the CLI cannot do that without spinning up
+    // AppState, so we leave that check to the daemon at run time —
+    // matches the contract Atlas described (load-time vs run-time
+    // layers in #877/#878).
+    match (
+        agent.summary_provider.as_deref(),
+        agent.summary_model.as_deref(),
+    ) {
+        (Some(_), None) => {
+            anyhow::bail!(
+                "SUMMARY_PROVIDER_REQUIRES_MODEL: agent.summary_provider would \
+                 be set but agent.summary_model is empty after this update. \
+                 Pass --summary-model together with --summary-provider, or \
+                 add --clear-summary-provider to drop the existing override."
+            );
+        }
+        (None, Some(_)) => {
+            anyhow::bail!(
+                "SUMMARY_MODEL_REQUIRES_PROVIDER: agent.summary_model would be \
+                 set but agent.summary_provider is empty after this update. \
+                 Pass --summary-provider together with --summary-model, or \
+                 add --clear-summary-model to drop the existing override."
+            );
+        }
+        _ => {}
+    }
+
     agent.last_active = chrono::Utc::now();
     store.update_agent(&agent)?;
 
@@ -477,6 +715,8 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -513,6 +753,8 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -530,6 +772,8 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -553,6 +797,8 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -579,6 +825,8 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
                 default: false,
                 json: false,
                 workspace_dir: Some(&ws_dir),
@@ -653,6 +901,10 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
                 json: false,
             },
         )
@@ -699,6 +951,10 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
                 json: false,
             },
         )
@@ -729,6 +985,8 @@ mod tests {
                 thinking_budget_tokens: Some(8192),
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -755,6 +1013,8 @@ mod tests {
                 thinking_budget_tokens: Some(0),
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -782,6 +1042,10 @@ mod tests {
                 thinking_budget_tokens: Some(4096),
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
                 json: false,
             },
         )
@@ -801,6 +1065,10 @@ mod tests {
                 thinking_budget_tokens: Some(0),
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
                 json: false,
             },
         )
@@ -820,6 +1088,10 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
                 json: false,
             },
         )
@@ -855,6 +1127,8 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: Some(16384),
+                summary_provider: None,
+                summary_model: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -882,6 +1156,8 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: Some(0),
+                summary_provider: None,
+                summary_model: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -909,6 +1185,10 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: Some(4096),
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
                 json: false,
             },
         )
@@ -928,6 +1208,10 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: Some(0),
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
                 json: false,
             },
         )
@@ -948,6 +1232,10 @@ mod tests {
                 thinking_budget_tokens: None,
                 reasoning_effort: None,
                 gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
                 json: false,
             },
         )
@@ -959,5 +1247,623 @@ mod tests {
             "omitted flag must not clobber existing gemini_thinking_budget"
         );
         assert_eq!(after_noop.model.as_deref(), Some("some-model"));
+    }
+
+    // -- CLI --summary-provider / --summary-model on create + config (#876) ---
+    //
+    // Mirrors the shape of `--thinking-budget-tokens` and
+    // `--gemini-thinking-budget` above. The pair-only invariant
+    // (`SUMMARY_PROVIDER_REQUIRES_MODEL` / `SUMMARY_MODEL_REQUIRES_PROVIDER`)
+    // and the `--clear-*` sentinel mirror the HTTP API's semantics on
+    // `POST /agents` and `PUT /agents/{id}` so users with scripts driven
+    // by both surfaces see consistent diagnostics.
+
+    #[test]
+    fn test_create_with_summary_provider_and_model_together() {
+        let store = new_store();
+        agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "summary-set".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap();
+        let agent = resolve_agent(&store, "summary-set").unwrap();
+        assert_eq!(agent.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(agent.summary_model.as_deref(), Some("minimax/minimax-m2.7"));
+    }
+
+    #[test]
+    fn test_create_rejects_summary_provider_without_model() {
+        // Pair-only invariant — surface the same error code at the CLI
+        // layer that the HTTP `POST /agents` validator uses, so users who
+        // scripted against either surface see consistent diagnostics.
+        let store = new_store();
+        let err = agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "partial-pair-a".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("openrouter".into()),
+                summary_model: None,
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--summary-model is empty"),
+            "expected partial-pair error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_summary_model_without_provider() {
+        let store = new_store();
+        let err = agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "partial-pair-b".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--summary-provider is empty"),
+            "expected partial-pair error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_sets_summary_provider_and_model_together() {
+        let store = new_store();
+        make_agent(&store, "summary-config");
+        agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "summary-config",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                clear_summary_provider: false,
+                clear_summary_model: false,
+                json: false,
+            },
+        )
+        .unwrap();
+        let agent = resolve_agent(&store, "summary-config").unwrap();
+        assert_eq!(agent.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(agent.summary_model.as_deref(), Some("minimax/minimax-m2.7"));
+    }
+
+    #[test]
+    fn test_config_clear_summary_provider_and_model_together() {
+        // Seed an agent that already has both fields set, then clear
+        // both via the dedicated sentinels — same pattern as the HTTP
+        // API's `clear_summary_provider` / `clear_summary_model`.
+        let store = new_store();
+        let now = chrono::Utc::now();
+        let agent = AgentRecord {
+            id: AgentId::new(),
+            name: "summary-clear".to_string(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: Some("openrouter".to_string()),
+            summary_model: Some("minimax/minimax-m2.7".to_string()),
+            is_default: false,
+            created_at: now,
+            last_active: now,
+        };
+        store.create_agent(&agent).unwrap();
+
+        agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "summary-clear",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: true,
+                clear_summary_model: true,
+                json: false,
+            },
+        )
+        .unwrap();
+        let updated = resolve_agent(&store, "summary-clear").unwrap();
+        assert!(updated.summary_provider.is_none());
+        assert!(updated.summary_model.is_none());
+    }
+
+    #[test]
+    fn test_config_rejects_clear_and_value_together_summary_provider() {
+        let store = new_store();
+        make_agent(&store, "conflict-a");
+        let err = agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "conflict-a",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("openrouter".into()),
+                summary_model: None,
+                clear_summary_provider: true,
+                clear_summary_model: false,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("CLEAR_AND_VALUE_CONFLICT"),
+            "expected CLEAR_AND_VALUE_CONFLICT, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_clear_and_value_together_summary_model() {
+        let store = new_store();
+        make_agent(&store, "conflict-b");
+        let err = agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "conflict-b",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                clear_summary_provider: false,
+                clear_summary_model: true,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("CLEAR_AND_VALUE_CONFLICT"),
+            "expected CLEAR_AND_VALUE_CONFLICT, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_setting_only_summary_provider() {
+        // Pair-only invariant on the post-update record state — when the
+        // pre-existing record has both fields None, setting only the
+        // provider would leave the record asymmetric. Reject with the
+        // same error code the HTTP `PUT /agents/{id}` validator uses.
+        let store = new_store();
+        make_agent(&store, "asymmetric-a");
+        let err = agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "asymmetric-a",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("openrouter".into()),
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("SUMMARY_PROVIDER_REQUIRES_MODEL"),
+            "expected SUMMARY_PROVIDER_REQUIRES_MODEL, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_clearing_only_one_half_of_pair() {
+        // Pre-state: both summary fields are set. Clearing only the
+        // model would leave provider stranded — same shape the HTTP
+        // PATCH layer rejects.
+        let store = new_store();
+        let now = chrono::Utc::now();
+        let agent = AgentRecord {
+            id: AgentId::new(),
+            name: "asymmetric-b".to_string(),
+            description: String::new(),
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: Some("openrouter".to_string()),
+            summary_model: Some("minimax/minimax-m2.7".to_string()),
+            is_default: false,
+            created_at: now,
+            last_active: now,
+        };
+        store.create_agent(&agent).unwrap();
+
+        let err = agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "asymmetric-b",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: true,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("SUMMARY_PROVIDER_REQUIRES_MODEL"),
+            "expected SUMMARY_PROVIDER_REQUIRES_MODEL, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_empty_string_summary_fields() {
+        // The HTTP layer rejects empty-string for these fields with
+        // `SUMMARY_FIELD_EMPTY`; mirror that at the CLI layer so users
+        // who type `--summary-provider ""` get a clear error rather
+        // than a silently-stored empty record. (Empty-string-as-clear
+        // would conflict with the explicit `--clear-*` sentinel.)
+        let store = new_store();
+        make_agent(&store, "empty-string");
+        let err = agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "empty-string",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some(String::new()),
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be an empty or whitespace-only string"),
+            "expected empty-string rejection, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--summary-provider"),
+            "expected --summary-provider in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_empty_string_summary_model() {
+        // Symmetric coverage for the `--summary-model` half of the pair
+        // — Tim flagged that the existing empty-string test only covered
+        // `--summary-provider`. The two checks live on independent code
+        // paths, so verify both fire.
+        let store = new_store();
+        make_agent(&store, "empty-model");
+        let err = agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "empty-model",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: Some(String::new()),
+                clear_summary_provider: false,
+                clear_summary_model: false,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be an empty or whitespace-only string"),
+            "expected empty-string rejection, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--summary-model"),
+            "expected --summary-model in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_config_rejects_whitespace_only_summary_fields() {
+        // Whitespace-only inputs trim to empty, which would conflict
+        // with the explicit `--clear-*` sentinel just like a literal
+        // empty string. Reject both cases on both halves of the pair.
+        let store = new_store();
+        make_agent(&store, "ws-provider");
+        let err = agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "ws-provider",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("   ".into()),
+                summary_model: None,
+                clear_summary_provider: false,
+                clear_summary_model: false,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be an empty or whitespace-only string"),
+            "expected whitespace-rejection on --summary-provider, got: {err}"
+        );
+
+        make_agent(&store, "ws-model");
+        let err = agent_config(
+            &store,
+            AgentConfigOpts {
+                name_or_id: "ws-model",
+                model: None,
+                posture: None,
+                provider: None,
+                description: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: None,
+                summary_model: Some("\t  \n".into()),
+                clear_summary_provider: false,
+                clear_summary_model: false,
+                json: false,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be an empty or whitespace-only string"),
+            "expected whitespace-rejection on --summary-model, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_empty_string_summary_provider() {
+        // S2 follow-up on #876 (Tim PR #923 review). Previously
+        // `agent_create` let `Some("")` slip through the pair-check as
+        // `(Some, Some)` and persisted the empty string verbatim,
+        // diverging from the HTTP `POST /agents` back-compat
+        // normalization and the `PUT /agents/{id}` `SUMMARY_FIELD_EMPTY`
+        // rejection. The CLI now matches PUT's stricter behaviour for
+        // both halves of the pair.
+        let store = new_store();
+        let err = agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "create-empty-prov".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some(String::new()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be an empty or whitespace-only string"),
+            "expected empty-string rejection, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--summary-provider"),
+            "expected --summary-provider in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_empty_string_summary_model() {
+        // Symmetric coverage for the `--summary-model` half on `agent
+        // create`. See `test_create_rejects_empty_string_summary_provider`.
+        let store = new_store();
+        let err = agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "create-empty-model".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some(String::new()),
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be an empty or whitespace-only string"),
+            "expected empty-string rejection, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("--summary-model"),
+            "expected --summary-model in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_whitespace_only_summary_fields() {
+        // Whitespace-only inputs trim to empty server-side; reject up
+        // front rather than persisting whitespace verbatim. Covers
+        // both halves of the pair for parity with `agent_config`.
+        let store = new_store();
+        let err = agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "create-ws-prov".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("   ".into()),
+                summary_model: Some("minimax/minimax-m2.7".into()),
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be an empty or whitespace-only string"),
+            "expected whitespace-rejection on --summary-provider, got: {err}"
+        );
+
+        let err = agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "create-ws-model".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some("openrouter".into()),
+                summary_model: Some("\t  \n".into()),
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be an empty or whitespace-only string"),
+            "expected whitespace-rejection on --summary-model, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_create_rejects_both_empty_summary_fields() {
+        // Regression-pin for the exact scenario Tim flagged in S2:
+        // `--summary-provider "" --summary-model ""` should be rejected,
+        // not pass the pair-check as `(Some, Some)` and persist a
+        // double-empty record.
+        let store = new_store();
+        let err = agent_create(
+            &store,
+            AgentCreateOpts {
+                name: "create-both-empty".into(),
+                description: None,
+                model: None,
+                posture: None,
+                provider: None,
+                thinking_budget_tokens: None,
+                reasoning_effort: None,
+                gemini_thinking_budget: None,
+                summary_provider: Some(String::new()),
+                summary_model: Some(String::new()),
+                default: false,
+                json: false,
+                workspace_dir: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot be an empty or whitespace-only string"),
+            "expected empty-string rejection, got: {err}"
+        );
+        // Verify nothing was persisted.
+        assert!(resolve_agent(&store, "create-both-empty").is_err());
     }
 }

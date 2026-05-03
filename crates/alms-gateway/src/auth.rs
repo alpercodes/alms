@@ -19,12 +19,14 @@ pub struct AuthToken(pub Option<String>);
 /// Recognised SSE paths:
 ///   - `/runs/{run_id}/events`
 ///   - `/sessions/{session_id}/events`
+///   - `/agents/{agent_id}/events`
 fn is_sse_endpoint(path: &str) -> bool {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    // Pattern: ["runs", <id>, "events"] or ["sessions", <id>, "events"]
+    // Pattern: ["runs", <id>, "events"] | ["sessions", <id>, "events"] |
+    //          ["agents", <id>, "events"]
     matches!(
         segments.as_slice(),
-        ["runs", _, "events"] | ["sessions", _, "events"]
+        ["runs", _, "events"] | ["sessions", _, "events"] | ["agents", _, "events"],
     )
 }
 
@@ -34,10 +36,11 @@ fn is_sse_endpoint(path: &str) -> bool {
 /// Otherwise, the `Authorization: Bearer <token>` header must match.
 ///
 /// The `?token=<token>` query parameter is accepted **only** on SSE
-/// endpoints (`/runs/{id}/events`, `/sessions/{id}/events`) where the
-/// browser `EventSource` API cannot set custom headers.  On all other
-/// routes, query-string auth is rejected to prevent credential leakage
-/// into server logs, browser history, and HTTP `Referer` headers.
+/// endpoints (`/runs/{id}/events`, `/sessions/{id}/events`,
+/// `/agents/{id}/events`) where the browser `EventSource` API cannot set
+/// custom headers.  On all other routes, query-string auth is rejected to
+/// prevent credential leakage into server logs, browser history, and HTTP
+/// `Referer` headers.
 pub async fn require_auth(
     Extension(auth): Extension<AuthToken>,
     req: Request<axum::body::Body>,
@@ -114,6 +117,7 @@ mod tests {
             .route("/test", get(dummy))
             .route("/runs/{run_id}/events", get(dummy))
             .route("/sessions/{session_id}/events", get(dummy))
+            .route("/agents/{agent_id}/events", get(dummy))
             .layer(middleware::from_fn(require_auth))
             .layer(Extension(AuthToken(token.map(String::from))))
     }
@@ -210,6 +214,20 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn test_bearer_header_accepted_on_agent_events_sse() {
+        let resp = app(Some("secret"))
+            .oneshot(
+                HttpRequest::get("/agents/some-agent-id/events")
+                    .header("Authorization", "Bearer secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     // --- Query-string token: rejected on non-SSE routes ---
 
     #[tokio::test]
@@ -254,6 +272,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_query_param_accepted_on_agent_events_sse() {
+        let resp = app(Some("secret"))
+            .oneshot(
+                HttpRequest::get("/agents/some-agent-id/events?token=secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn test_query_param_wrong_token_on_sse_returns_401() {
         let resp = app(Some("secret"))
             .oneshot(
@@ -272,6 +303,7 @@ mod tests {
     fn test_is_sse_endpoint_positive() {
         assert!(is_sse_endpoint("/runs/abc-123/events"));
         assert!(is_sse_endpoint("/sessions/def-456/events"));
+        assert!(is_sse_endpoint("/agents/ghi-789/events"));
     }
 
     #[test]
@@ -281,6 +313,8 @@ mod tests {
         assert!(!is_sse_endpoint("/runs/abc/cancel"));
         assert!(!is_sse_endpoint("/sessions/abc/messages"));
         assert!(!is_sse_endpoint("/agents"));
+        assert!(!is_sse_endpoint("/agents/abc"));
+        assert!(!is_sse_endpoint("/agents/abc/sessions"));
         assert!(!is_sse_endpoint("/health"));
     }
 

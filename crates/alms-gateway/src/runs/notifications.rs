@@ -1,6 +1,6 @@
 //! DM notification routing, scheduler integration, and trigger loops.
 
-use super::{RunOverrides, RunParams, find_user_facing_session};
+use super::{RunParams, find_user_facing_session};
 use crate::cron_utils;
 use crate::server::AppState;
 use crate::sse::SseEventData;
@@ -91,7 +91,6 @@ async fn fire_job_run(state: AppState, job_id: JobId) -> alms_core::AlmsResult<(
             session_id,
             agent_id: job.agent_id,
             input: run.input,
-            overrides: RunOverrides::default(),
             context_id,
             cancel_token,
             is_peer_message: false,
@@ -582,7 +581,6 @@ async fn enqueue_triggered_run(
                     session_id,
                     agent_id,
                     input,
-                    overrides: RunOverrides::default(),
                     context_id,
                     cancel_token,
                     is_peer_message,

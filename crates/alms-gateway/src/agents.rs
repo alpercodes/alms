@@ -841,9 +841,9 @@ mod tests {
     /// End-to-end round trip through SQLite: insert an agent with all
     /// three reasoning knobs set, PATCH with all three `clear_*: true`,
     /// reload from the store, verify all three are `None`. This is what
-    /// the `apply_overrides` precedence test relies on: once the SQLite
-    /// record's knob is `None`, the agent-layer precedence falls through
-    /// to the server default.
+    /// the `resolve_agent_config` precedence test relies on: once the
+    /// SQLite record's knob is `None`, the agent-layer precedence falls
+    /// through to the server default.
     #[test]
     fn clear_sentinels_round_trip_through_sqlite() {
         let store = SqliteStore::open_in_memory().unwrap();
@@ -865,9 +865,9 @@ mod tests {
         store.update_agent(&loaded).unwrap();
 
         // Reload and verify all three are None — this is what
-        // `apply_overrides` will see on a subsequent POST /runs, and
-        // that's what makes the precedence fall through to the server
-        // default.
+        // `resolve_agent_config` will see on a subsequent POST /runs,
+        // and that's what makes the precedence fall through to the
+        // server default.
         let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
         assert!(reloaded.thinking_budget_tokens.is_none());
         assert!(reloaded.reasoning_effort.is_none());
@@ -1153,5 +1153,397 @@ mod tests {
                 "variant {variant:?} must serialize as {expected_str:?}"
             );
         }
+    }
+
+    // ==================================================================
+    // HTTP-level coverage for per-agent SUMMARY_PROVIDER_UNKNOWN /
+    // SUMMARY_PROVIDER_MISSING_API_KEY (#878)
+    //
+    // The PATCH /settings layer in `settings.rs` already has axum
+    // oneshot-style coverage for `SUMMARY_PROVIDER_UNKNOWN` and
+    // `SUMMARY_PROVIDER_MISSING_API_KEY`. The per-agent CRUD layer wires
+    // the same `validate_summary_pair` against `state.llm_config` /
+    // `state.secrets`, but until #878 only the mutual-exclusion /
+    // `clear_*` sentinel paths had explicit unit tests — the
+    // provider-existence and key-resolvability paths were verified by
+    // code inspection only. These tests close that gap so a regression
+    // in `validate_summary_pair` cannot land silently.
+    //
+    // Test matrix:
+    //   1. POST /agents with provider="nonexistent"
+    //      -> 400 SUMMARY_PROVIDER_UNKNOWN
+    //   2. POST /agents with provider that's configured but has no key
+    //      -> 400 SUMMARY_PROVIDER_MISSING_API_KEY
+    //   3. PUT /agents/{id} (the same two cases via update path)
+    //   4. POST /agents with happy path -> 201 Created (both configured
+    //      AND a key resolvable from the secrets store)
+    //   5. POST /agents with an asymmetric pair (#877 mirror at the
+    //      per-agent layer) -> 400 SUMMARY_PROVIDER_REQUIRES_MODEL /
+    //      SUMMARY_MODEL_REQUIRES_PROVIDER
+    // ==================================================================
+
+    /// Build an `AppState` with a SQLite-backed agent registry AND a
+    /// custom `[llm.providers]` map so we can drive the
+    /// `validate_summary_pair` provider-existence / key-resolvability
+    /// branches deterministically. Mirrors
+    /// `runs::integration_tests::test_app_state_with_sqlite` but with
+    /// the plumbing for the four channels collapsed into `_` since the
+    /// per-agent CRUD path doesn't drive any of them.
+    fn agents_test_app_state_with_sqlite() -> crate::server::AppState {
+        let gateway_config = crate::gateway::GatewayConfig {
+            db_path: Some(":memory:".to_string()),
+            ..crate::gateway::GatewayConfig::default()
+        };
+        let gateway = crate::gateway::Gateway::new(gateway_config).unwrap();
+        let scheduler = std::sync::Arc::new(alms_runtime::Scheduler::new());
+        let shutdown_token = tokio_util::sync::CancellationToken::new();
+        let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (dm_event_tx, _dm_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::server::AppState::new(
+            gateway,
+            scheduler,
+            shutdown_token,
+            completion_tx,
+            trigger_tx,
+            dm_event_tx,
+        )
+        .unwrap()
+    }
+
+    /// Inject an `[llm.providers.openrouter]` entry into the test state
+    /// AND seed an API key for it in the secrets store. The summary
+    /// provider validator passes both the `SUMMARY_PROVIDER_UNKNOWN`
+    /// (entry exists) and `SUMMARY_PROVIDER_MISSING_API_KEY` (key
+    /// resolves) checks, so the cross-field pair invariant or other
+    /// validators are what we exercise on top.
+    fn inject_openrouter_provider_with_key(state: &mut crate::server::AppState) {
+        state.llm_config.providers.insert(
+            "openrouter".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://openrouter.ai/api/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        state
+            .secrets
+            .write()
+            .set_key("openrouter", "sk-or-test")
+            .unwrap();
+    }
+
+    /// Inject a provider entry that exists but has NO resolvable key —
+    /// neither in the entry's own `api_key_env`/`api_key` fields nor in
+    /// the secrets store. Used to drive `SUMMARY_PROVIDER_MISSING_API_KEY`.
+    fn inject_anthropic_provider_without_key(state: &mut crate::server::AppState) {
+        state.llm_config.providers.insert(
+            "anthropic".into(),
+            alms_core::config::ProviderEntry {
+                kind: alms_core::config::ProviderKind::OpenAiCompatible,
+                base_url: "https://api.anthropic.com/v1".into(),
+                api_key_env: None,
+                api_key: None,
+                model: None,
+                auth_scheme: alms_core::config::AuthScheme::Bearer,
+                quirks: alms_core::config::ProviderQuirks::default(),
+            },
+        );
+        // Make sure the secrets store does NOT have a key for this
+        // provider — `agents_test_app_state_with_sqlite` returns a
+        // freshly-constructed state, but be defensive in case future
+        // refactors thread a non-empty store through.
+        let _ = state.secrets.write().remove_key("anthropic");
+    }
+
+    /// Helper: invoke `create_agent` and unwrap the JSON error payload.
+    /// The handler returns a `Result<(StatusCode, Json), (StatusCode,
+    /// Json)>` — both arms carry a JSON body, but only the error arm
+    /// wraps the well-known `error.code` shape we want to assert on.
+    async fn create_agent_err(
+        state: crate::server::AppState,
+        req: alms_core::CreateAgentRequest,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let result = create_agent(axum::extract::State(state), Json(req)).await;
+        let (status, body) = result.expect_err("expected create_agent to return Err");
+        (status, body.0)
+    }
+
+    async fn update_agent_err(
+        state: crate::server::AppState,
+        id_or_name: String,
+        req: alms_core::UpdateAgentRequest,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let result = update_agent(
+            axum::extract::State(state),
+            axum::extract::Path(id_or_name),
+            Json(req),
+        )
+        .await;
+        let body = result.expect_err("expected update_agent to return Err");
+        (body.0, body.1.0)
+    }
+
+    /// Helper: extract the well-known `error.code` field from an
+    /// `api_error`-shaped JSON payload, matching the shape produced by
+    /// `crate::api_error`. Panics if the structure is unexpected so
+    /// failed tests print a clear message.
+    fn err_code(json: &serde_json::Value) -> &str {
+        json.get("error")
+            .and_then(|e| e.get("code"))
+            .and_then(|c| c.as_str())
+            .expect("error response missing error.code field")
+    }
+
+    #[tokio::test]
+    async fn post_agents_rejects_unknown_summary_provider() {
+        // No `[llm.providers.nonexistent]` entry exists, so the validator
+        // must reject before any DB write.
+        let state = agents_test_app_state_with_sqlite();
+        let req = alms_core::CreateAgentRequest {
+            name: "bad-summary-prov".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: Some("nonexistent".into()),
+            summary_model: Some("some-model".into()),
+            is_default: None,
+        };
+        let (status, body) = create_agent_err(state.clone(), req).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err_code(&body), "SUMMARY_PROVIDER_UNKNOWN");
+
+        // Defense in depth: nothing was written to the registry.
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(
+            store
+                .load_agent_by_name("bad-summary-prov")
+                .unwrap()
+                .is_none(),
+            "rejected POST must not commit the agent record"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_agents_rejects_summary_provider_without_api_key() {
+        // Provider is configured under `[llm.providers.<name>]` but no
+        // key resolves from either the entry or the secrets store. This
+        // is the exact run-time failure mode #878 asks us to surface
+        // cleanly at create time so the operator hears about it before
+        // a summary task ever fires.
+        let mut state = agents_test_app_state_with_sqlite();
+        inject_anthropic_provider_without_key(&mut state);
+        let req = alms_core::CreateAgentRequest {
+            name: "no-key-agent".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: Some("anthropic".into()),
+            summary_model: Some("claude-haiku-4".into()),
+            is_default: None,
+        };
+        let (status, body) = create_agent_err(state.clone(), req).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err_code(&body), "SUMMARY_PROVIDER_MISSING_API_KEY");
+    }
+
+    #[tokio::test]
+    async fn post_agents_rejects_summary_provider_without_model() {
+        // Asymmetric pair (provider set, model unset) — same shape #877
+        // closes at the server-level config-load layer, mirrored here at
+        // the per-agent layer.
+        let mut state = agents_test_app_state_with_sqlite();
+        inject_openrouter_provider_with_key(&mut state);
+        let req = alms_core::CreateAgentRequest {
+            name: "asymmetric-a".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: Some("openrouter".into()),
+            summary_model: None,
+            is_default: None,
+        };
+        let (status, body) = create_agent_err(state, req).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err_code(&body), "SUMMARY_PROVIDER_REQUIRES_MODEL");
+    }
+
+    #[tokio::test]
+    async fn post_agents_rejects_summary_model_without_provider() {
+        let mut state = agents_test_app_state_with_sqlite();
+        inject_openrouter_provider_with_key(&mut state);
+        let req = alms_core::CreateAgentRequest {
+            name: "asymmetric-b".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: Some("minimax/minimax-m2.7".into()),
+            is_default: None,
+        };
+        let (status, body) = create_agent_err(state, req).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err_code(&body), "SUMMARY_MODEL_REQUIRES_PROVIDER");
+    }
+
+    #[tokio::test]
+    async fn post_agents_accepts_summary_pair_with_resolvable_key() {
+        // Happy path: provider entry exists AND has a resolvable key.
+        // Both fields land in the persisted record verbatim.
+        let mut state = agents_test_app_state_with_sqlite();
+        inject_openrouter_provider_with_key(&mut state);
+        let req = alms_core::CreateAgentRequest {
+            name: "happy-summary".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: Some("openrouter".into()),
+            summary_model: Some("minimax/minimax-m2.7".into()),
+            is_default: None,
+        };
+        let (status, body) = create_agent(axum::extract::State(state.clone()), Json(req))
+            .await
+            .expect("happy path must succeed");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        assert_eq!(body.0["summary_provider"], "openrouter");
+        assert_eq!(body.0["summary_model"], "minimax/minimax-m2.7");
+
+        // Round-trip: the registry-stored record carries both fields.
+        let store = state.session_manager.store().expect("sqlite store");
+        let stored = store.load_agent_by_name("happy-summary").unwrap().unwrap();
+        assert_eq!(stored.summary_provider.as_deref(), Some("openrouter"));
+        assert_eq!(
+            stored.summary_model.as_deref(),
+            Some("minimax/minimax-m2.7")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_agents_rejects_unknown_summary_provider() {
+        // PATCH path mirror: an agent is already in the registry with
+        // both summary fields unset; an UPDATE that sets `summary_provider
+        // = "nonexistent"` must reject with `SUMMARY_PROVIDER_UNKNOWN`.
+        let state = agents_test_app_state_with_sqlite();
+        let store = state.session_manager.store().expect("sqlite store");
+        let agent = new_agent("update-target");
+        store.create_agent(&agent).unwrap();
+
+        let req = alms_core::UpdateAgentRequest {
+            summary_provider: Some("nonexistent".into()),
+            summary_model: Some("some-model".into()),
+            ..Default::default()
+        };
+        let (status, body) = update_agent_err(state, agent.id.to_string(), req).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err_code(&body), "SUMMARY_PROVIDER_UNKNOWN");
+    }
+
+    #[tokio::test]
+    async fn put_agents_rejects_summary_provider_without_api_key() {
+        // PATCH path mirror of the missing-key check. Even when the
+        // entry-exists check passes, the resolvable-key check must fire
+        // before the agent record is updated.
+        let mut state = agents_test_app_state_with_sqlite();
+        inject_anthropic_provider_without_key(&mut state);
+        let store = state.session_manager.store().expect("sqlite store");
+        let agent = new_agent("missing-key-target");
+        store.create_agent(&agent).unwrap();
+
+        let req = alms_core::UpdateAgentRequest {
+            summary_provider: Some("anthropic".into()),
+            summary_model: Some("claude-haiku-4".into()),
+            ..Default::default()
+        };
+        let (status, body) = update_agent_err(state.clone(), agent.id.to_string(), req).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err_code(&body), "SUMMARY_PROVIDER_MISSING_API_KEY");
+
+        // Defense in depth: the agent record must be untouched.
+        let stored = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(
+            stored.summary_provider.is_none(),
+            "rejected PATCH must not commit summary_provider"
+        );
+        assert!(
+            stored.summary_model.is_none(),
+            "rejected PATCH must not commit summary_model"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_agents_runtime_path_surfaces_missing_key_when_key_was_removed() {
+        // The runtime case Atlas described in #878: agent was created
+        // when the API key was set; the operator removes the key from
+        // the secrets store; subsequent PATCH attempts touching the
+        // summary fields must surface `MISSING_API_KEY` cleanly. This
+        // is the second layer the load-time validator (#877) cannot
+        // cover.
+        let mut state = agents_test_app_state_with_sqlite();
+        inject_openrouter_provider_with_key(&mut state);
+        let store = state.session_manager.store().expect("sqlite store");
+
+        // Create an agent with the summary pair set while the key is
+        // still resolvable.
+        let req = alms_core::CreateAgentRequest {
+            name: "key-removed".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: Some("openrouter".into()),
+            summary_model: Some("minimax/minimax-m2.7".into()),
+            is_default: None,
+        };
+        let (_status, _body) = create_agent(axum::extract::State(state.clone()), Json(req))
+            .await
+            .expect("create must succeed while key is present");
+
+        // Operator removes the key — the entry remains configured but
+        // there's no resolvable secret. Any PATCH that touches the
+        // summary fields must reject.
+        state.secrets.write().remove_key("openrouter").unwrap();
+
+        let agent = store.load_agent_by_name("key-removed").unwrap().unwrap();
+        let patch = alms_core::UpdateAgentRequest {
+            summary_provider: Some("openrouter".into()),
+            summary_model: Some("minimax/minimax-m2.7".into()),
+            ..Default::default()
+        };
+        let (status, body) = update_agent_err(state, agent.id.to_string(), patch).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err_code(&body), "SUMMARY_PROVIDER_MISSING_API_KEY");
     }
 }

@@ -16,6 +16,7 @@ import { activeRunId } from '../../state/runs.js';
 import { dmPeer } from '../../state/agent-status.js';
 import { scrollToBottom } from '../../utils/format.js';
 import { ToolRow } from './tool-row.js';
+import { MessageTimestamp } from './message.js';
 import { dmThinkingBuffers } from '../../hooks/use-session-stream.js';
 import { cancelDm } from '../../api/sessions.js';
 import { DM_END_REASON_LABELS } from '../../utils/constants.js';
@@ -68,9 +69,21 @@ function DmMessage({ msg, participants, perspectiveAgent }) {
 
     const rendered = renderMarkdown(msg.text || '');
 
+    // Per-message timestamp on DM bubbles (PR #926 follow-up). Tim's
+    // review on PR #926 caught that `ts` was already plumbed onto
+    // `dm_message` SSE events and onto persisted DM history (see
+    // `history.js`'s isDm branch which sets `ts: m.timestamp`) but never
+    // rendered. DM is the primary chat surface — "when did Bob reply?"
+    // is exactly what #855 set out to answer — so the timestamp belongs
+    // here as much as on regular agent messages. Reuses the
+    // `<MessageTimestamp>` component from message.js so the formatting,
+    // tooltip, and CSS class stay in lock-step with the main chat view.
     return html`
         <div class="dm-msg dm-msg-${side}">
-            <div class="dm-msg-name">${agentName}</div>
+            <div class="dm-msg-name-row dm-msg-name-row-${side}">
+                <div class="dm-msg-name">${agentName}</div>
+                <${MessageTimestamp} ts=${msg.ts} />
+            </div>
             <div class="dm-msg-bubble markdown-body"
                  dangerouslySetInnerHTML=${{ __html: rendered }} />
         </div>
@@ -265,7 +278,10 @@ export function DmConversationView() {
                     if (m.pending) {
                         thinkLabel = 'Sending\u2026';
                     } else if (m.queuedBehind > 0) {
-                        thinkLabel = 'Queued \u2014 waiting for agent\u2026';
+                        // 1-indexed: queuedBehind === 1 means "next up".
+                        // Source: run_created.queued_behind (initial) and
+                        // run_queue_position SSE decrements (#831).
+                        thinkLabel = `Queued \u2014 position ${m.queuedBehind}\u2026`;
                     } else if (m.source) {
                         // Show which agent is thinking when source info is available.
                         // DM thinking messages carry source like "peer:AgentName".
@@ -327,9 +343,20 @@ export function DmConversationView() {
                 if (m.type === 'image') {
                     const side = messageSide(m, participants, perspectiveAgent);
                     const agentName = m.fromAgent || (side === 'left' ? participants[0] : participants[1]) || '?';
+                    // Image DMs share the same name + timestamp row as text
+                    // bubbles (PR #926 Tim re-review nit 2). Image DMs are
+                    // a primary chat surface — "when did Bob send this?"
+                    // matters as much for an image as for text — so the
+                    // same `.dm-msg-name-row` flex wrapper applies. The
+                    // shared `<MessageTimestamp>` returns null for falsy
+                    // `ts`, so older history without timestamps degrades
+                    // gracefully into a single-name row.
                     return html`
                         <div key=${m.id} class="dm-msg dm-msg-${side}">
-                            <div class="dm-msg-name">${agentName}</div>
+                            <div class="dm-msg-name-row dm-msg-name-row-${side}">
+                                <div class="dm-msg-name">${agentName}</div>
+                                <${MessageTimestamp} ts=${m.ts} />
+                            </div>
                             <div class="dm-msg-bubble">
                                 ${m.url
                                     ? html`<img src=${m.url} alt=${m.alt || ''} class="dm-msg-image" />`

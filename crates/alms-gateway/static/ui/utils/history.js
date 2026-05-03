@@ -168,13 +168,30 @@ export function mapHistoryMessages(msgs, opts) {
             // These are the agent's internal thinking text, stored as
             // Role::User with message_type="reasoning". Map them to a
             // special type that groupDmReasoningBlocks() can collect.
+            //
+            // For reasoning-capable models (Anthropic thinking_budget_tokens,
+            // OpenAI reasoning_effort, Gemini thinking_budget — see #767/
+            // #768/#769) the runtime persists the visible assistant text in
+            // `content` and the extended-thinking trace in
+            // `metadata.reasoning_blocks` (see `merge_reasoning_blocks` in
+            // loop_impl.rs). Prefer the trace when present so the reload
+            // render matches the live thinking pane (#897). Fall back to
+            // `m.content` for non-reasoning models that have no
+            // `reasoning_blocks` metadata. Fixes #898.
             const isReasoningText = m.metadata
                 && m.metadata.message_type === 'reasoning';
             if (isReasoningText) {
+                let text = '';
+                if (Array.isArray(m.metadata.reasoning_blocks)) {
+                    text = m.metadata.reasoning_blocks
+                        .map(b => (b && typeof b.text === 'string') ? b.text : '')
+                        .join('');
+                }
+                if (!text) text = m.content || '';
                 pushEntry({
                     id: nextMsgId(),
                     type: 'dm_reasoning_text',
-                    text: m.content || '',
+                    text,
                     fromAgent: m.metadata.from_agent || null,
                     runId: m.metadata.run_id || null,
                 }, m.timestamp);
@@ -216,6 +233,12 @@ export function mapHistoryMessages(msgs, opts) {
             }
 
             // Run boundary markers -> run_boundary dividers between runs.
+            // Failed/cancelled boundaries also carry `metadata.kind == "error"`
+            // (issue #874) so the runtime backfills them into the LLM
+            // context, but the UI still renders them as run_boundary
+            // dividers (red border + label) — that visual treatment
+            // already conveys "this run failed" without a separate
+            // ErrorMessage block.
             if (isSynthetic && m.metadata.type === 'run_boundary') {
                 const runStatus = m.metadata.status || 'completed';
                 pushEntry({
@@ -225,6 +248,23 @@ export function mapHistoryMessages(msgs, opts) {
                     runId: m.metadata.run_id || null,
                     error: m.metadata.error || null,
                     text: m.content || '',
+                }, m.timestamp);
+                continue;
+            }
+
+            // Error markers that don't have a paired run_boundary —
+            // currently `runtime_init_error` for runs whose runtime failed
+            // to construct before the agent loop started (#874). Render
+            // them with the existing ErrorMessage component (red border,
+            // X icon) so they match the SSE-time error toast styling.
+            if (isSynthetic && m.metadata.kind === 'error') {
+                pushEntry({
+                    id: nextMsgId(),
+                    type: 'error',
+                    text: m.metadata.error
+                        ? `${m.content}\n\n${m.metadata.error}`.trim()
+                        : (m.content || 'Run error'),
+                    code: m.metadata.error_kind || m.metadata.type || null,
                 }, m.timestamp);
                 continue;
             }
@@ -306,6 +346,10 @@ export function mapHistoryMessages(msgs, opts) {
                 reasoning,
                 // Carry the sender name so Message can show it as the label.
                 fromAgent: isDm ? m.metadata.from_agent : undefined,
+                // Per-message timestamp (#855) — passed through to the
+                // Message component so each chat row can render a discreet
+                // grey time stamp with the full ISO available on hover.
+                ts: m.timestamp || null,
             }, m.timestamp);
         } else if (m.type === 'tool_call') {
             const callId = (m.metadata && m.metadata.tool_call_id) || null;
@@ -387,6 +431,8 @@ export function mapHistoryMessages(msgs, opts) {
                 runId: enrichedRunId || undefined,
                 isReasoning: isReasoning || undefined,
                 fromAgent,
+                // Per-message timestamp (#855) for tool rows.
+                ts: m.timestamp || null,
             }, m.timestamp);
         } else if (m.type === 'image') {
             // DM image messages use the same metadata pattern as text. (#546)
@@ -401,6 +447,8 @@ export function mapHistoryMessages(msgs, opts) {
                 alt: m.alt || '',
                 sealed: true,
                 fromAgent: isDmImg ? m.metadata.from_agent : undefined,
+                // Per-message timestamp (#855) for image rows.
+                ts: m.timestamp || null,
             }, m.timestamp);
         }
         // tool_result entries are consumed via resultMap -- skip them here
@@ -473,6 +521,8 @@ export function mapHistoryMessages(msgs, opts) {
                     // after reload when session-level persistence was lost.
                     isReasoning: isDm || undefined,
                     fromAgent,
+                    // Per-message timestamp (#855).
+                    ts: pair.call.timestamp || null,
                 },
                 ts: pair.call.timestamp || null,
             });

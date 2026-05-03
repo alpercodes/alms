@@ -36,13 +36,6 @@
   letter-spacing: 0.06em;
 }
 .settings-hint { font-size: var(--text-2xs); color: var(--text-disabled); }
-/* Provider/model "disabled" hint sits directly under the Provider+Model
-   row (#865); pull it tight against the row above so it visually groups
-   with that pair instead of floating into the Max-tokens row below. */
-.settings-overrides-disabled-note {
-  margin-top: calc(-1 * var(--space-1));
-  margin-bottom: var(--space-2);
-}
 .settings-input, .settings-select {
   background: var(--surface-1);
   border: 1px solid var(--border-default);
@@ -236,37 +229,11 @@
   word-break: break-all;
 }
 
-/* Per-run overrides header */
-.settings-overrides-header {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-/* Sub-section header within per-run overrides (e.g. Reasoning & thinking).
-   Visually lighter than the main overrides header — same flex-column shape
-   but with a top margin to separate it from the preceding grid. */
-.settings-overrides-subheader {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-top: var(--space-2);
-}
-
-/* Tri-state budget control (Inherit / Disable / Custom) — modal flavor.
-   Used by the shared <BudgetTriState> component when the modal supplies
-   its own className map. The select sits flush; the optional number
-   input renders inline next to it when mode === 'custom'. */
-.settings-tristate-group {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-}
-.settings-tristate-group .settings-select { flex: 1 1 auto; min-width: 0; }
-.settings-tristate-value { flex: 0 0 auto; max-width: 50%; }
-
-/* Effective value hint below each editable field */
+/* "Effective" value hint kept for the summary-model row, which still
+   shows a one-line preview of the resolved model under the input. The
+   per-run override decorations (.settings-effective-source,
+   .settings-overrides-*, .settings-override-marker, .settings-tristate-*)
+   were removed in the #941 pivot along with the per-run UI surface. */
 .settings-effective {
   font-size: var(--text-2xs);
   color: var(--text-disabled);

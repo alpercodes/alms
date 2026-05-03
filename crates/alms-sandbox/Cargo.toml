@@ -18,6 +18,7 @@ async-trait.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 reqwest.workspace = true
+futures.workspace = true
 chrono.workspace = true
 iana-time-zone = "0.1"
 regex.workspace = true

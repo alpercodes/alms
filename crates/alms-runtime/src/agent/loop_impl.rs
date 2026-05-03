@@ -1,9 +1,11 @@
-use crate::events::{PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS, RuntimeEvent};
+use crate::events::{PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS, RuntimeEvent, RuntimeEventSender};
 use crate::llm_types::*;
 use alms_core::{AlmsError, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
 use alms_session::{
     Content as SessionContent, Message as SessionMessage, Role as SessionRole, SessionManager,
 };
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -14,6 +16,76 @@ use super::dm::{
 };
 use super::helpers::tool_result_ok;
 use super::types::Posture;
+
+/// In-flight tool-call tracker shared between `run_tool_calls` and
+/// `execute_tool_call`.
+///
+/// Keyed by `invocation_id` (the SSE-facing identifier carried by both
+/// `ToolStart` and `ToolEnd`), value is the canonical tool name (kept for
+/// log context when the outer cancel arm synthesises `ToolEnd` events).
+///
+/// **Protocol**:
+///   1. `execute_tool_call` inserts `(invocation_id, name)` immediately
+///      before emitting `ToolStart`, and removes the entry immediately
+///      before emitting any of its terminal `ToolEnd` paths (success,
+///      error, denied, cancel-during-approval-wait).
+///   2. When the outer `select!` cancel arm fires (cancel-during-tool-
+///      execution), the inner `execute_tool_call` future is dropped at an
+///      `await` point — between award boundaries the steps in (1) are
+///      synchronous, so any entry still in the tracker corresponds to a
+///      live `tool_start` with no terminal event yet.
+///   3. The cancel arm drains the tracker and emits a synthetic
+///      `ToolEnd { ok: false, result: {"error": "run cancelled"} }` per
+///      remaining entry, restoring the 1:1 invariant before returning
+///      `AlmsError::Cancelled`. (Mirrors the result shape from the
+///      cancel-during-approval-wait fix in #816 / #845.)
+///
+/// See issue #846 for the full bug write-up. The frontend defensive sweep
+/// at `use-session-stream.js` (added in #594 to mask this bug at the UI
+/// layer) is removed in the same PR — the runtime is now solely
+/// responsible for terminal-event emission.
+type InflightTracker = Mutex<HashMap<Uuid, String>>;
+
+/// Remove `invocation_id` from the in-flight tracker if present. Called by
+/// each terminal `ToolEnd` emission path inside `execute_tool_call` so the
+/// outer cancel arm in `run_tool_calls` does not synthesise a duplicate
+/// event for a tool that already terminated.
+///
+/// Cheap (single hashmap remove) and a no-op when no tracker is attached.
+fn unregister_inflight(inflight: Option<&InflightTracker>, invocation_id: Uuid) {
+    if let Some(tracker) = inflight {
+        let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        guard.remove(&invocation_id);
+    }
+}
+
+/// Drain `inflight` and emit a synthetic `ToolEnd` for each remaining
+/// entry. Used by the outer cancel arms in `run_tool_calls` after one of
+/// the `select!` cancel branches wins and the inner futures are dropped.
+fn synthesize_cancel_tool_ends(sender: Option<&RuntimeEventSender>, inflight: &InflightTracker) {
+    let drained: Vec<(Uuid, String)> = {
+        let mut guard = inflight.lock().unwrap_or_else(|p| p.into_inner());
+        guard.drain().collect()
+    };
+    if drained.is_empty() {
+        return;
+    }
+    let Some(sender) = sender else { return };
+    for (invocation_id, tool_name) in drained {
+        debug!(
+            tool_name = %tool_name,
+            invocation_id = %invocation_id,
+            "Emitting synthetic tool_end for cancel-during-tool-execution (#846)"
+        );
+        let _ = sender.send(RuntimeEvent::ToolEnd {
+            invocation_id,
+            ok: false,
+            result: serde_json::json!({"error": "run cancelled"}),
+            source_agent: None,
+            task_id: None,
+        });
+    }
+}
 
 /// Output of a completed agent loop.
 ///
@@ -572,7 +644,7 @@ impl AgentRuntime {
     ///
     /// Returns `Err(AlmsError::Cancelled)` if the run is cancelled during
     /// execution; otherwise returns the result vector in tool_calls order.
-    async fn run_tool_calls(
+    pub(crate) async fn run_tool_calls(
         &self,
         tool_calls: &[ToolCall],
         invocation_ids: &[Uuid],
@@ -580,6 +652,11 @@ impl AgentRuntime {
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
     ) -> AlmsResult<Vec<AlmsResult<serde_json::Value>>> {
+        // Tracker for in-flight tool calls (#846). Shared with each
+        // `execute_tool_call` invocation so the outer cancel arms below can
+        // synthesise matching `ToolEnd` events for any tool whose inner
+        // future was dropped mid-flight by `tokio::select!`.
+        let inflight: InflightTracker = Mutex::new(HashMap::new());
         match self.config.posture {
             Posture::Guarded => {
                 // Sequential execution with cancellation support during each tool.
@@ -599,11 +676,19 @@ impl AgentRuntime {
                     }
                     let result = if let Some(ref token) = self.cancel_token {
                         tokio::select! {
-                            r = self.execute_tool_call(tc, inv_id, session_manager, session_id) => r,
-                            _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                            r = self.execute_tool_call(tc, inv_id, session_manager, session_id, Some(&inflight)) => r,
+                            _ = token.cancelled() => {
+                                // Cancel-during-tool-execution (#846): the
+                                // inner future was dropped at an await point
+                                // inside `execute_tool_call`. Emit synthetic
+                                // `ToolEnd` events for any tool that had
+                                // already fired `ToolStart`, then unwind.
+                                synthesize_cancel_tool_ends(self.event_sender.as_ref(), &inflight);
+                                return Err(AlmsError::Cancelled);
+                            }
                         }
                     } else {
-                        self.execute_tool_call(tc, inv_id, session_manager, session_id)
+                        self.execute_tool_call(tc, inv_id, session_manager, session_id, None)
                             .await
                     };
                     results.push(result);
@@ -629,12 +714,25 @@ impl AgentRuntime {
                             invocation_ids[i],
                             session_manager,
                             session_id,
+                            Some(&inflight),
                         )
                     });
                     if let Some(ref token) = self.cancel_token {
                         tokio::select! {
                             r = futures::future::join_all(exec_futures) => r,
-                            _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                            _ = token.cancelled() => {
+                                // Cancel-during-tool-execution (#846): up to
+                                // N inner futures were running concurrently
+                                // when the cancel arm won — each one needs a
+                                // synthetic `ToolEnd` to match its already-
+                                // emitted `ToolStart`. Tools that finished
+                                // before the cancel raced through have
+                                // already removed themselves from the
+                                // tracker, so this only synthesises for
+                                // genuinely in-flight calls.
+                                synthesize_cancel_tool_ends(self.event_sender.as_ref(), &inflight);
+                                return Err(AlmsError::Cancelled);
+                            }
                         }
                     } else {
                         futures::future::join_all(exec_futures).await
@@ -810,8 +908,24 @@ impl AgentRuntime {
 
     /// Process tool execution results: push tool result messages into the
     /// conversation, persist to session, and collect per-run records.
+    ///
+    /// Every result is routed through the shared in-loop tool-output
+    /// truncation service (issue #851) before it lands in `messages` or
+    /// the session DB. When truncation fires, the *truncated* preview
+    /// (head + tail + spill-path hint) is what enters the conversation
+    /// AND what is persisted, so the rebuild path on the next run
+    /// observes the same bytes the live agent saw — no asymmetry between
+    /// "in-loop view" and "session-history view". The
+    /// `truncated_in_loop: true` flag in the message metadata tells
+    /// `session_msg_to_llm` to skip its own (smaller) re-truncation pass.
+    ///
+    /// Visible to test code (in this crate and `alms-coordinator`) so
+    /// integration tests can drive the truncation path without spinning
+    /// up a full LLM round trip. Not part of the public API surface —
+    /// `#[doc(hidden)]` keeps it out of generated docs.
+    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)] // Private helper; the parameters are clear and grouping them into a struct would add indirection without real benefit.
-    fn process_tool_results(
+    pub fn process_tool_results(
         &self,
         tool_calls: &[ToolCall],
         results: Vec<AlmsResult<serde_json::Value>>,
@@ -823,16 +937,48 @@ impl AgentRuntime {
         session_id: alms_core::SessionId,
         is_dm: bool,
     ) {
+        // Workspace root for relativising spill paths in the LLM-visible
+        // hint. When no workspace is attached (e.g. unit tests), fall back
+        // to the resolved sandbox root, then to None — `truncate` handles
+        // the None case by emitting the absolute path.
+        let workspace_root = self.workspace_root_for_truncate();
+
         for ((tool_call, result), invocation_id) in
             tool_calls.iter().zip(results).zip(invocation_ids)
         {
-            let (content, ok) = match result {
+            let (raw_content, ok) = match result {
                 Ok(value) => {
                     let ok = tool_result_ok(&value);
                     (value.to_string(), ok)
                 }
                 Err(e) => (format!("Error: {}", e), false),
             };
+
+            // Apply the shared in-loop truncation policy. When the policy
+            // is disabled (e.g. unit tests, gateway with the feature
+            // turned off in TOML), `truncate` is a pass-through.
+            let outcome = crate::tool_output_truncate::truncate(
+                &raw_content,
+                &self.tool_output_truncate_policy,
+                &tool_call.id,
+                workspace_root.as_deref(),
+            );
+            let content = outcome.content;
+            let truncated_in_loop = outcome.truncated;
+
+            if truncated_in_loop {
+                debug!(
+                    target: "agent::loop",
+                    tool = %tool_call.function.name,
+                    tool_call_id = %tool_call.id,
+                    original_bytes = outcome.original_bytes,
+                    original_lines = outcome.original_lines,
+                    preview_bytes = content.len(),
+                    spill_path = ?outcome.output_path,
+                    "Tool output truncated by in-loop service (#851)"
+                );
+            }
+
             messages.push(LlmMessage::tool_result(&tool_call.id, content.clone()));
 
             // Persist tool result to session history.
@@ -848,11 +994,36 @@ impl AgentRuntime {
             // merged with the existing ok/tool_invocation_id fields. This
             // preserves the DM invariant (all shared-session messages are
             // Role::User) and enables UI reasoning block reconstruction.
+            //
+            // When the in-loop truncate fired, we mark the persisted row
+            // with `truncated_in_loop: true` so `session_msg_to_llm` skips
+            // its own 2000-byte re-truncation — the bytes already on disk
+            // are the bytes the agent saw live.
             {
-                let base_meta = serde_json::json!({
+                let mut base_meta = serde_json::json!({
                     "ok": ok,
                     "tool_invocation_id": invocation_id.to_string(),
                 });
+                if truncated_in_loop && let Some(obj) = base_meta.as_object_mut() {
+                    obj.insert(
+                        "truncated_in_loop".to_string(),
+                        serde_json::Value::Bool(true),
+                    );
+                    obj.insert(
+                        "original_bytes".to_string(),
+                        serde_json::Value::Number(outcome.original_bytes.into()),
+                    );
+                    obj.insert(
+                        "original_lines".to_string(),
+                        serde_json::Value::Number(outcome.original_lines.into()),
+                    );
+                    if let Some(ref path) = outcome.output_path {
+                        obj.insert(
+                            "spill_path".to_string(),
+                            serde_json::Value::String(path.clone()),
+                        );
+                    }
+                }
                 let (role, metadata) = if is_dm {
                     (
                         SessionRole::User,
@@ -891,6 +1062,64 @@ impl AgentRuntime {
                 from_agent: self.agent_name.clone(),
             });
             *tool_seq += 1;
+        }
+    }
+
+    /// Resolve the workspace root for spill-path relativisation.
+    ///
+    /// Falls back to `resolved_sandbox_root` when no workspace is attached
+    /// (e.g. unnamed agents) and to `None` when the agent has neither (the
+    /// truncate service emits the absolute path in that case). Centralised so
+    /// `process_tool_results` and `truncate_for_emit` see the same root.
+    pub(crate) fn workspace_root_for_truncate(&self) -> Option<std::path::PathBuf> {
+        self.workspace
+            .as_ref()
+            .map(|w| w.dir().to_path_buf())
+            .or_else(|| self.resolved_sandbox_root.clone())
+    }
+
+    /// Truncate a tool result `Value` for emission on the audit log + the
+    /// `ToolEnd` SSE event (#921 review fix #4).
+    ///
+    /// The pre-#921 paths emitted the full untruncated `Value` regardless of
+    /// size — context-window protection was the only consumer of the in-loop
+    /// truncation service. Tim flagged that this still let a 10 MB tool
+    /// output saturate SSE bandwidth and audit-log disk even after the
+    /// in-loop messages vec was capped. Routing the audit + SSE payloads
+    /// through the same `truncate` service closes that gap.
+    ///
+    /// Behaviour:
+    /// - When the truncate policy is disabled OR the JSON-stringified value
+    ///   is inside both caps, the original `Value` is returned unchanged
+    ///   (preserves structured-JSON wire shape for small results).
+    /// - When truncation fires, returns a `Value::String(preview)` carrying
+    ///   the head+tail preview with the spill-path hint appended. Wire-shape
+    ///   for oversized results becomes a JSON string instead of a structured
+    ///   object — consumers that want the full bytes use the spill file.
+    ///
+    /// Visible across crates (`alms-coordinator` integration tests) but
+    /// `#[doc(hidden)]` so it stays off the public API surface.
+    #[doc(hidden)]
+    pub fn truncate_for_emit(
+        &self,
+        tool_call_id: &str,
+        value: &serde_json::Value,
+    ) -> serde_json::Value {
+        if !self.tool_output_truncate_policy.is_active() {
+            return value.clone();
+        }
+        let raw = value.to_string();
+        let workspace_root = self.workspace_root_for_truncate();
+        let outcome = crate::tool_output_truncate::truncate(
+            &raw,
+            &self.tool_output_truncate_policy,
+            tool_call_id,
+            workspace_root.as_deref(),
+        );
+        if outcome.truncated {
+            serde_json::Value::String(outcome.content)
+        } else {
+            value.clone()
         }
     }
 
@@ -1073,9 +1302,18 @@ impl AgentRuntime {
     }
 
     /// Execute a tool call, emitting tool_start/tool_end events and handling approvals.
+    ///
+    /// `inflight` is the in-flight tool tracker shared with `run_tool_calls`
+    /// (see [`InflightTracker`]). When `Some`, this method registers the
+    /// `(invocation_id, tool_name)` pair before emitting `ToolStart` and
+    /// removes it before any of its terminal `ToolEnd` paths so the outer
+    /// `select!` cancel arm can synthesise events for any future that was
+    /// dropped mid-flight. `None` is used by the non-cancel-token branch
+    /// and by tests that do not care about cancel-during-execution
+    /// bookkeeping.
     #[instrument(
         level = "info",
-        skip(self, tool_call, invocation_id, session_manager),
+        skip(self, tool_call, invocation_id, session_manager, inflight),
         fields(
             agent_id = %self.agent_id.0,
             tool_name = %tool_call.function.name,
@@ -1090,6 +1328,7 @@ impl AgentRuntime {
         invocation_id: Uuid,
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
+        inflight: Option<&InflightTracker>,
     ) -> AlmsResult<serde_json::Value> {
         let name = &tool_call.function.name;
         let args_str = &tool_call.function.arguments;
@@ -1149,6 +1388,34 @@ impl AgentRuntime {
             return Err(err);
         }
 
+        // Hoisted guard (Tim's nit on #846): the Guarded-posture branch
+        // below requires an event sender to emit `ApprovalRequired`. If
+        // we discover that requirement AFTER inserting into the in-flight
+        // tracker, the early-return via `?` would leave a dangling
+        // tracker entry, and a subsequent outer cancel arm would
+        // synthesise a `ToolEnd` for an `invocation_id` that never had a
+        // matching `ToolStart` (the emit below is itself gated on
+        // `Some(ref sender)`). Validating up-front keeps the
+        // tracker-insert + tool_start-emit + approval-gate trio
+        // structurally consistent.
+        let auto_approved = self.tools.is_auto_approved(name);
+        let needs_approval_gate = self.config.posture == Posture::Guarded && !auto_approved;
+        if needs_approval_gate && self.event_sender.is_none() {
+            return Err(alms_core::AlmsError::Runtime(
+                "Guarded posture requires an event sender for approvals".to_string(),
+            ));
+        }
+
+        // Register in the in-flight tracker BEFORE emitting tool_start so
+        // that if the next await is dropped by an outer cancel arm (#846),
+        // the cancel arm can find this entry and synthesise a matching
+        // ToolEnd. Insert + emit are both synchronous, so no future
+        // cancellation can fire between them.
+        if let Some(tracker) = inflight {
+            let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+            guard.insert(invocation_id, name.to_string());
+        }
+
         // Emit tool_start
         if let Some(ref sender) = self.event_sender {
             let _ = sender.send(RuntimeEvent::ToolStart {
@@ -1164,18 +1431,17 @@ impl AgentRuntime {
         // Auto-approved tools (datetime, echo, read-only tools) bypass this
         // gate — they are inherently safe and requiring approval adds friction
         // with zero security benefit.
-        let auto_approved = self.tools.is_auto_approved(name);
         if self.config.posture == Posture::Guarded && auto_approved {
             debug!(
                 tool_name = %name,
                 "Auto-approved tool — skipping approval gate in guarded posture"
             );
-        } else if self.config.posture == Posture::Guarded {
-            let sender = self.event_sender.as_ref().ok_or_else(|| {
-                alms_core::AlmsError::Runtime(
-                    "Guarded posture requires an event sender for approvals".to_string(),
-                )
-            })?;
+        } else if needs_approval_gate {
+            // Sender presence already validated above; unwrap is safe.
+            let sender = self
+                .event_sender
+                .as_ref()
+                .expect("event_sender presence validated above");
             let approval_id = Uuid::new_v4();
             let (decision_tx, decision_rx) = tokio::sync::oneshot::channel();
             let _ = sender.send(RuntimeEvent::ApprovalRequired {
@@ -1186,22 +1452,123 @@ impl AgentRuntime {
                 source_agent: None,
             });
             // Checkpoint D: approval wait with cancellation support.
+            //
+            // If the run is cancelled while we're blocked here, we MUST emit a
+            // matching `ToolEnd` for the `tool_start` we already fired above —
+            // the frontend's spinner-cleanup, group-collapsing, and
+            // persisted-state-parity logic all rely on that 1:1 invariant. See
+            // #816 (the cancel-during-approval-wait counterpart of the
+            // post-approval-resolve fix in #800/#803).
             let approved = if let Some(ref token) = self.cancel_token {
                 tokio::select! {
                     result = decision_rx => result.unwrap_or(false),
-                    _ = token.cancelled() => return Err(AlmsError::Cancelled),
+                    _ = token.cancelled() => {
+                        // Unregister before emit so the outer cancel arm in
+                        // `run_tool_calls` does not synthesise a duplicate
+                        // (#846 protocol).
+                        unregister_inflight(inflight, invocation_id);
+                        // #893: persist the cancellation to the audit log.
+                        // Sibling gap to #815 in the same approval gate. Without
+                        // this append, the audit trail cannot distinguish
+                        // "approval pending then run cancelled" from "approval
+                        // never happened" — operators see a `tool_start` with
+                        // no corresponding audit row. Using `AuditDecision::Deny`
+                        // (rather than introducing a new variant) keeps the
+                        // schema/wire shape stable; the error string is the
+                        // discriminator that lets log queries separate
+                        // user-denial (#815) from cancellation here.
+                        let cancel_reason = format!(
+                            "Tool '{}' approval cancelled by run cancellation",
+                            name
+                        );
+                        let _ = session_manager.append_audit(
+                            session_id,
+                            AuditEvent {
+                                session_id,
+                                run_id: self.run_id,
+                                tool: name.to_string(),
+                                decision: AuditDecision::Deny,
+                                params: args.clone(),
+                                result: None,
+                                error: Some(cancel_reason),
+                                timestamp: alms_core::Timestamp::now(),
+                            },
+                        );
+                        let _ = sender.send(RuntimeEvent::ToolEnd {
+                            invocation_id,
+                            ok: false,
+                            result: serde_json::json!({"error": "run cancelled"}),
+                            source_agent: None,
+                            task_id: None,
+                        });
+                        return Err(AlmsError::Cancelled);
+                    }
                 }
             } else {
                 match decision_rx.await {
                     Ok(v) => v,
                     Err(_) => {
-                        return Err(alms_core::AlmsError::ToolExecution(
-                            "Approval channel closed".to_string(),
-                        ));
+                        // #894: persist the channel-closed unwind to the audit
+                        // log. Sibling gap to #815 / #893. Without this append,
+                        // a closed approval channel (approver disconnected,
+                        // gateway shutting down, channel adapter dropped the
+                        // receiver) leaves a `tool_start` with no audit row and
+                        // operators have to dig through logs to figure out why.
+                        // Using `AuditDecision::Deny` mirrors the pattern from
+                        // #815 (user denial) and #893 (cancellation) — the
+                        // error string is the discriminator. The cancel-token
+                        // branch is not active here (`inflight` is `None`), so
+                        // no inflight unregister is needed.
+                        //
+                        // The error string mirrors the `Tool '{name}'` prefix
+                        // shape used by #815 and #893 so log queries that
+                        // filter by tool-name prefix catch all three audit-
+                        // Deny paths (Tim's review on PR #925).
+                        let closed_reason = format!("Tool '{}' approval channel closed", name);
+                        let _ = session_manager.append_audit(
+                            session_id,
+                            AuditEvent {
+                                session_id,
+                                run_id: self.run_id,
+                                tool: name.to_string(),
+                                decision: AuditDecision::Deny,
+                                params: args.clone(),
+                                result: None,
+                                error: Some(closed_reason.clone()),
+                                timestamp: alms_core::Timestamp::now(),
+                            },
+                        );
+                        return Err(alms_core::AlmsError::ToolExecution(closed_reason));
                     }
                 }
             };
             if !approved {
+                unregister_inflight(inflight, invocation_id);
+                // #815: persist the denial to the audit log. Without this
+                // append, the audit trail is one-sided — it captures every
+                // approved tool call but silently drops user-rejected ones,
+                // so operators cannot retroactively answer "did I deny X
+                // at this time?". Mirror the structure of the approve+execute
+                // success path's audit emission, but with `Decision::Deny`
+                // and a denial-shaped error string. The deny path for
+                // unknown-tools / argument-parse failures earlier in this
+                // function already uses `AuditDecision::Deny`; user denials
+                // belong in the same bucket — they are a policy decision,
+                // not a runtime execution failure (`AuditDecision::Error`).
+                let denial_reason = format!("Tool '{}' denied by user", name);
+                let _ = session_manager.append_audit(
+                    session_id,
+                    AuditEvent {
+                        session_id,
+                        run_id: self.run_id,
+                        tool: name.to_string(),
+                        decision: AuditDecision::Deny,
+                        params: args.clone(),
+                        result: None,
+                        error: Some(denial_reason.clone()),
+                        timestamp: alms_core::Timestamp::now(),
+                    },
+                );
                 let _ = sender.send(RuntimeEvent::ToolEnd {
                     invocation_id,
                     ok: false,
@@ -1209,16 +1576,23 @@ impl AgentRuntime {
                     source_agent: None,
                     task_id: None,
                 });
-                return Err(alms_core::AlmsError::ToolExecution(format!(
-                    "Tool '{}' denied by user",
-                    name
-                )));
+                return Err(alms_core::AlmsError::ToolExecution(denial_reason));
             }
         }
 
         // Execute
         let result = self.tools.execute(name, args.clone()).await;
         let elapsed = start.elapsed();
+
+        // The inner future has finished and we are now in synchronous code
+        // that emits the matching ToolEnd. Unregister from the in-flight
+        // tracker BEFORE the emission below so the outer cancel arm in
+        // `run_tool_calls` cannot synthesise a duplicate ToolEnd.
+        //
+        // Safety: from this point until the ToolEnd `sender.send(..)` call
+        // there are no `await`s, so `tokio::select!` cannot drop this
+        // future and the cancel arm cannot fire. (#846 protocol)
+        unregister_inflight(inflight, invocation_id);
 
         match &result {
             Ok(value) => {
@@ -1230,6 +1604,23 @@ impl AgentRuntime {
                     duration_ms = %elapsed.as_millis(),
                     "Tool execution succeeded"
                 );
+                // Route the audit-log + ToolEnd SSE payloads through the
+                // shared in-loop truncation service (#921 review fix #4).
+                // Pre-fix, an oversized tool result hit both the audit log
+                // and the SSE channel uncapped — eating audit-log disk and
+                // SSE bandwidth even though the in-loop messages vec was
+                // already capped by `process_tool_results`. The agent-visible
+                // preview, the audit log, and the SSE event now see the same
+                // truncated content + spill-path hint.
+                //
+                // The spill file is written here (and possibly again in
+                // `process_tool_results`); the second write is idempotent
+                // because both paths use the same deterministic
+                // `tool_<sanitized_call_id>.txt` filename and the same raw
+                // bytes. The `truncate` service falls through cheaply when
+                // the policy is disabled or the value is already inside the
+                // caps.
+                let emit_value = self.truncate_for_emit(&tool_call.id, value);
                 let _ = session_manager.append_audit(
                     session_id,
                     AuditEvent {
@@ -1238,7 +1629,7 @@ impl AgentRuntime {
                         tool: name.to_string(),
                         decision: AuditDecision::Allow,
                         params: args,
-                        result: Some(value.clone()),
+                        result: Some(emit_value.clone()),
                         error: None,
                         timestamp: alms_core::Timestamp::now(),
                     },
@@ -1249,7 +1640,7 @@ impl AgentRuntime {
                     let _ = sender.send(RuntimeEvent::ToolEnd {
                         invocation_id,
                         ok,
-                        result: value.clone(),
+                        result: emit_value,
                         source_agent: None,
                         task_id: None,
                     });

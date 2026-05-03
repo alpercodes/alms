@@ -137,7 +137,8 @@ CREATE TABLE IF NOT EXISTS runs (
     completion_tokens INTEGER,
     job_id            TEXT,
     parent_run_id     TEXT,
-    created_at        TEXT NOT NULL
+    created_at        TEXT NOT NULL,
+    resolved_config   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id);
@@ -283,6 +284,12 @@ impl SqliteStore {
         // Auto-migrate: add index on runs(agent_id) for timeline queries.
         let _ =
             conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_runs_agent_id ON runs(agent_id);");
+        // Auto-migrate: add resolved_config column for the layered run-config
+        // snapshot (#837). Stored as a JSON-encoded TEXT blob — the column
+        // is NULL for runs created before the snapshot was wired up so the
+        // backward-compat surface is "old rows hydrate with `resolved_config:
+        // None`" without explicit handling.
+        let _ = conn.execute_batch("ALTER TABLE runs ADD COLUMN resolved_config TEXT;");
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -530,7 +537,8 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
 /// Expected column order:
 ///   0: run_id, 1: session_id, 2: agent_id, 3: input, 4: response,
 ///   5: error, 6: status, 7: started_at, 8: ended_at,
-///   9: prompt_tokens, 10: completion_tokens, 11: job_id, 12: created_at
+///   9: prompt_tokens, 10: completion_tokens, 11: job_id,
+///   12: parent_run_id, 13: created_at, 14: resolved_config (#837)
 fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let run_id_str: String = row.get(0)?;
     let session_id_str: String = row.get(1)?;
@@ -546,6 +554,29 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let job_id_str: Option<String> = row.get(11)?;
     let parent_run_id_str: Option<String> = row.get(12)?;
     let created_at_str: String = row.get(13)?;
+    // #837: optional JSON-encoded snapshot of the layered run config.
+    // Older rows (or runs that never advanced past Queued) carry NULL —
+    // surfaced to callers as `resolved_config: None`. Corrupt JSON
+    // is tolerated: we log a warning and fall back to None rather
+    // than failing the whole row, matching the existing `started_at` /
+    // `ended_at` permissive-parse pattern.
+    //
+    // Why the permissive `.ok().flatten()` form: the realistic failure
+    // mode this guards is a NULL-valued cell on a row that predates #837
+    // (or was inserted via a code path that didn't set `resolved_config`).
+    // `row.get::<_, Option<String>>(14)?` would also handle the NULL
+    // cleanly — `?` and `.ok().flatten()` are technically equivalent for
+    // the NULL case. The permissive form is kept as defense-in-depth: if
+    // a future schema change drops or renames the column (or the
+    // best-effort `ALTER TABLE ADD COLUMN` migration above ever stops
+    // running on some path), the strict `?` would propagate
+    // `InvalidColumnIndex` / `InvalidColumnName` and poison every row
+    // hydration; `.ok().flatten()` collapses both "missing column" and
+    // "NULL cell" into `resolved_config: None` so triage degrades
+    // gracefully — the run still hydrates with no snapshot. Do NOT
+    // tighten this to `row.get(14)?` without auditing those failure
+    // paths.
+    let resolved_config_str: Option<String> = row.get(14).ok().flatten();
 
     let run_id_uuid = uuid::Uuid::parse_str(&run_id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -605,6 +636,20 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
     let parent_run_id = parent_run_id_str
         .and_then(|s| uuid::Uuid::parse_str(&s).ok())
         .map(RunId);
+    // #837: parse the JSON-encoded layered run-config snapshot. NULL
+    // (old rows) and corrupt JSON both surface as `None` — the latter
+    // is logged so triage can spot a snapshot persisted under a now-
+    // incompatible serde shape.
+    let resolved_config = resolved_config_str.and_then(|s| match serde_json::from_str(&s) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            tracing::warn!(
+                run_id = %run_id_str,
+                "Corrupt resolved_config in DB, hydrating as None: {e}"
+            );
+            None
+        }
+    });
 
     Ok(Run {
         run_id: RunId(run_id_uuid),
@@ -620,5 +665,6 @@ fn parse_run_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
         ended_at,
         job_id,
         parent_run_id,
+        resolved_config,
     })
 }

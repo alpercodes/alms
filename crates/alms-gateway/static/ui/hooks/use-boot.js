@@ -5,11 +5,12 @@ import { sessions, activeSessionId, showNotifications } from '../state/sessions.
 import { activeRunId, selectedRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
 import { replaceMessages } from '../state/chat-actions.js';
-import { messageQueue } from '../state/queue.js';
+import { messageQueue, bgRuns } from '../state/queue.js';
 import { wsFiles } from '../state/workspace.js';
 import { auditEvents } from '../state/audit.js';
 import { agentSwitchLoading } from '../state/loading.js';
 import { openSessionStream, closeSessionStream } from './use-session-stream.js';
+import { openAgentEventsStream, closeAgentEventsStream } from './use-agent-events.js';
 import { bumpSelectGeneration } from '../state/select-generation.js';
 import { loadSession } from '../utils/load-session.js';
 import { clearAllSubagents } from '../state/subagents.js';
@@ -88,6 +89,23 @@ async function loadAgentSessions(agentId) {
         }
         sessions.value = agentSessions;
 
+        // Seed cross-session activity indicators (#856) from the
+        // `has_active_run` snapshot so the sidebar's yellow dot shows
+        // up immediately on boot / agent switch / reload-mid-run, even
+        // before the first SSE event arrives on the agent feed.
+        const seedBg = {};
+        for (const s of agentSessions) {
+            if (s.has_active_run) {
+                seedBg[s.id] = { runId: null, finished: false };
+            }
+        }
+        bgRuns.value = seedBg;
+
+        // Open the agent-scoped SSE feed so subsequent transitions
+        // (`session_activity_started` / `session_activity_ended`)
+        // update bgRuns live.  Closes any previously open stream.
+        openAgentEventsStream(agentId);
+
         if (agentSessions.length > 0) {
             const selected = loadActiveSession(agentId, agentSessions);
             activeSessionId.value = selected.id;
@@ -131,6 +149,7 @@ export async function switchAgent(agentId) {
     if (!agent) return;
 
     closeSessionStream(); // close previous session stream
+    closeAgentEventsStream(); // close previous agent-scoped events stream (#856)
     bumpSelectGeneration(); // invalidate any in-flight selectSession() fetches
 
     activeAgentId.value = agentId;
@@ -147,6 +166,7 @@ export async function switchAgent(agentId) {
     messageQueue.value = [];
     wsFiles.value = null;
     auditEvents.value = null;
+    bgRuns.value = {}; // clear stale cross-session activity (#856)
     clearAllSubagents();
 
     // loadAgentSessions() bumps switchGeneration synchronously (before its

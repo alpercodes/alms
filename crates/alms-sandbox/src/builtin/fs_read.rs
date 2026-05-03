@@ -4,8 +4,9 @@ use crate::{SandboxError, Tool};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader};
 
+use super::line_cap::{LineRead, read_line_capped};
 use super::{
     check_sandbox_path_async, check_sandbox_path_with_extras_async, is_blocked_device_path,
     normalize_unsandboxed_path, reject_unc_path,
@@ -149,7 +150,15 @@ impl Tool for FsReadTool {
     fn description(&self) -> &str {
         "Read a file with line numbers (cat -n format). Supports partial reads via offset/limit. \
          Returns content with 1-based line numbers, has_more_before/has_more_after indicators, \
-         and total_lines when known (file read to EOF). Max file size: 256 KB."
+         and total_lines when known (file read to EOF). Whole-file reads are capped at 256 KB; \
+         pass offset and/or limit to read a slice of a larger file (slice is capped at 64 KB). \
+         Individual lines longer than 256 KB are truncated with an inline marker; check \
+         `line_truncated: true` in the response to detect this programmatically. \
+         When the response would exceed the 64 KB output budget — whether from one \
+         oversized line or accumulated smaller lines — `byte_budget_exceeded: true` is \
+         set with `has_more_after: true`. If `lines_returned: 0`, paginate past the \
+         offending line by setting `offset = current_offset + 1`; otherwise resume from \
+         `offset = current_offset + lines_returned`."
     }
 
     fn is_builtin(&self) -> bool {
@@ -182,13 +191,26 @@ impl Tool for FsReadTool {
     async fn execute(&self, params: Value) -> SandboxResult<Value> {
         /// Maximum file size we will attempt to read (256 KiB).
         const MAX_READ_BYTES: u64 = 256 * 1024;
-        /// Maximum accumulated bytes in the formatted output (512 KiB).
-        const MAX_OUTPUT_BYTES: usize = 512 * 1024;
+        /// Maximum accumulated bytes in the formatted output (64 KiB).
+        ///
+        /// Lowered from 512 KiB in #917 to match prevailing agent-tool caps and to
+        /// reduce pre-truncation bloat now that the in-loop tool-output
+        /// truncate (#851) caps at 32 KB / 2000 lines anyway. Bigger reads
+        /// must use `offset` + `limit` to paginate explicitly.
+        const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
         let path = params
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| SandboxError::InvalidParameters("'path' is required".to_string()))?;
+
+        // Track whether the caller explicitly asked for a partial read.
+        // When either `offset` or `limit` is set we skip the whole-file
+        // size guard below — the response is gated on returned bytes via
+        // `MAX_OUTPUT_BYTES` instead.  See #813.
+        let offset_set = params.get("offset").is_some();
+        let limit_set = params.get("limit").is_some();
+        let partial_read_requested = offset_set || limit_set;
 
         let offset = match params.get("offset") {
             Some(v) => v.as_u64().ok_or_else(|| {
@@ -290,13 +312,20 @@ impl Tool for FsReadTool {
             )));
         }
 
-        // File size guard — reject files larger than 256 KiB.
-        if meta.len() > MAX_READ_BYTES {
+        // File size guard — reject files larger than 256 KiB **only** when
+        // the caller asked for the whole file (no `offset` / `limit`).  When
+        // either parameter is set the caller has opted into a partial read,
+        // and the response payload is gated on `MAX_OUTPUT_BYTES` further
+        // down via the per-line accumulator.  See #813.
+        if !partial_read_requested && meta.len() > MAX_READ_BYTES {
             return Err(SandboxError::InvalidParameters(format!(
-                "File '{}' is {} bytes, which exceeds the maximum read size of 256 KB. \
-                 Use offset and limit parameters to read a portion of the file.",
+                "File '{}' is {} bytes, which exceeds the maximum read size of {} bytes. \
+                 Pass `offset` and/or `limit` to read a slice of the file — \
+                 the {} byte cap applies to the returned slice, not the underlying file.",
                 path,
-                meta.len()
+                meta.len(),
+                MAX_READ_BYTES,
+                MAX_OUTPUT_BYTES
             )));
         }
 
@@ -328,8 +357,7 @@ impl Tool for FsReadTool {
         }
 
         // Reuse the same handle for the line reader — one open() total.
-        let reader = BufReader::new(file);
-        let mut lines_stream = reader.lines();
+        let mut reader = BufReader::new(file);
 
         let mut lines_read: usize = 0;
         let mut selected_lines: Vec<(usize, String)> = Vec::new();
@@ -337,11 +365,22 @@ impl Tool for FsReadTool {
         let mut output_bytes: usize = 0;
         let mut byte_budget_exceeded = false;
         let mut read_past_end = false;
+        let mut any_line_truncated = false;
 
         // Phase 1: skip lines before offset, collect lines in [offset, end), stop
-        // collecting once we've passed the requested range.
-        while let Some(line) = lines_stream
-            .next_line()
+        // collecting once we've passed the requested range.  Each line is read
+        // via `read_line_capped` which bounds buffered allocation to
+        // `MAX_LINE_BYTES` (#902) so a pathological single-line file can no
+        // longer pull the whole file into one allocation.
+        //
+        // `any_line_truncated` is only set for lines that actually surface in
+        // the returned content (#914) — over-cap lines that get skipped past
+        // (offset-skip, line-at-`end` probe, peek-past-end) must NOT flip the
+        // flag, otherwise callers see `line_truncated: true` with no inline
+        // marker in the response.
+        while let Some(LineRead {
+            line, truncated, ..
+        }) = read_line_capped(&mut reader)
             .await
             .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?
         {
@@ -356,12 +395,17 @@ impl Tool for FsReadTool {
                     break;
                 }
                 output_bytes += line_cost;
+                if truncated {
+                    any_line_truncated = true;
+                }
                 selected_lines.push((line_idx + 1, line)); // 1-based line number
             }
 
             // Once we've passed the requested range, stop storing lines.
             // The line at `end` was consumed but not collected, so we already
             // know there is at least one unreturned line after the range.
+            // Its `truncated` bit is intentionally ignored — the line is not
+            // returned, so flipping the flag would be a phantom signal (#914).
             if line_idx >= end {
                 read_past_end = true;
                 break;
@@ -375,9 +419,10 @@ impl Tool for FsReadTool {
         let hit_eof = !byte_budget_exceeded && !read_past_end && {
             // If we naturally exhausted the range without reading past it
             // (i.e. file had exactly `offset + limit` lines), peek one more
-            // line to see whether the file continues.
-            let peeked = lines_stream
-                .next_line()
+            // line to see whether the file continues.  The peeked line's
+            // `truncated` bit is intentionally ignored: the line is not
+            // returned, so it must not influence `line_truncated` (#914).
+            let peeked = read_line_capped(&mut reader)
                 .await
                 .map_err(|e| SandboxError::Io(format!("Failed to read '{}': {}", path, e)))?;
             if peeked.is_some() {
@@ -433,6 +478,15 @@ impl Tool for FsReadTool {
             result["limit"] = serde_json::json!(limit);
         }
 
+        // Surface per-line truncation (#902).  At least one line in the file
+        // exceeded `MAX_LINE_BYTES` and was truncated with an inline marker.
+        // Independent of `byte_budget_exceeded` — both can be set on the same
+        // call.  The marker is already inlined in `content`; this flag lets
+        // callers programmatically detect truncation without scanning text.
+        if any_line_truncated {
+            result["line_truncated"] = serde_json::json!(true);
+        }
+
         if byte_budget_exceeded {
             result["byte_budget_exceeded"] = serde_json::json!(true);
             result["note"] = serde_json::json!(format!(
@@ -442,10 +496,17 @@ impl Tool for FsReadTool {
         }
 
         // Populate the file state cache so subsequent fs_write/fs_edit calls
-        // can verify the file was read first.
-        if let Some(ref cache) = self.file_state_cache {
-            // Re-read raw bytes for hashing. The file is already verified to
-            // be <= 256KB so this is cheap.
+        // can verify the file was read first.  Skip cache population when the
+        // underlying file is larger than `MAX_READ_BYTES` — slurping a multi-MB
+        // file just to hash it would defeat the whole point of partial reads
+        // (#813).  Partial reads of huge files therefore fall through to the
+        // standard fs_write/fs_edit "read first" enforcement, which is the
+        // correct behaviour: the agent has not actually seen the full file.
+        if let Some(ref cache) = self.file_state_cache
+            && meta.len() <= MAX_READ_BYTES
+        {
+            // Re-read raw bytes for hashing. The file is verified to be
+            // <= 256KB so this is cheap.
             if let Ok(raw_bytes) = tokio::fs::read(&resolved).await {
                 let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                 let is_partial = offset > 0 || has_more_after;
@@ -735,8 +796,14 @@ mod tests {
             "got: {err_msg}"
         );
         assert!(
-            err_msg.contains("offset and limit"),
+            err_msg.contains("offset") && err_msg.contains("limit"),
             "error should suggest offset/limit, got: {err_msg}"
+        );
+        // The error must name the byte threshold so agents have concrete
+        // numbers, not just hand-waving — see #813 acceptance criteria.
+        assert!(
+            err_msg.contains(&(256 * 1024).to_string()),
+            "error should mention the 256 KiB byte threshold, got: {err_msg}"
         );
     }
 
@@ -1187,6 +1254,146 @@ mod tests {
         );
     }
 
+    // ── Partial reads on large files (#813) ──────────────────────────────
+
+    /// A file larger than the 256 KiB whole-file cap must be readable
+    /// when the caller passes `offset` and `limit`.  This is the core
+    /// regression test for #813: the size guard previously fired before
+    /// the offset/limit application logic, leaving the advertised
+    /// partial-read affordance dead-on-arrival.
+    #[tokio::test]
+    async fn test_fs_read_offset_limit_succeeds_on_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.txt");
+        // 1 MiB worth of short lines — well over the 256 KiB whole-file cap.
+        let content: String = (1..=200_000).map(|i| format!("line-{i}\n")).collect();
+        assert!(content.len() > 256 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        // Slice request well under the response budget — should succeed.
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1000,
+                "limit": 5
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["lines_returned"], 5);
+        assert_eq!(result["has_more_before"], true);
+        assert_eq!(result["has_more_after"], true);
+        let text = result["content"].as_str().unwrap();
+        assert!(text.contains("  1001\tline-1001"));
+        assert!(text.contains("  1005\tline-1005"));
+        assert!(!text.contains("line-1000\n"));
+        assert!(!text.contains("line-1006"));
+    }
+
+    /// Only `offset` set (no `limit`) on a file larger than the whole-file
+    /// cap must also succeed — the rejection should not fire whenever any
+    /// partial-read parameter is present.
+    #[tokio::test]
+    async fn test_fs_read_offset_only_succeeds_on_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_offset_only.txt");
+        let content: String = (1..=200_000).map(|i| format!("l{i}\n")).collect();
+        assert!(content.len() > 256 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 100
+            }))
+            .await
+            .unwrap();
+
+        // Default limit is 2000, so we get 2000 lines starting at index 100.
+        assert_eq!(result["lines_returned"], 2000);
+        assert_eq!(result["has_more_before"], true);
+        // The file has way more than offset+limit lines.
+        assert_eq!(result["has_more_after"], true);
+    }
+
+    /// Only `limit` set (no `offset`) on a file larger than the whole-file
+    /// cap must also succeed.
+    #[tokio::test]
+    async fn test_fs_read_limit_only_succeeds_on_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_limit_only.txt");
+        let content: String = (1..=200_000).map(|i| format!("l{i}\n")).collect();
+        assert!(content.len() > 256 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "limit": 50
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["lines_returned"], 50);
+        assert_eq!(result["has_more_before"], false);
+        assert_eq!(result["has_more_after"], true);
+    }
+
+    /// A slice request on a 1 MiB file with a `limit` so large that the
+    /// returned slice itself would exceed the response byte budget must
+    /// trip `byte_budget_exceeded` — the per-line accumulator gates the
+    /// payload even though the whole-file size guard was skipped.
+    #[tokio::test]
+    async fn test_fs_read_slice_exceeding_budget_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_slice.txt");
+        // ~1 MiB of short two-byte lines.
+        let content: String = (0..524_288).map(|_| "x\n").collect();
+        assert!(content.len() > 256 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 500_000
+            }))
+            .await
+            .unwrap();
+
+        // The slice asks for far more bytes than `MAX_OUTPUT_BYTES`, so
+        // the accumulator must trigger `byte_budget_exceeded` and stop
+        // collecting before the requested limit is reached.
+        assert_eq!(result["byte_budget_exceeded"], true);
+        let lines_returned = result["lines_returned"].as_u64().unwrap();
+        assert!(
+            lines_returned < 500_000,
+            "byte budget should truncate well before the requested limit, got {lines_returned}"
+        );
+        assert_eq!(result["has_more_after"], true);
+        assert!(result["note"].as_str().unwrap().contains("truncated"));
+    }
+
+    /// Whole-file reads of files over 256 KiB must still be rejected when
+    /// neither `offset` nor `limit` is passed — the new partial-read
+    /// affordance must not weaken the unaccompanied whole-file guard.
+    #[tokio::test]
+    async fn test_fs_read_no_params_still_rejects_large_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_full.txt");
+        let content = "x".repeat(256 * 1024 + 1);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({"path": path.to_str().unwrap()}))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("exceeds the maximum read size"));
+        assert!(err.contains("offset"));
+        assert!(err.contains("limit"));
+    }
+
     #[tokio::test]
     async fn test_fs_read_did_you_mean_distance_ranking() {
         // Four candidates with strictly distinct Levenshtein distances from
@@ -1222,5 +1429,259 @@ mod tests {
             !err.contains("zzzzzzzz"),
             "furthest candidate should be dropped by cap: {err}"
         );
+    }
+
+    // ── Per-line byte cap (#902) ──────────────────────────────────────────
+
+    /// Regression guard for #902: a 1 MiB single-line file (no newlines)
+    /// must NOT pull the whole file into a single allocation.  Pre-#902 the
+    /// underlying `BufReader::next_line()` had no per-line cap, so this
+    /// same call would allocate ~1 MiB.  Post-#902 the line allocation is
+    /// bounded by `MAX_LINE_BYTES` (256 KiB) — the surplus bytes are
+    /// drained without growing the buffer.
+    ///
+    /// After #917 lowered `MAX_OUTPUT_BYTES` to 64 KiB, the truncated line
+    /// (256 KiB + marker) no longer fits in the response budget, so the
+    /// per-line accumulator now trips `byte_budget_exceeded` and the
+    /// over-cap line is rejected from the response — but the daemon still
+    /// does not OOM, which is the point of this regression guard.
+    #[tokio::test]
+    async fn test_fs_read_per_line_cap_huge_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("megaline.txt");
+        // 1 MiB of `x`s with no newlines — exceeds MAX_LINE_BYTES (256 KiB)
+        // by ~4x.  Picked over multi-GB to keep the test fast and CI-safe;
+        // the cap behaviour is identical at any size > MAX_LINE_BYTES.
+        let content = "x".repeat(1024 * 1024);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 10,
+            }))
+            .await
+            .unwrap();
+
+        // Post-#917 the truncated line (256 KiB) exceeds the 64 KiB output
+        // budget, so the byte-budget gate fires before the line is added
+        // to the response.  The line is dropped from `selected_lines`, so
+        // `lines_returned` is 0 and `line_truncated` stays absent.
+        assert_eq!(
+            result["lines_returned"], 0,
+            "over-budget truncated line must be rejected from response"
+        );
+        assert_eq!(
+            result["byte_budget_exceeded"], true,
+            "byte-budget guard must fire when the per-line-truncated line exceeds the output cap"
+        );
+        // Sanity check on the recovery hint — no megaline content leaked.
+        let text = result["content"].as_str().unwrap();
+        assert!(
+            text.len() < 1024,
+            "content should be empty/short — over-budget line must not leak, got {} bytes",
+            text.len()
+        );
+    }
+
+    /// Multi-line files with all lines under the cap must read normally.
+    /// `line_truncated` is absent and no inline markers are inserted.
+    /// Regression guard against the per-line cap accidentally firing on
+    /// reasonable inputs.
+    #[tokio::test]
+    async fn test_fs_read_per_line_cap_normal_multiline_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("normal.txt");
+        // 500 lines, ~20 bytes each — well under MAX_LINE_BYTES.
+        let content: String = (1..=500).map(|i| format!("line number {i}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 100,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(result["lines_returned"], 100);
+        assert!(
+            result.get("line_truncated").is_none(),
+            "line_truncated must be absent when no line was truncated"
+        );
+        let text = result["content"].as_str().unwrap();
+        assert!(
+            !text.contains("[line truncated"),
+            "no truncation marker should appear in normal multi-line reads, got: {}",
+            &text.chars().take(200).collect::<String>()
+        );
+        // Spot-check first and last lines of the slice.
+        assert!(text.contains("     1\tline number 1"));
+        assert!(text.contains("   100\tline number 100"));
+        assert!(!text.contains("line number 101"));
+    }
+
+    /// A file containing one over-cap line followed by normal short lines.
+    /// The first line gets allocation-capped to MAX_LINE_BYTES (256 KiB)
+    /// inside `read_line_capped` — its drain-to-newline phase positions the
+    /// reader at the start of line 2 — but post-#917 the 256 KiB truncated
+    /// line exceeds the 64 KiB output budget and trips
+    /// `byte_budget_exceeded` before being added to the response, so the
+    /// follow-on short lines are not collected either.  The agent is
+    /// expected to paginate past the offending line via `offset=1`.
+    ///
+    /// This test still guards the drain-to-newline path indirectly: if the
+    /// drain were broken, `read_line_capped` would either OOM the test
+    /// process or fail to terminate, neither of which happens here.
+    #[tokio::test]
+    async fn test_fs_read_per_line_cap_truncates_then_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.txt");
+        // First line: 600 KiB of `x` (well over the 256 KiB cap).
+        // Subsequent lines: short, normal text.
+        let mut content = "x".repeat(600 * 1024);
+        content.push('\n');
+        content.push_str("short_line_2\n");
+        content.push_str("short_line_3\n");
+        std::fs::write(&path, &content).unwrap();
+
+        // Phase 1: offset=0 — over-cap first line trips the byte budget.
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 10,
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result["lines_returned"], 0,
+            "over-budget truncated first line must be rejected from response"
+        );
+        assert_eq!(
+            result["byte_budget_exceeded"], true,
+            "byte-budget guard must fire when the truncated line exceeds the output cap"
+        );
+        assert_eq!(result["has_more_after"], true);
+
+        // Phase 2: offset=1 — drain-to-newline must have correctly
+        // positioned the reader, so subsequent reads pick up from line 2.
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 1,
+                "limit": 10,
+            }))
+            .await
+            .unwrap();
+
+        let text = result["content"].as_str().unwrap();
+        assert!(
+            text.contains("short_line_2"),
+            "second line should be readable when paginating past the over-cap line, got: {}",
+            &text.chars().take(200).collect::<String>()
+        );
+        assert!(
+            text.contains("short_line_3"),
+            "third line should be readable when paginating past the over-cap line"
+        );
+        assert_eq!(result["lines_returned"], 2);
+    }
+
+    /// Regression guard for #914: when an over-cap line lives past the
+    /// requested range, the EOF-probe step (`read_line_capped` called once
+    /// after the loop body to determine whether the file continues) must NOT
+    /// flip `line_truncated` for that line.  The flag describes truncation
+    /// in *returned* content; an over-cap line that never shows up in the
+    /// response would otherwise be a phantom signal.
+    #[tokio::test]
+    async fn test_fs_read_peeked_past_line_does_not_set_truncated_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peek_past.txt");
+        // First 3 lines are short and normal; the 4th line is over-cap (1
+        // MiB single line) and lives past the requested range.  `offset=0,
+        // limit=3` collects exactly the first three lines, then the EOF
+        // probe reads line 4 to check whether the file ends.  Pre-#914,
+        // that probe flipped `any_line_truncated`, so the response carried
+        // `line_truncated: true` even though no inline marker is visible.
+        let mut content = String::from("line1\nline2\nline3\n");
+        content.push_str(&"x".repeat(1024 * 1024));
+        content.push('\n');
+        std::fs::write(&path, &content).unwrap();
+
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 3,
+            }))
+            .await
+            .unwrap();
+
+        let text = result["content"].as_str().unwrap();
+        // Returned content has no truncation marker — the over-cap line is
+        // beyond `limit` and was never collected.
+        assert!(
+            !text.contains("[line truncated"),
+            "no truncation marker should appear in returned content, got: {}",
+            &text.chars().take(200).collect::<String>()
+        );
+        // And the flag must agree.  Pre-#914 this was `Some(true)`.
+        assert!(
+            result.get("line_truncated").is_none(),
+            "line_truncated must not be set when no returned line was truncated, got: {:?}",
+            result.get("line_truncated")
+        );
+        assert_eq!(result["lines_returned"], 3);
+        assert_eq!(result["has_more_after"], true);
+    }
+
+    /// Companion to the above for the `read_past_end` path — when `limit`
+    /// is one short of the over-cap line, the loop reads-but-discards the
+    /// line at index `end` to detect that the file continues.  That
+    /// discarded line must not flip `line_truncated` either.
+    #[tokio::test]
+    async fn test_fs_read_read_past_end_line_does_not_set_truncated_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("past_end.txt");
+        // Same shape as the previous test, but request only 2 lines.  The
+        // loop will read line 3 (short) and stop at index `end == 2`,
+        // however since `end = offset + limit = 2`, the line at index 2
+        // (line3 — short) is the one consumed-but-not-collected.  To hit
+        // the read_past_end path against an over-cap line, place the
+        // over-cap line at index `end`.
+        let mut content = String::from("alpha\nbeta\n");
+        content.push_str(&"y".repeat(1024 * 1024));
+        content.push('\n');
+        content.push_str("delta\n");
+        std::fs::write(&path, &content).unwrap();
+
+        // limit=2 collects alpha + beta, then the loop reads the over-cap
+        // line at index 2 (>= end), sets `read_past_end`, and breaks.
+        let result = FsReadTool::new()
+            .execute(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "offset": 0,
+                "limit": 2,
+            }))
+            .await
+            .unwrap();
+
+        let text = result["content"].as_str().unwrap();
+        assert!(
+            !text.contains("[line truncated"),
+            "no truncation marker should appear in returned content, got: {}",
+            &text.chars().take(200).collect::<String>()
+        );
+        assert!(
+            result.get("line_truncated").is_none(),
+            "line_truncated must not be set for the read-past-end probe, got: {:?}",
+            result.get("line_truncated")
+        );
+        assert_eq!(result["lines_returned"], 2);
+        assert_eq!(result["has_more_after"], true);
     }
 }

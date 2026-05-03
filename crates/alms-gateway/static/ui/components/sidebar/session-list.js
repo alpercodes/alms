@@ -5,14 +5,12 @@ import { replaceMessages } from '../../state/chat-actions.js';
 import { activeRunId, selectedRunId, runs } from '../../state/runs.js';
 import { bgRuns, messageQueue } from '../../state/queue.js';
 import { auditEvents } from '../../state/audit.js';
-import { sessionSwitchLoading } from '../../state/loading.js';
 import { listSessions, createSession, deleteSession } from '../../api/sessions.js';
 import { openSessionStream, closeSessionStream } from '../../hooks/use-session-stream.js';
-import { clearAllSubagents, parentSessionId } from '../../state/subagents.js';
+import { clearAllSubagents } from '../../state/subagents.js';
 import { saveActiveSession } from '../../hooks/use-boot.js';
-import { selectGeneration, bumpSelectGeneration } from '../../state/select-generation.js';
-import { loadSession } from '../../utils/load-session.js';
-import { closeSidebar } from '../header.js';
+import { bumpSelectGeneration } from '../../state/select-generation.js';
+import { navigateToSession } from '../../utils/navigate-session.js';
 
 /**
  * Session type metadata: icon character and CSS class suffix.
@@ -36,40 +34,12 @@ function hasActiveRun(sessionId) {
     return bg && !bg.finished;
 }
 
-async function selectSession(sessionId) {
-    if (sessionId === activeSessionId.value) return;
-
-    closeSidebar(); // auto-close sidebar overlay on mobile
-
-    const gen = bumpSelectGeneration();
-
-    closeSessionStream();
-    activeSessionId.value = sessionId;
-    activeRunId.value = null;
-    selectedRunId.value = null;
-    replaceMessages([]);
-    messageQueue.value = [];
-    auditEvents.value = null;
-    clearAllSubagents();
-    parentSessionId.value = null; // clear breadcrumb on manual session switch
-    sessionSwitchLoading.value = true;
-
-    // Persist the selection for this agent
-    saveActiveSession(activeAgentId.value, sessionId);
-
-    // Delegate the run/history/approval/SSE loading to the shared
-    // loadSession() function, passing a stale-check callback tied
-    // to the shared selectGeneration counter.
-    try {
-        await loadSession(sessionId, {
-            isStale: () => gen !== selectGeneration,
-            logPrefix: 'selectSession',
-        });
-    } finally {
-        if (gen === selectGeneration) {
-            sessionSwitchLoading.value = false;
-        }
-    }
+// Sidebar entry point — delegates to the shared in-app navigator
+// (utils/navigate-session.js). Both the runs-tab and tool-output's
+// "View full session" link share the same path so behaviour can't
+// drift across call sites.
+function selectSession(sessionId) {
+    return navigateToSession(sessionId, { logPrefix: 'selectSession' });
 }
 
 async function newSession() {

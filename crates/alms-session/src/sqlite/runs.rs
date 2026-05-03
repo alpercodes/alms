@@ -17,14 +17,30 @@ impl SqliteStore {
             })
             .unwrap_or((None, None));
 
+        // #837: serialize the layered run-config snapshot to JSON for
+        // storage in the new TEXT `resolved_config` column. `None`
+        // (queued runs, old rows) maps to a SQL NULL via Option.
+        // A serialization failure is non-fatal — we log and store NULL
+        // so a malformed snapshot can never block a run from persisting.
+        let resolved_config_json = run.resolved_config.as_ref().and_then(|cfg| {
+            serde_json::to_string(cfg)
+                .map_err(|e| {
+                    tracing::warn!(
+                        run_id = %run.run_id.0,
+                        "Failed to serialize resolved_config snapshot, persisting NULL: {e}"
+                    );
+                })
+                .ok()
+        });
+
         self.conn
             .lock()
             .execute(
                 "INSERT OR REPLACE INTO runs \
                  (run_id, session_id, agent_id, input, response, error, status, \
                   started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
-                  parent_run_id, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                  parent_run_id, created_at, resolved_config) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     run.run_id.0.to_string(),
                     run.session_id.0.to_string(),
@@ -40,6 +56,7 @@ impl SqliteStore {
                     run.job_id.map(|j| j.0.to_string()),
                     run.parent_run_id.map(|r| r.0.to_string()),
                     run.created_at.to_rfc3339(),
+                    resolved_config_json,
                 ],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite save_run: {e}")))?;
@@ -52,7 +69,7 @@ impl SqliteStore {
         let result = conn.query_row(
             "SELECT run_id, session_id, agent_id, input, response, error, status, \
                     started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
-                    parent_run_id, created_at \
+                    parent_run_id, created_at, resolved_config \
              FROM runs WHERE run_id = ?1",
             params![run_id.0.to_string()],
             parse_run_row,
@@ -75,7 +92,7 @@ impl SqliteStore {
             .prepare(
                 "SELECT run_id, session_id, agent_id, input, response, error, status, \
                         started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
-                        parent_run_id, created_at \
+                        parent_run_id, created_at, resolved_config \
                  FROM runs WHERE session_id = ?1 ORDER BY created_at DESC LIMIT ?2",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_runs_by_session: {e}")))?;
@@ -114,7 +131,7 @@ impl SqliteStore {
             .prepare(
                 "SELECT run_id, session_id, agent_id, input, response, error, status, \
                         started_at, ended_at, prompt_tokens, completion_tokens, job_id, \
-                        parent_run_id, created_at \
+                        parent_run_id, created_at, resolved_config \
                  FROM runs WHERE created_at >= ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare load_all_runs: {e}")))?;
@@ -425,5 +442,52 @@ mod tests {
 
         let all = store.load_all_runs().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    /// #837: a run with `resolved_config: None` (the default for new
+    /// runs and the only state for old SQLite rows that pre-date the
+    /// snapshot column) round-trips cleanly. This is the backward-compat
+    /// surface — old rows must hydrate to `None` without surfacing a
+    /// parse error.
+    #[test]
+    fn test_run_resolved_config_none_roundtrip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let run = new_run(session.id, session.agent_id);
+        assert!(run.resolved_config.is_none());
+        store.save_run(&run).unwrap();
+        let loaded = store.load_run(run.run_id).unwrap().unwrap();
+        assert!(loaded.resolved_config.is_none());
+    }
+
+    /// #837: a populated `ResolvedRunConfig` round-trips through the
+    /// JSON-encoded TEXT column without losing fields. Pinned so a
+    /// future schema change to `ResolvedRunConfig` either preserves
+    /// serde compatibility or fails this test loudly at CI time.
+    #[test]
+    fn test_run_resolved_config_some_roundtrip() {
+        use alms_core::ResolvedRunConfig;
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = new_session();
+        let mut run = new_run(session.id, session.agent_id);
+        let cfg = ResolvedRunConfig {
+            provider: "anthropic".into(),
+            model: "claude-sonnet-4-20250514".into(),
+            max_tokens: 8192,
+            posture: "autonomous".into(),
+            debug_mode: true,
+            thinking_budget_tokens: 4096,
+            reasoning_effort: Some(alms_core::config::ReasoningEffort::Medium),
+            gemini_thinking_budget: Some(2048),
+        };
+        run.set_resolved_config(cfg.clone());
+        store.save_run(&run).unwrap();
+
+        let loaded = store.load_run(run.run_id).unwrap().unwrap();
+        let loaded_cfg = loaded
+            .resolved_config
+            .expect("resolved_config should round-trip");
+        assert_eq!(loaded_cfg, cfg);
     }
 }

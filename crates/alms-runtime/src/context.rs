@@ -69,11 +69,35 @@ const CONTINUE_PLACEHOLDER: &str = "Please continue.";
 /// Builds the context window (Vec<LlmMessage>) for an LLM request.
 pub struct ContextBuilder {
     config: ContextConfig,
+    /// Workspace root used to resolve relative `spill_path` metadata when
+    /// rebuilding tool-result messages from session history. When the
+    /// referenced spill file no longer exists on disk (the per-run sweep
+    /// has expired it), `session_msg_to_llm` swaps the trailing recovery
+    /// hint for an "expired" notice so an agent reading an older session
+    /// doesn't get told to `fs_read` a path that returns ENOENT (#921 review
+    /// fix #3).
+    workspace_root: Option<std::path::PathBuf>,
 }
 
 impl ContextBuilder {
     pub fn new(config: ContextConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            workspace_root: None,
+        }
+    }
+
+    /// Set the workspace root used to resolve spill-path metadata when
+    /// rebuilding tool-result messages from session history.
+    ///
+    /// Without a root, `session_msg_to_llm` cannot tell whether a spill
+    /// file referenced by a stored tool-result message has been swept
+    /// (>7d retention) and falls back to leaving the original recovery
+    /// hint intact — the LLM may try `fs_read` and get ENOENT, but the
+    /// degradation is graceful.
+    pub fn with_workspace_root(mut self, root: Option<std::path::PathBuf>) -> Self {
+        self.workspace_root = root;
+        self
     }
 
     /// Build the message list for an LLM call.
@@ -156,6 +180,51 @@ impl ContextBuilder {
         let reserved = system_tokens + input_tokens + episodic_tokens + 1000;
         let history_budget = self.config.max_input_tokens.saturating_sub(reserved);
 
+        // Drop legacy lifecycle-layer `(run failed) ...` / `(run cancelled)`
+        // `kind: "error"` `type: "run_boundary"` markers that sit
+        // immediately after a runtime-layer `[Run failed: ...]` /
+        // `[Run cancelled by user]` text bubble for the same conceptual run.
+        //
+        // Pre-#912 the gateway's `lifecycle.rs` `Cancelled`,
+        // `CancelledWithToolCalls`, `FailedWithToolCalls`, and generic
+        // `Err(_)` arms each wrote a `persist_error_marker` call AFTER
+        // the runtime layer's `finish_run` had already persisted the
+        // canonical `[Run failed: ...]` / `[Run cancelled by user]`
+        // assistant bubble.  Both records reached the LLM context: the
+        // bubble survived `strip_mid_history_system_markers` natively,
+        // and the marker survived via `session_msg_to_llm`'s `kind:
+        // "error"` rewrite into a `[Error] ...` user message — so the
+        // agent saw the same failure twice on every follow-up turn.
+        //
+        // #912 removed the four duplicate `persist_error_marker` calls,
+        // which fixes the duplication for all NEW failed runs.  But
+        // existing SQLite DBs that captured a failed run before #912
+        // still have BOTH records — and the rewrite path means both
+        // still surface to the LLM.  Filtering those legacy duplicates
+        // here is the reconstruction-side fix for the legacy gap
+        // (Tim's F2 finding on PR #930): the duplicate marker is dropped
+        // during context build so legacy DBs match new-DB display
+        // without touching user data.  Idempotent on post-#912 data
+        // because new DBs never write the marker in the first place.
+        //
+        // The `runtime_init_error` marker (`type: "runtime_init_error"`)
+        // is intentionally NOT matched: that path fires when
+        // `AgentRuntime::new()` itself fails, before `finish_run` could
+        // possibly run, so it has no runtime-layer counterpart and is
+        // the only error record for those runs (kept by #912).
+        let dedup_history: Vec<Message>;
+        let history_after_dedup = if Self::has_legacy_duplicate_run_boundary_markers(history) {
+            let before = history.len();
+            dedup_history = Self::filter_legacy_duplicate_run_boundary_markers(history);
+            debug!(
+                filtered = before - dedup_history.len(),
+                "Filtered legacy duplicate run_boundary markers from context"
+            );
+            dedup_history.as_slice()
+        } else {
+            history
+        };
+
         // Filter out reasoning messages (message_type="reasoning") from
         // DM sessions before building context.  These are internal agent
         // reasoning (thinking text, tool calls, tool results) persisted as
@@ -166,22 +235,23 @@ impl ContextBuilder {
         //     messages when perspective-mapped ToolResult hits the catch-all
         //     in session_msg_to_llm — fixes C2)
         let filtered_history: Vec<Message>;
-        let effective_history =
-            if perspective_agent.is_some() && history.iter().any(Self::is_reasoning_message) {
-                let before = history.len();
-                filtered_history = history
-                    .iter()
-                    .filter(|m| !Self::is_reasoning_message(m))
-                    .cloned()
-                    .collect();
-                debug!(
-                    filtered = before - filtered_history.len(),
-                    "Filtered reasoning messages from DM context"
-                );
-                filtered_history.as_slice()
-            } else {
-                history
-            };
+        let effective_history = if perspective_agent.is_some()
+            && history_after_dedup.iter().any(Self::is_reasoning_message)
+        {
+            let before = history_after_dedup.len();
+            filtered_history = history_after_dedup
+                .iter()
+                .filter(|m| !Self::is_reasoning_message(m))
+                .cloned()
+                .collect();
+            debug!(
+                filtered = before - filtered_history.len(),
+                "Filtered reasoning messages from DM context"
+            );
+            filtered_history.as_slice()
+        } else {
+            history_after_dedup
+        };
 
         // Pre-map the history if perspective is set, then pass the mapped
         // messages through the standard strategies.
@@ -396,10 +466,147 @@ impl ContextBuilder {
         messages.extend(selected);
     }
 
+    /// Returns `true` when the message is an error marker persisted by
+    /// `persist_error_marker` in the gateway (issue #874).
+    ///
+    /// Error markers are `Role::System` synthetic markers tagged with
+    /// `metadata.kind == "error"`. They surface mid-run failures (LLM
+    /// 4xx/5xx, run cancellation, runtime construction error) into the
+    /// agent's context so a follow-up turn like "why did that fail?"
+    /// gives the LLM the error text without re-quoting.
+    fn is_error_marker(msg: &Message) -> bool {
+        if msg.role != Role::System {
+            return false;
+        }
+        msg.metadata
+            .as_ref()
+            .and_then(|m| m.get("kind"))
+            .and_then(|v| v.as_str())
+            == Some("error")
+    }
+
+    /// Returns `true` when the message is the lifecycle-layer
+    /// `(run failed) ...` / `(run cancelled)` `kind: "error"` marker
+    /// removed in #912.
+    ///
+    /// Identified by `metadata.kind == "error"` AND `metadata.type ==
+    /// "run_boundary"` — exactly the shape persisted by the four
+    /// `persist_error_marker` call sites in `gateway::runs::lifecycle`'s
+    /// `Cancelled`, `CancelledWithToolCalls`, `FailedWithToolCalls`, and
+    /// generic `Err(_)` arms before #912.  Crucially does NOT match
+    /// `type: "runtime_init_error"` — that marker has no runtime-layer
+    /// counterpart and is the only error record for runtime-construction
+    /// failures, so it must be kept.
+    fn is_legacy_lifecycle_error_marker(msg: &Message) -> bool {
+        if !Self::is_error_marker(msg) {
+            return false;
+        }
+        msg.metadata
+            .as_ref()
+            .and_then(|m| m.get("type"))
+            .and_then(|v| v.as_str())
+            == Some("run_boundary")
+    }
+
+    /// Returns `true` when the message is the runtime-layer
+    /// `[Run failed: ...]` or `[Run cancelled by user]` text bubble
+    /// persisted by `AgentRuntime::finish_run` on the `Err(_)` and
+    /// `Err(Cancelled)` arms.
+    ///
+    /// Matches both the regular-session shape (`Role::Assistant` text)
+    /// and the DM-session shape (`Role::User` with `from_agent`
+    /// metadata) — both bubbles share the literal `[Run failed:` /
+    /// `[Run cancelled by user]` content prefix.
+    fn is_runtime_layer_failure_bubble(msg: &Message) -> bool {
+        // Runtime-layer bubbles are never persisted as `Role::System`,
+        // so a `System` here is necessarily a marker, not a bubble.
+        if msg.role == Role::System {
+            return false;
+        }
+        match &msg.content {
+            Content::Text(t) => {
+                t.starts_with("[Run failed:") || t.starts_with("[Run cancelled by user]")
+            }
+            _ => false,
+        }
+    }
+
+    /// Returns `true` when `history` contains a legacy lifecycle-layer
+    /// `kind: "error"` `type: "run_boundary"` marker immediately after
+    /// (or before) a runtime-layer failure bubble — the duplicate
+    /// pattern from pre-#912 SQLite DBs.  Used as a cheap pre-check to
+    /// avoid building a fresh `Vec<Message>` when the common case
+    /// (post-#912 data, no duplicates) holds.
+    fn has_legacy_duplicate_run_boundary_markers(history: &[Message]) -> bool {
+        for (idx, msg) in history.iter().enumerate() {
+            if !Self::is_legacy_lifecycle_error_marker(msg) {
+                continue;
+            }
+            // Pre-#912 the runtime-layer bubble is written first, then
+            // the lifecycle-layer marker — so the bubble is at idx-1.
+            // We also check idx+1 defensively in case a future ordering
+            // change inverts that.
+            let prev_is_bubble = idx
+                .checked_sub(1)
+                .and_then(|i| history.get(i))
+                .is_some_and(Self::is_runtime_layer_failure_bubble);
+            let next_is_bubble = history
+                .get(idx + 1)
+                .is_some_and(Self::is_runtime_layer_failure_bubble);
+            if prev_is_bubble || next_is_bubble {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Drop legacy lifecycle-layer `kind: "error"` `type: "run_boundary"`
+    /// markers that sit adjacent to a runtime-layer failure bubble,
+    /// returning a fresh `Vec<Message>` with the duplicates removed.
+    ///
+    /// Caller is responsible for the cheap pre-check
+    /// (`has_legacy_duplicate_run_boundary_markers`) — calling this on
+    /// post-#912 data simply clones the slice unchanged, but allocating
+    /// a fresh `Vec` per build call when there's nothing to filter is
+    /// wasteful.
+    fn filter_legacy_duplicate_run_boundary_markers(history: &[Message]) -> Vec<Message> {
+        history
+            .iter()
+            .enumerate()
+            .filter(|(idx, msg)| {
+                if !Self::is_legacy_lifecycle_error_marker(msg) {
+                    return true;
+                }
+                let prev_is_bubble = idx
+                    .checked_sub(1)
+                    .and_then(|i| history.get(i))
+                    .is_some_and(Self::is_runtime_layer_failure_bubble);
+                let next_is_bubble = history
+                    .get(idx + 1)
+                    .is_some_and(Self::is_runtime_layer_failure_bubble);
+                // Drop only when adjacent to a bubble.  Markers that
+                // appear without an adjacent bubble (corrupted DB,
+                // unusual write order, future code path) are kept so
+                // the agent still sees the failure on follow-up.
+                !(prev_is_bubble || next_is_bubble)
+            })
+            .map(|(_, msg)| msg.clone())
+            .collect()
+    }
+
     /// Convert a session Message to an LlmMessage.
     /// Reconstructs structured tool call/result messages from persisted format
     /// so the LLM has full visibility of previous tool executions across runs.
     fn session_msg_to_llm(&self, msg: &Message) -> LlmMessage {
+        // Error markers (#874) are converted to a `user` message with a
+        // `[Error]` prefix BEFORE the per-role match below, so they
+        // survive `strip_mid_history_system_markers` and reach the LLM.
+        // Without this, the existing canonical-shape pass would drop
+        // them and the agent would never see the prior failure.
+        if Self::is_error_marker(msg) {
+            return LlmMessage::user(format!("[Error] {}", msg.content.to_display_string()));
+        }
+
         match (&msg.role, &msg.content) {
             // Reconstruct structured assistant message with tool_calls
             (Role::Assistant, Content::ToolCall { name, params }) => {
@@ -425,8 +632,43 @@ impl ContextBuilder {
             // Reconstruct tool result with correct tool_call_id
             (Role::Tool, Content::ToolResult { tool_id, result }) => {
                 let result_str = result.to_string();
-                // Truncate long tool outputs in context
-                let content = if result_str.len() > 2000 {
+                // When the in-loop truncation service (#851) already
+                // capped this message, the persisted bytes are exactly
+                // what the live agent saw. Skip the legacy 2000-byte
+                // re-truncation in that case — re-truncating would shrink
+                // the head+tail preview to ~2 KB and discard the spill-
+                // path hint the agent needs to recover the full bytes.
+                let truncated_in_loop = msg
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("truncated_in_loop"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let content = if truncated_in_loop {
+                    // Detect a swept spill file (#921 review fix #3): if the
+                    // recorded `spill_path` no longer exists on disk (>7 day
+                    // retention sweep has expired it), rewrite the trailing
+                    // recovery hint so the agent doesn't try to `fs_read` a
+                    // path that returns ENOENT.
+                    let spill_path = msg
+                        .metadata
+                        .as_ref()
+                        .and_then(|m| m.get("spill_path"))
+                        .and_then(|v| v.as_str());
+                    if let Some(rel) = spill_path
+                        && let Some(ref root) = self.workspace_root
+                        && Self::spill_file_missing(root, rel)
+                    {
+                        Self::rewrite_hint_as_expired(&result_str, rel)
+                    } else {
+                        result_str
+                    }
+                } else if result_str.len() > 2000 {
+                    // Legacy fallback for tool-result messages persisted
+                    // before #851 (or when the in-loop service is
+                    // disabled by config). Keeps the pre-#851 wire shape
+                    // byte-identical so existing fixtures continue to
+                    // pass.
                     format!(
                         "{}... [truncated, {} bytes total]",
                         truncate_to_char_boundary(&result_str, 2000),
@@ -444,6 +686,53 @@ impl ContextBuilder {
                 LlmMessage::tool_result(msg.id.clone(), msg.content.to_display_string())
             }
         }
+    }
+
+    /// Resolve the relative `spill_path` from a tool-result message's
+    /// metadata against `workspace_root` and return `true` when the file
+    /// does NOT exist on disk (i.e. the retention sweep has expired it).
+    ///
+    /// `rel` is the path emitted by `tool_output_truncate::truncate` —
+    /// either workspace-relative (when a workspace root was passed in at
+    /// truncate time) or an absolute path (no workspace root). We try
+    /// `workspace_root.join(rel)` first; when that doesn't exist *and* the
+    /// raw `rel` parses as an absolute path, we try that too. Either path
+    /// existing is enough to consider the spill "live"; both missing means
+    /// it has been swept (or never made it to disk).
+    fn spill_file_missing(workspace_root: &std::path::Path, rel: &str) -> bool {
+        let joined = workspace_root.join(rel);
+        if joined.exists() {
+            return false;
+        }
+        let raw = std::path::Path::new(rel);
+        if raw.is_absolute() && raw.exists() {
+            return false;
+        }
+        true
+    }
+
+    /// Rewrite the trailing recovery hint in a head+tail-truncated tool
+    /// result to indicate the spill file is no longer available.
+    ///
+    /// `original` is the persisted preview that ends with the
+    /// `[The tool output was truncated to N KB. Full output saved to:
+    ///  \`<rel>\`...]` block produced by
+    /// `tool_output_truncate::build_preview`. We trim that trailing block
+    /// (everything from the last `[The tool output was truncated to`
+    /// occurrence onward) and append a short "expired" notice. When the
+    /// marker is absent for any reason we just append the notice — the
+    /// degradation is safe even if the original shape is unexpected.
+    fn rewrite_hint_as_expired(original: &str, rel: &str) -> String {
+        const MARKER: &str = "[The tool output was truncated to";
+        let trimmed = match original.rfind(MARKER) {
+            Some(idx) => original[..idx].trim_end_matches('\n').to_string(),
+            None => original.trim_end_matches('\n').to_string(),
+        };
+        format!(
+            "{trimmed}\n\n[The tool output was truncated. The full-output spill file \
+             (`{rel}`) is no longer available — retention period has expired. Only \
+             this preview survives.]\n"
+        )
     }
 
     /// Remove tool-result messages whose `tool_call_id` is not introduced by
@@ -1965,6 +2254,435 @@ mod tests {
         );
     }
 
+    /// Helper: build an error-marker message matching the shape persisted
+    /// by `gateway::runs::markers::persist_error_marker` (#874).
+    fn make_error_marker(text: &str, status: &str, error: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::System,
+            content: Content::Text(text.to_string()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "synthetic": true,
+                "kind": "error",
+                "type": "run_boundary",
+                "status": status,
+                "error": error,
+            })),
+        }
+    }
+
+    /// Run-failed error markers (#874) must reach the LLM context as a
+    /// `user` message so a follow-up turn ("why did that fail?") gives the
+    /// agent the error text without re-quoting. Without the
+    /// `is_error_marker` rewrite in `session_msg_to_llm`, the standard
+    /// `strip_mid_history_system_markers` pass would drop the marker and
+    /// the agent would never see the prior failure.
+    #[test]
+    fn error_marker_survives_as_user_message() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "List files in /tmp"),
+            make_error_marker(
+                "(run failed) Anthropic 500: server error",
+                "failed",
+                "Anthropic 500: server error",
+            ),
+        ];
+
+        let messages = builder.build(
+            "You are a helpful agent.",
+            &history,
+            "why did that fail?",
+            None,
+        );
+
+        // No mid-history system messages survive normalization.
+        assert!(
+            messages[1..].iter().all(|m| m.role != "system"),
+            "no system message may appear after the system prefix"
+        );
+
+        // The error marker must reach the LLM as a user message tagged
+        // with the [Error] prefix so the agent can answer the follow-up.
+        let error_visible = messages.iter().any(|m| {
+            m.role == "user"
+                && m.content.as_deref().is_some_and(|s| {
+                    s.contains("[Error]") && s.contains("Anthropic 500: server error")
+                })
+        });
+        assert!(
+            error_visible,
+            "error marker must be rewritten to a `user` [Error] message so the LLM sees it; got: {:?}",
+            messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.clone().unwrap_or_default()))
+                .collect::<Vec<_>>()
+        );
+
+        // The trailing user-input invariant must hold: the user's actual
+        // follow-up question is the last message.
+        let last = messages.last().expect("non-empty");
+        assert_eq!(last.role, "user");
+        assert!(
+            last.content
+                .as_deref()
+                .is_some_and(|s| s.contains("why did that fail?")),
+            "trailing user message must be the fresh input, not the rewritten error marker"
+        );
+    }
+
+    /// Cancellation markers (#874) follow the same rewrite path as
+    /// run-failed markers — the `kind: "error"` flag is what matters,
+    /// not the specific `status`/`error_kind` value.
+    #[test]
+    fn cancelled_marker_survives_as_user_message() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "Run a long-running task"),
+            make_error_marker("(run cancelled)", "cancelled", "user cancelled"),
+        ];
+
+        let messages = builder.build("System.", &history, "try again", None);
+
+        let cancelled_visible = messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|s| s.contains("[Error]") && s.contains("(run cancelled)"))
+        });
+        assert!(
+            cancelled_visible,
+            "cancellation marker must be rewritten to [Error] user message"
+        );
+    }
+
+    /// Non-error system markers (e.g. job notifications, completed
+    /// run_boundary) must continue to be stripped — only `kind: "error"`
+    /// markers get the rewrite. This protects the existing canonical
+    /// invariant (no mid-history system messages reach the LLM).
+    #[test]
+    fn non_error_system_markers_still_stripped() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        // A completed run_boundary marker (no `kind: "error"`) should be
+        // stripped — only failed/cancelled markers carry `kind: "error"`.
+        let completed_marker = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::System,
+            content: Content::Text("(run completed)".to_string()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "synthetic": true,
+                "type": "run_boundary",
+                "status": "completed",
+            })),
+        };
+
+        let history = vec![
+            make_msg(Role::User, "hi"),
+            make_msg(Role::Assistant, "hello"),
+            completed_marker,
+        ];
+
+        let messages = builder.build("System.", &history, "next?", None);
+
+        // The completed marker must NOT appear in the context.
+        assert!(
+            !messages.iter().any(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|s| s.contains("(run completed)"))
+            }),
+            "non-error system markers must continue to be stripped"
+        );
+    }
+
+    // -- #912 follow-up: legacy duplicate run_boundary marker filter ---------
+
+    /// Regression test for PR #930 follow-up F2 — Tim's "forward-only dedup"
+    /// finding.  Pre-#912 SQLite DBs persist BOTH the runtime-layer
+    /// `[Run failed: ...]` assistant bubble AND the lifecycle-layer
+    /// `(run failed) ...` `kind: "error"` `type: "run_boundary"` system
+    /// marker for every failed run.  #912 stops new failed runs from writing
+    /// the marker, but existing DBs still surface both records during
+    /// context reload.  This test pins the reconstruction-side filter that
+    /// drops the duplicate marker so legacy DBs match new-DB display
+    /// behaviour without a data migration.
+    #[test]
+    fn legacy_duplicate_run_boundary_marker_dropped_when_adjacent_to_runtime_bubble() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        // Mimic the exact pre-#912 SQLite shape: runtime-layer bubble at
+        // index 1 (Role::Assistant), then lifecycle-layer marker at index
+        // 2 (Role::System with kind: "error", type: "run_boundary",
+        // status: "failed").  Both records carry the same conceptual
+        // failure event.
+        let history = vec![
+            make_msg(Role::User, "do something"),
+            make_msg(Role::Assistant, "[Run failed: Provider error]"),
+            make_error_marker("(run failed) Provider error", "failed", "Provider error"),
+        ];
+
+        let messages = builder.build(
+            "You are a helpful agent.",
+            &history,
+            "why did that fail?",
+            None,
+        );
+
+        // The runtime-layer assistant bubble must survive as the
+        // canonical record (Atlas + Alper's decision on #912).
+        let bubble_count = messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|s| s.contains("[Run failed: Provider error]"))
+            })
+            .count();
+        assert_eq!(
+            bubble_count, 1,
+            "the runtime-layer `[Run failed: ...]` bubble must survive as the canonical record; got {bubble_count} occurrences in {messages:?}"
+        );
+
+        // The lifecycle-layer marker must NOT surface as a `[Error]
+        // (run failed) ...` user message — pre-fix it would, because
+        // `session_msg_to_llm` rewrites `kind: "error"` markers into
+        // `[Error] ...` user messages BEFORE
+        // `strip_mid_history_system_markers` runs.  Post-fix the
+        // marker is dropped during context build, so the rewrite never
+        // fires and the LLM sees only the bubble.
+        let legacy_marker_visible = messages.iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|s| s.contains("[Error]") && s.contains("(run failed)"))
+        });
+        assert!(
+            !legacy_marker_visible,
+            "legacy lifecycle-layer marker must not surface to the LLM when an adjacent runtime-layer bubble carries the same event; messages: {messages:?}"
+        );
+    }
+
+    /// Same legacy-duplicate test, but for the cancellation pair —
+    /// `[Run cancelled by user]` runtime bubble + `(run cancelled)`
+    /// `kind: "error"` `status: "cancelled"` lifecycle marker.  Mirrors
+    /// the pre-#912 shape for the `Cancelled` and
+    /// `CancelledWithToolCalls` arms.
+    #[test]
+    fn legacy_duplicate_cancelled_marker_dropped_when_adjacent_to_runtime_bubble() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "long-running task"),
+            make_msg(Role::Assistant, "[Run cancelled by user]"),
+            make_error_marker("(run cancelled)", "cancelled", "user cancelled"),
+        ];
+
+        let messages = builder.build("System.", &history, "try again", None);
+
+        let bubble_count = messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|s| s.contains("[Run cancelled by user]"))
+            })
+            .count();
+        assert_eq!(
+            bubble_count, 1,
+            "the runtime-layer `[Run cancelled by user]` bubble must survive; got {bubble_count} in {messages:?}"
+        );
+
+        let legacy_marker_visible = messages.iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|s| s.contains("[Error]") && s.contains("(run cancelled)"))
+        });
+        assert!(
+            !legacy_marker_visible,
+            "legacy cancellation marker must not surface to the LLM when an adjacent bubble exists; messages: {messages:?}"
+        );
+    }
+
+    /// New (post-#912) DBs only have the runtime-layer bubble — no
+    /// lifecycle-layer marker is written for the four removed call
+    /// sites.  The filter must be a no-op on this shape: the bubble
+    /// reaches the LLM as a regular conversation turn, and the agent
+    /// can answer "why did that fail?" using its content directly (no
+    /// `[Error]` rewrite needed because there is no marker to rewrite).
+    #[test]
+    fn post_912_history_with_only_runtime_bubble_unchanged_by_filter() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "do something"),
+            make_msg(Role::Assistant, "[Run failed: Provider error]"),
+        ];
+
+        let messages = builder.build("System.", &history, "why?", None);
+
+        let bubble_count = messages
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_deref()
+                    .is_some_and(|s| s.contains("[Run failed: Provider error]"))
+            })
+            .count();
+        assert_eq!(
+            bubble_count, 1,
+            "post-#912 history must keep the single runtime-layer bubble untouched"
+        );
+    }
+
+    /// `runtime_init_error` markers (`type: "runtime_init_error"`)
+    /// fire when `AgentRuntime::new()` itself fails — strictly before
+    /// `finish_run` could possibly run, so they have NO runtime-layer
+    /// counterpart.  The legacy-duplicate filter must NOT match these
+    /// markers (matching them would drop the only error record for
+    /// runtime-construction failures).  This is the negative-space
+    /// guard for `is_legacy_lifecycle_error_marker`.
+    #[test]
+    fn runtime_init_error_marker_not_matched_by_legacy_dedup() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        // Mimic the shape persisted by lifecycle.rs's
+        // runtime_init_error path (kept by #912).  No runtime-layer
+        // bubble is present because the runtime never started.
+        let init_error_marker = Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            role: Role::System,
+            content: Content::Text("(runtime initialization failed) Provider error".to_string()),
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "synthetic": true,
+                "kind": "error",
+                "type": "runtime_init_error",
+                "status": "failed",
+                "error": "Provider error",
+                "error_kind": "runtime_init",
+            })),
+        };
+
+        let history = vec![make_msg(Role::User, "first turn"), init_error_marker];
+
+        let messages = builder.build("System.", &history, "follow-up", None);
+
+        // The init-error marker must surface to the LLM as a `[Error]
+        // ...` user message (existing #874 behaviour) — the legacy
+        // dedup filter must NOT have touched it because its `type` is
+        // `runtime_init_error`, not `run_boundary`.
+        let init_error_visible = messages.iter().any(|m| {
+            m.role == "user"
+                && m.content.as_deref().is_some_and(|s| {
+                    s.contains("[Error]") && s.contains("runtime initialization failed")
+                })
+        });
+        assert!(
+            init_error_visible,
+            "runtime_init_error marker must still reach the LLM — it has no runtime-layer counterpart; messages: {messages:?}"
+        );
+    }
+
+    /// A bare lifecycle-layer marker with NO adjacent runtime-layer
+    /// bubble (e.g. corrupted DB, partial write, future code path that
+    /// re-introduces the marker without a bubble) must be kept — the
+    /// dedup filter only fires on the duplicate pattern, not on every
+    /// `kind: "error"` `type: "run_boundary"` marker it sees.  This
+    /// preserves the agent's ability to answer "why did that fail?"
+    /// even when the runtime-layer write was lost.
+    #[test]
+    fn bare_run_boundary_marker_without_adjacent_bubble_kept() {
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "do something"),
+            // A bare lifecycle-layer marker with NO preceding bubble.
+            // Not the duplicate pattern — the filter must keep it.
+            make_error_marker("(run failed) lonely marker", "failed", "lonely error"),
+        ];
+
+        let messages = builder.build("System.", &history, "why?", None);
+
+        let marker_visible = messages.iter().any(|m| {
+            m.role == "user"
+                && m.content
+                    .as_deref()
+                    .is_some_and(|s| s.contains("[Error]") && s.contains("lonely marker"))
+        });
+        assert!(
+            marker_visible,
+            "a bare run_boundary marker without an adjacent bubble must still surface as `[Error] ...` so the agent can answer follow-ups; messages: {messages:?}"
+        );
+    }
+
     /// Helper: create a message with metadata.
     fn make_msg_with_meta(role: Role, content: Content, metadata: serde_json::Value) -> Message {
         Message {
@@ -2592,5 +3310,249 @@ mod tests {
         // Marker stripped, assistant tail detected, placeholder synthesised.
         assert_eq!(messages.last().unwrap().role, "user");
         assert!(messages[1..].iter().all(|m| m.role != "system"));
+    }
+
+    // -- #851: in-loop truncation interaction with session_msg_to_llm ---------
+
+    /// When a tool result message carries `truncated_in_loop: true` in its
+    /// metadata, `session_msg_to_llm` must NOT apply its legacy 2000-byte
+    /// re-truncation — the persisted bytes ARE the bytes the live agent
+    /// saw, including the spill-path hint, and re-truncating would shred
+    /// the recovery instructions.
+    #[test]
+    fn session_msg_to_llm_skips_re_truncation_when_in_loop_flag_set() {
+        let builder = default_builder();
+        let preview = format!("preview head\n{}\npreview tail", "x".repeat(3000));
+        // Sanity: the preview is well above 2000 bytes so the legacy path
+        // would trigger.
+        assert!(preview.len() > 2000);
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(preview.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+                "truncated_in_loop": true,
+                "spill_path": ".alms/tool-output/run1/tool_call_abc.txt",
+                "original_bytes": 100_000,
+                "original_lines": 1,
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        // The serialised tool-result string must contain the full preview
+        // body — no `... [truncated, N bytes total]` suffix.
+        assert!(
+            !llm.content_str().contains("[truncated,"),
+            "in-loop-truncated message must not be re-truncated by session_msg_to_llm"
+        );
+        assert!(
+            llm.content_str().len() > 2000,
+            "preview must survive past the legacy 2000-byte cap"
+        );
+    }
+
+    /// Symmetric counterpart: when the in-loop flag is absent, the legacy
+    /// 2000-byte re-truncation still fires. This pins the
+    /// backward-compatibility guarantee for tool result messages persisted
+    /// before #851 (or by deployments where the in-loop service is
+    /// disabled in `alms.toml`).
+    #[test]
+    fn session_msg_to_llm_still_truncates_when_flag_absent() {
+        let builder = default_builder();
+        let big = "x".repeat(5000);
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(big.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        let body = llm.content_str();
+        assert!(
+            body.contains("[truncated,"),
+            "legacy path must still truncate when truncated_in_loop is absent"
+        );
+        // 2000-byte preview + suffix string -> stays under, say, 2500
+        // bytes for the entire message.
+        assert!(
+            body.len() < 2500,
+            "legacy path caps at 2000 bytes plus suffix"
+        );
+    }
+
+    // -- #921 review fix #3: stale spill_path detection -----------------------
+
+    /// When a tool-result message references a `spill_path` that has been
+    /// swept (>7d retention), `session_msg_to_llm` must rewrite the
+    /// recovery hint to indicate the file is no longer available so the
+    /// LLM doesn't try to `fs_read` an ENOENT path.
+    #[test]
+    fn session_msg_to_llm_rewrites_hint_when_spill_file_missing() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let builder =
+            default_builder().with_workspace_root(Some(workspace_dir.path().to_path_buf()));
+
+        // Persisted preview with the full hint text from `build_preview`.
+        let preview = format!(
+            "head data\n\n... [50000 bytes / 1 lines omitted] ...\n\ntail data\n\n[The tool output \
+             was truncated to 32 KB. Full output saved to: `{rel}` (50000 bytes, 1 lines). Use \
+             `fs_grep` to search the full content or `fs_read` with `offset`/`limit` to view \
+             specific sections.]\n",
+            rel = "tool-output/run1/tool_call_abc.txt"
+        );
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(preview.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+                "truncated_in_loop": true,
+                // This relative path does NOT exist under workspace_dir.
+                "spill_path": "tool-output/run1/tool_call_abc.txt",
+                "original_bytes": 50_000,
+                "original_lines": 1,
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        let body = llm.content_str();
+        // The original "Use `fs_grep`..." hint must be gone.
+        assert!(
+            !body.contains("Use `fs_grep`"),
+            "stale fs_grep hint must be removed when spill is missing"
+        );
+        // The replacement notice must mention "retention" and "expired".
+        assert!(
+            body.contains("retention period has expired"),
+            "expired hint must be present: {body}"
+        );
+        // The head/tail body itself must survive the rewrite.
+        assert!(body.contains("head data"));
+        assert!(body.contains("tail data"));
+    }
+
+    /// Symmetric counterpart: when the spill file IS still present on
+    /// disk, the recovery hint must remain intact so the agent can
+    /// `fs_read` it normally.
+    #[test]
+    fn session_msg_to_llm_keeps_hint_when_spill_file_present() {
+        let workspace_dir = tempfile::tempdir().unwrap();
+        // Materialise the spill file under workspace_dir so the existence
+        // check passes.
+        let spill_dir = workspace_dir.path().join("tool-output").join("run1");
+        std::fs::create_dir_all(&spill_dir).unwrap();
+        let spill_file = spill_dir.join("tool_call_abc.txt");
+        std::fs::write(&spill_file, b"original payload").unwrap();
+
+        let builder =
+            default_builder().with_workspace_root(Some(workspace_dir.path().to_path_buf()));
+
+        let preview = format!(
+            "head data\n\n... omitted ...\n\ntail data\n\n[The tool output was truncated to 32 KB. \
+             Full output saved to: `{rel}` (50000 bytes, 1 lines). Use `fs_grep` to search the full \
+             content or `fs_read` with `offset`/`limit` to view specific sections.]\n",
+            rel = "tool-output/run1/tool_call_abc.txt"
+        );
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(preview.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+                "truncated_in_loop": true,
+                "spill_path": "tool-output/run1/tool_call_abc.txt",
+                "original_bytes": 50_000,
+                "original_lines": 1,
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        let body = llm.content_str();
+        // The recovery hint must be intact.
+        assert!(
+            body.contains("Use `fs_grep`"),
+            "fs_grep hint must survive when spill file exists"
+        );
+        // The expired notice must NOT appear.
+        assert!(!body.contains("retention period has expired"));
+    }
+
+    /// Without a workspace root configured the builder cannot resolve
+    /// relative spill paths, so it MUST leave the hint unchanged (graceful
+    /// degradation: the agent may try `fs_read` and fail, but the LLM is
+    /// not given an inaccurate "expired" notice).
+    #[test]
+    fn session_msg_to_llm_leaves_hint_alone_without_workspace_root() {
+        let builder = default_builder(); // no workspace_root
+
+        let preview =
+            "head\n\n... omitted ...\n\ntail\n\n[The tool output was truncated to 32 KB. \
+             Full output saved to: `tool-output/run1/tool_call_abc.txt` (50000 bytes, 1 lines). \
+             Use `fs_grep` to search the full content or `fs_read` with `offset`/`limit` to view \
+             specific sections.]\n"
+                .to_string();
+
+        let msg = Message {
+            id: "m1".to_string(),
+            role: Role::Tool,
+            content: Content::ToolResult {
+                tool_id: "call_abc".to_string(),
+                result: serde_json::Value::String(preview.clone()),
+            },
+            timestamp: Timestamp::now(),
+            metadata: Some(serde_json::json!({
+                "ok": true,
+                "tool_invocation_id": "abc",
+                "truncated_in_loop": true,
+                "spill_path": "tool-output/run1/tool_call_abc.txt",
+                "original_bytes": 50_000,
+                "original_lines": 1,
+            })),
+        };
+
+        let llm = builder.session_msg_to_llm(&msg);
+        // Without a workspace root the existence check is skipped, so the
+        // hint must survive intact — including the spill path reference
+        // and the `Use \`fs_grep\`` recovery instruction. (The session
+        // round-trip JSON-encodes the inner string, so we only check that
+        // the original recovery hint substring is present, not byte
+        // equality with the bare preview.)
+        let body = llm.content_str();
+        assert!(
+            body.contains("Use `fs_grep`"),
+            "fs_grep hint must survive when workspace_root is unset: {body}"
+        );
+        assert!(
+            !body.contains("retention period has expired"),
+            "expired notice must NOT appear when workspace_root is unset"
+        );
     }
 }

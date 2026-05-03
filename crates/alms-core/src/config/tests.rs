@@ -762,7 +762,11 @@ fn test_load_or_default_resolves_data_dir() {
     let _lock = ENV_LOCK.lock().unwrap();
     // Clear data dir env to use the relative default "./.alms".
     let _data_guard = SingleEnvGuard::remove("ALMS_DATA_DIR");
-    // Mock LLM irrelevant here -- load_or_default() swallows errors.
+    // #924: post-fail-fast, `load_or_default()` runs `validate()`. The
+    // default config (and env-overridden config in this test) passes
+    // validate without needing mock mode — `validate()` only WARNS
+    // about a missing API key and does not return Err. Mock mode is
+    // irrelevant here.
     let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
 
     let config = AlmsConfig::load_or_default();
@@ -1658,5 +1662,295 @@ reasoning_effort = "extreme"
         result.is_err(),
         "invalid reasoning_effort should fail to parse, got: {:?}",
         result.map(|c| c.llm.openai.reasoning_effort)
+    );
+}
+
+// ---- Symmetric pair-only validation for [context].summary_* (#877) ----
+//
+// The PATCH /settings layer in alms-gateway already rejects asymmetric
+// updates with `SUMMARY_PROVIDER_REQUIRES_MODEL` /
+// `SUMMARY_MODEL_REQUIRES_PROVIDER`. The HTTP `POST /agents` /
+// `PUT /agents/{id}` validators do the same for per-agent overrides.
+// Issue #877 closed the remaining gap: a hand-edited `alms.toml` with
+// only one of the pair set used to start the daemon successfully and
+// only fail at run time. These tests pin the load-time rejection so
+// the validation gap can't sneak back in.
+
+#[test]
+fn test_validation_rejects_summary_provider_without_model() {
+    let mut config = AlmsConfig::default();
+    config.context.summary_provider = Some("openrouter".into());
+    config.context.summary_model = None;
+    let err = config.validate().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("summary_provider is set") && msg.contains("summary_model is empty"),
+        "expected pair-only error message about provider-without-model, got: {msg}"
+    );
+}
+
+#[test]
+fn test_validation_rejects_summary_model_without_provider() {
+    let mut config = AlmsConfig::default();
+    config.context.summary_provider = None;
+    config.context.summary_model = Some("minimax/minimax-m2.7".into());
+    let err = config.validate().unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("summary_model is set") && msg.contains("summary_provider is empty"),
+        "expected pair-only error message about model-without-provider, got: {msg}"
+    );
+}
+
+#[test]
+fn test_validation_accepts_both_summary_fields_set() {
+    let mut config = AlmsConfig::default();
+    config.context.summary_provider = Some("openrouter".into());
+    config.context.summary_model = Some("minimax/minimax-m2.7".into());
+    assert!(
+        config.validate().is_ok(),
+        "both fields set together is the valid 'opt-in' shape"
+    );
+}
+
+#[test]
+fn test_validation_accepts_both_summary_fields_none() {
+    // Default config — both None — is the shipped baseline. Must
+    // continue to validate as OK so the daemon starts out of the box.
+    let config = AlmsConfig::default();
+    assert!(
+        config.context.summary_provider.is_none() && config.context.summary_model.is_none(),
+        "default config has both fields None"
+    );
+    assert!(config.validate().is_ok());
+}
+
+/// End-to-end: a hand-edited `alms.toml` with `[context]` set to the
+/// asymmetric (provider, no-model) shape must be rejected at config
+/// load — not later as a run-time error. The full `validate()` chain
+/// runs, so we call `ensure_builtin_providers()` first so the
+/// `[llm.providers.anthropic]` sugar entry is registered (mirroring
+/// the production `from_*()` paths in `mod.rs`).
+#[test]
+fn test_asymmetric_summary_toml_fails_at_load_time() {
+    let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet"
+
+[context]
+summary_provider = "openrouter"
+"#;
+    let mut cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    cfg.llm.ensure_builtin_providers();
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("summary_provider is set"),
+        "asymmetric TOML must be rejected at validate(), got: {err}"
+    );
+}
+
+#[test]
+fn test_asymmetric_summary_toml_other_direction_fails_at_load_time() {
+    let toml_str = r#"
+[llm]
+provider = "anthropic"
+model = "claude-sonnet"
+
+[context]
+summary_model = "minimax/minimax-m2.7"
+"#;
+    let mut cfg: AlmsConfig = toml::from_str(toml_str).expect("TOML parses");
+    cfg.llm.ensure_builtin_providers();
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("summary_model is set"),
+        "asymmetric TOML must be rejected at validate(), got: {err}"
+    );
+}
+
+// ---- #924: load_or_default fail-fast on validate() failure ----
+//
+// `AlmsConfig::load_or_default()` is the path the gateway entrypoint
+// (`alms gateway`) uses (via `crates/alms-cli/src/main.rs:137`). Pre-#924
+// it caught every `load()` error — including `validate()` violations —
+// and silently fell back to compiled defaults with a stderr warning.
+// That meant a hand-edited `alms.toml` with one of the pair-only
+// `[context]` summary fields set (or any other `validate()` violation)
+// produced a daemon that:
+//   1. Printed an easily-missed stderr warning;
+//   2. Started with default settings, silently discarding the operator's
+//      intent;
+//   3. Ran every subsequent run against the wrong config.
+//
+// #877's stated acceptance criterion ("Daemon refuses to start on
+// hand-edited asymmetric `alms.toml`") was therefore not literally
+// satisfied — `AlmsConfig::load()` did refuse, but `load_or_default()`
+// was the one actually wired into the gateway boot path.
+//
+// The fix splits two error classes:
+//   - File-load failures (IO / TOML parse) → warn + use defaults.
+//     First-run / fresh-install / corrupted-file scenarios still
+//     produce a working daemon.
+//   - Validation failures → fatal, process exits non-zero with a clear
+//     stderr message pointing at the bad field.
+//
+// Tests use `load_or_default_fallible()` — the inner `Result`-returning
+// shape — so they can assert on the error path without aborting the
+// test process. The public `load_or_default()` wraps it with
+// `std::process::exit(1)` on Err. The two CWD-based tests serialise
+// against `ENV_LOCK` because `find_config_file()` reads from the
+// process cwd, which is shared across parallel tests.
+
+/// Verify the fail-fast contract directly at the helper boundary:
+/// `load_or_default_fallible()` must return `Err(InvalidConfig(_))`
+/// when `[context]` is in the partial-pair shape #877 rejects.
+///
+/// We construct the partial-pair config in a temp directory and chdir
+/// into it so `find_config_file()` picks up the test toml. Holding
+/// `ENV_LOCK` for the whole test serialises against any other test
+/// that touches process cwd or `ALMS_*` env vars.
+#[test]
+fn test_load_or_default_fail_fast_on_partial_summary_pair() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    // Clear any LLM env overrides that could otherwise force the
+    // config into a different invalid shape (we want to pin the
+    // pair-only invariant specifically).
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+
+    let tempdir = tempfile::tempdir().expect("tempdir creates");
+    let toml_path = tempdir.path().join("alms.toml");
+    std::fs::write(
+        &toml_path,
+        r#"
+[llm]
+provider = "anthropic"
+
+[context]
+summary_provider = "openrouter"
+"#,
+    )
+    .expect("toml write");
+
+    // chdir into the tempdir so `find_config_file()` picks up our
+    // partial-pair toml. Save the current cwd so we can restore it
+    // even if the assertion below panics.
+    let saved_cwd = std::env::current_dir().expect("cwd readable");
+    std::env::set_current_dir(tempdir.path()).expect("chdir to tempdir");
+
+    let result = AlmsConfig::load_or_default_fallible();
+
+    // Restore cwd BEFORE asserting so a failure doesn't poison the
+    // test process for other tests acquiring `ENV_LOCK`.
+    std::env::set_current_dir(&saved_cwd).expect("restore cwd");
+
+    let err = result.expect_err(
+        "load_or_default_fallible must return Err on a partial-pair \
+         [context] config (#924 fail-fast contract). Pre-#924 the \
+         function would silently fall back to defaults and discard \
+         the operator's intent.",
+    );
+    assert!(
+        matches!(err, AlmsError::InvalidConfig(_)),
+        "expected InvalidConfig variant on validate() failure, got: {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("summary_provider is set") && msg.contains("summary_model is empty"),
+        "expected pair-only error message, got: {msg}"
+    );
+}
+
+/// Counterpart to the partial-pair test: when no config file is
+/// present, `load_or_default_fallible()` must succeed (returns
+/// defaults + env overrides). This pins the bootstrapping case so the
+/// fail-fast change does not regress first-run / fresh-install.
+///
+/// We point cwd at an empty tempdir AND clear `HOME` so
+/// `find_config_file()` cannot find the user's home `~/.config/alms/`
+/// either. The result must be a valid default config.
+#[test]
+fn test_load_or_default_succeeds_with_no_config_file() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    // Point HOME at an empty tempdir so `~/.config/alms/config.toml`
+    // resolves to a non-existent path and `find_config_file()` returns
+    // None for the home branch. On Windows, `dirs_path()` reads
+    // `USERPROFILE` rather than `HOME` — set both so the test works
+    // cross-platform.
+    let empty_home_dir = tempfile::tempdir().expect("tempdir creates");
+    let _home_guard = SingleEnvGuard::set("HOME", empty_home_dir.path().to_str().unwrap());
+    let _userprofile_guard =
+        SingleEnvGuard::set("USERPROFILE", empty_home_dir.path().to_str().unwrap());
+
+    let tempdir = tempfile::tempdir().expect("tempdir creates");
+    // The tempdir is intentionally empty — no `alms.toml` to find.
+
+    let saved_cwd = std::env::current_dir().expect("cwd readable");
+    std::env::set_current_dir(tempdir.path()).expect("chdir to tempdir");
+
+    let result = AlmsConfig::load_or_default_fallible();
+
+    std::env::set_current_dir(&saved_cwd).expect("restore cwd");
+
+    let cfg = result.expect(
+        "load_or_default_fallible must succeed when no config file is \
+         present (bootstrapping / first-run case). The fail-fast \
+         change for #924 must not regress this path.",
+    );
+    // Spot-check that the defaults shape is intact.
+    assert!(
+        cfg.context.summary_provider.is_none() && cfg.context.summary_model.is_none(),
+        "default config has both pair fields None"
+    );
+    assert!(
+        std::path::Path::new(&cfg.server.data_dir).is_absolute(),
+        "data_dir must still be resolved to an absolute path"
+    );
+}
+
+/// Verify a corrupt / unparseable `alms.toml` still falls back to
+/// defaults rather than aborting. This pins the
+/// "file-load-failures-are-recoverable" axis of the #924 split: only
+/// `validate()` errors are fatal, not IO / TOML-parse errors.
+///
+/// (Whether to make TOML parse errors fatal is an open design
+/// question in the issue; the chosen behaviour is to keep them
+/// recoverable so a corrupted file doesn't lock the operator out of
+/// running the daemon at all. The `validate()` axis, post-fallback, is
+/// guaranteed to pass on defaults.)
+#[test]
+fn test_load_or_default_falls_back_to_defaults_on_unparseable_toml() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _provider_guard = SingleEnvGuard::remove("ALMS_LLM_PROVIDER");
+    let _mock_guard = SingleEnvGuard::remove("ALMS_LLM_MOCK");
+    let empty_home_dir = tempfile::tempdir().expect("tempdir creates");
+    let _home_guard = SingleEnvGuard::set("HOME", empty_home_dir.path().to_str().unwrap());
+    let _userprofile_guard =
+        SingleEnvGuard::set("USERPROFILE", empty_home_dir.path().to_str().unwrap());
+
+    let tempdir = tempfile::tempdir().expect("tempdir creates");
+    let toml_path = tempdir.path().join("alms.toml");
+    std::fs::write(&toml_path, "not valid toml { } [unclosed").expect("toml write");
+
+    let saved_cwd = std::env::current_dir().expect("cwd readable");
+    std::env::set_current_dir(tempdir.path()).expect("chdir to tempdir");
+
+    let result = AlmsConfig::load_or_default_fallible();
+
+    std::env::set_current_dir(&saved_cwd).expect("restore cwd");
+
+    // Corrupt-file fallback returns Ok(defaults), not Err — the file
+    // axis is recoverable. The validate-axis is fatal (covered by
+    // `test_load_or_default_fail_fast_on_partial_summary_pair`).
+    let cfg = result.expect(
+        "an unparseable alms.toml must fall back to defaults, not \
+         abort — only validate() failures are fatal under #924",
+    );
+    assert!(
+        cfg.context.summary_provider.is_none() && cfg.context.summary_model.is_none(),
+        "fallback config should have default summary pair (both None)"
     );
 }

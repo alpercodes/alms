@@ -16,7 +16,7 @@ use crate::runs::{
     is_internal_context_id, list_runs, stream_run_events,
 };
 use crate::settings::{get_settings, patch_settings};
-use crate::workspace::{get_workspace, update_workspace_file};
+use crate::workspace::{get_workspace, open_workspace, update_workspace_file};
 use alms_core::{AgentId, SessionId, dm_participants};
 use alms_session::{Content, Role};
 use axum::{
@@ -153,9 +153,26 @@ pub(crate) fn protected_router() -> Router<AppState> {
         .route("/agents/{id_or_name}/default", post(agents::set_default))
         // Workspace (agent identity files)
         .route("/agents/{id_or_name}/workspace", get(get_workspace))
+        // #858: open the workspace dir in the host file explorer.
+        // Registered BEFORE the `{file}` PUT route so axum's path matcher
+        // resolves `/workspace/open` to this handler instead of treating
+        // "open" as a file slug — a PUT on `/workspace/open` would have
+        // hit the file-overwrite handler with `file = "open"` and 404'd
+        // anyway, but POST is unambiguous either way.
+        .route("/agents/{id_or_name}/workspace/open", post(open_workspace))
         .route(
             "/agents/{id_or_name}/workspace/{file}",
             axum::routing::put(update_workspace_file),
+        )
+        // Agent-scoped SSE feed (#856) — emits
+        // `session_activity_started` / `session_activity_ended` events for
+        // runs across all of the agent's sessions, so the sidebar can
+        // surface activity on sessions other than the currently-viewed one.
+        // Future per-agent events (e.g. DM activity in #886) will share
+        // this same feed.
+        .route(
+            "/agents/{agent_id}/events",
+            get(crate::runs::stream_agent_events),
         )
         // Settings (server defaults for UI pre-population + partial update)
         .route("/settings", get(get_settings).patch(patch_settings))
@@ -217,6 +234,11 @@ async fn health_check() -> impl IntoResponse {
 ///   `"subagent"`, `"telegram"`, `"episodic"` (derived from `context_id`)
 /// - `participants`: `[name1, name2]` for DM sessions (parsed from `context_id`)
 /// - `agent_name`: agent name extracted from `notifications:{agent}` context IDs
+/// - `has_active_run`: `true` if any queued or running run is currently
+///   tied to this session — drives the sidebar's "active" indicator on
+///   the initial load and after SSE reconnect (#856). Pairs with the
+///   agent-scoped SSE feed (`GET /agents/{agent_id}/events`) which emits
+///   live transitions between calls to this endpoint.
 async fn list_sessions(
     State(state): State<AppState>,
     Query(params): Query<ListSessionsQuery>,
@@ -268,6 +290,9 @@ async fn list_sessions(
         // Build the enriched JSON object
         let mut obj = serde_json::to_value(&session).unwrap_or_default();
         obj["session_type"] = serde_json::json!(session_type);
+        // `has_active_run` powers the sidebar's "active" indicator on
+        // initial load / SSE reconnect (#856).
+        obj["has_active_run"] = serde_json::json!(state.run_manager.has_active_runs(session.id));
 
         // Type-specific enrichments
         match session_type {

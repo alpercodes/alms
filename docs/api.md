@@ -142,6 +142,7 @@ subagent, job) are excluded by default.
       "agent_id": "<uuid>",
       "context_id": "telegram_main_1853446411",
       "session_type": "telegram",
+      "has_active_run": false,
       "created_at": "2026-02-11T07:00:00Z",
       "last_activity": "2026-02-11T07:52:00Z",
       "status": "active"
@@ -152,6 +153,7 @@ subagent, job) are excluded by default.
       "context_id": "dm:alice:bob",
       "session_type": "dm",
       "participants": ["alice", "bob"],
+      "has_active_run": true,
       "created_at": "2026-02-11T08:00:00Z",
       "last_activity": "2026-02-11T08:15:00Z",
       "status": "active"
@@ -162,6 +164,7 @@ subagent, job) are excluded by default.
       "context_id": "notifications:alice",
       "session_type": "notification",
       "agent_name": "alice",
+      "has_active_run": false,
       "created_at": "2026-02-11T09:00:00Z",
       "last_activity": "2026-02-11T09:30:00Z",
       "status": "active"
@@ -177,6 +180,7 @@ subagent, job) are excluded by default.
 | `session_type` | string | Session type derived from the `context_id`. Always present. See table below. |
 | `participants` | string[] | Participant names parsed from the DM context ID (e.g. `["alice", "bob"]`). Only present when `session_type` is `"dm"`. |
 | `agent_name` | string | Agent name extracted from the notification context ID (e.g. `"alice"` from `"notifications:alice"`). Only present when `session_type` is `"notification"`. |
+| `has_active_run` | bool | `true` if any queued or running run is currently tied to this session, `false` otherwise. Drives the sidebar's "active" indicator on the initial load and after SSE reconnect. Always present. Pairs with the agent-scoped SSE feed (`GET /agents/{agent_id}/events`, section 5.7) which emits live `session_activity_started` / `session_activity_ended` transitions between calls to this endpoint. See #856. |
 
 **`session_type` values**
 
@@ -351,15 +355,17 @@ Notes:
 ```json
 {
   "session_id": "<uuid>",
+  "agent_id": "<uuid>",
   "input": {
     "type": "text",
     "text": "Hello"
-  },
-  "mode": {
-    "kind": "non_stream" 
   }
 }
 ```
+
+`agent_id` is optional for normal sessions (the gateway resolves it from the session's owning agent) and **required** for shared DM sessions. The request body carries no config knobs — per-run overrides were removed in the #941 pivot. Operators change model / provider / posture / reasoning budgets via `PATCH /agents/{id}` (or `PATCH /settings` for server defaults) before starting the run.
+
+**Forward compatibility.** Unknown fields on the request body are silently ignored — the deserializer does NOT use `deny_unknown_fields`. UI clients on stale builds that still send `model`, `max_tokens`, `posture`, `provider`, `debug_mode`, `thinking_budget_tokens`, `reasoning_effort`, or `gemini_thinking_budget` will continue to function: the gateway accepts the request, drops the stale fields on the floor, and runs with the agent's resolved config.
 
 **Response 201**
 ```json
@@ -391,7 +397,15 @@ Why not `POST /agent/run`?
   "ts": "2026-02-11T07:52:05Z",
   "job_id": null,
   "parent_run_id": null,
-  "tool_call_count": 6
+  "tool_call_count": 6,
+  "resolved_config": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 4096,
+    "posture": "guarded",
+    "debug_mode": false,
+    "thinking_budget_tokens": 0
+  }
 }
 ```
 
@@ -401,6 +415,8 @@ Notes:
 - `usage` is `null` for failed/cancelled runs.
 - `parent_run_id` is present (as a UUID string) for subagent runs; absent for top-level runs (uses `skip_serializing_if = "Option::is_none"`).
 - `tool_call_count` (optional integer) — number of tool call records stored for this run. Present when SQLite persistence is enabled. Use `GET /runs/{run_id}/tool-calls` to retrieve the full records.
+- `queue_position` (optional integer, 1-indexed) — present and `>= 1` only while `status == "queued"`. Carries the same semantic as `run_created.queued_behind` and the live `run_queue_position` SSE event so a late-joining client (page reload, polling) can render the queued state without waiting for the next decrement. Absent for running/terminal runs.
+- `resolved_config` (optional object, #837) — snapshot of the layered (per-agent > server-default) config the run committed to at start-time. Per-run config overrides were removed in the #941 pivot, so the snapshot now reflects a two-layer chain instead of three. Absent for runs still queued, runs that never advanced past `queued` (e.g. queued-then-cancelled fast-path), and pre-#837 SQLite rows. Fields: `provider`, `model`, `max_tokens`, `posture`, `debug_mode` (always present); `thinking_budget_tokens` (Anthropic, `0` = disabled, always present as `u32`); `reasoning_effort` (OpenAI-compat, `"low"`/`"medium"`/`"high"`/`"minimal"`, omitted on the wire when no value reached the adapter); `gemini_thinking_budget` (Gemini, omitted on the wire when no value reached the adapter). The reasoning / thinking shape asymmetry is intentional — see the `ResolvedRunConfig` field docs in `crates/alms-core/src/run.rs` for the rationale (each field mirrors its underlying `AgentConfig` shape so the snapshot is a faithful projection of what the adapter saw).
 
 ### 5.3 Stream a run (SSE-first)
 `GET /runs/{run_id}/events`
@@ -448,7 +464,33 @@ The `source` field is omitted when not set. `is_notification` is `true` when the
 
 `run_started`
 ```json
-{ "run_id": "<uuid>", "session_id": "<uuid>", "ts": "..." }
+{
+  "run_id": "<uuid>",
+  "session_id": "<uuid>",
+  "ts": "...",
+  "resolved_config": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-20250514",
+    "max_tokens": 4096,
+    "posture": "guarded",
+    "debug_mode": false,
+    "thinking_budget_tokens": 0
+  }
+}
+```
+
+`resolved_config` (optional object, #837) carries the same snapshot surfaced on `GET /runs/{run_id}`. It is absent on the wire (uses `skip_serializing_if = "Option::is_none"`, **not** emitted as `null`) when the snapshot wasn't built — for example a queued-then-cancelled fast-path that never reached the `Queued -> Running` transition. Replay of `run_started` via SSE reconnect (`Last-Event-ID`) carries the same field identically to the live broadcast. See `GET /runs/{run_id}` notes above for the field shape and the rationale for the per-knob shape asymmetry.
+
+`run_queue_position`
+Emitted when the head of the per-agent queue advances (a run finishes, fails, or is cancelled) so still-queued runs can show a live decrementing position in the UI. The event fires once per remaining queued run on the same agent each time the head advances. `position` matches the same 1-indexed semantic as `run_created.queued_behind` — `1` means "next up" (one run still ahead). No event is emitted with `position == 0`; the existing `run_started` event signals that a run has left the queue and is now executing. Fanned out on both the per-run and per-session SSE feeds.
+```json
+{
+  "run_id": "<uuid>",
+  "session_id": "<uuid>",
+  "agent_id": "<uuid>",
+  "position": 1,
+  "ts": "..."
+}
 ```
 
 `token_delta`
@@ -725,6 +767,72 @@ Notes:
 { "error": { "code": "AMBIGUOUS_FILTER", "message": "..." } }
 ```
 
+### 5.7 Stream agent-scoped events (SSE)
+`GET /agents/{agent_id}/events`
+
+Persistent SSE feed scoped to a single agent, carrying activity events
+across **all** of the agent's sessions (regular chat, DMs, notifications,
+jobs). Backs the web UI's session sidebar so it can light up the
+"active" indicator on any session — not just the currently-viewed one
+(#856).
+
+Filtering is performed at the broadcast layer: subscribers to one
+agent's feed never see events for any other agent.
+
+**Response 200**
+- `Content-Type: text/event-stream`
+
+**Response 404** — `agent_id` does not resolve to a known agent in the
+registry. The check happens before any sender is registered, so
+unknown-agent connections never insert orphan entries into the in-memory
+sender map (#887).
+
+#### Event types
+
+`session_activity_started`
+Emitted when a run on any of the agent's sessions transitions out of
+`Queued` and starts executing. Pairs 1:1 with `session_activity_ended`
+when the run actually executes.
+```json
+{
+  "session_id": "<uuid>",
+  "run_id": "<uuid>",
+  "agent_id": "<uuid>",
+  "ts": "..."
+}
+```
+
+`session_activity_ended`
+Emitted when a run on any of the agent's sessions reaches a terminal
+state (completed, failed, or cancelled). Always paired with a prior
+`session_activity_started`, **except** for the pre-cancellation path:
+when a queued run is cancelled before it starts executing, the feed
+emits an `ended` without a paired `started` so the sidebar's
+snapshot-derived `has_active_run: true` indicator clears. Consumers
+should treat the snapshot from `GET /sessions` as the source of truth
+for "indicator on" and `ended` as the universal "indicator off" signal
+(#888).
+```json
+{
+  "session_id": "<uuid>",
+  "run_id": "<uuid>",
+  "agent_id": "<uuid>",
+  "ts": "..."
+}
+```
+
+#### Reconnect
+Supported via `Last-Event-ID` header (automatic browser reconnect) or
+`?last_event_id=<n>` query parameter (initial connection). The query
+parameter takes precedence when both are present. Event IDs are scoped
+to the agent's event log — separate from per-run and per-session event
+log counters.
+
+> **Note:** The agent event log is held in memory and lost on daemon
+> restart. After a restart, clients should open the SSE stream without a
+> `last_event_id` parameter and rely on `GET /sessions` to repopulate
+> any sidebar indicators.
+
 ---
 
 ## 6) Approvals (minimal but real)
@@ -917,10 +1025,11 @@ is asking for two contradictory things, so we reject rather than silently
 pick one. `clear_*: false` is equivalent to omitting the field entirely
 (the stored value is unchanged).
 
-After a successful clear, a subsequent `POST /runs` with no per-run
-override for that knob resolves to the server default from
-`[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]`, completing the
-three-layer precedence chain (per-run > per-agent > server default).
+After a successful clear, a subsequent `POST /runs` resolves to the
+server default from `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]`,
+completing the two-layer precedence chain (per-agent > server default).
+Per-run overrides were removed in the #941 pivot; agents are the single
+per-tenant config surface.
 
 **Response 200** — updated `AgentRecord`
 **Response 400 CLEAR_AND_VALUE_CONFLICT** — both a value and the matching `clear_*` flag were sent for the same reasoning knob.
@@ -1009,7 +1118,7 @@ Returns current server defaults for UI pre-population.
 }
 ```
 
-Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved for backward compatibility alongside the new nested objects (`context`, `session`, `logging`, `tools`, `llm`). The nested objects contain the same data in a structured form. New consumers should prefer the nested objects. The `llm` block (added in #809) mirrors the `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` sections of `alms.toml` — these are the *server-level* defaults that feed the three-layer precedence chain for per-agent and per-run overrides.
+Note: Top-level flat keys (`context_strategy`, `enabled_tools`) are preserved for backward compatibility alongside the new nested objects (`context`, `session`, `logging`, `tools`, `llm`). The nested objects contain the same data in a structured form. New consumers should prefer the nested objects. The `llm` block (added in #809) mirrors the `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` sections of `alms.toml` — these are the *server-level* defaults that feed the two-layer precedence chain (per-agent > server default; per-run overrides were removed in #941).
 
 ### 10.2 Update server settings
 `PATCH /settings`
@@ -1022,7 +1131,7 @@ Partially update server-level configuration at runtime. The `context`, `session`
 
 Within `tools`, only `shell_policy`, `sandbox_root`, `timeout_secs`, and `max_output_bytes` are dynamically mutable. **`tools.shell_permissions` is configured in `alms.toml` only** — its allow/deny regex patterns are compiled once at startup and baked into each `ShellTool` instance (see `docs/agent-runtime-design.md` for the config schema and `docs/security-model.md` § 4.3 for the policy semantics). This applies to every field in the block: `allowed_commands`, `denied_commands`, and `classifier_overrides` are all config-file-only and are **not** PATCH-mutable. Sending `shell_permissions` in a `PATCH /settings` body is ignored; restart the gateway to pick up new patterns.
 
-Within `llm`, each provider-family sub-block mirrors the shape of `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` in `alms.toml`. Mutations feed the server-default layer of the three-layer precedence chain (per-run > per-agent > server default) and are picked up on the next `POST /runs` without a restart. All provider-family sub-blocks and fields are optional; fields that are `None` in the patch body are left unchanged. API keys and endpoints are **not** in scope — those live under a separate security surface.
+Within `llm`, each provider-family sub-block mirrors the shape of `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` in `alms.toml`. Mutations feed the server-default layer of the two-layer precedence chain (per-agent > server default; per-run overrides were removed in #941) and are picked up on the next `POST /runs` without a restart. All provider-family sub-blocks and fields are optional; fields that are `None` in the patch body are left unchanged. API keys and endpoints are **not** in scope — those live under a separate security surface.
 
 #### `llm` field semantics — clear sentinels and wire shape
 
@@ -1128,6 +1237,33 @@ Updates a single workspace file. `{file}` is one of: `personality.md`, `goals.md
 ```
 
 **Response 200** — `{ "ok": true }`
+
+### 11.3 Open workspace in host file explorer
+`POST /agents/{id_or_name}/workspace/open`
+
+Spawns the host's native file explorer at the agent's workspace directory (Windows Explorer / Finder / `xdg-open`). Operator-trust: the gateway is expected to run on the same host as the operator's browser, so the existing bearer-auth gate is the only privilege check. Bearer auth applies as on other write endpoints.
+
+The endpoint takes no client-supplied path — the workspace path is resolved server-side from the agent registry record and the configured `ALMS_WORKSPACE_DIR`. Path-traversal is closed-by-construction by `validate_agent_name`, which restricts agent names to ASCII lowercase + digits + hyphens.
+
+The launcher process is fire-and-forget — the response returns as soon as the OS accepts the spawn. The launcher itself is expected to outlive the request (the file explorer window should stay open until the user closes it).
+
+**Request** — empty body.
+
+**Response 200**
+```json
+{ "ok": true, "path": "/abs/path/to/agents/<name>" }
+```
+
+**Errors**
+- `503 NOT_CONFIGURED` — `ALMS_WORKSPACE_DIR` is unset.
+- `404 NOT_FOUND` — agent not found.
+- `500 WORKSPACE_PATH_MISSING` — workspace dir does not exist on disk (the agent record exists but its workspace dir was never created or has been deleted).
+- `500 LAUNCHER_FAILED` — could not spawn the launcher binary (e.g., `xdg-open` not on PATH on a server-only Linux box).
+
+**Platform notes**
+- **Windows**: launches `explorer.exe`. `explorer.exe` exits with status 1 even on a successful folder-open, so the gateway does NOT inspect the launcher exit code on any platform — successful `Command::spawn` is treated as success.
+- **macOS**: launches `open`.
+- **Linux / other Unix**: launches `xdg-open` (relies on `xdg-utils`).
 
 ---
 
@@ -1235,4 +1371,26 @@ Bearer token authentication. Enabled when `ALMS_AUTH_TOKEN` is set.
 
 ---
 
-*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response, new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`), `dm_conversation_ended` SSE event, and `notification:dm_ended` run source. Updated 2026-04-12 with `GET /sessions/{session_id}/tool-calls` endpoint (section 4.6). Updated 2026-04-12 with `GET /agents/{id_or_name}/timeline` endpoint (section 12) for cross-channel unified activity view (#608).*
+## 14) Built-in tool response shapes (selected)
+
+Most built-in tool response shapes are documented inline in the tool's `description()` (the surface the LLM sees) and on the `RuntimeEvent` payload. This section captures shapes whose nuances are easy to miss when reading per-call output.
+
+### 14.1 `fs_grep`
+
+`fs_grep` searches file contents using regex patterns. The response shape varies slightly across the three `output_mode` values (`files_with_matches`, `count`, `content`); all three share the truncation-reporting fields described below.
+
+**Common response fields**
+| Field             | Type    | Description |
+|-------------------|---------|-------------|
+| `matches`         | array   | Matching results — shape depends on `output_mode`. |
+| `total` / `total_matches` | int | Total result count (pre-pagination). |
+| `truncated`       | bool    | `true` when the file iteration was cut short by `head_limit` or the output cap. Files past the cutoff are *not* visited. |
+| `truncated_lines` | int     | Count of over-cap lines (per the 256 KiB per-line cap from #913) encountered across files actually scanned. See note below. |
+
+**`truncated_lines` semantics — important caveat.** `truncated_lines` reflects only files that were *actually visited* during the scan. When `head_limit` short-circuits the iteration (or the output-byte budget caps `files_with_matches` mode), files past the cutoff are not opened and any over-cap lines they contain are not counted. This matches the existing `truncated` flag's "results were cut short" semantic — `truncated: true` is the structural signal that the count is partial; `truncated_lines` reports only what the scan observed before stopping. To get a complete `truncated_lines` count, re-issue with `head_limit: 0` (unlimited) or paginate via `offset`.
+
+`truncated_lines` is `0` in `output_mode: "content"`, which uses a 1 MiB whole-file gate rather than the per-line cap (the field is emitted unconditionally for response-shape consistency).
+
+---
+
+*Authored by Mesut (2026-02-11). Updated 2026-03-28 with episodic memory config in `/settings` response, new tools (`list_my_sessions`, `read_session`, `read_messages`, `send_message`, `list_agents`, `ignore_message`), `dm_conversation_ended` SSE event, and `notification:dm_ended` run source. Updated 2026-04-12 with `GET /sessions/{session_id}/tool-calls` endpoint (section 4.6). Updated 2026-04-12 with `GET /agents/{id_or_name}/timeline` endpoint (section 12) for cross-channel unified activity view (#608). Updated 2026-04-29 with `fs_grep` response-shape section (14.1) noting `truncated_lines` reflects only visited files when `head_limit` short-circuits the scan (#913 follow-up).*

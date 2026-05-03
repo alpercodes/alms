@@ -153,7 +153,22 @@ Isolated tool execution used by every agent regardless of hierarchy level.
 
 **Read-before-write guard:** `fs_write` and `fs_edit` enforce a read-before-write policy via `FileStateCache` (per-run, shared across all fs tools). Existing files must be read via `fs_read` before they can be written or edited. The guard also detects external modifications (mtime + content-hash fallback) and rejects stale writes. New file creation bypasses the guard. See `crates/alms-sandbox/src/file_state_cache.rs`.
 
+**`fs_read` size limits:** Whole-file reads are capped at 256 KiB; passing `offset` or `limit` opts into a partial read that falls back to a 64 KiB output-byte budget (lowered from 512 KiB in #917 to match prevailing agent-tool caps and reduce pre-truncation bloat now that the in-loop tool-output truncate caps at 32 KB anyway — see #813 / #901). Each individual line is allocation-capped at 256 KiB before being returned — over-cap lines are truncated with an inline marker and the surplus bytes are drained, so a pathological single-line file (e.g. minified bundles) cannot exhaust daemon memory (#902); after #917 a fully-capped single line exceeds the 64 KiB response budget on its own, so such lines are now rejected from the response with `byte_budget_exceeded: true` and the agent must paginate via `offset`/`limit`.
+
 **Sibling workspace reads (#242):** When a named agent is attached via `with_workspace()`, its read-family fs tools (`fs_read`, `fs_list`, `fs_grep`, `fs_glob`) gain an additional read-only root at the workspace parent directory, so a parent agent can read a subagent's `personality.md`/`goals.md`/`memories.md` without being able to modify them. Write-family tools (`fs_write`, `fs_edit`, `workspace_write`) stay scoped to the primary sandbox root. See the "Filesystem sandboxing" section of `docs/security-model.md` for the full trust model (including ephemeral subagent asymmetry).
+
+**Tool output truncation + spill files (#756 + #851):** Two layers cap how much tool output reaches the LLM context, the audit log, and the SSE stream:
+
+- **`shell` internal spill (#756)** — caps `shell_exec` stdout/stderr at 30 KB head + tail per invocation. The full pre-truncation bytes are written to `{data_dir}/shell_output/{run_id}/shell_<call_id>.txt` so the agent can recover them via `fs_read` / `fs_grep`. Lives *inside* the shell tool, before the JSON result is returned to the agent loop. Configured under `[tools.shell_spill]` in `alms.toml`.
+- **Shared in-loop truncate (#851)** — every tool's result (including `fs_read`, `http_get`, `read_session`, etc., not just shell) is routed through `tool_output_truncate::truncate` before it lands in the agent's live message vec, the session DB, the audit log, and the `ToolEnd` SSE event. Caps oversized outputs at **32 KB / 2000 lines** (whichever fires first). The full pre-truncation bytes are spilled to `{data_dir}/tool-output/{run_id}/tool_<call_id>.txt`. Configured under `[tools.tool_output_truncate]` in `alms.toml`.
+
+Both spill features:
+- Use a **7-day retention sweep** that runs once at gateway startup (filesystem `mtime` check). Operators tune via `retention_days` in the respective config block.
+- Widen the read-family fs_* tools' allowed roots to include the per-run spill directory, so the LLM-visible recovery hint (``Use `fs_grep` to search the full content or `fs_read` with `offset`/`limit` to view specific sections.``) resolves to a path the agent can actually read.
+- Lay out subagent spills under `{data_dir}/{shell_output|tool-output}/sub-{task_id}/` so the parent's startup retention sweep collects them the same way it collects parent spills.
+- Are config-file-only (not mutable via `PATCH /settings`) — operators tune the TOML and restart the daemon.
+
+When the truncation service rewrites a tool result, the persisted session row carries `truncated_in_loop: true` metadata so `session_msg_to_llm` skips its legacy 2000-byte re-truncation pass on context rebuild — the bytes on disk are exactly the bytes the live agent saw. When the retention sweep later expires the spill file, `session_msg_to_llm` detects the missing path and rewrites the trailing recovery hint to a "retention period has expired" notice so the agent doesn't try to `fs_read` an ENOENT path on a follow-up turn.
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 

@@ -7,6 +7,7 @@ mod fs_list;
 mod fs_read;
 mod fs_write;
 mod http_get;
+mod line_cap;
 mod math;
 
 pub use datetime::DatetimeTool;

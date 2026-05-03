@@ -5,7 +5,13 @@ use crate::helpers::{api_get, api_post, fmt_time, open_db, resolve_agent, short_
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum RunCommands {
-    /// Create a new run (requires running gateway)
+    /// Create a new run (requires running gateway).
+    ///
+    /// Per-run config overrides were removed in the #941 pivot — agents
+    /// are the single per-tenant config surface. To change model /
+    /// provider / posture / budgets for the next run, edit the agent
+    /// first via `alms agent config <name> --model=... --posture=...`
+    /// (see `alms agent config --help`).
     Create {
         /// Session UUID
         #[arg(long)]
@@ -16,15 +22,6 @@ pub(crate) enum RunCommands {
         /// Agent name or UUID. Required when creating a run on a shared DM session.
         #[arg(long)]
         agent: Option<String>,
-        /// Model override
-        #[arg(long)]
-        model: Option<String>,
-        /// Max tokens override
-        #[arg(long)]
-        max_tokens: Option<u32>,
-        /// Posture override ("guarded", "full_control", or "autonomous")
-        #[arg(long)]
-        posture: Option<String>,
     },
     /// List runs for a session (requires running gateway)
     List {
@@ -42,16 +39,12 @@ pub(crate) enum RunCommands {
     },
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_create(
     client: &reqwest::Client,
     url: &str,
     session: &str,
     input: &str,
     agent: Option<String>,
-    model: Option<String>,
-    max_tokens: Option<u32>,
-    posture: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
     let session_uuid =
@@ -68,14 +61,6 @@ pub(crate) async fn run_create(
         input: RunInput::Text {
             text: input.to_string(),
         },
-        model,
-        max_tokens,
-        posture,
-        provider: None,
-        debug_mode: None,
-        thinking_budget_tokens: None,
-        reasoning_effort: None,
-        gemini_thinking_budget: None,
     };
     let (_status, val) = api_post(client, url, "runs", &req).await?;
     if json {

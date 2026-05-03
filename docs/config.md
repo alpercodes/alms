@@ -88,15 +88,16 @@ When non-zero, every Anthropic request gains a `"thinking": {"type": "enabled", 
 
 Prior thinking blocks are **not** replayed on follow-up tool-use turns — this is standard mode. The Anthropic interleaved-thinking beta (which would require replaying signatures) is out of scope today and will land as a follow-up.
 
-### Per-agent and per-run precedence
+### Per-agent precedence
 
-The budget follows the same three-layer precedence pattern as `model` / `max_tokens`:
+The budget follows the same two-layer precedence pattern as `model` / `max_tokens`:
 
-1. **Per-run** (highest) — `thinking_budget_tokens` field on the `POST /runs` body.
-2. **Per-agent** — `thinking_budget_tokens` field on the agent registry entry (set via `POST /agents` or the CLI).
-3. **Server default** (lowest) — `[llm.anthropic].thinking_budget_tokens` in `alms.toml`.
+1. **Per-agent** (highest) — `thinking_budget_tokens` field on the agent registry entry (set via `POST /agents` or the CLI).
+2. **Server default** (lowest) — `[llm.anthropic].thinking_budget_tokens` in `alms.toml`.
 
-`Some(0)` at any layer is an explicit opt-out — e.g. an agent with `thinking_budget_tokens = 0` will never use extended thinking even when the server default enables it. Non-Anthropic providers silently ignore the field.
+`Some(0)` at either layer is an explicit opt-out — e.g. an agent with `thinking_budget_tokens = 0` will never use extended thinking even when the server default enables it. Non-Anthropic providers silently ignore the field.
+
+Per-run config overrides were removed in the #941 pivot; agents are the single per-tenant config surface. Operators set the budget on the agent record before starting the run.
 
 ### Usage accounting
 
@@ -183,15 +184,16 @@ Response-side, ALMS parses reasoning content from whichever field the provider u
 
 Like Anthropic thinking, reasoning text is **not** replayed back to the model on follow-up turns — it's a display/debug artifact, persisted as `reasoning_blocks` metadata on the assistant message so it survives page reload.
 
-### Per-agent and per-run precedence
+### Per-agent precedence
 
-Same three-layer chain as `model` / `max_tokens` / `thinking_budget_tokens`:
+Same two-layer chain as `model` / `max_tokens` / `thinking_budget_tokens`:
 
-1. **Per-run** (highest) — `reasoning_effort` field on the `POST /runs` body.
-2. **Per-agent** — `reasoning_effort` field on the agent registry entry (set via `POST /agents`, `PUT /agents/{id}`, or `alms agent create --reasoning-effort <value>`).
-3. **Server default** (lowest) — `[llm.openai].reasoning_effort` in `alms.toml`.
+1. **Per-agent** (highest) — `reasoning_effort` field on the agent registry entry (set via `POST /agents`, `PUT /agents/{id}`, or `alms agent create --reasoning-effort <value>`).
+2. **Server default** (lowest) — `[llm.openai].reasoning_effort` in `alms.toml`.
 
 Omitting the field at every layer means no `reasoning_effort` is sent — non-reasoning models behave exactly as before. There is no sentinel to clear a per-agent override back to "inherit server default" in a PATCH today (matches the `thinking_budget_tokens` PATCH shape); delete + recreate if you need that.
+
+Per-run config overrides were removed in the #941 pivot; agents are the single per-tenant config surface.
 
 ### Usage accounting
 
@@ -370,19 +372,20 @@ Set `cache_enabled = false` to skip cache creation entirely — useful for diagn
 
 **Prefix-hash invalidation.** Alongside each cache name, the in-process cache store keeps a hash of the exact JSON bytes that went into the cache (system instruction + tool definitions). On every turn the store re-hashes the current prefix; a mismatch (workspace file edited, tool list changed, system prompt rewritten) drops the stored handle and creates a fresh cache on the next turn. There's no operator knob for this — the hash comparison is automatic.
 
-**Server-level only.** Caching is a pure optimization — no per-agent or per-run override. Subagents inherit the parent's `cache_enabled` / `cache_ttl_seconds` verbatim so they share cache entries wherever possible.
+**Server-level only.** Caching is a pure optimization — no per-agent override. Subagents inherit the parent's `cache_enabled` / `cache_ttl_seconds` verbatim so they share cache entries wherever possible.
 
 #### Thinking passthrough
 
 Setting `thinking_budget = N` with `N > 0` emits `generationConfig.thinkingConfig: { thinkingBudget: N, includeThoughts: true }` on every Gemini request. The provider streams parts with `thought: true` alongside the visible text; ALMS routes those into the same provider-neutral `RuntimeEvent::ReasoningDelta` channel used by Anthropic extended thinking (#767) and OpenAI o-series reasoning (#768). The web UI renders them in the same collapsible reasoning panel.
 
-**Three-layer precedence** (#794) — `[llm.gemini].thinking_budget` in `alms.toml` is the server default, but per-agent and per-run overrides layer on top with the same shape as `thinking_budget_tokens` (#767) and `reasoning_effort` (#768):
+**Two-layer precedence** (#794 / #941) — `[llm.gemini].thinking_budget` in `alms.toml` is the server default, with per-agent overrides layering on top with the same shape as `thinking_budget_tokens` (#767) and `reasoning_effort` (#768):
 
-1. **Per-run** (highest): `POST /runs` with `"gemini_thinking_budget": N` in the request body.
-2. **Per-agent**: stored in the agent registry and set via `alms agent create --gemini-thinking-budget N` or `alms agent config --gemini-thinking-budget N` (also via `POST /agents` and `PUT /agents/{id_or_name}` on the HTTP surface).
-3. **Server default** (lowest): `[llm.gemini].thinking_budget` in `alms.toml`.
+1. **Per-agent** (highest): stored in the agent registry and set via `alms agent create --gemini-thinking-budget N` or `alms agent config --gemini-thinking-budget N` (also via `POST /agents` and `PUT /agents/{id_or_name}` on the HTTP surface).
+2. **Server default** (lowest): `[llm.gemini].thinking_budget` in `alms.toml`.
 
-`Some(0)` at any layer explicitly disables extended thinking for that scope — it is NOT a "use default" sentinel. `None` / omitted at a layer falls through to the next. Non-Gemini providers silently ignore the field regardless of layer. Named subagents get the same three-layer chain with the parent's effective budget acting as the "server default" layer: a per-named-subagent override stored on the registered `AgentRecord` wins, `None` inherits the parent's effective value verbatim. Caching knobs (`cache_enabled`, `cache_ttl_seconds`) remain server-level only.
+`Some(0)` at either layer explicitly disables extended thinking for that scope — it is NOT a "use default" sentinel. `None` / omitted at a layer falls through to the next. Non-Gemini providers silently ignore the field regardless of layer. Named subagents get the same two-layer chain with the parent's effective budget acting as the "server default" layer: a per-named-subagent override stored on the registered `AgentRecord` wins, `None` inherits the parent's effective value verbatim. Caching knobs (`cache_enabled`, `cache_ttl_seconds`) remain server-level only.
+
+Per-run config overrides were removed in the #941 pivot — agents are the single per-tenant config surface.
 
 Like Anthropic thinking, reasoning text is **not** replayed back to the model on follow-up turns — it's persisted as `reasoning_blocks` metadata on the assistant message so it survives page reload.
 

@@ -81,6 +81,23 @@
   text-align: right;
 }
 
+/* Per-DM-bubble timestamp row (PR #926 follow-up to #855). Pairs the
+   agent name label with the small grey <MessageTimestamp> next to it.
+   For right-side messages we reverse the row direction so the
+   timestamp lands on the outside of the bubble (left of the name) and
+   the agent-name still aligns flush to the bubble's right edge — same
+   "outside the bubble" placement as messaging apps like Slack/Discord.
+   The shared `.msg-timestamp` class still drives the typography, so DM
+   timestamps stay visually consistent with the main chat view. */
+.dm-msg-name-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.dm-msg-name-row-right {
+  flex-direction: row-reverse;
+}
+
 /* Message bubble */
 .dm-msg-bubble {
   padding: var(--space-2) var(--space-3);

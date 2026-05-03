@@ -143,7 +143,12 @@ function flushDeltaBuffer() {
         if (last && last.type === 'agent' && !last.sealed) {
             copy[copy.length - 1] = { ...last, text: last.text + pending };
         } else {
-            copy.push({ id: nextMsgId(), type: 'agent', role: 'assistant', text: pending, sealed: false });
+            // Capture the timestamp of the first delta so the per-message
+            // timestamp (#855) reflects when the agent started speaking.
+            copy.push({
+                id: nextMsgId(), type: 'agent', role: 'assistant',
+                text: pending, sealed: false, ts: new Date().toISOString(),
+            });
         }
         // Defensive check: log if tool messages were lost during buffer flush.
         // The only messages that should be removed are 'thinking' indicators.
@@ -338,8 +343,14 @@ export function openSessionStream(sessionId, opts) {
                     // showing the agent's current activity (e.g. a DM with
                     // another peer).  The inline thinking indicator handles
                     // the queued state via queuedBehind. (#693)
+                    //
+                    // runId is stored on the thinking message so the
+                    // `run_queue_position` SSE handler (#831) can locate
+                    // the right indicator to decrement when an upstream
+                    // run completes.
                     appendMessage({
-                        id: nextMsgId(), type: 'thinking', source: data.source, queuedBehind,
+                        id: nextMsgId(), type: 'thinking', source: data.source,
+                        queuedBehind, runId: data.run_id,
                     });
                 });
             } else {
@@ -372,10 +383,15 @@ export function openSessionStream(sessionId, opts) {
             // show thinking indicator with source context. The inline
             // indicator handles queue state via queuedBehind; the header
             // bar keeps showing the agent's current activity. (#693)
+            //
+            // runId is stored on the thinking message so the
+            // `run_queue_position` SSE handler (#831) can locate the right
+            // indicator to decrement when an upstream run completes.
             batch(() => {
                 activeRunId.value = data.run_id;
                 appendMessage({
-                    id: nextMsgId(), type: 'thinking', source: data.source, queuedBehind,
+                    id: nextMsgId(), type: 'thinking', source: data.source,
+                    queuedBehind, runId: data.run_id,
                 });
             });
         } else if (queuedBehind > 0) {
@@ -385,11 +401,15 @@ export function openSessionStream(sessionId, opts) {
             // activity); the inline indicator shows queue status. (#693)
             // Clear `pending` so it transitions from "Sending..." to
             // "Queued..." immediately. (#704)
+            //
+            // runId is stamped onto the thinking message so the
+            // `run_queue_position` SSE handler (#831) can locate the right
+            // indicator to decrement when an upstream run completes.
             batch(() => {
                 activeRunId.value = data.run_id;
                 updateMessage(
                     m => m.type === 'thinking' && m.pending,
-                    m => ({ ...m, queuedBehind, pending: false }),
+                    m => ({ ...m, queuedBehind, pending: false, runId: data.run_id }),
                 );
             });
         } else {
@@ -461,6 +481,30 @@ export function openSessionStream(sessionId, opts) {
         bumpRunListGeneration();
     });
 
+    // -- run_queue_position: live queue-position decrement (#831) --
+    //
+    // Fires every time a run ahead of this one in the per-agent queue
+    // finishes, fails, or is cancelled. `position` is 1-indexed and
+    // matches the semantic of `run_created.queued_behind` ("1 = next up").
+    // Position 0 is never emitted -- the existing `run_started` handler
+    // clears the chip when this run is dequeued.
+    //
+    // The run is identified by `data.run_id`, which both the `run_created`
+    // SSE handler and the `loadSession` reload path stamp onto the
+    // thinking-indicator message. A defensive `!m.runId` fallback handles
+    // any legacy / unstamped indicator (sessions only ever have one queued
+    // run on screen at a time, so the fallback can't update the wrong row).
+    on('run_queue_position', (e) => {
+        const data = JSON.parse(e.data);
+        const position = typeof data.position === 'number' ? data.position : 0;
+        if (position <= 0) return; // defensive -- backend never emits 0
+        updateMessage(
+            m => m.type === 'thinking' && m.queuedBehind > 0
+                && (m.runId === data.run_id || !m.runId),
+            m => ({ ...m, queuedBehind: position }),
+        );
+    });
+
     // -- status: agent phase update (live indicator in header bar) --
     // Note: no source_agent filter needed -- subagent status events are
     // routed to their own session streams, not the parent's.  If that
@@ -518,6 +562,31 @@ export function openSessionStream(sessionId, opts) {
         if (data.source_agent) return; // subagent reasoning is suppressed
         const delta = data.text || '';
         if (!delta) return;
+        const isDm = activeSession.value?.session_type === 'dm';
+        if (isDm) {
+            // For DM sessions: accumulate reasoning text into the per-run
+            // thinking buffer instead of mutating chatMessages.  The
+            // DmReasoningBlock for the active run reads this buffer and
+            // displays the text inside the collapsible "thinking" pane.
+            //
+            // Without this branch, the fallback path below would push a
+            // brand-new agent placeholder message with empty `text` and
+            // only a `reasoning` field — which DmConversationView routes
+            // through DmMessage, producing an empty right-side bubble that
+            // never gets content (the canonical message text arrives via
+            // `dm_message`, on a separate row).  The empty bubble persists
+            // until reload re-fetches history (where reasoning is grouped
+            // into dm_reasoning blocks via groupDmReasoningBlocks and
+            // never materialises as a stand-alone agent message). (#849)
+            const runId = activeRunId.value;
+            if (runId) {
+                const prev = dmThinkingBuffers.value;
+                const next = new Map(prev);
+                next.set(runId, (next.get(runId) || '') + delta);
+                dmThinkingBuffers.value = next;
+            }
+            return;
+        }
         transformMessages(prev => {
             // Drop any transient "thinking" indicator like token_delta does,
             // so the reasoning panel doesn't race with the pre-stream
@@ -540,6 +609,9 @@ export function openSessionStream(sessionId, opts) {
                     text: '',
                     reasoning: delta,
                     sealed: false,
+                    // Per-message timestamp (#855) — captured at the start
+                    // of the assistant turn (first reasoning delta).
+                    ts: new Date().toISOString(),
                 });
             }
             return copy;
@@ -851,6 +923,10 @@ export function openSessionStream(sessionId, opts) {
                 fromAgent: data.from_agent,
                 fromAgentId: data.from_agent_id,
                 sealed: true,
+                // Per-message timestamp (#855) — prefer the SSE-supplied
+                // event ts so the rendered time matches the persisted
+                // message timestamp on the server side.
+                ts: data.ts || new Date().toISOString(),
             });
         });
     });
@@ -1011,17 +1087,22 @@ export function openSessionStream(sessionId, opts) {
                     m.type === 'approval' && !m.resolved
                     && (!m.runId || !endingRunId || m.runId === endingRunId);
 
-                // Mark any still-running tool messages as cancelled.
-                // When a run is cancelled (or errors) mid-tool-execution, the
-                // backend emits run_cancelled but never emits tool_end for in-
-                // flight tools, leaving the spinner animation stuck.  (Fixes #593)
-                const isStuckTool = (m) =>
-                    m.type === 'tool' && m.status === 'running';
+                // NOTE: The defensive sweep that previously rewrote any
+                // `m.type === 'tool' && m.status === 'running'` to
+                // `cancelled` on run_end (added in PR #594 for #593) was
+                // removed in #846. The runtime now guarantees that every
+                // `tool_start` has a matching terminal `tool_end` event,
+                // including the cancel-during-tool-execution case (the
+                // synthesised `ToolEnd { ok: false, result: { error: 'run
+                // cancelled' } }` emitted from the outer `select!` cancel
+                // arm in `run_tool_calls`). The bandage was hiding a
+                // contract violation rather than fixing it; with the
+                // runtime fix in place the bandage is no longer needed,
+                // and removing it ensures any future regression in the
+                // runtime's terminal-event invariant surfaces immediately
+                // (stuck spinner) rather than being silently masked.
 
                 let msgs = prev.filter(m => !isStaleApproval(m)).map(m => {
-                    if (isStuckTool(m)) {
-                        return { ...m, status: 'cancelled' };
-                    }
                     // Seal live DM reasoning blocks for this run.
                     if (m.type === 'dm_reasoning' && m.runId === endingRunId && m.isLive) {
                         const finalThinking = savedThinkingText || m.thinkingText || '';

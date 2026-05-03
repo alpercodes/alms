@@ -189,12 +189,40 @@
 .msg.user { align-self: flex-start; }
 .msg.agent { align-self: flex-start; }
 
+/* Per-message label row (#855): pairs the author label with a small
+   grey timestamp to the right. Falls back gracefully when no timestamp
+   is present — the label still sits in its own row with the same
+   bottom padding the bare .msg-label used to provide. */
+.msg-label-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding-bottom: 2px;
+}
 .msg-label {
   font-size: var(--text-2xs);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.08em;
+}
+/* When .msg-label is rendered outside .msg-label-row (legacy callers)
+   it should still produce the same bottom padding. */
+.msg > .msg-label {
   padding-bottom: 2px;
+}
+/* Per-message timestamp (#855) — small grey text rendered next to the
+   author label. The full ISO is exposed via the title attribute on
+   hover. Tabular numerals keep the text from jiggling between updates. */
+.msg-timestamp {
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  font-variant-numeric: tabular-nums;
+  cursor: default;
+  user-select: none;
 }
 .msg.user .msg-label { color: var(--user-prompt); }
 .msg.agent .msg-label { color: var(--agent-prompt); }

@@ -20,6 +20,7 @@ pub mod llm_client;
 pub mod llm_types;
 pub mod scheduler;
 pub mod summary_client;
+pub mod tool_output_truncate;
 pub mod tools;
 pub mod workspace;
 pub mod workspace_tool;

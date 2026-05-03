@@ -52,7 +52,11 @@ const pendingMessages = new Map();
  * @param {string} text - the user's message text
  */
 export function savePendingMessage(sessionId, text) {
-    pendingMessages.set(sessionId, { text, runId: null });
+    // Capture the moment the user pressed Send so the per-message
+    // timestamp (#855) survives a session switch -- if the message has
+    // to be re-injected by reconcilePendingMessage(), the timestamp is
+    // still the original send time rather than the reload time.
+    pendingMessages.set(sessionId, { text, runId: null, ts: new Date().toISOString() });
 }
 
 /**

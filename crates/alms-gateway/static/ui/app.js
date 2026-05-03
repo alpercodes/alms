@@ -2,7 +2,7 @@ import { html, render, signal, effect, useEffect, useRef, useSignal } from './de
 import { boot } from './hooks/use-boot.js';
 import { Header } from './components/header.js';
 import { Sidebar } from './components/sidebar/index.js';
-import { Message, ErrorMessage, WarningMessage, SystemMessage, DmEndedMessage, RunBoundary, TokenBadge } from './components/chat/message.js';
+import { Message, MessageTimestamp, ErrorMessage, WarningMessage, SystemMessage, DmEndedMessage, RunBoundary, TokenBadge } from './components/chat/message.js';
 import { ToolRow, ToolGroup } from './components/chat/tool-row.js';
 import { ContextDebugRow } from './components/chat/context-debug-row.js';
 import { ApprovalCard } from './components/chat/approval-card.js';
@@ -162,7 +162,7 @@ function ChatView() {
                     }
                     const m = item;
                     if (m.type === 'user' || m.type === 'agent') {
-                        return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} fromAgent=${m.fromAgent} reasoning=${m.reasoning} />`;
+                        return html`<${Message} key=${m.id} type=${m.type} text=${m.text} sealed=${m.sealed} fromAgent=${m.fromAgent} reasoning=${m.reasoning} ts=${m.ts} />`;
                     }
                     if (m.type === 'tool') {
                         return html`<${ToolRow} key=${m.id} ...${m} />`;
@@ -193,7 +193,10 @@ function ChatView() {
                             : (agentName ? `${agentName} $` : '$');
                         return html`
                             <div key=${m.id} class="msg ${cls}">
-                                <div class="msg-label">${label}</div>
+                                <div class="msg-label-row">
+                                    <div class="msg-label">${label}</div>
+                                    ${m.ts && html`<${MessageTimestamp} ts=${m.ts} />`}
+                                </div>
                                 <div class="msg-body">
                                     ${m.url
                                         ? html`<img src=${m.url} alt=${m.alt || ''} style="max-width:100%;border-radius:8px;" />`
@@ -239,7 +242,10 @@ function ChatView() {
                             label = 'Sending';
                             indicatorClass = 'pending-indicator';
                         } else if (m.queuedBehind > 0) {
-                            label = 'Queued \u2014 waiting for agent\u2026';
+                            // 1-indexed: queuedBehind === 1 means "next up".
+                            // Source: run_created.queued_behind (initial)
+                            // and run_queue_position SSE decrements (#831).
+                            label = `Queued \u2014 position ${m.queuedBehind}`;
                             indicatorClass = 'queued-indicator';
                         } else if (m.source && m.source.startsWith('peer:')) {
                             label = 'Replying to message from ' + m.source.slice(5);

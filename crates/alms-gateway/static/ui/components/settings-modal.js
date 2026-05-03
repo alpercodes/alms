@@ -1,5 +1,5 @@
-import { html, useSignal, useEffect, computed } from '../deps.js';
-import { serverDefaults, localSettings, saveSettings, refreshServerDefaults } from '../state/settings.js';
+import { html, useSignal, useEffect } from '../deps.js';
+import { serverDefaults, refreshServerDefaults } from '../state/settings.js';
 import { patchSettings } from '../api/settings.js';
 import { listKeys, setKey, removeKey } from '../api/auth.js';
 import {
@@ -7,23 +7,6 @@ import {
     ModelDisplay,
     formatProviderLabel,
 } from '../utils/model-display.js';
-import { BudgetTriState } from './budget-tri-state.js';
-
-const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
-
-/**
- * Modal-flavored class map for the shared <BudgetTriState>. Keeps the
- * tri-state visually consistent with the rest of the modal's per-run
- * section (settings-row / settings-label / settings-select) instead of
- * the composer's `composer-advanced-*` classes.
- */
-const MODAL_TRISTATE_CLASSES = {
-    row: 'settings-row',
-    label: 'settings-label',
-    group: 'settings-tristate-group',
-    select: 'settings-select',
-    input: 'settings-input settings-tristate-value',
-};
 
 const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'gemini'];
 
@@ -50,7 +33,7 @@ function Section({ title, defaultOpen = false, children }) {
             <button type="button" class="settings-section-toggle"
                     aria-expanded=${open.value}
                     onClick=${(e) => { e.stopPropagation(); open.value = !open.value; }}>
-                <span class="settings-section-arrow ${open.value ? 'open' : ''}">\u25B6</span>
+                <span class="settings-section-arrow ${open.value ? 'open' : ''}">▶</span>
                 <span class="settings-section-title">${title}</span>
             </button>
             <div class="settings-section-body ${open.value ? 'open' : ''}"
@@ -188,49 +171,14 @@ function ApiKeysSection() {
 }
 
 /**
- * Count how many per-run overrides are currently active.
- * Exported so the header (and composer Advanced expander) can show an
- * indicator badge.
+ * Settings modal — server-level configuration only.
  *
- * Includes `max_tokens`, `posture`, `debug_mode`, and the three
- * reasoning knobs (`thinking_budget_tokens`, `reasoning_effort`,
- * `gemini_thinking_budget`). For the budget knobs, `Some(0)` (explicit
- * disable) and any positive value both count as "active overrides";
- * only `null`/`undefined` is "inherit". For `debug_mode`, both `true`
- * and `false` count — `null` is inherit.
- *
- * NOTE: `provider` and `model` are intentionally NOT counted — chat UI
- * no longer forwards those keys as per-run overrides (#865), so they
- * have no effect on the wire and including them here would mislead the
- * badge. Their controls remain visible-but-disabled in the modal /
- * composer Advanced UIs until a deliberate "use this provider/model
- * for this chat" UX exists.
+ * Per-run config overrides were removed in the #941 pivot. The modal
+ * mutates server defaults via `PATCH /settings`; per-tenant overrides
+ * (model / provider / posture / reasoning budgets) live on the agent
+ * record and are edited from the Agents panel.
  */
-export const activeOverrideCount = computed(() => {
-    const s = localSettings.value;
-    let count = 0;
-    if (s.max_tokens != null) count++;
-    if (s.posture) count++;
-    // debug_mode is now tri-state on the composer (#818 nit follow-up):
-    // null = inherit, true = enable, false = explicit per-run disable.
-    // Both `true` and `false` count as active overrides.
-    if (s.debug_mode != null) count++;
-    if (s.thinking_budget_tokens != null) count++;
-    if (s.reasoning_effort) count++;
-    if (s.gemini_thinking_budget != null) count++;
-    return count;
-});
-
 export function SettingsModal({ open, onClose }) {
-    const provider = useSignal('');
-    const model = useSignal('');
-    const maxTokens = useSignal('');
-    const posture = useSignal('');
-    // debug_mode is tri-state to mirror the composer: '' = inherit
-    // (null), 'true' = enable, 'false' = explicit disable. The composer's
-    // tri-state introduced meaningful `false`, so the modal must round-trip
-    // it without collapsing back to `null` on Apply.
-    const debugMode = useSignal('');
     const saved = useSignal(false);
 
     // Server-level editable signals — Context
@@ -287,21 +235,6 @@ export function SettingsModal({ open, onClose }) {
             const llmOpen = llm.openai || {};
             const llmGem = llm.gemini || {};
 
-            // provider / model inputs are disabled (#865) — keep their
-            // signals empty so the UI doesn't echo stale localStorage
-            // values back to the user. The "Effective" display next to
-            // each row pulls from `defaults` (server) and the agent
-            // record handles per-agent values, so an empty signal here
-            // is the truthful representation of "no per-run override".
-            provider.value = '';
-            model.value = '';
-            maxTokens.value = localSettings.value.max_tokens != null
-                ? String(localSettings.value.max_tokens)
-                : '';
-            posture.value = localSettings.value.posture || '';
-            const dm = localSettings.value.debug_mode;
-            debugMode.value = dm == null ? '' : (dm ? 'true' : 'false');
-
             // Populate server-level fields
             ctxStrategy.value = ctx.strategy || 'truncate';
             ctxMaxInput.value = ctx.max_input_tokens != null ? String(ctx.max_input_tokens) : '';
@@ -343,7 +276,6 @@ export function SettingsModal({ open, onClose }) {
                 ? String(llmGem.cache_ttl_seconds) : '';
 
             saved.value = false;
-
             serverError.value = '';
         }
     }, [open]);
@@ -360,59 +292,18 @@ export function SettingsModal({ open, onClose }) {
     const llmOpen = llm.openai || {};
     const llmGem = llm.gemini || {};
 
-    const onReset = () => {
-        // Clear all per-run overrides — including the three reasoning
-        // knobs added by #804 Slice C — so the modal's Reset button
-        // mirrors the composer Advanced expander's "Reset all". Both
-        // surfaces share the same eight localSettings keys.
-        saveSettings({
-            provider: null,
-            model: null,
-            max_tokens: null,
-            posture: null,
-            debug_mode: null,
-            thinking_budget_tokens: null,
-            reasoning_effort: null,
-            gemini_thinking_budget: null,
-        });
-        provider.value = '';
-        model.value = '';
-        maxTokens.value = '';
-        posture.value = '';
-        debugMode.value = '';
-        saved.value = true;
-        setTimeout(() => onClose(), 600);
-    };
-
-    /** Single Apply handler: saves per-run overrides to localStorage AND patches server settings. */
+    /**
+     * Apply handler — diffs each server-level section against the cached
+     * `serverDefaults` and PATCHes only the changed fields. Per-run
+     * overrides were removed in the #941 pivot, so this Apply path no
+     * longer touches localStorage.
+     */
     const onApply = async () => {
         serverSaving.value = true;
         serverError.value = '';
         saved.value = false;
 
-        // 1. Always save per-run overrides to localStorage (this never fails).
-        //
-        // `provider` / `model` are intentionally NOT written here (#865).
-        // Their inputs are disabled in the UI; chat UI ignores those keys
-        // when forwarding per-run overrides to /runs. We also actively
-        // clear any pre-existing stale values so users affected by the
-        // pre-#865 silent-stamp bug get unblocked the first time they
-        // hit Apply (or Reset) on the upgraded build.
-        const updates = {
-            provider: null,
-            model: null,
-        };
-        const mt = parseInt(maxTokens.value, 10);
-        updates.max_tokens = (!isNaN(mt) && mt > 0) ? mt : null;
-        updates.posture = posture.value || null;
-        // Tri-state debug_mode: '' = inherit (null), 'true' / 'false'
-        // round-trip as explicit booleans so the modal doesn't clobber an
-        // explicit `false` set from the composer.
-        if (debugMode.value === '') updates.debug_mode = null;
-        else updates.debug_mode = debugMode.value === 'true';
-        saveSettings(updates);
-
-        // 2. Build server settings patch — only include fields that changed from server defaults
+        // Build server settings patch — only include fields that changed from server defaults
         const body = {};
 
         const ctxPatch = {};
@@ -536,7 +427,7 @@ export function SettingsModal({ open, onClose }) {
 
         if (Object.keys(llmPatch).length > 0) body.llm = llmPatch;
 
-        // 3. If there are server-level changes, PATCH them
+        // PATCH server settings if anything changed.
         if (Object.keys(body).length > 0) {
             try {
                 await patchSettings(body);
@@ -548,7 +439,7 @@ export function SettingsModal({ open, onClose }) {
             }
         }
 
-        // 4. Show success feedback — per-run overrides are always saved even if server patch failed
+        // Show success feedback.
         saved.value = true;
         serverSaving.value = false;
 
@@ -564,13 +455,6 @@ export function SettingsModal({ open, onClose }) {
 
     const enabledTools = tools.enabled || defaults.enabled_tools || [];
 
-    // Effective values: what the next run will actually use.
-    // (Provider/model rows are disabled here so they no longer render an
-    // "Effective:" line — see #865 / Tim's v0.2.3 note on PR #868. The
-    // context-summary <${ModelDisplay} below still uses ModelDisplay.)
-    const effMaxTokens = maxTokens.value ? parseInt(maxTokens.value, 10) : (defaults.max_tokens || 100000);
-    const effPosture = posture.value || defaults.posture || 'guarded';
-
     return html`
         <div class="settings-overlay open" onClick=${onOverlayClick}>
             <div class="settings-modal">
@@ -581,152 +465,12 @@ export function SettingsModal({ open, onClose }) {
 
                 <div class="settings-divider"></div>
 
-                <!-- Per-run overrides (editable) -->
-                <div class="settings-overrides-header">
-                    <span class="settings-label">Per-run overrides</span>
-                    <span class="settings-hint">
-                        Applied to every new run. Leave empty to use server defaults.
-                    </span>
-                </div>
-
-                <div class="settings-grid">
-                    <div class="settings-row">
-                        <label class="settings-label">Provider</label>
-                        <select class="settings-select"
-                                value=${provider.value}
-                                disabled
-                                title="Per-run provider overrides are disabled. Configure provider on the agent (Agents panel) or as the server default."
-                                onChange=${e => { provider.value = e.target.value; }}>
-                            <option value="">Default (${formatProviderLabel(defaults.provider || 'openai')})</option>
-                            <option value="openai">OpenAI</option>
-                            <option value="anthropic">Anthropic</option>
-                            <option value="openrouter">OpenRouter</option>
-                        </select>
-                        <!-- No "Effective:" row while the control is disabled.
-                             It would only ever show the server default and
-                             would lie for any agent with a per-agent override
-                             (Tim's v0.2.3 note on PR #868). Threading the
-                             active agent's provider/model through the modal
-                             is a separate, larger change tracked for v0.2.3. -->
-                    </div>
-
-                    <div class="settings-row">
-                        <label class="settings-label">Model</label>
-                        <input class="settings-input" type="text"
-                               list="model-suggestions"
-                               disabled
-                               title="Per-run model overrides are disabled. Configure model on the agent (Agents panel) or as the server default."
-                               placeholder=${defaults.model || 'server default'}
-                               value=${model.value}
-                               onInput=${e => { model.value = e.target.value; }} />
-                        <datalist id="model-suggestions">
-                            ${MODEL_SUGGESTIONS.map(m => html`<option value=${m} />`)}
-                        </datalist>
-                        <!-- No "Effective:" row while the control is disabled.
-                             Same rationale as the Provider row above — see
-                             Tim's v0.2.3 note on PR #868. -->
-                    </div>
-                </div>
-                <div class="settings-hint settings-overrides-disabled-note">
-                    Provider and model are configured per-agent (Agents panel) or as the server default. Per-run overrides are disabled here to keep per-agent config from being silently squashed by stale localStorage values.
-                </div>
-
-                <div class="settings-grid">
-                    <div class="settings-row">
-                        <label class="settings-label">Max tokens</label>
-                        <input class="settings-input" type="number" min="1" step="1000"
-                               placeholder=${defaults.max_tokens || 100000}
-                               value=${maxTokens.value}
-                               onInput=${e => { maxTokens.value = e.target.value; }} />
-                        <span class="settings-effective">
-                            Effective: ${fmt(effMaxTokens)}
-                        </span>
-                    </div>
-
-                    <div class="settings-row">
-                        <label class="settings-label">Posture</label>
-                        <select class="settings-select"
-                                value=${posture.value}
-                                onChange=${e => { posture.value = e.target.value; }}>
-                            <option value="">Default (${defaults.posture || 'guarded'})</option>
-                            <option value="full_control">full_control</option>
-                            <option value="guarded">guarded</option>
-                            <option value="autonomous">autonomous</option>
-                        </select>
-                        <span class="settings-effective">
-                            Effective: ${effPosture}
-                        </span>
-                    </div>
-                </div>
-
-                <div class="settings-grid">
-                    <div class="settings-row">
-                        <label class="settings-label">Debug mode</label>
-                        <select class="settings-select"
-                                value=${debugMode.value}
-                                onChange=${e => { debugMode.value = e.target.value; }}>
-                            <option value="">Inherit (default)</option>
-                            <option value="true">On</option>
-                            <option value="false">Off</option>
-                        </select>
-                        <span class="settings-hint">
-                            When On, shows the full context window sent to the LLM before each response.
-                            Off explicitly disables it for the next run even if the agent has it enabled.
-                        </span>
-                    </div>
-                </div>
-
-                <!--
-                    Reasoning & thinking knobs (#804 Slice C parity).
-
-                    These three knobs were previously only surfaced via the
-                    composer's Advanced expander (#818). They share the same
-                    'localSettings' keys, so a value set from either surface
-                    is visible to both — this section just makes the modal a
-                    full editor too. Live-write to localSettings (no Apply
-                    needed for these specific rows) so changes round-trip
-                    through the same path as the composer.
-
-                    Wrapped in <Section> for visual parity with the
-                    Context / Session / Tools / LLM Providers / Logging
-                    sections below — defaultOpen=false matches siblings.
-                -->
-                <${Section} key="reasoning" title=${'Reasoning & thinking'} defaultOpen=${false}>
-                    <span class="settings-hint settings-section-desc">
-                        Provider-specific. Silently ignored when the effective provider doesn't support the knob.
-                        Applied immediately &mdash; Cancel does not revert these.
-                    </span>
-
-                    <div class="settings-grid">
-                        <${BudgetTriState}
-                            label="Anthropic thinking budget"
-                            wireValue=${localSettings.value.thinking_budget_tokens}
-                            onWrite=${(v) => saveSettings({ thinking_budget_tokens: v })}
-                            classNames=${MODAL_TRISTATE_CLASSES} />
-
-                        <div class="settings-row">
-                            <label class="settings-label">OpenAI reasoning effort</label>
-                            <select class="settings-select"
-                                    value=${localSettings.value.reasoning_effort || ''}
-                                    onChange=${e => saveSettings({ reasoning_effort: e.target.value || null })}>
-                                <option value="">Inherit (server default)</option>
-                                ${REASONING_EFFORTS.map(eff => html`
-                                    <option value=${eff} key=${eff}>${eff}</option>
-                                `)}
-                            </select>
-                        </div>
-                    </div>
-
-                    <div class="settings-grid">
-                        <${BudgetTriState}
-                            label="Gemini thinking budget"
-                            wireValue=${localSettings.value.gemini_thinking_budget}
-                            onWrite=${(v) => saveSettings({ gemini_thinking_budget: v })}
-                            classNames=${MODAL_TRISTATE_CLASSES} />
-                    </div>
-                <//>
-
-                <div class="settings-divider"></div>
+                <!-- Per-run config overrides were removed in the #941
+                     pivot. Per-agent values (model / provider / posture /
+                     reasoning budgets) live on the agent record and are
+                     edited from the Agents panel; server defaults are
+                     edited below and propagate to the next run via
+                     PATCH /settings. -->
 
                 <!-- Context (server-level, editable) -->
                 <${Section} key="ctx" title="Context" defaultOpen=${false}>
@@ -980,12 +724,11 @@ export function SettingsModal({ open, onClose }) {
 
                 ${serverError.value && html`
                     <div class="settings-error">
-                        Per-run overrides saved. Server settings failed: ${serverError.value}
+                        Failed to save server settings: ${serverError.value}
                     </div>
                 `}
 
                 <div class="settings-footer">
-                    <button class="settings-cancel" onClick=${onReset}>Reset</button>
                     <button class="settings-cancel" onClick=${onClose}>Cancel</button>
                     <button class="settings-save" onClick=${onApply}
                             disabled=${serverSaving.value}>

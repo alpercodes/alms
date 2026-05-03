@@ -18,7 +18,7 @@ pub use types::{
     AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, FsEditConfig, GeminiConfig,
     LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry, ProviderKind, ProviderQuirks,
     ReasoningEffort, RunSummaryMode, ServerConfig, SessionConfig, ShellClassificationMode,
-    ShellPermissions, ShellSpillConfig, ToolsConfig,
+    ShellPermissions, ShellSpillConfig, ToolOutputTruncateConfig, ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};
@@ -105,29 +105,120 @@ impl AlmsConfig {
         Ok(config)
     }
 
-    /// Load config, falling back to defaults on error.
+    /// Load config with fail-fast semantics on validation failure (#924).
     ///
-    /// Unlike `AlmsConfig::load().unwrap_or_default()`, this ensures that
-    /// `data_dir` is resolved to an absolute path even in the fallback case.
-    /// Use this whenever a best-effort config is acceptable (e.g. CLI
-    /// subcommands that just need a database path).
+    /// This is the path the gateway entrypoint (`alms gateway`) uses. It
+    /// distinguishes two error classes:
+    ///
+    /// - **File-load failures** (file unreadable due to permissions, TOML
+    ///   parse error): warn to stderr and fall back to compiled defaults
+    ///   so first-run / fresh-install / corrupted-file scenarios still
+    ///   produce a working daemon.
+    /// - **Validation failures** (a hand-edited `alms.toml` that loaded
+    ///   cleanly but violates a `validate()` invariant — e.g. asymmetric
+    ///   `[context].summary_provider` / `summary_model` after #877's
+    ///   pair-only rule): **fatal**, the process exits non-zero with a
+    ///   clear stderr message pointing at the bad field.
+    ///
+    /// Falling back to defaults on a validation failure would silently
+    /// discard the operator's intent (Tim's review framing on PR #923,
+    /// surfaced as #924). The recovery is on the operator (fix the
+    /// config) not the daemon (drop the config and pretend nothing
+    /// happened). Missing-file (`find_config_file() == None`) is the
+    /// genuine bootstrapping case and is handled before either branch
+    /// runs — it produces a defaults-with-env-overrides config and zero
+    /// exit, same as before.
+    ///
+    /// Unlike `AlmsConfig::load().unwrap_or_default()`, this ensures
+    /// `data_dir` is resolved to an absolute path even in the file-load
+    /// fallback case. Use this whenever a best-effort config is
+    /// acceptable for the file-load axis but the validation invariant
+    /// must hold (gateway boot, scheduler, anything that drives runs).
+    ///
+    /// **Behaviour scope (#924 follow-up).** This entry-point is shared
+    /// across the gateway boot path *and* every CLI subcommand that goes
+    /// through `helpers::open_db_with_config()` (`alms agent ...`,
+    /// `alms session ...`, `alms run ...`, `alms job ...`, plus
+    /// `alms auth`). A validation failure therefore aborts the process
+    /// for those CLI commands too, not just `alms gateway`. This is the
+    /// intended shape — discarding the operator's intent silently would
+    /// be just as wrong on a CLI invocation as on daemon boot — but it
+    /// is wider than the issue title suggests, so callers that want a
+    /// best-effort defaults-on-validation-failure shape should reach for
+    /// [`Self::load_or_default_fallible`] (or [`Self::load`]) directly.
+    ///
+    /// Calls `std::process::exit(1)` on validation failure. The fallible
+    /// shape lives in [`Self::load_or_default_fallible`] for unit
+    /// testing.
     pub fn load_or_default() -> Self {
-        match Self::load() {
-            Ok(c) => c,
+        match Self::load_or_default_fallible() {
+            Ok(cfg) => cfg,
             Err(e) => {
-                eprintln!("Warning: failed to load config: {e}. Using defaults.");
-                let mut cfg = Self::default();
-                // Ensure sugar provider entries exist before env overrides so
-                // `ALMS_LLM_BASE_URL` / `ALMS_LLM_MODEL` can propagate into
-                // the resolved provider entry (mirrors `load()`).
-                cfg.llm.ensure_builtin_providers();
-                cfg.apply_env_overrides();
-                cfg.server.data_dir = crate::resolve_to_absolute(Path::new(&cfg.server.data_dir));
-                cfg.warn_legacy_data_dir();
-                cfg.context.normalize_episodic();
-                cfg
+                eprintln!("Error: invalid configuration: {e}");
+                eprintln!(
+                    "The daemon will not start with an invalid config — fix the offending \
+                     field in alms.toml (or in the corresponding ALMS_* environment \
+                     variable) and try again. Removing the config file entirely is also \
+                     valid; the daemon will then start with compiled defaults."
+                );
+                std::process::exit(1);
             }
         }
+    }
+
+    /// Inner of [`Self::load_or_default`] — same semantics, but returns
+    /// the validation error instead of exiting the process. Exposed for
+    /// unit testing the fail-fast contract from #924.
+    ///
+    /// Contract:
+    /// - File-load failures (IO, TOML parse): warn-and-default. Returns
+    ///   `Ok(default-shaped config)`.
+    /// - Validation failures: returns `Err(InvalidConfig(...))`. The
+    ///   process-exit wrapper turns this into a non-zero exit with a
+    ///   helpful stderr message.
+    pub fn load_or_default_fallible() -> AlmsResult<Self> {
+        // Step 1: try to read + parse the config file (or fall through
+        // when no file is present). File-load failures are
+        // recoverable — warn and use defaults. The eventual `validate()`
+        // call below still applies; defaults are guaranteed to pass
+        // validation, but env-var overrides could still produce an
+        // invalid config that fails the fail-fast check.
+        let mut config = match Self::find_config_file() {
+            Some(path) => match Self::from_file(&path) {
+                Ok(c) => {
+                    info!("Loaded config from {}", path.display());
+                    c
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to load config file {}: {}. Using defaults.",
+                        path.display(),
+                        e,
+                    );
+                    Self::default()
+                }
+            },
+            None => Self::default(),
+        };
+
+        // Step 2: layer env overrides + provider sugar + path resolution +
+        // soft normalisations. Mirrors `load()` so the two paths produce
+        // structurally identical configs modulo the file-load fallback.
+        config.llm.ensure_builtin_providers();
+        config.apply_env_overrides();
+        config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
+        config.warn_legacy_data_dir();
+        config.context.normalize_episodic();
+
+        // Step 3: fail-fast on validation errors (#924). A
+        // hand-edited `alms.toml` (or an env-var override) that
+        // violates an invariant must NOT be silently replaced with
+        // defaults — the operator's intent is then discarded and runs
+        // proceed against the wrong config. Propagate the error so the
+        // wrapper can exit non-zero with a helpful message.
+        config.validate()?;
+
+        Ok(config)
     }
 
     /// Load from a specific file path
@@ -360,6 +451,42 @@ impl AlmsConfig {
             return Err(AlmsError::InvalidConfig(
                 "context.recent_window must be > 0".into(),
             ));
+        }
+
+        // Symmetric pair-only validation for `[context].summary_provider`
+        // / `[context].summary_model` (#877). The PATCH layer (and the
+        // per-agent CRUD path, see `validate_summary_pair` in
+        // `alms-gateway/src/agents.rs`) already reject asymmetric inputs,
+        // but a hand-edited `alms.toml` can land the daemon in that
+        // shape without going through PATCH. Validate at config-load
+        // time so the daemon refuses to start rather than silently
+        // shipping a half-configured summary path. Rule: both fields
+        // must be `Some` together or both `None` together — exactly
+        // one set is the broken case.
+        match (
+            self.context.summary_provider.as_deref(),
+            self.context.summary_model.as_deref(),
+        ) {
+            (Some(_), None) => {
+                return Err(AlmsError::InvalidConfig(
+                    "context.summary_provider is set but context.summary_model is empty. \
+                     Set both fields together — the summary provider's wire model namespace \
+                     is independent of the agent's primary provider, so partial settings \
+                     cannot be safely resolved. Either set both, or remove both to \
+                     fall through to the agent's primary provider/model."
+                        .into(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(AlmsError::InvalidConfig(
+                    "context.summary_model is set but context.summary_provider is empty. \
+                     Set both fields together — leaving summary_provider unset would fall \
+                     through to the agent's primary provider, which may not match this \
+                     model's namespace. Either set both, or remove both."
+                        .into(),
+                ));
+            }
+            _ => {}
         }
 
         // Cross-section validation: session storage must hold at least one

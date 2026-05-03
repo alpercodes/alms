@@ -1,16 +1,13 @@
 //! Run creation, execution, and completion — the core run lifecycle.
 
 use super::tools::{RuntimeEventForwarder, forward_runtime_events};
-use super::{
-    RunOverrides, RunParams, apply_overrides, is_internal_context_id, resolve_agent_config,
-    validate_provider,
-};
+use super::{RunParams, is_internal_context_id, resolve_agent_config};
 use crate::api_error;
 use crate::server::AppState;
 use crate::sse::SseEventData;
 use alms_core::{
-    AgentId, CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus,
-    RunStatusResponse, SessionId, classify_session_type,
+    AgentId, AlmsError, CreateRunRequest, CreateRunResponse, Run, RunId, RunInput, RunStatus,
+    RunStatusResponse, SessionId, classify_session_type, sanitize_error_for_session,
 };
 use alms_runtime::RuntimeEvent;
 use alms_tools::message_sender::ConversationEndReason;
@@ -322,22 +319,6 @@ pub async fn create_run(
         None => session_agent_id,
     };
 
-    // Validate provider override early so the user gets a clear 400 instead
-    // of a confusing "invalid API key" error from a wrong provider.
-    if let Some(ref p) = req.provider {
-        validate_provider(p)?;
-    }
-
-    let overrides = RunOverrides {
-        model: req.model.clone(),
-        max_tokens: req.max_tokens,
-        posture: req.posture.clone(),
-        provider: req.provider.clone(),
-        debug_mode: req.debug_mode,
-        thinking_budget_tokens: req.thinking_budget_tokens,
-        reasoning_effort: req.reasoning_effort,
-        gemini_thinking_budget: req.gemini_thinking_budget,
-    };
     let run = Run::new(session.id, agent_id, input_text);
     let run_id = run.run_id;
     let session_id = run.session_id;
@@ -450,7 +431,6 @@ pub async fn create_run(
                     session_id,
                     agent_id,
                     input: run.input,
-                    overrides,
                     context_id,
                     cancel_token,
                     is_peer_message: false,
@@ -553,10 +533,24 @@ const PEER_ERROR_MESSAGE_MAX_LEN: usize = 300;
 
 /// Build the human-readable error string carried in
 /// `ConversationEndReason::Errored { message }` for the peer-side
-/// notification. Truncated to [`PEER_ERROR_MESSAGE_MAX_LEN`] on a UTF-8
-/// char boundary; appends an ellipsis when truncated.
-fn truncate_error_for_peer(err: &dyn std::fmt::Display) -> String {
-    let s = err.to_string();
+/// notification.
+///
+/// Routes the error through [`sanitize_error_for_session`] first so any
+/// raw provider details (URLs, API keys, response bodies) are collapsed
+/// to a category label before reaching the peer agent's notification
+/// context. This closes the same threat surface that #911 / #930 closed
+/// on the failing agent's own session — see issue #931. Sanitisation is
+/// inlined (rather than bolted onto the call sites) so future callers
+/// of this helper cannot accidentally skip it.
+///
+/// After sanitisation the result is truncated to
+/// [`PEER_ERROR_MESSAGE_MAX_LEN`] on a UTF-8 char boundary and an
+/// ellipsis is appended when truncated. In practice the sanitiser
+/// already collapses to a short fixed label, so the truncation step is
+/// effectively a no-op — but it remains a safety net in case the
+/// sanitiser's contract widens in the future.
+fn truncate_error_for_peer(err: &AlmsError) -> String {
+    let s = sanitize_error_for_session(err);
     if s.len() <= PEER_ERROR_MESSAGE_MAX_LEN {
         return s;
     }
@@ -570,6 +564,50 @@ fn truncate_error_for_peer(err: &dyn std::fmt::Display) -> String {
     truncated
 }
 
+/// Broadcast a `run_queue_position` SSE event for every still-queued run on
+/// the given agent (#831).
+///
+/// Called when the head of the per-agent queue is about to advance — i.e. at
+/// every terminal exit of [`execute_run`]. For each remaining `Queued` run
+/// (FIFO-sorted), assigns a 1-indexed position matching the same semantic as
+/// `run_created.queued_behind` and fans the event out on both the per-run and
+/// per-session SSE feeds.
+///
+/// Position numbering: if any `Running` run still exists for the agent, the
+/// first queued run is position 1 (next up); otherwise the first queued run
+/// is position 0 and is **skipped** — `run_started` will fire for it shortly.
+/// Subsequent queued runs are numbered sequentially.
+///
+/// The broadcast also tolerates the narrow TOCTOU window between
+/// `pending.fetch_sub(1)` inside the queue handler and `mark_run_as_running`:
+/// in either ordering the FIFO-sorted Queued runs still produce monotonically
+/// decremented positions matching what a fresh `create_run` would compute via
+/// `pending_count + agent_has_running_run`.
+async fn broadcast_queue_advance(state: &AppState, agent_id: AgentId) {
+    let queued = state.run_manager.list_queued_for_agent(agent_id);
+    if queued.is_empty() {
+        return;
+    }
+    let running_offset = usize::from(state.run_manager.agent_has_running_run(agent_id));
+    for (idx, run) in queued.iter().enumerate() {
+        let position = idx + running_offset;
+        if position == 0 {
+            // First queued run is about to be picked up by the queue handler;
+            // `run_started` will fire for it shortly, so we don't emit a
+            // misleading position-zero event.
+            continue;
+        }
+        state
+            .run_manager
+            .send_event(
+                run.run_id,
+                run.session_id,
+                SseEventData::run_queue_position(run.run_id, run.session_id, agent_id, position),
+            )
+            .await;
+    }
+}
+
 /// Execute a run in background, forwarding runtime events to SSE.
 #[instrument(level = "info", skip(state, params), fields(run_id = %params.run_id.0, session_id = %params.session_id.0))]
 pub(super) async fn execute_run(state: AppState, params: RunParams) {
@@ -578,7 +616,6 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         session_id,
         agent_id,
         input,
-        overrides,
         context_id,
         cancel_token,
         is_peer_message,
@@ -598,14 +635,50 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // shutdown -- they would increment the in-flight counter and potentially
     // outlive the drain timeout.
     if cancel_token.is_cancelled() || state.shutdown_token.is_cancelled() {
+        // #895: flip the run state BEFORE broadcasting the SSE event.
+        // `RunManager::get_session_runs()` uses `RunState` membership to
+        // compute `has_active_run` for `GET /sessions` (#890 / #892). If we
+        // broadcast first and flip second, a concurrent client opening
+        // `GET /sessions` between the broadcast and the state flip observes
+        // `has_active_run: true` while the SSE feed has already moved past
+        // the `ended` event — a subsequent `last_event_id`-based reconnect
+        // won't replay it, and the sidebar's "active" indicator stays stuck
+        // until the next unrelated event clears it. Flipping first makes
+        // "a client that sees `has_active_run: true`" a strict prefix of
+        // "a client that has the started event but not the ended event,"
+        // closing the race. The change is internal to the gateway lock
+        // window — the SSE event ordering visible to clients is identical.
+        state.run_manager.mark_run_as_cancelled(run_id);
         state
             .run_manager
             .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
             .await;
-        state.run_manager.mark_run_as_cancelled(run_id);
+        // Emit a synthetic `session_activity_ended` on the agent-scoped
+        // feed (#888). The pre-cancel branch never emits a paired
+        // `session_activity_started`, so this is asymmetric — but the run
+        // was visible as `Queued` between insertion and cancellation, so
+        // any concurrent `GET /sessions` snapshot will have observed
+        // `has_active_run: true` and lit the sidebar's "active" indicator.
+        // Without this `ended` event, that indicator stays stuck until the
+        // page reloads. The consumer treats the snapshot as the source of
+        // truth for "indicator on" and `ended` as the universal "indicator
+        // off" signal, so the missing `started` is harmless: clients with
+        // no indicator simply ignore the event.
+        state
+            .run_manager
+            .send_agent_event(
+                agent_id,
+                run_id,
+                session_id,
+                SseEventData::session_activity_ended(session_id, run_id, agent_id),
+            )
+            .await;
         state.run_manager.remove_cancel_token(run_id);
         state.run_manager.remove_senders(run_id);
         info!("Run {} was cancelled before starting", run_id.0);
+        // The queue head is advancing — fan out updated positions to any
+        // remaining queued runs on this agent (#831).
+        broadcast_queue_advance(&state, agent_id).await;
         return;
     }
 
@@ -613,19 +686,38 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // client is connected. The SSE client registers its own sender when it
     // calls GET /runs/{id}/events.
 
-    state
-        .run_manager
-        .send_event(
-            run_id,
-            session_id,
-            SseEventData::run_started(run_id, session_id),
-        )
-        .await;
+    // ---------------------------------------------------------------------
+    // Resolve the layered run config UP FRONT (#837).
+    //
+    // The per-agent > server-default merge — including the bootstrap-prompt
+    // swap and the system-triggered notification debug-flip — happens here,
+    // **before** the `Queued` → `Running` transition fires. Two reasons:
+    //
+    // 1. Triage: the resolved snapshot is persisted alongside the
+    //    `Running` state and broadcast on the `run_started` SSE so live
+    //    observers and post-hoc `GET /runs/{id}` calls can confirm the
+    //    provider / model / posture / budgets the run actually committed
+    //    to. This makes "I set model X but Y was used" reports falsifiable
+    //    from stored data alone (#833).
+    // 2. Atomicity: marking the run `Running` and attaching its snapshot
+    //    in a single `mark_run_as_running_with_config` call means SQLite
+    //    never observes a torn state where status is `Running` but the
+    //    snapshot is absent.
+    //
+    // Per-run config overrides were removed in the #941 pivot — the run
+    // config is determined entirely by `resolve_agent_config` (per-agent
+    // > server default). Operators change agent config via `PATCH
+    // /agents/{id}` (or server defaults via `PATCH /settings`) before
+    // starting the run; `POST /runs` carries no config knobs. Removing
+    // the per-run path closes the leak family at #833 / #860 / #863 /
+    // #939 by deleting the pathway that produced them.
+    // ---------------------------------------------------------------------
 
-    state.run_manager.mark_run_as_running(run_id);
-
-    // Resolve per-agent config (model, posture) from the agent registry,
-    // then layer per-run overrides on top.
+    // Resolve per-agent config (model, posture, provider, reasoning
+    // budgets, summary provider/model) from the agent registry on top of
+    // the server default. The returned `LlmClient` already carries the
+    // per-agent provider switch (with secrets re-resolved) and any
+    // per-agent model override.
     let base_agent_config = state.agent_config.read().clone();
     let resolved = resolve_agent_config(
         agent_id,
@@ -642,50 +734,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         );
     }
 
-    // Apply per-run overrides (highest precedence) on top of the resolved config.
-    // Uses `apply_overrides()` for the common fields (max_tokens, posture,
-    // debug_mode) to avoid duplicating the logic that lives in runs/mod.rs.
-    // Provider and model require LLM client mutations which `apply_overrides()`
-    // does not handle, so those stay inline.
-    let merged = apply_overrides(resolved.agent_config, None, &overrides);
-    let mut agent_config = merged.agent_config;
-    if let Some(ref provider) = overrides.provider {
-        info!("Run {} using provider override: {}", run_id.0, provider);
-    }
-    if let Some(ref model) = overrides.model {
-        info!("Run {} using model override: {}", run_id.0, model);
-    }
-    // Apply per-run LLM overrides (provider + model) via the shared helper
-    // in `runs/mod.rs::apply_per_run_llm_overrides`. The helper preserves
-    // the three-layer precedence (per-run > per-agent > server default) for
-    // model even when a per-run provider override would otherwise clobber
-    // the resolved per-agent model via `apply_provider` (#833).
-    let llm = super::apply_per_run_llm_overrides(resolved.llm, &overrides, &state.secrets.read());
+    let mut agent_config = resolved.agent_config;
+    let llm = resolved.llm;
 
     // System-triggered runs (peer DMs, notifications, subagent completions)
     // have no human in the loop, so Guarded posture would hang forever
     // waiting for approval.  Force Autonomous posture for these runs.
-    let resolved = resolve_posture_for_run(agent_config.posture, is_system_triggered);
-    if resolved != agent_config.posture {
+    let posture_resolved = resolve_posture_for_run(agent_config.posture, is_system_triggered);
+    if posture_resolved != agent_config.posture {
         info!(
             "Run {} is system-triggered — overriding {:?} posture to {:?}",
-            run_id.0, agent_config.posture, resolved
+            run_id.0, agent_config.posture, posture_resolved
         );
     }
-    agent_config.posture = resolved;
-
-    // Create a runtime event channel so we can forward tool events to SSE.
-    // A second sender (`invoke_agent_tx`) is created for the InvokeAgentTool
-    // so subagent events are forwarded into the same SSE stream.  It is moved
-    // directly into the tool (not cloned) so no orphaned sender lingers in
-    // this scope -- when the runtime drops its sender and the tool drops its
-    // sender, the channel closes and the forwarder task completes.
-    let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
-    let invoke_agent_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
-        std::sync::Arc::new(RuntimeEventForwarder::new(runtime_tx.clone()));
+    agent_config.posture = posture_resolved;
 
     // Override system prompt with bootstrap prompt for first-time agents.
     // Must come after per-agent overrides so bootstrap takes precedence.
+    // Only mutates `system_prompt`; the layered fields the snapshot tracks
+    // (provider/model/posture/budgets/debug) are unaffected.
     let agent_config =
         if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
             let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);
@@ -709,6 +776,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // persisted), so the cost is negligible — and it lets users inspect the
     // LLM context for notification runs without special client-side plumbing.
     // (#546 — debug_mode for notification runs)
+    //
+    // The flip happens before the snapshot is taken so the persisted
+    // `resolved_config.debug_mode` reflects the value the runtime actually
+    // uses, not the raw per-run override.
     let agent_config = if is_system_triggered
         && !is_peer_message
         && !is_internal_context_id(&context_id)
@@ -724,6 +795,59 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     } else {
         agent_config
     };
+
+    // Snapshot the fully-layered config now that all post-resolution
+    // transforms have settled. Fed into both the persisted `Run` row and
+    // the `run_started` SSE payload below (#837).
+    let resolved_config = super::build_resolved_config(&agent_config, &llm);
+
+    // #895: flip the run state BEFORE broadcasting `run_started`. See the
+    // pre-cancel branch above for the full rationale — broadcasting first
+    // leaves a narrow window where a concurrent `GET /sessions` observes
+    // `has_active_run: false` (the run hasn't been added to the running
+    // set yet) while the `started` event has already been delivered, so
+    // the sidebar misses the activity. Flipping first guarantees that
+    // any `has_active_run: true` observation is followed by an `ended`
+    // event the client will see.
+    //
+    // Atomic-with-snapshot variant (#837): the layered config is stored
+    // alongside the status flip in a single SQLite upsert.
+    state
+        .run_manager
+        .mark_run_as_running_with_config(run_id, resolved_config.clone());
+
+    state
+        .run_manager
+        .send_event(
+            run_id,
+            session_id,
+            SseEventData::run_started_with_config(run_id, session_id, resolved_config),
+        )
+        .await;
+
+    // Mirror onto the agent-scoped session-activity feed (#856) so the
+    // web UI sidebar can surface activity on sessions other than the
+    // currently-viewed one. Covers both regular runs and DM runs because
+    // every run goes through this point.
+    state
+        .run_manager
+        .send_agent_event(
+            agent_id,
+            run_id,
+            session_id,
+            SseEventData::session_activity_started(session_id, run_id, agent_id),
+        )
+        .await;
+
+    // Create a runtime event channel so we can forward tool events to SSE.
+    // A second sender (`invoke_agent_tx`) is created for the InvokeAgentTool
+    // so subagent events are forwarded into the same SSE stream.  It is moved
+    // directly into the tool (not cloned) so no orphaned sender lingers in
+    // this scope -- when the runtime drops its sender and the tool drops its
+    // sender, the channel closes and the forwarder task completes.
+    let (runtime_tx, runtime_rx) = mpsc::unbounded_channel::<RuntimeEvent>();
+    let invoke_agent_fwd: std::sync::Arc<dyn alms_tools::EventForwarder> =
+        std::sync::Arc::new(RuntimeEventForwarder::new(runtime_tx.clone()));
 
     // Capture summary config before agent_config and llm are consumed.
     // C1 fix: resolve the summary model *from the per-agent LLM client* so
@@ -793,10 +917,53 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                     SseEventData::run_error(run_id, &e.to_string()),
                 )
                 .await;
+            // Pair the earlier `session_activity_started` so the agent feed
+            // sees a clean started/ended cycle even when the runtime fails
+            // to initialise (#856).
+            state
+                .run_manager
+                .send_agent_event(
+                    agent_id,
+                    run_id,
+                    session_id,
+                    SseEventData::session_activity_ended(session_id, run_id, agent_id),
+                )
+                .await;
             state.run_manager.mark_run_as_failed(run_id, e.to_string());
+
+            // Persist the runtime-construction failure so a follow-up
+            // turn ("why did that fail?") gives the agent the error in
+            // context (#874). Skipped for internal context IDs to mirror
+            // the run-boundary marker policy.
+            //
+            // The error text is run through `sanitize_error_for_session`
+            // before persistence so raw provider response bodies — which
+            // can contain API keys, internal hostnames, or request URLs —
+            // never reach session history or the LLM context on follow-up
+            // turns (#911). The same sanitiser already guards the
+            // runtime-layer fallback at `alms-runtime::agent::mod`.
+            if !is_internal_context_id(&context_id) {
+                let safe_reason = sanitize_error_for_session(&e);
+                super::markers::persist_error_marker(
+                    &state.session_manager,
+                    session_id,
+                    "runtime_init_error",
+                    format!("(runtime initialization failed) {safe_reason}"),
+                    serde_json::json!({
+                        "run_id": run_id.0.to_string(),
+                        "status": "failed",
+                        "error": safe_reason,
+                        "error_kind": "runtime_init",
+                    }),
+                );
+            }
+
             state.run_manager.remove_senders(run_id);
             state.run_manager.remove_cancel_token(run_id);
             state.approval_store.clear_for_run(run_id);
+            // The queue head is advancing — fan out updated positions to any
+            // remaining queued runs on this agent (#831).
+            broadcast_queue_advance(&state, agent_id).await;
             return;
         }
     }
@@ -846,6 +1013,25 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             .join(alms_runtime::spill::SPILL_DIR_NAME)
             .join(run_id.0.to_string());
         runtime = runtime.with_shell_spill(run_dir, spill_cfg.enabled);
+    }
+
+    // Wire the shared in-loop tool-output truncation policy (issue #851).
+    // Mirrors `with_shell_spill` above — same lifecycle, same retention
+    // model, same fs_* read-root widening, but applied to *every* tool's
+    // output (not just shell). Must come before `with_workspace` so the
+    // per-run spill dir is included in the agent's extra_read_roots.
+    {
+        let trunc_cfg = state.tools_config.read().tool_output_truncate.clone();
+        let run_dir = state
+            .data_dir
+            .join(alms_runtime::tool_output_truncate::TOOL_OUTPUT_DIR_NAME)
+            .join(run_id.0.to_string());
+        runtime = runtime.with_tool_output_truncate(
+            run_dir,
+            trunc_cfg.enabled,
+            trunc_cfg.max_bytes,
+            trunc_cfg.max_lines,
+        );
     }
 
     // Attach workspace if configured — registers the workspace_write tool for this run
@@ -1142,20 +1328,17 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         Ok(output) => {
             persist_tool_calls(&output.tool_calls);
 
-            // token_delta events already emitted during streaming in the agent loop
-            state
-                .run_manager
-                .send_event(
-                    run_id,
-                    session_id,
-                    SseEventData::run_finished(run_id, true, output.usage),
-                )
-                .await;
-
             // Persist a run-boundary marker so page reloads show "(run
             // completed)" separators. Only for user-facing sessions to
             // avoid cluttering internal sessions (jobs, subagents, DMs,
             // notifications).
+            //
+            // Note: this writes to the session store, not to the SSE feed,
+            // so its position relative to the state-flip / broadcast
+            // ordering below is not load-bearing. Kept above
+            // `mark_run_as_completed` for the same reason as before — it's
+            // a synchronous SQLite write that sequences naturally before
+            // both branches.
             if !is_internal_context_id(&context_id) {
                 super::markers::persist_lifecycle_marker(
                     &state.session_manager,
@@ -1169,7 +1352,9 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 );
             }
 
-            // Clone the response before mark_run_as_completed consumes it.
+            // Compute the summary text BEFORE `mark_run_as_completed`
+            // consumes `output.response` (#927 reorder preserves the
+            // original consume-then-clone shape, just rolls it earlier).
             //
             // For DM runs the agent's actual outbound reply is sent via the
             // `send_message` tool and persisted to the shared DM session —
@@ -1208,9 +1393,34 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 output.response.clone()
             });
 
+            // #927 (extends #895): flip the run state to `Completed`
+            // BEFORE broadcasting `run_finished`. Pre-fix, a concurrent
+            // `GET /sessions` snapshot taken between the broadcast and
+            // the flip could observe `has_active_run: true` while the SSE
+            // feed had already moved past the terminal event —
+            // `last_event_id`-based reconnect would never replay it,
+            // leaving the sidebar's activity indicator stuck.
+            //
+            // The usage payload is `Copy` (TokenUsage is a small struct
+            // of u32/u64), so the broadcast can read it after the flip
+            // consumes the original via `mark_run_as_completed`. We
+            // capture it here for clarity and to avoid relying on a
+            // post-move value.
+            let usage_for_broadcast = output.usage;
+
             state
                 .run_manager
                 .mark_run_as_completed(run_id, output.response, output.usage);
+
+            // token_delta events already emitted during streaming in the agent loop
+            state
+                .run_manager
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_finished(run_id, true, usage_for_broadcast),
+                )
+                .await;
 
             // Fire-and-forget episodic summary generation.
             // Runs in a separate task so it never blocks the SSE cleanup path.
@@ -1265,25 +1475,31 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             info!("Run {} completed successfully", run_id.0);
         }
         Err(alms_core::AlmsError::Cancelled) => {
+            // #895: flip the run state BEFORE broadcasting `run_cancelled`.
+            // See the pre-cancel branch at the top of this function for the
+            // full rationale; the same race applies to every started/ended
+            // boundary that uses `mark_run_as_*` to drive `has_active_run`.
+            state.run_manager.mark_run_as_cancelled(run_id);
+
             state
                 .run_manager
                 .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
                 .await;
 
-            state.run_manager.mark_run_as_cancelled(run_id);
-
-            if !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_boundary",
-                    "(run cancelled)".to_string(),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "status": "cancelled",
-                    }),
-                );
-            }
+            // Issue #912 — DO NOT persist a lifecycle-layer
+            // `(run cancelled)` error marker here.  The runtime layer
+            // (`alms_runtime::AgentRuntime::finish_run`) already wrote a
+            // `[Run cancelled by user]` text message at
+            // `Role::Assistant` (or `Role::User` with `from_agent`
+            // metadata in DM sessions).  That runtime-layer record is
+            // the canonical source of truth: it survives
+            // `strip_mid_history_system_markers` natively and reaches
+            // the next-turn LLM context as a regular conversation turn,
+            // satisfying the #874 follow-up-visibility requirement.
+            // Persisting a second `kind: "error"` marker here would
+            // duplicate the same conceptual event in both chat history
+            // and LLM context — see Atlas + Alper's decision recorded
+            // on issue #912.
 
             // Best-effort: notify the DM peer that the conversation ended
             // because this run was cancelled mid-flight. Without this, the
@@ -1313,25 +1529,19 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // Persist partial tool call records even though the run was cancelled.
             persist_tool_calls(&tool_calls);
 
+            // #895: flip the run state BEFORE broadcasting `run_cancelled`.
+            // See the pre-cancel branch at the top of this function for the
+            // full rationale.
+            state.run_manager.mark_run_as_cancelled(run_id);
+
             state
                 .run_manager
                 .send_event(run_id, session_id, SseEventData::run_cancelled(run_id))
                 .await;
 
-            state.run_manager.mark_run_as_cancelled(run_id);
-
-            if !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_boundary",
-                    "(run cancelled)".to_string(),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "status": "cancelled",
-                    }),
-                );
-            }
+            // Issue #912 — see the `Cancelled` arm above.  The
+            // runtime-layer `[Run cancelled by user]` write is the
+            // canonical record; no lifecycle-layer marker is persisted.
 
             // Best-effort: see comment in the `Cancelled` arm.
             if let Err(e) = super::dm_lifecycle::handle_dm_run_failure(
@@ -1362,6 +1572,15 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             // Persist partial tool call records even though the run failed.
             persist_tool_calls(&tool_calls);
 
+            // #927 (extends #895): flip the run state to `Failed` BEFORE
+            // broadcasting `run_error`. See the `Ok` arm above and the
+            // pre-cancel branch at the top of this function for the full
+            // rationale; the same race applies to every started/ended
+            // boundary that uses `mark_run_as_*` to drive `has_active_run`.
+            state
+                .run_manager
+                .mark_run_as_failed(run_id, source.to_string());
+
             state
                 .run_manager
                 .send_event(
@@ -1371,23 +1590,21 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 )
                 .await;
 
-            state
-                .run_manager
-                .mark_run_as_failed(run_id, source.to_string());
-
-            if !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_boundary",
-                    format!("(run failed) {source}"),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "status": "failed",
-                        "error": source.to_string(),
-                    }),
-                );
-            }
+            // Issue #912 — DO NOT persist a lifecycle-layer
+            // `(run failed) ...` error marker here.  The runtime layer
+            // (`alms_runtime::AgentRuntime::finish_run`) already wrote a
+            // `[Run failed: <safe_reason>]` text message at
+            // `Role::Assistant` (or `Role::User` with `from_agent`
+            // metadata in DM sessions), already passed through
+            // `sanitize_error_for_session` (#911).  That runtime-layer
+            // record is the canonical source of truth: it survives
+            // `strip_mid_history_system_markers` natively and reaches
+            // the next-turn LLM context as a regular conversation turn,
+            // satisfying the #874 follow-up-visibility requirement.
+            // Persisting a second `kind: "error"` marker here would
+            // duplicate the same conceptual event in both chat history
+            // and LLM context — see Atlas + Alper's decision recorded
+            // on issue #912.
 
             // Best-effort: notify the DM peer that the conversation ended
             // due to a runtime error. The truncated `source` string is
@@ -1422,6 +1639,11 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             );
         }
         Err(e) => {
+            // #927 (extends #895): flip the run state to `Failed` BEFORE
+            // broadcasting `run_error`. See the `Ok` and
+            // `FailedWithToolCalls` arms for the full rationale.
+            state.run_manager.mark_run_as_failed(run_id, e.to_string());
+
             state
                 .run_manager
                 .send_event(
@@ -1431,21 +1653,14 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
                 )
                 .await;
 
-            state.run_manager.mark_run_as_failed(run_id, e.to_string());
-
-            if !is_internal_context_id(&context_id) {
-                super::markers::persist_lifecycle_marker(
-                    &state.session_manager,
-                    session_id,
-                    "run_boundary",
-                    format!("(run failed) {e}"),
-                    serde_json::json!({
-                        "run_id": run_id.0.to_string(),
-                        "status": "failed",
-                        "error": e.to_string(),
-                    }),
-                );
-            }
+            // Issue #912 — see the `FailedWithToolCalls` arm above.
+            // This generic-error arm covers LLM 4xx/5xx, rate-limit,
+            // content-policy reject, and runtime errors (context budget
+            // exceeded, summary generation failed) — all of which the
+            // runtime layer has already persisted as a sanitised
+            // `[Run failed: <safe_reason>]` text message via
+            // `finish_run`'s `Err(e)` branch.  The lifecycle-layer
+            // marker would be a duplicate.
 
             // Best-effort: see comment in the `FailedWithToolCalls` arm.
             if let Err(end_err) = super::dm_lifecycle::handle_dm_run_failure(
@@ -1471,6 +1686,24 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             error!("Run {} failed: {}", run_id.0, e);
         }
     }
+
+    // Mirror the run's terminal transition onto the agent-scoped
+    // session-activity feed (#856) — paired with the
+    // `session_activity_started` emitted before the run executed. Fires
+    // exactly once per run regardless of which terminal arm the result
+    // took (Ok / Cancelled / CancelledWithToolCalls / FailedWithToolCalls
+    // / generic Err). Pre-execution cancellation and runtime-construction
+    // failure paths handle their own emissions inline above and return
+    // early, so this site is reached only when the run actually started.
+    state
+        .run_manager
+        .send_agent_event(
+            agent_id,
+            run_id,
+            session_id,
+            SseEventData::session_activity_ended(session_id, run_id, agent_id),
+        )
+        .await;
 
     // Forward a `dm_activity_ended` event to the agent's webchat session
     // so the frontend can update the status bar (#688).  This is distinct
@@ -1506,6 +1739,11 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     state.run_manager.remove_cancel_token(run_id);
     // Clean up any stale pending approvals for this run
     state.approval_store.clear_for_run(run_id);
+    // The queue head is advancing — fan out updated positions to any
+    // remaining queued runs on this agent (#831). Emitted once per run
+    // regardless of which terminal arm was taken (Ok / Cancelled /
+    // CancelledWithToolCalls / FailedWithToolCalls / generic Err).
+    broadcast_queue_advance(&state, agent_id).await;
     // `_in_flight_guard` dropped here — signals drain waiters that this run is done.
 }
 
@@ -1516,10 +1754,32 @@ pub async fn get_run_status(
 ) -> Result<Json<RunStatusResponse>, (StatusCode, Json<serde_json::Value>)> {
     match state.run_manager.get_run(run_id) {
         Some(run) => {
+            let agent_id = run.agent_id;
+            let is_queued = matches!(run.status, alms_core::RunStatus::Queued);
             let mut resp = RunStatusResponse::from(run);
             // Attach tool call count if SQLite is available.
             if let Some(store) = state.session_manager.store() {
                 resp.tool_call_count = store.count_tool_calls(run_id).ok();
+            }
+            // Attach the live 1-indexed queue position so a late-joining
+            // client (page reload, polling fallback) can render "Queued —
+            // position N" without waiting for the next SSE decrement (#831).
+            //
+            // Position uses the same FIFO-rank-among-Queued + running-offset
+            // formulation as the SSE `run_queue_position` broadcast, so the
+            // two surfaces always agree. `None` is returned when the run is
+            // running/terminal, or when the run somehow isn't in the queued
+            // set (defensive: shouldn't happen for status == Queued but the
+            // FIFO sort tolerates it gracefully).
+            if is_queued {
+                let queued = state.run_manager.list_queued_for_agent(agent_id);
+                let running_offset = usize::from(state.run_manager.agent_has_running_run(agent_id));
+                if let Some(idx) = queued.iter().position(|r| r.run_id == run_id) {
+                    let pos = idx + running_offset;
+                    if pos > 0 {
+                        resp.queue_position = Some(pos);
+                    }
+                }
             }
             Ok(Json(resp))
         }
@@ -1614,54 +1874,159 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_error_for_peer_short_ascii_unchanged() {
-        // Short ASCII passes through unmodified (no ellipsis appended).
-        let s = "boom";
-        let out = truncate_error_for_peer(&s);
-        assert_eq!(out, "boom");
-    }
-
-    #[test]
-    fn test_truncate_error_for_peer_exact_boundary_unchanged() {
-        // Exactly PEER_ERROR_MESSAGE_MAX_LEN bytes -> no truncation, no ellipsis.
-        let s = "a".repeat(PEER_ERROR_MESSAGE_MAX_LEN);
-        let out = truncate_error_for_peer(&s);
-        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN);
+    fn test_truncate_error_for_peer_short_label_unchanged() {
+        // The sanitiser collapses Runtime errors to short fixed category
+        // labels well under PEER_ERROR_MESSAGE_MAX_LEN — the helper passes
+        // them through with no truncation and no ellipsis.
+        let err = AlmsError::Runtime("429 Too Many Requests".into());
+        let out = truncate_error_for_peer(&err);
+        assert_eq!(out, "LLM rate limit exceeded");
         assert!(!out.ends_with("..."));
+        assert!(out.len() <= PEER_ERROR_MESSAGE_MAX_LEN);
     }
 
     #[test]
-    fn test_truncate_error_for_peer_oversize_ascii_truncates_with_ellipsis() {
-        // Oversize ASCII clips to PEER_ERROR_MESSAGE_MAX_LEN bytes + "..."
-        // (char-boundary walkback is a no-op for ASCII).
-        let s = "a".repeat(PEER_ERROR_MESSAGE_MAX_LEN + 50);
-        let out = truncate_error_for_peer(&s);
-        assert!(out.ends_with("..."));
-        // Body is exactly the max-len prefix; total len = max + 3 ("...").
-        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN + 3);
+    fn test_truncate_error_for_peer_cancelled_passes_through() {
+        // The Cancelled label is also bounded and passes through unchanged.
+        let err = AlmsError::Cancelled;
+        let out = truncate_error_for_peer(&err);
+        assert_eq!(out, "Run cancelled by user");
     }
 
+    /// Regression test for #931: a `Runtime` error whose Display string
+    /// embeds an API key, hostname, header, or bearer token must NOT
+    /// reach the peer agent's notification context. Before the fix,
+    /// `truncate_error_for_peer` was a length-only UTF-8 truncator and
+    /// the raw provider error would land verbatim in the peer's
+    /// `dm_ended` notification body.
+    ///
+    /// Mirrors the `sanitize_runtime_auth_strips_url_and_keys` test in
+    /// `alms-core/src/error.rs` but at the gateway-layer helper boundary
+    /// — so a future change that swaps the sanitiser call out (or wires
+    /// the helper to a non-sanitising path) is caught here.
+    #[test]
+    fn test_truncate_error_for_peer_strips_secrets_for_dm_peer() {
+        let err = AlmsError::Runtime(
+            "HTTP 401 Unauthorized at https://api.example.com (authorization: Bearer sk-test-12345)"
+                .into(),
+        );
+        let out = truncate_error_for_peer(&err);
+        // The sanitiser collapses 401/403 Runtime errors to a fixed label.
+        assert_eq!(out, "LLM authentication error");
+        for needle in [
+            "sk-test-",
+            "api.example.com",
+            "Bearer",
+            "authorization",
+            "Unauthorized",
+        ] {
+            assert!(
+                !out.contains(needle),
+                "DM peer notification text must not contain {needle:?}, got {out:?}"
+            );
+        }
+    }
+
+    /// Regression test for #931: also exercise the
+    /// `AlmsError::FailedWithToolCalls` shape used by one of the two
+    /// production call sites — the inner `source` is what reaches
+    /// `truncate_error_for_peer` after a `&Box<AlmsError>` deref-coerce.
+    /// A raw 500-internal-error body containing leaked secrets must not
+    /// survive sanitisation through that path either.
+    #[test]
+    fn test_truncate_error_for_peer_failed_with_tool_calls_path_strips_secrets() {
+        let inner = AlmsError::Runtime(
+            "provider 500 internal error: secret-key=sk-test-12345 leaked in body".into(),
+        );
+        // Mirror the production call site shape: `&source` where
+        // `source: Box<AlmsError>` deref-coerces to `&AlmsError`.
+        let source: Box<AlmsError> = Box::new(inner);
+        let out = truncate_error_for_peer(&source);
+        assert_eq!(out, "Runtime error");
+        assert!(
+            !out.contains("sk-test-12345"),
+            "API key from inner Runtime body must not survive sanitisation: got {out:?}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Truncation + UTF-8 char-boundary walkback path (#931 / #936 follow-up)
+    //
+    // The sanitiser collapses every error variant *except* `ToolExecution`
+    // to a short fixed-length category label, so in practice the truncation
+    // step is a no-op for those variants. `ToolExecution` is the one
+    // variant whose sanitised output length scales with caller input
+    // (`format!("Tool execution failed: {}", msg.split(':').next())`), so
+    // it is the only path through which the truncation + char-boundary
+    // walkback can fire on production data. These tests pin that path so a
+    // future "this code is dead, remove it" refactor either preserves the
+    // behaviour or notices it has live callers.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Pins the truncation arm on the only sanitiser output that can
+    /// exceed `PEER_ERROR_MESSAGE_MAX_LEN`: a `ToolExecution` error whose
+    /// pre-`:` segment is large enough that `"Tool execution failed: <name>"`
+    /// overflows the cap. The truncated body must end with `"..."` and the
+    /// total length must be exactly `PEER_ERROR_MESSAGE_MAX_LEN + 3`
+    /// because the input is pure ASCII (no walkback required).
+    #[test]
+    fn test_truncate_error_for_peer_oversize_ascii_tool_truncates_with_ellipsis() {
+        // 400 ASCII chars with no ':' means the sanitiser keeps the full
+        // tool name, producing `"Tool execution failed: aaaa..."` of total
+        // length 22 + 400 = 422 > PEER_ERROR_MESSAGE_MAX_LEN (300).
+        let long_name = "a".repeat(400);
+        let err = AlmsError::ToolExecution(long_name);
+        let out = truncate_error_for_peer(&err);
+        assert!(
+            out.ends_with("..."),
+            "oversize sanitiser output must be truncated and ellipsis-terminated, got {out:?}"
+        );
+        // Body length is exactly PEER_ERROR_MESSAGE_MAX_LEN for pure ASCII
+        // (char-boundary walkback is a no-op); total = max + 3 ("...").
+        assert_eq!(out.len(), PEER_ERROR_MESSAGE_MAX_LEN + 3);
+        assert!(out.starts_with("Tool execution failed: "));
+    }
+
+    /// Pins the UTF-8 char-boundary walkback inside the truncation arm.
+    /// Constructs a `ToolExecution` error whose sanitised output places a
+    /// multibyte codepoint *across* byte offset `PEER_ERROR_MESSAGE_MAX_LEN`,
+    /// so a naive `&s[..PEER_ERROR_MESSAGE_MAX_LEN]` would panic. The
+    /// helper must walk back to the nearest char boundary at or below the
+    /// cap and append `"..."`.
+    ///
+    /// Without the walkback, slicing `String` on a non-boundary panics —
+    /// so this test would fail by panicking, not by producing wrong output.
     #[test]
     fn test_truncate_error_for_peer_multibyte_walks_back_to_char_boundary() {
-        // "é" is 2 bytes in UTF-8. With 200 copies (400 bytes), the raw
-        // PEER_ERROR_MESSAGE_MAX_LEN=300 cut would land mid-codepoint at
-        // offset 300 (which IS a char boundary for 2-byte codepoints since
-        // 300 is even); construct a 3-byte char case that forces a walkback.
-        // "あ" is 3 bytes; 150 copies = 450 bytes. Cut at 300 -> 300 % 3 == 0,
-        // also a boundary. Use a mix: leading "a" then 3-byte chars so the
-        // cut lands inside a codepoint and must walk back.
-        let s = format!("a{}", "あ".repeat(200)); // 1 + 600 = 601 bytes
-        // Cut at 300: byte 0 is 'a', then "あ" starts at byte 1 (3 bytes each).
-        // Boundaries after byte 1 are at 1 + 3k. 300 - 1 = 299, not a multiple
-        // of 3, so 300 is mid-codepoint. Walk back: 300 -> 299 -> 298 (1+3*99=298).
-        let out = truncate_error_for_peer(&s);
+        // The sanitiser prefix `"Tool execution failed: "` is 23 ASCII
+        // bytes. Pad the start of the tool name so that the cap (300)
+        // lands inside a 3-byte codepoint — concretely: 23 prefix bytes
+        // + N filler ASCII bytes + a run of 3-byte CJK chars, with N
+        // chosen so that 300 - (23 + N) is not a multiple of 3.
+        //
+        // Use N = 1 ("x"): prefix runs 23..24, then "あ" (0xE3 0x81 0x82,
+        // 3 bytes each) starts at byte 24. Codepoint boundaries after
+        // byte 24 are at 24 + 3k. 300 - 24 = 276, which IS a multiple
+        // of 3, so 300 is on a boundary. Use N = 2 instead: 23 + 2 = 25,
+        // boundaries at 25 + 3k, 300 - 25 = 275, not a multiple of 3.
+        // Walkback must land at the nearest boundary <= 300, which is
+        // 25 + 3*91 = 298.
+        let mut tool_name = "xx".to_string();
+        tool_name.push_str(&"あ".repeat(200)); // 600 bytes; total >> 300
+        let err = AlmsError::ToolExecution(tool_name);
+        let out = truncate_error_for_peer(&err);
         assert!(out.ends_with("..."));
-        // The body must end at a UTF-8 char boundary (no panic on slicing).
         let body = out.trim_end_matches("...");
-        assert!(body.is_char_boundary(body.len()));
-        // Body length is the largest valid char boundary <= 300.
+        // Body must end at a UTF-8 char boundary (otherwise `&s[..end]`
+        // panics inside the helper, never reaching this assertion).
+        assert!(
+            body.is_char_boundary(body.len()),
+            "truncated body must end on a UTF-8 char boundary"
+        );
         assert!(body.len() <= PEER_ERROR_MESSAGE_MAX_LEN);
-        assert!(s.is_char_boundary(body.len()));
+        // The walkback should land ON the largest valid boundary <= 300,
+        // not arbitrarily earlier. With our padding, that boundary is 298.
+        assert_eq!(body.len(), 298);
     }
 
     // ─────────────────────────────────────────────────────────────────────

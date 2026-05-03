@@ -36,6 +36,9 @@ async fn test_stream_llm_call_emits_token_deltas() {
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
         agent_name: None,
     };
 
@@ -81,6 +84,9 @@ async fn test_build_context() {
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
         agent_name: None,
     };
 
@@ -116,6 +122,9 @@ async fn test_build_context_dm_perspective_mapping() {
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
         agent_name: Some("bob".to_string()),
     };
 
@@ -199,6 +208,9 @@ async fn test_build_context_non_dm_no_perspective() {
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
         agent_name: Some("bob".to_string()),
     };
 
@@ -235,54 +247,140 @@ async fn test_build_context_non_dm_no_perspective() {
     assert!(messages[1].content_str().contains("hi"));
 }
 
-#[test]
-fn test_sanitize_error_runtime_auth() {
-    let err = AlmsError::Runtime("HTTP 401 Unauthorized at https://api.example.com".into());
-    assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "LLM authentication error"
+// `sanitize_error_for_session` lives in `alms-core` (issue #911) so both
+// the runtime and gateway can use it. Tests for it live alongside the
+// function in `alms-core::error`.
+
+/// Regression test for #912 — when a run fails, the runtime layer's
+/// `finish_run` is the single place that persists the failure record
+/// to the session.  Before #912 the gateway's lifecycle layer also
+/// wrote a `(run failed) ...` `Role::System` marker tagged with
+/// `kind: "error"`; both records reached the LLM context on the next
+/// turn and double-spent the agent's attention budget on the same
+/// event.  Atlas + Alper's decision (recorded on issue #912) was to
+/// keep this runtime-layer write — the canonical record that lands as
+/// `Role::Assistant` text and survives `strip_mid_history_system_markers`
+/// natively — and remove the duplicate lifecycle-layer marker.
+///
+/// This test pins the runtime-layer invariant: a failed run produces
+/// exactly ONE error-flavoured record in the session.  Together with
+/// the lifecycle-layer removal in `crates/alms-gateway/src/runs/lifecycle.rs`
+/// it locks in "one failed-run record per `run_id`, not two".
+#[tokio::test]
+async fn finish_run_persists_exactly_one_error_record_on_failure() {
+    use crate::llm_types::LlmMessage;
+
+    let config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let session_manager = SessionManager::new(SessionConfig::default());
+    let llm = LlmClient::new(config).unwrap();
+    let agent_id = AgentId::new();
+    let runtime = AgentRuntime::new(agent_id, AgentConfig::default(), llm).unwrap();
+
+    // Pre-populate the session with a user turn so the failure record
+    // is visible in a realistic history shape.
+    let session = session_manager.get_or_create(agent_id, "test-dedup");
+    session_manager
+        .append_message(
+            session.id,
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: alms_session::Role::User,
+                content: alms_session::Content::Text("do something".to_string()),
+                timestamp: alms_core::Timestamp::now(),
+                metadata: None,
+            },
+        )
+        .unwrap();
+
+    // Drive `finish_run` down its `Err(_)` arm by passing a synthetic
+    // history error — this is exactly the path triggered by an LLM
+    // 401/429/500, a context-build failure, or any other run-level
+    // error caught by `agent_loop` / `build_context`.
+    let history: AlmsResult<Vec<LlmMessage>> = Err(AlmsError::Runtime(
+        "simulated provider 500: server error".into(),
+    ));
+    let result = runtime
+        .finish_run(&session_manager, session.id, "test-dedup", history)
+        .await;
+
+    // The runtime layer surfaces the error to the caller wrapped in
+    // `FailedWithToolCalls` so the gateway can persist partial tool
+    // call records.  The key invariant for #912 is the side effect on
+    // the session, not the return value shape.
+    assert!(
+        matches!(result, Err(AlmsError::FailedWithToolCalls { .. })),
+        "finish_run on Err(_) history must surface FailedWithToolCalls; got {result:?}"
     );
-}
 
-#[test]
-fn test_sanitize_error_runtime_rate_limit() {
-    let err = AlmsError::Runtime("429 Too Many Requests".into());
+    let history = session_manager.get_history(session.id).unwrap();
+
+    // Count every record that smells like a run-failure marker:
+    //   - the runtime-layer `[Run failed: ...]` text (Role::Assistant)
+    //   - any synthetic `(run failed) ...` marker from a hypothetical
+    //     lifecycle-layer write (Role::System with kind=error)
+    let run_failed_records: Vec<_> = history
+        .iter()
+        .filter(|m| match &m.content {
+            alms_session::Content::Text(t) => {
+                t.contains("[Run failed:") || t.contains("(run failed)")
+            }
+            _ => false,
+        })
+        .collect();
+
     assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "LLM rate limit exceeded"
+        run_failed_records.len(),
+        1,
+        "exactly one run-failed record per run is required (issue #912); got {} records: {:#?}",
+        run_failed_records.len(),
+        run_failed_records
+            .iter()
+            .map(|m| match &m.content {
+                alms_session::Content::Text(t) => (m.role, t.clone()),
+                _ => (m.role, "<non-text>".to_string()),
+            })
+            .collect::<Vec<_>>()
     );
-}
 
-#[test]
-fn test_sanitize_error_runtime_timeout() {
-    let err = AlmsError::Runtime("request timed out after 60s".into());
+    // The single record is the runtime-layer `[Run failed: ...]` text
+    // at `Role::Assistant`, sanitised via `sanitize_error_for_session`.
+    let only = run_failed_records[0];
+    assert_eq!(only.role, alms_session::Role::Assistant);
+    if let alms_session::Content::Text(t) = &only.content {
+        assert!(
+            t.starts_with("[Run failed:"),
+            "runtime-layer marker must use the `[Run failed: ...]` shape; got {t:?}"
+        );
+        // Confirm the raw error body did not survive sanitisation —
+        // overlapping defence with #911's coverage in alms-core.
+        assert!(
+            !t.contains("provider 500: server error"),
+            "raw provider body must not leak into the persisted marker; got {t:?}"
+        );
+    } else {
+        panic!("expected text content on the run-failed record");
+    }
+
+    // No `Role::System` markers carrying `kind: "error"` — the
+    // lifecycle-layer write removed in #912 was the only path that
+    // produced those during a normal run failure.
+    let system_error_markers = history
+        .iter()
+        .filter(|m| {
+            m.role == alms_session::Role::System
+                && m.metadata
+                    .as_ref()
+                    .and_then(|md| md.get("kind"))
+                    .and_then(|v| v.as_str())
+                    == Some("error")
+        })
+        .count();
     assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "LLM request timed out"
-    );
-}
-
-#[test]
-fn test_sanitize_error_runtime_generic() {
-    let err = AlmsError::Runtime("some secret-key=abc123 in raw error".into());
-    assert_eq!(helpers::sanitize_error_for_session(&err), "Runtime error");
-}
-
-#[test]
-fn test_sanitize_error_tool_strips_output() {
-    let err = AlmsError::ToolExecution("shell_exec: secret output here".into());
-    assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "Tool execution failed: shell_exec"
-    );
-}
-
-#[test]
-fn test_sanitize_error_context_building() {
-    let err = AlmsError::Runtime("failed to build context window".into());
-    assert_eq!(
-        helpers::sanitize_error_for_session(&err),
-        "Context building failed"
+        system_error_markers, 0,
+        "runtime-layer finish_run must not write Role::System kind=error markers (issue #912)"
     );
 }
 
@@ -354,6 +452,9 @@ async fn test_guarded_posture_sequential_approvals() {
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
         agent_name: None,
     };
 
@@ -388,7 +489,7 @@ async fn test_guarded_posture_sequential_approvals() {
     for tc in &tool_calls {
         results.push(
             runtime
-                .execute_tool_call(tc, uuid::Uuid::new_v4(), &session_manager, session.id)
+                .execute_tool_call(tc, uuid::Uuid::new_v4(), &session_manager, session.id, None)
                 .await,
         );
     }
@@ -408,6 +509,542 @@ async fn test_guarded_posture_sequential_approvals() {
     assert_eq!(
         approval_order[1].1, 1,
         "Second approval should see count=1 (first resolved)"
+    );
+}
+
+/// Regression test for #815: a user-denied approval under Guarded posture
+/// must append an `AuditDecision::Deny` entry. Before the fix, the deny
+/// branch of the approval gate emitted `tool_end` and returned the
+/// `ToolExecution` error to the loop — but never called
+/// `session_manager.append_audit`. That left a one-sided audit trail
+/// (every approved call recorded, every denied call silently dropped),
+/// which is useless for any forensic / compliance / post-incident review
+/// that needs to answer "did the operator deny X at this time?".
+///
+/// Approve-side audit emission remains covered by other tests in this
+/// module; the explicit positive assertion here is for the deny path.
+#[tokio::test]
+async fn test_denied_approval_appends_deny_audit_entry() {
+    use alms_core::AuditDecision;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // `math` is NOT auto-approved, so the approval gate fires.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: None,
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+    };
+
+    let tool_call = ToolCall::new("tc-deny", "math", r#"{"operation":"add","a":1,"b":2}"#);
+
+    // Spawn a handler that denies the approval (`decision_tx.send(false)`).
+    let deny_handler = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let RuntimeEvent::ApprovalRequired { decision_tx, .. } = event {
+                decision_tx.send(false).unwrap();
+                break;
+            }
+        }
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call,
+            uuid::Uuid::new_v4(),
+            &session_manager,
+            session.id,
+            None,
+        )
+        .await;
+
+    deny_handler.await.unwrap();
+
+    // The loop must surface a tool-execution error mentioning the denial.
+    match &result {
+        Err(AlmsError::ToolExecution(msg)) => {
+            assert!(
+                msg.contains("denied by user"),
+                "expected denial reason in error, got {:?}",
+                msg
+            );
+        }
+        other => panic!("expected ToolExecution(denied by user), got {:?}", other),
+    }
+
+    // The audit log must contain exactly one entry: a `Deny` decision for
+    // the `math` tool, with the params we passed in and a denial-shaped
+    // error string. Before the #815 fix this assertion would fail with
+    // an empty audit log.
+    let audit = session_manager.get_audit(session.id).unwrap();
+    let deny_entries: Vec<_> = audit
+        .iter()
+        .filter(|e| matches!(e.decision, AuditDecision::Deny))
+        .collect();
+    assert_eq!(
+        deny_entries.len(),
+        1,
+        "expected exactly one Deny audit entry for the user-denied approval, \
+         got {} (full audit: {:#?})",
+        deny_entries.len(),
+        audit
+    );
+    let entry = deny_entries[0];
+    assert_eq!(entry.tool, "math", "deny entry must record tool name");
+    assert!(
+        entry
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("denied by user")),
+        "deny entry must record denial reason, got {:?}",
+        entry.error
+    );
+    assert!(
+        entry.result.is_none(),
+        "deny entry must not carry a result payload, got {:?}",
+        entry.result
+    );
+    // `params` should be the parsed JSON form of the tool call's arguments.
+    assert_eq!(
+        entry.params,
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+        "deny entry must record the parsed tool arguments"
+    );
+    // No `Allow` entry should sneak in for a denied call.
+    assert!(
+        !audit
+            .iter()
+            .any(|e| matches!(e.decision, AuditDecision::Allow)),
+        "denied call must not produce an Allow audit entry"
+    );
+}
+
+/// Regression test for #816: cancellation during approval-wait must emit a
+/// matching `ToolEnd` for the `ToolStart` already fired before the approval
+/// gate. Without that terminal event the UI's tool row stays in the spinner
+/// state until the user reloads — live render diverges from persisted/reload
+/// render, breaking the same invariant #800/#803 fixed for the
+/// approve-then-resolve path.
+#[tokio::test]
+async fn test_cancel_during_approval_wait_emits_tool_end() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // `math` is NOT auto-approved, so the approval gate fires.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+    let cancel_token = CancellationToken::new();
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: Some(cancel_token.clone()),
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+    };
+
+    let tool_call = ToolCall::new("tc1", "math", r#"{"operation":"add","a":1,"b":2}"#);
+    let invocation_id = uuid::Uuid::new_v4();
+
+    // Spawn a task that watches for `ApprovalRequired` and then cancels the
+    // run instead of resolving the decision channel — simulating an operator
+    // hitting `run cancel` while the approval prompt is open. We hold onto
+    // `decision_tx` so it isn't dropped (which would unblock the await with
+    // `false` and resolve as "denied" rather than "cancelled").
+    let cancel_token_clone = cancel_token.clone();
+    let approval_handler = tokio::spawn(async move {
+        let mut held_tx = None;
+        while let Some(event) = rx.recv().await {
+            match event {
+                RuntimeEvent::ApprovalRequired { decision_tx, .. } => {
+                    held_tx = Some(decision_tx);
+                    cancel_token_clone.cancel();
+                }
+                RuntimeEvent::ToolEnd { .. } => {
+                    // Surface the terminal event back to the test body.
+                    return (held_tx, Some(event));
+                }
+                _ => {}
+            }
+        }
+        (held_tx, None)
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call,
+            invocation_id,
+            &session_manager,
+            session.id,
+            None,
+        )
+        .await;
+
+    // Drop the runtime so the event channel closes and the handler's `recv`
+    // loop terminates cleanly if `ToolEnd` was never observed.
+    drop(runtime);
+
+    // The loop must surface `Cancelled` — not a denial or success.
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+
+    let (_held_tx, tool_end) = approval_handler.await.unwrap();
+
+    // The terminal event must have been emitted before unwind.
+    let tool_end = tool_end.expect(
+        "tool_end must be emitted on cancel-during-approval-wait — \
+         every tool_start must have a matching terminal event (#816)",
+    );
+    match tool_end {
+        RuntimeEvent::ToolEnd {
+            invocation_id: end_id,
+            ok,
+            result,
+            ..
+        } => {
+            assert_eq!(
+                end_id, invocation_id,
+                "tool_end must reference the same invocation_id as the tool_start"
+            );
+            assert!(!ok, "tool_end after cancel must report ok=false");
+            // Result payload should mention cancellation so the UI / persisted
+            // state can distinguish this from a denial or generic error.
+            let err_str = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            assert!(
+                err_str.contains("cancel"),
+                "tool_end result.error should mention cancellation, got {:?}",
+                result
+            );
+        }
+        _ => panic!("expected RuntimeEvent::ToolEnd, got a different RuntimeEvent variant"),
+    }
+}
+
+/// Regression test for #893: cancellation during approval-wait must append
+/// an audit entry. Sibling gap to #815 in the same approval gate. Without
+/// the fix, cancelling a run while the approval prompt is open emits a
+/// `tool_end` event but leaves the audit log silent — operators can't
+/// distinguish "approval pending then run cancelled" from "approval never
+/// happened".
+#[tokio::test]
+async fn test_cancel_during_approval_wait_appends_audit_entry() {
+    use alms_core::AuditDecision;
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    // `math` is NOT auto-approved, so the approval gate fires.
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+    let cancel_token = CancellationToken::new();
+
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: Some(cancel_token.clone()),
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+    };
+
+    let tool_call = ToolCall::new("tc-cancel", "math", r#"{"operation":"add","a":1,"b":2}"#);
+    let invocation_id = uuid::Uuid::new_v4();
+
+    // Wait for `ApprovalRequired`, then cancel without resolving the
+    // decision channel. Hold onto `decision_tx` so dropping it doesn't
+    // unblock the await as "denied" before the cancel arm fires.
+    let cancel_token_clone = cancel_token.clone();
+    let approval_handler = tokio::spawn(async move {
+        let mut held_tx = None;
+        while let Some(event) = rx.recv().await {
+            if let RuntimeEvent::ApprovalRequired { decision_tx, .. } = event {
+                held_tx = Some(decision_tx);
+                cancel_token_clone.cancel();
+                break;
+            }
+        }
+        held_tx
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call,
+            invocation_id,
+            &session_manager,
+            session.id,
+            None,
+        )
+        .await;
+
+    drop(runtime);
+
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+
+    let _held_tx = approval_handler.await.unwrap();
+
+    // The audit log must contain exactly one entry: a `Deny` decision for
+    // the `math` tool with a cancellation-shaped error string. Before the
+    // #893 fix this assertion failed with an empty audit log.
+    let audit = session_manager.get_audit(session.id).unwrap();
+    let deny_entries: Vec<_> = audit
+        .iter()
+        .filter(|e| matches!(e.decision, AuditDecision::Deny))
+        .collect();
+    assert_eq!(
+        deny_entries.len(),
+        1,
+        "expected exactly one Deny audit entry for the cancelled approval, \
+         got {} (full audit: {:#?})",
+        deny_entries.len(),
+        audit
+    );
+    let entry = deny_entries[0];
+    assert_eq!(entry.tool, "math", "deny entry must record tool name");
+    // VERBATIM equality on the error string (Tim's review on PR #925):
+    // the audit-log discriminator IS the error string text — log-query
+    // tooling that greps for "approval cancelled by run cancellation"
+    // would silently break under a future wording refactor if the test
+    // only asserted on a substring. Pin the wire shape exactly.
+    assert_eq!(
+        entry.error.as_deref(),
+        Some("Tool 'math' approval cancelled by run cancellation"),
+        "deny entry error string must match the exact #893 discriminator"
+    );
+    assert!(
+        entry.result.is_none(),
+        "deny entry must not carry a result payload, got {:?}",
+        entry.result
+    );
+    assert_eq!(
+        entry.params,
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+        "deny entry must record the parsed tool arguments"
+    );
+    // No `Allow` entry should sneak in for a cancelled call.
+    assert!(
+        !audit
+            .iter()
+            .any(|e| matches!(e.decision, AuditDecision::Allow)),
+        "cancelled call must not produce an Allow audit entry"
+    );
+}
+
+/// Regression test for #894: when the approval `decision_rx` is closed
+/// without a value (no cancel token branch active because `inflight`
+/// is `None`), the function returns `Err(ToolExecution("Approval channel
+/// closed"))` and must append an audit entry. Sibling gap to #815 / #893.
+/// Mirrors the shape of `test_denied_approval_appends_deny_audit_entry`.
+#[tokio::test]
+async fn test_approval_channel_closed_appends_audit_entry() {
+    use alms_core::AuditDecision;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let tools =
+        crate::tools::ToolRegistry::with_builtins_sandboxed(None, true, &["math".to_string()]);
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let agent_id = AgentId::new();
+    let session = session_manager.get_or_create(agent_id, "test");
+
+    // Note: `cancel_token: None` is critical here — the channel-closed
+    // branch only fires in the `else` arm of the cancel-token check.
+    let runtime = AgentRuntime {
+        agent_id,
+        config: AgentConfig {
+            posture: Posture::Guarded,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: None,
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+    };
+
+    let tool_call = ToolCall::new("tc-closed", "math", r#"{"operation":"add","a":1,"b":2}"#);
+
+    // Drop the approval `decision_tx` without sending a value. This closes
+    // the channel and triggers the `Err(_)` branch of `decision_rx.await`.
+    let close_handler = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let RuntimeEvent::ApprovalRequired { decision_tx, .. } = event {
+                drop(decision_tx);
+                break;
+            }
+        }
+    });
+
+    let result = runtime
+        .execute_tool_call(
+            &tool_call,
+            uuid::Uuid::new_v4(),
+            &session_manager,
+            session.id,
+            None,
+        )
+        .await;
+
+    close_handler.await.unwrap();
+
+    match &result {
+        Err(AlmsError::ToolExecution(msg)) => {
+            // VERBATIM equality on the wire-shape error string — see
+            // the analogous comment in
+            // `test_cancel_during_approval_wait_appends_audit_entry`
+            // and Tim's review on PR #925.
+            assert_eq!(
+                msg, "Tool 'math' approval channel closed",
+                "expected exact channel-closed error message, got {:?}",
+                msg
+            );
+        }
+        other => panic!(
+            "expected ToolExecution(\"Tool 'math' approval channel closed\"), got {:?}",
+            other
+        ),
+    }
+
+    let audit = session_manager.get_audit(session.id).unwrap();
+    let deny_entries: Vec<_> = audit
+        .iter()
+        .filter(|e| matches!(e.decision, AuditDecision::Deny))
+        .collect();
+    assert_eq!(
+        deny_entries.len(),
+        1,
+        "expected exactly one Deny audit entry for the channel-closed unwind, \
+         got {} (full audit: {:#?})",
+        deny_entries.len(),
+        audit
+    );
+    let entry = deny_entries[0];
+    assert_eq!(entry.tool, "math", "deny entry must record tool name");
+    // VERBATIM equality on the audit error string. The discriminator-by-
+    // error-string approach (#815 / #893 / #894) means log-query tooling
+    // depends on this exact text — pin it. See Tim's review on PR #925.
+    assert_eq!(
+        entry.error.as_deref(),
+        Some("Tool 'math' approval channel closed"),
+        "deny entry error string must match the exact #894 discriminator"
+    );
+    assert!(
+        entry.result.is_none(),
+        "deny entry must not carry a result payload, got {:?}",
+        entry.result
+    );
+    assert_eq!(
+        entry.params,
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+        "deny entry must record the parsed tool arguments"
+    );
+    assert!(
+        !audit
+            .iter()
+            .any(|e| matches!(e.decision, AuditDecision::Allow)),
+        "channel-closed call must not produce an Allow audit entry"
     );
 }
 
@@ -450,6 +1087,9 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
         shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
         agent_name: None,
     };
 
@@ -457,7 +1097,13 @@ async fn test_auto_approved_tool_bypasses_approval_in_guarded_posture() {
 
     // Execute the auto-approved tool — should succeed without blocking.
     let result = runtime
-        .execute_tool_call(&tc, uuid::Uuid::new_v4(), &session_manager, session.id)
+        .execute_tool_call(
+            &tc,
+            uuid::Uuid::new_v4(),
+            &session_manager,
+            session.id,
+            None,
+        )
         .await;
     assert!(
         result.is_ok(),
@@ -531,12 +1177,21 @@ async fn test_classifier_blocked_shell_surfaces_target_in_tool_end() {
         shell_permissions: alms_core::config::ShellPermissions::default(),
         shell_classification_mode: alms_core::config::ShellClassificationMode::BlockDestructive,
         shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
         agent_name: None,
     };
 
     let tc = ToolCall::new("tc-blocked", "shell", r#"{"command":"rm -rf /etc"}"#);
     let result = runtime
-        .execute_tool_call(&tc, uuid::Uuid::new_v4(), &session_manager, session.id)
+        .execute_tool_call(
+            &tc,
+            uuid::Uuid::new_v4(),
+            &session_manager,
+            session.id,
+            None,
+        )
         .await;
     assert!(
         result.is_err(),
@@ -2065,9 +2720,8 @@ async fn test_reasoning_persisted_reload_roundtrip() {
 }
 
 /// `AgentConfig.anthropic_thinking_budget` threads through to every LLM
-/// request the agent loop issues. Without this invariant, per-agent /
-/// per-run overrides would land in config but never be seen by the
-/// provider.
+/// request the agent loop issues. Without this invariant, per-agent
+/// overrides would land in config but never be seen by the provider.
 ///
 /// This is a shape-assertion test — we don't run a real LLM; we build
 /// the `CompletionRequest` exactly as the agent loop does and check the
@@ -2103,6 +2757,468 @@ fn test_agent_config_thinking_budget_threads_into_request() {
         req0 = req0.with_thinking_budget(cfg0.anthropic_thinking_budget);
     }
     assert!(req0.thinking_budget_tokens.is_none());
+}
+
+// =====================================================================
+// #846 — cancel-during-tool-execution must emit a synthetic ToolEnd.
+//
+// Sibling of #816 (cancel during approval-wait, fixed in #845). Both
+// cancel arms in `run_tool_calls` (Guarded sequential, line ~603, and
+// FullControl/Autonomous parallel, line ~637) race against the inner
+// `execute_tool_call` future. When the cancel arm wins, the inner future
+// is dropped at an `await` point — `tool_start` was already emitted but
+// `tool_end` was not. The runtime must synthesise a matching `ToolEnd`
+// before unwinding so consumers (UI, audit log, persisted state) see
+// the 1:1 invariant honoured. The frontend defensive sweep that
+// previously masked this bug (`use-session-stream.js:1018-1023`, added
+// in #594) is removed in the same PR — this test stands alone.
+// =====================================================================
+
+/// Test helper: a tool whose `execute()` awaits on a oneshot receiver
+/// before returning, letting the test deterministically hold the tool
+/// in-flight until it deliberately fires the cancel token.
+///
+/// Marked `is_auto_approved = true` so it bypasses the Guarded approval
+/// gate and the inner future immediately reaches `tools.execute().await`
+/// (the cancel-during-tool-execution race window).
+#[derive(Debug)]
+struct BlockingTestTool {
+    name: String,
+    /// Drained on each call. Tests pre-load this with one or more
+    /// receivers; each `execute()` invocation pops one and awaits it.
+    /// Once the channel sender is dropped (without sending), `await`
+    /// returns Err and the tool returns an error.
+    rx_queue: tokio::sync::Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl BlockingTestTool {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            rx_queue: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    async fn enqueue(&self, rx: tokio::sync::oneshot::Receiver<()>) {
+        self.rx_queue.lock().await.push_back(rx);
+    }
+}
+
+#[async_trait::async_trait]
+impl alms_sandbox::Tool for BlockingTestTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        "test-only tool that blocks on a oneshot receiver"
+    }
+    fn is_auto_approved(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _params: serde_json::Value,
+    ) -> alms_sandbox::SandboxResult<serde_json::Value> {
+        let rx = {
+            let mut q = self.rx_queue.lock().await;
+            q.pop_front()
+        };
+        if let Some(rx) = rx {
+            // Block until the test fires the sender, OR until the future
+            // is dropped (cancel-during-tool-execution race). Drop is the
+            // expected path for #846 tests.
+            let _ = rx.await;
+        }
+        Ok(serde_json::json!({"ok": true}))
+    }
+}
+
+fn make_runtime_for_cancel_test(
+    posture: Posture,
+    tool: std::sync::Arc<dyn alms_sandbox::Tool>,
+    cancel_token: tokio_util::sync::CancellationToken,
+    tx: tokio::sync::mpsc::UnboundedSender<RuntimeEvent>,
+) -> AgentRuntime {
+    let llm_config = LlmConfig {
+        mock: true,
+        ..LlmConfig::default()
+    };
+    let tools = ToolRegistry::new();
+    tools.register(tool);
+    AgentRuntime {
+        agent_id: AgentId::new(),
+        config: AgentConfig {
+            posture,
+            ..AgentConfig::default()
+        },
+        llm: LlmClient::new(llm_config).unwrap(),
+        summary_llm: None,
+        tools,
+        workspace: None,
+        event_sender: Some(tx),
+        run_id: None,
+        cancel_token: Some(cancel_token),
+        resolved_sandbox_root: None,
+        shell_unrestricted: true,
+        shell_default_env: std::collections::HashMap::new(),
+        shell_permissions: alms_core::config::ShellPermissions::default(),
+        shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+        shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+        tool_output_truncate_policy:
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled(),
+        extra_fs_read_roots: Vec::new(),
+        agent_name: None,
+    }
+}
+
+/// Spawn a watcher task that consumes events from `rx`, mirrors
+/// `(invocation_id, ok, result)` of every ToolEnd into `ends`, marks
+/// every ToolStart's `invocation_id` in `starts`, and once the
+/// observed `ToolStart` count reaches `cancel_after_n_starts` fires
+/// `cancel_token`. This deterministically arranges for the cancel to
+/// land after every expected inner future has registered with the
+/// in-flight tracker and is parked at its blocking await — removing
+/// the dependency on tokio scheduling order that an "always cancel on
+/// first start" variant would have in the multi-tool parallel case
+/// (Tim's nit on #846).
+// Test helper return type is intentionally a tuple of two collections
+// — splitting into a named alias would obscure the call sites without
+// any reuse benefit (only one caller shape).
+#[allow(clippy::type_complexity)]
+fn spawn_cancel_on_tool_start(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<RuntimeEvent>,
+    cancel_token: tokio_util::sync::CancellationToken,
+    cancel_after_n_starts: usize,
+) -> tokio::task::JoinHandle<(
+    std::collections::HashSet<uuid::Uuid>,
+    Vec<(uuid::Uuid, bool, serde_json::Value)>,
+)> {
+    assert!(
+        cancel_after_n_starts >= 1,
+        "cancel_after_n_starts must be at least 1"
+    );
+    tokio::spawn(async move {
+        let mut starts = std::collections::HashSet::new();
+        let mut ends = Vec::new();
+        let mut cancelled = false;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                RuntimeEvent::ToolStart { invocation_id, .. } => {
+                    starts.insert(invocation_id);
+                    // Cancel only once we've observed the expected
+                    // number of ToolStarts. For the parallel test (n=3)
+                    // this guarantees all 3 inner futures have
+                    // registered with the in-flight tracker before the
+                    // cancel arm fires, regardless of how the runtime
+                    // interleaves the watcher task with `join_all`'s
+                    // synchronous walk.
+                    if !cancelled && starts.len() >= cancel_after_n_starts {
+                        cancel_token.cancel();
+                        cancelled = true;
+                    }
+                }
+                RuntimeEvent::ToolEnd {
+                    invocation_id,
+                    ok,
+                    result,
+                    ..
+                } => {
+                    ends.push((invocation_id, ok, result));
+                }
+                _ => {}
+            }
+        }
+        (starts, ends)
+    })
+}
+
+/// #846 — Guarded sequential cancel arm: a non-conflicting tool starts
+/// executing under Guarded posture (auto-approved → no approval gate),
+/// the test cancels mid-execution, and `run_tool_calls` must synthesise
+/// a matching `ToolEnd` for the in-flight tool before returning
+/// `Cancelled`.
+#[tokio::test]
+async fn test_cancel_during_tool_execution_emits_tool_end_guarded() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let cancel_token = CancellationToken::new();
+
+    let blocking = std::sync::Arc::new(BlockingTestTool::new("block_test"));
+    // Pre-load one receiver — the matching sender is held by the test
+    // and never fired, so the tool will block until its future is
+    // dropped by the cancel arm.
+    let (_tx_release, rx_release) = tokio::sync::oneshot::channel::<()>();
+    blocking.enqueue(rx_release).await;
+
+    let runtime = make_runtime_for_cancel_test(
+        Posture::Guarded,
+        blocking.clone() as std::sync::Arc<dyn alms_sandbox::Tool>,
+        cancel_token.clone(),
+        tx,
+    );
+
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+    let tool_calls = vec![ToolCall::new("tc1", "block_test", "{}")];
+    let invocation_id = uuid::Uuid::new_v4();
+    let invocation_ids = vec![invocation_id];
+
+    // Guarded sequential cancel arm — single tool, cancel after the
+    // first (only) ToolStart.
+    let watcher = spawn_cancel_on_tool_start(rx, cancel_token.clone(), 1);
+
+    let result = runtime
+        .run_tool_calls(
+            &tool_calls,
+            &invocation_ids,
+            &[],
+            &session_manager,
+            session.id,
+        )
+        .await;
+
+    // Drop runtime so the event channel closes and the watcher task's
+    // `recv` loop terminates.
+    drop(runtime);
+    let (starts, ends) = watcher.await.unwrap();
+
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+    assert!(
+        starts.contains(&invocation_id),
+        "tool_start must have been emitted before cancel landed (#846)"
+    );
+
+    let our_ends: Vec<_> = ends
+        .iter()
+        .filter(|(id, _, _)| *id == invocation_id)
+        .collect();
+    assert_eq!(
+        our_ends.len(),
+        1,
+        "exactly one ToolEnd must be emitted for invocation {} — got {:?}",
+        invocation_id,
+        ends
+    );
+    let (_id, ok, result_val) = our_ends[0];
+    assert!(!ok, "synthetic tool_end after cancel must report ok=false");
+    let err_str = result_val
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        err_str.contains("cancel"),
+        "synthetic tool_end result.error should mention cancellation, got {:?}",
+        result_val
+    );
+}
+
+/// #846 — FullControl/Autonomous parallel cancel arm: 3 tools run
+/// concurrently in `join_all` under FullControl, the test cancels
+/// mid-execution, and `run_tool_calls` must synthesise a matching
+/// `ToolEnd` for *each* in-flight tool before returning `Cancelled`.
+/// This exercises the harder of the two arms — multiple in-flight calls
+/// at cancel time, each needs its own synthetic event.
+#[tokio::test]
+async fn test_cancel_during_tool_execution_emits_tool_end_parallel() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let cancel_token = CancellationToken::new();
+
+    let blocking = std::sync::Arc::new(BlockingTestTool::new("block_test"));
+    // Three calls — pre-load three receivers, hold all three senders
+    // unfired so all three futures park at their blocking awaits.
+    let mut held_senders = Vec::new();
+    for _ in 0..3 {
+        let (s, r) = tokio::sync::oneshot::channel::<()>();
+        blocking.enqueue(r).await;
+        held_senders.push(s);
+    }
+
+    let runtime = make_runtime_for_cancel_test(
+        Posture::FullControl,
+        blocking.clone() as std::sync::Arc<dyn alms_sandbox::Tool>,
+        cancel_token.clone(),
+        tx,
+    );
+
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+    let tool_calls = vec![
+        ToolCall::new("tc1", "block_test", "{}"),
+        ToolCall::new("tc2", "block_test", "{}"),
+        ToolCall::new("tc3", "block_test", "{}"),
+    ];
+    let inv_ids: Vec<uuid::Uuid> = (0..3).map(|_| uuid::Uuid::new_v4()).collect();
+
+    // Cancel only after observing all 3 ToolStarts. This removes the
+    // dependency on tokio scheduling order — instead of trusting that
+    // `join_all`'s synchronous walk polls all 3 inner futures through
+    // their first await before the watcher task is scheduled, we wait
+    // until the watcher has actually seen 3 ToolStart events, which
+    // proves all 3 invocations are registered in the in-flight tracker
+    // before the cancel arm fires (Tim's nit on #846).
+    let watcher = spawn_cancel_on_tool_start(rx, cancel_token.clone(), 3);
+
+    let result = runtime
+        .run_tool_calls(&tool_calls, &inv_ids, &[], &session_manager, session.id)
+        .await;
+
+    drop(runtime);
+    drop(held_senders);
+    let (starts, ends) = watcher.await.unwrap();
+
+    assert!(
+        matches!(result, Err(AlmsError::Cancelled)),
+        "expected AlmsError::Cancelled, got {:?}",
+        result
+    );
+
+    for inv in &inv_ids {
+        assert!(
+            starts.contains(inv),
+            "tool_start missing for invocation {} — test setup broken",
+            inv
+        );
+        let our_ends: Vec<_> = ends.iter().filter(|(id, _, _)| id == inv).collect();
+        assert_eq!(
+            our_ends.len(),
+            1,
+            "expected exactly one ToolEnd for invocation {} — got {:?} \
+             (the parallel cancel arm must synthesise one ToolEnd per \
+             in-flight tool, no more no less; #846)",
+            inv,
+            ends
+        );
+        let (_id, ok, result_val) = our_ends[0];
+        assert!(
+            !ok,
+            "synthetic tool_end after cancel must report ok=false (inv {})",
+            inv
+        );
+        let err_str = result_val
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            err_str.contains("cancel"),
+            "synthetic tool_end result.error should mention cancellation \
+             (inv {}), got {:?}",
+            inv,
+            result_val
+        );
+    }
+}
+
+/// #846 — No-double-emission regression: a tool that finishes Ok
+/// followed (in real time) by a cancel arrival must not produce two
+/// `ToolEnd` events for the same invocation. The unregister-before-emit
+/// protocol inside `execute_tool_call` ensures the entry is gone from
+/// the in-flight tracker before the outer cancel arm could even see it.
+///
+/// Sequencing is event-driven, not wall-clock based (Tim's nit on
+/// #846): the watcher task fires `cancel_token.cancel()` the moment it
+/// observes a `ToolEnd`, which proves the success path's
+/// unregister-before-emit step has already run by the time the cancel
+/// could possibly land. Nothing depends on `tokio::time::sleep`.
+#[tokio::test]
+async fn test_no_double_tool_end_when_tool_ok_then_cancel() {
+    use tokio_util::sync::CancellationToken;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RuntimeEvent>();
+    let cancel_token = CancellationToken::new();
+
+    let blocking = std::sync::Arc::new(BlockingTestTool::new("block_test"));
+    // Single call with a sender that we WILL fire before cancelling —
+    // forces the inner branch of `select!` to win and emit the normal
+    // success ToolEnd. The cancel arrives after, by which point the
+    // tracker is empty so no synthetic should be emitted.
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    blocking.enqueue(release_rx).await;
+
+    let runtime = make_runtime_for_cancel_test(
+        Posture::Guarded,
+        blocking.clone() as std::sync::Arc<dyn alms_sandbox::Tool>,
+        cancel_token.clone(),
+        tx,
+    );
+
+    let session_config = SessionConfig::default();
+    let session_manager = SessionManager::new(session_config);
+    let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+    let tool_calls = vec![ToolCall::new("tc1", "block_test", "{}")];
+    let invocation_id = uuid::Uuid::new_v4();
+    let invocation_ids = vec![invocation_id];
+
+    // Watcher: counts ToolEnd events for this invocation, and on the
+    // FIRST observed ToolEnd fires `cancel_token.cancel()`. Because
+    // the success ToolEnd is sent only AFTER the inner future has
+    // already removed itself from the in-flight tracker (the
+    // unregister-before-emit protocol in `execute_tool_call`), this
+    // guarantees that the cancel — if it races into the outer
+    // `run_tool_calls` cancel arm at all — finds an empty tracker and
+    // emits zero synthetic ToolEnds. Replaces a fragile sleep(20ms)/
+    // sleep(200ms) pair with deterministic event-based sequencing.
+    let watcher = {
+        let cancel_token = cancel_token.clone();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            let mut tool_end_count = 0usize;
+            while let Some(ev) = rx.recv().await {
+                if let RuntimeEvent::ToolEnd {
+                    invocation_id: id, ..
+                } = ev
+                    && id == invocation_id
+                {
+                    tool_end_count += 1;
+                    if tool_end_count == 1 {
+                        cancel_token.cancel();
+                    }
+                }
+            }
+            tool_end_count
+        })
+    };
+
+    // Release the tool synchronously — no wall-clock wait needed. The
+    // runtime has not started yet, but the inner await on the receiver
+    // sees the value as soon as it polls.
+    let _ = release_tx.send(());
+
+    let result = runtime
+        .run_tool_calls(
+            &tool_calls,
+            &invocation_ids,
+            &[],
+            &session_manager,
+            session.id,
+        )
+        .await;
+    drop(runtime);
+
+    let tool_end_count = watcher.await.unwrap();
+
+    assert!(
+        result.is_ok(),
+        "tool finished normally, run_tool_calls should return Ok, got {:?}",
+        result
+    );
+    assert_eq!(
+        tool_end_count, 1,
+        "exactly one ToolEnd must be emitted per invocation — even if a \
+         cancel arrives after the inner future already removed itself \
+         from the in-flight tracker (#846 no-double-emission protocol)"
+    );
 }
 
 /// #866: `with_summary_llm` populates the dedicated summary client.
@@ -2166,4 +3282,402 @@ async fn test_with_summary_llm_sets_dedicated_client_for_866() {
         "anthropic",
         "agent's main llm must NOT be re-targeted by with_summary_llm"
     );
+}
+
+// ── #851 — In-loop tool-output truncation integration ───────────────────────
+
+mod tool_output_truncate_integration {
+    use super::*;
+    use crate::tool_output_truncate::ToolOutputTruncatePolicy;
+
+    /// Build a minimal `AgentRuntime` with the in-loop truncation service
+    /// active and pointed at `run_dir`. No LLM or workspace — we are
+    /// driving `process_tool_results` directly.
+    fn make_runtime_with_truncate(run_dir: std::path::PathBuf) -> AgentRuntime {
+        let llm_config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let mut policy = ToolOutputTruncatePolicy::with_run_dir(run_dir);
+        // Use small caps so the test stays fast and the assertions are
+        // concrete (32 KB is too big to construct quickly in a unit test
+        // and offers no extra coverage).
+        policy.max_bytes = 4 * 1024;
+        policy.max_lines = 100;
+        AgentRuntime {
+            agent_id: AgentId::new(),
+            config: AgentConfig::default(),
+            llm: LlmClient::new(llm_config).unwrap(),
+            summary_llm: None,
+            tools: ToolRegistry::new(),
+            workspace: None,
+            event_sender: None,
+            run_id: None,
+            cancel_token: None,
+            resolved_sandbox_root: None,
+            shell_unrestricted: true,
+            shell_default_env: std::collections::HashMap::new(),
+            shell_permissions: alms_core::config::ShellPermissions::default(),
+            shell_classification_mode: alms_core::config::ShellClassificationMode::default(),
+            shell_spill_policy: alms_sandbox::shell::spill::ShellSpillPolicy::disabled(),
+            tool_output_truncate_policy: policy,
+            extra_fs_read_roots: Vec::new(),
+            agent_name: None,
+        }
+    }
+
+    /// Drive `process_tool_results` with a single oversized tool result
+    /// and assert: the in-loop messages carry the truncated preview, the
+    /// session DB row has `truncated_in_loop: true` metadata, and the
+    /// spill file on disk holds the full original bytes.
+    #[tokio::test]
+    async fn process_tool_results_truncates_oversized_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = make_runtime_with_truncate(dir.path().to_path_buf());
+
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+        // Synthesize a tool call + a 100 KB JSON-string result. 100 KB of
+        // 'x' characters serialise to a string longer than the 4 KB
+        // policy cap, so truncation will fire.
+        let tool_call = ToolCall::new("call_huge", "fake_tool", "{}");
+        let raw_text = "x".repeat(100 * 1024);
+        let result_value = serde_json::Value::String(raw_text.clone());
+
+        let mut messages: Vec<LlmMessage> = Vec::new();
+        let mut records: Vec<alms_core::ToolCallRecord> = Vec::new();
+        let mut seq: u32 = 0;
+        let invocation_ids = vec![uuid::Uuid::new_v4()];
+
+        runtime.process_tool_results(
+            std::slice::from_ref(&tool_call),
+            vec![Ok(result_value)],
+            &invocation_ids,
+            &mut messages,
+            &mut records,
+            &mut seq,
+            &session_manager,
+            session.id,
+            /* is_dm */ false,
+        );
+
+        // 1) The in-loop messages vec must carry the truncated preview,
+        //    not the original.
+        assert_eq!(messages.len(), 1);
+        let preview = messages[0].content_str();
+        assert!(
+            preview.len() < raw_text.len(),
+            "preview must be smaller than the original: preview={} raw={}",
+            preview.len(),
+            raw_text.len()
+        );
+        assert!(
+            preview.contains("call_huge") || preview.contains("tool_call_huge"),
+            "preview must reference the spill file by id"
+        );
+        assert!(preview.contains("Use `fs_grep`"));
+
+        // 2) The spill file must exist and hold the full original bytes.
+        let spill_path = dir.path().join("tool_call_huge.txt");
+        assert!(spill_path.exists(), "spill file must be written");
+        let spilled = std::fs::read_to_string(&spill_path).unwrap();
+        assert_eq!(spilled, serde_json::Value::String(raw_text).to_string());
+
+        // 3) The persisted session message must carry the truncation flag
+        //    so `session_msg_to_llm` skips its own re-truncation pass.
+        let history = session_manager.get_history(session.id).unwrap();
+        let tool_msg = history
+            .iter()
+            .find(|m| matches!(m.role, alms_session::Role::Tool))
+            .expect("tool result message must be persisted");
+        let meta = tool_msg.metadata.as_ref().expect("metadata must be set");
+        assert_eq!(
+            meta.get("truncated_in_loop").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(meta.get("spill_path").and_then(|v| v.as_str()).is_some());
+        assert!(
+            meta.get("original_bytes")
+                .and_then(|v| v.as_u64())
+                .is_some()
+        );
+    }
+
+    /// Symmetric counterpart: when the tool output is small, no
+    /// truncation, no spill file, no `truncated_in_loop` flag.
+    #[tokio::test]
+    async fn process_tool_results_passes_small_output_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = make_runtime_with_truncate(dir.path().to_path_buf());
+
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+        let tool_call = ToolCall::new("call_small", "fake_tool", "{}");
+        let result_value = serde_json::json!({"hello": "world"});
+
+        let mut messages: Vec<LlmMessage> = Vec::new();
+        let mut records: Vec<alms_core::ToolCallRecord> = Vec::new();
+        let mut seq: u32 = 0;
+        let invocation_ids = vec![uuid::Uuid::new_v4()];
+
+        runtime.process_tool_results(
+            std::slice::from_ref(&tool_call),
+            vec![Ok(result_value)],
+            &invocation_ids,
+            &mut messages,
+            &mut records,
+            &mut seq,
+            &session_manager,
+            session.id,
+            false,
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content_str().contains("\"hello\":\"world\""));
+
+        // No spill file should exist.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            entries.is_empty(),
+            "small output must not create a spill file"
+        );
+
+        // Metadata must NOT carry the truncated_in_loop flag.
+        let history = session_manager.get_history(session.id).unwrap();
+        let tool_msg = history
+            .iter()
+            .find(|m| matches!(m.role, alms_session::Role::Tool))
+            .expect("tool result message must be persisted");
+        let meta = tool_msg.metadata.as_ref().expect("metadata must be set");
+        let flag = meta
+            .get("truncated_in_loop")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(!flag, "small output must not be marked truncated_in_loop");
+    }
+
+    /// #851 acceptance test: simulate three sequential 50 KB tool calls
+    /// inside a single run loop and assert the cumulative size of the
+    /// LLM-visible messages stays bounded by the policy cap rather than
+    /// growing 50/100/150 KB across turns.
+    #[tokio::test]
+    async fn three_sequential_50kb_calls_stay_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = make_runtime_with_truncate(dir.path().to_path_buf());
+
+        let session_manager = SessionManager::new(SessionConfig::default());
+        let session = session_manager.get_or_create(runtime.agent_id, "test");
+
+        let mut messages: Vec<LlmMessage> = Vec::new();
+        let mut records: Vec<alms_core::ToolCallRecord> = Vec::new();
+        let mut seq: u32 = 0;
+
+        for i in 0..3u32 {
+            let tool_call = ToolCall::new(format!("call_{i}"), "fake_tool", "{}");
+            let result_value = serde_json::Value::String("x".repeat(50 * 1024));
+            let invocation_ids = vec![uuid::Uuid::new_v4()];
+
+            runtime.process_tool_results(
+                std::slice::from_ref(&tool_call),
+                vec![Ok(result_value)],
+                &invocation_ids,
+                &mut messages,
+                &mut records,
+                &mut seq,
+                &session_manager,
+                session.id,
+                false,
+            );
+        }
+
+        // Each preview is well under the 4 KB cap + ~1 KB hint, so the
+        // cumulative size of the in-loop messages must stay under
+        // 3 * (4 KB + 2 KB) = 18 KB instead of the unbounded 3 * 50 KB
+        // = 150 KB pre-#851 case.
+        let cumulative: usize = messages.iter().map(|m| m.content_str().len()).sum();
+        assert!(
+            cumulative < 18 * 1024,
+            "three 50 KB calls must collapse under the cap: got {cumulative} bytes"
+        );
+
+        // All three spills must exist on disk so the agent can recover
+        // any of them via fs_read.
+        for i in 0..3 {
+            let spill = dir.path().join(format!("tool_call_{i}.txt"));
+            assert!(
+                spill.exists(),
+                "spill {i} must be written: {}",
+                spill.display()
+            );
+        }
+    }
+
+    /// `truncate_for_emit` must:
+    ///   - return the original `Value` unchanged when truncation is a
+    ///     no-op (small payload OR disabled policy)
+    ///   - return a `Value::String(preview)` when truncation fires
+    ///   - write the spill file as a side effect when truncation fires
+    ///
+    /// Pre-#921 review fix #4, the audit log + `ToolEnd` SSE emitted the
+    /// raw untruncated bytes regardless of size. Post-fix, both surfaces
+    /// see the same preview the agent loop sees.
+    #[tokio::test]
+    async fn truncate_for_emit_passes_small_value_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = make_runtime_with_truncate(dir.path().to_path_buf());
+
+        let value = serde_json::json!({"hello": "world"});
+        let out = runtime.truncate_for_emit("call_small", &value);
+        assert_eq!(out, value, "small value must pass through unchanged");
+
+        // No spill file should have been written.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            entries.is_empty(),
+            "small value must not create a spill file"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncate_for_emit_truncates_oversized_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = make_runtime_with_truncate(dir.path().to_path_buf());
+
+        // Use a 100 KB string — above the 4 KB cap configured by
+        // `make_runtime_with_truncate`.
+        let value = serde_json::Value::String("y".repeat(100 * 1024));
+        let out = runtime.truncate_for_emit("call_emit_big", &value);
+
+        // The emitted value must be a JSON string (the preview), not the
+        // original 100 KB structured value.
+        let s = out.as_str().expect("truncated emit value must be a string");
+        assert!(
+            s.len() < 100 * 1024,
+            "preview must be smaller than the original: {} vs {}",
+            s.len(),
+            100 * 1024
+        );
+        assert!(s.contains("call_emit_big"));
+        assert!(s.contains("Use `fs_grep`"));
+
+        // Spill file must exist.
+        let spill = dir.path().join("tool_call_emit_big.txt");
+        assert!(spill.exists(), "spill must be written by truncate_for_emit");
+    }
+
+    /// `truncate_for_emit` and `process_tool_results` are independent
+    /// callers of the same `truncate` service. When the service is
+    /// disabled, neither path should write a spill file.
+    #[tokio::test]
+    async fn truncate_for_emit_is_no_op_when_policy_disabled() {
+        // Construct a runtime with an explicitly disabled policy.
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = make_runtime_with_truncate(dir.path().to_path_buf());
+        runtime.tool_output_truncate_policy =
+            crate::tool_output_truncate::ToolOutputTruncatePolicy::disabled();
+
+        let value = serde_json::Value::String("z".repeat(100 * 1024));
+        let out = runtime.truncate_for_emit("call_disabled", &value);
+        assert_eq!(
+            out, value,
+            "disabled policy must pass even an oversized value through unchanged"
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            entries.is_empty(),
+            "disabled policy must not create a spill file"
+        );
+    }
+}
+
+/// Tests for the #921 review fix #1 — `extra_fs_read_roots` accumulator
+/// pattern. The pre-fix code re-registered fs_* tools inside both
+/// `with_shell_spill` and `with_tool_output_truncate`, but `with_workspace`
+/// (called LAST in the gateway lifecycle order) silently overwrote those
+/// extras. The fix replaces the per-builder fs_* re-registration with a
+/// single `extra_fs_read_roots` accumulator that every fs_* registration
+/// site reads from.
+#[cfg(test)]
+mod fs_read_roots_accumulator {
+    use super::*;
+    use crate::workspace::AgentWorkspace;
+
+    fn make_runtime_with_sandbox(sandbox_root: std::path::PathBuf) -> AgentRuntime {
+        let cfg = AgentConfig {
+            sandbox_root: sandbox_root.to_string_lossy().into_owned(),
+            shell_policy: "sandboxed".into(),
+            ..AgentConfig::default()
+        };
+        let llm_config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        AgentRuntime::new(AgentId::new(), cfg, LlmClient::new(llm_config).unwrap()).unwrap()
+    }
+
+    /// `with_workspace` followed by `with_shell_spill` and
+    /// `with_tool_output_truncate` must end up with the same accumulated
+    /// extras as the documented gateway order
+    /// (`with_shell_spill` → `with_tool_output_truncate` → `with_workspace`).
+    ///
+    /// Pre-fix the documented order silently dropped the spill extras
+    /// because `with_workspace` overwrote them. Post-fix the accumulator
+    /// is the single source of truth and the order does not matter.
+    #[test]
+    fn extras_survive_either_call_order() {
+        let sandbox = tempfile::tempdir().unwrap();
+        // Create the workspace as a subdirectory so canonicalize() resolves.
+        let ws_dir = sandbox.path().join("agent");
+        std::fs::create_dir_all(&ws_dir).unwrap();
+        let shell_dir = sandbox.path().join("shell_output").join("run-1");
+        let trunc_dir = sandbox.path().join("tool-output").join("run-1");
+        std::fs::create_dir_all(&shell_dir).unwrap();
+        std::fs::create_dir_all(&trunc_dir).unwrap();
+
+        // Order A: spill → truncate → workspace (the documented gateway order)
+        let runtime_a = make_runtime_with_sandbox(sandbox.path().to_path_buf())
+            .with_shell_spill(shell_dir.clone(), true)
+            .with_tool_output_truncate(trunc_dir.clone(), true, 32 * 1024, 2000)
+            .with_workspace(AgentWorkspace::with_dir(ws_dir.clone()));
+
+        // Order B: workspace first, then the spill builders. Pre-fix this
+        // would have produced a different (broader) extras set than A
+        // because workspace's overwrite of fs_* tools dropped the trunc
+        // dir. Post-fix the accumulator collects every spill dir
+        // regardless of when the workspace registration happened.
+        let runtime_b = make_runtime_with_sandbox(sandbox.path().to_path_buf())
+            .with_workspace(AgentWorkspace::with_dir(ws_dir.clone()))
+            .with_shell_spill(shell_dir.clone(), true)
+            .with_tool_output_truncate(trunc_dir.clone(), true, 32 * 1024, 2000);
+
+        // Both runtimes must have both spill dirs in their accumulator,
+        // regardless of call order. (We compare as a sorted set so a
+        // future re-ordering of the push sites doesn't break the test.)
+        let mut a: Vec<_> = runtime_a.extra_fs_read_roots.iter().collect();
+        let mut b: Vec<_> = runtime_b.extra_fs_read_roots.iter().collect();
+        a.sort();
+        b.sort();
+        assert_eq!(a, b, "spill extras must be order-independent");
+        assert!(
+            a.iter()
+                .any(|p| p.ends_with("shell_output/run-1") || p.ends_with("shell_output\\run-1")),
+            "shell_output spill dir must be in extras: {:?}",
+            a
+        );
+        assert!(
+            a.iter()
+                .any(|p| p.ends_with("tool-output/run-1") || p.ends_with("tool-output\\run-1")),
+            "tool-output spill dir must be in extras: {:?}",
+            a
+        );
+    }
 }
