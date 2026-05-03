@@ -1040,7 +1040,36 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // the workspace v2 single-root model. Must come AFTER the spill /
     // tool-output-truncate builders so the accumulated `extra_fs_read_roots`
     // are reflected in the read-family fs_* tool registrations.
-    runtime = runtime.with_project_root(state.project_root.clone());
+    //
+    // Operator escape hatch (#947): when the agent's name is on
+    // `[security].allow_full_os_access`, skip `with_project_root` and
+    // call `with_unrestricted_filesystem` instead — the agent runs
+    // without a filesystem sandbox at all. `shell_permissions` (#717)
+    // and the destructive-command classifier (#745) still apply; they
+    // are independent operator policy. A run-start `WARN` fires below
+    // so log scanners can correlate runs against the loosened sandbox.
+    let full_os_access = agent_name
+        .as_deref()
+        .map(|n| state.security_config.is_full_os_access_agent(n))
+        .unwrap_or(false);
+    if full_os_access {
+        // Defensive `unwrap` is fine — `full_os_access` is only true when
+        // `agent_name` is `Some`.
+        let name = agent_name.as_deref().unwrap_or("");
+        warn!(
+            target: "alms.security",
+            agent_name = %name,
+            run_id = %run_id.0,
+            allow_full_os_access = true,
+            "Run starting for agent '{}' WITHOUT project-root filesystem sandbox \
+             (allow_full_os_access). shell_permissions and the destructive-command \
+             classifier still apply.",
+            name,
+        );
+        runtime = runtime.with_unrestricted_filesystem();
+    } else {
+        runtime = runtime.with_project_root(state.project_root.clone());
+    }
 
     // Attach workspace if configured — registers the workspace_write tool for this run.
     // After #945 this no longer changes the sandbox root or default cwd —

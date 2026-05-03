@@ -17,8 +17,9 @@ mod tests;
 pub use types::{
     AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, FsEditConfig, GeminiConfig,
     LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry, ProviderKind, ProviderQuirks,
-    ReasoningEffort, RunSummaryMode, ServerConfig, SessionConfig, ShellClassificationMode,
-    ShellPermissions, ShellSpillConfig, ToolOutputTruncateConfig, ToolsConfig,
+    ReasoningEffort, RunSummaryMode, SecurityConfig, ServerConfig, SessionConfig,
+    ShellClassificationMode, ShellPermissions, ShellSpillConfig, ToolOutputTruncateConfig,
+    ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};
@@ -37,6 +38,10 @@ pub struct AlmsConfig {
     pub tools: ToolsConfig,
     pub channels: ChannelsConfig,
     pub logging: LoggingConfig,
+    /// Security knobs the operator sets in `alms.toml` and that are NOT
+    /// mutable via `PATCH /settings` (#947). See [`SecurityConfig`] for
+    /// the threat model.
+    pub security: SecurityConfig,
 }
 
 impl Default for AlmsConfig {
@@ -54,6 +59,7 @@ impl Default for AlmsConfig {
             tools: ToolsConfig::default(),
             channels: ChannelsConfig::default(),
             logging: LoggingConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -555,6 +561,23 @@ impl AlmsConfig {
                 "logging.file_level must be one of {:?}, got '{}'",
                 valid_levels, self.logging.file_level
             )));
+        }
+
+        // Security validation (#947). Empty / whitespace-only entries in
+        // `allow_full_os_access` are caught here so a hand-edited TOML
+        // can't accidentally widen the blast radius of every unnamed
+        // agent (`SecurityConfig::is_full_os_access_agent` already
+        // shortcircuits on empty input, but rejecting at load time
+        // surfaces the operator error explicitly rather than silently
+        // discarding the broken entry).
+        for (idx, name) in self.security.allow_full_os_access.iter().enumerate() {
+            if name.trim().is_empty() {
+                return Err(AlmsError::InvalidConfig(format!(
+                    "security.allow_full_os_access[{idx}] is empty — every entry must \
+                     name a registered agent. Remove the empty string or replace it \
+                     with the agent's name."
+                )));
+            }
         }
 
         Ok(())

@@ -167,6 +167,14 @@ pub struct Coordinator {
     /// Optional run registrar — when set, subagent runs are registered as
     /// proper runs so they appear in GET /runs, the UI sidebar, and the CLI.
     run_registrar: Option<Arc<dyn RunRegistrar>>,
+    /// Security config snapshot (#947) — config-file-only, loaded once at
+    /// gateway boot. The Coordinator consults
+    /// [`SecurityConfig::is_full_os_access_agent`] for each named subagent
+    /// to decide whether to inherit the parent's project-root sandbox or
+    /// drop it via `with_unrestricted_filesystem`. Inherited subagents
+    /// (no name) are never listed by construction, so they always pick up
+    /// the project-root sandbox.
+    security_config: alms_core::config::SecurityConfig,
 }
 
 impl Coordinator {
@@ -185,6 +193,7 @@ impl Coordinator {
             completion_tx: None,
             secrets: None,
             run_registrar: None,
+            security_config: alms_core::config::SecurityConfig::default(),
         }
     }
 
@@ -213,6 +222,7 @@ impl Coordinator {
             completion_tx: None,
             secrets: None,
             run_registrar: None,
+            security_config: alms_core::config::SecurityConfig::default(),
         }
     }
 
@@ -264,6 +274,18 @@ impl Coordinator {
         tx: mpsc::UnboundedSender<SubagentCompletion>,
     ) -> Self {
         self.completion_tx = Some(tx);
+        self
+    }
+
+    /// Set the security-config snapshot so subagents named in
+    /// `[security].allow_full_os_access` (#947) inherit the operator's
+    /// "no project-root sandbox" decision the same way HTTP-triggered
+    /// runs do. Defaults to an empty list — no agent is listed.
+    pub fn with_security_config(
+        mut self,
+        security_config: alms_core::config::SecurityConfig,
+    ) -> Self {
+        self.security_config = security_config;
         self
     }
 
@@ -361,6 +383,7 @@ impl Coordinator {
         let completion_tx = self.completion_tx.clone();
         let secrets = self.secrets.clone();
         let run_registrar = self.run_registrar.clone();
+        let security_config = self.security_config.clone();
 
         let span = tracing::info_span!(
             "subagent::execute",
@@ -388,6 +411,7 @@ impl Coordinator {
                     parent_cancel_token,
                     secrets,
                     run_registrar,
+                    security_config,
                     is_background,
                 )
                 .await;
@@ -546,6 +570,7 @@ async fn run_subagent(
     parent_cancel_token: Option<CancellationToken>,
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     run_registrar: Option<Arc<dyn RunRegistrar>>,
+    security_config: alms_core::config::SecurityConfig,
     is_background: bool,
 ) {
     // RAII guard: removes the name from active_named on drop (including panics).
@@ -638,7 +663,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None)
         }
-        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), is_background) => {
+        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -1075,6 +1100,7 @@ async fn run_agent_loop(
     subagent_prompts: &DashMap<String, String>,
     cancel_token: CancellationToken,
     secrets: Option<&Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
+    security_config: &alms_core::config::SecurityConfig,
     is_background: bool,
 ) -> AlmsResult<RunOutput> {
     // Derive config based on whether the subagent is named (identity already resolved
@@ -1285,7 +1311,32 @@ async fn run_agent_loop(
     // `AgentConfig` resolved at construction time — same as the pre-#945
     // behaviour for those paths. Must come AFTER the spill builders so
     // the accumulated `extra_fs_read_roots` are reflected.
-    if let Some(root) = project_root {
+    //
+    // Operator escape hatch (#947): named subagents whose name appears
+    // on `[security].allow_full_os_access` opt out of the project-root
+    // sandbox the same way HTTP-triggered runs do. Ephemeral subagents
+    // (no `subagent_name`) cannot be on the list by construction, so
+    // they always pick up the project-root pin. A run-start `WARN`
+    // fires for parity with the HTTP / Telegram paths.
+    let sub_full_os_access = request
+        .subagent_name
+        .as_deref()
+        .map(|n| security_config.is_full_os_access_agent(n))
+        .unwrap_or(false);
+    if sub_full_os_access {
+        let name = request.subagent_name.as_deref().unwrap_or("");
+        warn!(
+            target: "alms.security",
+            agent_name = %name,
+            task_id = %task_id.0,
+            allow_full_os_access = true,
+            "Subagent run starting for agent '{}' WITHOUT project-root filesystem \
+             sandbox (allow_full_os_access). shell_permissions and the \
+             destructive-command classifier still apply.",
+            name,
+        );
+        runtime = runtime.with_unrestricted_filesystem();
+    } else if let Some(root) = project_root {
         runtime = runtime.with_project_root(root.to_path_buf());
     }
 

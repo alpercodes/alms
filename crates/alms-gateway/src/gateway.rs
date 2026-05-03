@@ -51,6 +51,12 @@ pub struct GatewayConfig {
     pub logging_config: alms_core::config::LoggingConfig,
     /// Tools configuration snapshot — timeout and max_output_bytes for UI display.
     pub tools_config: alms_core::config::ToolsConfig,
+    /// Security configuration snapshot (#947) — config-file-only,
+    /// loaded once at boot, never mutated by `PATCH /settings`. Used to
+    /// resolve the `allow_full_os_access` list at run-start to decide
+    /// whether to attach the project-root sandbox to a new
+    /// [`AgentRuntime`].
+    pub security_config: alms_core::config::SecurityConfig,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -69,6 +75,7 @@ impl Default for GatewayConfig {
             auth_token: None,
             logging_config: alms_core::config::LoggingConfig::default(),
             tools_config: alms_core::config::ToolsConfig::default(),
+            security_config: alms_core::config::SecurityConfig::default(),
         }
     }
 }
@@ -134,6 +141,7 @@ impl GatewayConfig {
             auth_token: config.server.auth_token.clone(),
             logging_config: config.logging.clone(),
             tools_config: config.tools.clone(),
+            security_config: config.security.clone(),
         }
     }
 
@@ -194,6 +202,34 @@ impl GatewayConfig {
     pub fn from_env() -> AlmsResult<Self> {
         let config = AlmsConfig::load()?;
         Ok(Self::from_alms_config_with_env(&config))
+    }
+}
+
+/// Emit a structured WARN for every agent named in
+/// [`SecurityConfig::allow_full_os_access`][alms_core::config::SecurityConfig::allow_full_os_access]
+/// (#947).
+///
+/// Called once from [`Gateway::start`] so operators see the loosened
+/// sandbox at boot. A matching per-run WARN fires from
+/// `runs/lifecycle.rs::execute_run` so log scanners can correlate runs
+/// against the listed agents on long-lived daemons too.
+///
+/// Extracted as a free function (not a method) so unit tests can call
+/// it directly under a custom tracing subscriber without spinning up a
+/// full `Gateway` instance — see `boot_warn_emits_for_each_listed_agent`
+/// in this file's tests.
+pub(crate) fn warn_full_os_access_at_boot(security_config: &alms_core::config::SecurityConfig) {
+    for agent_name in &security_config.allow_full_os_access {
+        warn!(
+            target: "alms.security",
+            agent_name = %agent_name,
+            allow_full_os_access = true,
+            "Agent '{}' is in [security].allow_full_os_access — runs will execute \
+             WITHOUT the project-root filesystem sandbox. shell_permissions and \
+             the destructive-command classifier still apply. Worktree-mode (when \
+             wired up) is silently ignored for this agent.",
+            agent_name,
+        );
     }
 }
 
@@ -454,6 +490,14 @@ impl Gateway {
     pub async fn start(&mut self) -> AlmsResult<()> {
         info!("Starting ALMS Gateway");
 
+        // Boot-time WARN for every agent named in
+        // `[security].allow_full_os_access` (#947). Operators see each
+        // listed agent on every boot — log scanners can correlate these
+        // structured fields against runs. The matching run-start WARN
+        // fires per-run from the runs lifecycle so a long-lived daemon
+        // continues to surface the policy at run granularity.
+        warn_full_os_access_at_boot(&self.config.security_config);
+
         // Shell output spill retention sweep (issue #756). Runs once at
         // startup — no background ticker — so expired `.alms/shell_output/*`
         // files are cleaned up the next time the gateway restarts rather
@@ -665,7 +709,29 @@ impl Gateway {
                     // the same single-root model. Must precede
                     // `with_workspace` so the project-root re-registration
                     // of fs_* / shell happens before workspace attachment.
-                    if let Some(project_root) = self.config.project_root.clone() {
+                    //
+                    // `[security].allow_full_os_access` (#947): when the
+                    // agent's name is on the list, skip the project-root
+                    // pin and drop the sandbox entirely. Mirrors the HTTP
+                    // path in `runs/lifecycle.rs`. A run-start `WARN`
+                    // fires for parity.
+                    let full_os_access = self
+                        .config
+                        .security_config
+                        .is_full_os_access_agent(&effective_name);
+                    if full_os_access {
+                        warn!(
+                            target: "alms.security",
+                            agent_name = %effective_name,
+                            allow_full_os_access = true,
+                            channel = "telegram",
+                            "Telegram run starting for agent '{}' WITHOUT project-root \
+                             filesystem sandbox (allow_full_os_access). shell_permissions \
+                             and the destructive-command classifier still apply.",
+                            effective_name,
+                        );
+                        runtime = runtime.with_unrestricted_filesystem();
+                    } else if let Some(project_root) = self.config.project_root.clone() {
                         runtime = runtime.with_project_root(project_root);
                     }
                     // Attach workspace so agent personality/goals/memories
@@ -797,6 +863,13 @@ impl Gateway {
     /// Get tools config reference (for exposing server defaults)
     pub fn tools_config(&self) -> &alms_core::config::ToolsConfig {
         &self.config.tools_config
+    }
+
+    /// Get the security config reference (#947). Snapshotted at gateway
+    /// construction; the field is config-file-only and never mutated at
+    /// runtime, so no `Arc<RwLock<_>>` is needed.
+    pub fn security_config(&self) -> &alms_core::config::SecurityConfig {
+        &self.config.security_config
     }
 
     /// Get a clone of the shared secrets store handle.
@@ -1050,5 +1123,122 @@ mod tests {
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].id, existing_id);
+    }
+
+    // ── #947: WARN-log assertions for [security].allow_full_os_access ──
+
+    /// In-memory `MakeWriter` that captures every line emitted by the
+    /// fmt subscriber so tests can assert on log content.
+    ///
+    /// Implemented as a `Mutex<Vec<u8>>` shared via `Arc` so the writer
+    /// closure (which the subscriber calls per event) and the test body
+    /// (which reads the captured lines) point at the same buffer.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = LogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn captured(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// `warn_full_os_access_at_boot` emits one structured WARN per
+    /// listed agent. Acceptance check from #947: "WARN at agent-create
+    /// / first-observation-at-boot".
+    #[test]
+    fn boot_warn_emits_for_each_listed_agent() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_target(true)
+            .with_span_events(FmtSpan::NONE)
+            .without_time()
+            // No ANSI colour codes — keeps assertions on the captured
+            // text simple.
+            .with_ansi(false)
+            .finish();
+
+        let security_config = alms_core::config::SecurityConfig {
+            allow_full_os_access: vec!["alice".into(), "bob".into()],
+        };
+
+        // Drive the helper under our subscriber.
+        tracing::subscriber::with_default(subscriber, || {
+            warn_full_os_access_at_boot(&security_config);
+        });
+
+        let captured = logs.captured();
+
+        // The structured fields each appear in the output (the fmt
+        // subscriber renders them as `field_name=value`).
+        assert!(
+            captured.contains("agent_name=alice"),
+            "WARN must carry structured agent_name=alice: {captured}"
+        );
+        assert!(
+            captured.contains("agent_name=bob"),
+            "WARN must carry structured agent_name=bob: {captured}"
+        );
+        assert!(
+            captured.contains("allow_full_os_access=true"),
+            "WARN must carry structured allow_full_os_access=true: {captured}"
+        );
+        // Target is the configured "alms.security" string.
+        assert!(
+            captured.contains("alms.security"),
+            "WARN must use the alms.security tracing target: {captured}"
+        );
+        // Two listed agents → at least two `WARN` markers.
+        let warn_lines = captured.matches("WARN").count();
+        assert!(
+            warn_lines >= 2,
+            "Expected ≥2 WARN lines (one per listed agent), got {warn_lines}: {captured}"
+        );
+    }
+
+    /// Empty `allow_full_os_access` is a complete no-op: no WARN at boot.
+    #[test]
+    fn boot_warn_silent_when_list_is_empty() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_target(true)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+
+        let security_config = alms_core::config::SecurityConfig::default();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_full_os_access_at_boot(&security_config);
+        });
+
+        let captured = logs.captured();
+        assert!(
+            !captured.contains("alms.security"),
+            "no WARN must fire when the list is empty: {captured}"
+        );
     }
 }

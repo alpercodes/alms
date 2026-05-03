@@ -68,6 +68,14 @@ pub struct AppState {
     pub logging_config: alms_core::config::LoggingConfig,
     /// Tools config — mutable via PATCH /settings.
     pub tools_config: Arc<parking_lot::RwLock<alms_core::config::ToolsConfig>>,
+    /// Security config (#947) — config-file-only snapshot. The
+    /// `[security].allow_full_os_access` list is consulted at run-start
+    /// to decide whether to attach the project-root sandbox; it is NOT
+    /// mutable via `PATCH /settings`, NOT persisted in
+    /// `PersistedSettings`, and the `/settings` PATCH handler rejects
+    /// any payload referencing this section with `400
+    /// SECURITY_KNOB_NOT_PATCHABLE`.
+    pub security_config: alms_core::config::SecurityConfig,
 }
 
 impl AppState {
@@ -111,6 +119,7 @@ impl AppState {
         let mut session_config = gateway.session_config().clone();
         let logging_config = gateway.logging_config().clone();
         let mut tools_config = gateway.tools_config().clone();
+        let security_config = gateway.security_config().clone();
 
         // Apply persisted settings from a previous PATCH /settings so that
         // configuration changes survive gateway restarts.
@@ -185,6 +194,12 @@ impl AppState {
         // resolves at construction time, which after #945 would break the
         // single-root invariant.
         coord = coord.with_project_root(project_root.clone());
+        // Plumb the security config (#947) so named subagents on
+        // `[security].allow_full_os_access` opt out of the project-root
+        // sandbox the same way HTTP-triggered runs do. Empty list (the
+        // default) means no subagent is listed and the project-root pin
+        // above wins as before.
+        coord = coord.with_security_config(security_config.clone());
 
         // Share the Gateway's secrets store so runtime key changes are visible
         // to both HTTP handlers and the Telegram message loop.
@@ -247,6 +262,7 @@ impl AppState {
             session_config: Arc::new(parking_lot::RwLock::new(session_config)),
             logging_config,
             tools_config: Arc::new(parking_lot::RwLock::new(tools_config)),
+            security_config,
         })
     }
 }

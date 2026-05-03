@@ -272,6 +272,114 @@ impl AgentRuntime {
         self
     }
 
+    /// Drop the agent's filesystem-sandbox root so `fs_*` and `shell` run
+    /// without a path prefix to enforce (#947 — the
+    /// `[security].allow_full_os_access` operator escape hatch).
+    ///
+    /// Replaces every read-family fs_* tool (`fs_read`, `fs_list`,
+    /// `fs_grep`, `fs_glob`) and every write-family fs_* tool (`fs_write`,
+    /// `fs_edit`) with their unsandboxed (`::new()`) variants, and
+    /// re-registers `shell` (and its `shell_exec` alias) with no sandbox
+    /// root and no default cwd. Subject to OS-level permissions of the
+    /// daemon process — and to `shell_permissions` / the destructive-command
+    /// classifier, which are independent operator policy and remain
+    /// active. The accumulated `extra_fs_read_roots` (per-run spill
+    /// directories) become irrelevant when there is no primary root to
+    /// extend, so the field is cleared to keep the bookkeeping honest.
+    ///
+    /// Must be called *after* `AgentRuntime::new` (which installs the
+    /// initial sandboxed tools from `config.sandbox_root`) and BEFORE
+    /// `with_workspace` so the unrestricted fs_*/shell tools are what
+    /// `with_workspace` sees when it (post-#945) re-registers
+    /// `workspace_write` only — `with_workspace` no longer touches
+    /// fs_*/shell registration, but the ordering invariant still holds
+    /// for forward-compatibility. `with_shell_default_env` is the
+    /// exception: it is called BEFORE `with_unrestricted_filesystem`
+    /// at every call site (gateway HTTP path, Telegram path, coordinator
+    /// subagent path) and the unrestricted shell registration reads
+    /// `self.shell_default_env` directly, so the env vars are
+    /// preserved across the re-registration. The gateway's run lifecycle
+    /// wires the call between the spill / shell-env builders and the
+    /// project-root / workspace builders for exactly this reason.
+    ///
+    /// Worktree-mode-git interaction: this method is the runtime
+    /// equivalent of "the operator said this agent is unsandboxed". When
+    /// worktree-mode is wired up later (#938), this method takes
+    /// precedence — `allow_full_os_access` wins. The startup-time WARN
+    /// fired from `Gateway::start` documents that precedence to operators.
+    pub fn with_unrestricted_filesystem(mut self) -> Self {
+        use alms_sandbox::{
+            FsEditTool, FsGlobTool, FsGrepTool, FsListTool, FsReadTool, FsWriteTool,
+        };
+
+        self.resolved_sandbox_root = None;
+        // Per-run spill dirs are still real paths the agent may want to
+        // read, but with no primary root to enforce against `extras` is
+        // a no-op — the unsandboxed fs_* tools accept absolute paths
+        // anywhere. Clear the accumulator so later builders that consult
+        // it (e.g. a re-call into `register_fs_tools` from
+        // `with_workspace`) do not re-introduce a sandboxed registration.
+        self.extra_fs_read_roots.clear();
+
+        let cache = self.tools.file_state_cache().clone();
+        let enabled = &self.config.enabled_tools;
+        let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
+
+        if tool_enabled("fs_read") {
+            self.tools.register(std::sync::Arc::new(
+                FsReadTool::new().with_cache(cache.clone()),
+            ));
+        }
+        if tool_enabled("fs_write") {
+            self.tools.register(std::sync::Arc::new(
+                FsWriteTool::new().with_cache(cache.clone()),
+            ));
+        }
+        if tool_enabled("fs_list") {
+            self.tools.register(std::sync::Arc::new(FsListTool::new()));
+        }
+        if tool_enabled("fs_edit") {
+            self.tools.register(std::sync::Arc::new(
+                FsEditTool::new()
+                    .with_cache(cache)
+                    .with_fuzzy_match(self.config.fs_edit_fuzzy_match),
+            ));
+        }
+        if tool_enabled("fs_grep") {
+            self.tools.register(std::sync::Arc::new(FsGrepTool::new()));
+        }
+        if tool_enabled("fs_glob") {
+            self.tools.register(std::sync::Arc::new(FsGlobTool::new()));
+        }
+
+        // Re-register the shell tool with no sandbox root and no default
+        // cwd. `shell_permissions` and `shell_classification_mode` ride
+        // along — they are independent operator policy.
+        let shell_enabled =
+            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
+        if shell_enabled {
+            let mut shell_tool =
+                alms_sandbox::ShellTool::with_policy(None, /* unrestricted */ true)
+                    .with_permissions(&self.shell_permissions)
+                    .with_classification_mode(self.shell_classification_mode)
+                    .with_spill_policy(self.shell_spill_policy.clone());
+            if !self.shell_default_env.is_empty() {
+                shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
+            }
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
+        }
+        // `shell_unrestricted` controls whether the shell tool's persistent
+        // cwd may escape the sandbox. With no sandbox root at all this flag
+        // is moot, but flipping it to `true` keeps the runtime invariants
+        // tidy: `resolved_sandbox_root.is_none() ↔ shell_unrestricted`.
+        self.shell_unrestricted = true;
+
+        self
+    }
+
     /// Attach an agent workspace for persistent identity files.
     ///
     /// Registers the `workspace_write` tool so the agent can update its

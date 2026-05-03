@@ -1213,6 +1213,75 @@ impl Default for ToolOutputTruncateConfig {
 }
 
 // ---------------------------------------------------------------------------
+// SecurityConfig
+// ---------------------------------------------------------------------------
+
+/// Security policy knobs that operators set in `alms.toml` and that the
+/// gateway must NOT accept via `PATCH /settings`.
+///
+/// **Threat model.** Every field on this struct widens the blast radius of
+/// the daemon — a compromised auth token (or a misbehaving operator script)
+/// must not be able to silently flip them. They are config-file-only,
+/// loaded at startup, and never mirrored into `PersistedSettings`. The
+/// gateway's `/settings` PATCH handler rejects any payload referencing a
+/// field on this section with `400 SECURITY_KNOB_NOT_PATCHABLE`. Operators
+/// who need to change one of these values edit `alms.toml` and restart the
+/// daemon.
+///
+/// `GET /settings` MAY surface the values as read-only / informational; a
+/// `SecurityConfig` field is never accepted on the inbound side.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Operator-only escape hatch from the project-root sandbox boundary
+    /// introduced in #945 (workspace v2).
+    ///
+    /// Names listed here name agents (by registry name) that should run
+    /// **without** the project-root filesystem sandbox: `fs_*` tools have
+    /// no path prefix to enforce, and the `shell` tool's persistent cwd is
+    /// not pinned to the project root. These agents are subject only to
+    /// the OS-level user permissions of the daemon process — `fs_read
+    /// /etc/passwd` works (modulo file mode), `shell ls /` returns the
+    /// real root.
+    ///
+    /// The two **independent** operator policies in
+    /// [`ToolsConfig::shell_permissions`] (#717) and
+    /// [`ToolsConfig::shell_classification_mode`] (#745) **still apply**
+    /// to listed agents. They are defense-in-depth controls layered on
+    /// top of the sandbox, not part of it.
+    ///
+    /// Worktree-mode `git` (when wired up — see #938) on a listed agent
+    /// is silently ignored at runtime; this list wins. The gateway logs a
+    /// startup-time `WARN` for every listed agent so operators see the
+    /// precedence on boot. A second `WARN` fires at every `run_started`
+    /// for the listed agent so log scanners can correlate runs against
+    /// the loosened sandbox.
+    ///
+    /// **Config-file-only** — see the type-level docs on
+    /// [`SecurityConfig`] for why this field is not `PATCH`-mutable.
+    pub allow_full_os_access: Vec<String>,
+}
+
+impl SecurityConfig {
+    /// Returns `true` when the named agent is on the
+    /// [`Self::allow_full_os_access`] list.
+    ///
+    /// Comparison is exact-match on the registry name (the same string an
+    /// operator types for `alms agent create --name <name>`). Empty input
+    /// (an unnamed/ephemeral agent) never matches because empty entries
+    /// in the list itself would be a configuration error caught by
+    /// [`Self::validate`]. The check is O(n) — the list is short by
+    /// design (a handful of operator-blessed agents), so a `HashSet` is
+    /// not worth the allocation cost.
+    pub fn is_full_os_access_agent(&self, agent_name: &str) -> bool {
+        if agent_name.is_empty() {
+            return false;
+        }
+        self.allow_full_os_access.iter().any(|n| n == agent_name)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ChannelsConfig
 // ---------------------------------------------------------------------------
 

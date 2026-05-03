@@ -159,6 +159,13 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
             "max_output_bytes": tools_cfg.max_output_bytes,
             "enabled": tools,
         },
+        // Security settings (#947) — informational / read-only.
+        // PATCH /settings rejects any payload referencing this section
+        // with `400 SECURITY_KNOB_NOT_PATCHABLE`; operators must edit
+        // `[security]` in `alms.toml` and restart.
+        "security": {
+            "allow_full_os_access": state.security_config.allow_full_os_access,
+        },
         // LLM provider-family settings (#809). Mirrors the shape of the
         // `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]` blocks in
         // `alms.toml`. Server-level defaults only; per-agent overrides
@@ -186,7 +193,7 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
 // ── PATCH /settings — partial config update ────────────────────────────
 
 /// Partial context config update.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchContext {
     pub strategy: Option<String>,
@@ -201,7 +208,7 @@ pub struct PatchContext {
 }
 
 /// Partial session config update.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchSession {
     pub max_messages: Option<usize>,
@@ -212,7 +219,7 @@ pub struct PatchSession {
 }
 
 /// Partial tools config update.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchTools {
     pub shell_policy: Option<String>,
@@ -227,7 +234,7 @@ pub struct PatchTools {
 /// untouched; fields that are `Some` overwrite the live server default.
 /// The provider-neutral `AgentConfig` (which is what the agent loop reads
 /// per run) is what the PATCH handler mutates — no restart required.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchLlmAnthropic {
     pub thinking_budget_tokens: Option<u32>,
@@ -242,7 +249,7 @@ pub struct PatchLlmAnthropic {
 /// i.e. `{ "reasoning_effort": "" }` — which the handler treats as an
 /// explicit clear sentinel. This matches the existing pattern used by
 /// `PatchContext::summary_model`.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchLlmOpenai {
     pub reasoning_effort: Option<String>,
@@ -254,7 +261,7 @@ pub struct PatchLlmOpenai {
 /// a legitimate value meaning "disable extended thinking server-wide";
 /// it is not a clear sentinel. Three-layer precedence (per-run >
 /// per-agent > server default) still applies downstream.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchLlmGemini {
     pub thinking_budget: Option<u32>,
@@ -267,7 +274,7 @@ pub struct PatchLlmGemini {
 /// Nested under `llm` in the top-level PATCH /settings body. Each
 /// provider family has its own sub-object; absent sub-objects are
 /// untouched.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchLlm {
     pub anthropic: Option<PatchLlmAnthropic>,
@@ -276,7 +283,7 @@ pub struct PatchLlm {
 }
 
 /// Top-level PATCH /settings request body.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchSettingsRequest {
     pub context: Option<PatchContext>,
@@ -291,6 +298,17 @@ pub struct PatchSettingsRequest {
 /// runtime. Logging requires a restart and is not accepted here.
 /// Changes take effect on the next run (in-flight runs are unaffected).
 ///
+/// **Security knobs are rejected up front (#947).** Any payload referencing
+/// `security` (currently `security.allow_full_os_access`) is rejected
+/// with **400 `SECURITY_KNOB_NOT_PATCHABLE`** before any other field is
+/// processed. The `[security]` section is config-file-only — see
+/// [`alms_core::config::SecurityConfig`] for the threat model. Other
+/// fields in the same payload are ignored (the request is rejected as a
+/// whole, not partially applied), so an attacker cannot ride a security
+/// flip in alongside a benign-looking field. Mirrors the rejection
+/// shape of `classifier_overrides` from #745 — config-file-only knobs
+/// are not exposed via PATCH on principle.
+///
 /// Live-mutation propagation is **HTTP-path only**: mutations write through
 /// to the shared `Arc<RwLock<AgentConfig>>` referenced by the HTTP `POST
 /// /runs` and Coordinator paths. Telegram-triggered runs read from a
@@ -301,8 +319,41 @@ pub struct PatchSettingsRequest {
 /// `docs/api.md` § 10.2.
 pub async fn patch_settings(
     State(state): State<AppState>,
-    Json(body): Json<PatchSettingsRequest>,
+    Json(raw_body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
+    // ── Security-knob rejection (#947) ─────────────────────────────────
+    //
+    // Inspect the raw payload BEFORE deserialising into
+    // `PatchSettingsRequest` so a request that names `security.*` is
+    // rejected even when its `security` sub-object is otherwise empty
+    // (e.g. `{ "security": {} }`). This is the same shape Tim asked for
+    // on the #745 review of the `classifier_overrides` PATCH guard:
+    // config-file-only knobs surface a single, deterministic error code
+    // and never partially apply.
+    if let Some(rejection) = reject_security_knob(&raw_body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "code": "SECURITY_KNOB_NOT_PATCHABLE",
+                "errors": [rejection],
+            })),
+        );
+    }
+
+    let body: PatchSettingsRequest = match serde_json::from_value(raw_body) {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "status": "error",
+                    "errors": [format!("Invalid PATCH /settings body: {e}")],
+                })),
+            );
+        }
+    };
+
     let mut errors: Vec<String> = Vec::new();
 
     // ── Context ────────────────────────────────────────────────────────
@@ -624,6 +675,45 @@ pub async fn patch_settings(
             })),
         )
     }
+}
+
+// ── Security-knob rejection (#947) ────────────────────────────────────
+
+/// Inspect a raw `PATCH /settings` body for any reference to the
+/// `[security]` section.
+///
+/// Returns `Some(message)` when the payload contains a `security` key at
+/// the top level — including `{ "security": {} }`, `{ "security": null }`,
+/// and `{ "security": { "allow_full_os_access": [...] } }`. The caller
+/// translates that into a `400 SECURITY_KNOB_NOT_PATCHABLE` response.
+///
+/// Empty / `null` payloads are explicitly rejected because permitting
+/// them would create a back door: a future PATCH evolution that adds
+/// `security` as a real serde field would silently start accepting the
+/// shape that previously round-tripped to a no-op. Failing closed at the
+/// raw-JSON layer is the same defensive posture Tim asked for on the
+/// `classifier_overrides` rejection in #745.
+///
+/// Returns `None` when the payload does NOT reference `security` at the
+/// top level — the normal happy path. Nested objects whose name happens
+/// to be `security` (e.g. `{ "tools": { "security": ... } }`) are
+/// ignored on purpose: this guard is about the top-level
+/// [`PatchSettingsRequest::security`] surface, not arbitrary key
+/// matches.
+fn reject_security_knob(body: &serde_json::Value) -> Option<String> {
+    let obj = body.as_object()?;
+    if !obj.contains_key("security") {
+        return None;
+    }
+    Some(
+        "SECURITY_KNOB_NOT_PATCHABLE: settings.security is config-file-only \
+         and cannot be modified via PATCH /settings. Edit `[security]` in \
+         alms.toml (e.g. `[security]\\nallow_full_os_access = [\"agent-name\"]`) \
+         and restart the gateway. See issue #947 for the threat model — \
+         PATCH mutability would let a compromised auth token silently \
+         widen the agent sandbox."
+            .to_string(),
+    )
 }
 
 // ── Persistence helpers ───────────────────────────────────────────────
@@ -1545,7 +1635,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        let _resp = patch_settings(axum::extract::State(state.clone()), Json(body)).await;
+        let _resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await;
 
         // Read the live config back through the shared lock.
         let cfg = state.agent_config.read();
@@ -1596,7 +1690,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        let _resp = patch_settings(axum::extract::State(state.clone()), Json(body)).await;
+        let _resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await;
 
         assert!(
             state.agent_config.read().openai_reasoning_effort.is_none(),
@@ -1623,7 +1721,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        let _resp = patch_settings(axum::extract::State(state.clone()), Json(body)).await;
+        let _resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await;
 
         assert_eq!(
             state.agent_config.read().gemini_thinking_budget,
@@ -1686,9 +1788,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
-            .await
-            .into_response();
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
 
         assert_eq!(
             resp.status(),
@@ -1741,9 +1846,12 @@ mod tests {
             }),
             ..Default::default()
         };
-        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
-            .await
-            .into_response();
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(
             !path.exists(),
@@ -1777,9 +1885,12 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
-                .await
-                .into_response();
+            let resp = patch_settings(
+                axum::extract::State(state.clone()),
+                Json(serde_json::to_value(&body).unwrap()),
+            )
+            .await
+            .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
         }
         let prior_snapshot =
@@ -1809,9 +1920,12 @@ mod tests {
                 }),
                 ..Default::default()
             };
-            let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
-                .await
-                .into_response();
+            let resp = patch_settings(
+                axum::extract::State(state.clone()),
+                Json(serde_json::to_value(&body).unwrap()),
+            )
+            .await
+            .into_response();
             assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         }
 
@@ -1874,9 +1988,12 @@ mod tests {
     ) -> (StatusCode, Vec<String>) {
         use axum::body::to_bytes;
         use axum::response::IntoResponse;
-        let resp = patch_settings(axum::extract::State(state), Json(body))
-            .await
-            .into_response();
+        let resp = patch_settings(
+            axum::extract::State(state),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2125,9 +2242,12 @@ mod tests {
             ..Default::default()
         };
         use axum::response::IntoResponse;
-        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
-            .await
-            .into_response();
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let cfg = state.agent_config.read();
@@ -2161,13 +2281,200 @@ mod tests {
             ..Default::default()
         };
         use axum::response::IntoResponse;
-        let resp = patch_settings(axum::extract::State(state.clone()), Json(body))
-            .await
-            .into_response();
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
         assert_eq!(resp.status(), StatusCode::OK);
 
         let cfg = state.agent_config.read();
         assert!(cfg.context_config.summary_provider.is_none());
         assert!(cfg.context_config.summary_model.is_none());
+    }
+
+    // ── #947: PATCH /settings rejects security knobs ──────────────────
+
+    /// Read the JSON body of an axum response into a `serde_json::Value`.
+    /// Used by the `[security]` rejection tests below.
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let body = resp.into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("read body bytes");
+        serde_json::from_slice(&bytes).expect("body is valid JSON")
+    }
+
+    /// `PATCH /settings` with a populated `security.allow_full_os_access`
+    /// payload returns `400 SECURITY_KNOB_NOT_PATCHABLE` and does NOT
+    /// mutate the live `state.security_config`.
+    #[tokio::test]
+    async fn patch_security_allow_full_os_access_returns_400() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        // Populate a non-empty baseline so we can assert PATCH didn't
+        // mutate it (the snapshot is taken at gateway boot — patching is
+        // forbidden, not just a no-op).
+        state.security_config = alms_core::config::SecurityConfig {
+            allow_full_os_access: vec!["seeded-agent".into()],
+        };
+
+        let payload = serde_json::json!({
+            "security": {
+                "allow_full_os_access": ["new-agent"],
+            }
+        });
+
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "PATCH on a security knob must return 400, not 422 — the \
+             knob is config-file-only, not a validation failure (#947)"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("SECURITY_KNOB_NOT_PATCHABLE")
+        );
+        // The structured error code is the load-bearing wire shape;
+        // make sure the human-readable error message names the
+        // offending field too so operators can debug from logs alone.
+        let errors_str = body
+            .get("errors")
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        assert!(
+            errors_str.contains("SECURITY_KNOB_NOT_PATCHABLE"),
+            "errors array must surface the structured code: {errors_str}"
+        );
+        assert!(
+            errors_str.contains("security"),
+            "errors array must name the rejected section: {errors_str}"
+        );
+
+        // The snapshot on `AppState` must still hold the boot-time list.
+        assert_eq!(
+            state.security_config.allow_full_os_access,
+            vec!["seeded-agent".to_string()],
+            "rejected PATCH must not mutate the security_config snapshot"
+        );
+    }
+
+    /// An empty `security: {}` object also fails — the rejection key is
+    /// "the section is named at all", not "the section has values". A
+    /// future PATCH evolution that adds `security` as a real serde field
+    /// would otherwise silently start accepting the empty-object shape.
+    #[tokio::test]
+    async fn patch_security_empty_object_still_returns_400() {
+        use axum::response::IntoResponse;
+
+        let state = settings_test_app_state();
+
+        let payload = serde_json::json!({ "security": {} });
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("SECURITY_KNOB_NOT_PATCHABLE")
+        );
+    }
+
+    /// A request that mixes `security` with otherwise-valid fields is
+    /// rejected as a whole — no partial application. A request the
+    /// operator was told failed must NOT have written through to the
+    /// live config (the same fail-closed posture #810 applies for the
+    /// LLM path).
+    #[tokio::test]
+    async fn patch_security_combined_with_valid_fields_rejects_whole_request() {
+        use axum::response::IntoResponse;
+
+        let state = settings_test_app_state();
+        // Seed a known baseline that the LLM block in the request would
+        // otherwise overwrite if the rejection didn't fire first.
+        let baseline_budget = state.agent_config.read().anthropic_thinking_budget;
+
+        let payload = serde_json::json!({
+            "security": { "allow_full_os_access": ["whatever"] },
+            "llm": { "anthropic": { "thinking_budget_tokens": 9999 } },
+        });
+
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // The LLM block must NOT have landed — rejection is whole-payload,
+        // not per-section. This is the same fail-closed posture other
+        // PATCH guards use; here it doubles as a defence against an
+        // attacker riding a security flip in alongside benign fields.
+        assert_eq!(
+            state.agent_config.read().anthropic_thinking_budget,
+            baseline_budget,
+            "rejected payload must not partially apply other fields"
+        );
+    }
+
+    /// A payload that does NOT name `security` at the top level still
+    /// goes through the normal handler — the rejection guard is
+    /// surgical, not a blanket reject-everything-with-the-word.
+    #[tokio::test]
+    async fn patch_without_security_key_runs_normal_path() {
+        use axum::response::IntoResponse;
+
+        let state = settings_test_app_state();
+        let payload = serde_json::json!({
+            "llm": { "anthropic": { "thinking_budget_tokens": 4096 } },
+        });
+
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a payload without `security` at the top level must take the \
+             normal happy path, not the security rejection"
+        );
+        assert_eq!(
+            state.agent_config.read().anthropic_thinking_budget,
+            4096,
+            "the LLM mutation must have landed when no security key is named"
+        );
+    }
+
+    /// `PersistedSettings` does NOT carry `security`. Operators who
+    /// edit `[security]` in `alms.toml` and restart see the new value;
+    /// PATCH-style persistence must never round-trip the section. This
+    /// test pins the absence so a future refactor that adds `security`
+    /// to `PersistedSettings` will fail loudly.
+    #[test]
+    fn persisted_settings_struct_does_not_serialize_security() {
+        // Build a fully-populated `PersistedSettings` and serialize it.
+        // The wire shape must not contain a `security` key.
+        let persisted = PersistedSettings {
+            context: Some(PersistedContextOverrides::default()),
+            session: Some(PersistedSessionOverrides::default()),
+            tools: Some(PersistedToolsOverrides::default()),
+            llm: Some(PersistedLlmOverrides::default()),
+        };
+        let json = serde_json::to_string(&persisted).expect("serialize PersistedSettings");
+        assert!(
+            !json.contains("security"),
+            "PersistedSettings on-disk shape must not contain a `security` \
+             key — the section is config-file-only and PATCH-persistence \
+             would re-introduce a back door (#947). Serialized: {json}"
+        );
+        assert!(
+            !json.contains("allow_full_os_access"),
+            "Persisted JSON must not contain `allow_full_os_access` either: {json}"
+        );
     }
 }
