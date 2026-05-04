@@ -2001,10 +2001,404 @@ async fn create_run_resolves_per_agent_config_for_shared_session_via_requested_a
         &base_agent_config,
         &state.llm,
         Some(&secrets),
-    );
+    )
+    .expect("success path: per-agent provider+model both supplied");
     assert_eq!(resolved.agent_name.as_deref(), Some("chamunchuk"));
     assert_eq!(resolved.llm.provider(), "anthropic");
     assert_eq!(resolved.llm.default_model(), "claude-sonnet-4-6");
+}
+
+// ---------------------------------------------------------------------------
+// #863: MISSING_MODEL_AFTER_PROVIDER_SWITCH gateway-side 400
+//
+// `POST /runs` must reject requests where a per-agent provider override is
+// set but no model was supplied at any layer. Pre-#863 the agent loop would
+// send `model: ""` on the new provider's wire and surface as an opaque
+// downstream 4xx (e.g. Anthropic 404 on `model: ""`). Post-#863 the gateway
+// catches the deterministic config-shape failure mode at request time and
+// returns a structured 400 BEFORE any LLM call.
+// ---------------------------------------------------------------------------
+
+/// Per-agent provider switch with NO model on any layer -> structured 400.
+///
+/// Server default is the test-default `LlmConfig::default()` (provider:
+/// openrouter, default_model: moonshotai/kimi-k2.5, providers: empty).
+/// Agent record carries `provider: Some("anthropic")` and `model: None`,
+/// and there is no `[llm.providers.anthropic]` entry to supply a model.
+/// This is the canonical #863 leak shape — pre-fix the agent loop would
+/// send Anthropic the OpenRouter `kimi-k2.5` default; pre-#863 it would
+/// then fall through the empty-clear and Anthropic would 404 on `model: ""`;
+/// post-#863 the gateway returns 400 MISSING_MODEL_AFTER_PROVIDER_SWITCH
+/// before any LLM call.
+#[tokio::test]
+async fn create_run_rejects_provider_switch_with_no_model_anywhere() {
+    use alms_core::registry::AgentRecord;
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+    use chrono::Utc;
+
+    let (state, _shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "leaky-agent".into(),
+        description: String::new(),
+        // The #863 trigger: provider override with NO model at any layer.
+        model: None,
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+    };
+
+    let Err((status, body)) = super::lifecycle::create_run(State(state.clone()), Json(req)).await
+    else {
+        panic!("create_run must reject when no model is supplied at any layer (#863)");
+    };
+
+    // Acceptance criteria from issue #863:
+    // 1. 400 status code BEFORE any LLM call
+    assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+    // 2. error_code == "MISSING_MODEL_AFTER_PROVIDER_SWITCH"
+    assert_eq!(
+        body.0["error_code"], "MISSING_MODEL_AFTER_PROVIDER_SWITCH",
+        "body must carry the structured error_code so clients can branch on it"
+    );
+    // 3. Body carries agent_id + new_provider + prev_provider so the operator
+    //    knows which agent to PATCH and which providers were involved.
+    assert_eq!(
+        body.0["agent_id"],
+        agent_id.0.to_string(),
+        "body must identify the agent so operators know which record to PATCH"
+    );
+    assert_eq!(
+        body.0["new_provider"], "anthropic",
+        "body must name the new provider the run was about to be sent to"
+    );
+    assert_eq!(
+        body.0["prev_provider"], "openrouter",
+        "body must name the previous (server-default) provider whose model leaked"
+    );
+    // 4. Human-readable message describes the failure mode.
+    let message = body.0["message"]
+        .as_str()
+        .expect("message must be a string");
+    assert!(
+        message.contains("anthropic") && message.contains("openrouter"),
+        "message must explain which provider override caused the failure: {message}"
+    );
+
+    // 5. No run was enqueued — the rejection happens BEFORE `insert_run`.
+    let runs = state.run_manager.list_by_agent(agent_id, 10);
+    assert!(
+        runs.is_empty(),
+        "no run should have been created when the gateway rejects pre-flight"
+    );
+}
+
+/// Same provider on both sides -> no spurious 400.
+///
+/// Pin the no-spurious-400 invariant: when the agent record's provider
+/// matches the server default (no actual switch), the leak guard must NOT
+/// fire even if the agent has no per-agent `model`. The server-default
+/// model reaches the wire as intended.
+#[tokio::test]
+async fn create_run_does_not_reject_when_provider_unchanged() {
+    use alms_core::registry::AgentRecord;
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+    use chrono::Utc;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "happy-agent".into(),
+        description: String::new(),
+        model: None,
+        posture: None,
+        // Same provider as the server default (`openrouter` per
+        // `LlmConfig::default()`). No switch -> no leak guard.
+        provider: Some("openrouter".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+    };
+
+    let (status, _resp) = super::lifecycle::create_run(State(state), Json(req))
+        .await
+        .expect("same-provider config must NOT be rejected (#863)");
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    shutdown_token.cancel();
+}
+
+/// Per-agent provider switch WITH a per-agent model -> 200 (success path).
+///
+/// Pin the no-spurious-400 invariant: when the agent record carries an
+/// in-namespace per-agent model, the run is accepted even though the
+/// provider was switched.
+#[tokio::test]
+async fn create_run_accepts_provider_switch_with_per_agent_model() {
+    use alms_core::registry::AgentRecord;
+    use alms_core::{CreateRunRequest, RunInput};
+    use axum::Json;
+    use axum::extract::State;
+    use chrono::Utc;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "well-configured".into(),
+        description: String::new(),
+        // Per-agent model in the new provider's namespace -> success.
+        model: Some("claude-sonnet-4-6".into()),
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state.session_manager.get_or_create(agent_id, "web");
+    let req = CreateRunRequest {
+        session_id: session.id,
+        agent_id: Some(agent_id),
+        input: RunInput::Text {
+            text: "hello".into(),
+        },
+    };
+
+    let (status, _resp) = super::lifecycle::create_run(State(state), Json(req))
+        .await
+        .expect("provider switch with valid per-agent model must NOT be rejected");
+    assert_eq!(status, axum::http::StatusCode::CREATED);
+    shutdown_token.cancel();
+}
+
+/// `execute_run`'s `match resolve_outcome` failure arm must mark the run
+/// `Failed` with the structured `MissingModelAfterProviderSwitch` message
+/// when invoked on a non-HTTP path (Telegram / scheduler / peer-DM /
+/// subagent-completion triggers).
+///
+/// `create_run` runs `resolve_agent_config` as a pre-flight check and
+/// rejects with `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH` before
+/// `insert_run`, so the HTTP path never reaches the in-loop resolve. The
+/// non-HTTP triggers all enqueue runs that flow straight into
+/// `execute_run`, where the resolve runs again under live locks. If a
+/// future refactor "simplifies" the in-loop resolve back to `unwrap()`
+/// (the symmetry argument: "create_run already pre-flighted, the second
+/// resolve can't fail") the regression would be silent because the only
+/// existing tests covering the missing-model path go through
+/// `create_run`'s pre-flight rather than driving `execute_run` directly.
+///
+/// This test closes that coverage gap: it bypasses `create_run` (mirroring
+/// what the Telegram / scheduler paths do — `insert_run` + `execute_run`
+/// directly) and pins the three post-conditions of the failure arm:
+///
+/// 1. Terminal status is `Failed` — not `Running` (would mean the resolve
+///    Err leaked through), not `Cancelled` (would mean the cancel-token
+///    early-exit fired instead).
+/// 2. The persisted `error` field carries the `Display`-formatted
+///    structured message — `mark_run_as_failed(run_id, e.to_string())` —
+///    so operators reading `GET /runs/{id}` can identify the failure mode
+///    by `error_code`-substring grep, same as the HTTP 400 body's
+///    `message` field.
+/// 3. The `in_flight` counter returns to zero — the RAII
+///    `_in_flight_guard` decrements correctly when the failure arm
+///    early-returns.
+#[tokio::test]
+async fn execute_run_failure_arm_marks_run_failed_with_structured_error_on_provider_switch_without_model()
+ {
+    use alms_core::registry::AgentRecord;
+    use chrono::Utc;
+
+    let (state, shutdown_token, _cr, _tr, _dr) = test_app_state_with_sqlite();
+
+    // Seed an agent with the canonical #863 trigger shape: provider
+    // override to `anthropic` with NO model on any layer. Server default
+    // is `openrouter` per `LlmConfig::default()`, so this is a real
+    // cross-namespace switch and the in-loop `resolve_agent_config` will
+    // fail with `MissingModelAfterProviderSwitch`.
+    let agent_id = AgentId::new();
+    let now = Utc::now();
+    let agent = AgentRecord {
+        id: agent_id,
+        name: "non-http-trigger-agent".into(),
+        description: String::new(),
+        model: None,
+        posture: None,
+        provider: Some("anthropic".into()),
+        telegram_token: None,
+        thinking_budget_tokens: None,
+        reasoning_effort: None,
+        gemini_thinking_budget: None,
+        summary_provider: None,
+        summary_model: None,
+        is_default: false,
+        created_at: now,
+        last_active: now,
+    };
+    state
+        .session_manager
+        .store()
+        .expect("SQLite-backed state should have a store")
+        .create_agent(&agent)
+        .expect("agent seed should succeed");
+
+    let session = state
+        .session_manager
+        .get_or_create(agent_id, "non-http-context");
+    let session_id = session.id;
+
+    // Bypass `create_run` (which would reject pre-flight) and enqueue the
+    // run directly — this is the shape the Telegram / scheduler / peer-DM
+    // / subagent paths use.
+    let run = Run::new(session_id, agent_id, "trigger #863 in execute_run".into());
+    let run_id = run.run_id;
+    state.run_manager.insert_run(run.clone());
+
+    let cancel_token = CancellationToken::new();
+    state
+        .run_manager
+        .register_cancel_token(run_id, cancel_token.clone());
+
+    // Snapshot the in-flight counter before the call so we can pin its
+    // post-call delta even if the test fixture changes the baseline.
+    let in_flight_before = state.run_manager.in_flight_count();
+
+    super::lifecycle::execute_run(
+        state.clone(),
+        super::RunParams {
+            run_id,
+            session_id,
+            agent_id,
+            input: run.input,
+            context_id: "non-http-context".to_string(),
+            cancel_token,
+            // is_peer_message=false / is_system_triggered=false matches
+            // what a Telegram-driven run carries — the failure arm is
+            // independent of these flags. Other non-HTTP callers
+            // (notifications, subagent completions) use
+            // is_system_triggered=true; pinning the false case here is
+            // sufficient since the resolve happens before any flag-driven
+            // branch.
+            is_peer_message: false,
+            is_system_triggered: false,
+            input_pre_persisted: false,
+        },
+    )
+    .await;
+
+    // 1. Terminal status is Failed — the failure arm fired.
+    let final_run = state
+        .run_manager
+        .get_run(run_id)
+        .expect("run must still exist after execute_run returns");
+    assert_eq!(
+        final_run.status,
+        RunStatus::Failed,
+        "run must reach Failed via the resolve_outcome failure arm; got {:?}",
+        final_run.status,
+    );
+
+    // 2. The persisted error carries the `Display`-formatted structured
+    //    message. We grep for the agent_id and both provider names rather
+    //    than pinning the full string — the `Display` format itself is
+    //    pinned by `test_missing_model_after_provider_switch_display_format`
+    //    in `mod.rs`, and decoupling the assertions there from this one
+    //    means a benign rephrasing of `Display` only updates one test.
+    let error_msg = final_run
+        .error
+        .as_ref()
+        .expect("Failed run must carry a structured error message");
+    assert!(
+        error_msg.contains(&agent_id.0.to_string()),
+        "error must identify the agent_id (got: {error_msg})"
+    );
+    assert!(
+        error_msg.contains("anthropic"),
+        "error must name the new provider (got: {error_msg})"
+    );
+    assert!(
+        error_msg.contains("openrouter"),
+        "error must name the previous provider (got: {error_msg})"
+    );
+
+    // 3. The RAII `_in_flight_guard` must have decremented the counter
+    //    back to its pre-call value when the failure arm returned. A
+    //    future refactor that hoists the resolve out of the
+    //    `track_in_flight` window would silently regress the drain
+    //    semantics; pinning the delta catches that.
+    assert_eq!(
+        state.run_manager.in_flight_count(),
+        in_flight_before,
+        "in_flight counter must return to baseline ({}) after the failure arm; got {}",
+        in_flight_before,
+        state.run_manager.in_flight_count(),
+    );
+
+    shutdown_token.cancel();
 }
 
 /// When the user sends a message to an agent that is already *running* another

@@ -649,13 +649,28 @@ impl Gateway {
                     // pre-existing behaviour for the context / session / tools
                     // sections and is documented in `docs/api.md` § 10.2.
                     let secrets_guard = self.secrets.read();
-                    let resolved = crate::runs::resolve_agent_config(
+                    let resolved = match crate::runs::resolve_agent_config(
                         agent_id,
                         &self.session_manager,
                         &self.config.agent_config,
                         &self.llm,
                         Some(&secrets_guard),
-                    );
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // #863: per-agent provider override with no model
+                            // on any layer. Telegram has no HTTP response
+                            // surface, so log + drop the message — operator
+                            // must fix the agent config (PATCH /agents/{id})
+                            // before further messages are routable.
+                            error!(
+                                agent_id = %agent_id,
+                                "Telegram: dropping message — {}",
+                                e
+                            );
+                            continue;
+                        }
+                    };
                     drop(secrets_guard);
                     // Bootstrap detection: first-time agents get the
                     // bootstrap interview prompt instead of their default.

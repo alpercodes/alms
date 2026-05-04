@@ -336,6 +336,49 @@ pub async fn create_run(
         ));
     }
 
+    // #863: pre-flight per-agent config resolution so a per-agent provider
+    // override with no model on any layer is rejected with a clean 400
+    // BEFORE any LLM call rather than producing an opaque downstream 4xx
+    // (e.g. Anthropic 404 on `model: ""`). The resolve is pure (no
+    // side-effects) and `execute_run` will resolve again under the live
+    // secrets / agent_config locks at run time — this pre-flight only
+    // catches the deterministic config-shape failure mode.
+    {
+        let base_agent_config = state.agent_config.read().clone();
+        if let Err(super::ResolveAgentConfigError::MissingModelAfterProviderSwitch {
+            agent_id: ag,
+            new_provider,
+            prev_provider,
+        }) = super::resolve_agent_config(
+            agent_id,
+            &state.session_manager,
+            &base_agent_config,
+            &state.llm,
+            Some(&state.secrets.read()),
+        ) {
+            warn!(
+                agent_id = %ag,
+                new_provider = %new_provider,
+                prev_provider = %prev_provider,
+                "Rejecting POST /runs with MISSING_MODEL_AFTER_PROVIDER_SWITCH (#863)"
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error_code": "MISSING_MODEL_AFTER_PROVIDER_SWITCH",
+                    "message": format!(
+                        "agent {ag} overrides provider to {new_provider} but no \
+                         model was supplied; previous provider {prev_provider}'s \
+                         default cannot be reused"
+                    ),
+                    "agent_id": ag.0.to_string(),
+                    "new_provider": new_provider,
+                    "prev_provider": prev_provider,
+                })),
+            ));
+        }
+    }
+
     state.run_manager.insert_run(run.clone());
 
     // Pre-persist the user's input message to the session BEFORE enqueueing
@@ -718,14 +761,54 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // the server default. The returned `LlmClient` already carries the
     // per-agent provider switch (with secrets re-resolved) and any
     // per-agent model override.
+    //
+    // `resolve_agent_config` can fail with #863 `MissingModelAfterProviderSwitch`
+    // when a per-agent provider override is set with no model on any layer.
+    // The HTTP `create_run` handler runs the same resolve up-front and
+    // rejects with `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`, so this path
+    // is only reachable for non-HTTP triggers (Telegram / scheduler / peer
+    // DMs / subagent completions). Mark the run as failed with the same
+    // structured message so the run record carries an actionable error.
     let base_agent_config = state.agent_config.read().clone();
-    let resolved = resolve_agent_config(
-        agent_id,
-        &state.session_manager,
-        &base_agent_config,
-        &state.llm,
-        Some(&state.secrets.read()),
-    );
+    let resolve_outcome = {
+        let secrets_guard = state.secrets.read();
+        resolve_agent_config(
+            agent_id,
+            &state.session_manager,
+            &base_agent_config,
+            &state.llm,
+            Some(&secrets_guard),
+        )
+    };
+    let resolved = match resolve_outcome {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!("Run {} failed to resolve agent config: {}", run_id.0, e);
+            state
+                .run_manager
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_error(run_id, &e.to_string()),
+                )
+                .await;
+            state
+                .run_manager
+                .send_agent_event(
+                    agent_id,
+                    run_id,
+                    session_id,
+                    SseEventData::session_activity_ended(session_id, run_id, agent_id),
+                )
+                .await;
+            state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            state.run_manager.remove_senders(run_id);
+            state.run_manager.remove_cancel_token(run_id);
+            state.approval_store.clear_for_run(run_id);
+            broadcast_queue_advance(&state, agent_id).await;
+            return;
+        }
+    };
     let agent_name = resolved.agent_name;
     if state.workspace_dir.is_some() && agent_name.is_none() {
         warn!(
