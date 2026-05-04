@@ -155,7 +155,7 @@ Isolated tool execution used by every agent regardless of hierarchy level.
 
 **`fs_read` size limits:** Whole-file reads are capped at 256 KiB; passing `offset` or `limit` opts into a partial read that falls back to a 64 KiB output-byte budget (lowered from 512 KiB in #917 to match prevailing agent-tool caps and reduce pre-truncation bloat now that the in-loop tool-output truncate caps at 32 KB anyway — see #813 / #901). Each individual line is allocation-capped at 256 KiB before being returned — over-cap lines are truncated with an inline marker and the surplus bytes are drained, so a pathological single-line file (e.g. minified bundles) cannot exhaust daemon memory (#902); after #917 a fully-capped single line exceeds the 64 KiB response budget on its own, so such lines are now rejected from the response with `byte_budget_exceeded: true` and the agent must paginate via `offset`/`limit`.
 
-**Sibling workspace reads (#242):** When a named agent is attached via `with_workspace()`, its read-family fs tools (`fs_read`, `fs_list`, `fs_grep`, `fs_glob`) gain an additional read-only root at the workspace parent directory, so a parent agent can read a subagent's `personality.md`/`goals.md`/`memories.md` without being able to modify them. Write-family tools (`fs_write`, `fs_edit`, `workspace_write`) stay scoped to the primary sandbox root. See the "Filesystem sandboxing" section of `docs/security-model.md` for the full trust model (including ephemeral subagent asymmetry).
+**Sibling workspace reads (#242):** Every agent's identity files live under `<project_root>/.alms/agents/<name>/`, which is naturally inside the project-root sandbox set by `with_project_root` (#945). So a parent agent can already `fs_read('.alms/agents/<sibling>/personality.md')` through normal `fs_read`/`fs_list`/`fs_grep`/`fs_glob` calls — no separate sibling-workspaces extras list, no asymmetric ephemeral-subagent rules. Under per-agent [worktree mode](security-model.md#opt-in-worktree-mode) (#946), the gateway pushes `<project_root>/.alms/agents/` onto the read-family fs tools' extras list so cross-agent reads keep working from inside the worktree. `fs_write`/`fs_edit`/`workspace_write` land in the same single sandbox root; `workspace_write` itself is hard-pinned to the agent's own metadata directory by the tool. See [`docs/security-model.md` § 4.4](security-model.md#filesystem-sandboxing) for the full trust model.
 
 **Tool output truncation + spill files (#756 + #851):** Two layers cap how much tool output reaches the LLM context, the audit log, and the SSE stream:
 
@@ -186,6 +186,29 @@ See `docs/config.md` for copy-paste provider examples. API keys are resolved in 
 ### Session Manager (`alms-session`)
 
 Owns conversation history and workspace state. Backed by **SQLite** (`./.alms/alms.db`) for durable persistence of sessions, audit events, scheduled jobs, and the agent registry.
+
+**On-disk layout (post-#945 / #946 — workspace v2):**
+
+```
+<project_root>/
+├── .alms/
+│   ├── alms.db              # SQLite — sessions, audit, jobs, agent registry
+│   ├── secrets.json         # API keys (optional AES-256-GCM via ALMS_MASTER_KEY)
+│   ├── logs/                # Daily-rotated daemon logs
+│   ├── shell_output/        # Per-run shell stdout/stderr spills (#756, 7-day retention)
+│   ├── tool-output/         # Per-run shared tool-output spills (#851, 7-day retention)
+│   ├── agents/              # Per-agent metadata (renamed from workspaces/ in #945)
+│   │   └── <name>/
+│   │       ├── personality.md
+│   │       ├── goals.md
+│   │       ├── memories.md
+│   │       └── user.md
+│   └── worktrees/           # Per-agent git worktrees (#946 — only for agents with mode = "git")
+│       └── <name>/          # `git worktree add <path> -b alms/<name>`
+└── ...                       # Rest of the project tree — the sandbox root for default-mode agents
+```
+
+The `agents/` flat layout replaces the pre-#945 `workspaces/<agent>/` nesting. The `worktrees/` sibling exists only for agents created with `--worktree-mode git`; default-mode agents use the project root as their sandbox boundary directly. See [`docs/security-model.md` § 4.4](security-model.md#filesystem-sandboxing) for how the layout maps onto the filesystem-sandbox model and [§ "Opt-in worktree mode"](security-model.md#opt-in-worktree-mode) for the worktree provisioning + removal flow.
 
 **Hierarchy:**
 ```

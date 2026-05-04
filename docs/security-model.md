@@ -170,6 +170,7 @@ Response fields:
 - `stdout` (truncated to 30KB with head+tail line preservation)
 - `stderr` (truncated to 30KB with head+tail line preservation)
 
+<a id="43-configurable-shell-permissions-shell_permissions"></a>
 ### 4.3 Configurable shell permissions (`shell_permissions`)
 
 Operators can attach a configurable policy gate in front of every shell
@@ -258,13 +259,15 @@ denylists are fundamentally bypassable.
 
 **Scope and lifetime.** Permissions (including `classifier_overrides`)
 are compiled once (at gateway startup, agent creation, and the
-`with_workspace` / `with_shell_default_env` re-registration paths) into
-a `CompiledPermissions` struct baked into the `ShellTool` instance.
-They are **not** mutable via `PATCH /settings` — restart the gateway
-to pick up new patterns. The `classifier_overrides` field is
-operator-only (TOML-only) and is never exposed in any request/response
-schema or JSON tool-call parameter. See `docs/api.md` § 10.2 for the
-API contract.
+`with_project_root` / `with_unrestricted_filesystem` /
+`with_shell_default_env` re-registration paths) into a
+`CompiledPermissions` struct baked into the `ShellTool` instance. They
+are **not** mutable via `PATCH /settings` — restart the gateway to
+pick up new patterns. The `classifier_overrides` field is operator-only
+(TOML-only) and is never exposed in any request/response schema or
+JSON tool-call parameter. See
+[`docs/api.md` § 10.2](api.md#102-update-server-settings) for the API
+contract.
 
 **Scope today: global only.** `[tools.shell_permissions]` is configured
 once in `alms.toml` and inherited unchanged by every agent. There is no
@@ -285,19 +288,54 @@ child then re-compiles those patterns into its own
 subagents run under the same policy as their parent; recursive
 invocations cannot escape it.
 
+<a id="filesystem-sandboxing"></a>
 ### 4.4 Filesystem sandboxing (implemented)
 
-**Config** (`alms.toml` or env vars):
-- `tools.sandbox_root` (default `"."` = cwd) — all `fs_read`/`fs_write`/`fs_list`/`fs_edit`/`fs_grep`/`fs_glob` paths must resolve within this directory after symlink resolution. Set to `""` for unrestricted access. **Fail-closed:** if the configured path cannot be resolved (typo, missing directory), the runtime refuses to start rather than silently widening access.
-- `tools.shell_policy` (default `"sandboxed"`) — controls `shell_exec` cwd restriction:
-  - `"sandboxed"`: cwd forced to `sandbox_root`; explicit `cwd` param validated against it.
-  - `"unrestricted"`: no cwd restriction (power-user / full root access).
+#### Single sandbox root — the project root
 
-**How it works:**
-1. Relative paths are joined to `sandbox_root`, absolute paths are checked directly.
+Every agent runs with **one** filesystem sandbox root, and that root is
+the project directory by default. Both file tools (`fs_read`,
+`fs_write`, `fs_list`, `fs_edit`, `fs_grep`, `fs_glob`) and the `shell`
+tool enforce against this same root: paths must resolve under it after
+symlink canonicalization, and the shell's persistent cwd defaults to
+it.
+
+This is a deliberate change from the pre-#945 layout, where the agent's
+metadata directory under `workspace_dir/<agent>/` was the sandbox root
+and the project tree was effectively off-limits. Agents now operate on
+the project the way an operator does: their primary workspace is the
+project, and their identity files (`personality.md`, `goals.md`,
+`memories.md`, `user.md`) live at
+`<project_root>/.alms/agents/<name>/` — naturally inside the sandbox,
+so `fs_read('.alms/agents/<sibling>/personality.md')` resolves under
+the primary root by construction. There is no separate sibling-reads
+extras list to maintain.
+
+The project root is resolved at startup with this precedence: CLI
+`--project` flag, `ALMS_PROJECT_ROOT` env var, then
+`std::env::current_dir()` as the fallback. The path is canonicalized
+before being pinned so Windows `\\?\` prefix mismatches do not trip
+the `starts_with` comparison. **Fail-soft:** if canonicalization fails
+the as-is path is used with a `WARN`; `with_project_root` never
+silently widens the sandbox to "none."
+
+The legacy `tools.sandbox_root` and `tools.shell_policy` config knobs
+are still parsed (they configure the `AgentRuntime::new` initial fs/
+shell registration), but the gateway's run lifecycle calls
+`with_project_root(project_root)` immediately after — so the effective
+sandbox boundary every run sees is always the project root unless
+[`[security].allow_full_os_access`](#operator-escape-hatch-allow_full_os_access)
+or the agent's per-agent
+[worktree mode](#opt-in-worktree-mode) overrides it. In other words,
+in normal operation these two legacy knobs are effectively no-ops:
+whatever value they hold in `alms.toml` is overwritten on every run,
+so an operator scanning their config should treat them as inert.
+
+**How the prefix check works:**
+1. Relative paths are joined to the project root, absolute paths are checked directly.
 2. `std::fs::canonicalize()` follows symlinks to get the real path.
-3. The canonical path must `starts_with(sandbox_root)` — rejects symlink escapes, `..` traversal, and absolute paths outside the root.
-4. For new files (fs_write), the nearest existing ancestor is canonicalized and remaining components are appended.
+3. The canonical path must `starts_with(project_root)` — rejects symlink escapes, `..` traversal, and absolute paths outside the root.
+4. For new files (`fs_write`), the nearest existing ancestor is canonicalized and remaining components are appended.
 
 **UNC path blocking**: All file tools (`fs_read`, `fs_write`, `fs_list`, `fs_edit`, `fs_grep`, `fs_glob`) reject Windows UNC paths (`\\server\share`), extended-length UNC paths (`\\?\UNC\server\share`), and URI-style equivalents (`//server/share`) before any filesystem I/O. This prevents NTLM credential theft via SMB auto-authentication. The check runs on all platforms (not just Windows) because the daemon may be accessed from a Windows client, and forward-slash UNC paths are valid on some Linux SMB configurations. Device namespace paths (`\\.\`) are also blocked by the same check.
 
@@ -305,15 +343,181 @@ invocations cannot escape it.
 
 **Read-before-write guard (`FileStateCache`):** `fs_write` and `fs_edit` enforce a read-before-write policy via a per-run `FileStateCache`. Before mutating an existing file, the tool verifies that the agent has previously read it via `fs_read` within the same run. If the file has not been read, the write is rejected with a descriptive error. If the file was read but has been externally modified since (detected via mtime comparison with content-hash fallback), the write is also rejected so the agent re-reads the current version. This prevents agents from blindly overwriting files they have not inspected, reducing the risk of data loss from hallucinated content. New file creation (file does not exist on disk) bypasses the guard. After a successful write or edit, the cache is updated so subsequent mutations pass without requiring a re-read.
 
-**Read-only sibling workspace access (#242):** When a named agent is attached via `with_workspace()`, its `fs_read`/`fs_list`/`fs_grep`/`fs_glob` tools gain an additional read-only root at the parent of the agent's workspace directory — i.e. the top-level `workspace_dir` that contains every named agent's workspace as a sibling. This lets a parent agent read another agent's `personality.md`/`goals.md`/`memories.md` without being able to modify them. `fs_write`/`fs_edit`/`workspace_write` do NOT receive the extra root, so the write boundary stays tight. UNC/device-path blocks still apply everywhere; symlinks are canonicalized before the allow-list check, so a symlink inside a sibling workspace cannot escape to `/etc/passwd` etc. Recursive walkers (`fs_grep`, `fs_glob`) run with `follow_links(false)` so symlinks are filtered before file collection.
+#### Sibling-workspace reads (#242)
 
-The current implementation does not track parent/child invocation relationships, so *any* named agent attached via `with_workspace()` can read *any* other named agent's workspace files — the trust model is "all named agents share a read-only view of each other," consistent with the existing agent registry (named agents are already shared across parents). Narrowing this to direct-invocation only would require dynamic extras tracking; the current plumbing supports shrinking `sibling_workspaces_root` in the future without breaking the API.
+The single project-root sandbox naturally subsumes the sibling-reads
+behaviour from #242: every agent's metadata directory at
+`<project_root>/.alms/agents/<name>/` is inside the primary sandbox,
+so a parent agent can already `fs_read('.alms/agents/<sibling>/personality.md')`
+through normal `fs_read`/`fs_list`/`fs_grep`/`fs_glob` calls — no
+separate extras list, no sibling-workspaces root, no asymmetric
+ephemeral-subagent rules to track. `fs_write`/`fs_edit`/`workspace_write`
+land in the same root, so a write to a sibling's metadata file is
+syntactically possible but only ever via the agent's own sandboxed
+write path — and `workspace_write` itself is hard-pinned to the agent's
+own metadata directory by the tool, not by the sandbox.
 
-**Ephemeral subagent isolation:** Ephemeral subagents live at `{workspace_dir}/.ephemeral/{task_id}/` and receive `{workspace_dir}/.ephemeral/` as their extra read root (the parent of their own workspace), so they cannot see top-level named-agent workspaces. Note the asymmetry: named agents' extra root is `{workspace_dir}/`, which includes `{workspace_dir}/.ephemeral/`, so a named agent *can* read into the ephemeral tree of an in-flight subagent. Task-ids are UUIDs, so enumeration is not a practical exfiltration path, and ephemeral workspaces are cleaned up when the subagent completes, but operators should be aware that the boundary is asymmetric: ephemeral cannot see named, but named can see ephemeral.
+In [worktree mode](#opt-in-worktree-mode) the primary root narrows to
+the worktree path; the gateway widens the read-family fs_* tools'
+extras list with `<project_root>/.alms/agents/` so cross-agent reads
+keep working from inside the worktree.
 
-**Known limitation (non-Linux):** On platforms without Landlock support (Windows, macOS, older Linux kernels), shell sandboxing only restricts the cwd. The executed command itself (e.g. `cat /etc/passwd`) can still access any file the process user can read. Application-level command denylists are fundamentally bypassable. On Linux 5.13+, Landlock filesystem restrictions are applied to child processes (see section 4.5).
+<a id="opt-in-worktree-mode"></a>
+#### Opt-in worktree mode (#946)
 
-**Operator escape hatch — `[security].allow_full_os_access` (#947):** Operators may opt specific named agents out of the project-root filesystem sandbox by listing them under `[security].allow_full_os_access` in `alms.toml`. Listed agents run with no `sandbox_root` enforcement — `fs_*`/`shell` are subject only to OS-level permissions of the daemon process. `shell_permissions` (§ 4.3) and the destructive-command classifier (§ 4.3) **still apply** — they are independent operator policy, not part of the filesystem sandbox. The list is config-file-only: `PATCH /settings` rejects any payload naming `security` with `400 SECURITY_KNOB_NOT_PATCHABLE` (see `docs/api.md` § 10.2), so a compromised auth token cannot silently widen the sandbox; only `alms.toml` edits + restart change the list. A boot-time WARN fires for every listed agent and a per-run WARN fires at every `run_started` for a listed agent on HTTP / Telegram / subagent paths (`target = "alms.security"`, fields `agent_name` + `allow_full_os_access = true`) so listed agents are auditable from logs alone. Ephemeral subagents cannot match the list (they have no name) and always inherit the project-root pin.
+Worktree mode is a **per-agent** setting stored on the agent's
+registry record (`worktree_mode: "off" | "git"`, default `"off"`).
+There is no `[agent.worktree]` block in `alms.toml` — operators set it
+at agent-create time and toggle it via PATCH:
+
+```bash
+# Set at create time
+alms agent create my-agent --worktree-mode git
+
+# Flip later
+alms agent config my-agent --worktree-mode git
+alms agent config my-agent --worktree-mode off
+```
+
+When the mode is `git`, the gateway provisions a dedicated git
+worktree at `<project_root>/.alms/worktrees/<name>/` on branch
+`alms/<name>` and re-pins the sandbox root at the worktree path
+instead of the project root. Every `fs_*` and `shell` call from that
+agent resolves under the worktree, and the persistent shell cwd
+defaults to the worktree.
+
+The worktree is provisioned at agent-create time (or on a `mode: off → git`
+PATCH). On non-git projects, both create and PATCH return
+`400 WORKTREE_REQUIRES_GIT` and refuse to persist the agent record —
+there is no silent fallback to project-root mode. Worktree creation is
+idempotent: when the directory and branch already exist (e.g. the
+operator nuked the agent and re-created it), the gateway treats the
+existing layout as the desired layout. The path is also added to the
+parent repo's `.git/info/exclude` so `git status` on the project root
+does not flag the worktree as untracked.
+
+To keep cross-agent metadata reads working from inside the worktree,
+the gateway pushes `<project_root>/.alms/agents/` onto the agent's
+`extra_fs_read_roots` list before re-pinning the sandbox at the
+worktree. That list is read-only — the agent can `fs_read` a sibling's
+`personality.md` from outside its worktree, but not write to it. The
+project root *outside* `.alms/agents/` is not in the extras list, so
+worktree-mode agents do NOT have read access to the rest of the
+project tree from inside the worktree — that is the whole point of the
+mode.
+
+Removal at agent-delete time runs `git worktree remove` followed by
+`git branch -D alms/<name>`. The remove refuses on uncommitted changes
+unless the operator passes `--force` (CLI) or
+`force_worktree_remove: true` (HTTP); force discards both the working
+tree and the branch. A `mode: git → off` PATCH is just a remove with
+the same semantics.
+
+`[security].allow_full_os_access` takes precedence over worktree mode
+(below). The worktree itself stays on disk so the operator can flip
+the security knob off later without re-running `git worktree add` —
+only the run-time sandbox attachment is bypassed.
+
+**Ephemeral subagents** are not eligible for worktree mode: they have
+no registry record and therefore no `worktree_mode` field. They
+inherit the parent's effective sandbox root for their `fs_*` tools and
+receive a disposable workspace at `{agents_dir}/.ephemeral/{task_id}/`
+that is cleaned up after the subagent completes.
+
+<a id="operator-escape-hatch-allow_full_os_access"></a>
+#### Operator escape hatch — `[security].allow_full_os_access` (#947)
+
+Operators can opt specific named agents out of the filesystem sandbox
+entirely by listing them under `[security].allow_full_os_access` in
+`alms.toml`:
+
+```toml
+[security]
+allow_full_os_access = ["operator-shell", "deploy-bot"]
+```
+
+A listed agent's `fs_*` and `shell` tools run with **no path prefix to
+enforce** — `fs_read /etc/passwd` works, `shell ls /` returns the
+real root. Listed agents are subject only to the OS-level permissions
+of the daemon process. Be honest about what this means: listed agents
+are unsandboxed.
+
+The two independent operator-policy gates **still apply** to listed
+agents:
+
+- **`[tools.shell_permissions]`** allow / deny / classifier_overrides
+  (#717, [§ 4.3](#43-configurable-shell-permissions-shell_permissions)).
+- **`[tools.shell_classification_mode]`** destructive-command floor
+  (#745, same section).
+
+These are layered defense-in-depth. They are independent operator
+policy, not part of the filesystem sandbox boundary, and they survive
+`allow_full_os_access` precisely because operators sometimes want
+"unsandboxed fs but no `rm -rf /`."
+
+**Precedence with worktree mode:** when an agent is listed in
+`allow_full_os_access` AND has `worktree_mode = "git"`, the security
+list wins — the run executes without any filesystem sandbox even
+though the worktree directory remains on disk (the worktree is not
+re-provisioned mid-run, the runtime simply does not attach the
+sandbox to it). A boot-time WARN fires for every overlapping agent so
+the precedence is visible in the daemon log.
+
+**Config-file-only — non-PATCH-mutable.** `PATCH /settings` rejects
+any payload referencing the `security` key (including `{ "security": {} }`
+and `{ "security": null }`) with `400 SECURITY_KNOB_NOT_PATCHABLE`.
+Mixed payloads `{ "llm": {...}, "security": {...} }` reject the entire
+request — no partial application. Operators edit the TOML and restart
+the gateway. PATCH-mutability would let a compromised auth token
+silently widen the blast radius of an existing agent. See
+[`docs/api.md` § 10.2](api.md#102-update-server-settings) for the wire
+contract.
+
+**Audit signal.** A boot-time WARN fires once per listed agent at
+gateway startup, and a per-run WARN fires at every `run_started` for a
+listed agent on the HTTP, Telegram, and subagent paths
+(`target = "alms.security"`, structured fields `agent_name` +
+`allow_full_os_access = true`, plus `worktree_mode` for the overlap
+case). Listed agents are auditable from logs alone; an operator
+scanning for unsandboxed runs does not have to correlate against the
+TOML file.
+
+Ephemeral subagents cannot match the list — they have no name — and
+always inherit the parent's effective sandbox root.
+
+#### Shell sandboxing platform asymmetry — be honest about this
+
+The filesystem prefix check (the application-layer
+`canonicalize() + starts_with` logic above) runs identically on every
+platform. The `shell` tool's filesystem isolation does **not**.
+
+- **Linux 5.13+** — Landlock LSM applies a kernel-level filesystem
+  sandbox to every shell child process (see
+  [§ 4.5](#45-isolation-roadmap)). The child cannot open files outside
+  the configured allow-list of paths regardless of what the command
+  string says. This is the only platform where the shell sandbox is an
+  OS-enforced boundary.
+- **Windows and macOS** — there is no equivalent kernel-level shell
+  sandbox. The `shell` tool's path enforcement is **application-layer
+  only**: a substring scanner in `shell_exec` looks at the command
+  string and rejects invocations that reference paths outside the
+  sandbox root, but anything that hides the path (variable
+  substitution, base64 / hex decode, a script that the agent first
+  writes inside the sandbox and then `bash <script>`s, redirection
+  through stdin) bypasses the scanner. Same caveat as the existing
+  `command_references_denied_file` check: it catches the obvious
+  cases, not a motivated attacker.
+
+For real shell isolation on Windows / macOS, operators should run the
+daemon as a low-privilege OS user with filesystem ACLs that limit
+access to the project root. See
+[§ 4.5 Isolation roadmap](#45-isolation-roadmap) for the longer-term
+plan (`bubblewrap`/`nsjail` on Linux, OS-user-based isolation as the
+universal answer).
+
+`fs_*` tools have no equivalent platform asymmetry — they go through
+the same `canonicalize() + starts_with` check on every OS, and
+substring tricks in the path string are pre-empted by canonicalization.
 
 ### 4.5a Tool output handling — truncation + spill files (#756 + #851)
 
@@ -417,9 +621,10 @@ loosening these caps mid-flight could surprise running agents — operators
 edit the TOML and restart the daemon. The same model is applied to
 `[tools.shell_permissions]`.
 
+<a id="45-isolation-roadmap"></a>
 ### 4.5 Isolation roadmap
 
-**Current:** `bash -c` command strings + `env_clear()` + best-effort command denylist + `sandbox_root` path prefix enforcement for fs tools + persistent cwd restriction for shell (validated against sandbox root on each invocation) + **Landlock filesystem sandboxing on Linux 5.13+** (fail-closed: if Landlock is supported but enforcement fails, the command is aborted; only gracefully degrades on kernels without Landlock support).
+**Current:** `bash -c` command strings + `env_clear()` + best-effort command denylist + project-root path prefix enforcement for fs tools (the [single sandbox root](#filesystem-sandboxing) pinned by `with_project_root`) + persistent cwd restriction for shell (validated against the same root on each invocation) + **Landlock filesystem sandboxing on Linux 5.13+** (fail-closed: if Landlock is supported but enforcement fails, the command is aborted; only gracefully degrades on kernels without Landlock support).
 
 **Landlock read set — `/etc/passwd` excluded (#743 / #734 item 2):** The Linux Landlock policy grants the child process read access to a small allow-list of system paths (`/usr`, `/bin`, `/lib`, `/lib64`, the dynamic linker config under `/etc/ld.so.*`, `/etc/nsswitch.conf`, `/etc/resolv.conf`, `/etc/localtime`, `/dev/{null,urandom,zero}`, `/proc/self`). `/etc/passwd` is intentionally **not** in the read set: granting it would let a sandboxed agent enumerate every local user on a shared host, which is a valuable reconnaissance step for an attacker who has subverted the agent. The trade-off is that bash's `~user` tilde expansion to *other* users' homes no longer resolves (bash needs `getpwnam` to translate the name to a path), and `ls -l`/`whoami` may print numeric UIDs instead of names. `~/path` for the **current** user still works because bash uses the `$HOME` env var, which doesn't read `/etc/passwd`. Agents that legitimately need user enumeration (rare) can run unsandboxed by setting `tools.shell_unrestricted = true` in `alms.toml`.
 
@@ -428,7 +633,7 @@ edit the TOML and restart the daemon. The same model is applied to
 - **`bubblewrap`/`nsjail`**: lightweight containers — new mount namespace with only the workspace visible. Linux-only, external dependency.
 
 **Later:**
-- Per-session temp workspaces (ephemeral sandboxes) — **partially implemented**: ephemeral subagents now get a disposable workspace at `{workspace_dir}/.ephemeral/{task_id}/` that scopes their `fs_*` tools and is cleaned up after the subagent completes. Not yet extended to top-level sessions.
+- Per-session temp workspaces (ephemeral sandboxes) — **partially implemented**: ephemeral subagents now get a disposable workspace at `<project_root>/.alms/agents/.ephemeral/{task_id}/` that scopes their `fs_*` tools and is cleaned up after the subagent completes. Not yet extended to top-level sessions.
 - MicroVMs for high-risk environments
 - Platform-specific alternatives: Windows Job Objects, macOS Sandbox profiles
 
@@ -486,13 +691,13 @@ Suggested table/event fields:
 ## 8) Secure defaults (v1)
 
 Default posture recommendations:
-- Workspace-only file access — **implemented**: `sandbox_root = "."` confines fs tools to cwd
+- Project-root file access — **implemented**: every agent runs with the project root as its single sandbox boundary for both `fs_*` and `shell` (#945, see [§ 4.4](#filesystem-sandboxing)). Operators may opt specific named agents out via [`[security].allow_full_os_access`](#operator-escape-hatch-allow_full_os_access) (#947) or narrow them to a per-agent git [worktree](#opt-in-worktree-mode) (#946).
 - Shell interface is `bash -c` command strings — **implemented**: `shell` tool wraps commands with `bash -c`; Landlock filesystem restrictions applied on Linux 5.13+
 - Shell command denylist (best-effort) — **implemented**: substring-based denylist blocks `rm -rf /`, `mkfs.`, fork bombs, etc.; bypassable, defense-in-depth only
-- Configurable shell allow/deny permissions — **implemented**: `tools.shell_permissions` in `alms.toml` provides regex-based `allowed_commands` / `denied_commands` gates evaluated before the hardcoded denylist (deny wins; empty allowlist = denylist-only mode); startup-only, not mutable via `PATCH /settings`. See § 4.3.
-- Shell classifier as non-bypassable floor (#745) — **implemented**: destructive classifier findings block in every `ClassificationMode` except `Off`; `ClassificationMode::Warn` now blocks destructive (behavioural break from pre-v0.2.2). Operators may exempt specific commands via operator-only `classifier_overrides` regex. See § 4.3.
+- Configurable shell allow/deny permissions — **implemented**: `tools.shell_permissions` in `alms.toml` provides regex-based `allowed_commands` / `denied_commands` gates evaluated before the hardcoded denylist (deny wins; empty allowlist = denylist-only mode); startup-only, not mutable via `PATCH /settings`. See [§ 4.3](#43-configurable-shell-permissions-shell_permissions).
+- Shell classifier as non-bypassable floor (#745) — **implemented**: destructive classifier findings block in every `ClassificationMode` except `Off`; `ClassificationMode::Warn` now blocks destructive (behavioural break from pre-v0.2.2). Operators may exempt specific commands via operator-only `classifier_overrides` regex. See [§ 4.3](#43-configurable-shell-permissions-shell_permissions).
 - Shell env cleared — **implemented**: `env_clear()` prevents secret leakage to child processes
-- Shell cwd restricted — **implemented**: `shell_policy = "sandboxed"` restricts cwd to sandbox_root; persistent cwd validated against sandbox on each invocation
+- Shell cwd restricted — **implemented**: shell's persistent cwd defaults to the [single sandbox root](#filesystem-sandboxing) (project root by default, worktree path under per-agent [worktree mode](#opt-in-worktree-mode)); explicit `cwd` params are validated against the same root
 - Strict output truncation — **implemented**: 30KB stdout/stderr cap with head+tail line preservation; `fs_read` defaults to 2000 lines and a 64 KiB output budget (lowered from 512 KiB in #917 to match prevailing caps and reduce pre-truncation bloat now that the in-loop truncate caps at 32 KB anyway), with a 256 KiB whole-file size gate that fires only on parameter-less calls (passing `offset` or `limit` skips the whole-file gate and falls back to the output-byte budget — see #813 / #901); each line is independently allocation-capped at 256 KiB before being returned, with surplus bytes drained and an inline `[line truncated to N bytes; M bytes discarded]` marker plus a `line_truncated: true` flag on the response (#902 — bounds per-line allocation on pathological single-line inputs once the whole-file gate is bypassed); `fs_grep` shares the same 256 KiB per-line cap via the `builtin::line_cap` module (#913) and surfaces a `truncated_lines` counter on its response so agents can detect partial scans; UTF-8 safe truncation
 - No `sudo` — not yet enforced (command denylist not implemented; use OS-level restrictions)
 - Network allowlist empty by default — not yet implemented
@@ -511,9 +716,9 @@ P0 (before public use):
 - [x] Audit log for tool runs + job runs — SQLite-backed audit events
 - [ ] Job principal + capability scoping
 - [x] Output truncation + sanitization — safe UTF-8 truncation on all tool outputs
-- [x] Filesystem sandbox — `canonicalize()` + prefix check, configurable `sandbox_root`
+- [x] Filesystem sandbox — `canonicalize()` + prefix check, project-root by default with opt-in worktree mode and operator escape hatch (see [§ 4.4](#filesystem-sandboxing))
 - [x] Shell env isolation — `env_clear()` prevents secret leakage
-- [x] Shell cwd restriction — sandboxed mode restricts cwd to `sandbox_root`
+- [x] Shell cwd restriction — shell's persistent cwd defaults to the project root (or the agent's per-agent [worktree](#opt-in-worktree-mode) when `worktree_mode = "git"`)
 
 P1:
 - [x] Landlock integration (Linux) — kernel-level filesystem restriction for shell commands (fail-closed)

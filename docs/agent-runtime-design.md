@@ -212,10 +212,10 @@ Agents have no persistent identity. Every session starts from the same hardcoded
 
 ### Design
 
-**Workspace directory structure:**
+**Workspace directory structure (post-#945 — workspace v2):**
 
 ```
-data/agents/{agent_name}/
+<project_root>/.alms/agents/<name>/
 ├── personality.md        # Who the agent is (tone, style, constraints)
 ├── goals.md              # Current objectives and priorities
 ├── memories.md           # Learned facts, user preferences, past decisions
@@ -223,6 +223,18 @@ data/agents/{agent_name}/
 ```
 
 These are plain text files that the user can edit directly, or that the agent can update through the workspace tool. Per-agent config overrides (model, posture, etc.) are stored in the agent registry (SQLite), not in workspace files.
+
+**Workspace attachment (post-#945):** `AgentRuntime::with_workspace(workspace)` is now scoped down. It binds the `WorkspaceWriteTool` (so `workspace_write` knows which agent's metadata directory to write to) and ensures the metadata directory exists. It **no longer touches the filesystem sandbox** — the sandbox root is set independently by `with_project_root(project_root)`, which is the single source of truth for the `fs_*` and `shell` boundary. See [`docs/security-model.md` § 4.4](security-model.md#filesystem-sandboxing) for the full sandbox model.
+
+This is a deliberate departure from the pre-#945 `with_workspace(ws_root)` shape, where the workspace builder narrowed the `fs_*` sandbox to the agent's metadata directory. That coupling was the root cause of the "agent can't read project files" pain — it conflated *where the agent's identity lives* with *what the agent can touch*. Workspace v2 splits those concerns: identity files live at `<project_root>/.alms/agents/<name>/`, and the sandbox boundary is the project root.
+
+The other sandbox-root-related builders on `AgentRuntime` are:
+
+- **`with_project_root(project_root: PathBuf)`** — pin the sandbox at the project root (the default); re-registers `fs_*` + `shell` against it.
+- **`with_extra_fs_read_root(root: PathBuf)`** (added in #946) — push an additional read-only root onto the read-family `fs_*` tools. Used by per-agent [worktree mode](security-model.md#opt-in-worktree-mode) to widen worktree-mode agents with `<project>/.alms/agents/` so cross-agent metadata reads keep working from inside the worktree, and by per-run spill directories (`with_shell_spill`, `with_tool_output_truncate`) so the agent can `fs_read` its own spilled tool output.
+- **`with_unrestricted_filesystem()`** (added in #947) — drop the sandbox entirely; used by the [`[security].allow_full_os_access`](security-model.md#operator-escape-hatch-allow_full_os_access) operator escape hatch. Subject only to OS-level permissions of the daemon process; `shell_permissions` and the destructive-command classifier still apply.
+
+The gateway's run-lifecycle wires these in a deterministic order: spill / tool-output-truncate builders accumulate extras first, then the sandbox-root builder (`with_unrestricted_filesystem` if the agent is on the security list, otherwise `with_extra_fs_read_root(...).with_project_root(worktree)` if `worktree_mode = "git"`, otherwise `with_project_root(project_root)`), and finally `with_workspace` to bind `workspace_write`. After this, the run starts.
 
 **How they feed into the system prompt:**
 
