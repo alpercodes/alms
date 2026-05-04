@@ -1,5 +1,6 @@
 import { html, useSignal } from '../../deps.js';
 import { toolSummary, fmtSize } from '../../utils/tool-summary.js';
+import { renderToolOutput } from '../../utils/tool-output.js';
 import { TOOL_SUMMARY_LEN } from '../../utils/constants.js';
 
 /** Threshold (in characters) above which result text is truncated with a toggle. */
@@ -78,17 +79,6 @@ function toolIcon(tool) {
         default:
             return 'T';
     }
-}
-
-/**
- * Extract a short filename from a path for display headers.
- */
-function shortPath(path) {
-    if (!path) return '';
-    // Normalize separators and take the last 2 segments
-    const parts = path.replace(/\\/g, '/').split('/').filter(Boolean);
-    if (parts.length <= 2) return parts.join('/');
-    return '\u2026/' + parts.slice(-2).join('/');
 }
 
 /**
@@ -191,128 +181,24 @@ function renderParams(tool, params) {
 }
 
 /**
- * Render the structured result section for a specific tool type.
- * Includes truncation with "Show more" toggle for large results.
+ * Raw-JSON renderer \u2014 used for tool outputs the structured dispatcher does
+ * not handle, for failures, and as the universal "Raw" toggle target on
+ * every tool (acceptance criterion 2 of #873). Kept identical to the
+ * pre-#873 default so callers who toggle Raw see the exact same blob the
+ * tool returned.
  */
-function ResultSection({ tool, params, result, isFail, showFull }) {
+function RawResultPane({ result, isFail, showFull, label, blockedTarget }) {
     const text = formatJson(result);
     if (!text) return null;
-
     const isLong = text.length > RESULT_TRUNCATE_LEN;
     const displayText = (!showFull.value && isLong)
         ? text.slice(0, RESULT_TRUNCATE_LEN) + '\u2026'
         : text;
-
     const expandedCls = showFull.value ? ' tc-detail-expanded' : '';
-
     const toggleFull = (e) => {
         e.stopPropagation();
         showFull.value = !showFull.value;
     };
-
-    // Classifier-extracted target on a blocked shell command (#758).
-    // Surfaced as a distinct "Target" row so operators can see *what* was
-    // targeted without string-parsing the error message.
-    const blockedTarget = (isFail
-        && typeof result === 'object' && result !== null
-        && typeof result.target === 'string' && result.target.length > 0)
-        ? result.target
-        : null;
-
-    // Shell / shell_exec: render output as a code block
-    if ((tool === 'shell' || tool === 'shell_exec') && !isFail) {
-        return html`
-            <div class="tc-detail-section">
-                <div class="tc-detail-label">Output</div>
-                <pre class="tc-detail-content tc-code-block${expandedCls}">${displayText}</pre>
-                ${isLong && html`
-                    <button class="tc-show-more" onClick=${toggleFull}>
-                        ${showFull.value ? 'Show less' : 'Show more'}
-                    </button>
-                `}
-            </div>
-        `;
-    }
-
-    // fs_read: show file path header with monospace content
-    if (tool === 'fs_read' && !isFail) {
-        const path = params?.path || '';
-        return html`
-            <div class="tc-detail-section">
-                <div class="tc-detail-label tc-file-header">
-                    ${path ? shortPath(path) : 'File content'}
-                </div>
-                <pre class="tc-detail-content tc-code-block${expandedCls}">${displayText}</pre>
-                ${isLong && html`
-                    <button class="tc-show-more" onClick=${toggleFull}>
-                        ${showFull.value ? 'Show less' : 'Show more'}
-                    </button>
-                `}
-            </div>
-        `;
-    }
-
-    // fs_write: show path and confirmation
-    if (tool === 'fs_write' && !isFail) {
-        return html`
-            <div class="tc-detail-section">
-                <div class="tc-detail-label">Result</div>
-                <pre class="tc-detail-content">${displayText}</pre>
-            </div>
-        `;
-    }
-
-    // invoke_agent: show formatted subagent result summary
-    if (tool === 'invoke_agent') {
-        const resultObj = typeof result === 'object' && result !== null ? result : null;
-        const isBackground = resultObj && resultObj.task_id;
-
-        // Background subagent: just show the task_id
-        if (isBackground) {
-            return html`
-                <div class="tc-detail-section">
-                    <div class="tc-detail-label">Background task started</div>
-                    <pre class="tc-detail-content">task_id: ${resultObj.task_id}</pre>
-                </div>
-            `;
-        }
-
-        // Extract response text from various result shapes
-        let responseText = '';
-        if (resultObj) {
-            responseText = resultObj.response || resultObj.output || resultObj.result || '';
-            if (!responseText && typeof result !== 'string') {
-                responseText = JSON.stringify(result, null, 2);
-            }
-        } else {
-            responseText = text;
-        }
-        const truncResponse = (!showFull.value && responseText.length > RESULT_TRUNCATE_LEN)
-            ? responseText.slice(0, RESULT_TRUNCATE_LEN) + '\u2026'
-            : responseText;
-
-        // Build a status line for the subagent
-        const statusLine = isFail ? 'Failed' : 'Completed';
-
-        return html`
-            <div class="tc-detail-section">
-                <div class="tc-detail-label">
-                    Subagent ${statusLine}
-                </div>
-                ${responseText && html`
-                    <pre class="tc-detail-content${expandedCls} ${isFail ? 'tc-detail-error' : ''}">${truncResponse}</pre>
-                    ${responseText.length > RESULT_TRUNCATE_LEN && html`
-                        <button class="tc-show-more" onClick=${toggleFull}>
-                            ${showFull.value ? 'Show less' : 'Show more'}
-                        </button>
-                    `}
-                `}
-            </div>
-        `;
-    }
-
-    // Default: show result with truncation
-    const label = isFail ? 'Error' : 'Result';
     return html`
         ${blockedTarget && html`
             <div class="tc-detail-section">
@@ -328,6 +214,82 @@ function ResultSection({ tool, params, result, isFail, showFull }) {
                     ${showFull.value ? 'Show less' : 'Show more'}
                 </button>
             `}
+        </div>
+    `;
+}
+
+/**
+ * Render the structured result section for a specific tool type.
+ *
+ * Path 1 (#873): the structured dispatcher in `utils/tool-output.js` owns
+ * per-tool rendering. When it returns a template we show that, plus a small
+ * "Raw" toggle so operators can drop down to the JSON blob for debugging.
+ *
+ * Path 2 (fallback): when the dispatcher returns null \u2014 either the tool
+ * has no bespoke renderer or the payload shape didn't match \u2014 we fall
+ * back to the raw renderer with a longer-truncation Show-more toggle.
+ *
+ * Path 3 (failures): on `isFail` we always show the raw error pane, never
+ * the structured renderer (the payload shape on failure is the runtime's
+ * `{error, target?}` shell rather than the success shape).
+ */
+function ResultSection({ tool, params, result, isFail, isCancelled, showFull }) {
+    const showRaw = useSignal(false);
+
+    if (result == null && !isFail) return null;
+
+    // Classifier-extracted target on a blocked shell command (#758).
+    const blockedTarget = (isFail
+        && typeof result === 'object' && result !== null
+        && typeof result.target === 'string' && result.target.length > 0)
+        ? result.target
+        : null;
+
+    // Failure path \u2014 always raw, never structured.
+    if (isFail) {
+        return html`<${RawResultPane} result=${result} isFail=${true}
+            showFull=${showFull} label="Error" blockedTarget=${blockedTarget} />`;
+    }
+
+    // Cancelled-with-partial-result path \u2014 the runtime persists a
+    // partial result for debugging when a tool is cancelled mid-flight
+    // (see "partial tool call records persisted on error/cancellation"
+    // in the project state). Don't dress those up with a structured
+    // renderer; they're partial by definition and the operator wants
+    // to see the raw payload, not a misleading "ok" badge.
+    if (isCancelled) {
+        return html`<${RawResultPane} result=${result} isFail=${false}
+            showFull=${showFull} label="Result (cancelled)" />`;
+    }
+
+    // Success path \u2014 try the structured renderer first.
+    const structured = renderToolOutput(tool, result, params, { showFull });
+
+    if (!structured) {
+        // No bespoke renderer or unrecognised shape \u2014 raw view, no toggle
+        // (raw is already the only thing on screen).
+        return html`<${RawResultPane} result=${result} isFail=${false}
+            showFull=${showFull} label="Result" />`;
+    }
+
+    // Structured renderer matched \u2014 show it plus a Raw toggle that flips
+    // to the raw pane on demand. The toggle button itself lives in its
+    // own row so it sits below the structured output regardless of which
+    // sub-section produced it.
+    const toggleRaw = (e) => {
+        e.stopPropagation();
+        showRaw.value = !showRaw.value;
+    };
+    return html`
+        ${showRaw.value
+            ? html`<${RawResultPane} result=${result} isFail=${false}
+                showFull=${showFull} label="Result (raw)" />`
+            : structured
+        }
+        <div class="tc-detail-rawtoggle">
+            <button class="tc-show-more" onClick=${toggleRaw}>
+                ${showRaw.value ? 'Hide raw' : 'View raw'}
+            </button>
         </div>
     `;
 }
@@ -385,7 +347,8 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent, duratio
                 <div class="tc-detail" onClick=${(e) => e.stopPropagation()}>
                     ${renderParams(tool, params)}
                     ${html`<${ResultSection} tool=${tool} params=${params}
-                        result=${result} isFail=${isFail} showFull=${showFull} />`}
+                        result=${result} isFail=${isFail} isCancelled=${isCancelled}
+                        showFull=${showFull} />`}
                 </div>
             `}
         </div>

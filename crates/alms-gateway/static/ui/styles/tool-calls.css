@@ -244,6 +244,285 @@
   text-decoration: underline;
 }
 
+/* ──────────────────────────────────────────────────────────────────────
+   Tool-output structured rendering (#873)
+   ──────────────────────────────────────────────────────────────────────
+   These classes render the *result* side of a tool call into the same
+   visual register as the input side. See `utils/tool-output.js` for the
+   per-tool renderers; classes here are intentionally generic so multiple
+   tools can share them (e.g. .tc-match-list is used by fs_grep, fs_glob,
+   and fs_list). */
+
+/* Status row: pill + monospace metadata, rendered inline. Used by every
+   per-tool renderer to expose primary status (exit code, http status,
+   delivery ack, etc.). */
+.tc-status-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-2xs);
+}
+
+/* Pill — neutral by default. */
+.tc-kv-badge {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  background: var(--surface-3);
+  color: var(--text-secondary);
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+.tc-kv-badge-fail {
+  background: var(--error-muted);
+  color: var(--error);
+}
+
+/* Monospace metadata text — for task_ids, paths, session_ids etc. */
+.tc-kv-mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+/* Secondary metadata — non-mono, muted. */
+.tc-kv-meta {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  white-space: nowrap;
+}
+
+/* Footer text under a structured pane — counts, "truncated", session-id
+   hints, etc. */
+.tc-detail-footer {
+  font-size: var(--text-2xs);
+  color: var(--text-disabled);
+  font-style: italic;
+  margin-top: 2px;
+}
+
+/* Content variants for `tc-detail-content` */
+.tc-detail-content.tc-detail-warn {
+  /* stderr panes — same font as code-block but tinted amber to mark
+     non-fatal output without escalating to error red. */
+  color: var(--warning);
+  border-color: var(--warning);
+  background: var(--warning-muted);
+}
+.tc-detail-content.tc-detail-muted {
+  color: var(--text-disabled);
+  font-style: italic;
+}
+
+/* Inline link inside a detail section (e.g. invoke_agent's
+   "View full session"). Rendered as a <button> so the SPA in-app
+   navigator (utils/navigate-session.js) drives the transition rather
+   than a hard browser navigation that the SPA would ignore. The reset
+   below strips native button chrome so it visually reads as a link. */
+.tc-detail-link {
+  font-size: var(--text-2xs);
+  color: var(--info);
+  text-decoration: none;
+  font-weight: 500;
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: left;
+}
+.tc-detail-link:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+.tc-detail-link:focus-visible {
+  outline: 2px solid var(--info);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Match list — fs_grep, fs_glob, fs_list share this list shape. */
+.tc-match-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--surface-0);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  max-height: 300px;
+  overflow-y: auto;
+}
+.tc-match-row {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-secondary);
+  padding: 4px var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.tc-match-row + .tc-match-row {
+  border-top: 1px solid var(--border-subtle);
+}
+.tc-match-files .tc-match-path,
+.tc-match-file .tc-match-path {
+  color: var(--text-secondary);
+}
+.tc-match-dir .tc-match-path {
+  color: var(--info);
+  font-weight: 500;
+}
+.tc-match-count {
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+}
+.tc-match-content {
+  /* Two-line layout: file:line on top, snippet below. */
+  gap: 1px;
+}
+.tc-match-loc {
+  display: flex;
+  align-items: baseline;
+  gap: 0;
+  font-size: var(--text-2xs);
+}
+.tc-match-loc .tc-match-path {
+  color: var(--text-muted);
+}
+.tc-match-loc .tc-match-sep {
+  color: var(--text-disabled);
+}
+.tc-match-loc .tc-match-line {
+  color: var(--text-disabled);
+  font-weight: 500;
+}
+.tc-match-snippet {
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+/* Dimmed variant for fs_grep context_before / context_after lines so
+   the central match line stays visually dominant. */
+.tc-match-snippet.tc-match-context {
+  color: var(--text-disabled);
+}
+
+/* Record list — list_agents, list_my_sessions share this denser layout
+   with a head row of badges + a body row of free-text description /
+   summary. */
+.tc-record-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  background: var(--surface-0);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  max-height: 320px;
+  overflow-y: auto;
+}
+.tc-record-row {
+  padding: 6px var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: var(--text-2xs);
+}
+.tc-record-row + .tc-record-row {
+  border-top: 1px solid var(--border-subtle);
+}
+.tc-record-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.tc-record-body {
+  font-size: var(--text-2xs);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.tc-record-summary {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Chat-style list — read_messages, read_session, read_subagent_session
+   share this. */
+.tc-chat-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: 320px;
+  overflow-y: auto;
+}
+.tc-chat-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-0);
+  border: 1px solid var(--border-subtle);
+}
+.tc-chat-row.tc-chat-self {
+  border-color: var(--accent-muted);
+  background: var(--accent-muted);
+}
+.tc-chat-row.tc-chat-peer {
+  border-color: var(--dm-accent-muted);
+  background: var(--dm-accent-muted);
+}
+.tc-chat-sender {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: lowercase;
+}
+.tc-chat-row.tc-chat-self .tc-chat-sender {
+  color: var(--accent-text);
+}
+.tc-chat-row.tc-chat-peer .tc-chat-sender {
+  color: var(--dm-accent);
+}
+.tc-chat-content {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.5;
+}
+
+/* "View raw" toggle row — sits below the structured renderer's content
+   so it doesn't get tangled in any sub-section's flex layout. */
+.tc-detail-rawtoggle {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 2px;
+}
+
 /* ── Parallel tool group ── */
 .tc-group {
   border: 1px solid var(--border-subtle);

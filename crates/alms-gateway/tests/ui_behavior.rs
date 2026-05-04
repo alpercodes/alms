@@ -109,3 +109,18 @@ fn history_js_behaviour() {
 fn workspace_open_js_behaviour() {
     run_node_test("workspace-open.test.mjs");
 }
+
+/// Pinned regression for issue #873: tool-call output rendering parity.
+/// `static/ui/utils/tool-output.js` mirrors the input-side renderers from
+/// `tool-summary.js`/`tool-row.js`, dispatching `tool_end` payloads to a
+/// per-tool structured renderer instead of dumping the raw JSON blob. The
+/// JS-side test feeds representative `tool_end` payloads to the dispatcher
+/// and asserts the rendered DOM contains the expected sections (status
+/// pills, code-block panes, match-list rows, chat-bubble rows, etc.) and
+/// does NOT contain raw-JSON-fallback shapes — so a future refactor that
+/// silently breaks the structured path falls back to a visibly-different
+/// view that the test catches.
+#[test]
+fn tool_output_js_behaviour() {
+    run_node_test("tool-output.test.mjs");
+}
