@@ -238,6 +238,62 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
+/// Normalize a serialized tool-arguments string into a JSON object.
+///
+/// Tool arguments are spec'd as JSON objects on every provider we
+/// integrate with (Anthropic, OpenAI-compat, Gemini), so the result is
+/// always a [`serde_json::Value::Object`] regardless of what the wire
+/// shape was. Three cases:
+///
+/// 1. **Empty / whitespace-only `args`** → `{}`. Anthropic's streaming
+///    protocol simply omits the `input_json_delta` event when the model
+///    calls a no-args tool, so the streaming accumulator observes
+///    `arguments == ""`. `serde_json::from_str("")` is an EOF error,
+///    and the legacy fallback (`Value::String(args)`) poisoned the
+///    persisted shape: round-tripping through SQLite re-emitted
+///    `tool_use.input: ""` on the wire, which Anthropic rejects with
+///    `400 invalid_request_error: "Input should be an object"`.
+///
+/// 2. **Valid JSON that already parses to an object** → returned verbatim.
+///
+/// 3. **Anything else** (parse error, scalar, array): wrapped under
+///    `{"_raw": "<the original string>"}` with a `tracing::warn!` so
+///    the model still sees the raw value but we never violate the
+///    object-shape contract on the wire. Mirrors the wrapper Gemini
+///    has used since day one.
+///
+/// Used at every persistence + adapter boundary that owns the
+/// `arguments: String` → `params: Value` conversion. See issue #967.
+pub fn normalize_tool_args(args: &str) -> serde_json::Value {
+    if args.trim().is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) if v.is_object() => v,
+        Ok(other) => {
+            tracing::warn!(
+                "Tool arguments parsed to non-object value ({}); wrapping under `_raw` for object-shape contract",
+                match &other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object", // unreachable, covered above
+                }
+            );
+            serde_json::json!({ "_raw": args })
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Malformed tool arguments JSON: {}; wrapping under `_raw`",
+                e
+            );
+            serde_json::json!({ "_raw": args })
+        }
+    }
+}
+
 /// LLM completion request
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletionRequest {
@@ -978,5 +1034,71 @@ mod tests {
             Some("function"),
             "tool_calls in messages must include \"type\": \"function\": {json}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // normalize_tool_args (#967)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn normalize_tool_args_empty_string_returns_empty_object() {
+        // Anthropic's streaming protocol omits `input_json_delta`
+        // entirely for no-args tool calls, so the streaming
+        // accumulator observes `arguments == ""`. The pre-#967 code
+        // path treated this as a parse failure and fell back to
+        // `Value::String(args)`, which Anthropic 400s on the wire and
+        // poisons the persisted `Content::ToolCall.params` shape.
+        let v = normalize_tool_args("");
+        assert!(v.is_object(), "empty args must normalize to object: {v:?}");
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn normalize_tool_args_whitespace_only_returns_empty_object() {
+        let v = normalize_tool_args("   \n\t  ");
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn normalize_tool_args_valid_object_passes_through() {
+        let v = normalize_tool_args(r#"{"path":"src/lib.rs"}"#);
+        assert_eq!(v, serde_json::json!({"path": "src/lib.rs"}));
+    }
+
+    #[test]
+    fn normalize_tool_args_empty_object_passes_through() {
+        let v = normalize_tool_args("{}");
+        assert_eq!(v, serde_json::json!({}));
+    }
+
+    #[test]
+    fn normalize_tool_args_scalar_wraps_under_raw() {
+        // Genuine model error: never poison the wire shape, but keep
+        // the raw bytes visible to the model so it can self-correct.
+        let v = normalize_tool_args("42");
+        assert_eq!(v, serde_json::json!({"_raw": "42"}));
+    }
+
+    #[test]
+    fn normalize_tool_args_array_wraps_under_raw() {
+        let v = normalize_tool_args(r#"[1,2,3]"#);
+        assert_eq!(v, serde_json::json!({"_raw": "[1,2,3]"}));
+    }
+
+    #[test]
+    fn normalize_tool_args_malformed_json_wraps_under_raw() {
+        let v = normalize_tool_args(r#"{"unterminated"#);
+        assert_eq!(v, serde_json::json!({"_raw": r#"{"unterminated"#}));
+    }
+
+    #[test]
+    fn normalize_tool_args_quoted_empty_string_wraps_under_raw() {
+        // The exact poison shape from #967 round-tripping through the
+        // legacy persistence path: `Value::String("")`.to_string() ==
+        // "\"\"". When this enters the adapter (e.g. on a healed-but-
+        // not-yet-fully-fixed code path) we want it as an object, not
+        // a JSON string.
+        let v = normalize_tool_args("\"\"");
+        assert_eq!(v, serde_json::json!({"_raw": "\"\""}));
     }
 }

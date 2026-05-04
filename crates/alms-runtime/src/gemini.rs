@@ -327,26 +327,13 @@ pub(crate) fn to_gemini_request(req: &CompletionRequest) -> GeminiRequest {
                 }
                 if let Some(ref tool_calls) = msg.tool_calls {
                     for tc in tool_calls {
-                        let args: Value = serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or_else(|e| {
-                                tracing::warn!(
-                                    "Malformed tool arguments for {}: {} — wrapping as string",
-                                    tc.function.name,
-                                    e
-                                );
-                                // Gemini requires `args` to be an object;
-                                // wrap invalid JSON so the request still
-                                // serializes and the model can at least
-                                // see the raw argument.
-                                serde_json::json!({ "_raw": tc.function.arguments })
-                            });
-                        // Objectify scalar/array JSON since Gemini's `args`
-                        // is typed as an object in the schema.
-                        let args = if args.is_object() {
-                            args
-                        } else {
-                            serde_json::json!({ "_value": args })
-                        };
+                        // Gemini requires `args` to be an object. The
+                        // shared helper handles the no-args (`""` →
+                        // `{}`) case Anthropic's streaming protocol
+                        // emits (#967) and wraps non-object scalars
+                        // under `_raw` so the request still serializes
+                        // and the model can see the raw argument.
+                        let args: Value = normalize_tool_args(&tc.function.arguments);
                         parts.push(GeminiPart::FunctionCall {
                             function_call: FunctionCallPart {
                                 name: tc.function.name.clone(),
