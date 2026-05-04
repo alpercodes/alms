@@ -612,6 +612,45 @@ impl AgentRuntime {
         self
     }
 
+    /// Append an extra read-only root onto the accumulated
+    /// [`Self::extra_fs_read_roots`] list (#946 sibling-reads
+    /// support).
+    ///
+    /// Used by the gateway's run-lifecycle wiring when an agent runs
+    /// in `WorktreeMode::Git`: the agent's primary sandbox root is
+    /// the worktree path (`<project>/.alms/worktrees/<name>/`) but
+    /// the agent must still be able to read sibling personality
+    /// metadata at `<project>/.alms/agents/<sibling>/personality.md`,
+    /// which sits OUTSIDE the worktree.
+    ///
+    /// Order-independent: this builder pushes onto the
+    /// [`Self::extra_fs_read_roots`] accumulator and then calls
+    /// [`Self::refresh_fs_tools_for_extras`], so the new extra takes
+    /// effect immediately whether or not [`Self::with_project_root`]
+    /// has already run. When the primary root is set later, its
+    /// re-registration consults the same accumulator via
+    /// [`Self::compose_fs_extra_read_roots`] and picks the extra up
+    /// then. Mirrors the accumulator pattern used by
+    /// [`Self::with_shell_spill`] and [`Self::with_tool_output_truncate`].
+    pub fn with_extra_fs_read_root(mut self, root: std::path::PathBuf) -> Self {
+        // Skip duplicate-root pushes — the accumulator is consulted
+        // by every read-family fs_* re-registration so a duplicate
+        // would inflate the list without changing behaviour. The
+        // O(n) `contains` check is fine; the list is short by design
+        // (a handful of per-run spill dirs + the worktree sibling
+        // root).
+        if !self.extra_fs_read_roots.iter().any(|p| p == &root) {
+            self.extra_fs_read_roots.push(root);
+        }
+        // If the runtime already has a primary sandbox root pinned,
+        // re-register the read-family tools so the new extra takes
+        // effect immediately. Without this the tools registered at
+        // `AgentRuntime::new` time keep their stale extra-roots list.
+        // Same shape as `refresh_fs_tools_for_extras`'s callers.
+        self.refresh_fs_tools_for_extras();
+        self
+    }
+
     /// Activate the shell-output spill policy for this runtime (issue #756).
     ///
     /// `run_dir` is the per-run directory

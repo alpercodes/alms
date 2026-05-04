@@ -13,14 +13,15 @@
 
 use crate::api_error;
 use crate::server::AppState;
+use alms_core::worktree::{self, WorktreeError};
 use alms_core::{
-    AgentId, AgentRecord, CreateAgentRequest, UpdateAgentRequest, validate_agent_name,
+    AgentId, AgentRecord, CreateAgentRequest, UpdateAgentRequest, WorktreeMode, validate_agent_name,
 };
 use alms_runtime::Posture;
 use alms_session::SqliteStore;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -169,6 +170,7 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
         "gemini_thinking_budget": agent.gemini_thinking_budget,
         "summary_provider": agent.summary_provider,
         "summary_model": agent.summary_model,
+        "worktree_mode": agent.worktree_mode.as_wire_str(),
         "is_default": agent.is_default,
         "created_at": agent.created_at.to_rfc3339(),
         "last_active": agent.last_active.to_rfc3339(),
@@ -253,6 +255,54 @@ pub async fn create_agent(
         summary_model_norm.as_deref(),
     )?;
 
+    // Worktree-mode (#946). Default to `Off` when the request omits the
+    // field — the wire shape stays back-compat with pre-#946 clients.
+    // When `Git` is requested we provision the worktree BEFORE
+    // persisting the agent record so a non-git project produces a
+    // clean 4xx with NO half-created agent and NO half-created
+    // worktree directory. The expensive bit (`git worktree add`)
+    // happens on the createside; PATCH-time flips do the same dance.
+    let worktree_mode = req.worktree_mode.unwrap_or_default();
+
+    if worktree_mode == WorktreeMode::Git {
+        // Worktree provisioning needs the agent name as a path
+        // segment — validate uniqueness against the registry FIRST
+        // so we don't create a worktree dir for a name we'll then
+        // reject as a duplicate.
+        if let Ok(Some(_)) = store.load_agent_by_name(&req.name) {
+            return Err(api_error(
+                StatusCode::CONFLICT,
+                "DUPLICATE_NAME",
+                format!("Agent name '{}' already exists", req.name),
+            ));
+        }
+        if let Err(e) = worktree::create_worktree(&state.project_root, &req.name) {
+            return Err(worktree_error_to_api(&e));
+        }
+        // The startup-time WARN for `[security].allow_full_os_access`
+        // already documents the precedence at boot. Surface a second
+        // WARN here when an operator creates a worktree-mode agent
+        // that is ALSO on the allow list — the worktree itself is
+        // intentionally left in place (so flipping the security
+        // knob off later restores the worktree sandbox without a
+        // re-create), but the operator should know the worktree's
+        // sandbox attachment will be skipped at every run.
+        if state.security_config.is_full_os_access_agent(&req.name) {
+            tracing::warn!(
+                target: "alms.security",
+                agent_name = %req.name,
+                allow_full_os_access = true,
+                worktree_mode = "git",
+                "Agent '{}' has worktree_mode=git AND is on [security].allow_full_os_access. \
+                 The worktree was created at <project>/.alms/worktrees/{}/, but at run time \
+                 the security list takes precedence: the agent will run WITHOUT any \
+                 filesystem sandbox (worktree pin is skipped).",
+                req.name,
+                req.name,
+            );
+        }
+    }
+
     let now = Utc::now();
     let mut agent = AgentRecord {
         id: AgentId::new(),
@@ -267,6 +317,7 @@ pub async fn create_agent(
         gemini_thinking_budget: req.gemini_thinking_budget,
         summary_provider: summary_provider_norm,
         summary_model: summary_model_norm,
+        worktree_mode,
         // Always INSERT with is_default=false; set_default_agent atomically
         // clears old default + sets new one in a single transaction.
         is_default: false,
@@ -275,11 +326,27 @@ pub async fn create_agent(
     };
 
     store.create_agent(&agent).map_err(|e| match &e {
-        alms_core::AlmsError::DuplicateName(name) => api_error(
-            StatusCode::CONFLICT,
-            "DUPLICATE_NAME",
-            format!("Agent name '{name}' already exists"),
-        ),
+        alms_core::AlmsError::DuplicateName(name) => {
+            // Roll back the worktree we just created so a duplicate-name
+            // collision doesn't leave a stranded worktree dir behind.
+            // Force=true so the rollback succeeds even on the rare race
+            // where another concurrent create slipped in between our
+            // load_agent_by_name check and the INSERT below.
+            if worktree_mode == WorktreeMode::Git
+                && let Err(rb) = worktree::remove_worktree(&state.project_root, name, true)
+            {
+                tracing::warn!(
+                    agent_name = %name,
+                    error = %rb,
+                    "Failed to roll back worktree after duplicate-name collision"
+                );
+            }
+            api_error(
+                StatusCode::CONFLICT,
+                "DUPLICATE_NAME",
+                format!("Agent name '{name}' already exists"),
+            )
+        }
         _ => api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e),
     })?;
 
@@ -304,6 +371,39 @@ pub async fn create_agent(
     }
 
     Ok((StatusCode::CREATED, Json(agent_to_json(&agent))))
+}
+
+/// Map a [`WorktreeError`] onto an HTTP API error response.
+///
+/// Defined as a free function so both the create / update paths and
+/// the delete path map to identical wire shapes.
+fn worktree_error_to_api(e: &WorktreeError) -> (StatusCode, Json<serde_json::Value>) {
+    match e {
+        WorktreeError::NotAGitRepo => api_error(
+            StatusCode::BAD_REQUEST,
+            "WORKTREE_REQUIRES_GIT",
+            "worktree_mode = \"git\" requires the project root to be a git working tree. \
+             Either run `git init` in the project directory, or set `worktree_mode = \"off\"`.",
+        ),
+        WorktreeError::UncommittedChanges => api_error(
+            StatusCode::CONFLICT,
+            "WORKTREE_HAS_UNCOMMITTED_CHANGES",
+            "the agent's worktree contains uncommitted changes. Pass \
+             `force_worktree_remove: true` (PATCH) or `?force=true` (DELETE) \
+             to override — this discards the worktree contents AND deletes \
+             the `alms/<name>` branch.",
+        ),
+        WorktreeError::GitFailed(msg) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WORKTREE_GIT_FAILED",
+            format!("git worktree command failed: {msg}"),
+        ),
+        WorktreeError::Io(msg) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WORKTREE_IO_FAILED",
+            format!("worktree IO error: {msg}"),
+        ),
+    }
 }
 
 /// GET /agents/{id_or_name} — get agent details.
@@ -445,6 +545,14 @@ pub(crate) fn apply_update_request(
         agent.summary_model = Some(trimmed.to_string());
     }
 
+    // Worktree mode (#946). Pure-function update; the side-effecting
+    // `git worktree add` / `remove` runs in the HTTP handler layer
+    // (it needs `AppState` for the project root and the security
+    // config) — see `update_agent` below.
+    if let Some(mode) = req.worktree_mode {
+        agent.worktree_mode = mode;
+    }
+
     agent.last_active = Utc::now();
     Ok(())
 }
@@ -500,6 +608,14 @@ pub async fn update_agent(
     let store = get_store(&state)?;
     let mut agent = resolve_agent(store, &id_or_name)?;
 
+    // Snapshot the pre-PATCH worktree mode and the force flag so the
+    // side-effecting branch below can reason about transitions.
+    // `apply_update_request` mutates `agent.worktree_mode` in place
+    // for the new desired state.
+    let prev_mode = agent.worktree_mode;
+    let force_remove = req.force_worktree_remove.unwrap_or(false);
+    let agent_name = agent.name.clone();
+
     apply_update_request(&mut agent, req).map_err(|e| e.to_api_error())?;
 
     // Cross-field pair invariant for the per-agent summary fields (#872).
@@ -514,6 +630,42 @@ pub async fn update_agent(
         agent.summary_model.as_deref(),
     )?;
 
+    // Worktree-mode flip side-effects (#946). Done BEFORE persisting
+    // the row so a `git worktree add` failure surfaces a 4xx with no
+    // record drift.
+    let new_mode = agent.worktree_mode;
+    if prev_mode != new_mode {
+        match (prev_mode, new_mode) {
+            (WorktreeMode::Off, WorktreeMode::Git) => {
+                if let Err(e) = worktree::create_worktree(&state.project_root, &agent_name) {
+                    return Err(worktree_error_to_api(&e));
+                }
+                if state.security_config.is_full_os_access_agent(&agent_name) {
+                    tracing::warn!(
+                        target: "alms.security",
+                        agent_name = %agent_name,
+                        allow_full_os_access = true,
+                        worktree_mode = "git",
+                        "Agent '{}' flipped to worktree_mode=git AND is on \
+                         [security].allow_full_os_access — worktree pin will be skipped \
+                         at run time (security list wins).",
+                        agent_name,
+                    );
+                }
+            }
+            (WorktreeMode::Git, WorktreeMode::Off) => {
+                if let Err(e) =
+                    worktree::remove_worktree(&state.project_root, &agent_name, force_remove)
+                {
+                    return Err(worktree_error_to_api(&e));
+                }
+            }
+            // Same-mode transitions cannot reach here (prev != new),
+            // and Off→Off / Git→Git are filtered above.
+            _ => {}
+        }
+    }
+
     store
         .update_agent(&agent)
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
@@ -521,10 +673,23 @@ pub async fn update_agent(
     Ok(Json(agent_to_json(&agent)))
 }
 
+/// Query params for `DELETE /agents/{id_or_name}` (#946).
+///
+/// `force=true` is consumed by the worktree-removal step — when set
+/// it overrides the uncommitted-changes guard inside
+/// `worktree::remove_worktree`, discarding the worktree contents
+/// AND deleting the `alms/<name>` branch. Defaults to `false`.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct DeleteAgentQuery {
+    #[serde(default)]
+    pub force: bool,
+}
+
 /// DELETE /agents/{id_or_name} — delete an agent.
 pub async fn delete_agent(
     State(state): State<AppState>,
     Path(id_or_name): Path<String>,
+    Query(query): Query<DeleteAgentQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let store = get_store(&state)?;
     let agent = resolve_agent(store, &id_or_name)?;
@@ -536,6 +701,16 @@ pub async fn delete_agent(
             "CANNOT_DELETE_DEFAULT",
             "Cannot delete the default agent. Set another agent as default first.",
         ));
+    }
+
+    // Worktree teardown (#946). Runs BEFORE the SQLite delete so an
+    // uncommitted-changes refusal surfaces a 4xx without orphaning
+    // the agent record. `force` from the query string overrides the
+    // uncommitted-changes guard inside `remove_worktree`.
+    if agent.worktree_mode == WorktreeMode::Git
+        && let Err(e) = worktree::remove_worktree(&state.project_root, &agent.name, query.force)
+    {
+        return Err(worktree_error_to_api(&e));
     }
 
     store
@@ -587,6 +762,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: None,
             summary_model: None,
+            worktree_mode: WorktreeMode::Off,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -1316,6 +1492,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: Some("nonexistent".into()),
             summary_model: Some("some-model".into()),
+            worktree_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent_err(state.clone(), req).await;
@@ -1354,6 +1531,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: Some("anthropic".into()),
             summary_model: Some("claude-haiku-4".into()),
+            worktree_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent_err(state.clone(), req).await;
@@ -1380,6 +1558,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: Some("openrouter".into()),
             summary_model: None,
+            worktree_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent_err(state, req).await;
@@ -1403,6 +1582,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: None,
             summary_model: Some("minimax/minimax-m2.7".into()),
+            worktree_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent_err(state, req).await;
@@ -1428,6 +1608,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: Some("openrouter".into()),
             summary_model: Some("minimax/minimax-m2.7".into()),
+            worktree_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent(axum::extract::State(state.clone()), Json(req))
@@ -1525,6 +1706,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: Some("openrouter".into()),
             summary_model: Some("minimax/minimax-m2.7".into()),
+            worktree_mode: None,
             is_default: None,
         };
         let (_status, _body) = create_agent(axum::extract::State(state.clone()), Json(req))
@@ -1545,5 +1727,347 @@ mod tests {
         let (status, body) = update_agent_err(state, agent.id.to_string(), patch).await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(err_code(&body), "SUMMARY_PROVIDER_MISSING_API_KEY");
+    }
+
+    // ── #946: worktree-mode flip on apply_update_request ──────────
+
+    #[test]
+    fn apply_update_flips_worktree_mode_off_to_git() {
+        let mut agent = new_agent("test");
+        assert_eq!(agent.worktree_mode, WorktreeMode::Off);
+
+        let req = UpdateAgentRequest {
+            worktree_mode: Some(WorktreeMode::Git),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert_eq!(agent.worktree_mode, WorktreeMode::Git);
+    }
+
+    #[test]
+    fn apply_update_flips_worktree_mode_git_to_off() {
+        let mut agent = new_agent("test");
+        agent.worktree_mode = WorktreeMode::Git;
+
+        let req = UpdateAgentRequest {
+            worktree_mode: Some(WorktreeMode::Off),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert_eq!(agent.worktree_mode, WorktreeMode::Off);
+    }
+
+    #[test]
+    fn apply_update_omitted_worktree_mode_is_no_op() {
+        // Omitting `worktree_mode` from the PATCH must leave the
+        // stored value alone — same shape as every other field.
+        let mut agent = new_agent("test");
+        agent.worktree_mode = WorktreeMode::Git;
+
+        let req = UpdateAgentRequest {
+            description: Some("touched".into()),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert_eq!(
+            agent.worktree_mode,
+            WorktreeMode::Git,
+            "omitted worktree_mode must NOT clobber the stored value"
+        );
+        assert_eq!(agent.description, "touched");
+    }
+
+    #[test]
+    fn update_request_parses_worktree_mode_off() {
+        let req: UpdateAgentRequest = serde_json::from_str(r#"{"worktree_mode": "off"}"#).unwrap();
+        assert_eq!(req.worktree_mode, Some(WorktreeMode::Off));
+    }
+
+    #[test]
+    fn update_request_parses_worktree_mode_git() {
+        let req: UpdateAgentRequest = serde_json::from_str(r#"{"worktree_mode": "git"}"#).unwrap();
+        assert_eq!(req.worktree_mode, Some(WorktreeMode::Git));
+    }
+
+    #[test]
+    fn update_request_parses_force_worktree_remove() {
+        let req: UpdateAgentRequest =
+            serde_json::from_str(r#"{"force_worktree_remove": true}"#).unwrap();
+        assert_eq!(req.force_worktree_remove, Some(true));
+    }
+
+    // ── #946: HTTP-level worktree-mode integration tests ──────────
+
+    /// Override the test app state's `project_root` AND wire a tempdir
+    /// git repo so worktree-mode HTTP tests have a real working tree
+    /// to fork from.
+    fn agents_test_state_with_git_project(tmp_dir: &std::path::Path) -> crate::server::AppState {
+        let status = |args: &[&str]| {
+            let s = std::process::Command::new("git")
+                .current_dir(tmp_dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed");
+        };
+        status(&["init", "--initial-branch=main"]);
+        status(&["config", "user.email", "test@example.com"]);
+        status(&["config", "user.name", "Test"]);
+        status(&["commit", "--allow-empty", "-m", "init"]);
+
+        let mut state = agents_test_app_state_with_sqlite();
+        state.project_root = tmp_dir.to_path_buf();
+        state
+    }
+
+    /// Issue acceptance: `POST /agents` with `worktree_mode = "git"`
+    /// on a git project provisions the worktree at the canonical
+    /// path AND persists the agent record with `worktree_mode =
+    /// Git`.
+    #[tokio::test]
+    async fn post_agents_with_worktree_mode_git_provisions_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = agents_test_state_with_git_project(tmp.path());
+
+        let req = alms_core::CreateAgentRequest {
+            name: "atlas".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: Some(WorktreeMode::Git),
+            is_default: None,
+        };
+
+        let (status, body) = create_agent(axum::extract::State(state.clone()), Json(req))
+            .await
+            .expect("create must succeed on git project");
+        assert_eq!(status, axum::http::StatusCode::CREATED);
+        assert_eq!(body.0["worktree_mode"], serde_json::json!("git"));
+
+        // Worktree directory exists at the canonical path.
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        assert!(
+            worktree_dir.is_dir(),
+            "expected worktree at {}",
+            worktree_dir.display()
+        );
+
+        // The agent record persisted with worktree_mode = Git.
+        let store = state.session_manager.store().expect("sqlite store");
+        let stored = store.load_agent_by_name("atlas").unwrap().unwrap();
+        assert_eq!(stored.worktree_mode, WorktreeMode::Git);
+    }
+
+    /// Issue acceptance: `POST /agents` with `worktree_mode = "git"`
+    /// on a non-git project returns `400 WORKTREE_REQUIRES_GIT` and
+    /// the agent record is NOT persisted.
+    #[tokio::test]
+    async fn post_agents_with_worktree_mode_git_on_non_git_project_returns_400() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Note: NO git init — bare directory.
+        let mut state = agents_test_app_state_with_sqlite();
+        state.project_root = tmp.path().to_path_buf();
+
+        let req = alms_core::CreateAgentRequest {
+            name: "atlas".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: Some(WorktreeMode::Git),
+            is_default: None,
+        };
+
+        let (status, body) = create_agent_err(state.clone(), req).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err_code(&body), "WORKTREE_REQUIRES_GIT");
+
+        // Defensive: no agent record.
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.load_agent_by_name("atlas").unwrap().is_none());
+        // Defensive: no stranded worktree dir.
+        assert!(
+            !tmp.path()
+                .join(".alms")
+                .join("worktrees")
+                .join("atlas")
+                .exists(),
+            "non-git project must not leave a half-created worktree dir"
+        );
+    }
+
+    /// `PATCH /agents/{id}` flipping `Off → Git` provisions the
+    /// worktree on the fly.
+    #[tokio::test]
+    async fn patch_agents_off_to_git_provisions_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = agents_test_state_with_git_project(tmp.path());
+
+        // Create the agent in `Off` mode first.
+        let store = state.session_manager.store().expect("sqlite store");
+        let mut agent = new_agent("atlas");
+        agent.worktree_mode = WorktreeMode::Off;
+        store.create_agent(&agent).unwrap();
+
+        let req = UpdateAgentRequest {
+            worktree_mode: Some(WorktreeMode::Git),
+            ..Default::default()
+        };
+        let result = update_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path(agent.id.0.to_string()),
+            Json(req),
+        )
+        .await
+        .expect("PATCH must succeed");
+
+        assert_eq!(result.0["worktree_mode"], serde_json::json!("git"));
+        assert!(
+            tmp.path()
+                .join(".alms")
+                .join("worktrees")
+                .join("atlas")
+                .is_dir(),
+            "Off → Git flip must provision the worktree"
+        );
+    }
+
+    /// `PATCH /agents/{id}` flipping `Git → Off` removes the
+    /// worktree and refuses if uncommitted changes are present
+    /// (without `force_worktree_remove`).
+    #[tokio::test]
+    async fn patch_agents_git_to_off_refuses_uncommitted_without_force() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = agents_test_state_with_git_project(tmp.path());
+
+        // Create with Git mode so the worktree is on disk.
+        let create_req = alms_core::CreateAgentRequest {
+            name: "atlas".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: Some(WorktreeMode::Git),
+            is_default: None,
+        };
+        let (_status, _body) = create_agent(axum::extract::State(state.clone()), Json(create_req))
+            .await
+            .expect("create must succeed");
+
+        // Dirty up the worktree.
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        std::fs::write(worktree_dir.join("dirty.txt"), "wip").unwrap();
+
+        // Flip Git → Off without force — must refuse.
+        let req = UpdateAgentRequest {
+            worktree_mode: Some(WorktreeMode::Off),
+            ..Default::default()
+        };
+        let (status, body) = update_agent_err(state.clone(), "atlas".into(), req).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(err_code(&body), "WORKTREE_HAS_UNCOMMITTED_CHANGES");
+        assert!(
+            worktree_dir.is_dir(),
+            "refused PATCH must leave the worktree on disk"
+        );
+
+        // Retry with force — should succeed.
+        let req_force = UpdateAgentRequest {
+            worktree_mode: Some(WorktreeMode::Off),
+            force_worktree_remove: Some(true),
+            ..Default::default()
+        };
+        let result = update_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("atlas".into()),
+            Json(req_force),
+        )
+        .await
+        .expect("force PATCH must succeed");
+        assert_eq!(result.0["worktree_mode"], serde_json::json!("off"));
+        assert!(
+            !worktree_dir.exists(),
+            "force PATCH must remove the worktree"
+        );
+    }
+
+    /// `DELETE /agents/{id}` with `worktree_mode = git` removes the
+    /// worktree. Refuses on uncommitted changes unless `?force=true`.
+    #[tokio::test]
+    async fn delete_agents_with_worktree_refuses_uncommitted_without_force() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = agents_test_state_with_git_project(tmp.path());
+
+        let create_req = alms_core::CreateAgentRequest {
+            name: "atlas".into(),
+            description: None,
+            model: None,
+            posture: None,
+            provider: None,
+            telegram_token: None,
+            thinking_budget_tokens: None,
+            reasoning_effort: None,
+            gemini_thinking_budget: None,
+            summary_provider: None,
+            summary_model: None,
+            worktree_mode: Some(WorktreeMode::Git),
+            is_default: None,
+        };
+        let _ = create_agent(axum::extract::State(state.clone()), Json(create_req))
+            .await
+            .expect("create");
+
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        std::fs::write(worktree_dir.join("dirty.txt"), "wip").unwrap();
+
+        // DELETE without force — refuses.
+        let result = delete_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("atlas".into()),
+            axum::extract::Query(DeleteAgentQuery { force: false }),
+        )
+        .await;
+        let (status, body) = result.expect_err("delete must refuse on uncommitted");
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(err_code(&body.0), "WORKTREE_HAS_UNCOMMITTED_CHANGES");
+
+        // The agent record is still there.
+        let store = state.session_manager.store().expect("sqlite store");
+        assert!(store.load_agent_by_name("atlas").unwrap().is_some());
+
+        // DELETE with force — succeeds.
+        let result = delete_agent(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("atlas".into()),
+            axum::extract::Query(DeleteAgentQuery { force: true }),
+        )
+        .await
+        .expect("force delete must succeed");
+        assert_eq!(result.0["ok"], serde_json::json!(true));
+        assert!(
+            !worktree_dir.exists(),
+            "force delete must remove the worktree"
+        );
+        assert!(store.load_agent_by_name("atlas").unwrap().is_none());
     }
 }

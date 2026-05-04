@@ -118,7 +118,8 @@ CREATE TABLE IF NOT EXISTS agents (
     reasoning_effort       TEXT,
     gemini_thinking_budget INTEGER,
     summary_provider       TEXT,
-    summary_model          TEXT
+    summary_model          TEXT,
+    worktree_mode          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
@@ -242,6 +243,12 @@ impl SqliteStore {
         // path.
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN summary_provider TEXT;");
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN summary_model TEXT;");
+        // Auto-migrate: add worktree_mode column for per-agent git worktree
+        // isolation (issue #946). NULL on existing rows is treated as
+        // `WorktreeMode::Off` by `parse_agent_row` so the column is
+        // backward-compatible — agents created before #946 keep their
+        // project-root sandbox without any operator action.
+        let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN worktree_mode TEXT;");
         // Auto-migrate: add run_tool_calls table for per-run tool call storage.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS run_tool_calls (\
@@ -502,6 +509,26 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
     // when they're observed at run time.
     let summary_provider: Option<String> = row.get(13)?;
     let summary_model: Option<String> = row.get(14)?;
+    // Per-agent worktree-isolation mode (issue #946). Stored as TEXT;
+    // NULL maps to `WorktreeMode::Off` for back-compat with rows
+    // written before the column existed. Unrecognised values are
+    // logged and mapped to `Off` so a corrupt row never crashes
+    // parsing — matches the defence-in-depth stance on
+    // `reasoning_effort` above.
+    let worktree_mode: alms_core::WorktreeMode = match row.get::<_, Option<String>>(15)? {
+        None => alms_core::WorktreeMode::Off,
+        Some(s) => match s.parse() {
+            Ok(mode) => mode,
+            Err(e) => {
+                tracing::warn!(
+                    stored = %s,
+                    error = %e,
+                    "Skipping unparseable worktree_mode in agents row — defaulting to Off"
+                );
+                alms_core::WorktreeMode::Off
+            }
+        },
+    };
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -526,6 +553,7 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         gemini_thinking_budget,
         summary_provider,
         summary_model,
+        worktree_mode,
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),

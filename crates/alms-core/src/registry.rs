@@ -9,6 +9,90 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Per-agent worktree-isolation mode (#946 — workspace v2).
+///
+/// Controls how the agent's filesystem-sandbox root is resolved at run-start:
+///
+/// - [`WorktreeMode::Off`] (default): the agent's sandbox root is the
+///   project root. Multiple agents with `Off` share the same project
+///   directory and can step on each other's edits if they are running
+///   concurrently. This matches the post-#945 default.
+/// - [`WorktreeMode::Git`]: at agent-create time the gateway runs
+///   `git worktree add <project>/.alms/worktrees/<name>/ -b alms/<name>`
+///   and pins the agent's sandbox root at that worktree path instead.
+///   Each agent gets its own copy of the working tree on a dedicated
+///   branch — multiple agents on the same git project can work in
+///   parallel without filesystem collisions. The parent project's
+///   `.git/info/exclude` is appended with the worktree path so
+///   `git status` on the parent does not show the worktree dir as
+///   untracked.
+///
+/// **Precedence with `[security].allow_full_os_access` (#947):** the
+/// security list always wins. An agent listed in
+/// `allow_full_os_access` runs without any filesystem sandbox at all
+/// (`AgentRuntime::with_unrestricted_filesystem`) regardless of its
+/// `worktree_mode`. The worktree itself is still created at
+/// agent-create time so the operator can flip the security knob off
+/// later without re-running `git worktree add` — only the run-time
+/// sandbox attachment is bypassed. A startup-time `WARN` documents
+/// the precedence.
+///
+/// `Git` mode requires the project root to already be a git working
+/// tree at agent-create time. Creating an agent with `mode = "git"`
+/// on a non-git project returns `400 WORKTREE_REQUIRES_GIT` and the
+/// agent record is NOT persisted. There is no silent fallback to
+/// project-root mode — an operator who asked for `mode = "git"` gets
+/// an explicit error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeMode {
+    /// Default. The agent's sandbox root is the project root.
+    #[default]
+    Off,
+    /// The agent's sandbox root is its own git worktree at
+    /// `<project>/.alms/worktrees/<name>/` on branch `alms/<name>`.
+    Git,
+}
+
+impl WorktreeMode {
+    /// Wire string (`"off"` / `"git"`).
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Git => "git",
+        }
+    }
+
+    /// Returns `true` when the mode is anything other than `Off`.
+    ///
+    /// Convenience helper for the gateway run-start path which only
+    /// needs to know whether to compute a worktree path or use the
+    /// default project-root pin.
+    pub fn is_active(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for WorktreeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_wire_str())
+    }
+}
+
+impl std::str::FromStr for WorktreeMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "git" => Ok(Self::Git),
+            other => Err(format!(
+                "invalid worktree_mode '{other}' — expected one of: off, git"
+            )),
+        }
+    }
+}
+
 /// A persistent agent registered in the system.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRecord {
@@ -95,6 +179,16 @@ pub struct AgentRecord {
     /// the full list of error codes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_model: Option<String>,
+    /// Per-agent worktree-isolation mode (#946).
+    ///
+    /// `Off` (default) → sandbox root is the project root.
+    /// `Git` → sandbox root is `<project>/.alms/worktrees/<name>/` on
+    /// branch `alms/<name>`. The worktree is created at agent-create
+    /// time and removed at agent-delete time. See
+    /// [`WorktreeMode`] for the precedence with
+    /// `[security].allow_full_os_access`.
+    #[serde(default)]
+    pub worktree_mode: WorktreeMode,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
@@ -134,6 +228,14 @@ pub struct CreateAgentRequest {
     /// together with `summary_provider`.
     #[serde(default)]
     pub summary_model: Option<String>,
+    /// Per-agent worktree-isolation mode (#946). `None` is treated as
+    /// `WorktreeMode::Off` for back-compat with clients that predate
+    /// the field. Setting `Some(WorktreeMode::Git)` requires the
+    /// project root to be a git working tree at the moment the
+    /// request is processed; non-git projects return `400
+    /// WORKTREE_REQUIRES_GIT` and the agent is NOT persisted.
+    #[serde(default)]
+    pub worktree_mode: Option<WorktreeMode>,
     #[serde(default)]
     pub is_default: Option<bool>,
 }
@@ -228,6 +330,21 @@ pub struct UpdateAgentRequest {
     /// same request — sending both is a `400 CLEAR_AND_VALUE_CONFLICT`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clear_summary_model: Option<bool>,
+    /// Per-agent worktree-isolation mode (#946). `Some(mode)` flips the
+    /// stored value; omit the field to leave the existing setting
+    /// unchanged. Flipping `Off → Git` triggers a `git worktree add`
+    /// at PATCH time; `Git → Off` triggers `git worktree remove`. The
+    /// remove path refuses if the worktree has uncommitted changes —
+    /// pass `force_worktree_remove: true` to override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_mode: Option<WorktreeMode>,
+    /// When `true`, force the `Git → Off` flip even if the worktree
+    /// has uncommitted changes. Has no effect when `worktree_mode` is
+    /// not `Some(WorktreeMode::Off)` or when the agent's stored mode
+    /// is already `Off`. The forced removal discards the worktree
+    /// contents AND deletes the `alms/<name>` branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub force_worktree_remove: Option<bool>,
 }
 
 /// Validate an agent name slug.
@@ -469,6 +586,46 @@ mod tests {
         assert_eq!(m2, 0);
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── #946: WorktreeMode enum tests ──────────────────────────────
+
+    #[test]
+    fn test_worktree_mode_default_is_off() {
+        assert_eq!(WorktreeMode::default(), WorktreeMode::Off);
+    }
+
+    #[test]
+    fn test_worktree_mode_wire_strings() {
+        assert_eq!(WorktreeMode::Off.as_wire_str(), "off");
+        assert_eq!(WorktreeMode::Git.as_wire_str(), "git");
+    }
+
+    #[test]
+    fn test_worktree_mode_is_active() {
+        assert!(!WorktreeMode::Off.is_active());
+        assert!(WorktreeMode::Git.is_active());
+    }
+
+    #[test]
+    fn test_worktree_mode_from_str() {
+        use std::str::FromStr;
+        assert_eq!(WorktreeMode::from_str("off").unwrap(), WorktreeMode::Off);
+        assert_eq!(WorktreeMode::from_str("git").unwrap(), WorktreeMode::Git);
+        assert_eq!(WorktreeMode::from_str("OFF").unwrap(), WorktreeMode::Off);
+        assert_eq!(WorktreeMode::from_str("GIT").unwrap(), WorktreeMode::Git);
+        assert!(WorktreeMode::from_str("xdg").is_err());
+        assert!(WorktreeMode::from_str("").is_err());
+    }
+
+    #[test]
+    fn test_worktree_mode_serde_lowercase() {
+        // Round-trip JSON serialization. Wire format is lowercase
+        // strings to match what the CLI accepts via `--worktree-mode`.
+        let json = serde_json::to_string(&WorktreeMode::Git).unwrap();
+        assert_eq!(json, r#""git""#);
+        let parsed: WorktreeMode = serde_json::from_str(r#""off""#).unwrap();
+        assert_eq!(parsed, WorktreeMode::Off);
     }
 
     #[test]

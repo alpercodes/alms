@@ -1118,23 +1118,38 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     }
 
     // Pin the agent's filesystem-sandbox boundary at the project root
-    // (#945). After this call `fs_*` and `shell` enforce against the same
-    // root and the shell's persistent cwd defaults to the project root —
-    // the workspace v2 single-root model. Must come AFTER the spill /
-    // tool-output-truncate builders so the accumulated `extra_fs_read_roots`
-    // are reflected in the read-family fs_* tool registrations.
+    // (#945) — or, when `worktree_mode = "git"` (#946), at the agent's
+    // dedicated worktree under `<project>/.alms/worktrees/<name>/`. After
+    // this call `fs_*` and `shell` enforce against the same root and the
+    // shell's persistent cwd defaults to that root. Must come AFTER the
+    // spill / tool-output-truncate builders so the accumulated
+    // `extra_fs_read_roots` are reflected in the read-family fs_* tool
+    // registrations.
     //
-    // Operator escape hatch (#947): when the agent's name is on
-    // `[security].allow_full_os_access`, skip `with_project_root` and
-    // call `with_unrestricted_filesystem` instead — the agent runs
-    // without a filesystem sandbox at all. `shell_permissions` (#717)
-    // and the destructive-command classifier (#745) still apply; they
-    // are independent operator policy. A run-start `WARN` fires below
-    // so log scanners can correlate runs against the loosened sandbox.
+    // Precedence (highest wins):
+    // 1. `[security].allow_full_os_access` (#947) — when the agent's
+    //    name is on the list, skip the sandbox pin entirely and call
+    //    `with_unrestricted_filesystem`. Worktree mode is silently
+    //    ignored at runtime per the documented precedence; the
+    //    worktree itself stays on disk because the operator may flip
+    //    the security knob off later.
+    // 2. `worktree_mode = "git"` (#946) — pin the sandbox at the
+    //    worktree path. Push `<project>/.alms/agents/` onto the
+    //    extra-read-roots list FIRST so the parent agent can still
+    //    `fs_read('.alms/agents/<sibling>/personality.md')` from
+    //    outside its worktree (matches the issue's sibling-read
+    //    acceptance criterion).
+    // 3. Default — `with_project_root(state.project_root)` as #945
+    //    intended.
+    //
+    // `shell_permissions` (#717) and the destructive-command
+    // classifier (#745) apply at every level — they are independent
+    // operator policy, not part of the sandbox.
     let full_os_access = agent_name
         .as_deref()
         .map(|n| state.security_config.is_full_os_access_agent(n))
         .unwrap_or(false);
+    let resolved_worktree_mode = resolved.worktree_mode;
     if full_os_access {
         // Defensive `unwrap` is fine — `full_os_access` is only true when
         // `agent_name` is `Some`.
@@ -1144,12 +1159,41 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
             agent_name = %name,
             run_id = %run_id.0,
             allow_full_os_access = true,
+            worktree_mode = %resolved_worktree_mode.as_wire_str(),
             "Run starting for agent '{}' WITHOUT project-root filesystem sandbox \
              (allow_full_os_access). shell_permissions and the destructive-command \
-             classifier still apply.",
+             classifier still apply. Worktree-mode is silently ignored at runtime \
+             when the agent is on the security list.",
             name,
         );
         runtime = runtime.with_unrestricted_filesystem();
+    } else if resolved_worktree_mode == alms_core::WorktreeMode::Git
+        && let Some(ref name) = agent_name
+    {
+        // Worktree-mode-git path. The worktree was provisioned at
+        // agent-create time (or on a `mode: off → git` PATCH); we
+        // just compute the path again here and pin the sandbox at
+        // it. If the directory has been removed externally,
+        // `with_project_root` will fall back to the as-is path
+        // with a WARN — the run continues with whatever fs sandbox
+        // semantics the missing directory produces.
+        let worktree_dir = alms_core::worktree::worktree_path(&state.project_root, name);
+        // Sibling-read root: the project's `.alms/agents/` tree,
+        // read-only. This lets a parent agent in worktree mode still
+        // read sibling personality metadata from outside its
+        // worktree. Scoped tightly — NOT the entire project root,
+        // which would defeat the worktree's filesystem isolation.
+        let sibling_read_root = state.project_root.join(".alms").join("agents");
+        runtime = runtime
+            .with_extra_fs_read_root(sibling_read_root)
+            .with_project_root(worktree_dir.clone());
+        info!(
+            target: "alms.worktree",
+            agent_name = %name,
+            run_id = %run_id.0,
+            worktree_dir = %worktree_dir.display(),
+            "Run starting under per-agent git worktree (#946)"
+        );
     } else {
         runtime = runtime.with_project_root(state.project_root.clone());
     }

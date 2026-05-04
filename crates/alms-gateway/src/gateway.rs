@@ -227,9 +227,60 @@ pub(crate) fn warn_full_os_access_at_boot(security_config: &alms_core::config::S
             "Agent '{}' is in [security].allow_full_os_access — runs will execute \
              WITHOUT the project-root filesystem sandbox. shell_permissions and \
              the destructive-command classifier still apply. Worktree-mode (when \
-             wired up) is silently ignored for this agent.",
+             configured) is silently ignored for this agent.",
             agent_name,
         );
+    }
+}
+
+/// Emit a boot-time `WARN` for every agent that has both
+/// `worktree_mode = "git"` AND is on `[security].allow_full_os_access`
+/// (#946 + #947 precedence overlap).
+///
+/// At runtime the security list wins — the agent runs without any
+/// filesystem sandbox even though it has a worktree provisioned. The
+/// worktree itself stays on disk so the operator can flip the
+/// security knob off later without re-running `git worktree add`. We
+/// surface the conflict at boot so operators see it on every restart,
+/// not just on the per-run WARN that fires from the runs lifecycle.
+///
+/// Best-effort: when the SQLite store is unavailable (in-memory test
+/// builds, missing data dir) the function is a no-op.
+pub(crate) fn warn_worktree_and_full_os_access_overlap_at_boot(
+    store: Option<&std::sync::Arc<alms_session::SqliteStore>>,
+    security_config: &alms_core::config::SecurityConfig,
+) {
+    if security_config.allow_full_os_access.is_empty() {
+        return;
+    }
+    let Some(store) = store else {
+        return;
+    };
+    let agents = match store.list_agents() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(error = %e, "Could not list agents for worktree/full-os-access overlap WARN");
+            return;
+        }
+    };
+    for agent in agents {
+        if agent.worktree_mode == alms_core::WorktreeMode::Git
+            && security_config.is_full_os_access_agent(&agent.name)
+        {
+            warn!(
+                target: "alms.security",
+                agent_name = %agent.name,
+                allow_full_os_access = true,
+                worktree_mode = "git",
+                "Agent '{}' has worktree_mode=git AND is on [security].allow_full_os_access. \
+                 At runtime the security list wins — the agent will run WITHOUT any \
+                 filesystem sandbox. The worktree at <project>/.alms/worktrees/{}/ \
+                 stays on disk so the operator can flip the security knob off later \
+                 without re-creating it.",
+                agent.name,
+                agent.name,
+            );
+        }
     }
 }
 
@@ -498,6 +549,19 @@ impl Gateway {
         // continues to surface the policy at run granularity.
         warn_full_os_access_at_boot(&self.config.security_config);
 
+        // Boot-time WARN for every agent that has BOTH
+        // `worktree_mode = "git"` (#946) AND is on
+        // `[security].allow_full_os_access`. The security list always
+        // wins at runtime — the worktree exists on disk (so flipping
+        // the security knob off restores the worktree sandbox without
+        // a re-create) but the run-time sandbox attachment is
+        // skipped. Surface the precedence at boot so operators can
+        // catch the conflict in the daemon's first 200 lines.
+        warn_worktree_and_full_os_access_overlap_at_boot(
+            self.session_manager.store(),
+            &self.config.security_config,
+        );
+
         // Shell output spill retention sweep (issue #756). Runs once at
         // startup — no background ticker — so expired `.alms/shell_output/*`
         // files are cleaned up the next time the gateway restarts rather
@@ -719,33 +783,54 @@ impl Gateway {
                             runtime = runtime.with_shell_default_env(shell_env);
                         }
                     }
-                    // Pin the agent's sandbox at the project root (#945).
-                    // Mirror the HTTP path so Telegram-triggered runs see
-                    // the same single-root model. Must precede
-                    // `with_workspace` so the project-root re-registration
+                    // Pin the agent's sandbox at the project root (#945)
+                    // — or, when `worktree_mode = "git"` (#946), at the
+                    // agent's dedicated worktree under
+                    // `<project>/.alms/worktrees/<name>/`. Mirror the HTTP
+                    // path so Telegram-triggered runs see the same model.
+                    // Must precede `with_workspace` so the re-registration
                     // of fs_* / shell happens before workspace attachment.
                     //
-                    // `[security].allow_full_os_access` (#947): when the
-                    // agent's name is on the list, skip the project-root
-                    // pin and drop the sandbox entirely. Mirrors the HTTP
-                    // path in `runs/lifecycle.rs`. A run-start `WARN`
-                    // fires for parity.
+                    // Precedence: `[security].allow_full_os_access` wins
+                    // over both worktree mode and project-root mode. The
+                    // worktree (if provisioned) stays on disk — only the
+                    // run-time sandbox attachment is bypassed.
                     let full_os_access = self
                         .config
                         .security_config
                         .is_full_os_access_agent(&effective_name);
+                    let worktree_mode = resolved.worktree_mode;
                     if full_os_access {
                         warn!(
                             target: "alms.security",
                             agent_name = %effective_name,
                             allow_full_os_access = true,
                             channel = "telegram",
+                            worktree_mode = %worktree_mode.as_wire_str(),
                             "Telegram run starting for agent '{}' WITHOUT project-root \
                              filesystem sandbox (allow_full_os_access). shell_permissions \
-                             and the destructive-command classifier still apply.",
+                             and the destructive-command classifier still apply. \
+                             Worktree-mode is silently ignored at runtime.",
                             effective_name,
                         );
                         runtime = runtime.with_unrestricted_filesystem();
+                    } else if worktree_mode == alms_core::WorktreeMode::Git
+                        && let Some(project_root) = self.config.project_root.clone()
+                    {
+                        let worktree_dir =
+                            alms_core::worktree::worktree_path(&project_root, &effective_name);
+                        let sibling_read_root =
+                            project_root.join(".alms").join("agents");
+                        runtime = runtime
+                            .with_extra_fs_read_root(sibling_read_root)
+                            .with_project_root(worktree_dir.clone());
+                        info!(
+                            target: "alms.worktree",
+                            agent_name = %effective_name,
+                            channel = "telegram",
+                            worktree_dir = %worktree_dir.display(),
+                            "Telegram run starting under per-agent git worktree (#946)"
+                        );
                     } else if let Some(project_root) = self.config.project_root.clone() {
                         runtime = runtime.with_project_root(project_root);
                     }
@@ -984,6 +1069,7 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         gemini_thinking_budget: None,
         summary_provider: None,
         summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
         is_default: false,
         created_at: now,
         last_active: now,
@@ -1125,6 +1211,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: None,
             summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
             is_default: true,
             created_at: now,
             last_active: now,

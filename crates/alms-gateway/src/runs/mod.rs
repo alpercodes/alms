@@ -157,6 +157,10 @@ mod config {
         pub llm: alms_runtime::LlmClient,
         /// Agent name from registry (None if record not found).
         pub agent_name: Option<String>,
+        /// Per-agent worktree-isolation mode (#946). `Off` for unnamed
+        /// / unregistered agents and for agents that haven't opted
+        /// into the worktree dance.
+        pub worktree_mode: alms_core::WorktreeMode,
     }
 
     /// Failure modes from [`resolve_agent_config`].
@@ -429,10 +433,21 @@ mod config {
             });
         }
 
+        // Per-agent worktree-isolation mode (#946). Unnamed agents
+        // and agents not in the registry get `Off` — there is no
+        // worktree to attach to, so the run uses the project root
+        // (or the security escape hatch) like every other unnamed
+        // run.
+        let worktree_mode = agent_record
+            .as_ref()
+            .map(|r| r.worktree_mode)
+            .unwrap_or_default();
+
         Ok(ResolvedAgentConfig {
             agent_config: cfg,
             llm,
             agent_name,
+            worktree_mode,
         })
     }
 }
@@ -508,6 +523,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: None,
             summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
             is_default: false,
             created_at: now,
             last_active: now,

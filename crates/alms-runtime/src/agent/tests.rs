@@ -4151,4 +4151,154 @@ mod allow_full_os_access {
              {blocked_outcome}"
         );
     }
+
+    /// Worktree-mode sibling-reads guard test (#946).
+    ///
+    /// When an agent runs in `WorktreeMode::Git`, the gateway pins the
+    /// sandbox at `<project>/.alms/worktrees/<name>/` instead of the
+    /// project root. The agent must STILL be able to read sibling
+    /// personality metadata at
+    /// `<project>/.alms/agents/<sibling>/personality.md`, which sits
+    /// OUTSIDE the worktree directory.
+    ///
+    /// The gateway's run-lifecycle wiring achieves this by calling
+    /// `with_extra_fs_read_root(<project>/.alms/agents/)` BEFORE
+    /// `with_project_root(<worktree_path>)`. This test pins that
+    /// invariant: if a future refactor reorders the calls or drops
+    /// the extra read root, the parent agent loses access to sibling
+    /// personality and multi-agent coordination silently breaks.
+    #[tokio::test]
+    async fn test_worktree_mode_sibling_reads_via_extra_read_root() {
+        use crate::workspace::AgentWorkspace;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().to_path_buf();
+        let agents_dir = project_root.join(".alms").join("agents");
+        let worktree_dir = project_root.join(".alms").join("worktrees").join("parent");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+
+        // Sibling metadata lives at `.alms/agents/sibling/` — OUTSIDE
+        // the worktree dir, but reachable via the extra-read-roots
+        // shim the gateway wires up.
+        let sibling_meta_dir = agents_dir.join("sibling");
+        std::fs::create_dir_all(&sibling_meta_dir).unwrap();
+        let sibling_personality = sibling_meta_dir.join("personality.md");
+        std::fs::write(&sibling_personality, "I am the sibling.\n").unwrap();
+
+        // Build the parent agent exactly as the worktree-mode-git
+        // path of the gateway run lifecycle wires it: extra read
+        // root FIRST (sibling reads), then `with_project_root` at
+        // the worktree, then `with_workspace` for the parent's own
+        // metadata directory inside the project.
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        let runtime = AgentRuntime::new(
+            AgentId::new(),
+            agent_config,
+            LlmClient::new(config).unwrap(),
+        )
+        .expect("runtime")
+        .with_extra_fs_read_root(agents_dir.clone())
+        .with_project_root(worktree_dir.clone())
+        .with_workspace(AgentWorkspace::new(&agents_dir, "parent"));
+
+        // Resolve the absolute path to the sibling's personality file.
+        // We pass an absolute path because, from inside the worktree,
+        // `.alms/agents/...` would resolve relative to the worktree
+        // and miss the sibling tree entirely. The extra-read-roots
+        // shim accepts the absolute path as long as it's inside one
+        // of the registered extras.
+        let abs = std::fs::canonicalize(&sibling_personality)
+            .expect("canonicalize sibling personality path");
+
+        let result = runtime
+            .tools()
+            .execute(
+                "fs_read",
+                serde_json::json!({ "path": abs.to_string_lossy() }),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "parent in worktree mode must be able to read sibling \
+             personality via extra_fs_read_roots: {:?}",
+            result.err(),
+        );
+        let value = result.unwrap();
+        assert!(
+            value["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("I am the sibling"),
+            "expected sibling personality contents, got {value}"
+        );
+    }
+
+    /// Defensive: a parent in worktree mode WITHOUT the extra read
+    /// root cannot reach the sibling personality file. This pins
+    /// the load-bearing nature of the `with_extra_fs_read_root`
+    /// call in `runs/lifecycle.rs::execute_run` — drop the call and
+    /// the test passes (read fails) where it should fail (read
+    /// succeeds).
+    #[tokio::test]
+    async fn test_worktree_mode_sibling_reads_blocked_without_extras() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let project_root = dir.path().to_path_buf();
+        let agents_dir = project_root.join(".alms").join("agents");
+        let worktree_dir = project_root.join(".alms").join("worktrees").join("parent");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::create_dir_all(&worktree_dir).unwrap();
+
+        let sibling_meta_dir = agents_dir.join("sibling");
+        std::fs::create_dir_all(&sibling_meta_dir).unwrap();
+        let sibling_personality = sibling_meta_dir.join("personality.md");
+        std::fs::write(&sibling_personality, "I am the sibling.\n").unwrap();
+
+        let config = LlmConfig {
+            mock: true,
+            ..LlmConfig::default()
+        };
+        let agent_config = AgentConfig {
+            sandbox_root: "".into(),
+            ..AgentConfig::default()
+        };
+        // No `with_extra_fs_read_root` call — only `with_project_root`
+        // pinning the sandbox at the worktree dir.
+        let runtime = AgentRuntime::new(
+            AgentId::new(),
+            agent_config,
+            LlmClient::new(config).unwrap(),
+        )
+        .expect("runtime")
+        .with_project_root(worktree_dir.clone());
+
+        let abs = std::fs::canonicalize(&sibling_personality)
+            .expect("canonicalize sibling personality path");
+
+        let result = runtime
+            .tools()
+            .execute(
+                "fs_read",
+                serde_json::json!({ "path": abs.to_string_lossy() }),
+            )
+            .await;
+
+        assert!(
+            result.is_err() || result.as_ref().ok().and_then(|v| v.get("error")).is_some(),
+            "parent without extra_fs_read_roots must NOT be able to \
+             read outside the worktree — got Ok({:?})",
+            result.ok(),
+        );
+    }
 }

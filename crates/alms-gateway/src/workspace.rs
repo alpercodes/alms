@@ -393,6 +393,7 @@ mod open_tests {
             gemini_thinking_budget: None,
             summary_provider: None,
             summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
             is_default: false,
             created_at: now,
             last_active: now,

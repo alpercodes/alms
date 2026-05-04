@@ -331,9 +331,11 @@ async fn main() -> anyhow::Result<()> {
                     gemini_thinking_budget,
                     summary_provider,
                     summary_model,
+                    worktree_mode,
                     default,
                 } => {
                     let workspace_dir = config.server.agents_dir();
+                    let project_root = config.server.resolved_project_root();
                     cmd_agent::agent_create(
                         &store,
                         cmd_agent::AgentCreateOpts {
@@ -347,6 +349,8 @@ async fn main() -> anyhow::Result<()> {
                             gemini_thinking_budget,
                             summary_provider,
                             summary_model,
+                            worktree_mode: worktree_mode.map(Into::into).unwrap_or_default(),
+                            project_root: Some(&project_root),
                             default,
                             json,
                             workspace_dir: Some(&workspace_dir),
@@ -357,7 +361,8 @@ async fn main() -> anyhow::Result<()> {
                     cmd_agent::agent_show(&store, &name_or_id, json)?;
                 }
                 AgentCommands::Delete { name_or_id, force } => {
-                    cmd_agent::agent_delete(&store, &name_or_id, force, json)?;
+                    let project_root = config.server.resolved_project_root();
+                    cmd_agent::agent_delete(&store, &name_or_id, force, json, Some(&project_root))?;
                 }
                 AgentCommands::SetDefault { name_or_id } => {
                     cmd_agent::agent_set_default(&store, &name_or_id, json)?;
@@ -375,7 +380,10 @@ async fn main() -> anyhow::Result<()> {
                     summary_model,
                     clear_summary_provider,
                     clear_summary_model,
+                    worktree_mode,
+                    force_worktree_remove,
                 } => {
+                    let project_root = config.server.resolved_project_root();
                     cmd_agent::agent_config(
                         &store,
                         cmd_agent::AgentConfigOpts {
@@ -391,6 +399,9 @@ async fn main() -> anyhow::Result<()> {
                             summary_model,
                             clear_summary_provider,
                             clear_summary_model,
+                            worktree_mode: worktree_mode.map(Into::into),
+                            force_worktree_remove,
+                            project_root: Some(&project_root),
                             json,
                         },
                     )?;

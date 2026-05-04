@@ -1,4 +1,4 @@
-use alms_core::{AgentId, AgentRecord, config::ReasoningEffort, validate_agent_name};
+use alms_core::{AgentId, AgentRecord, WorktreeMode, config::ReasoningEffort, validate_agent_name};
 use alms_session::SqliteStore;
 use clap::{Subcommand, ValueEnum};
 
@@ -24,6 +24,26 @@ impl From<ReasoningEffortArg> for ReasoningEffort {
             ReasoningEffortArg::Low => ReasoningEffort::Low,
             ReasoningEffortArg::Medium => ReasoningEffort::Medium,
             ReasoningEffortArg::High => ReasoningEffort::High,
+        }
+    }
+}
+
+/// Clap-compatible wrapper around [`WorktreeMode`] (#946).
+///
+/// Defined here (rather than deriving `ValueEnum` on the core type) so
+/// that the core crate stays clap-free — same shape as
+/// [`ReasoningEffortArg`].
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum WorktreeModeArg {
+    Off,
+    Git,
+}
+
+impl From<WorktreeModeArg> for WorktreeMode {
+    fn from(v: WorktreeModeArg) -> Self {
+        match v {
+            WorktreeModeArg::Off => WorktreeMode::Off,
+            WorktreeModeArg::Git => WorktreeMode::Git,
         }
     }
 }
@@ -84,6 +104,17 @@ pub(crate) enum AgentCommands {
         /// rejected at create/PATCH time.
         #[arg(long)]
         summary_model: Option<String>,
+        /// Per-agent git worktree-isolation mode (#946). `off`
+        /// (default) → sandbox root is the project root. `git` → at
+        /// agent-create time the CLI runs `git worktree add
+        /// <project>/.alms/worktrees/<name>/ -b alms/<name>` and pins
+        /// the agent's sandbox at that worktree path. Multiple
+        /// agents on `git` mode can work in parallel on the same
+        /// repo without filesystem collisions. Requires the project
+        /// to be a git working tree; non-git projects fail with a
+        /// clear error and the agent record is NOT persisted.
+        #[arg(long, value_enum)]
+        worktree_mode: Option<WorktreeModeArg>,
         /// Set as the default agent
         #[arg(long)]
         default: bool,
@@ -168,6 +199,22 @@ pub(crate) enum AgentCommands {
         /// `--clear-summary-provider`.
         #[arg(long)]
         clear_summary_model: bool,
+        /// Per-agent git worktree-isolation mode (#946). Flips the
+        /// stored value: `off → git` runs `git worktree add` and
+        /// pins the agent's sandbox at the new worktree; `git → off`
+        /// runs `git worktree remove` and refuses if the worktree
+        /// has uncommitted changes (pass `--force-worktree-remove`
+        /// to override — that path also deletes the `alms/<name>`
+        /// branch). Omit the flag to leave the existing setting
+        /// unchanged.
+        #[arg(long, value_enum)]
+        worktree_mode: Option<WorktreeModeArg>,
+        /// When flipping `--worktree-mode off` from `git`, force the
+        /// removal even if the worktree has uncommitted changes. Has
+        /// no effect on other transitions. Discards the worktree
+        /// contents AND deletes the `alms/<name>` branch.
+        #[arg(long)]
+        force_worktree_remove: bool,
     },
 }
 
@@ -231,6 +278,19 @@ pub(crate) struct AgentCreateOpts<'a> {
     /// inherits the server-level `[context].summary_model`. Must be
     /// set together with `summary_provider`.
     pub summary_model: Option<String>,
+    /// Per-agent git worktree-isolation mode (#946). `Off` (default)
+    /// keeps the sandbox at the project root; `Git` runs
+    /// `git worktree add <project>/.alms/worktrees/<name>/ -b
+    /// alms/<name>` AT THIS CALL SITE before persisting the agent.
+    /// Non-git projects fail with `WORKTREE_REQUIRES_GIT` and the
+    /// agent is NOT persisted.
+    pub worktree_mode: WorktreeMode,
+    /// Optional project root for resolving `git worktree add` when
+    /// `worktree_mode == Git`. `None` is fine for `Off` agents and
+    /// for unit tests; `Some(path)` is required when `worktree_mode`
+    /// is `Git` — the CLI's `agent create` wires this from
+    /// `config.server.project_root()`.
+    pub project_root: Option<&'a std::path::Path>,
     pub default: bool,
     pub json: bool,
     pub workspace_dir: Option<&'a std::path::Path>,
@@ -248,12 +308,52 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         gemini_thinking_budget,
         summary_provider,
         summary_model,
+        worktree_mode,
+        project_root,
         default,
         json,
         workspace_dir,
     } = opts;
 
     validate_agent_name(&name)?;
+
+    // Worktree-mode (#946). Provision the worktree BEFORE persisting
+    // the agent record so a non-git project produces a clean error
+    // with NO half-created agent and NO half-created worktree
+    // directory. Mirrors the HTTP `POST /agents` shape.
+    //
+    // The CLI does NOT consult `[security].allow_full_os_access`
+    // here — that's a daemon-side runtime concern, and the worktree
+    // creation is purely a side-effect of the registry record. The
+    // gateway's boot-time WARN catches the overlap on the next
+    // restart.
+    if worktree_mode == WorktreeMode::Git {
+        let project_root = project_root.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--worktree-mode git requires a project root, but the CLI was invoked \
+                 without one. Run `alms agent create` from inside an `alms` daemon \
+                 project directory or set ALMS_PROJECT_ROOT explicitly."
+            )
+        })?;
+
+        // Refuse to create a worktree if the agent name is already
+        // taken — same shape as the HTTP path.
+        if let Ok(Some(_)) = store.load_agent_by_name(&name) {
+            anyhow::bail!("Agent name '{name}' already exists");
+        }
+        if let Err(e) = alms_core::worktree::create_worktree(project_root, &name) {
+            return Err(match e {
+                alms_core::worktree::WorktreeError::NotAGitRepo => anyhow::anyhow!(
+                    "WORKTREE_REQUIRES_GIT: --worktree-mode git requires the project \
+                     root to be a git working tree (project: {}). Either run `git init` \
+                     in the project directory or omit --worktree-mode to use the \
+                     project-root sandbox.",
+                    project_root.display()
+                ),
+                other => anyhow::anyhow!("WORKTREE_GIT_FAILED: {other}"),
+            });
+        }
+    }
 
     // Reject empty / whitespace-only summary values up front (S2 follow-up
     // on #876). The HTTP `PUT /agents/{id}` path returns `SUMMARY_FIELD_EMPTY`
@@ -329,6 +429,7 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         // with surrounding whitespace probably means it.
         summary_provider,
         summary_model,
+        worktree_mode,
         is_default: default,
         created_at: now,
         last_active: now,
@@ -336,6 +437,17 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
 
     if let Err(e) = store.create_agent(&agent) {
         if matches!(&e, alms_core::AlmsError::DuplicateName(_)) {
+            // Roll back the worktree we just created so a duplicate
+            // collision doesn't leave a stranded worktree dir behind.
+            if worktree_mode == WorktreeMode::Git
+                && let Some(project_root) = project_root
+                && let Err(rb) =
+                    alms_core::worktree::remove_worktree(project_root, &agent.name, true)
+            {
+                eprintln!(
+                    "Warning: failed to roll back worktree after duplicate-name collision: {rb}"
+                );
+            }
             anyhow::bail!("Agent name '{}' already exists", agent.name);
         }
         return Err(e.into());
@@ -448,6 +560,10 @@ pub(crate) fn agent_show(store: &SqliteStore, name_or_id: &str, json: bool) -> a
         "Sum Model:     {}",
         agent.summary_model.as_deref().unwrap_or("(server default)")
     );
+    // Per-agent worktree-isolation mode (#946). Surface the wire
+    // string verbatim so operators can match against the same
+    // value `agent create --worktree-mode <value>` would accept.
+    println!("Worktree:      {}", agent.worktree_mode.as_wire_str());
     println!(
         "Default:       {}",
         if agent.is_default { "yes" } else { "no" }
@@ -462,6 +578,7 @@ pub(crate) fn agent_delete(
     name_or_id: &str,
     force: bool,
     json: bool,
+    project_root: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     let agent = resolve_agent(store, name_or_id)?;
     if agent.is_default && !force {
@@ -469,6 +586,34 @@ pub(crate) fn agent_delete(
             "Cannot delete the default agent '{}'. Set another agent as default first, or use --force.",
             agent.name
         );
+    }
+    // Worktree teardown (#946). Runs BEFORE the SQLite delete so an
+    // uncommitted-changes refusal surfaces a clean error without
+    // orphaning the registry record. `--force` drives both the
+    // default-agent override and the uncommitted-changes override
+    // because the user's intent is "I really want this gone" and
+    // splitting the flag would be more friction than safety.
+    if agent.worktree_mode == WorktreeMode::Git {
+        let project_root = project_root.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Agent '{}' has worktree_mode=git but no project root was provided. \
+                 Run from inside the project directory or set ALMS_PROJECT_ROOT.",
+                agent.name
+            )
+        })?;
+        if let Err(e) = alms_core::worktree::remove_worktree(project_root, &agent.name, force) {
+            return Err(match e {
+                alms_core::worktree::WorktreeError::UncommittedChanges => anyhow::anyhow!(
+                    "WORKTREE_HAS_UNCOMMITTED_CHANGES: agent '{}' has uncommitted changes \
+                     in its worktree. Commit / stash them, or pass --force to delete \
+                     the agent — this discards the worktree contents AND deletes the \
+                     `alms/{}` branch.",
+                    agent.name,
+                    agent.name
+                ),
+                other => anyhow::anyhow!("WORKTREE_GIT_FAILED: {other}"),
+            });
+        }
     }
     store.delete_agent(agent.id)?;
     if json {
@@ -539,6 +684,20 @@ pub(crate) struct AgentConfigOpts<'a> {
     /// When `true`, clear the per-agent `summary_model` override.
     /// Mutually exclusive with `summary_model: Some(_)`.
     pub clear_summary_model: bool,
+    /// Per-agent git worktree-isolation mode (#946). `Some(mode)`
+    /// flips the stored value AND triggers the matching git
+    /// worktree side-effect (`add` / `remove`). `None` leaves the
+    /// stored value unchanged.
+    pub worktree_mode: Option<WorktreeMode>,
+    /// When flipping `Git → Off`, force the worktree removal even
+    /// if it has uncommitted changes. Has no effect on other
+    /// transitions. Discards the worktree contents AND deletes the
+    /// `alms/<name>` branch.
+    pub force_worktree_remove: bool,
+    /// Project root for resolving `git worktree add` / `remove`
+    /// when `worktree_mode` is set. `None` is fine for transitions
+    /// that don't run git (e.g. PATCH that omits worktree_mode).
+    pub project_root: Option<&'a std::path::Path>,
     pub json: bool,
 }
 
@@ -556,6 +715,9 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
         summary_model,
         clear_summary_provider,
         clear_summary_model,
+        worktree_mode,
+        force_worktree_remove,
+        project_root,
         json,
     } = opts;
 
@@ -650,6 +812,62 @@ pub(crate) fn agent_config(store: &SqliteStore, opts: AgentConfigOpts<'_>) -> an
         agent.summary_model = Some(model.trim().to_string());
     }
 
+    // Per-agent worktree-mode flip (#946). The side-effecting `git
+    // worktree add` / `remove` runs BEFORE the SQLite update so a
+    // failure surfaces a clean error without leaving the record
+    // half-changed. Mirrors the HTTP `PATCH /agents/{id}` flow.
+    let prev_worktree_mode = agent.worktree_mode;
+    if let Some(new_mode) = worktree_mode {
+        agent.worktree_mode = new_mode;
+        if prev_worktree_mode != new_mode {
+            let project_root = project_root.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--worktree-mode flip requires a project root, but the CLI was \
+                     invoked without one. Run from inside the project directory or set \
+                     ALMS_PROJECT_ROOT explicitly."
+                )
+            })?;
+            match (prev_worktree_mode, new_mode) {
+                (WorktreeMode::Off, WorktreeMode::Git) => {
+                    if let Err(e) = alms_core::worktree::create_worktree(project_root, &agent.name)
+                    {
+                        return Err(match e {
+                            alms_core::worktree::WorktreeError::NotAGitRepo => anyhow::anyhow!(
+                                "WORKTREE_REQUIRES_GIT: --worktree-mode git requires the project \
+                                 root to be a git working tree (project: {}).",
+                                project_root.display()
+                            ),
+                            other => anyhow::anyhow!("WORKTREE_GIT_FAILED: {other}"),
+                        });
+                    }
+                }
+                (WorktreeMode::Git, WorktreeMode::Off) => {
+                    if let Err(e) = alms_core::worktree::remove_worktree(
+                        project_root,
+                        &agent.name,
+                        force_worktree_remove,
+                    ) {
+                        return Err(match e {
+                            alms_core::worktree::WorktreeError::UncommittedChanges => {
+                                anyhow::anyhow!(
+                                    "WORKTREE_HAS_UNCOMMITTED_CHANGES: agent '{}' has \
+                                     uncommitted changes in its worktree. Commit / stash \
+                                     them or pass --force-worktree-remove to discard — \
+                                     this drops the worktree contents AND deletes the \
+                                     `alms/{}` branch.",
+                                    agent.name,
+                                    agent.name
+                                )
+                            }
+                            other => anyhow::anyhow!("WORKTREE_GIT_FAILED: {other}"),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Pair-only invariant on the post-update record state. Mirrors the
     // HTTP `PUT /agents/{id}` validator — setting one field without the
     // other (whether by patching just one half or by clearing one half
@@ -717,6 +935,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: None,
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -735,7 +955,7 @@ mod tests {
         assert_eq!(agent.description, "desc");
 
         // Delete
-        agent_delete(&store, "test-agent", false, false).unwrap();
+        agent_delete(&store, "test-agent", false, false, None).unwrap();
         assert!(store.list_agents().unwrap().is_empty());
     }
 
@@ -755,6 +975,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: None,
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -774,6 +996,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: None,
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -799,6 +1023,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: None,
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -827,6 +1053,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: None,
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: Some(&ws_dir),
@@ -871,7 +1099,7 @@ mod tests {
         let agent = make_agent(&store, "main");
         store.set_default_agent(agent.id).unwrap();
 
-        let err = agent_delete(&store, "main", false, false).unwrap_err();
+        let err = agent_delete(&store, "main", false, false, None).unwrap_err();
         assert!(err.to_string().contains("Cannot delete the default"));
     }
 
@@ -881,7 +1109,7 @@ mod tests {
         let agent = make_agent(&store, "main");
         store.set_default_agent(agent.id).unwrap();
 
-        agent_delete(&store, "main", true, false).unwrap();
+        agent_delete(&store, "main", true, false, None).unwrap();
         assert!(store.list_agents().unwrap().is_empty());
     }
 
@@ -905,6 +1133,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -933,6 +1164,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: None,
             summary_model: None,
+            worktree_mode: WorktreeMode::Off,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -955,6 +1187,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -987,6 +1222,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: None,
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1015,6 +1252,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: None,
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1046,6 +1285,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1069,6 +1311,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1092,6 +1337,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1129,6 +1377,8 @@ mod tests {
                 gemini_thinking_budget: Some(16384),
                 summary_provider: None,
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1158,6 +1408,8 @@ mod tests {
                 gemini_thinking_budget: Some(0),
                 summary_provider: None,
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1189,6 +1441,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1212,6 +1467,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1236,6 +1494,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1274,6 +1535,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: Some("openrouter".into()),
                 summary_model: Some("minimax/minimax-m2.7".into()),
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1304,6 +1567,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: Some("openrouter".into()),
                 summary_model: None,
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1332,6 +1597,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: None,
                 summary_model: Some("minimax/minimax-m2.7".into()),
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1363,6 +1630,9 @@ mod tests {
                 summary_model: Some("minimax/minimax-m2.7".into()),
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1392,6 +1662,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: Some("openrouter".to_string()),
             summary_model: Some("minimax/minimax-m2.7".to_string()),
+            worktree_mode: WorktreeMode::Off,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -1413,6 +1684,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: true,
                 clear_summary_model: true,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1441,6 +1715,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: true,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1470,6 +1747,9 @@ mod tests {
                 summary_model: Some("minimax/minimax-m2.7".into()),
                 clear_summary_provider: false,
                 clear_summary_model: true,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1503,6 +1783,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1533,6 +1816,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: Some("openrouter".to_string()),
             summary_model: Some("minimax/minimax-m2.7".to_string()),
+            worktree_mode: WorktreeMode::Off,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -1554,6 +1838,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: true,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1588,6 +1875,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1626,6 +1916,9 @@ mod tests {
                 summary_model: Some(String::new()),
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1663,6 +1956,9 @@ mod tests {
                 summary_model: None,
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1689,6 +1985,9 @@ mod tests {
                 summary_model: Some("\t  \n".into()),
                 clear_summary_provider: false,
                 clear_summary_model: false,
+                worktree_mode: None,
+                force_worktree_remove: false,
+                project_root: None,
                 json: false,
             },
         )
@@ -1723,6 +2022,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: Some(String::new()),
                 summary_model: Some("minimax/minimax-m2.7".into()),
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1758,6 +2059,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: Some("openrouter".into()),
                 summary_model: Some(String::new()),
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1794,6 +2097,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: Some("   ".into()),
                 summary_model: Some("minimax/minimax-m2.7".into()),
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1819,6 +2124,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: Some("openrouter".into()),
                 summary_model: Some("\t  \n".into()),
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
@@ -1852,6 +2159,8 @@ mod tests {
                 gemini_thinking_budget: None,
                 summary_provider: Some(String::new()),
                 summary_model: Some(String::new()),
+                worktree_mode: WorktreeMode::Off,
+                project_root: None,
                 default: false,
                 json: false,
                 workspace_dir: None,
