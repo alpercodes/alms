@@ -124,3 +124,28 @@ fn workspace_open_js_behaviour() {
 fn tool_output_js_behaviour() {
     run_node_test("tool-output.test.mjs");
 }
+
+/// Pinned regression for issues #981 (composer draft lost on session
+/// switch) and #975 (queued messages lost on session switch). Both bugs
+/// share an architecture — chat-component-local state with view-bound
+/// lifetime — and the fix persists draft + queue per-session in
+/// `localStorage` via `static/ui/state/composer-storage.js`. The JS-side
+/// test pins:
+///   - draft round-trip across mount/unmount and across module reload
+///   - draft cleared on send (and on empty-text save)
+///   - draft try-full-write-then-truncate-on-quota with console.warn
+///   - queue round-trip across mount/unmount and across module reload
+///   - per-session scoping (no bleed across session ids)
+///   - clearComposerState() sweeps both kinds of state on session delete
+///   - graceful behaviour when `localStorage` is missing or throws
+///   - byte-cap branches: oversize-tail drop and single-giant-item removal
+///   - load-side cap against tampered storage blobs
+///   - planMountDrain pure-function contract: pins the orphan-queue fix
+///     from Tim's review on PR #990 — when the run that the queue was
+///     waiting on completes while the operator is on a different session
+///     (or in the page-reload race window), the next mount must drain
+///     the head rather than leave the queue orphaned forever.
+#[test]
+fn composer_storage_js_behaviour() {
+    run_node_test("composer-storage.test.mjs");
+}

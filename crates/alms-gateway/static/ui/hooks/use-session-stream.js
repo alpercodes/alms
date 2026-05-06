@@ -40,6 +40,7 @@ import { activeAgent } from '../state/agents.js';
 import { normalizeApproval } from '../utils/approvals.js';
 import { selectGeneration } from '../state/select-generation.js';
 import { clearPendingMessage } from '../state/pending-messages.js';
+import { saveQueue } from '../state/composer-storage.js';
 import { DM_END_REASON_LABELS } from '../utils/constants.js';
 
 /**
@@ -1200,12 +1201,20 @@ export function openSessionStream(sessionId, opts) {
         // (avoids circular dependency with input-area.js)
         if (messageQueue.value.length > 0) {
             const next = messageQueue.value[0];
-            messageQueue.value = messageQueue.value.slice(1);
+            const remaining = messageQueue.value.slice(1);
+            messageQueue.value = remaining;
             // Capture activeSessionId synchronously before the async
             // import().then() microtask gap -- the value could change
             // if the user switches sessions between now and when the
             // .then() callback fires.  (Fixes #526)
             const capturedSessionId = activeSessionId.value;
+            // Mirror the dequeue into per-session storage so a refresh
+            // (or switch-away-then-back) doesn't restore the message we
+            // just drained. Keyed on the stream's closure-captured
+            // sessionId — same reasoning as the queue drain itself: the
+            // queue belongs to the run's session, not whatever session
+            // the operator is currently looking at. (#975)
+            saveQueue(sessionId, remaining);
             import('../components/chat/input-area.js').then(mod => {
                 if (mod.startRun) mod.startRun(next.text, { sessionId: capturedSessionId });
             }).catch(err => {

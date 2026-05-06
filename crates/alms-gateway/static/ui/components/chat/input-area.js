@@ -1,4 +1,4 @@
-import { html, useRef } from '../../deps.js';
+import { html, useRef, useEffect } from '../../deps.js';
 import { activeSessionId } from '../../state/sessions.js';
 import { activeAgentId, agents } from '../../state/agents.js';
 import { activeRunId, runs } from '../../state/runs.js';
@@ -7,6 +7,11 @@ import { appendMessage, transformMessages } from '../../state/chat-actions.js';
 import { messageQueue } from '../../state/queue.js';
 import { createRun, cancelRun as apiCancelRun } from '../../api/runs.js';
 import { savePendingMessage, setPendingRunId, clearPendingMessage } from '../../state/pending-messages.js';
+import {
+    loadDraft, saveDraft, clearDraft,
+    loadQueue, saveQueue,
+    planMountDrain,
+} from '../../state/composer-storage.js';
 import { IconSend, IconStop } from '../../utils/icons.js';
 
 /**
@@ -78,11 +83,22 @@ export async function startRun(text, opts) {
 function sendMessage(promptRef) {
     const text = promptRef.current.value.trim();
     if (!text || !activeSessionId.value || !activeAgentId.value) return;
+    const sessionId = activeSessionId.value;
     promptRef.current.value = '';
     promptRef.current.style.height = 'auto';
+    // Clear any persisted draft for this session — the operator pressed
+    // Send, so the in-progress draft is no longer in-progress regardless
+    // of whether it goes straight to a run or gets queued behind one.
+    // (Acceptance criterion for #981.)
+    clearDraft(sessionId);
 
     if (activeRunId.value) {
-        messageQueue.value = [...messageQueue.value, { text }];
+        const next = [...messageQueue.value, { text }];
+        messageQueue.value = next;
+        // Persist the queue per-session so a session-switch round-trip
+        // doesn't drop messages the operator has already queued behind
+        // an in-flight run. (#975)
+        saveQueue(sessionId, next);
         promptRef.current.focus();
         return;
     }
@@ -97,6 +113,17 @@ async function cancelCurrentRun() {
     } catch { /* SSE event will handle UI */ }
 }
 
+/**
+ * Resize the composer textarea to fit its content, capped at 150px.
+ * Called from both `onInput` (live typing) and the mount effect
+ * (restored draft) so a multi-line restored draft renders at its
+ * natural height instead of staying at the 1-row default.
+ */
+function autoGrow(el) {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 150) + 'px';
+}
+
 export function InputArea() {
     const promptRef = useRef(null);
     const hasAgent = agents.value.length > 0;
@@ -105,6 +132,72 @@ export function InputArea() {
     const canSend = hasAgent && hasActiveAgent && hasSession;
     const isRunning = !!activeRunId.value;
     const placeholder = hasActiveAgent ? 'Send a message...' : 'Select an agent to send a message';
+    const sessionId = activeSessionId.value;
+
+    // Restore the persisted draft + queue whenever the active session
+    // changes (also fires on first mount). The textarea is uncontrolled
+    // so we drive its `.value` imperatively via the ref. The queue is a
+    // global signal — every session-switch reducer wipes it to `[]`
+    // (navigate-session, session-list newSession, timeline-tab,
+    // toggleNotifications, switchAgent), so this effect re-hydrates it
+    // from the per-session storage entry rather than racing those
+    // reducers. (#975 / #981)
+    useEffect(() => {
+        const el = promptRef.current;
+        if (el) {
+            const draft = loadDraft(sessionId);
+            el.value = draft;
+            // Re-run the auto-grow sizing so a multi-line restored draft
+            // shows at its natural height instead of staying at 1 row.
+            autoGrow(el);
+        }
+        const restoredQueue = loadQueue(sessionId);
+        // Mount-effect drain — closes the orphan-queue window where the
+        // run that the queue was waiting on has already finished by the
+        // time we get back to this session. Two scenarios this catches
+        // that the SSE drain in use-session-stream.js can't:
+        //
+        //   1. Cross-session-return: user starts a run on A, queues M1,
+        //      switches to B (in-memory queue wiped to []), the run on
+        //      A finishes while on B (SSE drain reads empty in-memory
+        //      queue and skips), then comes back to A. Without this
+        //      drain M1 sits in the queue forever.
+        //
+        //   2. Page-reload-during-run race: on reload, boot()'s SSE
+        //      stream can deliver `run_finished` *before* this mount
+        //      effect runs. The SSE drain reads the (still-empty)
+        //      in-memory queue and skips. When this effect later
+        //      re-hydrates from storage there's no live drain trigger
+        //      left.
+        //
+        // The fix in both cases: when the mount effect sees a non-empty
+        // restored queue with no active run, peel off the head and start
+        // a run with it. Idempotent with the SSE drain because both gate
+        // on `messageQueue.value.length > 0` and there is exactly one
+        // mount and one run-end event per restoration. (#975)
+        //
+        // The decision is delegated to `planMountDrain` so the contract
+        // is pinned by a unit test without needing a Preact tree.
+        // `activeAgentId` is threaded through because `startRun` short-
+        // circuits on a null agent — peeling the head without an agent
+        // would silently lose it. See planMountDrain doc for the matrix.
+        const plan = planMountDrain({
+            restoredQueue,
+            activeRunId: activeRunId.value,
+            activeAgentId: activeAgentId.value,
+        });
+        if (restoredQueue.length > 0) {
+            // Hydrate the visible queue regardless of whether we drain —
+            // the operator should see what was queued. When a drain
+            // fires we re-write the remainder right after.
+            messageQueue.value = restoredQueue;
+        }
+        if (plan.drain) {
+            messageQueue.value = plan.remaining;
+            saveQueue(sessionId, plan.remaining);
+            startRun(plan.head.text, { sessionId });
+        }
+    }, [sessionId]);
 
     const onKeyDown = (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
@@ -116,8 +209,12 @@ export function InputArea() {
     const onInput = () => {
         const el = promptRef.current;
         if (el) {
-            el.style.height = 'auto';
-            el.style.height = Math.min(el.scrollHeight, 150) + 'px';
+            autoGrow(el);
+            // Persist the in-progress draft per-session. saveDraft()
+            // removes the storage entry when the value is empty so a
+            // user clearing the textarea also clears the stored draft.
+            // (#981)
+            saveDraft(sessionId, el.value);
         }
     };
 

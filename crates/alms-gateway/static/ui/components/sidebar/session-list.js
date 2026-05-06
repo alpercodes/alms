@@ -11,6 +11,7 @@ import { clearAllSubagents } from '../../state/subagents.js';
 import { saveActiveSession } from '../../hooks/use-boot.js';
 import { bumpSelectGeneration } from '../../state/select-generation.js';
 import { navigateToSession } from '../../utils/navigate-session.js';
+import { clearComposerState } from '../../state/composer-storage.js';
 
 /**
  * Session type metadata: icon character and CSS class suffix.
@@ -127,6 +128,12 @@ function SessionItem({ session }) {
         confirming.value = false;
         try {
             await deleteSession(session.id);
+            // Discard any persisted composer state (draft + queue) for
+            // the deleted session so storage doesn't leak entries for
+            // sessions that no longer exist on the backend. (#975 / #981
+            // acceptance criterion: "if the session is deleted, both
+            // draft and queue for that session are discarded".)
+            clearComposerState(session.id);
             // If we deleted the active session, clear it
             if (session.id === activeSessionId.value) {
                 closeSessionStream();
@@ -138,6 +145,10 @@ function SessionItem({ session }) {
                     runs.value = [];
                     auditEvents.value = null;
                     clearAllSubagents();
+                    // Drop any in-memory queue items belonging to the
+                    // session we just deleted — they're orphans now
+                    // and shouldn't drift into a fresh session view.
+                    messageQueue.value = [];
                 });
             }
             // Refresh session list
