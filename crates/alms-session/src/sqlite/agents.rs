@@ -280,6 +280,18 @@ impl SqliteStore {
                 params![sid],
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite delete summaries for session: {e}")))?;
+            // Delete cross-session episodic summaries for this session
+            // (added in #874). The `session_summaries` table has
+            // `session_id REFERENCES sessions(id)`, so leaving these rows
+            // behind would block the `DELETE FROM sessions` step below
+            // with a FOREIGN KEY constraint failure (#985).
+            tx.execute(
+                "DELETE FROM session_summaries WHERE session_id = ?1",
+                params![sid],
+            )
+            .map_err(|e| {
+                AlmsError::Runtime(format!("SQLite delete session_summaries for session: {e}"))
+            })?;
             tx.execute(
                 "DELETE FROM audit_events WHERE session_id = ?1",
                 params![sid],
@@ -796,6 +808,125 @@ mod tests {
         // Survivor's data is untouched.
         assert_eq!(store.count_tool_calls(s_run_id).unwrap(), 1);
         assert!(store.load_run(s_run_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_delete_agent_cascades_session_summaries() {
+        // Regression test for #985: `delete_agent` must remove
+        // `session_summaries` rows (added in #874) before deleting the
+        // sessions themselves. The `session_summaries.session_id`
+        // column has a `REFERENCES sessions(id)` FK, so any leftover
+        // row triggers `FOREIGN KEY constraint failed` on the
+        // `DELETE FROM sessions WHERE agent_id = ?1` step.
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        // Two agents -- one to delete with a full child-row history, one
+        // as a control to assert isolation.
+        let doomed = new_agent("doomed");
+        let survivor = new_agent("survivor");
+        store.create_agent(&doomed).unwrap();
+        store.create_agent(&survivor).unwrap();
+
+        // Sessions for both.
+        let ds = Session::new(doomed.id, "ctx-doomed");
+        let ss = Session::new(survivor.id, "ctx-survivor");
+        store.save_session(&ds).unwrap();
+        store.save_session(&ss).unwrap();
+
+        // Episodic summaries for both -- this is the row that would
+        // block the cascade pre-fix.
+        store
+            .upsert_session_summary(
+                doomed.id,
+                ds.id,
+                "doomed session summary",
+                None,
+                Some("User chat"),
+            )
+            .unwrap();
+        store
+            .upsert_session_summary(
+                survivor.id,
+                ss.id,
+                "survivor session summary",
+                None,
+                Some("User chat"),
+            )
+            .unwrap();
+
+        // Plus a run + tool call so the full v0.2.x child-row
+        // history is exercised in the same test.
+        let d_run = Run::new(ds.id, doomed.id, "hello".to_string());
+        let d_run_id = d_run.run_id;
+        store.save_run(&d_run).unwrap();
+        store
+            .save_tool_call(
+                d_run_id,
+                &ToolCallRecord {
+                    seq: 0,
+                    role: ToolCallRole::Assistant,
+                    tool_name: Some("echo".to_string()),
+                    tool_id: Some("call_0".to_string()),
+                    params: Some(r#"{"text":"hi"}"#.to_string()),
+                    result: None,
+                    timestamp: chrono::Utc::now(),
+                    from_agent: None,
+                },
+            )
+            .unwrap();
+
+        // Delete the doomed agent -- must succeed without a FK error.
+        assert!(store.delete_agent(doomed.id).unwrap());
+
+        // Doomed agent's data is gone, including the episodic summary.
+        assert!(store.load_agent_by_id(doomed.id).unwrap().is_none());
+        assert!(store.load_sessions_by_agent(doomed.id).unwrap().is_empty());
+        assert!(
+            store
+                .load_session_summary(doomed.id, ds.id)
+                .unwrap()
+                .is_none(),
+            "doomed agent's session_summaries row should have been deleted"
+        );
+        assert!(
+            store
+                .load_session_summaries(doomed.id, 10, None)
+                .unwrap()
+                .is_empty(),
+            "doomed agent should have no remaining session_summaries"
+        );
+
+        // Survivor's episodic summary is untouched.
+        let survivor_summary = store
+            .load_session_summary(survivor.id, ss.id)
+            .unwrap()
+            .expect("survivor's session_summaries row must remain");
+        assert_eq!(survivor_summary.summary, "survivor session summary");
+
+        // Generic audit loop: every table with a `REFERENCES sessions(id)` FK
+        // declared in `crates/alms-session/src/sqlite/mod.rs` must have zero
+        // rows pointing at the deleted agent's session IDs after `delete_agent`.
+        // The point is future-proofing: when a new child table is added that
+        // references `sessions(id)` and the author forgets to wire it into
+        // `delete_agent`, this loop catches the cascade gap without anyone
+        // having to update per-table assertions by hand. Add the new table
+        // name to `fk_session_tables` and the test fails until the cascade
+        // covers it. See PR #991 review for context.
+        let fk_session_tables = ["messages", "context_summaries", "session_summaries"];
+        let conn = store.conn.lock();
+        for table in fk_session_tables {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+                    params![ds.id.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                n, 0,
+                "orphan row in `{table}` referencing deleted agent's session_id after delete_agent"
+            );
+        }
     }
 
     #[test]
