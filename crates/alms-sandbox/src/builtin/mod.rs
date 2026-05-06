@@ -65,7 +65,7 @@ pub(crate) fn is_blocked_device_path(path: &Path) -> bool {
     #[cfg(unix)]
     {
         let s = path.to_str().unwrap_or("");
-        if BLOCKED_DEVICE_PATHS.iter().any(|&d| d == s) {
+        if BLOCKED_DEVICE_PATHS.contains(&s) {
             return true;
         }
     }

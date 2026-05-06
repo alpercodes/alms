@@ -17,8 +17,9 @@ mod tests;
 pub use types::{
     AnthropicConfig, AuthScheme, ChannelsConfig, ContextConfig, FsEditConfig, GeminiConfig,
     LlmConfig, LoggingConfig, OpenAiConfig, ProviderEntry, ProviderKind, ProviderQuirks,
-    ReasoningEffort, RunSummaryMode, ServerConfig, SessionConfig, ShellClassificationMode,
-    ShellPermissions, ShellSpillConfig, ToolOutputTruncateConfig, ToolsConfig,
+    ReasoningEffort, RunSummaryMode, SecurityConfig, ServerConfig, SessionConfig,
+    ShellClassificationMode, ShellPermissions, ShellSpillConfig, ToolOutputTruncateConfig,
+    ToolsConfig,
 };
 
 use crate::{AlmsError, AlmsResult};
@@ -37,6 +38,10 @@ pub struct AlmsConfig {
     pub tools: ToolsConfig,
     pub channels: ChannelsConfig,
     pub logging: LoggingConfig,
+    /// Security knobs the operator sets in `alms.toml` and that are NOT
+    /// mutable via `PATCH /settings` (#947). See [`SecurityConfig`] for
+    /// the threat model.
+    pub security: SecurityConfig,
 }
 
 impl Default for AlmsConfig {
@@ -54,6 +59,7 @@ impl Default for AlmsConfig {
             tools: ToolsConfig::default(),
             channels: ChannelsConfig::default(),
             logging: LoggingConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -88,10 +94,18 @@ impl AlmsConfig {
         config.apply_env_overrides();
 
         // Resolve data_dir to an absolute path so that downstream consumers
-        // (db_path(), workspace_dir(), shell_exec env) never interpret it
+        // (db_path(), agents_dir(), shell_exec env) never interpret it
         // relative to a changed cwd. This is the canonical fix for issue #300
         // (stray data/alms.db inside agent workspace directories).
         config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
+
+        // Resolve project_root (#945) only when explicitly configured. An
+        // empty value defers resolution to runtime so a fresh `Default` does
+        // not silently pin a stale cwd into the config.
+        if !config.server.project_root.is_empty() {
+            config.server.project_root =
+                crate::resolve_to_absolute(Path::new(&config.server.project_root));
+        }
 
         // Check for legacy ./data directory and warn about migration.
         config.warn_legacy_data_dir();
@@ -207,6 +221,15 @@ impl AlmsConfig {
         config.llm.ensure_builtin_providers();
         config.apply_env_overrides();
         config.server.data_dir = crate::resolve_to_absolute(Path::new(&config.server.data_dir));
+        // Resolve project_root (#945) only when the field is non-empty —
+        // an empty value means "fall back to current_dir at the moment a
+        // gateway / runtime asks". Pre-resolving an empty value here would
+        // pin a stale cwd onto the config, which is exactly the behaviour
+        // we want `resolved_project_root()` to side-step.
+        if !config.server.project_root.is_empty() {
+            config.server.project_root =
+                crate::resolve_to_absolute(Path::new(&config.server.project_root));
+        }
         config.warn_legacy_data_dir();
         config.context.normalize_episodic();
 
@@ -306,6 +329,14 @@ impl AlmsConfig {
         }
         if let Ok(data_dir) = std::env::var("ALMS_DATA_DIR") {
             self.server.data_dir = data_dir;
+        }
+        // Project root (#945) — the workspace v2 sandbox boundary.
+        // Stored as the raw string here; the gateway resolves it to an
+        // absolute path via `ServerConfig::resolved_project_root`. CLI
+        // `--project <path>` overrides by writing into this same field
+        // before `serve_with_config` runs.
+        if let Ok(project_root) = std::env::var("ALMS_PROJECT_ROOT") {
+            self.server.project_root = project_root;
         }
         if let Ok(token) = std::env::var("ALMS_AUTH_TOKEN") {
             self.server.auth_token = Some(token);
@@ -530,6 +561,23 @@ impl AlmsConfig {
                 "logging.file_level must be one of {:?}, got '{}'",
                 valid_levels, self.logging.file_level
             )));
+        }
+
+        // Security validation (#947). Empty / whitespace-only entries in
+        // `allow_full_os_access` are caught here so a hand-edited TOML
+        // can't accidentally widen the blast radius of every unnamed
+        // agent (`SecurityConfig::is_full_os_access_agent` already
+        // shortcircuits on empty input, but rejecting at load time
+        // surfaces the operator error explicitly rather than silently
+        // discarding the broken entry).
+        for (idx, name) in self.security.allow_full_os_access.iter().enumerate() {
+            if name.trim().is_empty() {
+                return Err(AlmsError::InvalidConfig(format!(
+                    "security.allow_full_os_access[{idx}] is empty — every entry must \
+                     name a registered agent. Remove the empty string or replace it \
+                     with the agent's name."
+                )));
+            }
         }
 
         Ok(())

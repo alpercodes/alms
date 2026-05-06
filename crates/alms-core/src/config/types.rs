@@ -76,6 +76,31 @@ pub struct ServerConfig {
     /// `cd` into your project directory, run `alms gateway`, and all
     /// instance-specific state lives under `.alms/` in the project root.
     pub data_dir: String,
+    /// Effective project root — the directory the agent's filesystem
+    /// sandbox is rooted at (#945, the workspace v2 redesign).
+    ///
+    /// Empty string means "resolve at boot from env / current_dir". The CLI's
+    /// `--project` flag writes the absolute path here directly so the
+    /// downstream gateway sees a single source of truth. Populated by
+    /// [`apply_env_overrides`](super::AlmsConfig::apply_env_overrides) from
+    /// `ALMS_PROJECT_ROOT` when no CLI override is in play. Resolved to an
+    /// absolute path via [`Self::resolved_project_root`] before flowing into
+    /// `GatewayConfig` / `AppState`.
+    ///
+    /// Precedence at boot is:
+    /// 1. CLI `--project <path>` flag (highest — written directly into this
+    ///    field by the CLI before `serve_with_config`).
+    /// 2. `ALMS_PROJECT_ROOT` env var (handled by `apply_env_overrides`).
+    /// 3. `std::env::current_dir()` (the fallback used by
+    ///    [`Self::resolved_project_root`] when this field is empty).
+    ///
+    /// Skipped from serde so the `Default::default()` (= "" → current_dir)
+    /// behaviour is the canonical "no project root configured" state and a
+    /// hand-edited `alms.toml` cannot accidentally pin the project root to a
+    /// stale absolute path. Operators who want to override the cwd fallback
+    /// should set `ALMS_PROJECT_ROOT` or pass `--project`.
+    #[serde(skip)]
+    pub project_root: String,
     /// Bearer token for API authentication — loaded from env only
     #[serde(skip)]
     pub auth_token: Option<String>,
@@ -86,6 +111,7 @@ impl Default for ServerConfig {
         Self {
             bind: "127.0.0.1:8080".into(),
             data_dir: "./.alms".into(),
+            project_root: String::new(),
             auth_token: None,
         }
     }
@@ -111,13 +137,54 @@ impl ServerConfig {
         })
     }
 
-    /// Return the resolved path to the agent workspace directory.
+    /// Return the resolved path to the agents-metadata directory under
+    /// the project root (#945).
     ///
-    /// Precedence: `ALMS_WORKSPACE_DIR` env var > `{data_dir}/workspace`.
-    pub fn workspace_dir(&self) -> PathBuf {
-        std::env::var("ALMS_WORKSPACE_DIR")
-            .map(Into::into)
-            .unwrap_or_else(|_| Path::new(&self.data_dir).join("workspace"))
+    /// Resolution: `<project_root>/.alms/agents/`. This is the new layout
+    /// — flat, one level under `.alms/`, sibling to `alms.db`. Each agent's
+    /// `personality.md`/`goals.md`/`memories.md`/`user/` lives in
+    /// `<agents_dir>/<name>/`.
+    ///
+    /// Precedence:
+    /// 1. `ALMS_WORKSPACE_DIR` env var (legacy override — kept so operators
+    ///    can pin agent metadata to a custom location).
+    /// 2. `<project_root>/.alms/agents/` (the v2 default).
+    pub fn agents_dir(&self) -> PathBuf {
+        if let Ok(val) = std::env::var("ALMS_WORKSPACE_DIR") {
+            return PathBuf::from(val);
+        }
+        self.resolved_project_root().join(".alms").join("agents")
+    }
+
+    /// Return the resolved project root — the directory the agent's
+    /// filesystem sandbox is rooted at (#945).
+    ///
+    /// Precedence:
+    /// 1. `self.project_root` if non-empty (CLI `--project` flag, written
+    ///    directly into this field by the CLI before
+    ///    `serve_with_config`).
+    /// 2. `ALMS_PROJECT_ROOT` env var (also written into `self.project_root`
+    ///    by `AlmsConfig::apply_env_overrides`; this branch handles the case
+    ///    where the field was cleared by a fresh `Default::default()`).
+    /// 3. `std::env::current_dir()` (the fallback every default install hits).
+    /// 4. `PathBuf::from(".")` if the cwd lookup fails — same final fallback
+    ///    as [`crate::resolve_to_absolute`].
+    ///
+    /// The returned path is NOT canonicalized here; callers that need a
+    /// canonical path (the gateway's sandbox-root resolution at agent
+    /// construction time) call `std::fs::canonicalize` themselves so they
+    /// can fail-closed when the path doesn't exist (see
+    /// `AgentRuntime::new`).
+    pub fn resolved_project_root(&self) -> PathBuf {
+        if !self.project_root.is_empty() {
+            return PathBuf::from(&self.project_root);
+        }
+        if let Ok(val) = std::env::var("ALMS_PROJECT_ROOT")
+            && !val.is_empty()
+        {
+            return PathBuf::from(val);
+        }
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 }
 
@@ -1142,6 +1209,75 @@ impl Default for ToolOutputTruncateConfig {
             max_lines: 2000,
             retention_days: 7,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SecurityConfig
+// ---------------------------------------------------------------------------
+
+/// Security policy knobs that operators set in `alms.toml` and that the
+/// gateway must NOT accept via `PATCH /settings`.
+///
+/// **Threat model.** Every field on this struct widens the blast radius of
+/// the daemon — a compromised auth token (or a misbehaving operator script)
+/// must not be able to silently flip them. They are config-file-only,
+/// loaded at startup, and never mirrored into `PersistedSettings`. The
+/// gateway's `/settings` PATCH handler rejects any payload referencing a
+/// field on this section with `400 SECURITY_KNOB_NOT_PATCHABLE`. Operators
+/// who need to change one of these values edit `alms.toml` and restart the
+/// daemon.
+///
+/// `GET /settings` MAY surface the values as read-only / informational; a
+/// `SecurityConfig` field is never accepted on the inbound side.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Operator-only escape hatch from the project-root sandbox boundary
+    /// introduced in #945 (workspace v2).
+    ///
+    /// Names listed here name agents (by registry name) that should run
+    /// **without** the project-root filesystem sandbox: `fs_*` tools have
+    /// no path prefix to enforce, and the `shell` tool's persistent cwd is
+    /// not pinned to the project root. These agents are subject only to
+    /// the OS-level user permissions of the daemon process — `fs_read
+    /// /etc/passwd` works (modulo file mode), `shell ls /` returns the
+    /// real root.
+    ///
+    /// The two **independent** operator policies in
+    /// [`ToolsConfig::shell_permissions`] (#717) and
+    /// [`ToolsConfig::shell_classification_mode`] (#745) **still apply**
+    /// to listed agents. They are defense-in-depth controls layered on
+    /// top of the sandbox, not part of it.
+    ///
+    /// Worktree-mode `git` (when wired up — see #938) on a listed agent
+    /// is silently ignored at runtime; this list wins. The gateway logs a
+    /// startup-time `WARN` for every listed agent so operators see the
+    /// precedence on boot. A second `WARN` fires at every `run_started`
+    /// for the listed agent so log scanners can correlate runs against
+    /// the loosened sandbox.
+    ///
+    /// **Config-file-only** — see the type-level docs on
+    /// [`SecurityConfig`] for why this field is not `PATCH`-mutable.
+    pub allow_full_os_access: Vec<String>,
+}
+
+impl SecurityConfig {
+    /// Returns `true` when the named agent is on the
+    /// [`Self::allow_full_os_access`] list.
+    ///
+    /// Comparison is exact-match on the registry name (the same string an
+    /// operator types for `alms agent create --name <name>`). Empty input
+    /// (an unnamed/ephemeral agent) never matches because empty entries
+    /// in the list itself would be a configuration error caught by
+    /// [`Self::validate`]. The check is O(n) — the list is short by
+    /// design (a handful of operator-blessed agents), so a `HashSet` is
+    /// not worth the allocation cost.
+    pub fn is_full_os_access_agent(&self, agent_name: &str) -> bool {
+        if agent_name.is_empty() {
+            return false;
+        }
+        self.allow_full_os_access.iter().any(|n| n == agent_name)
     }
 }
 

@@ -336,6 +336,49 @@ pub async fn create_run(
         ));
     }
 
+    // #863: pre-flight per-agent config resolution so a per-agent provider
+    // override with no model on any layer is rejected with a clean 400
+    // BEFORE any LLM call rather than producing an opaque downstream 4xx
+    // (e.g. Anthropic 404 on `model: ""`). The resolve is pure (no
+    // side-effects) and `execute_run` will resolve again under the live
+    // secrets / agent_config locks at run time — this pre-flight only
+    // catches the deterministic config-shape failure mode.
+    {
+        let base_agent_config = state.agent_config.read().clone();
+        if let Err(super::ResolveAgentConfigError::MissingModelAfterProviderSwitch {
+            agent_id: ag,
+            new_provider,
+            prev_provider,
+        }) = super::resolve_agent_config(
+            agent_id,
+            &state.session_manager,
+            &base_agent_config,
+            &state.llm,
+            Some(&state.secrets.read()),
+        ) {
+            warn!(
+                agent_id = %ag,
+                new_provider = %new_provider,
+                prev_provider = %prev_provider,
+                "Rejecting POST /runs with MISSING_MODEL_AFTER_PROVIDER_SWITCH (#863)"
+            );
+            return Err((
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "error_code": "MISSING_MODEL_AFTER_PROVIDER_SWITCH",
+                    "message": format!(
+                        "agent {ag} overrides provider to {new_provider} but no \
+                         model was supplied; previous provider {prev_provider}'s \
+                         default cannot be reused"
+                    ),
+                    "agent_id": ag.0.to_string(),
+                    "new_provider": new_provider,
+                    "prev_provider": prev_provider,
+                })),
+            ));
+        }
+    }
+
     state.run_manager.insert_run(run.clone());
 
     // Pre-persist the user's input message to the session BEFORE enqueueing
@@ -718,14 +761,54 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // the server default. The returned `LlmClient` already carries the
     // per-agent provider switch (with secrets re-resolved) and any
     // per-agent model override.
+    //
+    // `resolve_agent_config` can fail with #863 `MissingModelAfterProviderSwitch`
+    // when a per-agent provider override is set with no model on any layer.
+    // The HTTP `create_run` handler runs the same resolve up-front and
+    // rejects with `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`, so this path
+    // is only reachable for non-HTTP triggers (Telegram / scheduler / peer
+    // DMs / subagent completions). Mark the run as failed with the same
+    // structured message so the run record carries an actionable error.
     let base_agent_config = state.agent_config.read().clone();
-    let resolved = resolve_agent_config(
-        agent_id,
-        &state.session_manager,
-        &base_agent_config,
-        &state.llm,
-        Some(&state.secrets.read()),
-    );
+    let resolve_outcome = {
+        let secrets_guard = state.secrets.read();
+        resolve_agent_config(
+            agent_id,
+            &state.session_manager,
+            &base_agent_config,
+            &state.llm,
+            Some(&secrets_guard),
+        )
+    };
+    let resolved = match resolve_outcome {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            error!("Run {} failed to resolve agent config: {}", run_id.0, e);
+            state
+                .run_manager
+                .send_event(
+                    run_id,
+                    session_id,
+                    SseEventData::run_error(run_id, &e.to_string()),
+                )
+                .await;
+            state
+                .run_manager
+                .send_agent_event(
+                    agent_id,
+                    run_id,
+                    session_id,
+                    SseEventData::session_activity_ended(session_id, run_id, agent_id),
+                )
+                .await;
+            state.run_manager.mark_run_as_failed(run_id, e.to_string());
+            state.run_manager.remove_senders(run_id);
+            state.run_manager.remove_cancel_token(run_id);
+            state.approval_store.clear_for_run(run_id);
+            broadcast_queue_advance(&state, agent_id).await;
+            return;
+        }
+    };
     let agent_name = resolved.agent_name;
     if state.workspace_dir.is_some() && agent_name.is_none() {
         warn!(
@@ -1018,8 +1101,8 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // Wire the shared in-loop tool-output truncation policy (issue #851).
     // Mirrors `with_shell_spill` above — same lifecycle, same retention
     // model, same fs_* read-root widening, but applied to *every* tool's
-    // output (not just shell). Must come before `with_workspace` so the
-    // per-run spill dir is included in the agent's extra_read_roots.
+    // output (not just shell). Must come before `with_project_root` so
+    // the per-run spill dir is included in the agent's extra_read_roots.
     {
         let trunc_cfg = state.tools_config.read().tool_output_truncate.clone();
         let run_dir = state
@@ -1034,7 +1117,93 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
         );
     }
 
-    // Attach workspace if configured — registers the workspace_write tool for this run
+    // Pin the agent's filesystem-sandbox boundary at the project root
+    // (#945) — or, when `worktree_mode = "git"` (#946), at the agent's
+    // dedicated worktree under `<project>/.alms/worktrees/<name>/`. After
+    // this call `fs_*` and `shell` enforce against the same root and the
+    // shell's persistent cwd defaults to that root. Must come AFTER the
+    // spill / tool-output-truncate builders so the accumulated
+    // `extra_fs_read_roots` are reflected in the read-family fs_* tool
+    // registrations.
+    //
+    // Precedence (highest wins):
+    // 1. `[security].allow_full_os_access` (#947) — when the agent's
+    //    name is on the list, skip the sandbox pin entirely and call
+    //    `with_unrestricted_filesystem`. Worktree mode is silently
+    //    ignored at runtime per the documented precedence; the
+    //    worktree itself stays on disk because the operator may flip
+    //    the security knob off later.
+    // 2. `worktree_mode = "git"` (#946) — pin the sandbox at the
+    //    worktree path. Push `<project>/.alms/agents/` onto the
+    //    extra-read-roots list FIRST so the parent agent can still
+    //    `fs_read('.alms/agents/<sibling>/personality.md')` from
+    //    outside its worktree (matches the issue's sibling-read
+    //    acceptance criterion).
+    // 3. Default — `with_project_root(state.project_root)` as #945
+    //    intended.
+    //
+    // `shell_permissions` (#717) and the destructive-command
+    // classifier (#745) apply at every level — they are independent
+    // operator policy, not part of the sandbox.
+    let full_os_access = agent_name
+        .as_deref()
+        .map(|n| state.security_config.is_full_os_access_agent(n))
+        .unwrap_or(false);
+    let resolved_worktree_mode = resolved.worktree_mode;
+    if full_os_access {
+        // Defensive `unwrap` is fine — `full_os_access` is only true when
+        // `agent_name` is `Some`.
+        let name = agent_name.as_deref().unwrap_or("");
+        warn!(
+            target: "alms.security",
+            agent_name = %name,
+            run_id = %run_id.0,
+            allow_full_os_access = true,
+            worktree_mode = %resolved_worktree_mode.as_wire_str(),
+            "Run starting for agent '{}' WITHOUT project-root filesystem sandbox \
+             (allow_full_os_access). shell_permissions and the destructive-command \
+             classifier still apply. Worktree-mode is silently ignored at runtime \
+             when the agent is on the security list.",
+            name,
+        );
+        runtime = runtime.with_unrestricted_filesystem();
+    } else if resolved_worktree_mode == alms_core::WorktreeMode::Git
+        && let Some(ref name) = agent_name
+    {
+        // Worktree-mode-git path. The worktree was provisioned at
+        // agent-create time (or on a `mode: off → git` PATCH); we
+        // just compute the path again here and pin the sandbox at
+        // it. If the directory has been removed externally,
+        // `with_project_root` will fall back to the as-is path
+        // with a WARN — the run continues with whatever fs sandbox
+        // semantics the missing directory produces.
+        let worktree_dir = alms_core::worktree::worktree_path(&state.project_root, name);
+        // Sibling-read root: the project's `.alms/agents/` tree,
+        // read-only. This lets a parent agent in worktree mode still
+        // read sibling personality metadata from outside its
+        // worktree. Scoped tightly — NOT the entire project root,
+        // which would defeat the worktree's filesystem isolation.
+        let sibling_read_root = state.project_root.join(".alms").join("agents");
+        runtime = runtime
+            .with_extra_fs_read_root(sibling_read_root)
+            .with_project_root(worktree_dir.clone());
+        info!(
+            target: "alms.worktree",
+            agent_name = %name,
+            run_id = %run_id.0,
+            worktree_dir = %worktree_dir.display(),
+            "Run starting under per-agent git worktree (#946)"
+        );
+    } else {
+        runtime = runtime.with_project_root(state.project_root.clone());
+    }
+
+    // Attach workspace if configured — registers the workspace_write tool for this run.
+    // After #945 this no longer changes the sandbox root or default cwd —
+    // it only ensures the agent's metadata directory exists and binds the
+    // `workspace_write` tool. The metadata lives at
+    // `<project_root>/.alms/agents/<name>/`, naturally inside the
+    // project-root sandbox.
     if let (Some(workspace_dir), Some(name)) = (&state.workspace_dir, &agent_name) {
         let workspace = alms_runtime::AgentWorkspace::new(workspace_dir, name);
         runtime = runtime.with_workspace(workspace);

@@ -152,6 +152,10 @@ pub struct Coordinator {
     /// Absolute path to the gateway's data directory. Propagated to subagent
     /// shell_exec as `ALMS_DATA_DIR` so CLI commands find the right DB.
     data_dir: Option<std::path::PathBuf>,
+    /// Absolute path to the project root (#945) — the agent's filesystem
+    /// sandbox boundary. Subagents inherit it verbatim so a parent and its
+    /// subagent (named or ephemeral) share the single-root sandbox model.
+    project_root: Option<std::path::PathBuf>,
     /// Tracks the last-used system_prompt per named subagent context key,
     /// so we can warn when a re-invocation uses a different prompt.
     subagent_prompts: Arc<DashMap<String, String>>,
@@ -163,6 +167,14 @@ pub struct Coordinator {
     /// Optional run registrar — when set, subagent runs are registered as
     /// proper runs so they appear in GET /runs, the UI sidebar, and the CLI.
     run_registrar: Option<Arc<dyn RunRegistrar>>,
+    /// Security config snapshot (#947) — config-file-only, loaded once at
+    /// gateway boot. The Coordinator consults
+    /// [`SecurityConfig::is_full_os_access_agent`] for each named subagent
+    /// to decide whether to inherit the parent's project-root sandbox or
+    /// drop it via `with_unrestricted_filesystem`. Inherited subagents
+    /// (no name) are never listed by construction, so they always pick up
+    /// the project-root sandbox.
+    security_config: alms_core::config::SecurityConfig,
 }
 
 impl Coordinator {
@@ -176,10 +188,12 @@ impl Coordinator {
             base_agent_config: Arc::new(parking_lot::RwLock::new(AgentConfig::default())),
             workspace_dir: None,
             data_dir: None,
+            project_root: None,
             subagent_prompts: Arc::new(DashMap::new()),
             completion_tx: None,
             secrets: None,
             run_registrar: None,
+            security_config: alms_core::config::SecurityConfig::default(),
         }
     }
 
@@ -203,10 +217,12 @@ impl Coordinator {
             base_agent_config,
             workspace_dir: None,
             data_dir: None,
+            project_root: None,
             subagent_prompts: Arc::new(DashMap::new()),
             completion_tx: None,
             secrets: None,
             run_registrar: None,
+            security_config: alms_core::config::SecurityConfig::default(),
         }
     }
 
@@ -221,6 +237,16 @@ impl Coordinator {
     /// inherit `ALMS_DATA_DIR` and can find the correct database.
     pub fn with_data_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.data_dir = Some(dir);
+        self
+    }
+
+    /// Set the project root (#945) so subagents inherit the parent's
+    /// filesystem-sandbox boundary. Without this set, subagents fall back
+    /// to whatever sandbox root their `AgentConfig` resolves at construction
+    /// time — same as the pre-#945 behaviour, useful for unit tests that
+    /// don't drive the gateway's full plumbing.
+    pub fn with_project_root(mut self, dir: std::path::PathBuf) -> Self {
+        self.project_root = Some(dir);
         self
     }
 
@@ -248,6 +274,18 @@ impl Coordinator {
         tx: mpsc::UnboundedSender<SubagentCompletion>,
     ) -> Self {
         self.completion_tx = Some(tx);
+        self
+    }
+
+    /// Set the security-config snapshot so subagents named in
+    /// `[security].allow_full_os_access` (#947) inherit the operator's
+    /// "no project-root sandbox" decision the same way HTTP-triggered
+    /// runs do. Defaults to an empty list — no agent is listed.
+    pub fn with_security_config(
+        mut self,
+        security_config: alms_core::config::SecurityConfig,
+    ) -> Self {
+        self.security_config = security_config;
         self
     }
 
@@ -340,10 +378,12 @@ impl Coordinator {
         let base_agent_config = self.base_agent_config.read().clone();
         let workspace_dir = self.workspace_dir.clone();
         let data_dir = self.data_dir.clone();
+        let project_root = self.project_root.clone();
         let subagent_prompts = self.subagent_prompts.clone();
         let completion_tx = self.completion_tx.clone();
         let secrets = self.secrets.clone();
         let run_registrar = self.run_registrar.clone();
+        let security_config = self.security_config.clone();
 
         let span = tracing::info_span!(
             "subagent::execute",
@@ -365,11 +405,13 @@ impl Coordinator {
                     base_agent_config,
                     workspace_dir,
                     data_dir,
+                    project_root,
                     subagent_prompts,
                     completion_tx,
                     parent_cancel_token,
                     secrets,
                     run_registrar,
+                    security_config,
                     is_background,
                 )
                 .await;
@@ -522,11 +564,13 @@ async fn run_subagent(
     base_agent_config: AgentConfig,
     workspace_dir: Option<std::path::PathBuf>,
     data_dir: Option<std::path::PathBuf>,
+    project_root: Option<std::path::PathBuf>,
     subagent_prompts: Arc<DashMap<String, String>>,
     completion_tx: Option<mpsc::UnboundedSender<SubagentCompletion>>,
     parent_cancel_token: Option<CancellationToken>,
     secrets: Option<Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
     run_registrar: Option<Arc<dyn RunRegistrar>>,
+    security_config: alms_core::config::SecurityConfig,
     is_background: bool,
 ) {
     // RAII guard: removes the name from active_named on drop (including panics).
@@ -619,7 +663,7 @@ async fn run_subagent(
             );
             (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None)
         }
-        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), is_background) => {
+        output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background) => {
             match output {
                 Ok(run_output) => {
                     info!(
@@ -1052,9 +1096,11 @@ async fn run_agent_loop(
     base_agent_config: &AgentConfig,
     workspace_dir: Option<&std::path::Path>,
     data_dir: Option<&std::path::Path>,
+    project_root: Option<&std::path::Path>,
     subagent_prompts: &DashMap<String, String>,
     cancel_token: CancellationToken,
     secrets: Option<&Arc<parking_lot::RwLock<alms_core::secrets::SecretsStore>>>,
+    security_config: &alms_core::config::SecurityConfig,
     is_background: bool,
 ) -> AlmsResult<RunOutput> {
     // Derive config based on whether the subagent is named (identity already resolved
@@ -1253,33 +1299,67 @@ async fn run_agent_loop(
         );
     }
 
-    // Attach workspace to scope the fs_* sandbox.
+    // Pin the subagent's filesystem-sandbox boundary at the project root
+    // (#945). Subagents share the parent's single-root model — they
+    // operate on the same project directory their parent does. This is
+    // the expected v2 behaviour and matches how Claude Code's "isolation:
+    // worktree" subagents are explicitly opt-in (the worktree case is
+    // out-of-scope for this issue and lands in #946).
     //
-    // Named subagents:    {workspace_dir}/{name}/
+    // When `project_root` is None (unit-test paths that don't drive the
+    // gateway) we fall back to whatever sandbox the subagent's
+    // `AgentConfig` resolved at construction time — same as the pre-#945
+    // behaviour for those paths. Must come AFTER the spill builders so
+    // the accumulated `extra_fs_read_roots` are reflected.
+    //
+    // Operator escape hatch (#947): named subagents whose name appears
+    // on `[security].allow_full_os_access` opt out of the project-root
+    // sandbox the same way HTTP-triggered runs do. Ephemeral subagents
+    // (no `subagent_name`) cannot be on the list by construction, so
+    // they always pick up the project-root pin. A run-start `WARN`
+    // fires for parity with the HTTP / Telegram paths.
+    let sub_full_os_access = request
+        .subagent_name
+        .as_deref()
+        .map(|n| security_config.is_full_os_access_agent(n))
+        .unwrap_or(false);
+    if sub_full_os_access {
+        let name = request.subagent_name.as_deref().unwrap_or("");
+        warn!(
+            target: "alms.security",
+            agent_name = %name,
+            task_id = %task_id.0,
+            allow_full_os_access = true,
+            "Subagent run starting for agent '{}' WITHOUT project-root filesystem \
+             sandbox (allow_full_os_access). shell_permissions and the \
+             destructive-command classifier still apply.",
+            name,
+        );
+        runtime = runtime.with_unrestricted_filesystem();
+    } else if let Some(root) = project_root {
+        runtime = runtime.with_project_root(root.to_path_buf());
+    }
+
+    // Attach workspace to register `workspace_write` and ensure the
+    // metadata directory exists.
+    //
+    // Named subagents:    {workspace_dir}/{name}/   (now `<project>/.alms/agents/<name>/`)
     // Ephemeral subagents: {workspace_dir}/.ephemeral/{task_id}/
     //
-    // Ephemeral subagents get a disposable workspace so their fs_read/fs_write/
-    // fs_list/fs_edit tools are sandboxed to a narrow directory instead of inheriting
-    // the project-root sandbox (which would expose sensitive state, the SQLite
-    // database, and other agents' workspace files).
-    if attach_workspace {
-        if let Some(ws_dir) = workspace_dir {
-            let subagent_ws_dir = if let Some(name) = &request.subagent_name {
-                ws_dir.join(name)
-            } else {
-                ws_dir.join(".ephemeral").join(task_id.0.to_string())
-            };
-            let workspace = alms_runtime::AgentWorkspace::with_dir(subagent_ws_dir);
-            runtime = runtime.with_workspace(workspace);
+    // After #945, `with_workspace` no longer changes the sandbox root —
+    // the project-root pin above already did. Ephemeral subagents
+    // therefore share the project-root sandbox; their `.ephemeral/`
+    // directory only exists so the workspace_write tool has a stable
+    // metadata path that the parent can clean up after the subagent
+    // terminates.
+    if attach_workspace && let Some(ws_dir) = workspace_dir {
+        let subagent_ws_dir = if let Some(name) = &request.subagent_name {
+            ws_dir.join(name)
         } else {
-            warn!(
-                task_id = %task_id.0,
-                subagent_name = ?request.subagent_name,
-                "attach_workspace is true but workspace_dir is None — subagent will \
-                 inherit the project-root sandbox. Set workspace_dir on the Coordinator \
-                 to enable per-subagent sandbox scoping."
-            );
-        }
+            ws_dir.join(".ephemeral").join(task_id.0.to_string())
+        };
+        let workspace = alms_runtime::AgentWorkspace::with_dir(subagent_ws_dir);
+        runtime = runtime.with_workspace(workspace);
     }
 
     // Forward subagent tool events into the parent run's event stream,

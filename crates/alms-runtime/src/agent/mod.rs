@@ -189,11 +189,213 @@ impl AgentRuntime {
         Ok(runtime)
     }
 
+    /// Set the project root — the agent's filesystem sandbox boundary
+    /// (#945, the workspace v2 redesign).
+    ///
+    /// This re-registers `fs_read`, `fs_write`, `fs_list`, `fs_edit`,
+    /// `fs_grep`, `fs_glob`, and `shell` (plus its `shell_exec` alias) so
+    /// every file-touching tool enforces against the same single root.
+    /// `shell`'s persistent cwd is also rooted at `project_root` so the
+    /// agent's mental model is "I am working on the project."
+    ///
+    /// Sibling-workspace reads (#242) keep working without an extras list
+    /// here: every agent's metadata lives at
+    /// `<project_root>/.alms/agents/<name>/`, which is naturally inside
+    /// the project-root sandbox, so `fs_read('.alms/agents/<sibling>/personality.md')`
+    /// resolves under the primary root by construction. The
+    /// `extra_fs_read_roots` accumulator still threads through for
+    /// per-run spill directories (`with_shell_spill`,
+    /// `with_tool_output_truncate`) so the gateway can wire those *before*
+    /// `with_project_root` and the read-family tools pick them up here.
+    ///
+    /// Canonicalises the path so Windows `\\?\` prefix mismatches do not
+    /// trip `check_sandbox_path`'s `starts_with` comparison. Falls back to
+    /// the as-is path with a warning if canonicalisation fails — same
+    /// fail-soft behaviour `with_workspace` used pre-#945.
+    pub fn with_project_root(mut self, project_root: std::path::PathBuf) -> Self {
+        // Make sure the directory exists before canonicalising — the
+        // gateway already calls `create_dir_all` on the project root, but
+        // unit-test paths sometimes pass a tempdir-relative subpath.
+        if let Err(e) = std::fs::create_dir_all(&project_root) {
+            warn!(
+                error = %e,
+                project_root = %project_root.display(),
+                "Failed to create project root — fs tools may not work correctly"
+            );
+        }
+
+        let canonical_root = match std::fs::canonicalize(&project_root) {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    project_root = %project_root.display(),
+                    "Cannot canonicalize project root — using as-is"
+                );
+                project_root.clone()
+            }
+        };
+
+        self.resolved_sandbox_root = Some(canonical_root.clone());
+
+        // Re-register fs_* tools with the project root as the single
+        // primary sandbox root. Per-run spill dirs threaded through
+        // `extra_fs_read_roots` come along for the ride via
+        // `compose_fs_extra_read_roots`.
+        let extras = self.compose_fs_extra_read_roots(&[]);
+        self.register_fs_tools(Some(canonical_root.clone()), &extras);
+
+        // Re-register shell with the project root as both sandbox root
+        // and default cwd. The tool is registered under both "shell"
+        // (primary) and "shell_exec" (alias).
+        let enabled = &self.config.enabled_tools;
+        let shell_enabled =
+            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
+        if shell_enabled {
+            let mut shell_tool = alms_sandbox::ShellTool::with_policy(
+                Some(canonical_root.clone()),
+                self.shell_unrestricted,
+            )
+            .with_default_cwd(canonical_root)
+            .with_permissions(&self.shell_permissions)
+            .with_classification_mode(self.shell_classification_mode)
+            .with_spill_policy(self.shell_spill_policy.clone());
+            if !self.shell_default_env.is_empty() {
+                shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
+            }
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
+        }
+
+        self
+    }
+
+    /// Drop the agent's filesystem-sandbox root so `fs_*` and `shell` run
+    /// without a path prefix to enforce (#947 — the
+    /// `[security].allow_full_os_access` operator escape hatch).
+    ///
+    /// Replaces every read-family fs_* tool (`fs_read`, `fs_list`,
+    /// `fs_grep`, `fs_glob`) and every write-family fs_* tool (`fs_write`,
+    /// `fs_edit`) with their unsandboxed (`::new()`) variants, and
+    /// re-registers `shell` (and its `shell_exec` alias) with no sandbox
+    /// root and no default cwd. Subject to OS-level permissions of the
+    /// daemon process — and to `shell_permissions` / the destructive-command
+    /// classifier, which are independent operator policy and remain
+    /// active. The accumulated `extra_fs_read_roots` (per-run spill
+    /// directories) become irrelevant when there is no primary root to
+    /// extend, so the field is cleared to keep the bookkeeping honest.
+    ///
+    /// Must be called *after* `AgentRuntime::new` (which installs the
+    /// initial sandboxed tools from `config.sandbox_root`) and BEFORE
+    /// `with_workspace` so the unrestricted fs_*/shell tools are what
+    /// `with_workspace` sees when it (post-#945) re-registers
+    /// `workspace_write` only — `with_workspace` no longer touches
+    /// fs_*/shell registration, but the ordering invariant still holds
+    /// for forward-compatibility. `with_shell_default_env` is the
+    /// exception: it is called BEFORE `with_unrestricted_filesystem`
+    /// at every call site (gateway HTTP path, Telegram path, coordinator
+    /// subagent path) and the unrestricted shell registration reads
+    /// `self.shell_default_env` directly, so the env vars are
+    /// preserved across the re-registration. The gateway's run lifecycle
+    /// wires the call between the spill / shell-env builders and the
+    /// project-root / workspace builders for exactly this reason.
+    ///
+    /// Worktree-mode-git interaction: this method is the runtime
+    /// equivalent of "the operator said this agent is unsandboxed". When
+    /// worktree-mode is wired up later (#938), this method takes
+    /// precedence — `allow_full_os_access` wins. The startup-time WARN
+    /// fired from `Gateway::start` documents that precedence to operators.
+    pub fn with_unrestricted_filesystem(mut self) -> Self {
+        use alms_sandbox::{
+            FsEditTool, FsGlobTool, FsGrepTool, FsListTool, FsReadTool, FsWriteTool,
+        };
+
+        self.resolved_sandbox_root = None;
+        // Per-run spill dirs are still real paths the agent may want to
+        // read, but with no primary root to enforce against `extras` is
+        // a no-op — the unsandboxed fs_* tools accept absolute paths
+        // anywhere. Clear the accumulator so later builders that consult
+        // it (e.g. a re-call into `register_fs_tools` from
+        // `with_workspace`) do not re-introduce a sandboxed registration.
+        self.extra_fs_read_roots.clear();
+
+        let cache = self.tools.file_state_cache().clone();
+        let enabled = &self.config.enabled_tools;
+        let tool_enabled = |name: &str| enabled.is_empty() || enabled.iter().any(|t| t == name);
+
+        if tool_enabled("fs_read") {
+            self.tools.register(std::sync::Arc::new(
+                FsReadTool::new().with_cache(cache.clone()),
+            ));
+        }
+        if tool_enabled("fs_write") {
+            self.tools.register(std::sync::Arc::new(
+                FsWriteTool::new().with_cache(cache.clone()),
+            ));
+        }
+        if tool_enabled("fs_list") {
+            self.tools.register(std::sync::Arc::new(FsListTool::new()));
+        }
+        if tool_enabled("fs_edit") {
+            self.tools.register(std::sync::Arc::new(
+                FsEditTool::new()
+                    .with_cache(cache)
+                    .with_fuzzy_match(self.config.fs_edit_fuzzy_match),
+            ));
+        }
+        if tool_enabled("fs_grep") {
+            self.tools.register(std::sync::Arc::new(FsGrepTool::new()));
+        }
+        if tool_enabled("fs_glob") {
+            self.tools.register(std::sync::Arc::new(FsGlobTool::new()));
+        }
+
+        // Re-register the shell tool with no sandbox root and no default
+        // cwd. `shell_permissions` and `shell_classification_mode` ride
+        // along — they are independent operator policy.
+        let shell_enabled =
+            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
+        if shell_enabled {
+            let mut shell_tool =
+                alms_sandbox::ShellTool::with_policy(None, /* unrestricted */ true)
+                    .with_permissions(&self.shell_permissions)
+                    .with_classification_mode(self.shell_classification_mode)
+                    .with_spill_policy(self.shell_spill_policy.clone());
+            if !self.shell_default_env.is_empty() {
+                shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
+            }
+            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
+            self.tools.register(std::sync::Arc::clone(&tool_arc));
+            self.tools
+                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
+        }
+        // `shell_unrestricted` controls whether the shell tool's persistent
+        // cwd may escape the sandbox. With no sandbox root at all this flag
+        // is moot, but flipping it to `true` keeps the runtime invariants
+        // tidy: `resolved_sandbox_root.is_none() ↔ shell_unrestricted`.
+        self.shell_unrestricted = true;
+
+        self
+    }
+
     /// Attach an agent workspace for persistent identity files.
     ///
-    /// Also registers the `workspace_write` tool so the agent can update
-    /// its `goals.md` and `memories.md` during runs, and re-registers
-    /// the shell tool with the workspace directory as default cwd.
+    /// Registers the `workspace_write` tool so the agent can update its
+    /// `personality.md` / `goals.md` / `memories.md` / `user.md` during
+    /// runs. Ensures the workspace directory exists.
+    ///
+    /// Pre-#945 this method also re-targeted the filesystem sandbox at
+    /// the workspace dir; v2 collapses the two-root model so the
+    /// project-root sandbox set by [`Self::with_project_root`] is the
+    /// single source of truth and `with_workspace` no longer touches
+    /// sandbox paths or default cwds. The agent's metadata lives at
+    /// `<project_root>/.alms/agents/<name>/` — naturally inside the
+    /// project-root sandbox — so the previous parent-dir
+    /// `extra_read_roots` shim for sibling reads (#242) is also gone:
+    /// `fs_read('.alms/agents/<sibling>/personality.md')` resolves
+    /// directly under the primary root.
     ///
     /// **Note**: `workspace_write` registration goes through `ToolRegistry::register()`,
     /// which checks the `enabled_filter`. If the operator has set `tools.enabled`
@@ -205,89 +407,15 @@ impl AgentRuntime {
         // Subject to enabled_filter — see doc comment above.
         self.tools.register(std::sync::Arc::new(tool));
 
-        // Ensure the workspace directory exists before canonicalizing.
-        // Without this, canonicalize() fails on non-existent paths and the
-        // sandbox root falls back to a relative path — causing
-        // starts_with() mismatches on Windows (\\?\ prefix vs relative)
-        // and potential hangs in fs_write (see #273).
+        // Ensure the workspace directory exists so `workspace_write` and
+        // `read_file` calls don't trip on a missing directory. Failure is
+        // non-fatal — the tool surfaces the IO error on first use.
         if let Err(e) = workspace.ensure_dir() {
             warn!(
                 error = %e,
                 workspace_dir = %workspace.dir().display(),
-                "Failed to create workspace directory — fs tools may not work correctly"
+                "Failed to create workspace directory — workspace tools may fail at runtime"
             );
-        }
-
-        // Canonicalize the workspace path so the sandbox root is always
-        // absolute. This prevents Windows \\?\ prefix mismatches when
-        // check_sandbox_path compares the sandbox root against resolved
-        // file paths.
-        let ws_root = match std::fs::canonicalize(workspace.dir()) {
-            Ok(canonical) => canonical,
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    workspace_dir = %workspace.dir().display(),
-                    "Cannot canonicalize workspace dir — using as-is"
-                );
-                workspace.dir().to_path_buf()
-            }
-        };
-
-        // Parent directory of the workspace (e.g. `{workspace_dir}/`), which
-        // contains every named agent's workspace as a sibling subdirectory.
-        // Granting read-only access here lets a parent agent read a
-        // subagent's `memories.md`/`personality.md`/etc. without being able
-        // to modify them (see #242).  Writes remain gated by the primary
-        // sandbox root (`ws_root`) so agents still can't touch another
-        // agent's files.
-        //
-        // `ws_root` was canonicalized above, so `ws_root.parent()` is also
-        // canonical on all supported platforms — no further canonicalize
-        // call is needed.  If the parent can't be taken (workspace sits at
-        // a filesystem root), we fall back to an empty extras list so
-        // behaviour is unchanged.
-        //
-        // The per-run shell-spill (#756) and tool-output-truncate (#851)
-        // directories are picked up from `self.extra_fs_read_roots` below —
-        // any builder method that introduces a new spill dir pushes it onto
-        // that accumulator so the read-family fs_* tools always see every
-        // active spill root regardless of the order in which the builder
-        // methods were called. See the field doc on
-        // [`AgentRuntime::extra_fs_read_roots`] for the rationale (#921 fix).
-        let parent_root: Vec<std::path::PathBuf> = match ws_root.parent() {
-            Some(parent) => vec![parent.to_path_buf()],
-            None => Vec::new(),
-        };
-
-        // Re-register fs_* tools with workspace as primary sandbox root and
-        // sibling-workspaces + accumulated spill dirs as extra read roots.
-        let extras = self.compose_fs_extra_read_roots(&parent_root);
-        self.register_fs_tools(Some(ws_root.clone()), &extras);
-
-        // Re-register shell tool with workspace dir as default cwd and
-        // gateway-provided default env vars (ALMS_DATA_DIR, etc.).
-        // The tool is registered under both "shell" (primary) and "shell_exec" (alias).
-        let enabled = &self.config.enabled_tools;
-        let shell_enabled =
-            enabled.is_empty() || enabled.iter().any(|t| t == "shell" || t == "shell_exec");
-        if shell_enabled {
-            let mut shell_tool = alms_sandbox::ShellTool::with_policy(
-                self.resolved_sandbox_root.clone(),
-                self.shell_unrestricted,
-            )
-            .with_default_cwd(ws_root)
-            .with_permissions(&self.shell_permissions)
-            .with_classification_mode(self.shell_classification_mode)
-            .with_spill_policy(self.shell_spill_policy.clone());
-            if !self.shell_default_env.is_empty() {
-                shell_tool = shell_tool.with_default_env(self.shell_default_env.clone());
-            }
-            let tool_arc: std::sync::Arc<dyn alms_sandbox::Tool> = std::sync::Arc::new(shell_tool);
-            self.tools.register(std::sync::Arc::clone(&tool_arc));
-            // Also register under legacy alias for backward compatibility
-            self.tools
-                .register_arc_as(alms_sandbox::shell::SHELL_TOOL_ALIAS, tool_arc);
         }
 
         self.workspace = Some(workspace);
@@ -481,6 +609,45 @@ impl AgentRuntime {
     /// other agents stay as `Role::User`.
     pub fn with_agent_name(mut self, name: String) -> Self {
         self.agent_name = Some(name);
+        self
+    }
+
+    /// Append an extra read-only root onto the accumulated
+    /// [`Self::extra_fs_read_roots`] list (#946 sibling-reads
+    /// support).
+    ///
+    /// Used by the gateway's run-lifecycle wiring when an agent runs
+    /// in `WorktreeMode::Git`: the agent's primary sandbox root is
+    /// the worktree path (`<project>/.alms/worktrees/<name>/`) but
+    /// the agent must still be able to read sibling personality
+    /// metadata at `<project>/.alms/agents/<sibling>/personality.md`,
+    /// which sits OUTSIDE the worktree.
+    ///
+    /// Order-independent: this builder pushes onto the
+    /// [`Self::extra_fs_read_roots`] accumulator and then calls
+    /// [`Self::refresh_fs_tools_for_extras`], so the new extra takes
+    /// effect immediately whether or not [`Self::with_project_root`]
+    /// has already run. When the primary root is set later, its
+    /// re-registration consults the same accumulator via
+    /// [`Self::compose_fs_extra_read_roots`] and picks the extra up
+    /// then. Mirrors the accumulator pattern used by
+    /// [`Self::with_shell_spill`] and [`Self::with_tool_output_truncate`].
+    pub fn with_extra_fs_read_root(mut self, root: std::path::PathBuf) -> Self {
+        // Skip duplicate-root pushes — the accumulator is consulted
+        // by every read-family fs_* re-registration so a duplicate
+        // would inflate the list without changing behaviour. The
+        // O(n) `contains` check is fine; the list is short by design
+        // (a handful of per-run spill dirs + the worktree sibling
+        // root).
+        if !self.extra_fs_read_roots.iter().any(|p| p == &root) {
+            self.extra_fs_read_roots.push(root);
+        }
+        // If the runtime already has a primary sandbox root pinned,
+        // re-register the read-family tools so the new extra takes
+        // effect immediately. Without this the tools registered at
+        // `AgentRuntime::new` time keep their stale extra-roots list.
+        // Same shape as `refresh_fs_tools_for_extras`'s callers.
+        self.refresh_fs_tools_for_extras();
         self
     }
 

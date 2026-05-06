@@ -7,6 +7,7 @@ pub mod registry;
 pub mod run;
 pub mod secrets;
 pub mod source_label;
+pub mod worktree;
 
 pub use channel::{Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
 
@@ -15,8 +16,8 @@ pub use config::AlmsConfig;
 pub use error::{AlmsError, AlmsResult, sanitize_error_for_session};
 pub use job::{CreateJobRequest, Job, JobId, JobSchedule, JobStatus};
 pub use registry::{
-    AgentRecord, CreateAgentRequest, UpdateAgentRequest, WORKSPACE_FILENAMES, init_workspace_files,
-    migrate_workspace_dirs, validate_agent_name,
+    AgentRecord, CreateAgentRequest, UpdateAgentRequest, WORKSPACE_FILENAMES, WorktreeMode,
+    init_workspace_files, migrate_workspace_dirs, validate_agent_name,
 };
 pub use run::{
     CreateRunRequest, CreateRunResponse, ResolvedRunConfig, Run, RunId, RunInput, RunRegistrar,

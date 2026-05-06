@@ -893,9 +893,7 @@ impl AgentRuntime {
                     role,
                     content: SessionContent::ToolCall {
                         name: tc.function.name.clone(),
-                        params: serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| {
-                            serde_json::Value::String(tc.function.arguments.clone())
-                        }),
+                        params: normalize_tool_args(&tc.function.arguments),
                     },
                     timestamp: alms_core::Timestamp::now(),
                     metadata,
@@ -1347,25 +1345,40 @@ impl AgentRuntime {
         // approval check below.
         let start = std::time::Instant::now();
 
-        // Parse arguments
-        let args: serde_json::Value = match serde_json::from_str(args_str) {
-            Ok(value) => value,
-            Err(e) => {
-                let err = alms_core::AlmsError::ToolExecution(format!("Invalid arguments: {}", e));
-                let _ = session_manager.append_audit(
-                    session_id,
-                    AuditEvent {
+        // Parse arguments.
+        //
+        // Anthropic's streaming protocol omits the `input_json_delta`
+        // event entirely when the model calls a no-args tool (#967), so
+        // we observe `args_str == ""`. `serde_json::from_str("")` is an
+        // EOF error which would falsely deny an otherwise valid no-args
+        // invocation. Normalize empty / whitespace-only strings to an
+        // empty object up front. All other parse failures (malformed
+        // JSON, non-object literals) keep the original deny path — those
+        // are genuine model errors the tool's per-arg deserializer
+        // should surface to the agent rather than silently paper over.
+        let args: serde_json::Value = if args_str.trim().is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            match serde_json::from_str(args_str) {
+                Ok(value) => value,
+                Err(e) => {
+                    let err =
+                        alms_core::AlmsError::ToolExecution(format!("Invalid arguments: {}", e));
+                    let _ = session_manager.append_audit(
                         session_id,
-                        run_id: self.run_id,
-                        tool: name.to_string(),
-                        decision: AuditDecision::Deny,
-                        params: serde_json::Value::String(args_str.to_string()),
-                        result: None,
-                        error: Some(err.to_string()),
-                        timestamp: alms_core::Timestamp::now(),
-                    },
-                );
-                return Err(err);
+                        AuditEvent {
+                            session_id,
+                            run_id: self.run_id,
+                            tool: name.to_string(),
+                            decision: AuditDecision::Deny,
+                            params: serde_json::Value::String(args_str.to_string()),
+                            result: None,
+                            error: Some(err.to_string()),
+                            timestamp: alms_core::Timestamp::now(),
+                        },
+                    );
+                    return Err(err);
+                }
             }
         };
 

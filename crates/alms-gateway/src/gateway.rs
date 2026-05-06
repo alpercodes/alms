@@ -33,7 +33,15 @@ pub struct GatewayConfig {
     /// Propagated as `ALMS_DATA_DIR` to shell_exec so agent CLI commands
     /// find the right database regardless of sandbox cwd.
     pub data_dir: Option<std::path::PathBuf>,
-    /// Base directory for agent workspace files (None = workspace API disabled)
+    /// Absolute path to the project root — the agent's filesystem sandbox
+    /// boundary (#945). Resolved at gateway construction time from
+    /// [`ServerConfig::resolved_project_root`]; the CLI `--project` flag
+    /// writes through to that field before this struct is built.
+    pub project_root: Option<std::path::PathBuf>,
+    /// Base directory for agent workspace files (None = workspace API
+    /// disabled). After #945 this is `<project_root>/.alms/agents/` —
+    /// flat, sibling to `alms.db` rather than nested under
+    /// `<data_dir>/workspace/`.
     pub workspace_dir: Option<std::path::PathBuf>,
     /// Explicit agent ID (None = resolve from sidecar file or generate new)
     pub agent_id: Option<AgentId>,
@@ -43,6 +51,12 @@ pub struct GatewayConfig {
     pub logging_config: alms_core::config::LoggingConfig,
     /// Tools configuration snapshot — timeout and max_output_bytes for UI display.
     pub tools_config: alms_core::config::ToolsConfig,
+    /// Security configuration snapshot (#947) — config-file-only,
+    /// loaded once at boot, never mutated by `PATCH /settings`. Used to
+    /// resolve the `allow_full_os_access` list at run-start to decide
+    /// whether to attach the project-root sandbox to a new
+    /// [`AgentRuntime`].
+    pub security_config: alms_core::config::SecurityConfig,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -55,11 +69,13 @@ impl Default for GatewayConfig {
             session_config: SessionConfig::default(),
             db_path: None,
             data_dir: None,
+            project_root: None,
             workspace_dir: None,
             agent_id: None,
             auth_token: None,
             logging_config: alms_core::config::LoggingConfig::default(),
             tools_config: alms_core::config::ToolsConfig::default(),
+            security_config: alms_core::config::SecurityConfig::default(),
         }
     }
 }
@@ -119,28 +135,31 @@ impl GatewayConfig {
             },
             db_path: None,
             data_dir: None,
+            project_root: None,
             workspace_dir: None,
             agent_id: None,
             auth_token: config.server.auth_token.clone(),
             logging_config: config.logging.clone(),
             tools_config: config.tools.clone(),
+            security_config: config.security.clone(),
         }
     }
 
     /// Build GatewayConfig from a pre-loaded AlmsConfig, applying
-    /// environment-variable overrides for db_path, workspace_dir, and
-    /// agent_id.
+    /// environment-variable overrides for db_path, workspace_dir,
+    /// project_root, and agent_id.
     ///
     /// The data directory is resolved from `config.server.data_dir` (which
     /// itself respects the `ALMS_DATA_DIR` env var). Individual paths can
     /// still be overridden with `ALMS_DB_PATH` and `ALMS_WORKSPACE_DIR`.
+    /// The project root (#945) follows its own precedence chain via
+    /// [`ServerConfig::resolved_project_root`].
     pub fn from_alms_config_with_env(config: &AlmsConfig) -> Self {
         let mut gateway_config = Self::from_alms_config(config);
 
         let data_dir = &config.server.data_dir;
 
         gateway_config.db_path = Some(config.server.db_path());
-        gateway_config.workspace_dir = Some(config.server.workspace_dir());
 
         // Ensure data dir exists before SQLite tries to open files there.
         if let Err(e) = std::fs::create_dir_all(data_dir) {
@@ -150,6 +169,25 @@ impl GatewayConfig {
         // data_dir is already resolved to an absolute path by
         // AlmsConfig::load(). Store it for shell_exec env injection.
         gateway_config.data_dir = Some(std::path::PathBuf::from(data_dir));
+
+        // Resolve the project root (#945) and ensure it exists. This is the
+        // single source of truth for the agent's filesystem-sandbox
+        // boundary in v2 — fs_*, shell, fs_grep, fs_glob all share it.
+        let project_root = config.server.resolved_project_root();
+        if let Err(e) = std::fs::create_dir_all(&project_root) {
+            tracing::warn!(
+                "Could not create project root {}: {}",
+                project_root.display(),
+                e
+            );
+        }
+        gateway_config.project_root = Some(project_root);
+
+        // Agent metadata directory (#945): `<project_root>/.alms/agents/`.
+        // Workspace files for each agent live in `<agents_dir>/<name>/`,
+        // flat and sibling to `alms.db` instead of nested under the data
+        // directory.
+        gateway_config.workspace_dir = Some(config.server.agents_dir());
 
         gateway_config.agent_id = Some(resolve_default_agent_id(Path::new(data_dir)));
 
@@ -164,6 +202,85 @@ impl GatewayConfig {
     pub fn from_env() -> AlmsResult<Self> {
         let config = AlmsConfig::load()?;
         Ok(Self::from_alms_config_with_env(&config))
+    }
+}
+
+/// Emit a structured WARN for every agent named in
+/// [`SecurityConfig::allow_full_os_access`][alms_core::config::SecurityConfig::allow_full_os_access]
+/// (#947).
+///
+/// Called once from [`Gateway::start`] so operators see the loosened
+/// sandbox at boot. A matching per-run WARN fires from
+/// `runs/lifecycle.rs::execute_run` so log scanners can correlate runs
+/// against the listed agents on long-lived daemons too.
+///
+/// Extracted as a free function (not a method) so unit tests can call
+/// it directly under a custom tracing subscriber without spinning up a
+/// full `Gateway` instance — see `boot_warn_emits_for_each_listed_agent`
+/// in this file's tests.
+pub(crate) fn warn_full_os_access_at_boot(security_config: &alms_core::config::SecurityConfig) {
+    for agent_name in &security_config.allow_full_os_access {
+        warn!(
+            target: "alms.security",
+            agent_name = %agent_name,
+            allow_full_os_access = true,
+            "Agent '{}' is in [security].allow_full_os_access — runs will execute \
+             WITHOUT the project-root filesystem sandbox. shell_permissions and \
+             the destructive-command classifier still apply. Worktree-mode (when \
+             configured) is silently ignored for this agent.",
+            agent_name,
+        );
+    }
+}
+
+/// Emit a boot-time `WARN` for every agent that has both
+/// `worktree_mode = "git"` AND is on `[security].allow_full_os_access`
+/// (#946 + #947 precedence overlap).
+///
+/// At runtime the security list wins — the agent runs without any
+/// filesystem sandbox even though it has a worktree provisioned. The
+/// worktree itself stays on disk so the operator can flip the
+/// security knob off later without re-running `git worktree add`. We
+/// surface the conflict at boot so operators see it on every restart,
+/// not just on the per-run WARN that fires from the runs lifecycle.
+///
+/// Best-effort: when the SQLite store is unavailable (in-memory test
+/// builds, missing data dir) the function is a no-op.
+pub(crate) fn warn_worktree_and_full_os_access_overlap_at_boot(
+    store: Option<&std::sync::Arc<alms_session::SqliteStore>>,
+    security_config: &alms_core::config::SecurityConfig,
+) {
+    if security_config.allow_full_os_access.is_empty() {
+        return;
+    }
+    let Some(store) = store else {
+        return;
+    };
+    let agents = match store.list_agents() {
+        Ok(a) => a,
+        Err(e) => {
+            warn!(error = %e, "Could not list agents for worktree/full-os-access overlap WARN");
+            return;
+        }
+    };
+    for agent in agents {
+        if agent.worktree_mode == alms_core::WorktreeMode::Git
+            && security_config.is_full_os_access_agent(&agent.name)
+        {
+            warn!(
+                target: "alms.security",
+                agent_name = %agent.name,
+                allow_full_os_access = true,
+                worktree_mode = "git",
+                "Agent '{}' has worktree_mode=git AND is on [security].allow_full_os_access. \
+                 At runtime the security list wins — the agent will run WITHOUT any \
+                 filesystem sandbox. The worktree at <project>/.alms/worktrees/{}/ \
+                 stays on disk so the operator can flip the security knob off later \
+                 without re-creating it.",
+                agent.name,
+                agent.name,
+            );
+        }
     }
 }
 
@@ -424,6 +541,27 @@ impl Gateway {
     pub async fn start(&mut self) -> AlmsResult<()> {
         info!("Starting ALMS Gateway");
 
+        // Boot-time WARN for every agent named in
+        // `[security].allow_full_os_access` (#947). Operators see each
+        // listed agent on every boot — log scanners can correlate these
+        // structured fields against runs. The matching run-start WARN
+        // fires per-run from the runs lifecycle so a long-lived daemon
+        // continues to surface the policy at run granularity.
+        warn_full_os_access_at_boot(&self.config.security_config);
+
+        // Boot-time WARN for every agent that has BOTH
+        // `worktree_mode = "git"` (#946) AND is on
+        // `[security].allow_full_os_access`. The security list always
+        // wins at runtime — the worktree exists on disk (so flipping
+        // the security knob off restores the worktree sandbox without
+        // a re-create) but the run-time sandbox attachment is
+        // skipped. Surface the precedence at boot so operators can
+        // catch the conflict in the daemon's first 200 lines.
+        warn_worktree_and_full_os_access_overlap_at_boot(
+            self.session_manager.store(),
+            &self.config.security_config,
+        );
+
         // Shell output spill retention sweep (issue #756). Runs once at
         // startup — no background ticker — so expired `.alms/shell_output/*`
         // files are cleaned up the next time the gateway restarts rather
@@ -575,13 +713,28 @@ impl Gateway {
                     // pre-existing behaviour for the context / session / tools
                     // sections and is documented in `docs/api.md` § 10.2.
                     let secrets_guard = self.secrets.read();
-                    let resolved = crate::runs::resolve_agent_config(
+                    let resolved = match crate::runs::resolve_agent_config(
                         agent_id,
                         &self.session_manager,
                         &self.config.agent_config,
                         &self.llm,
                         Some(&secrets_guard),
-                    );
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // #863: per-agent provider override with no model
+                            // on any layer. Telegram has no HTTP response
+                            // surface, so log + drop the message — operator
+                            // must fix the agent config (PATCH /agents/{id})
+                            // before further messages are routable.
+                            error!(
+                                agent_id = %agent_id,
+                                "Telegram: dropping message — {}",
+                                e
+                            );
+                            continue;
+                        }
+                    };
                     drop(secrets_guard);
                     // Bootstrap detection: first-time agents get the
                     // bootstrap interview prompt instead of their default.
@@ -629,6 +782,57 @@ impl Gateway {
                         if !shell_env.is_empty() {
                             runtime = runtime.with_shell_default_env(shell_env);
                         }
+                    }
+                    // Pin the agent's sandbox at the project root (#945)
+                    // — or, when `worktree_mode = "git"` (#946), at the
+                    // agent's dedicated worktree under
+                    // `<project>/.alms/worktrees/<name>/`. Mirror the HTTP
+                    // path so Telegram-triggered runs see the same model.
+                    // Must precede `with_workspace` so the re-registration
+                    // of fs_* / shell happens before workspace attachment.
+                    //
+                    // Precedence: `[security].allow_full_os_access` wins
+                    // over both worktree mode and project-root mode. The
+                    // worktree (if provisioned) stays on disk — only the
+                    // run-time sandbox attachment is bypassed.
+                    let full_os_access = self
+                        .config
+                        .security_config
+                        .is_full_os_access_agent(&effective_name);
+                    let worktree_mode = resolved.worktree_mode;
+                    if full_os_access {
+                        warn!(
+                            target: "alms.security",
+                            agent_name = %effective_name,
+                            allow_full_os_access = true,
+                            channel = "telegram",
+                            worktree_mode = %worktree_mode.as_wire_str(),
+                            "Telegram run starting for agent '{}' WITHOUT project-root \
+                             filesystem sandbox (allow_full_os_access). shell_permissions \
+                             and the destructive-command classifier still apply. \
+                             Worktree-mode is silently ignored at runtime.",
+                            effective_name,
+                        );
+                        runtime = runtime.with_unrestricted_filesystem();
+                    } else if worktree_mode == alms_core::WorktreeMode::Git
+                        && let Some(project_root) = self.config.project_root.clone()
+                    {
+                        let worktree_dir =
+                            alms_core::worktree::worktree_path(&project_root, &effective_name);
+                        let sibling_read_root =
+                            project_root.join(".alms").join("agents");
+                        runtime = runtime
+                            .with_extra_fs_read_root(sibling_read_root)
+                            .with_project_root(worktree_dir.clone());
+                        info!(
+                            target: "alms.worktree",
+                            agent_name = %effective_name,
+                            channel = "telegram",
+                            worktree_dir = %worktree_dir.display(),
+                            "Telegram run starting under per-agent git worktree (#946)"
+                        );
+                    } else if let Some(project_root) = self.config.project_root.clone() {
+                        runtime = runtime.with_project_root(project_root);
                     }
                     // Attach workspace so agent personality/goals/memories
                     // are prepended to the system prompt (same as HTTP path).
@@ -719,7 +923,14 @@ impl Gateway {
         self.config.data_dir.as_deref()
     }
 
-    /// Get workspace base directory (None = workspace API disabled)
+    /// Get the absolute path to the project root (#945) — the agent's
+    /// filesystem sandbox boundary.
+    pub fn project_root(&self) -> Option<&std::path::Path> {
+        self.config.project_root.as_deref()
+    }
+
+    /// Get workspace base directory (None = workspace API disabled).
+    /// After #945 this is `<project_root>/.alms/agents/`.
     pub fn workspace_dir(&self) -> Option<&std::path::Path> {
         self.config.workspace_dir.as_deref()
     }
@@ -752,6 +963,13 @@ impl Gateway {
     /// Get tools config reference (for exposing server defaults)
     pub fn tools_config(&self) -> &alms_core::config::ToolsConfig {
         &self.config.tools_config
+    }
+
+    /// Get the security config reference (#947). Snapshotted at gateway
+    /// construction; the field is config-file-only and never mutated at
+    /// runtime, so no `Arc<RwLock<_>>` is needed.
+    pub fn security_config(&self) -> &alms_core::config::SecurityConfig {
+        &self.config.security_config
     }
 
     /// Get a clone of the shared secrets store handle.
@@ -851,6 +1069,7 @@ fn migrate_sidecar_agent(store: &SqliteStore, agent_id: AgentId) {
         gemini_thinking_budget: None,
         summary_provider: None,
         summary_model: None,
+        worktree_mode: alms_core::WorktreeMode::Off,
         is_default: false,
         created_at: now,
         last_active: now,
@@ -992,6 +1211,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: None,
             summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
             is_default: true,
             created_at: now,
             last_active: now,
@@ -1005,5 +1225,122 @@ mod tests {
         let agents = store.list_agents().unwrap();
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].id, existing_id);
+    }
+
+    // ── #947: WARN-log assertions for [security].allow_full_os_access ──
+
+    /// In-memory `MakeWriter` that captures every line emitted by the
+    /// fmt subscriber so tests can assert on log content.
+    ///
+    /// Implemented as a `Mutex<Vec<u8>>` shared via `Arc` so the writer
+    /// closure (which the subscriber calls per event) and the test body
+    /// (which reads the captured lines) point at the same buffer.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = LogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn captured(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// `warn_full_os_access_at_boot` emits one structured WARN per
+    /// listed agent. Acceptance check from #947: "WARN at agent-create
+    /// / first-observation-at-boot".
+    #[test]
+    fn boot_warn_emits_for_each_listed_agent() {
+        use tracing_subscriber::fmt::format::FmtSpan;
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_target(true)
+            .with_span_events(FmtSpan::NONE)
+            .without_time()
+            // No ANSI colour codes — keeps assertions on the captured
+            // text simple.
+            .with_ansi(false)
+            .finish();
+
+        let security_config = alms_core::config::SecurityConfig {
+            allow_full_os_access: vec!["alice".into(), "bob".into()],
+        };
+
+        // Drive the helper under our subscriber.
+        tracing::subscriber::with_default(subscriber, || {
+            warn_full_os_access_at_boot(&security_config);
+        });
+
+        let captured = logs.captured();
+
+        // The structured fields each appear in the output (the fmt
+        // subscriber renders them as `field_name=value`).
+        assert!(
+            captured.contains("agent_name=alice"),
+            "WARN must carry structured agent_name=alice: {captured}"
+        );
+        assert!(
+            captured.contains("agent_name=bob"),
+            "WARN must carry structured agent_name=bob: {captured}"
+        );
+        assert!(
+            captured.contains("allow_full_os_access=true"),
+            "WARN must carry structured allow_full_os_access=true: {captured}"
+        );
+        // Target is the configured "alms.security" string.
+        assert!(
+            captured.contains("alms.security"),
+            "WARN must use the alms.security tracing target: {captured}"
+        );
+        // Two listed agents → at least two `WARN` markers.
+        let warn_lines = captured.matches("WARN").count();
+        assert!(
+            warn_lines >= 2,
+            "Expected ≥2 WARN lines (one per listed agent), got {warn_lines}: {captured}"
+        );
+    }
+
+    /// Empty `allow_full_os_access` is a complete no-op: no WARN at boot.
+    #[test]
+    fn boot_warn_silent_when_list_is_empty() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_target(true)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+
+        let security_config = alms_core::config::SecurityConfig::default();
+        tracing::subscriber::with_default(subscriber, || {
+            warn_full_os_access_at_boot(&security_config);
+        });
+
+        let captured = logs.captured();
+        assert!(
+            !captured.contains("alms.security"),
+            "no WARN must fire when the list is empty: {captured}"
+        );
     }
 }

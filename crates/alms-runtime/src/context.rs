@@ -617,15 +617,26 @@ impl ContextBuilder {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                // Heal legacy `params: ""` poison written by the
+                // pre-#967 persistence path: a no-args Anthropic tool
+                // call (where `arguments == ""`) was stored as
+                // `Value::String("")` instead of `Value::Object({})`,
+                // and re-serializing that on the wire produced
+                // `tool_use.input: ""` which Anthropic 400s. The
+                // adapters' `normalize_tool_args` would also catch this
+                // (wrapping under `_raw`), but normalizing here means
+                // the rebuilt arguments are the truthful `{}` rather
+                // than `{"_raw":"\"\""}`.
+                let params_str = if matches!(params, serde_json::Value::String(s) if s.is_empty()) {
+                    "{}".to_string()
+                } else {
+                    params.to_string()
+                };
                 LlmMessage {
                     role: "assistant".to_string(),
                     content: None,
                     reasoning_content: None,
-                    tool_calls: Some(vec![ToolCall::new(
-                        tool_call_id,
-                        name.clone(),
-                        params.to_string(),
-                    )]),
+                    tool_calls: Some(vec![ToolCall::new(tool_call_id, name.clone(), params_str)]),
                     tool_call_id: None,
                 }
             }
@@ -1482,6 +1493,73 @@ mod tests {
         assert_eq!(tr_msg.role, "tool");
         assert_eq!(tr_msg.tool_call_id.as_deref(), Some("call_123"));
         assert!(tr_msg.content_str().contains("file1.txt"));
+    }
+
+    /// Regression test for #967 — legacy sessions persisted by the
+    /// pre-fix code path stored a no-args Anthropic tool call as
+    /// `Content::ToolCall { params: Value::String("") }`. Re-serializing
+    /// that on the wire produced `tool_use.input: ""` which Anthropic
+    /// rejects (`"Input should be an object"`), wedging the
+    /// conversation across runs. The rebuild path now heals the poison
+    /// so already-persisted sessions can recover without manual DB
+    /// surgery.
+    #[test]
+    fn test_legacy_empty_string_params_heals_to_empty_object() {
+        let config = ContextConfig {
+            strategy: "full".into(),
+            max_input_tokens: 32000,
+            recent_window: 20,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            make_msg(Role::User, "list files"),
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                // The exact poison shape from #967.
+                content: Content::ToolCall {
+                    name: "fs_list".to_string(),
+                    params: serde_json::Value::String(String::new()),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"tool_call_id": "call_poisoned"})),
+            },
+            Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Tool,
+                content: Content::ToolResult {
+                    tool_id: "call_poisoned".to_string(),
+                    result: serde_json::json!("[]"),
+                },
+                timestamp: Timestamp::now(),
+                metadata: Some(serde_json::json!({"ok": true})),
+            },
+            make_msg(Role::Assistant, "ok done"),
+        ];
+
+        let messages = builder.build("System", &history, "and now?", None);
+
+        let tc_msg = messages
+            .iter()
+            .find(|m| m.role == "assistant" && m.tool_calls.is_some())
+            .expect("rebuilt assistant tool_call message must exist");
+        let calls = tc_msg.tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].function.arguments, "{}",
+            "legacy `params: \"\"` poison must heal to `arguments: \"{{}}\"` so the \
+             Anthropic adapter serializes `tool_use.input: {{}}` and not `\"\"`",
+        );
+
+        // And confirm the parse round-trip: reconstructed `arguments`
+        // must parse back to a JSON object so subsequent normalize
+        // passes are no-ops.
+        let parsed: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert!(parsed.is_object());
     }
 
     #[test]

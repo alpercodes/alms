@@ -324,33 +324,112 @@ fn test_default_max_context_tokens_larger_than_max_input_tokens() {
 }
 
 #[test]
-fn test_workspace_dir_default() {
+fn test_agents_dir_default_uses_resolved_project_root() {
+    // After #945 the agent metadata directory lives under the project
+    // root rather than the data directory: `<project>/.alms/agents/`.
+    // The default `ServerConfig` resolves the project root from
+    // `current_dir()`, so the agents-dir suffix is what we pin here.
     let _lock = ENV_LOCK.lock().unwrap();
-    let _guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
+    let _ws_guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
+    let _project_guard = SingleEnvGuard::remove("ALMS_PROJECT_ROOT");
 
     let config = ServerConfig::default();
-    assert_eq!(config.workspace_dir(), PathBuf::from("./.alms/workspace"));
+    let agents = config.agents_dir();
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(agents, cwd.join(".alms").join("agents"));
 }
 
 #[test]
-fn test_workspace_dir_env_override() {
+fn test_agents_dir_legacy_workspace_env_override_still_wins() {
+    // `ALMS_WORKSPACE_DIR` is the legacy override knob; #945 keeps it as
+    // the highest-precedence agents-dir override so operators can pin
+    // metadata to a custom location even after the default layout flip.
     let _lock = ENV_LOCK.lock().unwrap();
-    let _guard = SingleEnvGuard::set("ALMS_WORKSPACE_DIR", "/custom/workspace");
+    let _ws_guard = SingleEnvGuard::set("ALMS_WORKSPACE_DIR", "/custom/workspace");
 
     let config = ServerConfig::default();
-    assert_eq!(config.workspace_dir(), PathBuf::from("/custom/workspace"));
+    assert_eq!(config.agents_dir(), PathBuf::from("/custom/workspace"));
 }
 
 #[test]
-fn test_workspace_dir_uses_data_dir() {
+fn test_project_root_precedence_explicit_field_wins() {
+    // Precedence: `self.project_root` (CLI) > env > current_dir.
+    // The CLI flag writes the absolute path into the field directly,
+    // so a non-empty field beats the env var.
     let _lock = ENV_LOCK.lock().unwrap();
-    let _guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
+    let _env_guard = SingleEnvGuard::set("ALMS_PROJECT_ROOT", "/from/env");
 
     let config = ServerConfig {
-        data_dir: "/my/data".into(),
+        project_root: "/from/cli".into(),
         ..Default::default()
     };
-    assert_eq!(config.workspace_dir(), PathBuf::from("/my/data/workspace"));
+    assert_eq!(
+        config.resolved_project_root(),
+        PathBuf::from("/from/cli"),
+        "explicit project_root field (CLI flag) must beat the env var"
+    );
+}
+
+#[test]
+fn test_project_root_precedence_env_wins_over_cwd() {
+    // No CLI override (field empty) → env var wins over `current_dir`.
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _env_guard = SingleEnvGuard::set("ALMS_PROJECT_ROOT", "/from/env");
+
+    let config = ServerConfig::default();
+    assert_eq!(
+        config.resolved_project_root(),
+        PathBuf::from("/from/env"),
+        "ALMS_PROJECT_ROOT must beat the current_dir fallback"
+    );
+}
+
+#[test]
+fn test_project_root_precedence_cwd_fallback() {
+    // No CLI override and no env var → `current_dir` fallback.
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _env_guard = SingleEnvGuard::remove("ALMS_PROJECT_ROOT");
+
+    let config = ServerConfig::default();
+    let resolved = config.resolved_project_root();
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(
+        resolved, cwd,
+        "with no CLI override and no env var, project_root falls back to current_dir"
+    );
+}
+
+#[test]
+fn test_project_root_precedence_empty_env_falls_through_to_cwd() {
+    // An explicit empty `ALMS_PROJECT_ROOT="" ` should NOT pin the project
+    // root to `""` — the resolver treats an empty env value the same as
+    // an unset variable so the cwd fallback wins. Mirrors the empty-field
+    // discipline (`if !self.project_root.is_empty()` in the resolver).
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _env_guard = SingleEnvGuard::set("ALMS_PROJECT_ROOT", "");
+
+    let config = ServerConfig::default();
+    let resolved = config.resolved_project_root();
+    let cwd = std::env::current_dir().unwrap();
+    assert_eq!(resolved, cwd);
+}
+
+#[test]
+fn test_agents_dir_follows_project_root() {
+    // With no `ALMS_WORKSPACE_DIR` and an explicit project_root, the
+    // agents directory anchors at `<project_root>/.alms/agents/`.
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _ws_guard = SingleEnvGuard::remove("ALMS_WORKSPACE_DIR");
+    let _project_guard = SingleEnvGuard::remove("ALMS_PROJECT_ROOT");
+
+    let config = ServerConfig {
+        project_root: "/my/project".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        config.agents_dir(),
+        PathBuf::from("/my/project").join(".alms").join("agents")
+    );
 }
 
 #[test]
@@ -1952,5 +2031,103 @@ fn test_load_or_default_falls_back_to_defaults_on_unparseable_toml() {
     assert!(
         cfg.context.summary_provider.is_none() && cfg.context.summary_model.is_none(),
         "fallback config should have default summary pair (both None)"
+    );
+}
+
+// ── #947: SecurityConfig (allow_full_os_access) ──────────────────────
+
+/// Default `[security]` is empty — no agent has full-OS access.
+#[test]
+fn security_config_default_is_empty() {
+    let security = SecurityConfig::default();
+    assert!(
+        security.allow_full_os_access.is_empty(),
+        "default allow_full_os_access list must be empty"
+    );
+    // The matcher rejects every conceivable name — including the empty
+    // string — when the list is empty.
+    assert!(!security.is_full_os_access_agent(""));
+    assert!(!security.is_full_os_access_agent("alice"));
+}
+
+/// `is_full_os_access_agent` is exact-match on the agent's registry name.
+#[test]
+fn security_config_match_is_exact() {
+    let security = SecurityConfig {
+        allow_full_os_access: vec!["alice".into(), "bob".into()],
+    };
+    assert!(security.is_full_os_access_agent("alice"));
+    assert!(security.is_full_os_access_agent("bob"));
+    assert!(!security.is_full_os_access_agent("carol"));
+    // No prefix / case-insensitivity / substring matches.
+    assert!(!security.is_full_os_access_agent("ali"));
+    assert!(!security.is_full_os_access_agent("Alice"));
+    assert!(!security.is_full_os_access_agent("alicebot"));
+    // Empty input never matches even when the list is non-empty —
+    // unnamed/ephemeral agents cannot be on the list by construction.
+    assert!(!security.is_full_os_access_agent(""));
+}
+
+/// `[security]` parses cleanly from TOML and survives a full `AlmsConfig`
+/// round-trip, including under `validate()`.
+#[test]
+fn security_config_parses_from_toml() {
+    let toml = r#"
+        [security]
+        allow_full_os_access = ["operator-shell", "deploy-bot"]
+    "#;
+    let cfg: AlmsConfig = toml::from_str(toml).expect("parse alms.toml fragment");
+    assert_eq!(
+        cfg.security.allow_full_os_access,
+        vec!["operator-shell".to_string(), "deploy-bot".to_string()],
+    );
+    // The remaining sections still default cleanly so a TOML that only
+    // contains `[security]` doesn't fail validation.
+    let mut cfg = cfg;
+    // Mock provider so `validate()` doesn't trip on the missing API key.
+    cfg.llm.mock = true;
+    cfg.llm.ensure_builtin_providers();
+    cfg.validate()
+        .expect("validate should accept valid security config");
+}
+
+/// Empty entries in `allow_full_os_access` fail `validate()` rather than
+/// silently disabling the entry. A blank string would never match
+/// anything (the matcher shortcircuits) but it signals an operator
+/// error in the config file, so we surface it loudly.
+#[test]
+fn security_config_rejects_empty_entries() {
+    let mut cfg = AlmsConfig::default();
+    cfg.llm.mock = true;
+    cfg.security.allow_full_os_access = vec!["valid".into(), "".into()];
+    let err = cfg
+        .validate()
+        .expect_err("validate must reject empty allow_full_os_access entries");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("allow_full_os_access[1]"),
+        "error must point at the bad index: got `{msg}`"
+    );
+
+    // Whitespace-only is also invalid — same operator-error class.
+    cfg.security.allow_full_os_access = vec!["   ".into()];
+    cfg.validate()
+        .expect_err("whitespace-only entry must also fail validation");
+}
+
+/// `[security]` is NOT in `apply_env_overrides` — the threat model says
+/// the knob is config-file-only, so an `ALMS_*` env var must not be a
+/// PATCH-mutation back door. Pin the absence with a sanity check.
+#[test]
+fn security_config_has_no_env_var_override() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_SECURITY_ALLOW_FULL_OS_ACCESS", "alice,bob");
+
+    let mut cfg = AlmsConfig::default();
+    cfg.apply_env_overrides();
+    assert!(
+        cfg.security.allow_full_os_access.is_empty(),
+        "apply_env_overrides must not interpret env vars for security knobs — \
+         the threat model demands config-file-only mutability"
     );
 }

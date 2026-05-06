@@ -401,15 +401,23 @@ pub(crate) fn to_anthropic_request(req: &CompletionRequest) -> AnthropicRequest 
                         blocks.push(ContentBlock::Text { text: text.clone() });
                     }
                     for tc in tool_calls {
-                        let input: Value = serde_json::from_str(&tc.function.arguments)
-                            .unwrap_or_else(|e| {
-                                tracing::warn!(
-                                    "Malformed tool arguments for {}: {}",
-                                    tc.function.name,
-                                    e
-                                );
-                                Value::String(tc.function.arguments.clone())
-                            });
+                        // Anthropic's `tool_use.input` is spec'd as an
+                        // object and the API rejects any other shape with
+                        // `400 invalid_request_error: "Input should be an
+                        // object"`. The legacy fallback here was
+                        // `Value::String(args)`, which:
+                        //
+                        //   1. wrote a JSON string into `tool_use.input`
+                        //      (Anthropic 400),
+                        //   2. and round-tripped a poisoned `params: ""`
+                        //      shape through SQLite (so the failure
+                        //      persisted across runs and wedged the
+                        //      session — see #967).
+                        //
+                        // Normalize through the shared helper so empty /
+                        // malformed / non-object args always serialize as
+                        // an object on the wire.
+                        let input: Value = normalize_tool_args(&tc.function.arguments);
                         blocks.push(ContentBlock::ToolUse {
                             // Sanitize for Anthropic's `^[a-zA-Z0-9_-]+$`
                             // regex (#850). Must use the same function on
@@ -1008,6 +1016,104 @@ mod tests {
         assert_eq!(anthropic_req.messages[0].role, "user");
         assert_eq!(anthropic_req.messages[1].role, "assistant");
         assert_eq!(anthropic_req.messages[2].role, "user"); // tool result in user message
+    }
+
+    /// Regression test for #967 — Anthropic 400s when `tool_use.input`
+    /// is anything other than an object. The pre-#967 code path
+    /// fell back to `Value::String(args)` on parse failure, so a
+    /// no-args tool call (Anthropic streaming omits `input_json_delta`
+    /// entirely → `arguments == ""`) round-tripped to
+    /// `tool_use.input: ""` on the wire and crashed the conversation.
+    #[test]
+    fn test_to_anthropic_request_no_args_tool_call_emits_object_input() {
+        // Empty `arguments` is the no-args case. Must serialize as
+        // `tool_use.input: {}` (an object) on the wire — never as a
+        // string, null, or any other shape.
+        let req = CompletionRequest::new("test-model").with_messages(vec![
+            LlmMessage::user("list files"),
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall::new("call_1", "fs_list", "")]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("call_1", "[]"),
+        ]);
+
+        let anthropic_req = to_anthropic_request(&req);
+        let serialized = serde_json::to_value(&anthropic_req).unwrap();
+
+        // Find the tool_use block and pin its input shape.
+        let assistant_blocks = serialized["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"].as_str() == Some("assistant"))
+            .expect("assistant message must exist")["content"]
+            .as_array()
+            .expect("assistant content must be blocks");
+
+        let tool_use = assistant_blocks
+            .iter()
+            .find(|b| b["type"].as_str() == Some("tool_use"))
+            .expect("tool_use block must be present");
+
+        let input = &tool_use["input"];
+        assert!(
+            input.is_object(),
+            "tool_use.input must be an object on the wire (#967), got: {input}"
+        );
+        assert_eq!(
+            input,
+            &serde_json::json!({}),
+            "no-args tool call must serialize as tool_use.input: {{}}, got: {input}"
+        );
+    }
+
+    /// Defense-in-depth: even if a malformed-args string somehow
+    /// reaches the adapter (e.g. a poisoned legacy session), the wire
+    /// shape must still be an object — never a string. Wrap under
+    /// `_raw` instead.
+    #[test]
+    fn test_to_anthropic_request_malformed_args_wraps_under_raw() {
+        let req = CompletionRequest::new("test-model").with_messages(vec![
+            LlmMessage::user("go"),
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                // Not valid JSON at all — pre-#967 this became
+                // `Value::String("not json")`.
+                tool_calls: Some(vec![ToolCall::new("call_1", "echo", "not json")]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("call_1", "ok"),
+        ]);
+
+        let anthropic_req = to_anthropic_request(&req);
+        let serialized = serde_json::to_value(&anthropic_req).unwrap();
+
+        let assistant_blocks = serialized["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"].as_str() == Some("assistant"))
+            .unwrap()["content"]
+            .as_array()
+            .unwrap();
+
+        let tool_use = assistant_blocks
+            .iter()
+            .find(|b| b["type"].as_str() == Some("tool_use"))
+            .unwrap();
+
+        let input = &tool_use["input"];
+        assert!(
+            input.is_object(),
+            "tool_use.input must be an object even on malformed args: {input}"
+        );
+        assert_eq!(input, &serde_json::json!({"_raw": "not json"}));
     }
 
     #[test]

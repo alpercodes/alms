@@ -854,3 +854,154 @@ test('#873 dispatcher: tools that return error shapes fall through to raw', () =
     assert.equal(tree, null,
         'send_message error shape must fall through to the raw fallback');
 });
+
+// =========================================================================
+// tool-row.js wiring — the regression that bit us in #969 was that
+// `utils/tool-output.js` got dropped on the develop branch during a
+// release-merge skew. The dispatcher tests above all passed (they only
+// load the dispatcher), but in production every tool rendered as raw
+// JSON because tool-row.js was never importing or invoking it.
+//
+// These tests pin the wiring contract at the source-text level so any
+// future refactor that drops the import or stops calling the dispatcher
+// gets caught at test time rather than in Alper's browser.
+// =========================================================================
+
+const TOOL_ROW_PATH = path.resolve(
+    __dirname,
+    '../../static/ui/components/chat/tool-row.js'
+);
+
+test('#969 wiring: tool-row.js imports the dispatcher from utils/tool-output.js', () => {
+    const src = fs.readFileSync(TOOL_ROW_PATH, 'utf8');
+    // Match either single- or double-quoted import paths and any
+    // amount of whitespace, but require the symbol `renderToolOutput`
+    // and the path `utils/tool-output.js` (relative to the chat
+    // component dir).
+    const importRe =
+        /import\s*\{[^}]*\brenderToolOutput\b[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/tool-output\.js['"]/;
+    assert.ok(importRe.test(src),
+        'tool-row.js must import { renderToolOutput } from "../../utils/tool-output.js"\n'
+        + 'Without this import the per-tool structured renderers never run and every\n'
+        + 'tool result falls through to the raw-JSON view (see #969).');
+});
+
+test('#969 wiring: tool-row.js invokes renderToolOutput on the success path', () => {
+    const src = fs.readFileSync(TOOL_ROW_PATH, 'utf8');
+    // The dispatcher is named `renderToolOutput`; it must be called
+    // somewhere in tool-row.js, not just imported. A bare import
+    // would still pass the import test above but produce raw output
+    // because nothing wires the dispatcher's return value into the JSX.
+    assert.ok(/\brenderToolOutput\s*\(/.test(src),
+        'tool-row.js must call renderToolOutput(...) on the success path.\n'
+        + 'A dangling import without an invocation regresses to the raw-JSON\n'
+        + 'fallback for every tool (see #969).');
+});
+
+test('#969 wiring: tool-output.js exists on disk and exports renderToolOutput', () => {
+    // The literal regression in #969 was that this file went missing on
+    // develop. A node-side existence + export test catches that class
+    // of failure even if every dispatcher test above silently shifts
+    // to "skip because the module is missing".
+    assert.ok(fs.existsSync(TOOL_OUTPUT_PATH),
+        'static/ui/utils/tool-output.js must exist — see #969.');
+    const src = fs.readFileSync(TOOL_OUTPUT_PATH, 'utf8');
+    assert.ok(/export\s+function\s+renderToolOutput\b/.test(src),
+        'tool-output.js must export `renderToolOutput` as the dispatcher entry point.');
+});
+
+// =========================================================================
+// Runtime → renderer shape contract
+//
+// The dispatcher's per-tool renderers read fields off the tool result
+// payload by name (e.g. `result.exit_code`, `result.matches`,
+// `result.content`). If the runtime crate ever renames or removes one
+// of those fields without updating the dispatcher, the renderer
+// silently returns null and tool-row.js falls back to raw — exactly
+// the regression class Alper hit.
+//
+// We can't drive the live Rust runtime from a node test, but we CAN
+// pin the shape contract here in canonical fixtures derived from the
+// Rust source. The fixtures below are copied from inline `json!({...})`
+// calls in the corresponding tools — re-deriving them is the work a
+// reviewer does when changing a tool's output. The tests assert the
+// dispatcher returns a non-null tree for each canonical shape, which
+// is the strongest contract test we can run from the JS side without
+// shelling into the binary.
+//
+// To regenerate after a Rust-side shape change, copy the new
+// `json!({...})` body from the source file referenced in each test
+// header into the `result` literal below.
+// =========================================================================
+
+test('#969 shape contract: shell foreground (crates/alms-sandbox/src/shell/mod.rs)', () => {
+    // Pinned from the json!({...}) at shell/mod.rs:330-336 + 572-576.
+    const result = { exit_code: 0, stdout: 'ok\n', stderr: '' };
+    const tree = renderToolOutput('shell', result, { command: 'echo ok' });
+    assert.ok(tree, 'shell foreground shape must render structured output');
+});
+
+test('#969 shape contract: fs_read (crates/alms-sandbox/src/builtin/fs_read.rs)', () => {
+    // Pinned from the json!({...}) at fs_read.rs:464-492 — content is
+    // the only required field; everything else is conditional.
+    const result = { content: 'line 1\nline 2\n' };
+    const tree = renderToolOutput('fs_read', result, { path: 'README.md' });
+    assert.ok(tree, 'fs_read minimal shape must render structured output');
+
+    // Also pin the "partial read with truncation flags" variant.
+    const partial = {
+        content: 'line 1\n',
+        total_lines: 100,
+        offset: 0,
+        limit: 1,
+        line_truncated: true,
+    };
+    const partialTree = renderToolOutput('fs_read', partial,
+        { path: 'big.txt', offset: 0, limit: 1 });
+    assert.ok(partialTree, 'fs_read partial-read shape must render structured output');
+});
+
+test('#969 shape contract: fs_write (crates/alms-sandbox/src/builtin/fs_write.rs)', () => {
+    // Pinned from the json!({...}) success branch in fs_write.rs.
+    const result = { ok: true, path: '/tmp/foo.txt' };
+    const tree = renderToolOutput('fs_write', result, { path: '/tmp/foo.txt' });
+    assert.ok(tree, 'fs_write success shape must render structured output');
+});
+
+test('#969 shape contract: fs_grep content mode (crates/alms-sandbox/src/builtin/fs_grep.rs)', () => {
+    // Pinned from the content-mode json!({...}) in fs_grep.rs.
+    const result = {
+        matches: [
+            { file: 'src/lib.rs', line: 12, content: 'fn foo() {' },
+        ],
+        total: 1,
+        truncated: false,
+        truncated_lines: 0,
+    };
+    const tree = renderToolOutput('fs_grep', result, { pattern: 'foo' });
+    assert.ok(tree, 'fs_grep content-mode shape must render structured output');
+});
+
+test('#969 shape contract: invoke_agent foreground (crates/alms-tools/src/invoke_agent*)', () => {
+    // Pinned from the foreground response shape — name + response.
+    const result = {
+        name: 'researcher',
+        session_id: '00000000-0000-0000-0000-000000000000',
+        response: 'Done.',
+    };
+    const tree = renderToolOutput('invoke_agent', result,
+        { name: 'researcher', task: 'Look something up.' });
+    assert.ok(tree, 'invoke_agent foreground shape must render structured output');
+});
+
+test('#969 shape contract: http_get (crates/alms-sandbox/src/builtin/http_get.rs)', () => {
+    // Pinned from the http_get json!({...}) — status, body, headers.
+    const result = {
+        status: 200,
+        body: '{"hello": "world"}',
+        headers: { 'content-type': 'application/json' },
+    };
+    const tree = renderToolOutput('http_get', result,
+        { url: 'https://example.com/api' });
+    assert.ok(tree, 'http_get shape must render structured output');
+});

@@ -33,6 +33,9 @@ uuid.workspace = true
 tempfile = "3"
 tokio-test.workspace = true
 walkdir.workspace = true
+# Test-only subscriber for asserting structured WARN logs fire on the
+# security path (#947). Same major version as the workspace dep.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # JS parse-sweep over `static/ui/` modules — see tests/static_assets_parse.rs.
 # Pinned to the major versions current at the time of #829; bump when bumping
 # any other swc_* crate in the workspace.

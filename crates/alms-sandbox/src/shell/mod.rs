@@ -1372,6 +1372,105 @@ mod tests {
         );
     }
 
+    /// Regression test for #954 (complement to `test_shell_spill_content_matches_input`):
+    /// when the user's command produces output WITHOUT a trailing newline, the spill
+    /// must capture exactly that byte sequence — no over-stripping of the last byte.
+    ///
+    /// Before #954's fix, an unbounded backward walk in `strip_pwd_marker_bytes` ate
+    /// the user's trailing newline. A naive "always strip the last byte" fix would
+    /// instead lose the last byte when the user emits no trailing newline. This test
+    /// pins the no-newline case so neither regression can sneak back in.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_spill_content_no_trailing_newline() {
+        use crate::shell::spill::ShellSpillPolicy;
+        use crate::shell::types::MAX_OUTPUT_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run-no-newline");
+        let tool =
+            ShellTool::new().with_spill_policy(ShellSpillPolicy::with_run_dir(run_dir.clone()));
+
+        // `printf '%.0sa'` (no `; echo` afterwards) emits exactly n 'a' bytes with
+        // no trailing newline. The single \n preceding the marker comes purely from
+        // the wrapper's own `echo;` separator, and must be the only \n stripped.
+        let n = MAX_OUTPUT_BYTES + 5_000;
+        let cmd = format!("printf '%.0sa' $(seq 1 {n})");
+        let result = tool
+            .execute(serde_json::json!({"command": cmd}))
+            .await
+            .unwrap();
+        let _ = result;
+
+        let entries: Vec<_> = std::fs::read_dir(&run_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1, "expected exactly one spill file");
+        let spill_path = entries.into_iter().next().unwrap().unwrap().path();
+        let spilled = std::fs::read(&spill_path).unwrap();
+
+        // Expected output is exactly n 'a' bytes — no trailing newline.
+        let expected = vec![b'a'; n];
+
+        assert_eq!(
+            spilled.len(),
+            expected.len(),
+            "spill file byte length must match the pre-truncation capture (no trailing newline)"
+        );
+        assert_eq!(
+            spilled, expected,
+            "spill file must contain exactly the user's bytes with no over-stripping"
+        );
+    }
+
+    /// Regression test for #954: marker-stripping behavior itself must be preserved.
+    /// The wrapper's PWD marker line and the trailing `pwd` line must not appear in
+    /// the captured stdout, even though the user's output contains a real trailing
+    /// newline. This guards the spill capture against a future "fix" that loosens
+    /// the marker boundary in the other direction.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_shell_spill_strips_pwd_marker_with_trailing_newline() {
+        use crate::shell::spill::ShellSpillPolicy;
+        use crate::shell::types::MAX_OUTPUT_BYTES;
+
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run-marker-strip");
+        let tool =
+            ShellTool::new().with_spill_policy(ShellSpillPolicy::with_run_dir(run_dir.clone()));
+
+        // Big enough to spill, with a final `echo` that emits a user-owned trailing \n.
+        let n = MAX_OUTPUT_BYTES + 1_000;
+        let cmd = format!("printf '%.0sb' $(seq 1 {n}); echo");
+        let result = tool
+            .execute(serde_json::json!({"command": cmd}))
+            .await
+            .unwrap();
+        let _ = result;
+
+        let entries: Vec<_> = std::fs::read_dir(&run_dir).unwrap().collect();
+        assert_eq!(entries.len(), 1, "expected exactly one spill file");
+        let spill_path = entries.into_iter().next().unwrap().unwrap().path();
+        let spilled = std::fs::read(&spill_path).unwrap();
+
+        // Marker token shape: __ALMS_PWD_<uuid simple>__ (see new_pwd_marker). Even
+        // though each ShellTool gets a random nonce, the static prefix is what we
+        // assert on — its presence in the spill would prove the marker line leaked.
+        let marker_prefix = b"__ALMS_PWD_";
+        assert!(
+            !spilled
+                .windows(marker_prefix.len())
+                .any(|w| w == marker_prefix),
+            "spill must not contain the PWD marker prefix — marker stripping regressed"
+        );
+
+        // And the user's bytes must be exactly n 'b's followed by a single '\n'.
+        let mut expected = vec![b'b'; n];
+        expected.push(b'\n');
+        assert_eq!(
+            spilled, expected,
+            "spill must contain exactly the user's bytes (no over-strip, no under-strip)"
+        );
+    }
+
     /// `enabled: false` at the config layer must produce no spill file and
     /// no `[full output spilled to: ...]` marker in the tool result. This
     /// guards the opt-out path the operator gets when they set

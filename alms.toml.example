@@ -117,6 +117,65 @@ sandbox_root = "."
 # Override with: ALMS_SHELL_POLICY=unrestricted
 shell_policy = "sandboxed"
 
+[security]
+# Operator-only escape hatch from the project-root filesystem sandbox (#947).
+#
+# Agents listed here run WITHOUT the project-root sandbox introduced in
+# the workspace v2 redesign (#945) — `fs_*` tools have no path prefix to
+# enforce, and the `shell` tool's persistent cwd is not pinned to the
+# project root. Listed agents are subject only to OS-level user
+# permissions of the daemon process: `fs_read /etc/passwd` works, `shell
+# ls /` returns the real root.
+#
+# The two independent operator policies still apply to listed agents:
+#   - `[tools.shell_permissions]` allow / deny / classifier_overrides (#717)
+#   - `[tools.shell_classification_mode]` destructive-command floor (#745)
+# They are defense-in-depth controls, not part of the sandbox boundary.
+#
+# THIS KNOB IS CONFIG-FILE-ONLY. `PATCH /settings` rejects any payload
+# referencing it with `400 SECURITY_KNOB_NOT_PATCHABLE`. PATCH mutability
+# would let a compromised auth token silently widen the blast radius of
+# an existing agent. Edit this file and restart the gateway to change
+# the list.
+#
+# A boot-time WARN fires for every listed agent and a per-run WARN fires
+# at every `run_started` for a listed agent so log scanners can correlate
+# runs against the loosened sandbox.
+#
+# Default: empty list. Uncomment and add agent names (matching `alms
+# agent create --name <name>`) to opt them out of the sandbox.
+# allow_full_os_access = ["operator-shell", "deploy-bot"]
+allow_full_os_access = []
+
+# ─────────────────────────────────────────────────────────────────────
+# Per-agent git worktree mode (#946) — workspace v2
+# ─────────────────────────────────────────────────────────────────────
+#
+# Worktree mode is a PER-AGENT setting, not a server-wide one. It is
+# configured at agent-create time, NOT in this file:
+#
+#   alms agent create my-agent --worktree-mode git
+#   alms agent config my-agent --worktree-mode off
+#
+# When `worktree_mode = "git"` the gateway runs `git worktree add
+# <project>/.alms/worktrees/<name>/ -b alms/<name>` and pins the
+# agent's filesystem sandbox at that worktree path instead of the
+# project root. Multiple agents on the same git project can work in
+# parallel without filesystem collisions.
+#
+# Precedence with `[security].allow_full_os_access` above: an agent
+# listed in `allow_full_os_access` runs WITHOUT any filesystem
+# sandbox at all, regardless of its worktree mode. The worktree
+# itself is still created at agent-create time so the operator can
+# flip the security knob off later without re-running `git worktree
+# add` — only the run-time sandbox attachment is bypassed. A
+# boot-time WARN fires for every agent in this overlap so the
+# precedence is visible in the daemon log.
+#
+# Non-git projects + `--worktree-mode git` returns `400
+# WORKTREE_REQUIRES_GIT` at create / PATCH time. There is no
+# silent fallback to project-root mode.
+
 [logging]
 # Enable/disable file-based logging. Only applies to the gateway command.
 # Set to false to disable file logging entirely (e.g., in containers with journal capture).

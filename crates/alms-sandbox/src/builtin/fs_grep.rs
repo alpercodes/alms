@@ -71,6 +71,23 @@ struct ContentMatch {
     context_after: Vec<String>,
 }
 
+/// Choose the directory to relativize match paths against.
+///
+/// When the agent passes `path` pointing at a single file, `search_root` is
+/// that file itself, so `relativize(file, search_root)` strips to the empty
+/// string and the per-match `file` field comes back as `""` (issue #972).
+///
+/// In single-file mode we relativize against the file's parent instead, which
+/// yields the basename — matching the directory-walk shape (relative path with
+/// a non-empty filename).
+fn relativize_base(search_root: &Path) -> &Path {
+    if search_root.is_file() {
+        search_root.parent().unwrap_or(search_root)
+    } else {
+        search_root
+    }
+}
+
 #[async_trait::async_trait]
 impl Tool for FsGrepTool {
     fn name(&self) -> &str {
@@ -338,6 +355,8 @@ async fn search_files_with_matches(
         head_limit
     };
 
+    let rel_base = relativize_base(search_root);
+
     for file in files {
         let scan = file_matches_regex(re, file).await?;
         truncated_lines = truncated_lines.saturating_add(scan.truncated_lines);
@@ -353,7 +372,7 @@ async fn search_files_with_matches(
                 break;
             }
 
-            let rel = relativize(file, search_root);
+            let rel = relativize(file, rel_base);
 
             output_chars += rel.len() + 4;
             if output_chars > MAX_OUTPUT_CHARS {
@@ -393,6 +412,8 @@ async fn search_content(
         head_limit
     };
 
+    let rel_base = relativize_base(search_root);
+
     'outer: for file in files {
         let matches = search_file_content(re, file, context_lines).await?;
         for m in matches {
@@ -407,7 +428,7 @@ async fn search_content(
                 break 'outer;
             }
 
-            let rel = relativize(file, search_root);
+            let rel = relativize(file, rel_base);
 
             let ctx_before = if context_lines > 0 {
                 if let Some(prev) = results.last() {
@@ -493,6 +514,8 @@ async fn search_count(
 
     let mut truncated_lines: u64 = 0;
 
+    let rel_base = relativize_base(search_root);
+
     for file in files {
         let scan = count_file_matches(re, file).await?;
         truncated_lines = truncated_lines.saturating_add(scan.truncated_lines);
@@ -513,7 +536,7 @@ async fn search_count(
             break;
         }
 
-        let rel = relativize(file, search_root);
+        let rel = relativize(file, rel_base);
         let entry = serde_json::json!({
             "file": rel,
             "count": count
@@ -2004,5 +2027,116 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["truncated_lines"].as_u64().unwrap(), 0);
+    }
+
+    /// Regression for #972: when `path` points at a single file, `content`
+    /// mode must populate the per-match `file` field with the file's basename
+    /// (matching the directory-walk shape). Previously it returned `""`
+    /// because `relativize(file, search_root)` strips a self-prefix to empty.
+    #[tokio::test]
+    async fn test_fs_grep_single_file_path_populates_file_field_content_mode() {
+        let dir = setup_grep_dir();
+        let file = dir.path().join("src/main.rs");
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "println",
+                "path": file.to_str().unwrap(),
+                "output_mode": "content"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        let file_field = matches[0]["file"].as_str().unwrap();
+        assert!(
+            !file_field.is_empty(),
+            "single-file mode must not return empty file field (#972)"
+        );
+        assert_eq!(
+            file_field, "main.rs",
+            "single-file mode emits the basename, matching directory-walk shape"
+        );
+    }
+
+    /// Regression for #972: same fix must apply to `count` mode.
+    #[tokio::test]
+    async fn test_fs_grep_single_file_path_populates_file_field_count_mode() {
+        let dir = setup_grep_dir();
+        let file = dir.path().join("src/main.rs");
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "println",
+                "path": file.to_str().unwrap(),
+                "output_mode": "count"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        let file_field = matches[0]["file"].as_str().unwrap();
+        assert_eq!(file_field, "main.rs");
+        assert_eq!(matches[0]["count"].as_u64().unwrap(), 1);
+    }
+
+    /// Regression for #972: same fix must apply to `files_with_matches` mode.
+    /// In that mode `matches` is a flat string array (not objects), so we
+    /// assert directly on the string value.
+    #[tokio::test]
+    async fn test_fs_grep_single_file_path_populates_file_field_fwm_mode() {
+        let dir = setup_grep_dir();
+        let file = dir.path().join("src/main.rs");
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "println",
+                "path": file.to_str().unwrap(),
+                "output_mode": "files_with_matches"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 1);
+        let entry = matches[0].as_str().unwrap();
+        assert!(
+            !entry.is_empty(),
+            "single-file mode must not return empty path (#972)"
+        );
+        assert_eq!(entry, "main.rs");
+    }
+
+    /// Sanity: directory-mode behaviour is unchanged — paths are still the
+    /// relative path under the search root, not just the basename.
+    #[tokio::test]
+    async fn test_fs_grep_directory_mode_file_field_unchanged() {
+        let dir = setup_grep_dir();
+        let root = dir.path();
+        let tool = FsGrepTool::new();
+
+        let result = tool
+            .execute(serde_json::json!({
+                "pattern": "println",
+                "path": root.to_str().unwrap(),
+                "output_mode": "content"
+            }))
+            .await
+            .unwrap();
+
+        let matches = result["matches"].as_array().unwrap();
+        let files: Vec<&str> = matches
+            .iter()
+            .map(|m| m["file"].as_str().unwrap())
+            .collect();
+        // Directory walk emits paths relative to `search_root`, e.g.
+        // "src/main.rs" — never just the basename, never empty.
+        assert!(files.contains(&"src/main.rs"));
+        assert!(files.iter().all(|f| !f.is_empty()));
     }
 }

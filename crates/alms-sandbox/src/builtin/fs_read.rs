@@ -1515,7 +1515,7 @@ mod tests {
         assert!(
             !text.contains("[line truncated"),
             "no truncation marker should appear in normal multi-line reads, got: {}",
-            &text.chars().take(200).collect::<String>()
+            text.chars().take(200).collect::<String>()
         );
         // Spot-check first and last lines of the slice.
         assert!(text.contains("     1\tline number 1"));
@@ -1582,7 +1582,7 @@ mod tests {
         assert!(
             text.contains("short_line_2"),
             "second line should be readable when paginating past the over-cap line, got: {}",
-            &text.chars().take(200).collect::<String>()
+            text.chars().take(200).collect::<String>()
         );
         assert!(
             text.contains("short_line_3"),
@@ -1627,7 +1627,7 @@ mod tests {
         assert!(
             !text.contains("[line truncated"),
             "no truncation marker should appear in returned content, got: {}",
-            &text.chars().take(200).collect::<String>()
+            text.chars().take(200).collect::<String>()
         );
         // And the flag must agree.  Pre-#914 this was `Some(true)`.
         assert!(
@@ -1674,7 +1674,7 @@ mod tests {
         assert!(
             !text.contains("[line truncated"),
             "no truncation marker should appear in returned content, got: {}",
-            &text.chars().take(200).collect::<String>()
+            text.chars().take(200).collect::<String>()
         );
         assert!(
             result.get("line_truncated").is_none(),

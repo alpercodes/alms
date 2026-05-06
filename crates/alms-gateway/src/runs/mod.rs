@@ -34,7 +34,7 @@ pub use streaming::{
 };
 
 // Public struct and function used by gateway.rs
-pub use self::config::{ResolvedAgentConfig, resolve_agent_config};
+pub use self::config::{ResolveAgentConfigError, ResolvedAgentConfig, resolve_agent_config};
 
 // ---------------------------------------------------------------------------
 // Shared types (used by multiple submodules)
@@ -157,7 +157,58 @@ mod config {
         pub llm: alms_runtime::LlmClient,
         /// Agent name from registry (None if record not found).
         pub agent_name: Option<String>,
+        /// Per-agent worktree-isolation mode (#946). `Off` for unnamed
+        /// / unregistered agents and for agents that haven't opted
+        /// into the worktree dance.
+        pub worktree_mode: alms_core::WorktreeMode,
     }
+
+    /// Failure modes from [`resolve_agent_config`].
+    ///
+    /// Currently the only variant is [`Self::MissingModelAfterProviderSwitch`]
+    /// (#863) — the structured replacement for the old `with_model("")`
+    /// fail-fast that surfaced as an opaque downstream 4xx (e.g. Anthropic
+    /// 404 on `model: ""`) at the upstream provider. Catching this at the
+    /// gateway lets `POST /runs` reject the request with a clean
+    /// `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH` before any LLM call.
+    #[derive(Debug, Clone)]
+    pub enum ResolveAgentConfigError {
+        /// A per-agent `provider` override switched the effective provider
+        /// AND no model was supplied at any layer for the new provider:
+        /// per-agent `model` was either `None` or carried a name from the
+        /// OLD provider's namespace (and was dropped by the #942 cross-
+        /// namespace check), AND the new provider's
+        /// `[llm.providers.<new>].model` entry has no `model` field. The
+        /// agent loop would otherwise send the previous provider's default
+        /// model on the new provider's wire (#860 leak) or send `model: ""`
+        /// (the pre-#863 fail-fast). Returning this error from
+        /// `resolve_agent_config` lets the gateway emit a structured 400
+        /// before any LLM call.
+        MissingModelAfterProviderSwitch {
+            agent_id: alms_core::AgentId,
+            new_provider: String,
+            prev_provider: String,
+        },
+    }
+
+    impl std::fmt::Display for ResolveAgentConfigError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::MissingModelAfterProviderSwitch {
+                    agent_id,
+                    new_provider,
+                    prev_provider,
+                } => write!(
+                    f,
+                    "agent {agent_id} overrides provider to {new_provider} but no \
+                     model was supplied; previous provider {prev_provider}'s default \
+                     cannot be reused"
+                ),
+            }
+        }
+    }
+
+    impl std::error::Error for ResolveAgentConfigError {}
 
     /// Resolve per-agent config overrides from the agent registry.
     ///
@@ -174,14 +225,18 @@ mod config {
     /// /agents/{id}` before starting the run; `POST /runs` carries no
     /// config knobs.
     ///
-    /// **#860 model-leak guard (no per-agent model).** When a per-agent
-    /// `provider` override switches the effective provider AND neither a
-    /// per-agent `model` nor a `[llm.providers.<name>].model` entry
-    /// supplies a model for the new provider, `apply_provider` leaves
-    /// `default_model` pointing at the OLD provider's default. That stale
-    /// model would 404 on the new provider's wire. The guard clears
-    /// `default_model` to `""` so the agent loop's wire request fails
-    /// fast with a clean "missing model" error.
+    /// **#863 missing-model gateway-side 400.** When a per-agent `provider`
+    /// override switches the effective provider AND neither a per-agent
+    /// `model` nor a `[llm.providers.<name>].model` entry supplies a model
+    /// for the new provider, `apply_provider` leaves `default_model`
+    /// pointing at the OLD provider's default — which would 404 on the new
+    /// provider's wire. The pre-#863 behaviour was a defensive
+    /// `with_model("")` empty-clear that surfaced as an opaque downstream
+    /// 4xx (e.g. Anthropic 404 on `model: ""`). The post-#863 behaviour is
+    /// to return [`ResolveAgentConfigError::MissingModelAfterProviderSwitch`]
+    /// so callers can map it to a structured `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`
+    /// before any LLM call. This subsumes the original #860 leak guard —
+    /// the empty-clear path no longer fires at all.
     ///
     /// **#942 cross-namespace per-agent model drop.** When a per-agent
     /// provider override switches the effective provider AND the per-agent
@@ -197,18 +252,17 @@ mod config {
     /// requires `gemini-` / `models/gemini-`, and `OpenAiCompatible` is
     /// permissive (the kind is a giant tent — OpenAI / OpenRouter /
     /// DeepSeek all share the wire format and accept different model
-    /// namespaces). Side-effect closes #863: empty-string `with_model("")`
-    /// no longer fires when an Anthropic-namespace per-agent model is
-    /// silently dropped, because the post-fix path either preserves the
-    /// (in-namespace) per-agent model or clears via the #860 guard with a
-    /// distinct `agent_id` log line operators can grep for.
+    /// namespaces). When the cross-namespace path falls through to the
+    /// missing-model condition described above, the function returns
+    /// [`ResolveAgentConfigError::MissingModelAfterProviderSwitch`] (#863)
+    /// rather than emitting an empty-clear `default_model`.
     pub fn resolve_agent_config(
         agent_id: alms_core::AgentId,
         session_manager: &alms_session::SessionManager,
         base_config: &alms_runtime::AgentConfig,
         llm: &alms_runtime::LlmClient,
         secrets: Option<&alms_core::secrets::SecretsStore>,
-    ) -> ResolvedAgentConfig {
+    ) -> Result<ResolvedAgentConfig, ResolveAgentConfigError> {
         let agent_record =
             session_manager
                 .store()
@@ -353,32 +407,48 @@ mod config {
         if let Some(model) = effective_per_agent_model {
             llm = llm.with_model(model);
         } else if provider_changed && llm.default_model() == previous_default_model {
-            // #860 leak guard: per-agent provider switch fired AND neither
-            // a per-agent model nor a `[llm.providers.<new_provider>].model`
+            // #863 structured rejection (subsumes the old #860 empty-clear
+            // fail-fast). Per-agent provider switch fired AND neither a
+            // per-agent model nor a `[llm.providers.<new_provider>].model`
             // entry supplied a model for the new provider, so `default_model`
-            // is still the OLD provider's default. Clear it so the agent
-            // loop's wire request fails fast with a clear "missing model"
-            // error rather than 404'ing on the new provider with the wrong
-            // model name (the original symptom in #860 was Anthropic 404 on
-            // an OpenRouter model name).
+            // is still the OLD provider's default. Returning an error here
+            // lets the gateway emit a clean `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`
+            // before any LLM call rather than letting the agent loop send
+            // the previous provider's default model on the new provider's
+            // wire (the #860 leak shape).
             warn!(
                 agent_id = %agent_id,
                 old_provider = %previous_provider,
                 new_provider = %llm.provider(),
                 stale_model = %previous_default_model,
                 "Per-agent provider switch with no per-agent model and no \
-                 provider-entry model -- clearing inherited model so the run \
-                 fails fast instead of sending the previous provider's default \
-                 model to the new provider's wire (#860)"
+                 provider-entry model -- rejecting before LLM call so the \
+                 user sees a clean 400 instead of an opaque downstream 4xx \
+                 (#863)"
             );
-            llm = llm.with_model(String::new());
+            return Err(ResolveAgentConfigError::MissingModelAfterProviderSwitch {
+                agent_id,
+                new_provider: llm.provider().to_string(),
+                prev_provider: previous_provider,
+            });
         }
 
-        ResolvedAgentConfig {
+        // Per-agent worktree-isolation mode (#946). Unnamed agents
+        // and agents not in the registry get `Off` — there is no
+        // worktree to attach to, so the run uses the project root
+        // (or the security escape hatch) like every other unnamed
+        // run.
+        let worktree_mode = agent_record
+            .as_ref()
+            .map(|r| r.worktree_mode)
+            .unwrap_or_default();
+
+        Ok(ResolvedAgentConfig {
             agent_config: cfg,
             llm,
             agent_name,
-        }
+            worktree_mode,
+        })
     }
 }
 
@@ -453,6 +523,7 @@ mod tests {
             gemini_thinking_budget: None,
             summary_provider: None,
             summary_model: None,
+            worktree_mode: alms_core::WorktreeMode::Off,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -585,7 +656,8 @@ mod tests {
         let server_llm = server_default_llm("server-default-model");
         let secrets = empty_secrets();
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent model in same provider namespace");
 
         assert_eq!(
             resolved.llm.default_model(),
@@ -665,7 +737,8 @@ mod tests {
         secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
         std::mem::forget(dir);
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent provider+model both in same namespace");
 
         assert_eq!(
             resolved.llm.default_model(),
@@ -740,7 +813,8 @@ mod tests {
         secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
         std::mem::forget(dir);
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent model wins over new provider entry's model");
 
         assert_eq!(
             resolved.llm.default_model(),
@@ -754,13 +828,17 @@ mod tests {
     // Regression: fails pre-fix on the exact #860 leak shape -- the
     // server-default OpenRouter `kimi-k2.6` model survives the per-agent
     // provider switch to Anthropic and reaches the wire, producing a
-    // confusing 404 from Anthropic referencing `moonshotai/kimi-k2.6`. The
-    // post-fix leak guard clears `default_model` so the failure is fast
-    // and obvious instead of routed-to-wrong-provider.
+    // confusing 404 from Anthropic referencing `moonshotai/kimi-k2.6`.
+    //
+    // Pre-#863: the leak guard cleared `default_model` to `""` for fail-fast.
+    // Post-#863: the same condition surfaces as a structured
+    // `ResolveAgentConfigError::MissingModelAfterProviderSwitch` so the
+    // gateway can emit a clean `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`
+    // before any LLM call.
     /// Hypothetical: per-agent provider only, no per-agent model. The
     /// server-default model leaks through to the new provider when the new
     /// provider's `[llm.providers.<name>]` entry has no `model` field.
-    /// This is the specific scenario surfaced in #860.
+    /// This is the specific scenario surfaced in #860 (and now #863).
     #[test]
     fn test_per_agent_provider_only_no_per_agent_model_does_not_leak_server_default() {
         let mut record = test_agent(None, None); // no per-agent model
@@ -819,25 +897,25 @@ mod tests {
         secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
         std::mem::forget(dir);
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let result = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
 
-        // Pre-fix: default_model() == "moonshotai/kimi-k2.6" (the leak).
-        // Post-fix: the leak guard clears default_model so the wire request
-        // fails fast with a clear missing-model error rather than 404'ing
-        // on Anthropic with the wrong (OpenRouter) model name.
-        assert_ne!(
-            resolved.llm.default_model(),
-            "moonshotai/kimi-k2.6",
-            "per-agent provider switch must NOT leak the server-default model \
-             of the previous provider to the new provider's wire (#860)"
-        );
-        assert_eq!(
-            resolved.llm.default_model(),
-            "",
-            "leak guard clears default_model when a per-agent provider switch \
-             produces no model from any layer (#860)"
-        );
-        assert_eq!(resolved.llm.provider(), "anthropic");
+        // Pre-#863: default_model() == "" via the leak-guard empty-clear.
+        // Post-#863: structured error so the gateway can return 400.
+        match result {
+            Err(ResolveAgentConfigError::MissingModelAfterProviderSwitch {
+                agent_id,
+                new_provider,
+                prev_provider,
+            }) => {
+                assert_eq!(agent_id, record.id);
+                assert_eq!(new_provider, "anthropic");
+                assert_eq!(prev_provider, "openrouter");
+            }
+            other => panic!(
+                "expected MissingModelAfterProviderSwitch, got {:?}",
+                other.map(|r| r.llm.default_model().to_string()),
+            ),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -864,10 +942,11 @@ mod tests {
     /// forget to update the model). Server default is openai with
     /// `gpt-4o-mini`. Pre-fix: the per-agent `with_model("gpt-4o-mini")`
     /// runs after `apply_provider("anthropic")` and the wire request goes
-    /// to Anthropic with `model: gpt-4o-mini` → 404. Post-fix: the
+    /// to Anthropic with `model: gpt-4o-mini` → 404. Post-#863: the
     /// cross-namespace check drops the per-agent model, the anthropic
-    /// entry has no `model` field, so the #860 leak guard fires and
-    /// `default_model` is cleared to "" for fail-fast.
+    /// entry has no `model` field, so `resolve_agent_config` returns
+    /// `MissingModelAfterProviderSwitch` and the gateway maps it to a
+    /// `400 MISSING_MODEL_AFTER_PROVIDER_SWITCH`.
     #[test]
     fn test_per_agent_provider_switch_drops_per_agent_model_from_old_provider_namespace() {
         let mut record = test_agent(Some("gpt-4o-mini"), None);
@@ -922,27 +1001,29 @@ mod tests {
         secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
         std::mem::forget(dir);
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let result = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
 
         // Pre-fix: default_model() == "gpt-4o-mini" (the per-agent model
         // applied via `with_model` even though it is from the openai
         // namespace and the new provider is anthropic). Wire request 404s.
-        // Post-fix: cross-namespace drop fires, no fallback model on the
-        // anthropic entry, #860 guard clears to "" for fail-fast.
-        assert_ne!(
-            resolved.llm.default_model(),
-            "gpt-4o-mini",
-            "per-agent provider switch must NOT apply a stale per-agent \
-             model from the OLD provider namespace -- the #942 leak"
-        );
-        assert_eq!(
-            resolved.llm.default_model(),
-            "",
-            "after dropping the cross-namespace per-agent model, the #860 \
-             empty-clear fail-fast fires because the new provider entry \
-             has no fallback model (#942 + #860 chain)"
-        );
-        assert_eq!(resolved.llm.provider(), "anthropic");
+        // Post-#863: cross-namespace drop fires, no fallback model on the
+        // anthropic entry, the missing-model error fires so the gateway
+        // returns 400 instead of letting the agent loop send `model: ""`.
+        match result {
+            Err(ResolveAgentConfigError::MissingModelAfterProviderSwitch {
+                agent_id,
+                new_provider,
+                prev_provider,
+            }) => {
+                assert_eq!(agent_id, record.id);
+                assert_eq!(new_provider, "anthropic");
+                assert_eq!(prev_provider, "openai");
+            }
+            other => panic!(
+                "expected MissingModelAfterProviderSwitch for #942 + #863 chain, got {:?}",
+                other.map(|r| r.llm.default_model().to_string()),
+            ),
+        }
     }
 
     /// Companion: per-agent provider override switches Anthropic → Gemini
@@ -1002,7 +1083,8 @@ mod tests {
         secrets.set_key("gemini", "AIza-test").unwrap();
         std::mem::forget(dir);
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent model is in the new provider's namespace");
 
         assert_eq!(
             resolved.llm.default_model(),
@@ -1041,10 +1123,7 @@ mod tests {
             ProviderKind::Gemini
         ));
         // Negative: still rejects out-of-namespace regardless of case.
-        assert!(!model_belongs_to_kind(
-            "GPT-4o",
-            ProviderKind::Anthropic
-        ));
+        assert!(!model_belongs_to_kind("GPT-4o", ProviderKind::Anthropic));
     }
 
     /// Symmetric snapshot test against `build_resolved_config`: pin that
@@ -1108,7 +1187,11 @@ mod tests {
         secrets.set_key("anthropic", "sk-ant-runtime").unwrap();
         std::mem::forget(dir);
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect(
+                "success path: cross-namespace per-agent model is dropped, anthropic entry's \
+                 fallback model fills in",
+            );
         let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
 
         assert_ne!(
@@ -1823,7 +1906,8 @@ mod tests {
         let server_llm = server_default_llm("server-default-model");
         let secrets = empty_secrets();
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent model, no provider switch");
 
         let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
         assert_eq!(
@@ -1848,7 +1932,8 @@ mod tests {
         let server_llm = server_default_llm("server-default-model");
         let secrets = empty_secrets();
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: no per-agent overrides at all");
 
         let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
         assert_eq!(snapshot.model, "server-default-model");
@@ -1872,7 +1957,8 @@ mod tests {
         let server_llm = server_default_llm("any-model");
         let secrets = empty_secrets();
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent posture only");
 
         let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
         assert_eq!(snapshot.posture, "autonomous", "per-agent posture wins");
@@ -1904,7 +1990,8 @@ mod tests {
         let server_llm = server_default_llm("any-model");
         let secrets = empty_secrets();
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent reasoning/thinking budgets only");
 
         let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
         assert_eq!(snapshot.thinking_budget_tokens, 8192);
@@ -1931,13 +2018,37 @@ mod tests {
         let server_llm = server_default_llm("any-model");
         let secrets = empty_secrets();
 
-        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets));
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent explicit-zero thinking budget");
 
         let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
         assert_eq!(
             snapshot.thinking_budget_tokens, 0,
             "per-agent Some(0) must surface as a literal 0 in the snapshot, \
              confirming the disable reached the wire"
+        );
+    }
+
+    /// `Display` impl on the #863 error variant must mention the agent and
+    /// both providers so the structured 400's `message` body is actionable
+    /// for operators triaging the rejection.
+    #[test]
+    fn test_missing_model_after_provider_switch_display_format() {
+        let agent_id = AgentId::new();
+        let err = ResolveAgentConfigError::MissingModelAfterProviderSwitch {
+            agent_id,
+            new_provider: "anthropic".into(),
+            prev_provider: "openrouter".into(),
+        };
+        let s = err.to_string();
+        assert!(
+            s.contains(&agent_id.to_string()),
+            "display must mention agent id"
+        );
+        assert!(s.contains("anthropic"), "display must mention new provider");
+        assert!(
+            s.contains("openrouter"),
+            "display must mention prev provider"
         );
     }
 }

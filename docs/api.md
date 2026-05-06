@@ -1203,6 +1203,17 @@ The reasoning / caching knobs on `/settings.llm.*` use **two different "no overr
 }
 ```
 
+**Response 400** (security knob — config-file-only, #947):
+```json
+{
+  "status": "error",
+  "code": "SECURITY_KNOB_NOT_PATCHABLE",
+  "errors": ["SECURITY_KNOB_NOT_PATCHABLE: settings.security is config-file-only and cannot be modified via PATCH /settings. Edit `[security]` in alms.toml ..."]
+}
+```
+
+Any `PATCH /settings` body that contains a top-level `security` key — including `{ "security": {} }`, `{ "security": null }`, and a populated `{ "security": { "allow_full_os_access": [...] } }` — is rejected as a whole with `400 SECURITY_KNOB_NOT_PATCHABLE` before any other field is applied. Mixed payloads `{ "llm": {...}, "security": {...} }` reject the entire request — no partial application. The `[security]` section is config-file-only by design; PATCH mutability would let a compromised auth token silently widen the agent sandbox. Edit `[security]` in `alms.toml` and restart the gateway. See `docs/security-model.md` § 4.4 (operator escape hatch) for the threat model.
+
 ---
 
 ## 11) Workspace (agent identity files)

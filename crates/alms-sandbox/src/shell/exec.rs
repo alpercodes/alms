@@ -531,16 +531,25 @@ fn strip_pwd_marker_bytes(stdout: &[u8], pwd_marker: &str) -> Vec<u8> {
     // Take all bytes up to the beginning of the marker line.
     let mut end_byte = lines[marker_idx].0;
 
-    // Strip the preceding blank-line separator (wrap_command_with_pwd_marker
-    // emits an explicit `echo` before the marker) plus its CR/LF. We want
-    // the caller's output to end at the last character the user actually
-    // produced. Walk backwards over \n, \r, and additional blank lines.
-    while end_byte > 0 {
-        let prev = stdout[end_byte - 1];
-        if prev == b'\n' || prev == b'\r' {
+    // Strip exactly the one separator newline emitted by `wrap_command_with_pwd_marker`'s
+    // bare `echo;` between the user's command and the marker. That separator is a single
+    // `\n` (or `\r\n` if the upstream stream happened to be CRLF) — nothing more.
+    //
+    // CRITICAL: do NOT walk back over arbitrary trailing newlines. The user's command may
+    // legitimately end in `\n` (e.g. `printf '...'; echo` produces a trailing `\n` that
+    // belongs to the user's output), and that byte must survive into the captured stdout
+    // so byte-for-byte spill round-trips work. See #954.
+    //
+    // Known minor lossy edge case: if the user's output ends in a raw `\r` with no
+    // following `\n` (i.e. wrapper bytes are `...a\r\n{MARKER}...`), the `\r` here is
+    // indistinguishable from the leading half of a CRLF separator and gets stripped
+    // alongside the `\n`. This is identical to the pre-#954 behavior and is realistic
+    // only for very obscure binary-ish output; fixing it would require the wrapper to
+    // emit a non-newline sentinel before the separator. Not worth the complexity today.
+    if end_byte > 0 && stdout[end_byte - 1] == b'\n' {
+        end_byte -= 1;
+        if end_byte > 0 && stdout[end_byte - 1] == b'\r' {
             end_byte -= 1;
-        } else {
-            break;
         }
     }
 
@@ -636,12 +645,31 @@ mod tests {
 
     #[test]
     fn test_strip_pwd_marker_bytes() {
+        // Layout: <user-output>\n<separator-from-bare-echo>\n<marker>\n<pwd>\n
+        // Here the user's output is "file1.txt\nfile2.txt\n" — the trailing \n
+        // belongs to the user and must survive. Only the single separator \n
+        // (and the marker line and pwd line) get stripped.
         let output = format!("file1.txt\nfile2.txt\n\n{TEST_MARKER}\n/home/user\n");
         let cleaned = strip_pwd_marker_bytes(output.as_bytes(), TEST_MARKER);
         let cleaned_str = String::from_utf8(cleaned).unwrap();
-        assert_eq!(cleaned_str, "file1.txt\nfile2.txt");
+        assert_eq!(cleaned_str, "file1.txt\nfile2.txt\n");
         assert!(!cleaned_str.contains(TEST_MARKER));
         assert!(!cleaned_str.contains("/home/user"));
+    }
+
+    #[test]
+    fn test_strip_pwd_marker_bytes_minimal_wrapper_shape() {
+        // Tim's suggested contract test (PR #955): pure-byte assertion on the
+        // canonical `wrap_command_with_pwd_marker` output shape, independent of
+        // bash availability. Locks #954 across every platform.
+        //
+        // Layout: <user>\n<separator>\n<marker>\n<pwd>\n
+        // Input : "aaa\n\n{MARKER}\n/home\n"
+        // Output: "aaa\n"  (user's trailing \n survives; the bare-`echo` separator
+        //                   and the marker/pwd lines are stripped — nothing more)
+        let input = format!("aaa\n\n{TEST_MARKER}\n/home\n");
+        let cleaned = strip_pwd_marker_bytes(input.as_bytes(), TEST_MARKER);
+        assert_eq!(cleaned, b"aaa\n");
     }
 
     #[test]
