@@ -42,6 +42,11 @@ import { selectGeneration } from '../state/select-generation.js';
 import { clearPendingMessage } from '../state/pending-messages.js';
 import { saveQueue } from '../state/composer-storage.js';
 import { DM_END_REASON_LABELS } from '../utils/constants.js';
+import {
+    markStreamDead,
+    clearStreamDead,
+    registerSessionReconnect,
+} from '../state/stream-health.js';
 
 /**
  * Per-run DM thinking text accumulation buffer.
@@ -101,6 +106,15 @@ function friendlyErrorMessage(code, rawMsg) {
 let activeSessionEs = null;
 let sessionRetryCount = 0;
 const MAX_SESSION_RETRIES = 10;
+/**
+ * In-flight backoff timer scheduled by `es.onerror` after a transient
+ * network blip. Stored at module scope so a manual reconnect path
+ * (`reconnectSessionStream`, banner click, `online` event) or an
+ * explicit `closeSessionStream()` can cancel the pending reopen and
+ * avoid a redundant double-open of an already-healthy stream
+ * (see #907 review — Suggestion 1).
+ */
+let backoffTimer = null;
 let deltaBuffer = '';
 let flushTimer = null;
 /**
@@ -231,6 +245,20 @@ export function openSessionStream(sessionId, opts) {
     closeSessionStream();
     if (!sessionId) return;
 
+    // Cancel any pending backoff reopen scheduled by a previous
+    // onerror — the manual-reconnect path (banner click, `online`
+    // event, or this fresh open) supersedes it. Without this guard
+    // the in-flight setTimeout would still fire a few seconds later
+    // and double-open the now-healthy stream (#907 review,
+    // Suggestion 1). closeSessionStream() above already cancels via
+    // the same guard, so this site is belt-and-braces — it pins the
+    // contract at the obvious entry point so a future caller that
+    // bypasses closeSessionStream cannot regress the cancel.
+    if (backoffTimer !== null) {
+        clearTimeout(backoffTimer);
+        backoffTimer = null;
+    }
+
     const token = localStorage.getItem('alms_auth_token');
     const params = new URLSearchParams();
     if (token) params.set('token', token);
@@ -241,6 +269,18 @@ export function openSessionStream(sessionId, opts) {
     activeSessionEs = es;
     sessionRetryCount = 0;
     lastSeenEventId = (opts && opts.lastEventId != null) ? opts.lastEventId : null;
+    // Defer clearing the dead-state flag until the connection
+    // actually opens — see the `'open'` listener below. Constructing
+    // an EventSource is optimistic and does not mean the server is
+    // reachable; if we cleared synchronously here, a manual
+    // reconnect that hit a still-broken backend would briefly drop
+    // the banner and then re-show it on the next exhaustion cycle
+    // (~30 s), which reads as "I clicked it and it lied to me" to
+    // the operator (#907 review, Suggestion 2).
+    es.addEventListener('open', () => {
+        if (es !== activeSessionEs) return;
+        clearStreamDead('session');
+    });
 
     // Capture the current selectGeneration so SSE handlers can detect
     // stale events from a previous session's stream.  If the user
@@ -1232,10 +1272,20 @@ export function openSessionStream(sessionId, opts) {
             sessionRetryCount++;
             if (sessionRetryCount >= MAX_SESSION_RETRIES) {
                 console.error('[session-stream] Max retries reached');
+                // Surface the dead state to the user (#907). The banner
+                // is rendered globally and offers click-to-reconnect;
+                // the browser-level `online` event also calls back into
+                // `reconnectAllStreams` to re-arm both hooks.
+                markStreamDead('session');
                 return;
             }
             const delay = Math.min(2000 * Math.pow(2, sessionRetryCount - 1), 30000);
-            setTimeout(() => {
+            // Track the timer id so the manual-reconnect path can
+            // cancel it (see the clearTimeout at the top of
+            // openSessionStream / closeSessionStream). Null the slot
+            // on fire so the cancel guard short-circuits cleanly.
+            backoffTimer = setTimeout(() => {
+                backoffTimer = null;
                 if (activeSessionId.value === sessionId) {
                     openSessionStream(sessionId, { lastEventId: lastSeenEventId });
                 }
@@ -1244,12 +1294,52 @@ export function openSessionStream(sessionId, opts) {
     };
 }
 
+/**
+ * Reset the session-stream retry budget and reopen against the
+ * currently-active session. Bound at module load to the global
+ * stream-health pub/sub so the banner click and the browser
+ * `online` event can both re-arm the stream without a full page
+ * reload (#907).
+ *
+ * No-op when there is no active session — the stream will be
+ * opened by the next `loadSession` call as part of normal session
+ * navigation.
+ */
+function reconnectSessionStream() {
+    sessionRetryCount = 0;
+    const sid = activeSessionId.value;
+    if (sid) {
+        openSessionStream(sid, { lastEventId: lastSeenEventId });
+    } else {
+        // Even with no active session there's nothing to reconnect to,
+        // but the dead flag should be cleared so the banner reflects
+        // reality (no stream is currently dead because no stream is
+        // currently desired).
+        clearStreamDead('session');
+    }
+}
+
+// Register the reconnect callback once at module load. The
+// stream-health module dispatches to whatever is currently
+// registered — last-write-wins semantics tolerate test-side
+// re-imports without stacking handlers (see `registerSessionReconnect`).
+registerSessionReconnect(reconnectSessionStream);
+
 export function closeSessionStream() {
     if (flushTimer !== null) {
         cancelAnimationFrame(flushTimer);
         flushTimer = null;
     }
     flushDeltaBuffer();
+    // Cancel any pending backoff reopen — closing the stream is an
+    // explicit "stop attempting to maintain this connection" signal
+    // (#907 review, Suggestion 1). Without this, a teardown
+    // mid-backoff would leave the timer queued to reopen against a
+    // stale sessionId.
+    if (backoffTimer !== null) {
+        clearTimeout(backoffTimer);
+        backoffTimer = null;
+    }
     // Reset per-run state so it does not carry over to the next session.
     sawTokenDelta = false;
     clearAgentPhase();
@@ -1257,6 +1347,12 @@ export function closeSessionStream() {
         activeSessionEs.close();
         activeSessionEs = null;
     }
+    // Closing the stream means we are no longer attempting to maintain
+    // this connection, so the dead-state signal should reflect "absent"
+    // rather than "dead". Without this, deleting the session that owns
+    // a previously-dead stream would leave the banner up indefinitely
+    // until the user re-opens any session. (#907)
+    clearStreamDead('session');
 }
 
 export function isSessionStreamOpen() {

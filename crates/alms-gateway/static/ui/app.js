@@ -23,6 +23,8 @@ import { AgentHeaderBar } from './components/chat/agent-header-bar.js';
 import { DmConversationView } from './components/chat/dm-conversation-view.js';
 import { scrollToBottom } from './utils/format.js';
 import { sessionSwitchLoading, agentSwitchLoading, bootRetryAvailable, setRunBoot } from './state/loading.js';
+import { StreamDeadBanner } from './components/stream-banner.js';
+import { installOnlineReconnectListener } from './state/stream-health.js';
 
 // ── Dynamic page title ──
 effect(() => {
@@ -286,6 +288,7 @@ function App() {
     const hasAgents = agents.value.length > 0;
     return html`
         <${Header} status=${status} onOpenSettings=${() => { settingsOpen.value = true; }} />
+        <${StreamDeadBanner} />
         ${hasAgents
             ? html`
                 <div id="main">
@@ -315,5 +318,11 @@ function doRunBoot() {
 
 // Register so other modules can trigger a retry via the loading module
 setRunBoot(doRunBoot);
+
+// Wire `window.addEventListener('online', ...)` once at boot so a
+// browser online transition automatically re-arms both SSE streams
+// (#907). The handler is idempotent — calling it when the streams
+// are already healthy is a cheap reset of the retry counters.
+installOnlineReconnectListener();
 
 doRunBoot();

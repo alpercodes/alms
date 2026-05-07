@@ -161,3 +161,49 @@ fn composer_storage_js_behaviour() {
 fn agent_name_js_behaviour() {
     run_node_test("agent-name.test.mjs");
 }
+
+/// Pinned regression for issue #907: SSE retry-budget exhaustion used to
+/// leave the user with a dead stream and only a `console.error`. The fix
+/// introduces a global `streamDead` signal in
+/// `static/ui/state/stream-health.js`, a click-to-reconnect path
+/// (`reconnectAllStreams`), and a `window.addEventListener('online', ...)`
+/// re-arm. The JS-side test pins:
+///   - `streamDead` transitions on mark / clear (idempotent, only flips on
+///     real empty <-> non-empty boundary)
+///   - "any stream dead -> banner up" semantic: two distinct sources keep
+///     the banner up until both clear
+///   - `reconnectAllStreams` fan-out (both callbacks fire exactly once)
+///   - last-write-wins on `register*` so HMR / test re-imports don't stack
+///     handlers
+///   - error in one callback doesn't block the other from firing
+///   - `installOnlineReconnectListener` wires window.online -> reconnect
+///     fan-out, returns a teardown that detaches cleanly
+///   - the integrated mark -> click -> clear cycle the operator actually
+///     sees in the banner
+#[test]
+fn stream_health_js_behaviour() {
+    run_node_test("stream-health.test.mjs");
+}
+
+/// Pinned regression for the timer-cancel-on-manual-reconnect contract
+/// in `static/ui/hooks/use-agent-events.js` (#907 follow-up — Tim's
+/// Suggestion 1 on PR #1001). When a manual reconnect path (banner
+/// click, `online` event, or fresh `openAgentEventsStream` call) fires
+/// while a backoff `setTimeout` is still pending from a previous
+/// `onerror`, the pending timer must be cancelled so it doesn't
+/// double-open the freshly-healthy stream a few seconds later. The
+/// JS-side test stubs `EventSource` + `localStorage` and uses
+/// `node:test` `mock.timers` to pin:
+///   - manual reconnect mid-backoff cancels the pending reopen
+///   - explicit close mid-backoff also cancels
+///   - the timer *does* normally fire and reopen when nothing cancels
+///     it (negative control)
+///
+/// The same fix shape is applied to `use-session-stream.js` but that
+/// hook has a 50+ collaborator import surface that is not worth
+/// standing up a parallel harness for — the cancel/clear/schedule
+/// edits are byte-for-byte identical between the two hooks.
+#[test]
+fn agent_events_timer_js_behaviour() {
+    run_node_test("agent-events-timer.test.mjs");
+}

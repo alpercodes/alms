@@ -1,0 +1,56 @@
+/* ══════════════════════════════════════════════════════════════════════
+   Stream-dead banner (#907)
+   ----------------------------------------------------------------------
+   Rendered by `components/stream-banner.js` when either SSE hook
+   marks its stream dead. Sits between the global header and the
+   #main split layout so it never overlaps the chat area but also
+   never gets hidden behind the sidebar. Styled as a single full-
+   width <button> so the entire bar is the click target — no
+   nested affordance needed for one-click reconnect.
+   ══════════════════════════════════════════════════════════════════════ */
+
+.stream-dead-banner {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* Wrap the icon + text onto a second line on very narrow viewports
+       (#907 review nit) — below ~400 px the 53-char message would
+       overflow horizontally without this. The flex defaults still
+       keep it on one line at typical desktop widths. */
+    flex-wrap: wrap;
+    gap: var(--space-2, 8px);
+    width: 100%;
+    padding: var(--space-2, 8px) var(--space-3, 12px);
+    border: 0;
+    border-bottom: 1px solid var(--warning, #ca8a04);
+    background: var(--warning-muted, rgba(202, 138, 4, 0.1));
+    color: var(--warning, #ca8a04);
+    font-family: inherit;
+    font-size: var(--text-sm, 0.8125rem);
+    font-weight: 500;
+    text-align: center;
+    cursor: pointer;
+}
+
+.stream-dead-banner:hover,
+.stream-dead-banner:focus-visible {
+    background: var(--warning-muted, rgba(202, 138, 4, 0.18));
+    /* Slight darkening on hover; falls back to the same colour if
+       the browser doesn't support color-mix. */
+    color: color-mix(in srgb, var(--warning, #ca8a04) 80%, black);
+    outline: none;
+}
+
+.stream-dead-banner:focus-visible {
+    box-shadow: inset 0 0 0 2px var(--warning, #ca8a04);
+}
+
+.stream-dead-banner-icon {
+    flex: 0 0 auto;
+    font-size: 1em;
+    line-height: 1;
+}
+
+.stream-dead-banner-text {
+    flex: 0 1 auto;
+}
