@@ -10,6 +10,7 @@ import {
     ProviderDisplay,
     formatProviderLabel,
 } from '../../utils/model-display.js';
+import { normalizeAgentName, validateNormalizedAgentName } from '../../utils/agent-name.js';
 
 const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
 
@@ -569,9 +570,41 @@ export function AgentsTab() {
         if (activePanelTab.value === 'agents') refreshAgents();
     }, [activePanelTab.value]);
 
+    // The input is lenient — we accept whatever the operator types and
+    // normalize on submit. The preview line below the input shows the
+    // slug shape that will actually be sent to the backend so there are
+    // no surprises after Create is clicked. See `utils/agent-name.js`
+    // for the normalization rules and #978 for the UX motivation.
+    const normalized = normalizeAgentName(newName.value);
+    const rawTrimmed = (newName.value || '').trim();
+    // Only show the preview when (a) the operator has typed something
+    // and (b) the normalized form actually differs from the raw input
+    // (otherwise it's just visual noise — they already see the slug).
+    const showPreview = rawTrimmed !== '' && normalized !== rawTrimmed;
+
     const onCreate = async () => {
-        const name = newName.value.trim();
-        if (!name) return;
+        const name = normalizeAgentName(newName.value);
+        if (!name) {
+            // Either the field was empty or every char got stripped (e.g. "!!!").
+            // Surface the same "name required" path the backend would for empty.
+            if ((newName.value || '').trim() === '') {
+                error.value = 'Agent name is required';
+            } else {
+                error.value = 'Agent name must contain at least one letter or digit';
+            }
+            return;
+        }
+        // Mirror the post-normalization rules from
+        // `crates/alms-core/src/registry.rs::validate_agent_name` —
+        // length cap, reserved names, UUID shape. Catching these
+        // client-side keeps the inline-error UX consistent with the
+        // empty / all-invalid paths above instead of leaking the raw
+        // backend 400 message.
+        const validation = validateNormalizedAgentName(name);
+        if (validation) {
+            error.value = validation.message;
+            return;
+        }
         error.value = '';
         loading.value = true;
         try {
@@ -596,11 +629,16 @@ export function AgentsTab() {
                        value=${newName.value}
                        onInput=${e => { newName.value = e.target.value; }}
                        onKeyDown=${e => { if (e.key === 'Enter') onCreate(); }} />
-                <button class="agent-card-btn" onClick=${onCreate}
+                <button class="agent-card-btn agent-create-btn" onClick=${onCreate}
                         disabled=${loading.value}>
                     ${loading.value ? '...' : '+ Create'}
                 </button>
             </div>
+            ${showPreview && html`
+                <div class="agent-create-preview">
+                    Will be saved as: <code>${normalized}</code>
+                </div>
+            `}
 
             ${error.value && html`<div class="agent-error">${error.value}</div>`}
 

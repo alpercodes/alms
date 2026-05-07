@@ -522,6 +522,11 @@ mod tests {
         // Also test a v4-style UUID
         let err = validate_agent_name("550e8400-e29b-41d4-a716-446655440000").unwrap_err();
         assert!(err.to_string().contains("UUID"));
+        // `Uuid::parse_str` also accepts the simple 32-char hex form —
+        // make sure the validator covers that shape too (Tim's PR #999
+        // re-review item; the client-side mirror missed this case).
+        let err = validate_agent_name("a1b2c3d4e5f67890abcdef1234567890").unwrap_err();
+        assert!(err.to_string().contains("UUID"));
     }
 
     #[test]

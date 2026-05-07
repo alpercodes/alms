@@ -47,7 +47,7 @@
 .agent-card-btn:hover { color: var(--text-primary); border-color: var(--border-strong); }
 .agent-card-btn.danger { color: var(--error); border-color: var(--error); }
 .agent-card-btn.danger:hover { background: var(--error-muted); }
-.agent-create-row { display: flex; gap: var(--space-2); align-items: center; }
+.agent-create-row { display: flex; gap: var(--space-2); align-items: stretch; }
 .agent-create-row input {
   flex: 1;
   background: var(--surface-2);
@@ -57,6 +57,38 @@
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   border-radius: var(--radius-sm);
+}
+/* Match the Create button to the input's height. The shared
+   .agent-card-btn rule is sized for the per-row action strip
+   (smaller font, tighter padding); the create-row sits next to
+   a full-size text input, so we override here without disturbing
+   the per-card buttons elsewhere on the panel. (#979) */
+.agent-create-row .agent-create-btn {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  line-height: 1.2;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+/* Live preview of the slug-normalized agent name. Sits directly
+   below the create-row so the operator can see what the backend
+   will actually receive before clicking Create. The negative
+   top-margin tightens the visual gap to the input above without
+   touching the column-gap of the parent container. (#978) */
+.agent-create-preview {
+  font-size: var(--text-2xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  padding: 0 var(--space-1);
+  margin-top: calc(var(--space-2) * -0.5);
+}
+.agent-create-preview code {
+  color: var(--text-secondary);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-1);
+  font-family: var(--font-mono);
 }
 
 .agent-card.active {
