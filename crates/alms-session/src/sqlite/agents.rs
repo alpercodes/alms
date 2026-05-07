@@ -319,11 +319,40 @@ impl SqliteStore {
         tx.execute("DELETE FROM sessions WHERE agent_id = ?1", params![&id_str])
             .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent sessions: {e}")))?;
 
-        // 4. Delete jobs belonging to this agent
+        // 4. Clear DM-orphan rows the agent created in shared DM sessions (#992).
+        //
+        // DM sessions are owned by `AgentId::nil()` (sentinel), so the
+        // `WHERE agent_id = ?1` query in step 1 never picks them up. The
+        // deleted agent's contributions to those shared sessions live in
+        // `runs.agent_id`, `run_tool_calls.from_agent`, and
+        // `session_summaries.agent_id` -- none of which carry FKs against
+        // `agents`, so they don't block the delete, but they accumulate as
+        // dangling rows over time with multi-agent DM use.
+        //
+        // Order: `run_tool_calls` first (logically depends on `runs`),
+        // then `session_summaries`, then `runs`. No FK enforces this --
+        // it's an audit-clarity choice. We do NOT delete the shared DM
+        // session row itself: the surviving partner still uses it.
+        tx.execute(
+            "DELETE FROM run_tool_calls WHERE from_agent = ?1",
+            params![&id_str],
+        )
+        .map_err(|e| AlmsError::Runtime(format!("SQLite delete dm-orphan run_tool_calls: {e}")))?;
+        tx.execute(
+            "DELETE FROM session_summaries WHERE agent_id = ?1",
+            params![&id_str],
+        )
+        .map_err(|e| {
+            AlmsError::Runtime(format!("SQLite delete dm-orphan session_summaries: {e}"))
+        })?;
+        tx.execute("DELETE FROM runs WHERE agent_id = ?1", params![&id_str])
+            .map_err(|e| AlmsError::Runtime(format!("SQLite delete dm-orphan runs: {e}")))?;
+
+        // 5. Delete jobs belonging to this agent
         tx.execute("DELETE FROM jobs WHERE agent_id = ?1", params![&id_str])
             .map_err(|e| AlmsError::Runtime(format!("SQLite delete agent jobs: {e}")))?;
 
-        // 5. Delete the agent row
+        // 6. Delete the agent row
         let affected = tx
             .execute("DELETE FROM agents WHERE id = ?1", params![&id_str])
             .map_err(|e| AlmsError::Runtime(format!("SQLite delete_agent: {e}")))?;
@@ -875,6 +904,100 @@ mod tests {
             )
             .unwrap();
 
+        // Plus shared-DM-session rows so the orphan-by-agent-id audit
+        // loop below has rows to bite against. DM sessions are owned by
+        // `AgentId::nil()`, so step 1's `WHERE sessions.agent_id = ?1`
+        // collection never picks up `dm.id` and step-2's per-session
+        // loop won't sweep these rows. Only step-4's per-agent DELETEs
+        // can clear them -- which is exactly what the audit loop tests.
+        // Without this fixture, the orphan-by-agent-id loop would be
+        // a no-op against this test (Tim's review on PR #1000).
+        let dm = Session::new(AgentId::nil(), "dm:doomed:survivor");
+        store.save_session(&dm).unwrap();
+        let dm_run = Run::new(dm.id, doomed.id, "ping".to_string());
+        let dm_run_id = dm_run.run_id;
+        store.save_run(&dm_run).unwrap();
+        store
+            .save_tool_call(
+                dm_run_id,
+                &ToolCallRecord {
+                    seq: 0,
+                    role: ToolCallRole::Assistant,
+                    tool_name: Some("send_message".to_string()),
+                    tool_id: Some("call_dm0".to_string()),
+                    params: Some(r#"{"to":"survivor","text":"hi"}"#.to_string()),
+                    result: None,
+                    timestamp: chrono::Utc::now(),
+                    from_agent: Some(doomed.id.0.to_string()),
+                },
+            )
+            .unwrap();
+        store
+            .upsert_session_summary(
+                doomed.id,
+                dm.id,
+                "doomed perspective on DM",
+                Some(dm_run_id),
+                Some("DM with survivor"),
+            )
+            .unwrap();
+
+        // Pre-delete sanity: each orphan-by-agent-id class has at least
+        // one row keyed on the doomed agent that lives on the shared DM
+        // session (and so survives step-1's session-id sweep). The audit
+        // loop below would be vacuous without these rows -- only step-4's
+        // per-agent-id DELETEs can clear them. (Tim's review on PR #1000.)
+        {
+            let conn = store.conn.lock();
+            let agent_id_str = doomed.id.0.to_string();
+            let dm_id_str = dm.id.0.to_string();
+
+            // runs: by agent_id on the DM session
+            let n_runs_dm: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM runs WHERE agent_id = ?1 AND session_id = ?2",
+                    params![&agent_id_str, &dm_id_str],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                n_runs_dm >= 1,
+                "pre-delete fixture must place at least one `runs` row \
+                 for doomed agent on shared DM session"
+            );
+
+            // run_tool_calls: by from_agent on a run that lives on the DM session
+            let n_calls_dm: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM run_tool_calls \
+                     WHERE from_agent = ?1 AND run_id IN \
+                     (SELECT run_id FROM runs WHERE session_id = ?2)",
+                    params![&agent_id_str, &dm_id_str],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                n_calls_dm >= 1,
+                "pre-delete fixture must place at least one `run_tool_calls` row \
+                 for doomed agent on shared DM session"
+            );
+
+            // session_summaries: by agent_id on the DM session
+            let n_summ_dm: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_summaries \
+                     WHERE agent_id = ?1 AND session_id = ?2",
+                    params![&agent_id_str, &dm_id_str],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                n_summ_dm >= 1,
+                "pre-delete fixture must place at least one `session_summaries` row \
+                 for doomed agent on shared DM session"
+            );
+        }
+
         // Delete the doomed agent -- must succeed without a FK error.
         assert!(store.delete_agent(doomed.id).unwrap());
 
@@ -927,6 +1050,292 @@ mod tests {
                 "orphan row in `{table}` referencing deleted agent's session_id after delete_agent"
             );
         }
+
+        // Orphan-by-agent-id audit loop (#992): tables that store the
+        // agent's id directly (rather than a session_id FK) must also
+        // be empty for the deleted agent. These tables don't carry FKs
+        // against `agents`, so they wouldn't surface as a delete failure
+        // -- the loop is the only thing that catches a missed cleanup.
+        // Same future-proofing intent as the FK loop above: when a new
+        // child table grows an `agent_id` / `from_agent` column, add
+        // (table, column) here and the test fails until the cascade
+        // covers it.
+        //
+        // The fixture above places one row per orphan class on a shared
+        // DM session (`AgentId::nil()`-owned), so step-1's per-session
+        // loop cannot reach them. The only path that clears them is
+        // step-4's per-agent DELETEs in `delete_agent`. Without step 4,
+        // every assertion in this loop fails. The dedicated
+        // `test_delete_agent_clears_dm_orphan_rows` test is the
+        // primary regression for the same fix; this loop additionally
+        // future-proofs the cascade by failing closed when a new
+        // (table, column) lands without a matching cleanup.
+        let agent_id_str = doomed.id.0.to_string();
+        let orphan_by_agent_tables = [
+            ("runs", "agent_id"),
+            ("run_tool_calls", "from_agent"),
+            ("session_summaries", "agent_id"),
+        ];
+        for (table, column) in orphan_by_agent_tables {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    params![&agent_id_str],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                n, 0,
+                "orphan row in `{table}.{column}` referencing deleted agent's id after delete_agent"
+            );
+        }
+
+        // The shared DM session row itself must survive: it's owned by
+        // `AgentId::nil()`, not by the deleted agent, and the surviving
+        // partner still uses it. (Both-partners-deleted is tracked as a
+        // separate v0.2.4 follow-up issue.)
+        let dm_session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![dm.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dm_session_count, 1,
+            "shared DM session row must survive delete_agent (not owned by deleted agent)"
+        );
+    }
+
+    #[test]
+    fn test_delete_agent_clears_dm_orphan_rows() {
+        // Regression test for #992: rows the deleted agent created
+        // *inside a shared DM session* are not picked up by the
+        // `WHERE sessions.agent_id = ?1` collection step in
+        // `delete_agent`, because DM sessions are owned by the
+        // `AgentId::nil()` sentinel. Pre-fix, those rows accumulated
+        // as dangling orphans in `runs`, `run_tool_calls`, and
+        // `session_summaries`. Post-fix, the three direct DELETEs
+        // added in step 4 of `delete_agent` clear them.
+        //
+        // The shared DM session row itself must NOT be deleted: the
+        // surviving partner still owns half of the conversation.
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let agent_a = new_agent("agent-a");
+        let agent_b = new_agent("agent-b");
+        store.create_agent(&agent_a).unwrap();
+        store.create_agent(&agent_b).unwrap();
+
+        // Shared DM session under the nil-agent sentinel -- both
+        // participants reference this single session row.
+        let dm = Session::new(AgentId::nil(), "dm:agent-a:agent-b");
+        store.save_session(&dm).unwrap();
+
+        // Each participant has their own non-DM session too, so we
+        // can assert step-1's per-session loop (clearing rows by
+        // session_id) interacts cleanly with step-4's per-agent loop.
+        let a_self = Session::new(agent_a.id, "user:agent-a");
+        let b_self = Session::new(agent_b.id, "user:agent-b");
+        store.save_session(&a_self).unwrap();
+        store.save_session(&b_self).unwrap();
+
+        // A's contributions inside the shared DM session: a run, a
+        // tool call attributed to A via `from_agent`, and an
+        // episodic summary the runtime would generate from A's
+        // perspective (`session_summaries.agent_id = A`,
+        // `session_id = dm`).
+        let a_dm_run = Run::new(dm.id, agent_a.id, "ping".to_string());
+        let a_dm_run_id = a_dm_run.run_id;
+        store.save_run(&a_dm_run).unwrap();
+        store
+            .save_tool_call(
+                a_dm_run_id,
+                &ToolCallRecord {
+                    seq: 0,
+                    role: ToolCallRole::Assistant,
+                    tool_name: Some("send_message".to_string()),
+                    tool_id: Some("call_a0".to_string()),
+                    params: Some(r#"{"to":"agent-b","text":"hi"}"#.to_string()),
+                    result: None,
+                    timestamp: chrono::Utc::now(),
+                    from_agent: Some(agent_a.id.0.to_string()),
+                },
+            )
+            .unwrap();
+        store
+            .upsert_session_summary(
+                agent_a.id,
+                dm.id,
+                "A's perspective on DM with B",
+                Some(a_dm_run_id),
+                Some("DM with agent-b"),
+            )
+            .unwrap();
+
+        // B's mirror-image contributions on the same shared DM
+        // session, plus B's own non-DM session for completeness.
+        let b_dm_run = Run::new(dm.id, agent_b.id, "pong".to_string());
+        let b_dm_run_id = b_dm_run.run_id;
+        store.save_run(&b_dm_run).unwrap();
+        store
+            .save_tool_call(
+                b_dm_run_id,
+                &ToolCallRecord {
+                    seq: 0,
+                    role: ToolCallRole::Assistant,
+                    tool_name: Some("send_message".to_string()),
+                    tool_id: Some("call_b0".to_string()),
+                    params: Some(r#"{"to":"agent-a","text":"hi back"}"#.to_string()),
+                    result: None,
+                    timestamp: chrono::Utc::now(),
+                    from_agent: Some(agent_b.id.0.to_string()),
+                },
+            )
+            .unwrap();
+        store
+            .upsert_session_summary(
+                agent_b.id,
+                dm.id,
+                "B's perspective on DM with A",
+                Some(b_dm_run_id),
+                Some("DM with agent-a"),
+            )
+            .unwrap();
+
+        // Sanity check: 6 orphan-class rows total before the delete --
+        // 2 runs, 2 run_tool_calls, 2 session_summaries -- one of
+        // each per agent, all keyed on the shared DM session.
+        {
+            let conn = store.conn.lock();
+            let count_runs: i64 = conn
+                .query_row("SELECT COUNT(*) FROM runs", [], |r| r.get(0))
+                .unwrap();
+            let count_calls: i64 = conn
+                .query_row("SELECT COUNT(*) FROM run_tool_calls", [], |r| r.get(0))
+                .unwrap();
+            let count_summaries: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_summaries", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count_runs, 2, "pre-delete: 2 runs (one per agent)");
+            assert_eq!(count_calls, 2, "pre-delete: 2 tool calls (one per agent)");
+            assert_eq!(
+                count_summaries, 2,
+                "pre-delete: 2 session summaries (one per agent)"
+            );
+        }
+
+        // Delete A. The shared DM session has agent_id = nil, so
+        // step 1's `WHERE sessions.agent_id = ?1` query never sees
+        // it -- the new step-4 cleanup is the only path that clears
+        // A's rows on the DM session.
+        assert!(store.delete_agent(agent_a.id).unwrap());
+
+        // ── A's side: every orphan-class row is gone. ────────────────
+        let a_id_str = agent_a.id.0.to_string();
+        let conn = store.conn.lock();
+
+        let n_runs_a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE agent_id = ?1",
+                params![&a_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_runs_a, 0, "A's runs must be cleared (incl. DM run)");
+
+        let n_calls_a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_tool_calls WHERE from_agent = ?1",
+                params![&a_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n_calls_a, 0,
+            "A's run_tool_calls must be cleared (incl. DM tool calls)"
+        );
+
+        let n_summaries_a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_summaries WHERE agent_id = ?1",
+                params![&a_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n_summaries_a, 0,
+            "A's session_summaries must be cleared (incl. DM-perspective summary)"
+        );
+
+        // ── B's side: untouched. ──────────────────────────────────────
+        let b_id_str = agent_b.id.0.to_string();
+
+        let n_runs_b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE agent_id = ?1",
+                params![&b_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_runs_b, 1, "B's DM run must remain intact");
+
+        let n_calls_b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_tool_calls WHERE from_agent = ?1",
+                params![&b_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n_calls_b, 1, "B's DM tool call must remain intact");
+
+        let n_summaries_b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_summaries WHERE agent_id = ?1",
+                params![&b_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n_summaries_b, 1,
+            "B's DM-perspective summary must remain intact"
+        );
+
+        // ── Shared DM session row itself: untouched. ─────────────────
+        // The DM session is owned by `AgentId::nil()` and shared by
+        // both participants. Deleting A must not delete the session.
+        let dm_session_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![dm.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dm_session_count, 1,
+            "shared DM session row must NOT be deleted -- B still uses it"
+        );
+
+        // B's own non-DM session is also untouched.
+        let b_self_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![b_self.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b_self_count, 1, "B's own session must remain");
+
+        // A's own non-DM session is gone (covered by step-1's
+        // `WHERE sessions.agent_id = ?1` collection).
+        let a_self_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![a_self.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(a_self_count, 0, "A's own non-DM session must be deleted");
     }
 
     #[test]
