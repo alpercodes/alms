@@ -392,3 +392,532 @@ fn ensure_trailing_user(messages: &mut Vec<LlmMessage>, has_fresh_input: bool) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::ContextBuilder;
+    use super::super::tests::{make_msg, make_msg_with_meta};
+    use super::*;
+    use crate::llm_types::{LlmMessage, ToolCall};
+    use alms_core::config::ContextConfig;
+    use alms_session::{Content, Role};
+
+    fn invariant_config() -> ContextConfig {
+        ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32_000,
+            recent_window: 50,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        }
+    }
+
+    fn assert_invariant(messages: &[LlmMessage]) {
+        assert!(!messages.is_empty(), "messages must be non-empty");
+        let first_non_system = messages
+            .iter()
+            .position(|m| m.role != "system")
+            .expect("at least one non-system message required");
+        assert!(
+            !messages[first_non_system..]
+                .iter()
+                .any(|m| m.role == "system"),
+            "no mid-history system message may survive"
+        );
+        assert_eq!(
+            messages.last().unwrap().role,
+            "user",
+            "last message must be user"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.content.as_deref().is_some_and(|s| s.is_empty())
+                    && m.tool_calls.is_none()
+                    && m.tool_call_id.is_none()),
+            "no empty-content messages allowed"
+        );
+    }
+
+    #[test]
+    fn test_group_tool_calls_does_not_merge_across_text() {
+        // If there's an assistant text message between two tool call groups,
+        // they should NOT be merged.
+        let mut messages = vec![
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall::new("call_1", "echo", "{}")]),
+                tool_call_id: None,
+            },
+            LlmMessage::assistant("some text in between"),
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall::new("call_2", "echo", "{}")]),
+                tool_call_id: None,
+            },
+        ];
+
+        group_tool_calls(&mut messages);
+
+        // Should remain 3 separate messages — not merged
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            messages[0].tool_calls.as_ref().unwrap().len(),
+            1,
+            "first tool call should not absorb second"
+        );
+        assert_eq!(
+            messages[2].tool_calls.as_ref().unwrap().len(),
+            1,
+            "second tool call should stay separate"
+        );
+    }
+
+    // -- Orphaned tool_result stripping tests ------------------------------
+    //
+    // These pin the fix for the Anthropic 400 "unexpected tool_use_id found
+    // in tool_result blocks" rejection that fires when truncation leaves a
+    // tool_result at the head of the selected context window with no
+    // matching tool_use in front of it.
+
+    /// Directly exercises `strip_orphaned_tool_results`: a leading
+    /// tool_result with no preceding assistant tool_use must be dropped.
+    #[test]
+    fn test_strip_orphaned_tool_results_drops_leading_orphan() {
+        let mut messages = vec![
+            LlmMessage::tool_result("functions_fs_write_4", "orphan result"),
+            LlmMessage::user("follow-up question"),
+        ];
+
+        strip_orphaned_tool_results(&mut messages);
+
+        assert_eq!(messages.len(), 1, "orphan tool_result must be dropped");
+        assert_eq!(messages[0].role, "user");
+    }
+
+    /// Paired tool_use/tool_result survive untouched.
+    #[test]
+    fn test_strip_orphaned_tool_results_keeps_paired_pair() {
+        let mut messages = vec![
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall::new("call_A", "echo", "{}")]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("call_A", "result A"),
+            LlmMessage::user("thanks"),
+        ];
+
+        strip_orphaned_tool_results(&mut messages);
+
+        assert_eq!(
+            messages.len(),
+            3,
+            "paired tool_use/tool_result must stay intact"
+        );
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[1].role, "tool");
+        assert_eq!(messages[2].role, "user");
+    }
+
+    /// Middle-of-array orphan (never emitted by a preceding assistant) is
+    /// also dropped — the Anthropic rejection fires after system extraction
+    /// too, which could promote a mid-history orphan to `messages.0`.
+    #[test]
+    fn test_strip_orphaned_tool_results_drops_mid_array_orphan() {
+        let mut messages = vec![
+            LlmMessage::user("hello"),
+            LlmMessage::tool_result("never_called_123", "orphan"),
+            LlmMessage::assistant("some reply"),
+        ];
+
+        strip_orphaned_tool_results(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[1].role, "assistant");
+    }
+
+    /// Partial parallel tool-call coverage — if assistant emits tool_calls
+    /// [A, B] and only tool_result B was truncated in, tool_result B is
+    /// kept (A was introduced by the preceding assistant).  tool_result A
+    /// would also be kept here because A is known.  Orphan-only if the
+    /// introducer is missing.
+    #[test]
+    fn test_strip_orphaned_tool_results_parallel_group_kept_when_introduced() {
+        let mut messages = vec![
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![
+                    ToolCall::new("call_A", "echo", "{}"),
+                    ToolCall::new("call_B", "echo", "{}"),
+                ]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("call_B", "result B only"),
+        ];
+
+        strip_orphaned_tool_results(&mut messages);
+
+        assert_eq!(
+            messages.len(),
+            2,
+            "tool_result whose tool_use was introduced must be preserved"
+        );
+    }
+
+    /// End-to-end regression for the reported 400:
+    ///
+    /// A session long enough to trigger `truncate` eviction of the
+    /// paired assistant tool_use, leaving a leading `functions_fs_write_4`
+    /// tool_result in the selected window.  After `build_with_perspective`
+    /// the assembled context must NOT begin with a tool-role message —
+    /// that is what Anthropic (direct or via OpenRouter→Claude) rejects as
+    /// `messages.0.content.0: unexpected tool_use_id found in tool_result
+    /// blocks`.
+    #[test]
+    fn test_build_never_leaves_tool_result_at_head_after_truncation() {
+        // recent_window = 2 forces the truncate strategy to keep only the
+        // two newest messages from a long history.  Arrange those last two
+        // to be (tool_result, assistant-text) so the orphan would sit at
+        // the front of the selected slice without the fix.
+        let config = ContextConfig {
+            strategy: "truncate".into(),
+            max_input_tokens: 32_000,
+            recent_window: 2,
+            summary_interval: 30,
+            summary_model: None,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history = vec![
+            // --- truncated out by recent_window=2 ---
+            make_msg(Role::User, "please write the file"),
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                content: Content::ToolCall {
+                    name: "fs_write".to_string(),
+                    params: serde_json::json!({"path": "/tmp/x"}),
+                },
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"tool_call_id": "functions_fs_write_4"})),
+            },
+            // --- kept by recent_window=2 ---
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Tool,
+                content: Content::ToolResult {
+                    tool_id: "functions_fs_write_4".to_string(),
+                    result: serde_json::json!("ok"),
+                },
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"ok": true})),
+            },
+            make_msg(Role::Assistant, "Done — file written."),
+        ];
+
+        let messages = builder.build("You are helpful.", &history, "thanks!", None);
+
+        // Head of the array must be a system message, and the first non-
+        // system entry must NOT be a tool_result — Anthropic rejects that
+        // shape after its system extraction step.
+        assert_eq!(
+            messages[0].role, "system",
+            "context must start with the system prompt"
+        );
+        let first_non_system = messages
+            .iter()
+            .find(|m| m.role != "system")
+            .expect("should have at least one non-system message");
+        assert_ne!(
+            first_non_system.role, "tool",
+            "context must not lead with a tool_result (Anthropic 400 trigger)"
+        );
+    }
+
+    // -- Canonical message-shape invariant (#586) -------------------------
+    //
+    // These tests pin the guarantees enforced by `normalize_for_llm` so
+    // the Anthropic / OpenAI adapters can trust the shape of the message
+    // list without re-running per-provider sanity passes.
+
+    #[test]
+    fn test_normalize_empty_input_synthesizes_trailing_user() {
+        // History has a user message already — the build with empty input
+        // ends with a user turn naturally. No synthesis needed, but the
+        // invariant still must hold.
+        let builder = ContextBuilder::new(invariant_config());
+        let history = vec![make_msg(Role::User, "ping")];
+        let messages = builder.build("sys", &history, "", None);
+        assert_invariant(&messages);
+        assert_eq!(messages.last().unwrap().content_str(), "ping");
+    }
+
+    #[test]
+    fn test_normalize_empty_input_assistant_tail_gets_placeholder() {
+        // History ends with assistant text and current input is empty —
+        // normalize must append a placeholder user turn.
+        let builder = ContextBuilder::new(invariant_config());
+        let history = vec![
+            make_msg(Role::User, "do X"),
+            make_msg(Role::Assistant, "done"),
+        ];
+        let messages = builder.build("sys", &history, "", None);
+        assert_invariant(&messages);
+        assert_eq!(
+            messages.last().unwrap().role,
+            "user",
+            "assistant-tail history must gain a trailing user placeholder"
+        );
+        // Synthesised placeholders are short and recognisable.
+        assert!(
+            messages
+                .last()
+                .unwrap()
+                .content_str()
+                .contains("Please continue"),
+            "placeholder should use the CONTINUE_PLACEHOLDER stub; got: {:?}",
+            messages.last().unwrap().content
+        );
+    }
+
+    #[test]
+    fn test_normalize_empty_input_pending_tool_calls_closes_with_synthetic_result() {
+        // An assistant tool_use whose matching tool_result is missing
+        // from history must be closed with a synthetic
+        // `[Tool execution was interrupted]` result before the trailing-
+        // user synthesis runs.
+        let builder = ContextBuilder::new(invariant_config());
+        let history = vec![
+            make_msg(Role::User, "run echo"),
+            alms_session::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                content: Content::ToolCall {
+                    name: "echo".to_string(),
+                    params: serde_json::json!({}),
+                },
+                timestamp: alms_core::Timestamp::now(),
+                metadata: Some(serde_json::json!({"tool_call_id": "call_pending"})),
+            },
+            // No matching Role::Tool result persisted (simulates crash/cancel).
+        ];
+
+        let messages = builder.build("sys", &history, "", None);
+        assert_invariant(&messages);
+
+        // The synthetic interrupted tool_result must exist paired with call_pending.
+        let synth = messages
+            .iter()
+            .find(|m| m.role == "tool" && m.tool_call_id.as_deref() == Some("call_pending"))
+            .expect("synthetic interrupted tool_result must be injected");
+        assert!(
+            synth.content_str().contains("interrupted"),
+            "synthetic result must use INTERRUPTED_TOOL_RESULT wording"
+        );
+    }
+
+    #[test]
+    fn test_normalize_strips_mid_history_system_markers() {
+        let builder = ContextBuilder::new(invariant_config());
+        let history = vec![
+            make_msg(Role::User, "hi"),
+            make_msg(Role::Assistant, "hello"),
+            // Synthetic mid-history marker (lifecycle event).
+            make_msg(Role::System, "[DM conversation ended]"),
+            make_msg(Role::User, "what happened?"),
+        ];
+        let messages = builder.build("sys", &history, "", None);
+        assert_invariant(&messages);
+        assert!(
+            messages[1..].iter().all(|m| m.role != "system"),
+            "mid-history system markers must be stripped"
+        );
+        // User content preserved.
+        assert!(messages.iter().any(|m| m.content_str() == "hi"));
+        assert!(messages.iter().any(|m| m.content_str() == "what happened?"));
+    }
+
+    #[test]
+    fn test_normalize_merges_consecutive_user_messages() {
+        // Direct helper test so we isolate the merge logic from the rest
+        // of the builder (which pushes system + current_input around it).
+        let mut messages = vec![
+            LlmMessage::user("first"),
+            LlmMessage::user("second"),
+            LlmMessage::assistant("reply"),
+            LlmMessage::user("third"),
+        ];
+        merge_consecutive_same_role(&mut messages);
+        assert_eq!(messages.len(), 3, "two consecutive users must merge to one");
+        assert_eq!(messages[0].role, "user");
+        assert!(messages[0].content_str().contains("first"));
+        assert!(messages[0].content_str().contains("second"));
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "user");
+    }
+
+    #[test]
+    fn test_normalize_preserves_system_prefix_block() {
+        let builder = ContextBuilder::new(invariant_config());
+        let history = vec![
+            make_msg(Role::User, "hi"),
+            make_msg(Role::Assistant, "hello"),
+        ];
+        let messages = builder.build_with_perspective(
+            "main system prompt",
+            &history,
+            "follow-up",
+            None,
+            None,
+            Some("prior session summary"),
+        );
+        assert_invariant(&messages);
+        // Two system messages at the head, then no more.
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "system");
+        assert_eq!(messages[2].role, "user");
+        assert!(messages[2..].iter().all(|m| m.role != "system"));
+    }
+
+    #[test]
+    fn test_normalize_drops_empty_content_messages() {
+        // Direct helper test: empty-body assistant/user turns get dropped
+        // but tool-call-only assistant and tool-role messages survive.
+        let mut messages = vec![
+            LlmMessage::user("hi"),
+            LlmMessage::assistant(""),
+            LlmMessage::user(""),
+            LlmMessage {
+                role: "assistant".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ToolCall::new("c1", "echo", "{}")]),
+                tool_call_id: None,
+            },
+            LlmMessage::tool_result("c1", "result"),
+            LlmMessage::user("thanks"),
+        ];
+        drop_empty_content_messages(&mut messages);
+        assert_eq!(
+            messages.len(),
+            4,
+            "empty-body user/assistant must be dropped"
+        );
+        assert_eq!(messages[0].content_str(), "hi");
+        assert!(messages[1].tool_calls.is_some());
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[3].content_str(), "thanks");
+    }
+
+    #[test]
+    fn test_anthropic_adapter_trusts_canonical_shape() {
+        // Feed the Anthropic adapter a message list in canonical shape
+        // (system prefix + alternating + trailing user + no empties) and
+        // verify system extraction + trailing user role + non-empty array.
+        use crate::anthropic::to_anthropic_request;
+        let req = crate::llm_types::CompletionRequest::new("claude-sonnet").with_messages(vec![
+            LlmMessage::system("You are helpful."),
+            LlmMessage::user("hi"),
+            LlmMessage::assistant("hello"),
+            LlmMessage::user("what time is it?"),
+        ]);
+        let areq = to_anthropic_request(&req);
+        assert_eq!(
+            areq.system.as_ref().and_then(|s| s.as_text()),
+            Some("You are helpful."),
+            "single system prefix must be extracted to top-level system"
+        );
+        assert!(
+            !areq.messages.is_empty(),
+            "adapter must never emit an empty messages array"
+        );
+        assert_eq!(
+            areq.messages.last().map(|m| m.role.as_str()),
+            Some("user"),
+            "adapter post-condition: trailing user turn"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_adapter_never_sends_empty_messages_array() {
+        // Regression: even a degenerate history (just a user turn) must
+        // still produce a non-empty messages array after system extraction.
+        let builder = ContextBuilder::new(invariant_config());
+        let history: Vec<alms_session::Message> = Vec::new();
+        let messages = builder.build("sys", &history, "hello", None);
+        assert_invariant(&messages);
+        let req = crate::llm_types::CompletionRequest::new("claude-sonnet").with_messages(messages);
+        let areq = crate::anthropic::to_anthropic_request(&req);
+        assert!(!areq.messages.is_empty());
+        assert_eq!(areq.messages.last().map(|m| m.role.as_str()), Some("user"));
+    }
+
+    #[test]
+    fn test_dm_perspective_then_normalize() {
+        // DM session with reasoning filter + perspective mapping + normalize.
+        // The perspective mapping can break alternation (two adjacent user
+        // messages post-map); normalize must merge them and still end with
+        // a user turn.
+        let builder = ContextBuilder::new(invariant_config());
+        let history = vec![
+            make_msg_with_meta(
+                Role::User,
+                Content::Text("hi from alice".to_string()),
+                serde_json::json!({"from_agent": "alice", "message_type": "dm"}),
+            ),
+            make_msg_with_meta(
+                Role::User,
+                Content::Text("one more thing from alice".to_string()),
+                serde_json::json!({"from_agent": "alice", "message_type": "dm"}),
+            ),
+        ];
+        let messages = builder.build_with_perspective("sys", &history, "", None, Some("bob"), None);
+        assert_invariant(&messages);
+        // Two alice messages collapse into one user turn; no placeholder
+        // synthesis needed because the tail is already user.
+        let user_turns = messages.iter().filter(|m| m.role == "user").count();
+        assert_eq!(
+            user_turns, 1,
+            "two adjacent alice messages must merge into one user turn"
+        );
+    }
+
+    /// Extends the original notification test: the invariant must hold even
+    /// when the `notification_input` message was never persisted (lifecycle
+    /// failure — e.g. the append_message before run_on_session errored).
+    #[test]
+    fn test_notification_run_context_ends_with_user_even_without_notification_input() {
+        let builder = ContextBuilder::new(invariant_config());
+        let history = vec![
+            make_msg(Role::User, "please message Bob"),
+            make_msg(Role::Assistant, "I'll message Bob."),
+            // A synthetic Role::System marker (lifecycle marker) landed
+            // but the notification_input Role::User was NOT persisted.
+            {
+                let mut marker = make_msg(Role::System, "[DM conversation ended]");
+                marker.metadata = Some(serde_json::json!({
+                    "synthetic": true,
+                    "type": "dm_ended_notification",
+                }));
+                marker
+            },
+        ];
+        let messages = builder.build("sys", &history, "", None);
+        assert_invariant(&messages);
+        // Marker stripped, assistant tail detected, placeholder synthesised.
+        assert_eq!(messages.last().unwrap().role, "user");
+        assert!(messages[1..].iter().all(|m| m.role != "system"));
+    }
+}

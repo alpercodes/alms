@@ -33,7 +33,12 @@ crates/
                      #   agent/context.rs — build_context(), episodic summaries, summarization
                      #   agent/dm.rs — DM-specific helpers, conflict detection
                      #   agent/types.rs — Posture, AgentConfig, SystemPrompts, RunOutput
-                     #   context.rs — ContextBuilder (token-budgeted context window)
+                     #   context/mod.rs — ContextBuilder orchestrator (token-budgeted context window)
+                     #   context/normalize.rs — canonical message-shape pipeline (group/strip/normalize)
+                     #   context/strategies.rs — token-budgeted history selection (full/truncate/sliding)
+                     #   context/perspective.rs — DM-perspective role mapping + reasoning-message filter
+                     #   context/rebuild.rs — persisted Message → LlmMessage reconstruction (incl. spill repair)
+                     #   context/error_markers.rs — error-marker classification + legacy run-boundary dedup
                      #   workspace.rs — AgentWorkspace (personality/goals/memories/user files)
                      #   episodic.rs — Cross-session episodic memory (summary generation + formatting)
                      #   workspace_tool.rs — WorkspaceWriteTool (exception: stays in runtime)
