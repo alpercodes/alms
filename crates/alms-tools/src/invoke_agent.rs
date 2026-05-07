@@ -142,7 +142,7 @@ impl Tool for InvokeAgentTool {
                     self.parent_cancel_token.clone(),
                 )
                 .await
-                .map_err(|e| SandboxError::Io(format!("Subagent error: {}", e)))?;
+                .map_err(SandboxError::from)?;
 
             return Ok(serde_json::json!({
                 "task_id": task_id.to_string(),
@@ -161,7 +161,7 @@ impl Tool for InvokeAgentTool {
                 self.parent_cancel_token.clone(),
             )
             .await
-            .map_err(|e| SandboxError::Io(format!("Subagent error: {}", e)))?;
+            .map_err(SandboxError::from)?;
 
         Ok(serde_json::json!({
             "response": response,
@@ -232,6 +232,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dispatcher_error_propagates() {
+        // #920: dispatcher errors must propagate as the structured
+        // `SandboxError::Subagent(Box<AlmsError>)` variant — *not*
+        // stringified into `SandboxError::Io(format!("Subagent error:
+        // {e}"))`. The runtime tool registry's catch-all unwraps the
+        // box back to the typed `AlmsError` so the parent agent's
+        // `tool_result` reads as one tractable line instead of the
+        // legacy 4-prefix wrap. This test pins that boundary.
         #[derive(Debug)]
         struct FailDispatcher;
         #[async_trait]
@@ -245,7 +252,11 @@ mod tests {
                 _subagent_name: Option<String>,
                 _parent_cancel_token: Option<CancellationToken>,
             ) -> AlmsResult<(String, SessionId)> {
-                Err(alms_core::AlmsError::Runtime("subagent failed".to_string()))
+                Err(alms_core::AlmsError::SubagentLlmError {
+                    provider: "anthropic".to_string(),
+                    status: 400,
+                    body: r#"{"error":{"message":"prompt is too long"}}"#.to_string(),
+                })
             }
         }
         let tool = InvokeAgentTool::new(Arc::new(FailDispatcher), SessionId::new(), None, None);
@@ -253,7 +264,78 @@ mod tests {
             .execute(serde_json::json!({ "task": "fail" }))
             .await
             .unwrap_err();
-        assert!(matches!(err, SandboxError::Io(_)));
+        // Pin the variant — must be `Subagent(...)`, not `Io(...)`.
+        let inner = match err {
+            SandboxError::Subagent(boxed) => *boxed,
+            other => panic!("expected SandboxError::Subagent, got {other:?}"),
+        };
+        // Pin the inner `AlmsError` shape — the typed
+        // `SubagentLlmError` triple must arrive at the SandboxError
+        // boundary verbatim, ready for `ToolRegistry::execute` to
+        // unwrap it back to the parent's tool_result message.
+        match inner {
+            alms_core::AlmsError::SubagentLlmError {
+                provider,
+                status,
+                body,
+            } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(status, 400);
+                assert!(body.contains("prompt is too long"));
+            }
+            other => panic!("expected inner SubagentLlmError, got {other:?}"),
+        }
+    }
+
+    /// #920: a generic (non-SubagentLlmError) `AlmsError` from the
+    /// dispatcher must also flow through `SandboxError::Subagent` so the
+    /// `From` boundary is the same regardless of the underlying variant.
+    /// The runtime side then propagates the typed variant verbatim.
+    #[tokio::test]
+    async fn test_dispatcher_generic_error_uses_structured_subagent_variant() {
+        #[derive(Debug)]
+        struct GenericFailDispatcher;
+        #[async_trait]
+        impl SubagentDispatcher for GenericFailDispatcher {
+            async fn dispatch(
+                &self,
+                _task: String,
+                _parent_session_id: SessionId,
+                _parent_run_id: Option<RunId>,
+                _parent_event_tx: Option<Arc<dyn EventForwarder>>,
+                _subagent_name: Option<String>,
+                _parent_cancel_token: Option<CancellationToken>,
+            ) -> AlmsResult<(String, SessionId)> {
+                Err(alms_core::AlmsError::Runtime(
+                    "downstream blew up".to_string(),
+                ))
+            }
+        }
+        let tool = InvokeAgentTool::new(
+            Arc::new(GenericFailDispatcher),
+            SessionId::new(),
+            None,
+            None,
+        );
+        let err = tool
+            .execute(serde_json::json!({ "task": "fail" }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SandboxError::Subagent(_)),
+            "expected SandboxError::Subagent, got {err:?}"
+        );
+        // Defense-in-depth: the legacy `IO error: Subagent error:`
+        // prefix must not appear in the rendered string.
+        let s = err.to_string();
+        assert!(
+            !s.contains("IO error:"),
+            "structured Subagent variant must not render as IO error, got: {s}"
+        );
+        assert!(
+            !s.contains("Subagent error:"),
+            "structured Subagent variant must not have legacy prefix, got: {s}"
+        );
     }
 
     #[test]

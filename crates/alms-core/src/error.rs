@@ -37,9 +37,35 @@ pub enum AlmsError {
     #[error("Sandbox error: {0}")]
     Sandbox(String),
 
+    /// LLM provider returned a non-success HTTP status while serving a
+    /// subagent's call. Carries the structured triple (provider, status,
+    /// raw response body) so callers can render a one-line, diagnosable
+    /// message instead of stringifying-and-rewrapping at every boundary
+    /// from the provider client back to the parent agent's tool result.
+    ///
+    /// Issue #920. The `Display` impl renders as
+    /// `Subagent LLM error ({provider} {status}): {body}`, a single
+    /// human-readable line — *not* `Runtime error: Runtime error: ...`.
+    /// The triple is preserved verbatim through the SubagentDispatcher
+    /// boundary, the coordinator's `TaskResult`, the `invoke_agent` tool,
+    /// and `ToolRegistry::execute`'s catch-all so the parent agent's
+    /// `tool_result` message reads as a single tractable line.
+    #[error("Subagent LLM error ({provider} {status}): {body}")]
+    SubagentLlmError {
+        provider: String,
+        status: u16,
+        body: String,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    // Note for #995 follow-up reviewers: every `SubagentLlmError` value
+    // should be constructed via [`AlmsError::subagent_llm_error`] rather
+    // than direct struct-literal syntax. The constructor normalises
+    // newlines in `body` so the `Display` impl above stays a single
+    // tractable line even when providers (notably Gemini) return
+    // multi-line JSON error bodies. Issue #920 / Tim's PR #995 review.
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
@@ -59,6 +85,54 @@ pub enum AlmsError {
 }
 
 pub type AlmsResult<T> = Result<T, AlmsError>;
+
+impl AlmsError {
+    /// Construct an [`AlmsError::SubagentLlmError`] with the body
+    /// normalised so the `Display` impl renders as a single line.
+    ///
+    /// The variant's `Display` is documented as a single tractable line of
+    /// the shape `Subagent LLM error ({provider} {status}): {body}`. That
+    /// guarantee can only hold if `body` itself contains no line breaks —
+    /// some providers (notably Gemini) return JSON error bodies that span
+    /// multiple lines, which would otherwise smear the rendered error
+    /// across audit logs, the `tool_result` parent message, and SSE
+    /// `tool_end` payloads.
+    ///
+    /// This constructor replaces every `\r\n`, `\n`, and bare `\r`
+    /// occurrence in `body` with a single ASCII space so the rendered
+    /// line stays grep-friendly. The substitution is intentionally
+    /// non-recoverable — operators reading audit logs get a sane
+    /// single-line shape; if the original raw body is needed, the
+    /// underlying provider response is logged separately at the call
+    /// site (`error!("LLM API error: {} - {}", status, error_text)` in
+    /// `llm_client::mod.rs`).
+    ///
+    /// All emission sites (`LlmClient::complete`, `complete_stream`, and
+    /// their cache-retry branches) MUST go through this constructor so
+    /// the single-line invariant holds at every boundary. Tests in this
+    /// file pin the contract — see
+    /// `subagent_llm_error_constructor_normalises_newlines`. Issue #920 /
+    /// PR #995 polish.
+    pub fn subagent_llm_error(
+        provider: impl Into<String>,
+        status: u16,
+        body: impl Into<String>,
+    ) -> Self {
+        let raw = body.into();
+        // Single pass: collapse CR/LF into spaces. We deliberately do not
+        // collapse runs of whitespace — that would mutate the body's
+        // internal structure beyond the line-shape guarantee.
+        let normalised: String = raw
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect();
+        AlmsError::SubagentLlmError {
+            provider: provider.into(),
+            status,
+            body: normalised,
+        }
+    }
+}
 
 /// Produce a safe error description for session history.
 ///
@@ -98,6 +172,18 @@ pub fn sanitize_error_for_session(err: &AlmsError) -> String {
         AlmsError::InvalidConfig(_) => "Invalid configuration".to_string(),
         AlmsError::Cancelled => "Run cancelled by user".to_string(),
         AlmsError::Io(_) => "I/O error".to_string(),
+        // Subagent LLM errors carry the raw provider response body, which
+        // can echo prompts, snippets of model output, or other
+        // potentially sensitive content. Categorise by HTTP status so
+        // session history reflects the failure class without persisting
+        // the body. Issue #920.
+        AlmsError::SubagentLlmError { status, .. } => match *status {
+            401 | 403 => "Subagent LLM authentication error".to_string(),
+            429 => "Subagent LLM rate limit exceeded".to_string(),
+            400..=499 => "Subagent LLM request rejected".to_string(),
+            500..=599 => "Subagent LLM server error".to_string(),
+            _ => "Subagent LLM error".to_string(),
+        },
         // The classifier `reason` is public info — surface a distinct label
         // so operators grepping session history can tell policy denials
         // apart from generic internal errors.
@@ -228,6 +314,152 @@ mod tests {
                     "absolute path or secret {needle:?} must not survive sanitisation: got {sanitized:?} (raw: {raw:?})"
                 );
             }
+        }
+    }
+
+    /// #920: the structured subagent LLM error variant must render as a
+    /// single human-readable line — no `Runtime error:` prefix, no
+    /// `IO error: Subagent error:` prefix, no `Tool execution failed:`
+    /// prefix. The 4-level wrap from before this issue produced
+    /// `Tool execution failed: IO error: Subagent error: Runtime error:
+    /// Runtime error: LLM API error: 400 - {body}`. The new shape is
+    /// just `Subagent LLM error (anthropic 400): {body}`.
+    #[test]
+    fn subagent_llm_error_display_is_one_line_no_layer_prefixes() {
+        let err = AlmsError::SubagentLlmError {
+            provider: "anthropic".to_string(),
+            status: 400,
+            body: r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 270000 tokens > 262144 maximum"}}"#.to_string(),
+        };
+        let s = err.to_string();
+        assert!(
+            s.starts_with("Subagent LLM error (anthropic 400):"),
+            "expected single-line structured Display, got: {s}"
+        );
+        // The legacy 4-prefix wrap that this variant collapses must not
+        // reappear for any reason.
+        for forbidden in [
+            "Runtime error:",
+            "IO error: Subagent error:",
+            "Tool execution failed:",
+            // The doubled prefix from the legacy stringify-then-rewrap
+            // on the coordinator boundary.
+            "Runtime error: Runtime error:",
+            "LLM API error:",
+        ] {
+            assert!(
+                !s.contains(forbidden),
+                "structured Display must not contain legacy prefix {forbidden:?}, got: {s}"
+            );
+        }
+        // The body — including the actual provider message — survives
+        // verbatim so callers can render it.
+        assert!(
+            s.contains("prompt is too long"),
+            "raw provider message must survive in body, got: {s}"
+        );
+    }
+
+    /// #920: sanitiser must categorise the structured variant by HTTP
+    /// status without persisting the raw provider response body, which
+    /// can echo prompts or other sensitive content into session
+    /// history. Mirrors the existing `Runtime` sanitiser contract.
+    #[test]
+    fn sanitize_subagent_llm_error_strips_body_keeps_status_class() {
+        let cases = [
+            (400, "Subagent LLM request rejected"),
+            (401, "Subagent LLM authentication error"),
+            (403, "Subagent LLM authentication error"),
+            (429, "Subagent LLM rate limit exceeded"),
+            (500, "Subagent LLM server error"),
+            (503, "Subagent LLM server error"),
+        ];
+        for (status, expected) in cases {
+            let err = AlmsError::SubagentLlmError {
+                provider: "anthropic".to_string(),
+                status,
+                body: "secret payload with api-key=sk-test-12345 and prompt fragments".to_string(),
+            };
+            let s = sanitize_error_for_session(&err);
+            assert_eq!(s, expected, "status {status} sanitised to wrong label");
+            assert!(
+                !s.contains("sk-test-12345"),
+                "API key must not survive sanitisation for status {status}, got: {s}"
+            );
+            assert!(
+                !s.contains("prompt fragments"),
+                "raw body must not survive sanitisation for status {status}, got: {s}"
+            );
+        }
+    }
+
+    /// #920 / PR #995 polish: the `subagent_llm_error` constructor
+    /// guarantees that the resulting `Display` is a single line, even
+    /// when the provider returns a multi-line body (e.g. pretty-printed
+    /// JSON from Gemini). The constructor replaces `\n`, `\r\n`, and
+    /// bare `\r` with spaces; downstream renderers (audit log,
+    /// `tool_result`, SSE `tool_end`) get a grep-friendly line.
+    #[test]
+    fn subagent_llm_error_constructor_normalises_newlines() {
+        // Multi-line body covering all three line-ending shapes:
+        // bare LF (Unix), CRLF (Windows / HTTP), and bare CR (legacy
+        // Mac / mid-string).
+        let body = "{\n  \"error\": {\r\n    \"message\": \"prompt is too long\"\r  }\n}";
+        let err = AlmsError::subagent_llm_error("gemini", 400, body);
+
+        let s = err.to_string();
+        // Hard contract: no line breaks in the rendered Display.
+        assert!(
+            !s.contains('\n'),
+            "Display must not contain LF after constructor normalisation: {s:?}"
+        );
+        assert!(
+            !s.contains('\r'),
+            "Display must not contain CR after constructor normalisation: {s:?}"
+        );
+        // Display still starts with the expected one-line prefix.
+        assert!(
+            s.starts_with("Subagent LLM error (gemini 400):"),
+            "expected single-line prefix, got: {s}"
+        );
+        // The body's actual provider message survives — only line
+        // breaks were substituted.
+        assert!(
+            s.contains("prompt is too long"),
+            "provider message must survive normalisation, got: {s}"
+        );
+        // Pin the exact shape: each line break is exactly one ASCII
+        // space (so `\r\n` becomes two spaces — one per char), no
+        // collapsing of internal whitespace, no truncation.
+        //
+        // Input was: `{\n  "error": {\r\n    "message": "..."\r  }\n}`
+        // After substitution: `{` + ` ` (\n) + `  ` (existing indent)
+        // + `"error": {` + `  ` (\r\n) + `    ` + `"message": "..."`
+        // + ` ` (\r) + `  }` + ` ` (\n) + `}`.
+        match &err {
+            AlmsError::SubagentLlmError { body, .. } => {
+                assert_eq!(
+                    body, "{   \"error\": {      \"message\": \"prompt is too long\"   } }",
+                    "newline-to-space substitution must be 1:1, no whitespace collapsing"
+                );
+            }
+            other => panic!("expected SubagentLlmError, got {other:?}"),
+        }
+    }
+
+    /// PR #995 polish: a body that already contains no line breaks
+    /// must round-trip through the constructor unchanged. Guards
+    /// against the constructor accidentally mutating well-formed
+    /// single-line bodies (the common 99% case).
+    #[test]
+    fn subagent_llm_error_constructor_preserves_single_line_body() {
+        let raw = r#"{"error":{"message":"prompt is too long: 270000 tokens > 262144 maximum"}}"#;
+        let err = AlmsError::subagent_llm_error("anthropic", 400, raw);
+        match &err {
+            AlmsError::SubagentLlmError { body, .. } => {
+                assert_eq!(body, raw, "single-line body must round-trip unchanged");
+            }
+            other => panic!("expected SubagentLlmError, got {other:?}"),
         }
     }
 

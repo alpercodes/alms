@@ -172,6 +172,8 @@ When the truncation service rewrites a tool result, the persisted session row ca
 
 **Capability inheritance:** Each subagent receives a capability set derived from the parent's `invoke_agent` call. The runtime enforces these boundaries; a subagent cannot exceed the capabilities granted to it.
 
+**Typed errors across the sandbox boundary (#920):** Tools that wrap a typed `AlmsError` (notably the `invoke_agent` subagent path) propagate it through `SandboxError::Subagent(Box<AlmsError>)` instead of stringifying into `SandboxError::Io`. `ToolRegistry::execute`'s catch-all unwraps the `Subagent` arm back to the inner `AlmsError` so the structured variant (e.g. `AlmsError::SubagentLlmError { provider, status, body }`) survives every boundary verbatim and reaches the parent agent's `tool_result` as a single tractable line. The coordinator carries typed values through a parallel `error_tx`/`error_rx` oneshot alongside the JSON `TaskResult` for the `invoke_agent` path. New tools with structured errors worth preserving should rely on the `From<AlmsError> for SandboxError` impl rather than reaching for `Io`/`Internal`.
+
 ### LLM Client (`alms-runtime`)
 
 Multi-provider LLM support with streaming. Provider selected via `llm.provider` config or `ALMS_LLM_PROVIDER` env var. Providers are declared in `[llm.providers.<name>]` tables and looked up by name; the sugar names `anthropic`, `gemini`, `openai`, and `openrouter` are auto-populated so existing configs keep working.

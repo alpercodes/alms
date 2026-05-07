@@ -1,7 +1,8 @@
 pub mod message_bus;
 
 use alms_core::{
-    AgentId, AlmsResult, Run, RunId, RunRegistrar, SessionId, TokenUsage, truncate_to_char_boundary,
+    AgentId, AlmsError, AlmsResult, Run, RunId, RunRegistrar, SessionId, TokenUsage,
+    truncate_to_char_boundary,
 };
 use alms_runtime::{AgentConfig, AgentRuntime, LlmClient, RunOutput};
 use alms_session::SessionManager;
@@ -121,6 +122,12 @@ pub struct SubagentHandle {
     /// Stored result for background tasks — set by `run_subagent` on completion
     /// so the completion notification system can access the result.
     pub completed_result: Option<TaskResult>,
+    /// Receiver for the structured `AlmsError` produced by the subagent
+    /// (when it failed) — taken by `dispatch()` so it can return the
+    /// typed variant unchanged instead of stringifying-and-rewrapping
+    /// `task_result.result["error"]` as `AlmsError::Runtime(...)`.
+    /// `None` for completed / cancelled / timed-out runs. Issue #920.
+    pub error_rx: Option<oneshot::Receiver<AlmsError>>,
 }
 
 /// Coordinator manages subagent lifecycle in a pure hierarchy.
@@ -323,6 +330,13 @@ impl Coordinator {
         let task_id = TaskId::new();
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel::<TaskResult>();
+        // #920: typed error channel, parallel to the JSON `result_rx`.
+        // `run_subagent` fires this when the agent loop returns an error
+        // so `dispatch()` can propagate the structured `AlmsError`
+        // (e.g. `SubagentLlmError`) without going through the JSON
+        // stringification round trip that previously double-wrapped the
+        // error as `AlmsError::Runtime(stringified)`.
+        let (error_tx, error_rx) = oneshot::channel::<AlmsError>();
         let parent_run_id = request.parent_run_id;
         let parent_session_id = request.parent_session;
 
@@ -358,6 +372,7 @@ impl Coordinator {
             is_background,
             result_rx: Some(result_rx),
             completed_result: None,
+            error_rx: Some(error_rx),
         };
 
         self.subagents.insert(task_id, handle);
@@ -399,6 +414,7 @@ impl Coordinator {
                     active_named,
                     cancel_rx,
                     result_tx,
+                    error_tx,
                     session_manager,
                     llm,
                     parent_event_tx,
@@ -427,6 +443,16 @@ impl Coordinator {
     /// Returns `None` if the task does not exist or the receiver was already taken.
     pub fn take_result_rx(&self, task_id: TaskId) -> Option<oneshot::Receiver<TaskResult>> {
         self.subagents.get_mut(&task_id)?.result_rx.take()
+    }
+
+    /// Take the typed-error receiver for a task (can only be called once
+    /// per task). Companion to [`Self::take_result_rx`] used by
+    /// [`SubagentDispatcher::dispatch`] to recover the structured
+    /// `AlmsError` produced by the subagent without going through
+    /// `task_result.result["error"]` and an `AlmsError::Runtime` rewrap.
+    /// Issue #920.
+    pub fn take_error_rx(&self, task_id: TaskId) -> Option<oneshot::Receiver<AlmsError>> {
+        self.subagents.get_mut(&task_id)?.error_rx.take()
     }
 }
 
@@ -458,6 +484,13 @@ impl SubagentDispatcher for Coordinator {
         let result_rx = self.take_result_rx(task_id).ok_or_else(|| {
             alms_core::AlmsError::Runtime("No result channel for subagent".to_string())
         })?;
+        // #920: typed-error receiver. Carries the structured `AlmsError`
+        // when the subagent's loop returned an error, so we can return
+        // it verbatim instead of rebuilding an `AlmsError::Runtime` from
+        // the JSON `result["error"]` string (which previously produced
+        // the `Runtime error: Runtime error:` double prefix at the
+        // parent's tool-result message).
+        let error_rx = self.take_error_rx(task_id);
 
         // Block until the subagent completes (or is cancelled/times out)
         let task_result = result_rx.await.map_err(|_| {
@@ -472,12 +505,25 @@ impl SubagentDispatcher for Coordinator {
                     .to_string(),
                 sub_session_id,
             )),
-            TaskStatus::Failed => Err(alms_core::AlmsError::Runtime(
-                task_result.result["error"]
-                    .as_str()
-                    .unwrap_or("subagent failed")
-                    .to_string(),
-            )),
+            TaskStatus::Failed => {
+                // Prefer the typed `AlmsError` when present so the
+                // structured variant (e.g. `SubagentLlmError`) survives
+                // the boundary unchanged. Fall back to the JSON string
+                // for paths that never produced a structured error
+                // (timeout, missing typed channel) — those still come
+                // through as `AlmsError::Runtime` exactly as before.
+                if let Some(error_rx) = error_rx
+                    && let Ok(typed) = error_rx.await
+                {
+                    return Err(typed);
+                }
+                Err(alms_core::AlmsError::Runtime(
+                    task_result.result["error"]
+                        .as_str()
+                        .unwrap_or("subagent failed")
+                        .to_string(),
+                ))
+            }
             TaskStatus::Cancelled => Err(alms_core::AlmsError::Runtime(
                 "Subagent was cancelled".to_string(),
             )),
@@ -558,6 +604,13 @@ async fn run_subagent(
     active_named: Arc<dashmap::DashSet<String>>,
     cancel_rx: oneshot::Receiver<()>,
     result_tx: oneshot::Sender<TaskResult>,
+    // #920: typed-error sender, parallel to `result_tx`. Fired with the
+    // structured `AlmsError` from `run_agent_loop` when the subagent
+    // failed; never fired on success / cancel / timeout. `dispatch()`
+    // awaits this in preference to the JSON `result["error"]` so the
+    // typed variant (e.g. `SubagentLlmError`) propagates without a
+    // stringification round trip.
+    error_tx: oneshot::Sender<AlmsError>,
     session_manager: Arc<SessionManager>,
     llm: LlmClient,
     parent_event_tx: Option<Arc<dyn EventForwarder>>,
@@ -645,7 +698,13 @@ async fn run_subagent(
     // The select returns the task status, a JSON result value (for the
     // TaskResult / completion notification), and optionally the full
     // RunOutput so we can record accurate token usage in the run record.
-    let (new_status, result_value, tokens_used, run_output) = tokio::select! {
+    //
+    // #920: also returns the structured `AlmsError` (when the agent loop
+    // produced one) so the caller can forward it down the typed-error
+    // oneshot. Timeouts and cancellations have no underlying `AlmsError`
+    // and use `None` here — `dispatch()` falls back to the JSON path
+    // for those, exactly as before.
+    let (new_status, result_value, tokens_used, run_output, typed_error) = tokio::select! {
         _ = tokio::time::sleep(request.timeout) => {
             warn!(
                 target: "subagent::timeout",
@@ -653,7 +712,7 @@ async fn run_subagent(
                 timeout_secs = %request.timeout.as_secs(),
                 "Subagent timed out"
             );
-            (TaskStatus::Failed, serde_json::json!({"error": "Timeout"}), None, None)
+            (TaskStatus::Failed, serde_json::json!({"error": "Timeout"}), None, None, None)
         }
         _ = child_cancel_token.cancelled() => {
             info!(
@@ -661,7 +720,7 @@ async fn run_subagent(
                 task_id = %task_id.0,
                 "Subagent cancelled"
             );
-            (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None)
+            (TaskStatus::Cancelled, serde_json::json!({"cancelled": true}), None, None, None)
         }
         output = run_agent_loop(task_id, &request, sub_agent_id, &sub_context_id, &session_manager, &llm, parent_event_tx, &base_agent_config, workspace_dir.as_deref(), data_dir.as_deref(), project_root.as_deref(), &subagent_prompts, child_cancel_token.clone(), secrets.as_ref(), &security_config, is_background) => {
             match output {
@@ -679,6 +738,7 @@ async fn run_subagent(
                         serde_json::json!({"response": run_output.response}),
                         Some(tokens),
                         Some(run_output),
+                        None,
                     )
                 }
                 Err(e) => {
@@ -688,11 +748,13 @@ async fn run_subagent(
                         error = %e,
                         "Subagent run failed"
                     );
+                    let err_text = e.to_string();
                     (
                         TaskStatus::Failed,
-                        serde_json::json!({"error": e.to_string()}),
+                        serde_json::json!({"error": err_text}),
                         None,
                         None,
+                        Some(e),
                     )
                 }
             }
@@ -843,6 +905,25 @@ async fn run_subagent(
                 );
             }
         }
+    }
+
+    // #920: Send the typed error first so `dispatch()` (which awaits
+    // `result_rx` and then `error_rx` in sequence) is guaranteed to see
+    // the typed value the moment it unblocks on `result_rx`. Foreground
+    // and background paths both wire this — `let _ = ...` swallows
+    // closed-receiver errors when nobody's listening (background mode,
+    // or dispatch dropped before completion).
+    //
+    // Why the ordering matters: tokio oneshot sends are synchronous and
+    // visible to the receiver immediately on completion of `send()`, so
+    // sending `error_tx` *before* `result_tx` guarantees that when
+    // `dispatch()` unblocks on `result_rx.await` the typed error is
+    // already sitting in `error_rx`. There's no possible race where
+    // `error_rx.await` would see `Closed` while a typed error is still
+    // in flight; the only way it returns `Closed` is the genuine
+    // "no typed error was produced" path (timeout, cancel, success).
+    if let Some(typed) = typed_error {
+        let _ = error_tx.send(typed);
     }
 
     // Deliver result to dispatch() caller (foreground mode — may already be dropped)

@@ -4,7 +4,7 @@ use thiserror::Error;
 pub type SandboxResult<T> = Result<T, SandboxError>;
 
 /// Errors that can occur in the sandbox
-#[derive(Error, Debug, Clone)]
+#[derive(Error, Debug)]
 pub enum SandboxError {
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
@@ -45,6 +45,21 @@ pub enum SandboxError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// A subagent's `AgentRuntime` returned a structured `AlmsError`
+    /// (typically [`alms_core::AlmsError::SubagentLlmError`] when the
+    /// downstream provider returned a non-success HTTP status).
+    ///
+    /// Carries the inner error verbatim so [`crate::ToolRegistry`]'s
+    /// caller (`alms-runtime::tools::ToolRegistry::execute`) can recover
+    /// the typed variant via the `From` impl below and propagate it to
+    /// the parent agent's `tool_result` as a single tractable line —
+    /// instead of the legacy 4-prefix wrap from
+    /// `SandboxError::Io(format!("Subagent error: {}", e))` plus
+    /// `AlmsError::ToolExecution(format!("Tool execution failed: {}", e))`.
+    /// Issue #920.
+    #[error("{0}")]
+    Subagent(Box<alms_core::AlmsError>),
 }
 
 impl From<serde_json::Error> for SandboxError {
@@ -66,8 +81,13 @@ impl From<reqwest::Error> for SandboxError {
 }
 
 impl From<alms_core::AlmsError> for SandboxError {
+    /// Wrap an `AlmsError` so it survives the `SandboxResult` boundary
+    /// without lossy stringification. The `alms-runtime` tool registry's
+    /// catch-all unwraps `Subagent` back into the typed `AlmsError` so
+    /// the structured variant reaches the parent agent's tool-result
+    /// message intact. Issue #920.
     fn from(err: alms_core::AlmsError) -> Self {
-        SandboxError::Internal(err.to_string())
+        SandboxError::Subagent(Box::new(err))
     }
 }
 

@@ -87,6 +87,22 @@ impl LlmClient {
         })
     }
 
+    /// Stable, lowercase short name for the wire-protocol family.
+    ///
+    /// Used to label structured `AlmsError::SubagentLlmError` payloads
+    /// (#920) so callers can tell which provider returned the failing
+    /// status without re-parsing the body. Distinct from
+    /// `LlmConfig::provider`, which carries the user-facing config key
+    /// and may be a sugar alias (`openrouter`, `groq`, ...) — we always
+    /// return the protocol family the request was actually built against.
+    fn provider_name(&self) -> &'static str {
+        match self.provider {
+            Provider::OpenAi => "openai",
+            Provider::Anthropic => "anthropic",
+            Provider::Gemini => "gemini",
+        }
+    }
+
     /// Determine the wire-protocol family for the current provider.
     ///
     /// Checks the `providers` table first (populated from
@@ -326,18 +342,29 @@ impl LlmClient {
                         "LLM API error on cache-retry: {} - {}",
                         retry_status, retry_err
                     );
-                    return Err(AlmsError::Runtime(format!(
-                        "LLM API error: {} - {}",
-                        retry_status, retry_err
-                    )));
+                    // #920: emit the structured variant so the parent
+                    // agent's `tool_result` reads as one tractable line
+                    // (`Subagent LLM error (gemini 400): ...`) instead of
+                    // the legacy 4-prefix wrap. The constructor
+                    // normalises newlines in `body` so multi-line
+                    // provider responses (e.g. Gemini's pretty JSON)
+                    // still render as a single tractable line.
+                    return Err(AlmsError::subagent_llm_error(
+                        self.provider_name(),
+                        retry_status.as_u16(),
+                        retry_err,
+                    ));
                 }
                 return self.parse_completion_response(retry_response).await;
             }
             error!("LLM API error: {} - {}", status, error_text);
-            return Err(AlmsError::Runtime(format!(
-                "LLM API error: {} - {}",
-                status, error_text
-            )));
+            // #920: structured variant (see cache-retry branch above for
+            // the full rationale).
+            return Err(AlmsError::subagent_llm_error(
+                self.provider_name(),
+                status.as_u16(),
+                error_text,
+            ));
         }
 
         self.parse_completion_response(response).await
@@ -497,10 +524,16 @@ impl LlmClient {
                         "LLM API error on cache-retry: {} - {}",
                         retry_status, retry_err
                     );
-                    return Err(AlmsError::Runtime(format!(
-                        "LLM API error: {} - {}",
-                        retry_status, retry_err
-                    )));
+                    // #920: structured variant (mirrors the non-stream
+                    // branch — parent's `tool_result` should read as
+                    // `Subagent LLM error (gemini 400): ...`). The
+                    // constructor normalises newlines so multi-line
+                    // provider bodies still render as one line.
+                    return Err(AlmsError::subagent_llm_error(
+                        self.provider_name(),
+                        retry_status.as_u16(),
+                        retry_err,
+                    ));
                 }
                 return Ok(stream_response(
                     retry_response,
@@ -509,10 +542,13 @@ impl LlmClient {
                 ));
             }
             error!("LLM API error: {} - {}", status, error_text);
-            return Err(AlmsError::Runtime(format!(
-                "LLM API error: {} - {}",
-                status, error_text
-            )));
+            // #920: structured variant (see cache-retry branch above for
+            // the full rationale).
+            return Err(AlmsError::subagent_llm_error(
+                self.provider_name(),
+                status.as_u16(),
+                error_text,
+            ));
         }
 
         Ok(stream_response(
@@ -2105,16 +2141,19 @@ mod tests {
     }
 
     /// Nit 1: when the cache-expired retry in `complete()` itself fails
-    /// with a non-success status, the client must surface a clean
-    /// `"LLM API error: <status> - ..."` string — not a JSON parse
-    /// error from feeding the error body to the success-path parser.
+    /// with a non-success status, the client must surface the structured
+    /// `AlmsError::SubagentLlmError` variant (#920) carrying provider /
+    /// status / body — not a JSON parse error from feeding the error body
+    /// to the success-path parser.
     #[tokio::test]
     async fn complete_cache_retry_non_success_yields_typed_http_error() {
         // Two responses, in order:
         //   1. First request: 404 with a Gemini cache-not-found body.
         //      Triggers the retry branch via `decide_cache_retry`.
         //   2. Retry request: 500 with a generic error body.
-        //      Must NOT be parsed — must surface as "LLM API error: 500".
+        //      Must NOT be parsed — must surface as the structured
+        //      `AlmsError::SubagentLlmError { provider, status: 500, .. }`
+        //      variant (#920) rather than a parse error.
         let base_url = spawn_sequential_responder(vec![
             (
                 404,
@@ -2146,10 +2185,25 @@ mod tests {
             .await
             .expect_err("retry returning 500 must surface as a typed error");
 
+        // #920: structured variant. Pin the discriminant + fields so the
+        // typed shape sticks, and the Display rendering so callers get a
+        // single tractable line.
+        match &err {
+            AlmsError::SubagentLlmError {
+                provider,
+                status,
+                body,
+            } => {
+                assert_eq!(provider, "gemini");
+                assert_eq!(*status, 500);
+                assert!(body.contains("internal"), "body must carry payload: {body}");
+            }
+            other => panic!("expected SubagentLlmError, got {other:?}"),
+        }
         let msg = err.to_string();
         assert!(
-            msg.contains("LLM API error: 500"),
-            "expected clean HTTP error shape, got: {msg}"
+            msg.contains("Subagent LLM error (gemini 500)"),
+            "expected structured Display, got: {msg}"
         );
         assert!(
             !msg.contains("Failed to parse"),
@@ -2187,13 +2241,24 @@ mod tests {
             .with_gemini_cache_enabled(true);
 
         // `BoxStream` isn't `Debug`, so hand-match instead of `expect_err`.
-        let msg = match client.complete_stream(request).await {
+        let err = match client.complete_stream(request).await {
             Ok(_) => panic!("stream retry returning 500 must surface as a typed error"),
-            Err(e) => e.to_string(),
+            Err(e) => e,
         };
+        // #920: structured variant on the stream branch too.
+        match &err {
+            AlmsError::SubagentLlmError {
+                provider, status, ..
+            } => {
+                assert_eq!(provider, "gemini");
+                assert_eq!(*status, 500);
+            }
+            other => panic!("expected SubagentLlmError, got {other:?}"),
+        }
+        let msg = err.to_string();
         assert!(
-            msg.contains("LLM API error: 500"),
-            "expected clean HTTP error shape, got: {msg}"
+            msg.contains("Subagent LLM error (gemini 500)"),
+            "expected structured Display, got: {msg}"
         );
     }
 
