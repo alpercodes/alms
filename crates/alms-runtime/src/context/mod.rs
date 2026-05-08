@@ -220,30 +220,40 @@ impl ContextBuilder {
                 history
             };
 
-        // Filter out reasoning messages (message_type="reasoning") from
-        // DM sessions before building context.  These are internal agent
-        // reasoning (thinking text, tool calls, tool results) persisted as
-        // Role::User to preserve the DM invariant.  They should not appear
-        // in either agent's LLM context:
-        //   - The reasoning agent already has them from the current run
-        //   - The peer agent should never see them (token waste + malformed
-        //     messages when perspective-mapped ToolResult hits the catch-all
-        //     in rebuild::session_msg_to_llm — fixes C2)
+        // Filter out PEER reasoning messages (message_type="reasoning"
+        // with from_agent != perspective_agent) from DM sessions before
+        // building context.  These are the peer agent's internal thinking
+        // text, tool calls, and tool results persisted as Role::User to
+        // preserve the DM invariant.  They should not reach this agent's
+        // LLM context: token waste + malformed messages when the peer's
+        // perspective-mapped ToolResult hits the catch-all in
+        // rebuild::session_msg_to_llm (C2 in the #930 review).
+        //
+        // SAME-agent reasoning rows are retained (#988): they carry the
+        // agent's own prior tool_use / tool_result history inside the
+        // DM, which the agent needs for working memory across turn
+        // boundaries.  Without this, every DM turn looked like turn 1
+        // from the agent's perspective except for the textual
+        // back-and-forth — e.g. a `fs_read` on turn N was invisible by
+        // turn N+2, so the agent had to redo work or guess.
+        // `apply_perspective` below re-stamps the surviving same-agent
+        // rows onto their canonical roles so rebuild::session_msg_to_llm
+        // reconstructs them as structured assistant / tool messages.
         let filtered_history: Vec<Message>;
-        let effective_history = if perspective_agent.is_some()
+        let effective_history = if let Some(agent) = perspective_agent
             && history_after_dedup
                 .iter()
-                .any(perspective::is_reasoning_message)
+                .any(|m| perspective::is_peer_reasoning_message(m, agent))
         {
             let before = history_after_dedup.len();
             filtered_history = history_after_dedup
                 .iter()
-                .filter(|m| !perspective::is_reasoning_message(m))
+                .filter(|m| !perspective::is_peer_reasoning_message(m, agent))
                 .cloned()
                 .collect();
             debug!(
                 filtered = before - filtered_history.len(),
-                "Filtered reasoning messages from DM context"
+                "Filtered peer reasoning messages from DM context"
             );
             filtered_history.as_slice()
         } else {
