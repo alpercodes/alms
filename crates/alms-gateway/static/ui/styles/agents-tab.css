@@ -9,6 +9,17 @@
   flex-direction: column;
   gap: var(--space-2);
 }
+/* The agent cards live inside a role="listbox" wrapper (a11y parity with
+   session-list — see agents-tab.js for the rationale). The wrapper carries
+   the same vertical-stack layout as the parent so card spacing matches the
+   pre-listbox visual; we keep the parent's `gap` rule untouched so the
+   create-row / preview / error stack above the listbox still spaces the
+   same way. */
+.agent-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
 .agent-card {
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
@@ -17,8 +28,18 @@
   display: flex;
   flex-direction: column;
   transition: border-color var(--duration-normal);
+  /* Whole card is the click-target for selection (#983). The role="option"
+     + tabindex="0" markup (inside the parent role="listbox") makes the
+     card keyboard-activatable via Enter or Space and matches the
+     session-list a11y pattern; the cursor cue tells the operator it's
+     clickable on hover. */
+  cursor: pointer;
 }
 .agent-card:hover { border-color: var(--border-default); }
+.agent-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .agent-card-name { font-size: var(--text-sm); color: var(--text-primary); font-weight: 600; flex: 1; }
 .agent-card-badges { display: flex; gap: var(--space-1); align-items: center; }
 .agent-badge {

@@ -11,6 +11,7 @@ import {
     formatProviderLabel,
 } from '../../utils/model-display.js';
 import { normalizeAgentName, validateNormalizedAgentName } from '../../utils/agent-name.js';
+import { shouldActivateFromClick, shouldActivateFromKey } from '../../utils/card-activation.js';
 
 const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
 
@@ -482,13 +483,40 @@ function AgentCard({ agent, isActive, onEdit }) {
     const serverModelId = serverDefaults.value.model || '';
     const serverProvider = serverDefaults.value.provider || '';
 
-    const onDeleteClick = () => {
+    // Card-root activation — clicking anywhere on the card (or pressing
+    // Enter / Space when focused) selects this agent. Nested action
+    // buttons below call `stopPropagation()` so a click on them doesn't
+    // also fire this handler. (#983)
+    //
+    // The card uses `role="option"` inside a parent `role="listbox"` to
+    // match the session-list a11y pattern (sidebar/session-list.js). Both
+    // are selectable lists — keeping the role / aria attribute pair
+    // (option + aria-selected) consistent means a screen reader hears
+    // the same shape on both views. Enter / Space activation (rather
+    // than arrow-key navigation) matches session-list too — neither
+    // listbox implements roving-tabindex; both are tabbed-into and
+    // activated like buttons. That's slightly off-script for listbox
+    // semantics but the divergence is consistent across the codebase.
+    const onCardClick = (e) => {
+        if (!shouldActivateFromClick(e)) return;
+        switchAgent(agent.id);
+    };
+    const onCardKeyDown = (e) => {
+        if (!shouldActivateFromKey(e)) return;
+        e.preventDefault();
+        switchAgent(agent.id);
+    };
+
+    const onDeleteClick = (e) => {
+        // Don't bubble up to the card-root activation. (#983)
+        if (e) e.stopPropagation();
         confirming.value = true;
         // Auto-revert after 3 seconds if not confirmed
         deleteTimer.value = setTimeout(() => { confirming.value = false; }, 3000);
     };
 
-    const onDeleteConfirm = async () => {
+    const onDeleteConfirm = async (e) => {
+        if (e) e.stopPropagation();
         if (deleteTimer.value) { clearTimeout(deleteTimer.value); deleteTimer.value = null; }
         confirming.value = false;
         try {
@@ -505,12 +533,14 @@ function AgentCard({ agent, isActive, onEdit }) {
         }
     };
 
-    const onDeleteCancel = () => {
+    const onDeleteCancel = (e) => {
+        if (e) e.stopPropagation();
         if (deleteTimer.value) { clearTimeout(deleteTimer.value); deleteTimer.value = null; }
         confirming.value = false;
     };
 
-    const onSetDefault = async () => {
+    const onSetDefault = async (e) => {
+        if (e) e.stopPropagation();
         try {
             await setDefaultAgent(agent.id);
             await refreshAgents();
@@ -519,8 +549,19 @@ function AgentCard({ agent, isActive, onEdit }) {
         }
     };
 
+    const onEditClick = (e) => {
+        if (e) e.stopPropagation();
+        onEdit(agent);
+    };
+
     return html`
-        <div class="agent-card ${isActive ? 'active' : ''}">
+        <div class="agent-card ${isActive ? 'active' : ''}"
+             role="option"
+             tabindex="0"
+             aria-label=${'Select agent ' + agent.name}
+             aria-selected=${isActive ? 'true' : 'false'}
+             onClick=${onCardClick}
+             onKeyDown=${onCardKeyDown}>
             <div class="agent-card-header">
                 <span class="agent-card-name">${agent.name}</span>
                 ${agent.is_default && html`<span class="agent-badge">default</span>`}
@@ -543,8 +584,7 @@ function AgentCard({ agent, isActive, onEdit }) {
             `}
             ${error.value && html`<div class="agent-error">${error.value}</div>`}
             <div class="agent-card-actions">
-                <button class="agent-card-btn" onClick=${() => switchAgent(agent.id)}>Select</button>
-                <button class="agent-card-btn" onClick=${() => onEdit(agent)}>Edit</button>
+                <button class="agent-card-btn" onClick=${onEditClick}>Edit</button>
                 ${!agent.is_default && html`
                     <button class="agent-card-btn" onClick=${onSetDefault}>Set Default</button>
                 `}
@@ -642,14 +682,16 @@ export function AgentsTab() {
 
             ${error.value && html`<div class="agent-error">${error.value}</div>`}
 
-            ${agents.value.length === 0
-                ? html`<div class="empty-state">No agents</div>`
-                : agents.value.map(a => html`
-                    <${AgentCard} key=${a.id} agent=${a}
-                                  isActive=${a.id === activeAgentId.value}
-                                  onEdit=${(agent) => { editingAgent.value = agent; }} />
-                `)
-            }
+            <div class="agent-list" role="listbox" aria-label="Agents">
+                ${agents.value.length === 0
+                    ? html`<div class="empty-state">No agents</div>`
+                    : agents.value.map(a => html`
+                        <${AgentCard} key=${a.id} agent=${a}
+                                      isActive=${a.id === activeAgentId.value}
+                                      onEdit=${(agent) => { editingAgent.value = agent; }} />
+                    `)
+                }
+            </div>
 
             ${editingAgent.value && html`
                 <${AgentEditModal}

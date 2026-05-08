@@ -185,6 +185,25 @@ fn stream_health_js_behaviour() {
     run_node_test("stream-health.test.mjs");
 }
 
+/// Pinned regression for issue #983: the agent card in the right-side
+/// agents panel is now a whole-card click target (the per-card "Select"
+/// button is removed). The JS-side test exercises the pure-function
+/// activation predicates in `static/ui/utils/card-activation.js`:
+///   - `isActivationKey(key)` — Enter / Space activate, nothing else
+///   - `shouldActivateFromKey(event)` — keyboard-driven activation gate
+///     with a `defaultPrevented` suppression for nested handlers
+///   - `shouldActivateFromClick(event)` — click-driven activation gate
+///     with the same `defaultPrevented` suppression
+///
+/// Pins the wired-up handler shape from `agents-tab.js`'s `AgentCard`
+/// component (preventDefault on Enter / Space, ignore Tab) so a future
+/// refactor that drops the keyboard activation or breaks the
+/// stopPropagation defense for nested actions surfaces here.
+#[test]
+fn card_activation_js_behaviour() {
+    run_node_test("card-activation.test.mjs");
+}
+
 /// Pinned regression for the timer-cancel-on-manual-reconnect contract
 /// in `static/ui/hooks/use-agent-events.js` (#907 follow-up — Tim's
 /// Suggestion 1 on PR #1001). When a manual reconnect path (banner
