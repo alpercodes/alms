@@ -1005,3 +1005,709 @@ test('#969 shape contract: http_get (crates/alms-sandbox/src/builtin/http_get.rs
         { url: 'https://example.com/api' });
     assert.ok(tree, 'http_get shape must render structured output');
 });
+
+// =========================================================================
+// #974 — Tool input formatting parity (renderParams in tool-row.js)
+//
+// The input renderer surface lives in tool-row.js's `renderParams(tool,
+// params)` function. To test it under Node we reuse the same html-stub
+// strategy as the dispatcher harness above, but also stub the
+// non-renderParams imports `tool-row.js` carries (useSignal, toolSummary,
+// fmtSize, renderToolOutput, TOOL_SUMMARY_LEN). renderParams does not
+// touch any of those at runtime, so the no-op stubs are sufficient.
+// =========================================================================
+
+/**
+ * Load `tool-row.js` under Node by stubbing its top-level imports with
+ * inline shims. Returns the module's exported `renderParams` function.
+ */
+async function loadRenderParams() {
+    const src = fs.readFileSync(TOOL_ROW_PATH, 'utf8');
+
+    // Reuse the html-stub source from loadToolOutputModule(). Rebuilding
+    // it here keeps the two harnesses independent — if you tweak this
+    // one, the dispatcher harness above is unaffected and vice versa.
+    const stub = `
+        const __SENTINEL_OPEN = '\\u0001V';
+        const __SENTINEL_CLOSE = '\\u0001';
+
+        function __htmlStub(strings, ...values) {
+            let joined = strings[0];
+            for (let i = 0; i < values.length; i++) {
+                joined += __SENTINEL_OPEN + i + __SENTINEL_CLOSE + strings[i + 1];
+            }
+            return __scanFull(joined, values);
+        }
+
+        function __scanFull(s, values) {
+            const stack = [{ kind: 'elem', tag: '#fragment', classes: [], children: [] }];
+            const top = () => stack[stack.length - 1];
+            let i = 0;
+            while (i < s.length) {
+                const lt = s.indexOf('<', i);
+                if (lt === -1) { __emitText(s.slice(i), values, top()); break; }
+                if (lt > i) __emitText(s.slice(i, lt), values, top());
+                const gt = s.indexOf('>', lt + 1);
+                if (gt === -1) break;
+                const inside = s.slice(lt + 1, gt);
+                if (inside.startsWith('/')) {
+                    const tag = inside.slice(1).trim();
+                    while (stack.length > 1 && stack[stack.length - 1].tag !== tag) stack.pop();
+                    if (stack.length > 1) stack.pop();
+                    i = gt + 1;
+                    continue;
+                }
+                const selfClose = inside.endsWith('/');
+                const head = (selfClose ? inside.slice(0, -1) : inside).trim();
+                const spaceIdx = head.search(/\\s/);
+                const tag = spaceIdx === -1 ? head : head.slice(0, spaceIdx);
+                const attrs = spaceIdx === -1 ? '' : head.slice(spaceIdx + 1);
+                const expandedAttrs = __expandSentinels(attrs, values);
+                const classMatch = expandedAttrs.match(/class=\\"([^\\"]*)\\"/);
+                const classes = classMatch ? classMatch[1].split(/\\s+/).filter(Boolean) : [];
+                const elem = { kind: 'elem', tag, classes, children: [] };
+                stack[stack.length - 1].children.push(elem);
+                if (!selfClose) stack.push(elem);
+                i = gt + 1;
+            }
+            const root = stack[0];
+            if (root.children.length === 1 && root.children[0] && root.children[0].kind === 'elem') {
+                return root.children[0];
+            }
+            return root;
+        }
+
+        function __expandSentinels(s, values) {
+            return s.replace(/\\u0001V(\\d+)\\u0001/g, (_, idx) => {
+                const v = values[Number(idx)];
+                if (v === null || v === undefined || v === false || v === true) return '';
+                if (v && typeof v === 'object') return v.tag || '';
+                return String(v);
+            });
+        }
+
+        function __emitText(chunk, values, parent) {
+            if (!chunk) return;
+            const re = /\\u0001V(\\d+)\\u0001/g;
+            let last = 0;
+            let m;
+            while ((m = re.exec(chunk)) !== null) {
+                const before = chunk.slice(last, m.index);
+                const t = before.trim();
+                if (t) parent.children.push({ kind: 'text', text: t });
+                __pushValue(values[Number(m[1])], parent);
+                last = re.lastIndex;
+            }
+            const tail = chunk.slice(last).trim();
+            if (tail) parent.children.push({ kind: 'text', text: tail });
+        }
+
+        function __pushValue(v, parent) {
+            if (v === null || v === undefined || v === false || v === true) return;
+            if (Array.isArray(v)) { for (const item of v) __pushValue(item, parent); return; }
+            if (v && typeof v === 'object' && v.kind) { parent.children.push(v); return; }
+            const s = String(v);
+            if (s.length > 0) parent.children.push({ kind: 'text', text: s });
+        }
+    `;
+
+    // Replace the multi-symbol import line with the stub + bindings.
+    // tool-row.js's import block is:
+    //   import { html, useSignal } from '../../deps.js';
+    //   import { toolSummary, fmtSize } from '../../utils/tool-summary.js';
+    //   import { renderToolOutput } from '../../utils/tool-output.js';
+    //   import { TOOL_SUMMARY_LEN } from '../../utils/constants.js';
+    const depsRe =
+        /^import\s*\{\s*html\s*,\s*useSignal\s*\}\s*from\s*['"]\.\.\/\.\.\/deps\.js['"];?\s*$/m;
+    const summaryRe =
+        /^import\s*\{[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/tool-summary\.js['"];?\s*$/m;
+    const outputRe =
+        /^import\s*\{[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/tool-output\.js['"];?\s*$/m;
+    const constsRe =
+        /^import\s*\{[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/constants\.js['"];?\s*$/m;
+
+    if (!depsRe.test(src) || !summaryRe.test(src)
+        || !outputRe.test(src) || !constsRe.test(src)) {
+        throw new Error(
+            'tool-row.js: expected imports for html/useSignal, tool-summary, '
+            + 'tool-output, and constants. Update the test harness if the '
+            + 'imports were refactored.'
+        );
+    }
+
+    let stubbed = src.replace(
+        depsRe,
+        stub + '\nconst html = __htmlStub;\nconst useSignal = () => ({ value: false });'
+    );
+    stubbed = stubbed.replace(
+        summaryRe,
+        'const toolSummary = () => ""; const fmtSize = () => "";'
+    );
+    stubbed = stubbed.replace(
+        outputRe,
+        'const renderToolOutput = () => null;'
+    );
+    stubbed = stubbed.replace(
+        constsRe,
+        'const TOOL_SUMMARY_LEN = 80;'
+    );
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'alms-tool-row-test-'));
+    const tmpFile = path.join(tmpDir, 'tool-row.mjs');
+    fs.writeFileSync(tmpFile, stubbed, 'utf8');
+    return await import(url.pathToFileURL(tmpFile).href);
+}
+
+const rowMod = await loadRenderParams();
+const { renderParams, paramsAreTruncated } = rowMod;
+
+// ── output-side parity: echo / math / datetime (#974 expanded scope) ─────
+
+test('#974 echo output: string echo renders in monospace pane (not raw JSON)', () => {
+    const tree = renderToolOutput('echo', 'hello world', { message: 'hello world' });
+    assert.ok(tree, 'echo string result must render structured');
+    const text = collectText(tree);
+    assert.ok(text.includes('hello world'));
+    // Negative: not a raw JSON dump.
+    assert.ok(!text.includes('"message"'),
+        'echo output must not contain a raw JSON dump\n' + dump(tree));
+});
+
+test('#974 echo output: object passthrough is pretty-printed, not raw fallback', () => {
+    const tree = renderToolOutput('echo', { hello: 'world' }, {});
+    assert.ok(tree, 'echo object result must render structured');
+    const text = collectText(tree);
+    assert.ok(text.includes('hello'));
+    assert.ok(text.includes('world'));
+});
+
+test('#974 math output: integer result rendered as a kv-badge pill', () => {
+    const tree = renderToolOutput('math', 42, { operation: 'add', a: 10, b: 32 });
+    assert.ok(tree, 'math number result must render structured');
+    const classes = collectClasses(tree);
+    assert.ok(classes.has('tc-kv-badge'),
+        'math result must be rendered as a kv-badge\n' + dump(tree));
+    assert.ok(collectText(tree).includes('42'));
+});
+
+test('#974 math output: non-number result falls through to raw', () => {
+    // Defensive: math should never return a non-number, but if it ever
+    // does we want to fall through to raw rather than render a misleading
+    // pill containing "[object Object]".
+    const tree = renderToolOutput('math', { unexpected: true }, {});
+    assert.equal(tree, null);
+});
+
+test('#974 datetime output: UTC + Local sections render with timezone badges', () => {
+    const result = {
+        iso: '2026-05-07T10:00:00Z',
+        human: 'Thursday, May 7, 2026 10:00 AM',
+        timezone: 'UTC',
+        local_iso: '2026-05-07T13:00:00+03:00',
+        local_human: 'Thursday, May 7, 2026 1:00 PM',
+        local_timezone: 'Europe/Istanbul',
+        utc_offset: '+03:00',
+    };
+    const tree = renderToolOutput('datetime', result, {});
+    assert.ok(tree, 'datetime result must render structured');
+    const classes = collectClasses(tree);
+    const text = collectText(tree);
+    assert.ok(classes.has('tc-kv-badge'),
+        'timezone names must be rendered as kv-badges\n' + dump(tree));
+    assert.ok(text.includes('UTC'));
+    assert.ok(text.includes('Europe/Istanbul'));
+    assert.ok(text.includes('+03:00'));
+    assert.ok(text.includes('2026-05-07T10:00:00Z'));
+    // Negative.
+    assert.ok(!text.includes('"iso":'),
+        'datetime output must not contain a raw JSON dump\n' + dump(tree));
+});
+
+// =========================================================================
+// #974 — Per-tool input renderers (renderParams in tool-row.js)
+//
+// Each test below feeds a representative params object to renderParams
+// and asserts that the rendered tree carries the expected fragments
+// (path, pattern, mode, etc.) and that no params object is dumped as
+// raw JSON. Negative `assert.ok(!text.includes('{'))` checks pin the
+// "no raw fallback" contract from the issue's acceptance criterion.
+// =========================================================================
+
+test('#974 input shell: command renders in a code-block', () => {
+    const tree = renderParams('shell', { command: 'echo hi' });
+    assert.ok(tree);
+    const text = collectText(tree);
+    const classes = collectClasses(tree);
+    assert.ok(classes.has('tc-code-block'),
+        'shell command must render in a code-block\n' + dump(tree));
+    assert.ok(text.includes('echo hi'));
+});
+
+test('#974 input fs_read: file-path header renders without offset/limit', () => {
+    const tree = renderParams('fs_read', { path: 'src/lib.rs' });
+    assert.ok(tree);
+    const classes = collectClasses(tree);
+    const text = collectText(tree);
+    assert.ok(classes.has('tc-file-header'),
+        'fs_read input must render the path as a file header\n' + dump(tree));
+    assert.ok(text.includes('src/lib.rs'));
+});
+
+test('#974 input fs_read: line range surfaces when offset+limit set', () => {
+    const tree = renderParams('fs_read', { path: 'big.rs', offset: 100, limit: 50 });
+    assert.ok(tree);
+    const text = collectText(tree);
+    assert.ok(text.includes('big.rs'));
+    assert.ok(text.includes('lines 101'),
+        'fs_read input must surface the (offset+1) line range\n' + dump(tree));
+    assert.ok(text.includes('150'),
+        'fs_read input must surface the (offset+limit) tail\n' + dump(tree));
+});
+
+test('#974 input fs_write: file header + overwrite badge', () => {
+    const tree = renderParams('fs_write', { path: 'a.txt', content: 'hi' });
+    assert.ok(tree);
+    const text = collectText(tree);
+    const classes = collectClasses(tree);
+    assert.ok(classes.has('tc-file-header'));
+    assert.ok(text.includes('a.txt'));
+    assert.ok(text.includes('overwrite'),
+        'fs_write input must show overwrite badge by default\n' + dump(tree));
+    assert.ok(text.includes('hi'));
+});
+
+test('#974 input fs_write: append mode surfaces correctly', () => {
+    const tree = renderParams('fs_write', { path: 'log.txt', mode: 'append', content: 'x' });
+    assert.ok(tree);
+    const text = collectText(tree);
+    assert.ok(text.includes('append'));
+});
+
+test('#974 input fs_edit: file header + replace summary + find/replace blocks', () => {
+    const tree = renderParams('fs_edit', {
+        path: 'src/foo.rs',
+        old_string: 'let x = 1;',
+        new_string: 'let x = 2;',
+    });
+    assert.ok(tree, 'fs_edit must render structured input (was raw JSON before #974)');
+    const classes = collectClasses(tree);
+    const text = collectText(tree);
+    assert.ok(classes.has('tc-file-header'),
+        'fs_edit input must use file-header\n' + dump(tree));
+    assert.ok(text.includes('src/foo.rs'));
+    assert.ok(text.includes('replace once'),
+        'default replace mode label must be "replace once"\n' + dump(tree));
+    assert.ok(text.includes('let x = 1;'));
+    assert.ok(text.includes('let x = 2;'));
+    // Negative: must not dump the params object as JSON.
+    assert.ok(!text.includes('"old_string"'),
+        'fs_edit must not dump params as raw JSON\n' + dump(tree));
+});
+
+test('#974 input fs_edit: replace_all surfaces as the badge', () => {
+    const tree = renderParams('fs_edit', {
+        path: 'a.rs',
+        old_string: 'foo',
+        new_string: 'bar',
+        replace_all: true,
+    });
+    assert.ok(tree);
+    assert.ok(collectText(tree).includes('replace all'));
+});
+
+test('#974 input fs_list: path header', () => {
+    const tree = renderParams('fs_list', { path: 'src' });
+    assert.ok(tree, 'fs_list must render structured input (was raw JSON before #974)');
+    const classes = collectClasses(tree);
+    const text = collectText(tree);
+    assert.ok(classes.has('tc-file-header'));
+    assert.ok(text.includes('src'));
+    assert.ok(!text.includes('{'),
+        'fs_list input must not include a raw JSON dump\n' + dump(tree));
+});
+
+test('#974 input fs_grep: pattern in path with default mode is unbadged', () => {
+    const tree = renderParams('fs_grep', { pattern: 'fn ', path: 'src' });
+    assert.ok(tree, 'fs_grep must render structured input (was raw JSON before #974)');
+    const text = collectText(tree);
+    assert.ok(text.includes('fn'));
+    assert.ok(text.includes('src'));
+    assert.ok(text.includes('in'),
+        'fs_grep should render `<pattern> in <path>`\n' + dump(tree));
+    // Default output_mode (files_with_matches) must NOT show as a badge —
+    // the badge is reserved for explicit deviation.
+    assert.ok(!text.includes('files_with_matches'),
+        'default mode must not appear as a badge\n' + dump(tree));
+});
+
+test('#974 input fs_grep: non-default output_mode + glob + case-insensitive surface', () => {
+    const tree = renderParams('fs_grep', {
+        pattern: 'TODO',
+        path: 'src',
+        output_mode: 'content',
+        glob: '*.rs',
+        case_insensitive: true,
+    });
+    assert.ok(tree);
+    const text = collectText(tree);
+    assert.ok(text.includes('content'));
+    assert.ok(text.includes('*.rs'));
+    assert.ok(text.includes('case-insensitive'));
+});
+
+test('#974 input fs_glob: pattern in path', () => {
+    const tree = renderParams('fs_glob', { pattern: '**/*.rs', path: 'src' });
+    assert.ok(tree, 'fs_glob must render structured input (was raw JSON before #974)');
+    const text = collectText(tree);
+    assert.ok(text.includes('**/*.rs'));
+    assert.ok(text.includes('src'));
+});
+
+test('#974 input http_get: GET <url> rendered in status row', () => {
+    const tree = renderParams('http_get', { url: 'https://example.com/api' });
+    assert.ok(tree);
+    const text = collectText(tree);
+    const classes = collectClasses(tree);
+    assert.ok(classes.has('tc-kv-badge'),
+        'GET method must render as a kv-badge\n' + dump(tree));
+    assert.ok(text.includes('GET'));
+    assert.ok(text.includes('https://example.com/api'));
+});
+
+test('#974 input workspace_write: file badge + mode label', () => {
+    const tree = renderParams('workspace_write', {
+        file: 'memories',
+        mode: 'append',
+        content: 'foo',
+    });
+    assert.ok(tree, 'workspace_write must render structured input (was raw JSON before #974)');
+    const text = collectText(tree);
+    const classes = collectClasses(tree);
+    assert.ok(classes.has('tc-kv-badge'));
+    assert.ok(text.includes('memories'));
+    assert.ok(text.includes('append'));
+    assert.ok(text.includes('foo'));
+    // Negative.
+    assert.ok(!text.includes('"file"'));
+});
+
+test('#974 input invoke_agent: name badge + task preview', () => {
+    const tree = renderParams('invoke_agent', { name: 'reviewer', task: 'Review my PR.' });
+    assert.ok(tree);
+    const text = collectText(tree);
+    const classes = collectClasses(tree);
+    assert.ok(classes.has('tc-kv-badge'));
+    assert.ok(text.includes('reviewer'));
+    assert.ok(text.includes('Review my PR.'));
+});
+
+test('#974 input invoke_agent: task longer than INPUT_PREVIEW_LEN is truncated', () => {
+    const longTask = 'A'.repeat(500);
+    const tree = renderParams('invoke_agent', { name: 'iris', task: longTask });
+    assert.ok(tree);
+    const text = collectText(tree);
+    // The raw 500-A blob should NOT appear; the truncated form (200 A's
+    // + ellipsis) should.
+    assert.ok(!text.includes('A'.repeat(500)),
+        'long task must be truncated\n' + dump(tree));
+    assert.ok(text.includes('…'),
+        'truncation ellipsis must appear\n' + dump(tree));
+});
+
+test('#974 input invoke_agent: ephemeral subagent (no name)', () => {
+    const tree = renderParams('invoke_agent', { task: 'Hello' });
+    assert.ok(tree);
+    const text = collectText(tree);
+    assert.ok(text.includes('ephemeral'),
+        'missing name must surface as `(ephemeral)`\n' + dump(tree));
+});
+
+test('#974 input invoke_agent: background flag surfaces as meta', () => {
+    const tree = renderParams('invoke_agent', { name: 'l', task: 't', background: true });
+    assert.ok(tree);
+    assert.ok(collectText(tree).includes('background'));
+});
+
+test('#974 input send_message: to badge + message preview', () => {
+    const tree = renderParams('send_message', { to: 'larry', message: 'help me' });
+    assert.ok(tree);
+    const text = collectText(tree);
+    const classes = collectClasses(tree);
+    assert.ok(classes.has('tc-kv-badge'));
+    assert.ok(text.includes('larry'));
+    assert.ok(text.includes('help me'));
+});
+
+test('#974 input read_messages: filter summary `from <agent>` + `last N`', () => {
+    const tree = renderParams('read_messages', { from: 'larry', last_n: 5 });
+    assert.ok(tree, 'read_messages must render structured input (was raw JSON before #974)');
+    const text = collectText(tree);
+    assert.ok(text.includes('from'));
+    assert.ok(text.includes('larry'));
+    assert.ok(text.includes('last 5'));
+    assert.ok(!text.includes('"from"'));
+});
+
+test('#974 input read_session: session_id + summary-only badge + last N', () => {
+    const tree = renderParams('read_session', {
+        session_id: '11111111-2222-3333-4444-555555555555',
+        last_n: 10,
+        summary_only: true,
+    });
+    assert.ok(tree, 'read_session must render structured input (was raw JSON before #974)');
+    const text = collectText(tree);
+    assert.ok(text.includes('11111111'));
+    assert.ok(text.includes('summary only'));
+    assert.ok(text.includes('last 10'));
+});
+
+test('#974 input read_subagent_session: subagent name + run summary', () => {
+    const tree = renderParams('read_subagent_session', {
+        name: 'researcher',
+        last_n: 20,
+    });
+    assert.ok(tree, 'read_subagent_session must render structured input (was raw JSON before #974)');
+    const text = collectText(tree);
+    const classes = collectClasses(tree);
+    assert.ok(classes.has('tc-kv-badge'));
+    assert.ok(text.includes('researcher'));
+    assert.ok(text.includes('last 20'));
+});
+
+test('#974 input list_agents: returns null (no input — output renderer covers the call)', () => {
+    const tree = renderParams('list_agents', {});
+    assert.equal(tree, null,
+        'list_agents takes no input — params section must be suppressed');
+});
+
+test('#974 input list_my_sessions: no params returns null', () => {
+    const tree = renderParams('list_my_sessions', {});
+    assert.equal(tree, null);
+});
+
+test('#974 input list_my_sessions: with limit, surfaces filter section', () => {
+    const tree = renderParams('list_my_sessions', { limit: 5, include_current: true });
+    assert.ok(tree);
+    const text = collectText(tree);
+    assert.ok(text.includes('limit 5'));
+    assert.ok(text.includes('include current'));
+});
+
+test('#974 input ignore_message: reason rendered in monospace pane', () => {
+    const tree = renderParams('ignore_message', { reason: 'nothing to add' });
+    assert.ok(tree, 'ignore_message must render structured input (was raw JSON before #974)');
+    const text = collectText(tree);
+    assert.ok(text.includes('nothing to add'));
+});
+
+test('#974 input ignore_message: missing reason renders the no-reason hint', () => {
+    const tree = renderParams('ignore_message', {});
+    assert.ok(tree);
+    assert.ok(collectText(tree).includes('no reason given'));
+});
+
+test('#974 input echo: message renders in monospace pane', () => {
+    const tree = renderParams('echo', { message: 'hello' });
+    assert.ok(tree);
+    assert.ok(collectText(tree).includes('hello'));
+});
+
+test('#974 input math: operation badge + operands tuple', () => {
+    const tree = renderParams('math', { operation: 'add', a: 10, b: 32 });
+    assert.ok(tree);
+    const text = collectText(tree);
+    const classes = collectClasses(tree);
+    assert.ok(classes.has('tc-kv-badge'));
+    assert.ok(text.includes('add'));
+    assert.ok(text.includes('10'));
+    assert.ok(text.includes('32'));
+});
+
+test('#974 input datetime: returns null (no input — output renderer carries everything)', () => {
+    const tree = renderParams('datetime', {});
+    assert.equal(tree, null);
+});
+
+// Final sweep: pin the "no raw-JSON for any first-party tool" contract.
+// Any tool name from the registry must produce a non-null params tree
+// for a representative non-empty params object.
+test('#974 acceptance: every first-party tool produces a structured input', () => {
+    const cases = [
+        ['shell', { command: 'ls' }],
+        ['shell_exec', { command: 'ls' }],
+        ['fs_read', { path: 'a' }],
+        ['fs_write', { path: 'a', content: 'b' }],
+        ['fs_edit', { path: 'a', old_string: 'x', new_string: 'y' }],
+        ['fs_list', { path: '.' }],
+        ['fs_grep', { pattern: 'p' }],
+        ['fs_glob', { pattern: '**' }],
+        ['http_get', { url: 'https://x' }],
+        ['workspace_write', { file: 'memories', content: 'x' }],
+        ['invoke_agent', { task: 't' }],
+        ['send_message', { to: 'l', message: 'hi' }],
+        ['read_messages', { from: 'l' }],
+        ['read_session', { session_id: 'abc' }],
+        ['read_subagent_session', { name: 'r' }],
+        ['ignore_message', { reason: 'x' }],
+        ['echo', { message: 'x' }],
+        ['math', { operation: 'add', a: 1, b: 2 }],
+    ];
+    for (const [tool, params] of cases) {
+        const tree = renderParams(tool, params);
+        assert.ok(tree, `${tool}: must render a structured input (got null)`);
+        const text = collectText(tree);
+        // Heuristic raw-JSON detection: a real raw fallback would include
+        // `{"<key>":` for one of the params we passed.
+        for (const key of Object.keys(params)) {
+            assert.ok(!text.includes(`"${key}":`),
+                `${tool}: must not dump params as raw JSON (saw "${key}":)\n` + dump(tree));
+        }
+    }
+});
+
+// Tools with "no input" semantics must explicitly suppress the params
+// section so the operator doesn't see an empty "Parameters" header.
+test('#974 acceptance: zero-input tools render null params', () => {
+    for (const tool of ['list_agents', 'list_my_sessions', 'datetime']) {
+        const tree = renderParams(tool, {});
+        assert.equal(tree, null,
+            `${tool}: no-input tool must suppress the params section`);
+    }
+});
+
+// =========================================================================
+// #1005 review fix — `paramsAreTruncated` detection for the
+// "View raw params" toggle (parallel to "View raw" on the result side).
+//
+// The toggle should appear only when one of the truncated input fields
+// (`fs_edit.old_string`/`new_string`, `invoke_agent.task`,
+// `send_message.message`, `ignore_message.reason`, `echo.message`) is
+// longer than `INPUT_PREVIEW_LEN` (200). For everything else — including
+// tools whose renderer never truncates anything — the structured panel
+// is the full payload and no toggle is shown.
+// =========================================================================
+
+test('#1005 paramsAreTruncated: short fs_edit strings are not truncated', () => {
+    assert.equal(
+        paramsAreTruncated('fs_edit', {
+            path: 'a.rs', old_string: 'foo', new_string: 'bar',
+        }),
+        false,
+    );
+});
+
+test('#1005 paramsAreTruncated: long fs_edit.old_string triggers truncation', () => {
+    assert.equal(
+        paramsAreTruncated('fs_edit', {
+            path: 'a.rs',
+            old_string: 'A'.repeat(500),
+            new_string: 'bar',
+        }),
+        true,
+    );
+});
+
+test('#1005 paramsAreTruncated: long fs_edit.new_string triggers truncation', () => {
+    assert.equal(
+        paramsAreTruncated('fs_edit', {
+            path: 'a.rs',
+            old_string: 'foo',
+            new_string: 'B'.repeat(500),
+        }),
+        true,
+    );
+});
+
+test('#1005 paramsAreTruncated: long invoke_agent.task triggers truncation', () => {
+    assert.equal(
+        paramsAreTruncated('invoke_agent', {
+            name: 'iris', task: 'C'.repeat(500),
+        }),
+        true,
+    );
+});
+
+test('#1005 paramsAreTruncated: short invoke_agent.task is not truncated', () => {
+    assert.equal(
+        paramsAreTruncated('invoke_agent', { name: 'iris', task: 'short task' }),
+        false,
+    );
+});
+
+test('#1005 paramsAreTruncated: long send_message.message triggers truncation', () => {
+    assert.equal(
+        paramsAreTruncated('send_message', {
+            to: 'larry', message: 'D'.repeat(500),
+        }),
+        true,
+    );
+});
+
+test('#1005 paramsAreTruncated: long ignore_message.reason triggers truncation', () => {
+    assert.equal(
+        paramsAreTruncated('ignore_message', { reason: 'E'.repeat(500) }),
+        true,
+    );
+});
+
+test('#1005 paramsAreTruncated: long echo.message triggers truncation', () => {
+    assert.equal(
+        paramsAreTruncated('echo', { message: 'F'.repeat(500) }),
+        true,
+    );
+});
+
+test('#1005 paramsAreTruncated: tools without truncated fields always return false', () => {
+    // shell.command, fs_read.path, http_get.url, workspace_write.content —
+    // none of these are truncated by `renderParams`, so the toggle must
+    // not appear regardless of length.
+    assert.equal(
+        paramsAreTruncated('shell', { command: 'G'.repeat(500) }),
+        false,
+        'shell.command is not in the truncated-fields list — no toggle expected',
+    );
+    assert.equal(
+        paramsAreTruncated('fs_read', { path: 'H'.repeat(500) }),
+        false,
+    );
+    assert.equal(
+        paramsAreTruncated('http_get', { url: 'https://x/' + 'I'.repeat(500) }),
+        false,
+    );
+    assert.equal(
+        paramsAreTruncated('workspace_write', {
+            file: 'memories', mode: 'append', content: 'J'.repeat(500),
+        }),
+        false,
+        'workspace_write.content is rendered in full — no toggle expected',
+    );
+});
+
+test('#1005 paramsAreTruncated: missing or null params is safe (returns false)', () => {
+    assert.equal(paramsAreTruncated('fs_edit', null), false);
+    assert.equal(paramsAreTruncated('fs_edit', undefined), false);
+    assert.equal(paramsAreTruncated('fs_edit', {}), false);
+});
+
+test('#1005 paramsAreTruncated: unknown tool returns false', () => {
+    assert.equal(
+        paramsAreTruncated('unknown_third_party_tool', { something: 'X'.repeat(500) }),
+        false,
+        'unknown tools fall through to the raw-JSON fallback in renderParams '
+        + '— that path shows the full payload already, no toggle needed',
+    );
+});
+
+test('#1005 paramsAreTruncated: at-boundary length (== INPUT_PREVIEW_LEN) is not truncated', () => {
+    // INPUT_PREVIEW_LEN is 200; truncateInput cuts strictly when length > n.
+    assert.equal(
+        paramsAreTruncated('echo', { message: 'A'.repeat(200) }),
+        false,
+        'message with length === INPUT_PREVIEW_LEN renders in full',
+    );
+    assert.equal(
+        paramsAreTruncated('echo', { message: 'A'.repeat(201) }),
+        true,
+        'one char over INPUT_PREVIEW_LEN must trigger the toggle',
+    );
+});

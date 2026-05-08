@@ -955,6 +955,110 @@ export function renderListMySessionsOutput(result) {
     `;
 }
 
+// ── echo ─────────────────────────────────────────────────────────────────
+
+/**
+ * Render echo tool output. The runtime returns either:
+ *   - the literal `message` string when present (so `result` is a string), or
+ *   - the input params object verbatim when no `message` field was passed.
+ *
+ * Both shapes get a single monospace pane so the operator sees what was
+ * echoed without scanning a JSON blob.
+ */
+export function renderEchoOutput(result) {
+    if (isErrorShape(result)) return null;
+    let text;
+    if (typeof result === 'string') {
+        text = result;
+    } else if (result && typeof result === 'object') {
+        // Object passthrough — pretty-print so it's still legible without
+        // the raw-JSON toggle.
+        try {
+            text = JSON.stringify(result, null, 2);
+        } catch {
+            return null;
+        }
+    } else if (typeof result === 'number' || typeof result === 'boolean') {
+        text = String(result);
+    } else {
+        return null;
+    }
+    return html`
+        <div class="tc-detail-section">
+            <div class="tc-detail-label">Echoed</div>
+            <pre class="tc-detail-content">${text}</pre>
+        </div>
+    `;
+}
+
+// ── math ─────────────────────────────────────────────────────────────────
+
+/**
+ * Render math tool output. The runtime returns a bare JSON number
+ * (Value::from(i64) or Value::from(f64)) — render it as a single
+ * monospace pill so the operator sees `42` rather than `42` floating
+ * inside `tc-detail-content`'s pre block.
+ */
+export function renderMathOutput(result) {
+    if (isErrorShape(result)) return null;
+    if (typeof result !== 'number') return null;
+    return html`
+        <div class="tc-detail-section">
+            <div class="tc-detail-label">Result</div>
+            <div class="tc-status-row">
+                <span class="tc-kv-badge">${result}</span>
+            </div>
+        </div>
+    `;
+}
+
+// ── datetime ─────────────────────────────────────────────────────────────
+
+/**
+ * Render datetime tool output: structured rows for UTC + local time. The
+ * payload shape (from `crates/alms-sandbox/src/builtin/datetime.rs`):
+ *   { iso, human, timezone,
+ *     local_iso, local_human, local_timezone, utc_offset }
+ */
+export function renderDatetimeOutput(result) {
+    if (typeof result !== 'object' || result === null) return null;
+    if (isErrorShape(result)) return null;
+
+    const iso = typeof result.iso === 'string' ? result.iso : null;
+    const human = typeof result.human === 'string' ? result.human : null;
+    const tz = typeof result.timezone === 'string' ? result.timezone : null;
+    const localIso = typeof result.local_iso === 'string' ? result.local_iso : null;
+    const localHuman = typeof result.local_human === 'string' ? result.local_human : null;
+    const localTz = typeof result.local_timezone === 'string' ? result.local_timezone : null;
+    const offset = typeof result.utc_offset === 'string' ? result.utc_offset : null;
+
+    if (!iso && !localIso) return null;
+
+    return html`
+        ${(iso || human) && html`
+            <div class="tc-detail-section">
+                <div class="tc-detail-label">UTC</div>
+                <div class="tc-status-row">
+                    ${tz && html`<span class="tc-kv-badge">${tz}</span>`}
+                    ${human && html`<span class="tc-kv-meta">${human}</span>`}
+                </div>
+                ${iso && html`<pre class="tc-detail-content">${iso}</pre>`}
+            </div>
+        `}
+        ${(localIso || localHuman) && html`
+            <div class="tc-detail-section">
+                <div class="tc-detail-label">Local</div>
+                <div class="tc-status-row">
+                    ${localTz && html`<span class="tc-kv-badge">${localTz}</span>`}
+                    ${offset && html`<span class="tc-kv-meta">${offset}</span>`}
+                    ${localHuman && html`<span class="tc-kv-meta">${localHuman}</span>`}
+                </div>
+                ${localIso && html`<pre class="tc-detail-content">${localIso}</pre>`}
+            </div>
+        `}
+    `;
+}
+
 // ── ignore_message ───────────────────────────────────────────────────────
 
 /**
@@ -1023,6 +1127,12 @@ export function renderToolOutput(tool, result, params, opts) {
             return renderListMySessionsOutput(result);
         case 'ignore_message':
             return renderIgnoreMessageOutput(result);
+        case 'echo':
+            return renderEchoOutput(result);
+        case 'math':
+            return renderMathOutput(result);
+        case 'datetime':
+            return renderDatetimeOutput(result);
         default:
             return null;
     }
