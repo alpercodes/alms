@@ -725,7 +725,7 @@ P1:
 - [ ] Restricted OS user deployment guide — document setup for sandboxed daemon user
 - [ ] Container/jail execution for shell tools (`bubblewrap`/`nsjail`)
 - [x] Secrets store — `.alms/secrets.json` with optional AES-256-GCM encryption via `ALMS_MASTER_KEY`
-- [ ] Secrets redaction in transcripts/audit logs
+- [~] Secrets redaction in transcripts/audit logs — audit-log path done for the `SubagentLlmError` provider-response-body leak class (#911 / #997 / PR #995 / PR #1006); raw provider bodies are now categorised to a status-class label (`Subagent LLM request rejected` etc.) before reaching `tool_decided` audit rows, and `FailedWithToolCalls`-wrapped sources redact recursively. Transcript / session-history path is broader (any tool output that echoes a secret, model output containing pasted credentials, prompt fragments returned by a provider error, etc.) and remains open
 - [ ] Per-domain network allowlists
 
 P2:

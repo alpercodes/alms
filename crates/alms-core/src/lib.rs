@@ -13,7 +13,7 @@ pub use channel::{Channel, ChannelConfig, IncomingMessage, OutgoingMessage};
 
 pub use audit::{AuditDecision, AuditEvent};
 pub use config::AlmsConfig;
-pub use error::{AlmsError, AlmsResult, sanitize_error_for_session};
+pub use error::{AlmsError, AlmsResult, audit_error_string, sanitize_error_for_session};
 pub use job::{CreateJobRequest, Job, JobId, JobSchedule, JobStatus};
 pub use registry::{
     AgentRecord, CreateAgentRequest, UpdateAgentRequest, WORKSPACE_FILENAMES, WorktreeMode,

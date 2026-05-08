@@ -134,6 +134,82 @@ impl AlmsError {
     }
 }
 
+/// Produce a safe error description for the audit log.
+///
+/// The audit log records every tool execution with its decision and any
+/// error string. Most `AlmsError` variants are safe to render verbatim
+/// there — they carry operator-authored category labels (e.g.
+/// `Tool execution failed: ...`, `Runtime error: ...`) that aid
+/// debuggability and do not echo provider response bodies.
+///
+/// The exception is [`AlmsError::SubagentLlmError`], whose `Display`
+/// embeds the raw provider response `body` (preserved deliberately for
+/// in-context rendering of subagent failures back to the parent agent's
+/// tool result, per issue #920). That body can contain prompt fragments,
+/// snippets of model output, API-key-shaped tokens echoed back by buggy
+/// providers, or other potentially sensitive content. Persisting it
+/// verbatim into the audit log is the leak class Tim flagged on PR #995
+/// and tracked in issue #997.
+///
+/// This helper performs a per-variant dispatch:
+///
+/// - `SubagentLlmError` → the same status-class category label used by
+///   [`sanitize_error_for_session`] (e.g. `"Subagent LLM request
+///   rejected"`), so audit-log emissions and session-history persistence
+///   agree on the redacted shape.
+/// - Every other variant → `err.to_string()`, the existing pre-#997
+///   shape, preserving the operator-debuggable detail audit-log
+///   consumers depend on.
+///
+/// The audit-log JSON wire shape is unchanged — only the `error` string
+/// content shrinks for the one targeted variant. Operator grep / dashboard
+/// queries that match on category-label prefixes (e.g. `"Tool execution
+/// failed:"`, `"Runtime error:"`) keep working byte-for-byte, and queries
+/// that previously matched the raw provider body for `SubagentLlmError`
+/// audit rows now match the category label instead.
+///
+/// If a future variant grows a sensitive-payload field (e.g. a hypothetical
+/// `ProviderRateLimitError { body }`), add it to the dispatch here and to
+/// [`sanitize_error_for_session`] in lockstep so both the audit and
+/// session-history paths agree.
+///
+/// Issue #997. Follow-up to #920 / PR #995.
+pub fn audit_error_string(err: &AlmsError) -> String {
+    match err {
+        // The single leak class from Tim's review: route through the
+        // same status-class label used by session-history sanitisation
+        // so the audit log, session history, and SSE error markers all
+        // agree on the redacted shape for subagent LLM failures.
+        AlmsError::SubagentLlmError { .. } => sanitize_error_for_session(err),
+        // `FailedWithToolCalls` wraps another `AlmsError` and its `Display`
+        // delegates to `{source}`. Recurse so a `SubagentLlmError` source
+        // is still redacted if a future audit emission stringifies a
+        // wrapped error. Today no audit site reaches this arm — the
+        // variant is constructed at `agent::mod.rs:1114` *after* the
+        // run-loop's audit rows are already written — but pinning the
+        // recursive contract means an accidental future emission of
+        // `audit_error_string(&FailedWithToolCalls { source: SubagentLlmError })`
+        // can't silently leak the body through the catch-all arm. Tim's
+        // PR #1006 review.
+        AlmsError::FailedWithToolCalls { source, .. } => audit_error_string(source),
+        // Every other variant is operator-authored (category labels, tool
+        // names, classifier reasons) or already redacted at construction
+        // (`AlmsError::ToolExecution(format!("Tool '{name}' not allowed"))`).
+        // Pass through verbatim — preserves the pre-#997 audit-log shape
+        // and the debuggability operators rely on.
+        //
+        // WARNING: any new variant whose `Display` embeds an unredacted,
+        // potentially sensitive payload (provider response body, raw
+        // headers, secret material, etc.) MUST be added to the explicit
+        // dispatch above rather than falling through here. The catch-all
+        // is `to_string()`, so a sensitive payload baked into a new
+        // variant's `#[error]` template would silently land in audit
+        // rows. Mirror the addition in `sanitize_error_for_session` so
+        // the audit and session-history surfaces stay in lockstep.
+        _ => err.to_string(),
+    }
+}
+
 /// Produce a safe error description for session history.
 ///
 /// Strips details that could contain secrets (API keys, URLs, headers,
@@ -461,6 +537,219 @@ mod tests {
             }
             other => panic!("expected SubagentLlmError, got {other:?}"),
         }
+    }
+
+    /// #997: the audit-log helper redacts the `SubagentLlmError` body
+    /// to the same status-class label `sanitize_error_for_session`
+    /// uses, so the leak class Tim flagged on PR #995 (raw provider
+    /// response body landing in the audit log verbatim) is closed.
+    #[test]
+    fn audit_error_string_redacts_subagent_llm_body() {
+        let cases = [
+            (400, "Subagent LLM request rejected"),
+            (401, "Subagent LLM authentication error"),
+            (403, "Subagent LLM authentication error"),
+            (429, "Subagent LLM rate limit exceeded"),
+            (500, "Subagent LLM server error"),
+            (503, "Subagent LLM server error"),
+        ];
+        for (status, expected) in cases {
+            let err = AlmsError::SubagentLlmError {
+                provider: "anthropic".to_string(),
+                status,
+                body: "secret-key=sk-test-12345 prompt fragments leaked here".to_string(),
+            };
+            let s = audit_error_string(&err);
+            assert_eq!(s, expected, "status {status} audit-redacted to wrong label");
+            assert!(
+                !s.contains("sk-test-12345"),
+                "API key must not survive audit redaction for status {status}, got: {s}"
+            );
+            assert!(
+                !s.contains("prompt fragments"),
+                "raw body must not survive audit redaction for status {status}, got: {s}"
+            );
+            // Twin contract: the audit-log helper agrees with the
+            // session-history sanitiser on the redacted shape, so
+            // operators see the same label in both surfaces.
+            assert_eq!(
+                s,
+                sanitize_error_for_session(&err),
+                "audit and session sanitisers must agree for SubagentLlmError"
+            );
+        }
+    }
+
+    /// #997: every non-`SubagentLlmError` variant must pass through the
+    /// audit-log helper byte-for-byte, preserving the pre-#997 wire
+    /// shape and the operator-authored debuggability the audit log is
+    /// built for. Pin the contract for the variants that actually
+    /// surface in `loop_impl.rs` audit emissions today.
+    #[test]
+    fn audit_error_string_passes_through_non_subagent_variants() {
+        let cases = [
+            AlmsError::ToolExecution("Invalid arguments: expected object at line 1".to_string()),
+            AlmsError::ToolExecution("Tool 'shell' not allowed".to_string()),
+            AlmsError::Runtime("provider 500 internal error".to_string()),
+            AlmsError::ToolBlocked {
+                reason: "rm -rf / blocked by classifier".to_string(),
+                target: Some("/".to_string()),
+            },
+            AlmsError::Cancelled,
+            AlmsError::SessionNotFound("sess-123".to_string()),
+            AlmsError::AgentNotFound("missing-agent".to_string()),
+            AlmsError::InvalidConfig("bad model".to_string()),
+            AlmsError::Channel("telegram disconnected".to_string()),
+            AlmsError::Sandbox("path escape".to_string()),
+        ];
+        for err in &cases {
+            assert_eq!(
+                audit_error_string(err),
+                err.to_string(),
+                "non-SubagentLlmError variants must pass through audit redaction unchanged"
+            );
+        }
+    }
+
+    /// #997: a `SubagentLlmError` whose body contains an API-key-shaped
+    /// token, a verbatim user prompt fragment, and a verbatim model
+    /// output snippet — the realistic Tim-flagged leak shape — must
+    /// have all three stripped from the audit-log emission.
+    #[test]
+    fn audit_error_string_strips_api_key_and_prompt_and_output_fragments() {
+        let body = r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: \"Authorization: Bearer sk-test-12345\\nUser said: please summarise this confidential memo about Project Apollo\\nAssistant began: Sure, the memo states that...\""}}"#;
+        let err = AlmsError::SubagentLlmError {
+            provider: "anthropic".to_string(),
+            status: 400,
+            body: body.to_string(),
+        };
+        let s = audit_error_string(&err);
+        assert_eq!(s, "Subagent LLM request rejected");
+        for needle in [
+            "sk-test-12345",
+            "Bearer",
+            "Authorization",
+            "Project Apollo",
+            "confidential memo",
+            "User said",
+            "Assistant began",
+            "prompt is too long",
+        ] {
+            assert!(
+                !s.contains(needle),
+                "leak fragment {needle:?} must not survive audit redaction: got {s:?}"
+            );
+        }
+    }
+
+    /// PR #1006 review (Tim): `FailedWithToolCalls`'s `Display` delegates
+    /// to `{source}`, which means the catch-all `_` arm in
+    /// `audit_error_string` would silently leak a wrapped
+    /// `SubagentLlmError` body through `to_string()` if a future audit
+    /// emission ever stringifies a wrapped error.
+    ///
+    /// Today this is unreachable — the variant is constructed at
+    /// `crates/alms-runtime/src/agent/mod.rs:1114` *after* the run-loop's
+    /// audit rows are already written, so audit emissions only ever see
+    /// the unwrapped source. But the recursive-dispatch contract pins
+    /// the redacted shape so that defence holds even if a new audit
+    /// emission site is added that happens to stringify a wrapped
+    /// error.
+    ///
+    /// This test exercises the wrapping shape directly: build a
+    /// `FailedWithToolCalls` whose `source` is a `SubagentLlmError`
+    /// carrying an API-key-shaped body, run it through
+    /// `audit_error_string`, and assert the output is the same
+    /// status-class label `sanitize_error_for_session` produces — no
+    /// body fragment, no API key, no provider message survives the
+    /// audit redaction even one wrap deep.
+    #[test]
+    fn audit_error_string_redacts_through_failed_with_tool_calls_wrapper() {
+        let inner = AlmsError::SubagentLlmError {
+            provider: "anthropic".to_string(),
+            status: 400,
+            body: "secret-key=sk-test-12345 prompt fragments leaked here".to_string(),
+        };
+        let wrapped = AlmsError::FailedWithToolCalls {
+            source: Box::new(inner),
+            tool_calls: vec![],
+        };
+
+        // Sanity check: the wrapper's own `Display` would leak the body
+        // (this is exactly the latent leak Tim flagged) — `Display`
+        // delegates to `{source}`, so the raw `to_string()` of the
+        // wrapper renders the full `SubagentLlmError` line including
+        // body. The audit helper must NOT take this path.
+        let raw_display = wrapped.to_string();
+        assert!(
+            raw_display.contains("sk-test-12345"),
+            "fixture sanity: wrapper's raw Display delegates to {{source}} and leaks the body \
+             — that's the catch-all `_ => err.to_string()` failure mode this test guards against, \
+             got: {raw_display:?}"
+        );
+
+        // The audit helper takes the recursive arm and redacts to the
+        // same status-class label `sanitize_error_for_session` produces
+        // for a bare `SubagentLlmError` of the same status.
+        let s = audit_error_string(&wrapped);
+        assert_eq!(
+            s, "Subagent LLM request rejected",
+            "FailedWithToolCalls wrapping SubagentLlmError must redact to status-class label"
+        );
+        for needle in [
+            "sk-test-12345",
+            "secret-key",
+            "prompt fragments",
+            "leaked here",
+        ] {
+            assert!(
+                !s.contains(needle),
+                "leak fragment {needle:?} must not survive audit redaction through wrapper: \
+                 got {s:?}"
+            );
+        }
+
+        // Twin-contract: the audit helper agrees with the session-history
+        // sanitiser for the wrapped shape too (the session sanitiser
+        // doesn't recurse today — it only sees the bare source — but
+        // the resulting label is the same redacted shape, so the two
+        // surfaces stay aligned).
+        let inner_for_session = AlmsError::SubagentLlmError {
+            provider: "anthropic".to_string(),
+            status: 400,
+            body: "irrelevant".to_string(),
+        };
+        assert_eq!(
+            s,
+            sanitize_error_for_session(&inner_for_session),
+            "audit redaction through FailedWithToolCalls must match session-history sanitisation \
+             of the equivalent bare SubagentLlmError"
+        );
+    }
+
+    /// PR #1006 review: the recursive arm must also work when the
+    /// `FailedWithToolCalls` source is a non-`SubagentLlmError` variant
+    /// — the wrapped variant's normal pass-through behaviour is
+    /// preserved, byte-for-byte. Pinning this guards against a regression
+    /// where the recursive arm accidentally redacts variants that
+    /// `audit_error_string` is meant to leave alone.
+    #[test]
+    fn audit_error_string_passes_through_failed_with_tool_calls_wrapping_safe_source() {
+        let inner = AlmsError::ToolExecution("shell: invalid arguments".to_string());
+        let inner_display = inner.to_string();
+        let wrapped = AlmsError::FailedWithToolCalls {
+            source: Box::new(inner),
+            tool_calls: vec![],
+        };
+        // Recursive dispatch unwraps and falls through to the catch-all
+        // `_ => err.to_string()` arm for the source — same shape an
+        // unwrapped `ToolExecution` would produce.
+        assert_eq!(
+            audit_error_string(&wrapped),
+            inner_display,
+            "FailedWithToolCalls wrapping a non-sensitive variant must pass through verbatim \
+             via recursive dispatch, matching the unwrapped source's audit shape"
+        );
     }
 
     /// Regression test for #911: a Runtime error containing a long

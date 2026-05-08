@@ -1,6 +1,6 @@
 use crate::events::{PHASE_CALLING_LLM, PHASE_EXECUTING_TOOLS, RuntimeEvent, RuntimeEventSender};
 use crate::llm_types::*;
-use alms_core::{AlmsError, AlmsResult, AuditDecision, AuditEvent, TokenUsage};
+use alms_core::{AlmsError, AlmsResult, AuditDecision, AuditEvent, TokenUsage, audit_error_string};
 use alms_session::{
     Content as SessionContent, Message as SessionMessage, Role as SessionRole, SessionManager,
 };
@@ -1373,7 +1373,14 @@ impl AgentRuntime {
                             decision: AuditDecision::Deny,
                             params: serde_json::Value::String(args_str.to_string()),
                             result: None,
-                            error: Some(err.to_string()),
+                            // #997: route every audit emission carrying an
+                            // `AlmsError` value through the variant-dispatch
+                            // helper so future `SubagentLlmError`-shaped
+                            // errors that surface here cannot leak the raw
+                            // provider response body. For the
+                            // `ToolExecution` value built immediately above
+                            // the helper is a no-op pass-through.
+                            error: Some(audit_error_string(&err)),
                             timestamp: alms_core::Timestamp::now(),
                         },
                     );
@@ -1394,7 +1401,11 @@ impl AgentRuntime {
                     decision: AuditDecision::Deny,
                     params: args,
                     result: None,
-                    error: Some(err.to_string()),
+                    // #997: route through the variant-dispatch helper for
+                    // consistency with the other `AlmsError`-bearing audit
+                    // emissions in this function. No-op pass-through for
+                    // the `ToolExecution` value built immediately above.
+                    error: Some(audit_error_string(&err)),
                     timestamp: alms_core::Timestamp::now(),
                 },
             );
@@ -1686,6 +1697,17 @@ impl AgentRuntime {
                     .map(|t| serde_json::json!({"target": t}));
                 // Use `Error` (not `Deny`) to distinguish runtime failures
                 // from policy denials in audit log queries.
+                //
+                // #997: route the audit `error` field through
+                // `audit_error_string` (variant dispatch) so a
+                // `SubagentLlmError` here — which carries the raw
+                // provider response body and can echo prompt content,
+                // model output, or API-key-shaped tokens — is collapsed
+                // to its status-class category label before it lands in
+                // the audit log. All other `AlmsError` variants pass
+                // through verbatim, preserving the pre-#997 audit-log
+                // shape for operator debugging. Tim's flag on PR #995
+                // (https://github.com/alpercodes/alms/pull/995#issuecomment-4395490137).
                 let _ = session_manager.append_audit(
                     session_id,
                     AuditEvent {
@@ -1695,7 +1717,7 @@ impl AgentRuntime {
                         decision: AuditDecision::Error,
                         params: args,
                         result: audit_result,
-                        error: Some(e.to_string()),
+                        error: Some(audit_error_string(e)),
                         timestamp: alms_core::Timestamp::now(),
                     },
                 );
