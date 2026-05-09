@@ -255,6 +255,13 @@
 }
 .msg-body.markdown-body > *:first-child { margin-top: 0; }
 .msg-body.markdown-body > *:last-child { margin-bottom: 0; }
+/* When the first/last child is a fenced code block, the copy-button
+ * decorator (#986) wraps the <pre> in `.code-block-wrapper`, so the
+ * wrapper becomes the direct child and the inner <pre> retains its
+ * `margin: var(--space-2) 0`. Zero that boundary margin so messages
+ * starting or ending with a code block don't pick up extra space. */
+.msg-body.markdown-body > .code-block-wrapper:first-child > pre { margin-top: 0; }
+.msg-body.markdown-body > .code-block-wrapper:last-child > pre { margin-bottom: 0; }
 
 .msg-body.markdown-body p {
   margin: 0 0 var(--space-2) 0;
@@ -287,6 +294,63 @@
   font-size: var(--text-xs);
   line-height: 1.5;
   white-space: pre;
+}
+
+/* ── Code-block copy button (#986) ──
+ * The decorator in `utils/decorate-code-blocks.js` wraps every fenced
+ * code block in `.code-block-wrapper` and injects a `.code-block-copy`
+ * button. The wrapper supplies the positioning context; the button is
+ * absolutely positioned at the top-right of the block so it's always
+ * visible (per the issue: discoverability > minimal chrome). */
+.code-block-wrapper {
+  position: relative;
+}
+
+.code-block-wrapper > pre {
+  /* Reserve room at the top-right so long first lines don't slide
+   * underneath the button. The button is 28×28; nudge a bit more to
+   * cover its left edge plus padding. */
+  padding-right: calc(var(--space-3) + 32px);
+}
+
+.code-block-copy {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: var(--surface-3);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.code-block-copy:hover {
+  background: var(--surface-4);
+  color: var(--text-primary);
+  border-color: var(--border-default);
+}
+
+.code-block-copy:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.code-block-copy--copied,
+.code-block-copy--copied:hover {
+  background: var(--accent-muted);
+  color: var(--accent-text);
+  border-color: var(--border-accent);
+}
+
+.code-block-copy svg {
+  display: block;
 }
 
 .msg-body.markdown-body ul,

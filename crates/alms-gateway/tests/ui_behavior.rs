@@ -204,6 +204,21 @@ fn card_activation_js_behaviour() {
     run_node_test("card-activation.test.mjs");
 }
 
+/// Pinned regression for issue #986: copy-to-clipboard button on every
+/// fenced code block in agent messages. The pure-function logic in
+/// `static/ui/utils/code-copy.js` decides the clipboard payload —
+/// extracting the inner-`<code>` text (so the language tag, which is a
+/// class artifact, never leaks), stripping the single trailing newline
+/// marked appends, and returning the empty sentinel on null /
+/// non-element inputs. The side-effecting half (button injection,
+/// `navigator.clipboard.writeText`, icon swap) lives in
+/// `decorate-code-blocks.js` and is smoke-tested manually in the
+/// browser.
+#[test]
+fn code_copy_js_behaviour() {
+    run_node_test("code-copy.test.mjs");
+}
+
 /// Pinned regression for the timer-cancel-on-manual-reconnect contract
 /// in `static/ui/hooks/use-agent-events.js` (#907 follow-up — Tim's
 /// Suggestion 1 on PR #1001). When a manual reconnect path (banner

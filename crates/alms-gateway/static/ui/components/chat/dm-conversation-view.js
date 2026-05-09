@@ -15,6 +15,7 @@ import { activeAgent } from '../../state/agents.js';
 import { activeRunId } from '../../state/runs.js';
 import { dmPeer } from '../../state/agent-status.js';
 import { scrollToBottom } from '../../utils/format.js';
+import { decorateCodeBlocks } from '../../utils/decorate-code-blocks.js';
 import { ToolRow } from './tool-row.js';
 import { MessageTimestamp } from './message.js';
 import { dmThinkingBuffers } from '../../hooks/use-session-stream.js';
@@ -69,6 +70,19 @@ function DmMessage({ msg, participants, perspectiveAgent }) {
 
     const rendered = renderMarkdown(msg.text || '');
 
+    // Code-block copy button (#986) — DM bubbles from agents (the
+    // common case in peer-to-peer messaging) get the same decorator
+    // pass as regular sealed agent messages. The decorator runs after
+    // the inner HTML lands so we can find the `<pre>` elements; pure
+    // markdown text without code blocks is a no-op. User-authored DM
+    // messages skip the decorator (per the issue: "agent messages
+    // only — NOT user messages") since the operator typed the content.
+    const isAgentAuthored = msg.type === 'agent' || msg.role === 'assistant';
+    const bubbleRef = useRef(null);
+    useEffect(() => {
+        if (isAgentAuthored) decorateCodeBlocks(bubbleRef.current);
+    }, [rendered, isAgentAuthored]);
+
     // Per-message timestamp on DM bubbles (PR #926 follow-up). Tim's
     // review on PR #926 caught that `ts` was already plumbed onto
     // `dm_message` SSE events and onto persisted DM history (see
@@ -84,7 +98,7 @@ function DmMessage({ msg, participants, perspectiveAgent }) {
                 <div class="dm-msg-name">${agentName}</div>
                 <${MessageTimestamp} ts=${msg.ts} />
             </div>
-            <div class="dm-msg-bubble markdown-body"
+            <div class="dm-msg-bubble markdown-body" ref=${bubbleRef}
                  dangerouslySetInnerHTML=${{ __html: rendered }} />
         </div>
     `;

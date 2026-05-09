@@ -119,6 +119,12 @@
 /* Markdown inside DM bubbles — reuse markdown-body styles */
 .dm-msg-bubble.markdown-body > *:first-child { margin-top: 0; }
 .dm-msg-bubble.markdown-body > *:last-child { margin-bottom: 0; }
+/* When the first/last child is a fenced code block, the copy-button
+ * decorator (#986) wraps the <pre> in `.code-block-wrapper`. Zero the
+ * inner <pre>'s boundary margin so DM bubbles that start or end with
+ * a code block don't pick up extra space. */
+.dm-msg-bubble.markdown-body > .code-block-wrapper:first-child > pre { margin-top: 0; }
+.dm-msg-bubble.markdown-body > .code-block-wrapper:last-child > pre { margin-bottom: 0; }
 .dm-msg-bubble.markdown-body p { margin-bottom: var(--space-2); }
 .dm-msg-bubble.markdown-body p:last-child { margin-bottom: 0; }
 .dm-msg-bubble.markdown-body code {

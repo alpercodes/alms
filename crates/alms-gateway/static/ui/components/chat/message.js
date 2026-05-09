@@ -1,7 +1,8 @@
-import { html, useSignal, renderMarkdown } from '../../deps.js';
+import { html, useSignal, useRef, useEffect, renderMarkdown } from '../../deps.js';
 import { activeAgent } from '../../state/agents.js';
 import { filterMessages } from '../../state/chat-actions.js';
 import { fmtMessageTime } from '../../utils/format.js';
+import { decorateCodeBlocks } from '../../utils/decorate-code-blocks.js';
 
 /**
  * Per-message timestamp (#855) — small grey text rendered next to the
@@ -55,6 +56,27 @@ export function ReasoningPanel({ text, live }) {
     `;
 }
 
+/**
+ * Sealed-agent-message Markdown body — wraps the
+ * `dangerouslySetInnerHTML` block so we can attach a ref and run the
+ * code-block copy-button decorator after the inner HTML lands. (#986)
+ *
+ * The decorator is idempotent and side-effecting; running it inside a
+ * useEffect ties the work to mount + html-prop changes, so a future
+ * code path that hot-swaps the body text (no current callsite) still
+ * gets the new blocks decorated.
+ */
+function MarkdownBody({ html: htmlStr }) {
+    const ref = useRef(null);
+    useEffect(() => {
+        decorateCodeBlocks(ref.current);
+    }, [htmlStr]);
+    return html`
+        <div class="msg-body markdown-body" ref=${ref}
+             dangerouslySetInnerHTML=${{ __html: htmlStr }} />
+    `;
+}
+
 export function Message({ type, role, text, sealed, fromAgent, reasoning, ts }) {
     const cls = type === 'user' ? 'user' : 'agent';
     const agentName = activeAgent.value?.name;
@@ -99,10 +121,7 @@ export function Message({ type, role, text, sealed, fromAgent, reasoning, ts }) 
                     ${showTs && html`<${MessageTimestamp} ts=${ts} />`}
                 </div>
                 ${panel}
-                ${hasBody && html`
-                    <div class="msg-body markdown-body"
-                         dangerouslySetInnerHTML=${{ __html: rendered }} />
-                `}
+                ${hasBody && html`<${MarkdownBody} html=${rendered} />`}
             </div>
         `;
     }
