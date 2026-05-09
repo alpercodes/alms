@@ -20,16 +20,16 @@
 // when navigating from the chat surface on mobile).
 
 import { batch } from '../deps.js';
-import { activeSessionId } from '../state/sessions.js';
+import { activeSessionId, sessions, crossAgentSessions } from '../state/sessions.js';
 import { activeRunId, selectedRunId } from '../state/runs.js';
 import { replaceMessages } from '../state/chat-actions.js';
 import { messageQueue } from '../state/queue.js';
 import { auditEvents } from '../state/audit.js';
 import { sessionSwitchLoading } from '../state/loading.js';
-import { activeAgentId } from '../state/agents.js';
+import { activeAgentId, agents } from '../state/agents.js';
 import { clearAllSubagents, parentSessionId } from '../state/subagents.js';
 import { closeSessionStream } from '../hooks/use-session-stream.js';
-import { saveActiveSession } from '../hooks/use-boot.js';
+import { saveActiveSession, switchAgent } from '../hooks/use-boot.js';
 import { selectGeneration, bumpSelectGeneration } from '../state/select-generation.js';
 import { loadSession } from './load-session.js';
 import { closeSidebar } from '../components/header.js';
@@ -47,6 +47,42 @@ export async function navigateToSession(sessionId, opts) {
     if (sessionId === activeSessionId.value) return;
 
     closeSidebar(); // no-op when the sidebar overlay isn't open
+
+    // Cross-agent navigation auto-switch (Tim re-review on PR #1010,
+    // upgrades the previous `console.warn` from the same review path).
+    //
+    // The accordion ties expansion to `activeAgentId`, so navigating
+    // to a chat session whose `agent_id` doesn't match the active
+    // agent would leave the session highlighted inside a collapsed
+    // accordion group with no visible cue. Now we silently switch the
+    // active agent to the session's owner before loading it; the
+    // operator's accordion expansion follows because expansion is
+    // derived from `activeAgentId` (see session-list.js + use-boot.js).
+    //
+    // DM / notification surfaces are explicitly skipped — they live
+    // in their own cross-agent sections regardless of active agent,
+    // so clicking them shouldn't yank the active agent around (the
+    // operator might be reading alice's chat and quickly peeking at
+    // a DM-from-bob; jumping to bob would be intrusive).
+    //
+    // Side-effect note: `switchAgent` resets messages / queue / runs
+    // / subagents and bumps `selectGeneration`. We then return early —
+    // `switchAgent` takes care of loading the targeted session via
+    // its `targetSessionId` opt, so re-running the loadSession path
+    // below would race against the freshly opened session stream.
+    const target =
+        sessions.value.find(s => s.id === sessionId)
+        || crossAgentSessions.value.find(s => s.id === sessionId);
+    if (target
+        && target.session_type !== 'dm'
+        && target.session_type !== 'notification'
+        && target.agent_id
+        && activeAgentId.value
+        && target.agent_id !== activeAgentId.value
+        && agents.value.some(a => a.id === target.agent_id)) {
+        await switchAgent(target.agent_id, { targetSessionId: sessionId });
+        return;
+    }
 
     const gen = bumpSelectGeneration();
 

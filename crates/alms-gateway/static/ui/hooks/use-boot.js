@@ -1,7 +1,7 @@
 import { fetchSettings } from '../api/settings.js';
 import { listSessions, createSession } from '../api/sessions.js';
 import { agents, activeAgentId } from '../state/agents.js';
-import { sessions, activeSessionId, showNotifications } from '../state/sessions.js';
+import { sessions, activeSessionId, showNotifications, crossAgentSessions, expandedAgentId } from '../state/sessions.js';
 import { activeRunId, selectedRunId, runs } from '../state/runs.js';
 import { serverDefaults } from '../state/settings.js';
 import { replaceMessages } from '../state/chat-actions.js';
@@ -14,6 +14,7 @@ import { openAgentEventsStream, closeAgentEventsStream } from './use-agent-event
 import { bumpSelectGeneration } from '../state/select-generation.js';
 import { loadSession } from '../utils/load-session.js';
 import { clearAllSubagents } from '../state/subagents.js';
+import { defaultExpandedAgent } from '../utils/sidebar-grouping.js';
 
 const AGENT_KEY = 'alms_active_agent';
 
@@ -34,7 +35,15 @@ export function saveActiveSession(agentId, sessionId) {
     }
 }
 
-function loadActiveSession(agentId, agentSessions) {
+function loadActiveSession(agentId, agentSessions, preferred) {
+    // Caller-supplied preferred session wins (cross-agent navigate
+    // uses this so the auto-switched agent lands on the targeted
+    // session rather than its most-recent one). Falls back to
+    // localStorage > first session if `preferred` isn't found.
+    if (preferred) {
+        const match = agentSessions.find(s => s.id === preferred);
+        if (match) return match;
+    }
     const stored = localStorage.getItem(sessionStorageKey(agentId));
     if (stored) {
         const match = agentSessions.find(s => s.id === stored);
@@ -60,6 +69,11 @@ export async function boot() {
 
         if (agent) {
             activeAgentId.value = agent.id;
+            // Sidebar accordion default-expands the active agent at
+            // boot. Subsequent switchAgent() calls re-sync this; the
+            // header click handler in session-list.js can flip it to
+            // null on a same-agent click without altering activeAgentId.
+            expandedAgentId.value = defaultExpandedAgent(agent.id);
             localStorage.setItem(AGENT_KEY, agent.id);
             await loadAgentSessions(agent.id);
         }
@@ -70,24 +84,70 @@ export async function boot() {
 }
 
 /**
- * Load sessions for an agent, select the latest, load its history + runs.
+ * Fetch sessions across all agents (no agent_id filter). DMs are
+ * stored under `AgentId::nil()` (sentinel), notifications carry their
+ * owning agent's id, and chat sessions are agent-keyed. All three
+ * surfaces are needed cross-agent for the sidebar:
+ *   - DMs / notifications drive the dedicated cross-agent sections so
+ *     operators see incoming DMs / outgoing notifications for any of
+ *     their agents regardless of which agent is currently selected.
+ *   - Chat sessions for non-active agents power the per-agent
+ *     accordion header session-count badge so every agent can show
+ *     its real count without the operator having to switch into it
+ *     first (Alper UX feedback on PR #1010 — the badge was previously
+ *     active-only because chat sessions were filtered out here).
+ *
+ * Returns the raw session list (already sorted last_activity DESC by
+ * the backend); the caller decides where to assign it. Errors are
+ * logged and an empty array returned so the per-agent path keeps
+ * working when the cross-agent fetch fails for any reason.
  */
-async function loadAgentSessions(agentId) {
-    const gen = ++switchGeneration;
-
+export async function fetchCrossAgentSurfaces() {
     try {
-        const data = await listSessions(agentId, {
+        const data = await listSessions(null, {
             includeDms: true,
             includeNotifications: showNotifications.value,
         });
+        return data.sessions || [];
+    } catch (err) {
+        console.error('[fetchCrossAgentSurfaces] failed:', err);
+        return [];
+    }
+}
+
+/**
+ * Load sessions for an agent, select the latest, load its history + runs.
+ *
+ * @param {string} agentId
+ * @param {string} [preferredSessionId] Optional session id to land on
+ *   after the agent's sessions load. Used by cross-agent
+ *   `navigateToSession` so an auto-switch lands on the targeted
+ *   session rather than the agent's localStorage / latest fallback.
+ *   Silently falls back to the normal selection rule if the preferred
+ *   id isn't in this agent's session list.
+ */
+async function loadAgentSessions(agentId, preferredSessionId) {
+    const gen = ++switchGeneration;
+
+    try {
+        // Fan-out: per-agent chat-session list + cross-agent DM /
+        // notification list run in parallel. The per-agent call no
+        // longer asks for DMs / notifications because `SessionList`
+        // sources both surfaces exclusively from `crossAgentSessions`
+        // and filters them out of the per-agent list before grouping
+        // (Tim review #2 on PR #1010 — the per-agent flags were
+        // redundant payload that never reached the renderer).
+        const [data, crossAgent] = await Promise.all([
+            listSessions(agentId, {
+                includeDms: false,
+                includeNotifications: false,
+            }),
+            fetchCrossAgentSurfaces(),
+        ]);
         if (gen !== switchGeneration) return; // stale — discard
         const agentSessions = data.sessions || [];
-        const dmCount = agentSessions.filter(s => s.session_type === 'dm').length;
-        const notifCount = agentSessions.filter(s => s.session_type === 'notification').length;
-        if (dmCount > 0 || notifCount > 0) {
-            console.debug('[loadAgentSessions] loaded', agentSessions.length, 'sessions,', dmCount, 'DM,', notifCount, 'notification');
-        }
         sessions.value = agentSessions;
+        crossAgentSessions.value = crossAgent;
 
         // Seed cross-session activity indicators (#856) from the
         // `has_active_run` snapshot so the sidebar's yellow dot shows
@@ -107,7 +167,7 @@ async function loadAgentSessions(agentId) {
         openAgentEventsStream(agentId);
 
         if (agentSessions.length > 0) {
-            const selected = loadActiveSession(agentId, agentSessions);
+            const selected = loadActiveSession(agentId, agentSessions, preferredSessionId);
             activeSessionId.value = selected.id;
             // Re-persist in case the session list changed
             saveActiveSession(agentId, selected.id);
@@ -123,12 +183,16 @@ async function loadAgentSessions(agentId) {
             const ctx = 'web-chat-' + Date.now();
             const resp = await createSession(agentId, ctx);
             if (gen !== switchGeneration) return; // stale — discard
-            const reloaded = await listSessions(agentId, {
-                includeDms: true,
-                includeNotifications: showNotifications.value,
-            });
+            const [reloaded, reloadedCross] = await Promise.all([
+                listSessions(agentId, {
+                    includeDms: false,
+                    includeNotifications: false,
+                }),
+                fetchCrossAgentSurfaces(),
+            ]);
             if (gen !== switchGeneration) return; // stale — discard
             sessions.value = reloaded.sessions || [];
+            crossAgentSessions.value = reloadedCross;
             activeSessionId.value = resp.session_id;
             replaceMessages([]);
             runs.value = [];
@@ -143,8 +207,16 @@ async function loadAgentSessions(agentId) {
 
 /**
  * Switch to a different agent: reset state, load sessions.
+ *
+ * @param {string} agentId
+ * @param {{ targetSessionId?: string }} [opts] When `targetSessionId`
+ *   is set, the agent-switch lands on that session instead of the
+ *   agent's localStorage / latest default. Used by cross-agent
+ *   `navigateToSession` to auto-switch into the owning agent's
+ *   accordion group when the operator clicks a session that doesn't
+ *   belong to the active agent.
  */
-export async function switchAgent(agentId) {
+export async function switchAgent(agentId, opts) {
     const agent = agents.value.find(a => a.id === agentId);
     if (!agent) return;
 
@@ -153,6 +225,12 @@ export async function switchAgent(agentId) {
     bumpSelectGeneration(); // invalidate any in-flight selectSession() fetches
 
     activeAgentId.value = agentId;
+    // Re-sync the sidebar accordion expansion to the new active agent
+    // — switchAgent is the canonical "operator picked this agent"
+    // surface (dropdown, cross-agent navigate, header click on a
+    // different agent), so any previously-collapsed state should
+    // reset to expanded for the new agent.
+    expandedAgentId.value = defaultExpandedAgent(agentId);
     localStorage.setItem(AGENT_KEY, agentId);
     agentSwitchLoading.value = true;
 
@@ -161,6 +239,7 @@ export async function switchAgent(agentId) {
     activeRunId.value = null;
     selectedRunId.value = null;
     sessions.value = [];
+    crossAgentSessions.value = [];
     runs.value = [];
     replaceMessages([]);
     messageQueue.value = [];
@@ -171,7 +250,7 @@ export async function switchAgent(agentId) {
 
     // loadAgentSessions() bumps switchGeneration synchronously (before its
     // first await), so we start the call, then read the updated counter.
-    const promise = loadAgentSessions(agentId);
+    const promise = loadAgentSessions(agentId, opts && opts.targetSessionId);
     const gen = switchGeneration;
     try {
         await promise;

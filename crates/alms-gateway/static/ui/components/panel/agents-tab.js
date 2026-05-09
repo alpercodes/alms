@@ -1,5 +1,6 @@
 import { html, useEffect, useSignal } from '../../deps.js';
 import { agents, activeAgentId } from '../../state/agents.js';
+import { expandedAgentId } from '../../state/sessions.js';
 import { serverDefaults } from '../../state/settings.js';
 import { activePanelTab } from '../../state/panel.js';
 import { listAgents, createAgent, updateAgent, deleteAgent, setDefaultAgent } from '../../api/agents.js';
@@ -568,8 +569,16 @@ function AgentCard({ agent, isActive, onEdit }) {
             if (agent.id === activeAgentId.value) {
                 const def = agents.value.find(a => a.is_default);
                 const next = def || agents.value[0] || null;
-                if (next) switchAgent(next.id);
-                else activeAgentId.value = null;
+                if (next) {
+                    switchAgent(next.id);
+                } else {
+                    activeAgentId.value = null;
+                    // Clear sidebar accordion expansion alongside the
+                    // active agent so the just-deleted agent's id
+                    // doesn't linger as the expanded one. switchAgent
+                    // handles the non-empty branch via its own re-sync.
+                    expandedAgentId.value = null;
+                }
             }
         } catch (err) {
             error.value = err.error?.message || err.message || 'Delete failed';

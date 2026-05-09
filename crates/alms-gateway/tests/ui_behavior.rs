@@ -219,6 +219,29 @@ fn code_copy_js_behaviour() {
     run_node_test("code-copy.test.mjs");
 }
 
+/// Pinned regression for issue #980: the sidebar groups sessions under
+/// per-agent collapsible accordion headers. At most one agent group is
+/// expanded at a time; clicking another agent header collapses the
+/// previous and expands the new one. Clicking the expanded agent
+/// header is a true toggle (collapses the body) without changing the
+/// active agent. The default-expanded agent at boot is the
+/// currently-active one.
+///
+/// The runtime side (Preact rendering, signal wiring, `switchAgent`
+/// side-effect) is integration territory we can't easily unit-test
+/// under Node — what's pinned here is the pure-function shape of the
+/// expand/collapse decision in `static/ui/utils/sidebar-grouping.js`:
+///   - `expandAgent(state, clickedId)` — at-most-one-at-a-time, with
+///     same-agent-click pinned to "collapse" (true toggle)
+///   - `defaultExpandedAgent(activeId)` — boot-time default rule
+///   - `isAgentExpanded(state, agentId)` — render-time predicate
+///   - `groupSessionsByAgent(sessions)` — flat-list to per-agent Map
+///     with input-order preservation
+#[test]
+fn sidebar_grouping_js_behaviour() {
+    run_node_test("sidebar-grouping.test.mjs");
+}
+
 /// Pinned regression for the timer-cancel-on-manual-reconnect contract
 /// in `static/ui/hooks/use-agent-events.js` (#907 follow-up — Tim's
 /// Suggestion 1 on PR #1001). When a manual reconnect path (banner
