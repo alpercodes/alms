@@ -463,8 +463,13 @@ impl AlmsConfig {
             ));
         }
 
-        // Context validation
-        let valid_strategies = ["sliding-summary", "full", "truncate"];
+        // Context validation. #869: `compact` is the new canonical strategy
+        // name; `sliding-summary` is accepted as a back-compat alias and
+        // rewritten to `compact` by the `ContextConfig::Deserialize` impl
+        // and `normalize_episodic`. Both are listed here so a hand-edited
+        // `alms.toml` whose strategy bypasses both rewrite paths still
+        // validates cleanly.
+        let valid_strategies = ["compact", "sliding-summary", "full", "truncate"];
         if !valid_strategies.contains(&self.context.strategy.as_str()) {
             return Err(AlmsError::InvalidConfig(format!(
                 "context.strategy must be one of {:?}, got '{}'",
@@ -477,12 +482,9 @@ impl AlmsConfig {
                 "context.max_input_tokens must be > 0".into(),
             ));
         }
-
-        if self.context.recent_window == 0 {
-            return Err(AlmsError::InvalidConfig(
-                "context.recent_window must be > 0".into(),
-            ));
-        }
+        // #869: `recent_window > 0` check is gone — the field is gone too.
+        // The two `compact_*` knobs are bounded by `normalize_episodic`'s
+        // soft clamps; no hard validate-time check is needed.
 
         // Symmetric pair-only validation for `[context].summary_provider`
         // / `[context].summary_model` (#877). The PATCH layer (and the

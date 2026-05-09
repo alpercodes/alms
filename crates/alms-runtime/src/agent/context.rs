@@ -1,4 +1,6 @@
-use crate::context::ContextBuilder;
+use crate::context::{
+    ContextBuilder, HISTORY_RESERVE, estimate_session_message_tokens, estimate_tokens,
+};
 use crate::events::PHASE_SUMMARIZING;
 use crate::llm_types::*;
 use alms_core::AlmsResult;
@@ -45,8 +47,9 @@ impl AgentRuntime {
 
     /// Build context window for LLM using ContextBuilder.
     ///
-    /// For the `sliding-summary` strategy this is async because it may call the
-    /// LLM to compress old messages into a rolling summary.
+    /// For the `compact` strategy (renamed from `sliding-summary` in
+    /// #869) this is async because it may call the LLM to compress
+    /// old messages into a rolling summary.
     ///
     /// For DM sessions (context_id starts with `"dm:"`), perspective mapping is
     /// applied: messages from this agent become `Role::Assistant` so the LLM
@@ -84,38 +87,78 @@ impl AgentRuntime {
             }
         };
 
-        // For sliding-summary, attempt to compress old messages before building context.
-        // On failure we log a warning and fall back (None summary → truncate behaviour).
-        let summary_text: Option<String> =
-            if self.config.context_config.strategy == "sliding-summary" {
-                self.emit_status(PHASE_SUMMARIZING, None);
-                let current = session_manager.get_summary(*session_id).unwrap_or_default();
-                match self
-                    .maybe_summarize(session_manager, *session_id, &history, current)
-                    .await
-                {
-                    Ok(s) => Some(s.text).filter(|t| !t.is_empty()),
-                    Err(e) => {
-                        warn!(
-                            "Sliding-summary compression failed, falling back to truncation: {}",
-                            e
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
         // Load episodic summaries from other sessions when enabled.
         // This gives the agent cross-session awareness — it can see what it was
         // doing in other conversations without re-reading full transcripts.
+        //
+        // Loaded BEFORE the `maybe_summarize` call (PR #1012 / Codex review
+        // medium #2) so the trigger threshold can subtract its token cost
+        // from the available context window. Otherwise a large episodic
+        // block could push assembled history above `history_budget` and
+        // cause `build_compact` to start dropping messages verbatim
+        // before `maybe_summarize` ever fired.
         let episodic_text: Option<String> =
             if self.config.context_config.run_summary_mode != RunSummaryMode::Off {
                 self.load_episodic_summaries(session_manager, session_id)
             } else {
                 None
             };
+
+        // For the `compact` strategy (formerly `sliding-summary`, #869),
+        // attempt to compress old messages before building context. On
+        // failure we log a warning and fall back (None summary → verbatim
+        // tail, same as truncate). The legacy `"sliding-summary"` value
+        // is accepted as a back-compat alias here so a hand-edited config
+        // that bypassed both rewrite paths still routes through the
+        // summariser.
+        let strategy = self.config.context_config.strategy.as_str();
+        let summary_text: Option<String> = if strategy == "compact" || strategy == "sliding-summary"
+        {
+            self.emit_status(PHASE_SUMMARIZING, None);
+            let current = session_manager.get_summary(*session_id).unwrap_or_default();
+            // PR #1012 / Codex review medium #2: derive the compaction
+            // trigger from the EFFECTIVE history budget, not the raw
+            // `max_input_tokens`. The non-history overhead — system
+            // prompt, current input, episodic block, plus the same
+            // `HISTORY_RESERVE` reserve `ContextBuilder` uses — must be
+            // subtracted so `maybe_summarize` fires before
+            // `build_compact` starts dropping messages by token budget.
+            // Mirrors the calculation in `ContextBuilder::build_with_perspective`.
+            //
+            // PR #1012 / Tim review item 4: `HISTORY_RESERVE` is imported
+            // from `crate::context` so the trigger threshold and the
+            // builder budget cannot silently desync if a future edit
+            // bumps the reserve in one file but not the other.
+            let system_tokens = estimate_tokens(&system_prompt);
+            let input_tokens = estimate_tokens(input);
+            let episodic_tokens = episodic_text
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|t| estimate_tokens(t) + 4)
+                .unwrap_or(0);
+            let overhead_tokens = system_tokens + input_tokens + episodic_tokens + HISTORY_RESERVE;
+            match self
+                .maybe_summarize(
+                    session_manager,
+                    *session_id,
+                    &history,
+                    current,
+                    overhead_tokens,
+                )
+                .await
+            {
+                Ok(s) => Some(s.text).filter(|t| !t.is_empty()),
+                Err(e) => {
+                    warn!(
+                        "Compact-strategy compression failed, falling back to truncation: {}",
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // Wire the agent's workspace root into the builder so that
         // `session_msg_to_llm` can detect tool-result messages that
@@ -213,34 +256,87 @@ impl AgentRuntime {
         crate::episodic::format_episodic_for_injection(&summaries, effective_budget)
     }
 
-    /// Check whether history has grown past the summarization threshold and, if so,
+    /// Check whether history has grown past the compaction threshold and, if so,
     /// call the LLM to extend the rolling summary with the oldest uncovered messages.
     ///
     /// Returns the (possibly updated) `ContextSummary`. On success the updated
     /// summary is also persisted via `session_manager.update_summary()`.
+    ///
+    /// **#869 redesign.** Compaction is now driven by **token thresholds**
+    /// rather than message counts. The pre-#869 shape fired when
+    /// `uncovered.len() - recent_window >= summary_interval` and compressed
+    /// `[messages_covered .. history.len() - recent_window]`. The new
+    /// shape fires when the assembled tail's token estimate crosses
+    /// `compact_trigger_pct` of the EFFECTIVE history budget
+    /// (`max_input_tokens` minus the system / input / episodic /
+    /// reserve overhead the caller passes in `overhead_tokens`), and
+    /// compresses everything older than the verbatim window sized at
+    /// `compact_retain_pct` of that same effective budget.
+    /// `messages_covered` semantics are unchanged — it still tracks
+    /// the index where verbatim history begins.
+    ///
+    /// **PR #1012 / Codex review medium #2.** `overhead_tokens` was
+    /// added so the trigger lines up with `ContextBuilder`'s actual
+    /// `history_budget` calculation; otherwise large workspace / system
+    /// prompts or episodic blocks could push assembled history above
+    /// the builder's budget and cause `build_compact` to silently drop
+    /// older messages verbatim before this method ever fired.
     async fn maybe_summarize(
         &self,
         session_manager: &SessionManager,
         session_id: alms_core::SessionId,
         history: &[alms_session::Message],
         mut current: ContextSummary,
+        overhead_tokens: usize,
     ) -> AlmsResult<ContextSummary> {
-        let recent_window = self.config.context_config.recent_window;
-        let summary_interval = self.config.context_config.summary_interval;
+        let cfg = &self.config.context_config;
+        // Effective context window is the raw model max minus the
+        // non-history overhead (system prompt + current input +
+        // episodic block + reserve). `saturating_sub` so a degenerate
+        // overhead larger than `max_input_tokens` clamps to 0 and the
+        // compaction path simply never fires (the truncate-by-budget
+        // walk in `build_compact` is then the operative bound).
+        let effective_budget = cfg.max_input_tokens.saturating_sub(overhead_tokens);
+        // Degenerate case: overhead consumed the entire context window.
+        // The truncate-by-budget walk in `build_compact` is the only
+        // operative bound; skip the LLM-driven compaction call.
+        if effective_budget == 0 {
+            return Ok(current);
+        }
+        let trigger_tokens = (cfg.compact_trigger_pct * effective_budget as f32) as usize;
+        let retain_tokens = (cfg.compact_retain_pct * effective_budget as f32) as usize;
 
         // Guard against corrupt messages_covered value.
         current.messages_covered = current.messages_covered.min(history.len());
 
-        let uncovered = history.len().saturating_sub(current.messages_covered);
-        let compressible = uncovered.saturating_sub(recent_window);
+        let uncovered = &history[current.messages_covered..];
 
-        if compressible < summary_interval {
-            return Ok(current); // not enough new material to justify a summary call
+        // Early-out cheap path: if the uncovered tail's token estimate is
+        // below the trigger threshold there is no work to do. This is the
+        // hot path on every turn — short-circuit before we walk the tail.
+        let uncovered_tokens: usize = uncovered.iter().map(estimate_session_message_tokens).sum();
+        if uncovered_tokens < trigger_tokens {
+            return Ok(current);
         }
 
-        // Compress everything from messages_covered up to (history.len() - recent_window)
-        // so we always keep the recent window verbatim.
-        let compress_end = history.len() - recent_window;
+        // Walk backwards from the newest uncovered message, collecting
+        // messages whose cumulative tokens fit `retain_tokens`. Everything
+        // older than that boundary becomes the compress range.
+        let mut keep_tokens = 0usize;
+        // `keep_start_idx` is the index in `history` where the verbatim
+        // tail begins. Starts past-the-end (= compress everything if
+        // nothing fits in the retain budget).
+        let mut keep_start_idx = history.len();
+        for (i, m) in uncovered.iter().enumerate().rev() {
+            let t = estimate_session_message_tokens(m);
+            if keep_tokens + t > retain_tokens {
+                break;
+            }
+            keep_tokens += t;
+            keep_start_idx = current.messages_covered + i;
+        }
+
+        let compress_end = keep_start_idx;
         let to_compress = &history[current.messages_covered..compress_end];
         if to_compress.is_empty() {
             return Ok(current);
@@ -348,10 +444,12 @@ impl AgentRuntime {
         session_manager.update_summary(session_id, current.clone())?;
 
         info!(
-            "Sliding-summary: compressed {} messages (now {} covered, {} in recent window)",
-            to_compress.len(),
-            compress_end,
-            recent_window,
+            target: "alms.context",
+            compressed = to_compress.len(),
+            covered = compress_end,
+            retain_tokens = retain_tokens,
+            trigger_tokens = trigger_tokens,
+            "Compact strategy: compressed older messages into rolling summary"
         );
 
         Ok(current)

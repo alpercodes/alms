@@ -1792,12 +1792,16 @@ mod tests {
         let parent = AgentConfig {
             system_prompt: "parent prompt".into(),
             max_tokens: 9999,
+            // #869: `recent_window` / `summary_interval` are gone; the
+            // compact strategy uses threshold-based knobs. Set
+            // `compact_trigger_pct` to a non-default value to verify the
+            // override propagates through subagent inheritance.
             context_config: alms_core::config::ContextConfig {
-                strategy: "sliding-summary".into(),
+                strategy: "compact".into(),
                 max_input_tokens: 50_000,
-                recent_window: 5,
-                summary_interval: 10,
+                compact_trigger_pct: 0.75,
                 summary_model: Some("cheap-model".into()),
+                summary_provider: Some("openrouter".into()),
                 ..Default::default()
             },
             posture: alms_runtime::Posture::Guarded,
@@ -1822,9 +1826,9 @@ mod tests {
         assert!(model.is_none());
         // Should inherit runtime settings from parent
         assert_eq!(config.max_tokens, 9999);
-        assert_eq!(config.context_config.strategy, "sliding-summary");
+        assert_eq!(config.context_config.strategy, "compact");
         assert_eq!(config.context_config.max_input_tokens, 50_000);
-        assert_eq!(config.context_config.recent_window, 5);
+        assert_eq!(config.context_config.compact_trigger_pct, 0.75);
         // Should inherit sandbox settings
         assert_eq!(config.sandbox_root, "/sandbox");
         assert_eq!(config.shell_policy, "unrestricted");

@@ -13,7 +13,8 @@ use uuid::Uuid;
 /// Agent is assembling the token-budgeted context window.
 pub const PHASE_BUILDING_CONTEXT: &str = "building_context";
 
-/// Agent is summarizing old conversation history (sliding-summary strategy).
+/// Agent is summarizing old conversation history (compact strategy, #869 —
+/// renamed from `sliding-summary` but the SSE phase string is unchanged).
 pub const PHASE_SUMMARIZING: &str = "summarizing";
 
 /// Agent is waiting for the LLM to respond.

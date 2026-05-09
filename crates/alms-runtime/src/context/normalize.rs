@@ -406,8 +406,6 @@ mod tests {
         ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32_000,
-            recent_window: 50,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         }
@@ -584,36 +582,43 @@ mod tests {
     /// that is what Anthropic (direct or via OpenRouter→Claude) rejects as
     /// `messages.0.content.0: unexpected tool_use_id found in tool_result
     /// blocks`.
+    ///
+    /// #869: pre-#869 this test pinned the truncation point at
+    /// `recent_window = 2`. The recent_window cap is gone; we now use a
+    /// tiny `max_input_tokens` (1050: ~50 tokens of history budget after
+    /// the 1000-token reserved buffer) so the budget walk drops the
+    /// older messages and keeps only the (tool_result, assistant-text)
+    /// tail, exercising the same orphan-at-head shape as before.
     #[test]
     fn test_build_never_leaves_tool_result_at_head_after_truncation() {
-        // recent_window = 2 forces the truncate strategy to keep only the
-        // two newest messages from a long history.  Arrange those last two
-        // to be (tool_result, assistant-text) so the orphan would sit at
-        // the front of the selected slice without the fix.
         let config = ContextConfig {
             strategy: "truncate".into(),
-            max_input_tokens: 32_000,
-            recent_window: 2,
-            summary_interval: 30,
+            max_input_tokens: 1050,
             summary_model: None,
             ..Default::default()
         };
         let builder = ContextBuilder::new(config);
 
         let history = vec![
-            // --- truncated out by recent_window=2 ---
-            make_msg(Role::User, "please write the file"),
+            // --- token-budget walk drops these older entries first ---
+            make_msg(
+                Role::User,
+                "please write the file with a fairly long description that consumes tokens",
+            ),
             alms_session::Message {
                 id: uuid::Uuid::new_v4().to_string(),
                 role: Role::Assistant,
                 content: Content::ToolCall {
                     name: "fs_write".to_string(),
-                    params: serde_json::json!({"path": "/tmp/x"}),
+                    params: serde_json::json!({
+                        "path": "/tmp/x",
+                        "content": "padded payload to push token usage past the budget",
+                    }),
                 },
                 timestamp: alms_core::Timestamp::now(),
                 metadata: Some(serde_json::json!({"tool_call_id": "functions_fs_write_4"})),
             },
-            // --- kept by recent_window=2 ---
+            // --- kept by the budget walk ---
             alms_session::Message {
                 id: uuid::Uuid::new_v4().to_string(),
                 role: Role::Tool,

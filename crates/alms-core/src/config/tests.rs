@@ -130,12 +130,18 @@ fn test_default_config() {
     let config = AlmsConfig::default();
     assert_eq!(config.server.bind, "127.0.0.1:8080");
     assert_eq!(config.context.strategy, "truncate");
-    assert_eq!(config.context.recent_window, 20);
+    // #869: recent_window is gone; the new defaults are threshold-based.
+    assert_eq!(config.context.compact_trigger_pct, 0.80);
+    assert_eq!(config.context.compact_retain_pct, 0.40);
     assert!(config.llm.api_key.is_none());
 }
 
 #[test]
 fn test_config_from_toml() {
+    // #869: legacy fields (`recent_window`, strategy = "sliding-summary")
+    // remain accepted on the wire so existing alms.toml files don't break.
+    // The deserialiser rewrites `"sliding-summary"` → `"compact"` and
+    // drops `recent_window` with a one-time WARN.
     let toml = r#"
 [server]
 bind = "0.0.0.0:9090"
@@ -153,7 +159,8 @@ recent_window = 10
     assert_eq!(config.server.bind, "0.0.0.0:9090");
     assert_eq!(config.llm.model, "gpt-4");
     assert_eq!(config.llm.timeout_secs, 60);
-    assert_eq!(config.context.strategy, "sliding-summary");
+    // Alias rewritten by ContextConfig::Deserialize.
+    assert_eq!(config.context.strategy, "compact");
     assert_eq!(config.context.max_input_tokens, 16000);
     // Defaults preserved for unset fields
     assert_eq!(config.tools.timeout_secs, 30);
@@ -169,7 +176,10 @@ model = "claude-sonnet"
     let config: AlmsConfig = toml::from_str(toml).unwrap();
     assert_eq!(config.llm.model, "claude-sonnet");
     assert_eq!(config.server.bind, "127.0.0.1:8080"); // default
-    assert_eq!(config.context.recent_window, 20); // default
+    // #869: recent_window is gone; the new compact_* knobs default to
+    // 0.80 / 0.40 (Claude Code parity).
+    assert_eq!(config.context.compact_trigger_pct, 0.80);
+    assert_eq!(config.context.compact_retain_pct, 0.40);
 }
 
 #[test]
@@ -2129,5 +2139,157 @@ fn security_config_has_no_env_var_override() {
         cfg.security.allow_full_os_access.is_empty(),
         "apply_env_overrides must not interpret env vars for security knobs — \
          the threat model demands config-file-only mutability"
+    );
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// #869: context strategy redesign — threshold-based compact knobs +
+// deprecation aliases for `recent_window` / `summary_interval` /
+// `strategy = "sliding-summary"`.
+// ───────────────────────────────────────────────────────────────────────
+
+/// Old `alms.toml` files set `recent_window`. The deserialiser must accept
+/// the field on the wire (so the daemon doesn't fail to start) but drop
+/// the value — the struct no longer has a place to store it. The one-time
+/// boot WARN is fired by `warn_recent_window_once`; we don't capture
+/// tracing output here (the static `OnceLock` doesn't reset between tests
+/// in the same binary).
+#[test]
+fn test_recent_window_in_toml_is_ignored() {
+    let toml = r#"
+[context]
+strategy = "compact"
+max_input_tokens = 64000
+recent_window = 5
+summary_interval = 10
+"#;
+    let config: AlmsConfig = toml::from_str(toml).unwrap();
+    assert_eq!(config.context.strategy, "compact");
+    assert_eq!(config.context.max_input_tokens, 64000);
+    // The legacy fields are accepted on the wire and dropped from the
+    // struct. The runtime sees only the new compact_* knobs.
+    assert_eq!(
+        config.context.compact_trigger_pct, 0.80,
+        "compact_trigger_pct should hold the default after a TOML with only \
+         legacy fields parses"
+    );
+    assert_eq!(config.context.compact_retain_pct, 0.40);
+}
+
+/// `strategy = "sliding-summary"` is rewritten to `"compact"` by the
+/// `ContextConfig::Deserialize` impl so the rest of the system speaks one
+/// canonical strategy name. Pin the alias resolution at the deserialise
+/// boundary.
+#[test]
+fn test_sliding_summary_alias_resolves_to_compact() {
+    let toml = r#"
+[context]
+strategy = "sliding-summary"
+"#;
+    let config: AlmsConfig = toml::from_str(toml).unwrap();
+    assert_eq!(
+        config.context.strategy, "compact",
+        "ContextConfig::Deserialize must rewrite the legacy alias"
+    );
+}
+
+/// `compact_trigger_pct` out of range is clamped by `normalize_episodic`
+/// to the supported `[0.50, 0.95]` band. Verify both directions.
+#[test]
+fn test_compact_trigger_pct_clamped_to_range() {
+    // Above range — clamps to upper bound.
+    let mut cfg = ContextConfig {
+        compact_trigger_pct: 1.50,
+        ..Default::default()
+    };
+    cfg.normalize_episodic();
+    assert_eq!(cfg.compact_trigger_pct, 0.95);
+
+    // Below range — clamps to lower bound. Pair with a small retain so
+    // the gap floor doesn't kick in.
+    let mut cfg = ContextConfig {
+        compact_trigger_pct: 0.10,
+        compact_retain_pct: 0.20,
+        ..Default::default()
+    };
+    cfg.normalize_episodic();
+    assert_eq!(cfg.compact_trigger_pct, 0.50);
+
+    // NaN — replaced with the 0.80 default.
+    let mut cfg = ContextConfig {
+        compact_trigger_pct: f32::NAN,
+        ..Default::default()
+    };
+    cfg.normalize_episodic();
+    assert_eq!(cfg.compact_trigger_pct, 0.80);
+}
+
+/// Retain too close to trigger violates the `retain + 0.10 <= trigger`
+/// floor. `normalize_episodic` lowers retain to keep the gap so
+/// compaction always measurably reduces context size.
+///
+/// We pick values that are inside each knob's individual range
+/// (`[0.50, 0.95]` for trigger, `[0.20, 0.60]` for retain) so the
+/// gap-floor logic — not the per-knob clamps — is what fires.
+#[test]
+fn test_compact_retain_too_close_to_trigger_clamped() {
+    let mut cfg = ContextConfig {
+        compact_trigger_pct: 0.55, // in [0.50, 0.95]
+        compact_retain_pct: 0.50,  // in [0.20, 0.60]; gap = 0.05 < 0.10
+        ..Default::default()
+    };
+    cfg.normalize_episodic();
+    // retain dropped to trigger - 0.10 = 0.45.
+    assert!(
+        (cfg.compact_retain_pct - 0.45).abs() < 1e-6,
+        "expected retain ≈ 0.45 (trigger 0.55 − 0.10 floor), got {}",
+        cfg.compact_retain_pct
+    );
+    assert_eq!(cfg.compact_trigger_pct, 0.55);
+
+    // The default pair (0.80 / 0.40) is well inside the gap floor.
+    let mut cfg = ContextConfig::default();
+    cfg.normalize_episodic();
+    assert_eq!(cfg.compact_trigger_pct, 0.80);
+    assert_eq!(cfg.compact_retain_pct, 0.40);
+}
+
+/// `validate()` accepts both `"compact"` and `"sliding-summary"` so a
+/// hand-edited TOML that bypasses both rewrite paths still passes the
+/// hard validation step.
+#[test]
+fn test_validate_accepts_compact_and_alias() {
+    let mut cfg = AlmsConfig::default();
+    cfg.context.strategy = "compact".into();
+    assert!(cfg.validate().is_ok());
+
+    cfg.context.strategy = "sliding-summary".into();
+    assert!(
+        cfg.validate().is_ok(),
+        "validate must accept the legacy alias as a back-compat affordance"
+    );
+
+    cfg.context.strategy = "nope".into();
+    assert!(cfg.validate().is_err());
+}
+
+/// `ALMS_CONTEXT_STRATEGY=sliding-summary` lands the alias in
+/// `ContextConfig::strategy` directly (no Deserialize round-trip).
+/// `normalize_episodic` is the second rewrite layer that catches it.
+#[test]
+fn test_env_strategy_sliding_summary_normalises_to_compact() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let _guard = SingleEnvGuard::set("ALMS_CONTEXT_STRATEGY", "sliding-summary");
+
+    let mut cfg = AlmsConfig::default();
+    cfg.apply_env_overrides();
+    assert_eq!(
+        cfg.context.strategy, "sliding-summary",
+        "apply_env_overrides leaves the raw value as-is"
+    );
+    cfg.context.normalize_episodic();
+    assert_eq!(
+        cfg.context.strategy, "compact",
+        "normalize_episodic rewrites the alias for env-var-fed configs"
     );
 }

@@ -29,10 +29,11 @@ pub struct AgentRuntime {
     pub(crate) agent_id: AgentId,
     pub(crate) config: AgentConfig,
     pub(crate) llm: LlmClient,
-    /// Optional dedicated LLM client for in-loop sliding-summary generation
-    /// (#866). When `Some`, `maybe_summarize` uses this client instead of
-    /// `llm` so the summary task can target a different provider than the
-    /// agent (e.g. agent on Anthropic, summary on OpenRouter). When `None`,
+    /// Optional dedicated LLM client for in-loop compact-strategy summary
+    /// generation (#866; strategy renamed from `sliding-summary` in #869).
+    /// When `Some`, `maybe_summarize` uses this client instead of `llm` so
+    /// the summary task can target a different provider than the agent
+    /// (e.g. agent on Anthropic, summary on OpenRouter). When `None`,
     /// summaries inherit the agent's `llm` (pre-#866 behaviour).
     pub(crate) summary_llm: Option<LlmClient>,
     pub(crate) tools: ToolRegistry,
@@ -535,8 +536,8 @@ impl AgentRuntime {
         self
     }
 
-    /// Attach a dedicated LLM client for in-loop sliding-summary generation
-    /// (#866).
+    /// Attach a dedicated LLM client for in-loop compact-strategy summary
+    /// generation (#866; strategy renamed from `sliding-summary` in #869).
     ///
     /// When set, the in-loop summarizer (`maybe_summarize`) uses this client
     /// instead of `self.llm`. The gateway constructs this client by cloning

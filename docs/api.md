@@ -1089,8 +1089,8 @@ Returns current server defaults for UI pre-population.
   "context": {
     "strategy": "truncate",
     "max_input_tokens": 100000,
-    "recent_window": 20,
-    "summary_interval": 10,
+    "compact_trigger_pct": 0.80,
+    "compact_retain_pct": 0.40,
     "summary_model": "minimax/minimax-m2.7",
     "run_summary_mode": "llm",
     "run_summary_budget": 2000,
@@ -1169,10 +1169,10 @@ The reasoning / caching knobs on `/settings.llm.*` use **two different "no overr
 ```json
 {
   "context": {
-    "strategy": "sliding-summary",
+    "strategy": "compact",
     "max_input_tokens": 128000,
-    "recent_window": 20,
-    "summary_interval": 30,
+    "compact_trigger_pct": 0.80,
+    "compact_retain_pct": 0.40,
     "summary_model": "gpt-4o-mini"
   },
   "session": {
@@ -1214,7 +1214,7 @@ The reasoning / caching knobs on `/settings.llm.*` use **two different "no overr
 ```json
 {
   "status": "partial",
-  "errors": ["context.strategy must be one of [\"sliding-summary\", \"full\", \"truncate\"], got 'invalid'"]
+  "errors": ["context.strategy must be one of [\"compact\", \"sliding-summary\", \"full\", \"truncate\"], got 'invalid'"]
 }
 ```
 
@@ -1228,6 +1228,17 @@ The reasoning / caching knobs on `/settings.llm.*` use **two different "no overr
 ```
 
 Any `PATCH /settings` body that contains a top-level `security` key — including `{ "security": {} }`, `{ "security": null }`, and a populated `{ "security": { "allow_full_os_access": [...] } }` — is rejected as a whole with `400 SECURITY_KNOB_NOT_PATCHABLE` before any other field is applied. Mixed payloads `{ "llm": {...}, "security": {...} }` reject the entire request — no partial application. The `[security]` section is config-file-only by design; PATCH mutability would let a compromised auth token silently widen the agent sandbox. Edit `[security]` in `alms.toml` and restart the gateway. See `docs/security-model.md` § 4.4 (operator escape hatch) for the threat model.
+
+**Response 400** (legacy context field — removed in #869):
+```json
+{
+  "status": "error",
+  "code": "CONTEXT_LEGACY_FIELD_DEPRECATED",
+  "errors": ["CONTEXT_LEGACY_FIELD_DEPRECATED: context.recent_window / context.summary_interval are no longer recognised on the PATCH wire — the compact strategy is now token-threshold-driven. Use compact_trigger_pct / compact_retain_pct instead."]
+}
+```
+
+`PATCH /settings` rejects any context block containing `recent_window` or `summary_interval` with `400 CONTEXT_LEGACY_FIELD_DEPRECATED` before structural deserialisation runs. The threshold-based `compact_trigger_pct` (range 0.50–0.95, default 0.80) and `compact_retain_pct` (range 0.20–0.60, default 0.40) replace them — the cross-field invariant `compact_retain_pct + 0.10 <= compact_trigger_pct` is enforced at PATCH time and on TOML load. The `strategy = "sliding-summary"` value is accepted as a deprecated alias for `"compact"` (rewritten on commit, scheduled for removal in v0.3.0).
 
 ---
 

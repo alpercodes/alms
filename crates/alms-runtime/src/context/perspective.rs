@@ -432,8 +432,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 50,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -571,8 +569,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 50,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -687,8 +683,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "full".into(),
             max_input_tokens: 32000,
-            recent_window: 50,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -755,8 +749,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 50,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -802,8 +794,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 50,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -1000,8 +990,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 50,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -1128,8 +1116,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 50,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };

@@ -3473,8 +3473,9 @@ async fn test_no_double_tool_end_when_tool_ok_then_cancel() {
 
 /// #866: `with_summary_llm` populates the dedicated summary client.
 ///
-/// Default state: `summary_llm` is `None` so the in-loop sliding-summary
-/// path falls back to `self.llm` (pre-#866 behaviour).
+/// Default state: `summary_llm` is `None` so the in-loop compact
+/// path (renamed from `sliding-summary` in #869) falls back to
+/// `self.llm` (pre-#866 behaviour).
 ///
 /// After `with_summary_llm`, the field is `Some(client)` whose provider
 /// can differ from `self.llm`'s provider. This is the path the gateway

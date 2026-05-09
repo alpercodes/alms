@@ -7,7 +7,8 @@ use alms_core::{AgentId, RunId, SessionId, Timestamp, truncate_to_char_boundary}
 /// *other* sessions so the agent has cross-session awareness.
 ///
 /// Distinct from [`ContextSummary`], which is used for within-session rolling
-/// compression by the `sliding-summary` context strategy.
+/// compression by the `compact` context strategy (renamed from
+/// `sliding-summary` in #869).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     /// The agent this summary belongs to.
@@ -31,11 +32,12 @@ pub struct SessionSummary {
     pub source_label: Option<String>,
 }
 
-/// Rolling context summary for a session (used by the sliding-summary strategy).
+/// Rolling context summary for a session (used by the `compact` strategy,
+/// renamed from `sliding-summary` in #869).
 ///
 /// Tracks how many messages from the start of the session history have been
-/// compressed into `text`, so the runtime always knows where the "recent window"
-/// begins.
+/// compressed into `text`, so the runtime always knows where the verbatim
+/// retain window begins.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContextSummary {
     /// The accumulated summary text.

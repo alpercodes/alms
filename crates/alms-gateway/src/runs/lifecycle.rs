@@ -1062,11 +1062,12 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     }
 
     // #866: when a separate summary provider is configured, wire the
-    // re-targeted client into the runtime so the in-loop sliding-summary path
-    // (`maybe_summarize`) hits the configured provider rather than the
-    // agent's. When `summary_provider` is None we leave the runtime's
-    // `summary_llm` as None — the summarizer transparently falls back to
-    // `self.llm` (pre-#866 behaviour).
+    // re-targeted client into the runtime so the in-loop compact-strategy
+    // path (`maybe_summarize`, formerly known as sliding-summary; renamed
+    // in #869) hits the configured provider rather than the agent's. When
+    // `summary_provider` is None we leave the runtime's `summary_llm` as
+    // None — the summarizer transparently falls back to `self.llm`
+    // (pre-#866 behaviour).
     if summary_provider_cfg.is_some() {
         runtime = runtime.with_summary_llm(llm_for_summary.clone());
     }

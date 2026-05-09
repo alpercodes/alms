@@ -53,19 +53,36 @@ max_messages = 10000
 max_context_tokens = 256_000
 
 [context]
+# DEPRECATED as of v0.2.4 (#869): `recent_window` and `summary_interval`
+# are no longer recognised — the compact strategy is now token-threshold-
+# driven (see compact_trigger_pct / compact_retain_pct below). Configs
+# that still set them produce a one-time WARN at boot and are ignored.
+#
 # Context window strategy:
-#   "truncate"        - keep last N messages (simple, no LLM calls)
-#   "sliding-summary" - rolling summary + recent window (best quality)
-#   "full"            - send everything (for small conversations)
+#   "truncate"  - drop oldest messages to fit the token budget (simple, lossy)
+#   "compact"   - summarise older messages once history crosses the trigger
+#                 threshold, keep the recent verbatim tail
+#   "full"      - send everything (for small conversations or cheap models)
+#
+# (Legacy alias "sliding-summary" is accepted at config-load time and
+# rewritten to "compact"; remove it from your config when convenient.)
 strategy = "truncate"
 # PER-REQUEST LLM budget: max tokens to send to the LLM in a single request.
 # Should match your model's context window size. This is different from
 # session.max_context_tokens, which is the total session storage limit.
 max_input_tokens = 128000
-# number of recent messages to always keep in full
-recent_window = 20
-# how often to update rolling summary (in messages, for sliding-summary)
-summary_interval = 30
+# When strategy = "compact": fold older messages into a summary once
+# the assembled history exceeds this fraction of the EFFECTIVE history
+# budget (max_input_tokens minus the system / input / episodic /
+# reserve overhead — i.e. the actual room available for history).
+# Range: 0.50–0.95. Default: 0.80.
+compact_trigger_pct = 0.80
+# When compaction fires, retain this fraction of the EFFECTIVE history
+# budget worth of recent verbatim messages; older messages collapse
+# into the summary block. Range: 0.20–0.60. Default: 0.40.
+# (Enforced floor: compact_retain_pct + 0.10 <= compact_trigger_pct, so
+# compaction always measurably reduces context size.)
+compact_retain_pct = 0.40
 # Episodic memory: how run summaries are generated after each run.
 #   "off"       - disabled (default). No summaries, no episodic context injection.
 #   "heuristic" - one-line summary from truncated input + output. Zero LLM cost.

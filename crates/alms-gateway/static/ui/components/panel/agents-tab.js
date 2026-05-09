@@ -414,10 +414,10 @@ export function AgentEditModal({ agent, onClose }) {
                     draft=${geminiDraft} />
 
                 <div class="agent-edit-section-divider"></div>
-                <div class="agent-edit-section-title">Summary (sliding-summary compaction + episodic memory)</div>
+                <div class="agent-edit-section-title">Summary (compact strategy + episodic memory)</div>
 
                 <span class="settings-hint">
-                    Per-agent summary provider/model. Drives both the in-loop sliding-summary compaction and the
+                    Per-agent summary provider/model. Drives both the in-loop compact-strategy compaction and the
                     post-run episodic memory generation. Both fields must be set together — partial settings are
                     rejected server-side. Leave both empty to inherit the server default.
                 </span>

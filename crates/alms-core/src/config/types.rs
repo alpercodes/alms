@@ -761,10 +761,31 @@ impl Default for SessionConfig {
 /// Controls how the session's message history is assembled into a prompt for
 /// each LLM request. This is distinct from [`SessionConfig`], which controls
 /// how much history the session retains in storage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+///
+/// # Strategy redesign (#869)
+///
+/// As of v0.2.4 the two compaction-relevant strategies are modelled on
+/// **token thresholds**, not message counts. The pre-#869
+/// `recent_window` + `summary_interval` shape was a hard message-count
+/// cap that bypassed the token budget entirely. Strategies in scope:
+///
+/// - `truncate` — pure token-budget walk: keep the most recent messages
+///   that fit the per-request budget; drop everything older.
+/// - `compact` — Claude-Code / Codex style auto-compact: when
+///   assembled history crosses [`compact_trigger_pct`] of the budget,
+///   summarise the older prefix and retain at most [`compact_retain_pct`]
+///   worth of recent verbatim messages. Renamed from `sliding-summary`.
+/// - `full` — include all history; for small conversations / cheap models.
+///
+/// `"sliding-summary"` is accepted at load time as an alias for `"compact"`
+/// (rewritten on deserialise). The legacy fields `recent_window` and
+/// `summary_interval` are deprecated; if present in `alms.toml` they
+/// produce a one-time WARN at boot and are ignored.
+#[derive(Debug, Clone, Serialize)]
 pub struct ContextConfig {
-    /// Strategy: "sliding-summary", "full", "truncate"
+    /// Strategy: `"truncate"` | `"compact"` | `"full"`. The legacy alias
+    /// `"sliding-summary"` is accepted at load time and rewritten to
+    /// `"compact"` (see the `Deserialize` impl below).
     pub strategy: String,
     /// Maximum tokens to send to the LLM in a single request.
     ///
@@ -774,10 +795,28 @@ pub struct ContextConfig {
     /// Not to be confused with [`SessionConfig::max_context_tokens`], which is
     /// the total token storage limit for the session's history on disk.
     pub max_input_tokens: usize,
-    /// Number of recent messages to always keep in full
-    pub recent_window: usize,
-    /// How often to trigger a new summary (in uncovered messages beyond recent_window)
-    pub summary_interval: usize,
+    /// Trigger compaction when the assembled history exceeds this
+    /// fraction of the **effective history budget**
+    /// (`max_input_tokens` minus the system prompt, current input,
+    /// episodic block, and the 1000-token reserve `ContextBuilder`
+    /// uses) (#869, refined PR #1012).
+    ///
+    /// Range: `0.50..=0.95`. Default: `0.80` (Claude Code parity).
+    /// Out-of-range values are clamped at load time with a WARN.
+    /// Only consulted when `strategy == "compact"`.
+    pub compact_trigger_pct: f32,
+    /// After compaction, retain at most this fraction of the
+    /// **effective history budget** worth of recent verbatim messages;
+    /// everything older folds into the summary block (#869, refined
+    /// PR #1012).
+    ///
+    /// Range: `0.20..=0.60`. Default: `0.40`.
+    /// Out-of-range values are clamped at load time with a WARN.
+    /// `compact_retain_pct + 0.10 <= compact_trigger_pct` is enforced — if
+    /// the gap is too small, retain is dropped to `trigger - 0.10` so
+    /// compaction always measurably reduces context size.
+    /// Only consulted when `strategy == "compact"`.
+    pub compact_retain_pct: f32,
     /// Separate (cheaper) model for generating summaries.
     /// Falls back to the agent's default model when `None`.
     /// Defaults to `minimax/minimax-m2.7` to avoid wasting tokens on
@@ -814,8 +853,12 @@ impl Default for ContextConfig {
         Self {
             strategy: "truncate".into(),
             max_input_tokens: 128_000,
-            recent_window: 20,
-            summary_interval: 30,
+            // #869: threshold-based compaction defaults. 0.80 / 0.40 give
+            // a comfortable gap (the 0.10 hard floor is satisfied) and
+            // match Claude Code's auto-compact trigger. Only consulted
+            // when `strategy == "compact"`.
+            compact_trigger_pct: 0.80,
+            compact_retain_pct: 0.40,
             // Default to None for both fields (#872). The pre-#872 default
             // paired `summary_model = Some("minimax/minimax-m2.7")` with
             // `summary_provider = None`, which the resolver silently
@@ -833,14 +876,222 @@ impl Default for ContextConfig {
     }
 }
 
+// Custom Deserialize impl for ContextConfig (#869).
+//
+// Two pieces of migration logic land here so they fire wherever a
+// `[context]` block is parsed (TOML, JSON via `PersistedContextOverrides`'s
+// downstream apply, env-var-rebuilt configs that round-trip through
+// deserialize):
+//
+// 1. The legacy fields `recent_window` and `summary_interval` are accepted
+//    on the wire but dropped from the struct, with a one-time `WARN` at
+//    `target = "alms.config"` so an operator who upgraded without
+//    touching `alms.toml` sees the deprecation message exactly once per
+//    process start.
+// 2. `strategy = "sliding-summary"` is rewritten to `"compact"` so the
+//    rest of the system sees a single canonical name. The runtime
+//    dispatch in `context/mod.rs` keeps the alias arm as a belt-and-
+//    braces fallback for any path that bypasses this deserialiser.
+//
+// The boilerplate below mirrors what `#[serde(default)] #[derive(Deserialize)]`
+// would have generated, plus the two migration steps. Field order matches
+// the struct definition.
+impl<'de> Deserialize<'de> for ContextConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Raw {
+            strategy: Option<String>,
+            max_input_tokens: Option<usize>,
+            compact_trigger_pct: Option<f32>,
+            compact_retain_pct: Option<f32>,
+            // Legacy fields — accepted on the wire so old `alms.toml`
+            // / `settings.json` files load without a hard error, then
+            // dropped with a one-time WARN.
+            recent_window: Option<usize>,
+            summary_interval: Option<usize>,
+            summary_model: Option<String>,
+            summary_provider: Option<String>,
+            run_summary_mode: Option<RunSummaryMode>,
+            run_summary_budget: Option<usize>,
+            summary_max_tokens: Option<u32>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+
+        // Deprecation WARN — fires at most once per process for each legacy
+        // field, regardless of how many configs round-trip through
+        // deserialize during boot (handful, normally).
+        if raw.recent_window.is_some() {
+            warn_recent_window_once();
+        }
+        if raw.summary_interval.is_some() {
+            warn_summary_interval_once();
+        }
+
+        let defaults = ContextConfig::default();
+        let strategy = match raw.strategy {
+            Some(s) if s == "sliding-summary" => {
+                warn_sliding_summary_alias_once();
+                "compact".to_string()
+            }
+            Some(s) => s,
+            None => defaults.strategy,
+        };
+
+        Ok(ContextConfig {
+            strategy,
+            max_input_tokens: raw.max_input_tokens.unwrap_or(defaults.max_input_tokens),
+            compact_trigger_pct: raw
+                .compact_trigger_pct
+                .unwrap_or(defaults.compact_trigger_pct),
+            compact_retain_pct: raw
+                .compact_retain_pct
+                .unwrap_or(defaults.compact_retain_pct),
+            summary_model: raw.summary_model.or(defaults.summary_model),
+            summary_provider: raw.summary_provider.or(defaults.summary_provider),
+            run_summary_mode: raw.run_summary_mode.unwrap_or(defaults.run_summary_mode),
+            run_summary_budget: raw
+                .run_summary_budget
+                .unwrap_or(defaults.run_summary_budget),
+            summary_max_tokens: raw
+                .summary_max_tokens
+                .unwrap_or(defaults.summary_max_tokens),
+        })
+    }
+}
+
+// One-time deprecation WARNs for #869. Each `OnceLock` ensures the
+// message is emitted at most once per process — operators see the
+// deprecation, log scanners don't drown in duplicates if multiple
+// agents round-trip the same TOML.
+use std::sync::OnceLock;
+
+static WARN_RECENT_WINDOW_ONCE: OnceLock<()> = OnceLock::new();
+static WARN_SUMMARY_INTERVAL_ONCE: OnceLock<()> = OnceLock::new();
+static WARN_SLIDING_SUMMARY_ALIAS_ONCE: OnceLock<()> = OnceLock::new();
+
+fn warn_recent_window_once() {
+    WARN_RECENT_WINDOW_ONCE.get_or_init(|| {
+        warn!(
+            target: "alms.config",
+            "context.recent_window is deprecated and ignored as of v0.2.4 — \
+             the threshold-based \"compact\" strategy uses compact_trigger_pct \
+             / compact_retain_pct. Remove the field from alms.toml. See #869."
+        );
+    });
+}
+
+fn warn_summary_interval_once() {
+    WARN_SUMMARY_INTERVAL_ONCE.get_or_init(|| {
+        warn!(
+            target: "alms.config",
+            "context.summary_interval is deprecated and ignored as of v0.2.4 — \
+             the threshold-based \"compact\" strategy uses compact_trigger_pct \
+             / compact_retain_pct. Remove the field from alms.toml. See #869."
+        );
+    });
+}
+
+fn warn_sliding_summary_alias_once() {
+    WARN_SLIDING_SUMMARY_ALIAS_ONCE.get_or_init(|| {
+        warn!(
+            target: "alms.config",
+            "context.strategy = \"sliding-summary\" is deprecated as of v0.2.4 — \
+             rename to \"compact\". The alias is still accepted but will be \
+             removed in v0.3.0. See #869."
+        );
+    });
+}
+
 impl ContextConfig {
     /// Normalize episodic memory settings: validate mode and enforce the 15%
     /// budget cap. Called during config loading, before hard validation.
+    ///
+    /// As of #869 also handles the new `compact_*` knobs:
+    /// - Out-of-range trigger / retain are clamped to their valid ranges.
+    /// - The `retain + 0.10 <= trigger` floor is enforced — if violated,
+    ///   retain is dropped to `trigger - 0.10` so compaction always
+    ///   measurably reduces context size.
+    /// - `"sliding-summary"` strategy at this stage is rewritten to
+    ///   `"compact"` as a belt-and-braces fallback for any path that
+    ///   bypassed the `Deserialize` impl above (e.g. env var override,
+    ///   a hand-built `ContextConfig` literal that the test fixture
+    ///   sweep missed).
     pub fn normalize_episodic(&mut self) {
         // Normalize Unknown variant (from unrecognized TOML/env values) to Llm
         if self.run_summary_mode == RunSummaryMode::Unknown {
             warn!("Unrecognized run_summary_mode, falling back to \"llm\"");
             self.run_summary_mode = RunSummaryMode::Llm;
+        }
+
+        // #869: rewrite the "sliding-summary" alias here too, in case the
+        // value arrived via `ALMS_CONTEXT_STRATEGY` (which goes through
+        // `apply_env_overrides` directly without round-tripping through
+        // `Deserialize`).
+        if self.strategy == "sliding-summary" {
+            warn_sliding_summary_alias_once();
+            self.strategy = "compact".into();
+        }
+
+        // #869: clamp `compact_trigger_pct` to [0.50, 0.95].
+        const TRIGGER_MIN: f32 = 0.50;
+        const TRIGGER_MAX: f32 = 0.95;
+        if !(self.compact_trigger_pct.is_finite()
+            && (TRIGGER_MIN..=TRIGGER_MAX).contains(&self.compact_trigger_pct))
+        {
+            let clamped = if !self.compact_trigger_pct.is_finite() {
+                0.80
+            } else {
+                self.compact_trigger_pct.clamp(TRIGGER_MIN, TRIGGER_MAX)
+            };
+            warn!(
+                target: "alms.config",
+                configured = self.compact_trigger_pct,
+                clamped = clamped,
+                "context.compact_trigger_pct out of range [0.50, 0.95]; clamped"
+            );
+            self.compact_trigger_pct = clamped;
+        }
+
+        // #869: clamp `compact_retain_pct` to [0.20, 0.60].
+        const RETAIN_MIN: f32 = 0.20;
+        const RETAIN_MAX: f32 = 0.60;
+        if !(self.compact_retain_pct.is_finite()
+            && (RETAIN_MIN..=RETAIN_MAX).contains(&self.compact_retain_pct))
+        {
+            let clamped = if !self.compact_retain_pct.is_finite() {
+                0.40
+            } else {
+                self.compact_retain_pct.clamp(RETAIN_MIN, RETAIN_MAX)
+            };
+            warn!(
+                target: "alms.config",
+                configured = self.compact_retain_pct,
+                clamped = clamped,
+                "context.compact_retain_pct out of range [0.20, 0.60]; clamped"
+            );
+            self.compact_retain_pct = clamped;
+        }
+
+        // #869: enforce `retain + 0.10 <= trigger` so compaction always
+        // measurably reduces context size. If retain is too close to (or
+        // above) trigger, drop retain to `trigger - 0.10`.
+        const MIN_GAP: f32 = 0.10;
+        if self.compact_retain_pct + MIN_GAP > self.compact_trigger_pct {
+            let new_retain = (self.compact_trigger_pct - MIN_GAP).max(RETAIN_MIN);
+            warn!(
+                target: "alms.config",
+                trigger = self.compact_trigger_pct,
+                retain_was = self.compact_retain_pct,
+                retain_now = new_retain,
+                "context.compact_retain_pct must be at least 0.10 below compact_trigger_pct; \
+                 lowered retain to maintain the gap"
+            );
+            self.compact_retain_pct = new_retain;
         }
 
         // Enforce 15% hard cap on run_summary_budget

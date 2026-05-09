@@ -187,8 +187,11 @@ export function SettingsModal({ open, onClose }) {
     // Server-level editable signals — Context
     const ctxStrategy = useSignal('');
     const ctxMaxInput = useSignal('');
-    const ctxRecentWindow = useSignal('');
-    const ctxSummaryInterval = useSignal('');
+    // #869: threshold-based compact knobs replace the pre-#869
+    // `recent_window` / `summary_interval` pair. Defaults: 0.80 / 0.40
+    // (Claude Code parity). Stored as float strings for the form.
+    const ctxCompactTrigger = useSignal('');
+    const ctxCompactRetain = useSignal('');
     const ctxSummaryModel = useSignal('');
     // #866: dedicated provider for the summary task. '' = inherit agent
     // provider (pre-#866 behaviour); non-empty re-targets the summary
@@ -259,8 +262,11 @@ export function SettingsModal({ open, onClose }) {
             // Populate server-level fields
             ctxStrategy.value = ctx.strategy || 'truncate';
             ctxMaxInput.value = ctx.max_input_tokens != null ? String(ctx.max_input_tokens) : '';
-            ctxRecentWindow.value = ctx.recent_window != null ? String(ctx.recent_window) : '';
-            ctxSummaryInterval.value = ctx.summary_interval != null ? String(ctx.summary_interval) : '';
+            // #869: threshold-based compact knobs.
+            ctxCompactTrigger.value = ctx.compact_trigger_pct != null
+                ? String(ctx.compact_trigger_pct) : '';
+            ctxCompactRetain.value = ctx.compact_retain_pct != null
+                ? String(ctx.compact_retain_pct) : '';
             ctxSummaryModel.value = ctx.summary_model || '';
             ctxSummaryProvider.value = ctx.summary_provider || '';
 
@@ -346,13 +352,18 @@ export function SettingsModal({ open, onClose }) {
         if (!isNaN(newMaxInput) && newMaxInput !== ctx.max_input_tokens) {
             ctxPatch.max_input_tokens = newMaxInput;
         }
-        const newRecent = parseInt(ctxRecentWindow.value, 10);
-        if (!isNaN(newRecent) && newRecent !== ctx.recent_window) {
-            ctxPatch.recent_window = newRecent;
+        // #869: threshold-based compact knobs replace the legacy
+        // recent_window / summary_interval pair. The PATCH layer rejects
+        // the old fields with `400 CONTEXT_LEGACY_FIELD_DEPRECATED` so a
+        // cached UI bundle that still sent them would fail loudly — this
+        // bundle ships the new fields atomically.
+        const newTrigger = parseFloat(ctxCompactTrigger.value);
+        if (!isNaN(newTrigger) && newTrigger !== ctx.compact_trigger_pct) {
+            ctxPatch.compact_trigger_pct = newTrigger;
         }
-        const newSummaryInt = parseInt(ctxSummaryInterval.value, 10);
-        if (!isNaN(newSummaryInt) && newSummaryInt !== ctx.summary_interval) {
-            ctxPatch.summary_interval = newSummaryInt;
+        const newRetain = parseFloat(ctxCompactRetain.value);
+        if (!isNaN(newRetain) && newRetain !== ctx.compact_retain_pct) {
+            ctxPatch.compact_retain_pct = newRetain;
         }
         if (ctxSummaryModel.value !== (ctx.summary_model || '')) {
             ctxPatch.summary_model = ctxSummaryModel.value;
@@ -576,16 +587,17 @@ export function SettingsModal({ open, onClose }) {
                 <!-- Context (server-level, editable) -->
                 <${Section} key="ctx" title="Context" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        Controls how conversation history is assembled for each LLM request. Changes apply to the next run.
+                        truncate fits the most recent history into the token budget.
+                        compact summarises older messages once the session crosses the trigger threshold.
+                        Changes apply to the next run.
                     </span>
                     <${EditRow} label="Strategy"
-                        desc="truncate = drop oldest messages. full = send all. sliding-summary = summarize old + keep recent verbatim.">
+                        desc="truncate = drop oldest messages to fit the budget. compact = summarise old + keep recent verbatim once history crosses the trigger threshold.">
                         <select class="settings-select settings-input-sm"
                                 value=${ctxStrategy.value}
                                 onChange=${e => { ctxStrategy.value = e.target.value; }}>
-                            <option value="truncate">truncate</option>
-                            <option value="full">full</option>
-                            <option value="sliding-summary">sliding-summary</option>
+                            <option value="truncate">truncate — drop oldest messages to fit budget</option>
+                            <option value="compact">compact — summarise old + keep recent verbatim</option>
                         </select>
                     <//>
                     <${EditRow} label="Max input tokens"
@@ -594,27 +606,31 @@ export function SettingsModal({ open, onClose }) {
                                value=${ctxMaxInput.value}
                                onInput=${e => { ctxMaxInput.value = e.target.value; }} />
                     <//>
-                    <${EditRow} label="Recent window"
-                        desc="For sliding-summary: number of recent messages kept verbatim.">
-                        <input class="settings-input settings-input-sm" type="number" min="1"
-                               value=${ctxRecentWindow.value}
-                               onInput=${e => { ctxRecentWindow.value = e.target.value; }} />
+                    ${ctxStrategy.value === 'compact' ? html`
+                    <${EditRow} label="Compact trigger %"
+                        desc="Compact strategy: trigger compaction when assembled history exceeds this fraction of the effective history budget (max_input_tokens minus system / input / episodic / reserve overhead). Range: 0.50–0.95.">
+                        <input class="settings-input settings-input-sm" type="number"
+                               min="0.50" max="0.95" step="0.05"
+                               value=${ctxCompactTrigger.value}
+                               onInput=${e => { ctxCompactTrigger.value = e.target.value; }} />
                     <//>
-                    <${EditRow} label="Summary interval"
-                        desc="Messages between summary regenerations (sliding-summary only).">
-                        <input class="settings-input settings-input-sm" type="number" min="0"
-                               value=${ctxSummaryInterval.value}
-                               onInput=${e => { ctxSummaryInterval.value = e.target.value; }} />
+                    <${EditRow} label="Compact retain %"
+                        desc="Compact strategy: retain at most this fraction of the effective history budget (max_input_tokens minus system / input / episodic / reserve overhead) worth of recent verbatim messages after compaction. Range: 0.20–0.60.">
+                        <input class="settings-input settings-input-sm" type="number"
+                               min="0.20" max="0.60" step="0.05"
+                               value=${ctxCompactRetain.value}
+                               onInput=${e => { ctxCompactRetain.value = e.target.value; }} />
                     <//>
+                    ` : null}
                 <//>
 
                 <!-- Summary (server-level, editable) — controls BOTH the
-                     in-loop sliding-summary compaction AND the post-run
+                     in-loop compact-strategy compaction AND the post-run
                      episodic memory generation. Lifted out of the Context
                      section to make the dual-path scope obvious. -->
-                <${Section} key="summary" title="Summary (sliding-summary compaction + episodic memory)" defaultOpen=${false}>
+                <${Section} key="summary" title="Summary (compact strategy + episodic memory)" defaultOpen=${false}>
                     <span class="settings-hint settings-section-desc">
-                        Optional dedicated provider/model for the summary task. Drives both the in-loop sliding-summary compaction
+                        Optional dedicated provider/model for the summary task. Drives both the in-loop compact-strategy compaction
                         (rolling context window) and the per-run episodic memory generation. Both fields must be set together — partial
                         configurations are rejected so the user-supplied summary_model is never silently paired with the agent's primary provider.
                         Per-agent overrides live on the agent record (Agents panel).

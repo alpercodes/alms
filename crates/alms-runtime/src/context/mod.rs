@@ -59,6 +59,24 @@ mod perspective;
 mod rebuild;
 mod strategies;
 
+/// Token reserve subtracted from `max_input_tokens` when computing the
+/// effective history budget, on top of the system prompt, current input,
+/// and episodic summaries.
+///
+/// I6: Increased from 500 to 1000 tokens. The `estimate_tokens` heuristic
+/// (`len / 3`) overestimates English but underestimates code and JSON
+/// (~2-3 chars/token). A larger buffer provides a stronger safety margin
+/// against LLM API rejection for `max_input_tokens` breaches.
+///
+/// Tim review (PR #1012, item 4): exposed as `pub(crate)` so the
+/// `agent::context::AgentRuntime::build_context` overhead calculation
+/// uses the same constant as the builder. A future edit that nudges
+/// this value must propagate to every caller automatically — pre-#1012
+/// the constant lived in two files and could silently desync, putting
+/// the `maybe_summarize` trigger threshold and the actual builder
+/// budget out of step.
+pub(crate) const HISTORY_RESERVE: usize = 1000;
+
 /// Builds the context window (Vec<LlmMessage>) for an LLM request.
 pub struct ContextBuilder {
     config: ContextConfig,
@@ -98,8 +116,9 @@ impl ContextBuilder {
     /// Takes the full session history and produces a token-budgeted context window:
     /// `[system_prompt, (episodic?), (summary if needed), recent_messages, current_input]`
     ///
-    /// `existing_summary` is only used when `strategy == "sliding-summary"`.
-    /// Pass `None` for all other strategies.
+    /// `existing_summary` is only used when `strategy == "compact"`
+    /// (or its deprecated alias `"sliding-summary"`, accepted for
+    /// back-compat). Pass `None` for all other strategies.
     pub fn build(
         &self,
         system_prompt: &str,
@@ -165,12 +184,10 @@ impl ContextBuilder {
 
         // 4. Budget for history — episodic tokens are subtracted from the
         // available space so they do not eat into the history budget.
-        //
-        // I6: Buffer increased from 500 to 1000 tokens.  The estimate_tokens
-        // heuristic (len/3) overestimates English but underestimates code and
-        // JSON (~2-3 chars/token).  A larger buffer provides a stronger safety
-        // margin against LLM API rejection for max_input_tokens breaches.
-        let reserved = system_tokens + input_tokens + episodic_tokens + 1000;
+        // The `HISTORY_RESERVE` constant (see module-level docs) sits on
+        // top of system / input / episodic to keep a safety margin
+        // against `estimate_tokens` underestimating code/JSON content.
+        let reserved = system_tokens + input_tokens + episodic_tokens + HISTORY_RESERVE;
         let history_budget = self.config.max_input_tokens.saturating_sub(reserved);
 
         // Drop legacy lifecycle-layer `(run failed) ...` / `(run cancelled)`
@@ -283,17 +300,32 @@ impl ContextBuilder {
                     history_ref,
                     history_budget,
                     &mut messages,
-                    self.config.recent_window,
                     workspace_root,
                 );
             }
-            "sliding-summary" => {
-                strategies::build_sliding_summary(
+            // #869: `compact` is the canonical name; `sliding-summary` is
+            // accepted as a runtime alias for any path that bypassed the
+            // deserialise / `normalize_episodic` rewrites (env vars,
+            // hand-built `ContextConfig` literals).
+            "compact" | "sliding-summary" => {
+                // PR #1012 / Codex review medium #2: derive retain_budget
+                // from the EFFECTIVE history budget, not raw
+                // `max_input_tokens`. This keeps `retain_pct` aligned
+                // with `maybe_summarize`'s trigger calculation (both now
+                // measure against the assembled context window after
+                // system / input / episodic / reserve overhead) and
+                // preserves the gap-floor invariant
+                // (`retain + 0.10 <= trigger`) at runtime. Pre-fix, large
+                // overhead silently flipped retain to be larger than the
+                // effective trigger.
+                let retain_budget =
+                    (self.config.compact_retain_pct * history_budget as f32) as usize;
+                strategies::build_compact(
                     history_ref,
                     history_budget,
                     &mut messages,
                     existing_summary,
-                    self.config.recent_window,
+                    retain_budget,
                     workspace_root,
                 );
             }
@@ -306,7 +338,6 @@ impl ContextBuilder {
                     history_ref,
                     history_budget,
                     &mut messages,
-                    self.config.recent_window,
                     workspace_root,
                 );
             }
@@ -389,6 +420,34 @@ pub fn estimate_tokens(text: &str) -> usize {
     text.len().div_ceil(3)
 }
 
+/// Estimate tokens for a persisted [`Message`] without paying the full
+/// cost of [`rebuild::session_msg_to_llm`] (which canonicalises tool
+/// calls / tool results, resolves spill paths, etc.).
+///
+/// Used by `maybe_summarize` (#869) to compute the uncovered-tail token
+/// estimate that drives threshold-based compaction. Slightly less precise
+/// than `estimate_llm_message_tokens` because it works on the persisted
+/// content shape directly, but it doesn't need to be exact — the figure
+/// is compared against `compact_trigger_pct` of the effective history
+/// budget (PR #1012), where a few percent of slack is normal.
+pub(crate) fn estimate_session_message_tokens(msg: &Message) -> usize {
+    use alms_session::Content;
+    match &msg.content {
+        Content::Text(s) => estimate_tokens(s),
+        Content::ToolCall { name, params } => {
+            estimate_tokens(name) + estimate_tokens(&params.to_string()) + 10
+        }
+        Content::ToolResult { tool_id, result } => {
+            estimate_tokens(tool_id) + estimate_tokens(&result.to_string()) + 10
+        }
+        // Images are token-priced server-side by the provider; the
+        // text/`alt` fallback is the cheapest reasonable proxy.
+        Content::Image { url, alt } => {
+            estimate_tokens(url) + alt.as_deref().map(estimate_tokens).unwrap_or(0)
+        }
+    }
+}
+
 /// Estimate tokens for a full LlmMessage, including tool_calls if present.
 /// Plain text messages use `content_str()`. Tool call messages (content: None,
 /// tool_calls: Some) estimate from the serialized tool call JSON instead.
@@ -464,8 +523,6 @@ mod tests {
         ContextBuilder::new(ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 20,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         })
@@ -519,8 +576,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 20,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -546,8 +601,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 20,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -578,8 +631,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 20,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -615,8 +666,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 20,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -641,8 +690,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 20,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -669,8 +716,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 1150,
-            recent_window: 100,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -710,14 +755,14 @@ mod tests {
     }
 
     #[test]
-    fn test_episodic_with_sliding_summary() {
-        // When both episodic and sliding-summary are used, the context order
-        // should be: system -> episodic -> sliding-summary -> recent history -> input.
+    fn test_episodic_with_compact_strategy() {
+        // When both episodic and compact (#869) are used, the context order
+        // should be: system -> episodic -> compact-summary -> recent history -> input.
+        // The legacy `"sliding-summary"` value is also accepted at the
+        // dispatch layer as a back-compat alias.
         let config = ContextConfig {
-            strategy: "sliding-summary".into(),
-            max_input_tokens: 32000,
-            recent_window: 3,
-            summary_interval: 30,
+            strategy: "compact".into(),
+            max_input_tokens: 32_000,
             summary_model: None,
             ..Default::default()
         };
@@ -744,16 +789,86 @@ mod tests {
             Some(episodic),
         );
 
-        // system + episodic + sliding-summary + 3 recent + current = 7
-        assert_eq!(messages.len(), 7);
+        // system + episodic + compact-summary + 6 recent + current = 10.
+        // Pre-#869 this was capped at `recent_window = 3`; with the
+        // threshold model the verbatim tail comfortably fits all six
+        // tiny messages within the default `compact_retain_pct = 0.40`
+        // applied to the effective history budget (PR #1012):
+        // `0.40 × (max_input_tokens − reserved overhead)`
+        // ≈ `0.40 × (32_000 − 1019)` ≈ 12,392 tokens of headroom.
+        assert_eq!(messages.len(), 10);
         assert_eq!(messages[0].role, "system"); // main system prompt
         assert_eq!(messages[1].role, "system"); // episodic
         assert!(messages[1].content_str().contains("CORS"));
-        assert_eq!(messages[2].role, "system"); // sliding-summary
+        assert_eq!(messages[2].role, "system"); // compact-summary
         assert!(messages[2].content_str().contains("Context summary"));
         assert_eq!(messages.last().unwrap().role, "user"); // current input
         // Invariant: no mid-history system messages survive.
         assert!(messages[3..].iter().all(|m| m.role != "system"));
+    }
+
+    /// Tim review nit (PR #1012, item 2; tracked for v0.3.0 removal
+    /// in #1017): the runtime dispatch arm for
+    /// `strategy: "sliding-summary"` is a belt-and-braces fallback for
+    /// any path that bypassed `ContextConfig::Deserialize`,
+    /// `normalize_episodic`, and the gateway PATCH rewrite — e.g. an
+    /// in-process caller building a `ContextConfig` literal. A future
+    /// refactor that drops the alias arm without also dropping every
+    /// upstream rewrite would be silently caught by this test.
+    ///
+    /// We construct the config via direct struct literal (NOT
+    /// `ContextConfig::default()`-then-mutate, which is the same shape,
+    /// but explicit struct literal makes the intent clear) and exercise
+    /// the dispatch by passing a non-empty `existing_summary`. The
+    /// compact path is the only one that injects the summary block as
+    /// a leading system message; truncate / full strip it. So if the
+    /// alias arm were dropped without an upstream guard, the summary
+    /// block would silently disappear from the assembled context.
+    #[test]
+    fn test_sliding_summary_alias_routes_through_compact() {
+        let config = ContextConfig {
+            // Hand-built literal — bypasses Deserialize / normalize.
+            strategy: "sliding-summary".into(),
+            max_input_tokens: 32_000,
+            ..Default::default()
+        };
+        let builder = ContextBuilder::new(config);
+
+        let history: Vec<Message> = (0..4)
+            .map(|i| {
+                if i % 2 == 0 {
+                    make_msg(Role::User, &format!("q {i}"))
+                } else {
+                    make_msg(Role::Assistant, &format!("a {i}"))
+                }
+            })
+            .collect();
+
+        let summary = "Earlier the user asked about config changes.";
+        let messages = builder.build("System", &history, "current", Some(summary));
+
+        // Expected layout when the alias dispatched through `build_compact`:
+        // [0] = system prompt
+        // [1] = compact-summary system block (the existing_summary text)
+        // [2..6] = 4 verbatim history messages
+        // [6] = current input (user)
+        assert_eq!(
+            messages.len(),
+            7,
+            "summary block + 4 history + 1 input + system"
+        );
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "system");
+        assert!(
+            messages[1].content_str().contains("Context summary"),
+            "compact path injects summary block; truncate / full do not.              Got: {:?}",
+            messages[1].content_str()
+        );
+        assert!(
+            messages[1].content_str().contains("config changes"),
+            "summary block must carry the existing_summary text"
+        );
+        assert_eq!(messages.last().unwrap().role, "user");
     }
 
     /// Notification runs (DM-ended, subagent completion) on user-facing
@@ -778,8 +893,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 20,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };
@@ -851,8 +964,6 @@ mod tests {
         let config = ContextConfig {
             strategy: "truncate".into(),
             max_input_tokens: 32000,
-            recent_window: 20,
-            summary_interval: 30,
             summary_model: None,
             ..Default::default()
         };

@@ -129,8 +129,15 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
         "context": {
             "strategy": ctx.strategy,
             "max_input_tokens": ctx.max_input_tokens,
-            "recent_window": ctx.recent_window,
-            "summary_interval": ctx.summary_interval,
+            // #869: threshold-based compaction knobs replace the
+            // pre-#869 `recent_window` / `summary_interval` pair on
+            // the wire. Old UI bundles that read `recent_window` will
+            // see a missing key (defaulting to undefined / null on
+            // their side); shipping this key removal atomically with
+            // the bundled `settings-modal.js` update avoids in-flight
+            // drift.
+            "compact_trigger_pct": ctx.compact_trigger_pct,
+            "compact_retain_pct": ctx.compact_retain_pct,
             "summary_model": ctx.summary_model,
             "summary_provider": ctx.summary_provider,
             "run_summary_mode": ctx.run_summary_mode.to_string(),
@@ -193,13 +200,25 @@ pub async fn get_settings(State(state): State<AppState>) -> impl IntoResponse {
 // ── PATCH /settings — partial config update ────────────────────────────
 
 /// Partial context config update.
+///
+/// #869: `recent_window` and `summary_interval` were removed from the
+/// PATCH surface and replaced with the threshold-based
+/// [`Self::compact_trigger_pct`] / [`Self::compact_retain_pct`] knobs.
+/// Old UI bundles or scripted clients that still send the legacy fields
+/// receive a `400 CONTEXT_LEGACY_FIELD_DEPRECATED` so callers fail loud
+/// rather than silently no-op'ing — see `patch_settings`.
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PatchContext {
     pub strategy: Option<String>,
     pub max_input_tokens: Option<usize>,
-    pub recent_window: Option<usize>,
-    pub summary_interval: Option<usize>,
+    /// #869: trigger compaction when assembled history exceeds this fraction
+    /// of `max_input_tokens`. Range: `0.50..=0.95`.
+    pub compact_trigger_pct: Option<f32>,
+    /// #869: after compaction, retain at most this fraction of
+    /// `max_input_tokens` worth of recent verbatim messages.
+    /// Range: `0.20..=0.60`.
+    pub compact_retain_pct: Option<f32>,
     pub summary_model: Option<String>,
     /// Separate provider for the summary task (#866). Empty string clears
     /// back to "inherit agent provider"; non-empty must reference a
@@ -341,6 +360,24 @@ pub async fn patch_settings(
         );
     }
 
+    // #869: reject deprecated context fields BEFORE structural deserialise
+    // so callers that still send the pre-#869 shape fail loud rather than
+    // silently no-op'ing once we drop the fields. The TOML / `alms.toml`
+    // path stays soft (one-time WARN at boot) because operators editing
+    // config files don't read 4xx responses, but the HTTP API exposes
+    // ALMS to scripted clients that should be updated atomically with
+    // the rest of the surface.
+    if let Some(rejection) = reject_legacy_context_fields(&raw_body) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "status": "error",
+                "code": "CONTEXT_LEGACY_FIELD_DEPRECATED",
+                "errors": [rejection],
+            })),
+        );
+    }
+
     let body: PatchSettingsRequest = match serde_json::from_value(raw_body) {
         Ok(b) => b,
         Err(e) => {
@@ -362,9 +399,18 @@ pub async fn patch_settings(
         let ctx = &mut agent.context_config;
 
         if let Some(ref strategy) = ctx_patch.strategy {
-            let valid = ["sliding-summary", "full", "truncate"];
+            // #869: `compact` is the canonical name; `sliding-summary` is
+            // accepted as a back-compat alias and rewritten on commit
+            // (matching the deserialise-time rewrite in
+            // `ContextConfig::Deserialize`). The UI bundle ships
+            // `compact` only.
+            let valid = ["compact", "sliding-summary", "full", "truncate"];
             if valid.contains(&strategy.as_str()) {
-                ctx.strategy = strategy.clone();
+                ctx.strategy = if strategy == "sliding-summary" {
+                    "compact".to_string()
+                } else {
+                    strategy.clone()
+                };
             } else {
                 errors.push(format!(
                     "context.strategy must be one of {valid:?}, got '{strategy}'"
@@ -378,15 +424,69 @@ pub async fn patch_settings(
                 ctx.max_input_tokens = v;
             }
         }
-        if let Some(v) = ctx_patch.recent_window {
-            if v == 0 {
-                errors.push("context.recent_window must be > 0".into());
+        // #869 / Codex review (PR #1012): `compact_trigger_pct` and
+        // `compact_retain_pct` form a cross-field invariant
+        // (`retain + 0.10 <= trigger`). Pre-commit individual writes
+        // followed by a post-commit gap check left a partial-mutation
+        // hole — a same-PATCH pair like `{trigger: 0.55, retain: 0.50}`
+        // passed both per-knob range checks, committed both writes,
+        // then the gap check returned the would-be pair as invalid.
+        // The daemon then served runs with the invalid pair until the
+        // next successful PATCH or restart.
+        //
+        // Mirror the `summary_model` / `summary_provider` pattern below:
+        // compute would-be candidate values, validate range AND gap on
+        // the candidates, commit only when every check passes. Any
+        // per-knob range failure preserves the live value for the
+        // candidate the gap check sees, matching the documented
+        // status: partial wire contract for unrelated fields.
+        let mut next_compact_trigger_pct = ctx.compact_trigger_pct;
+        let mut trigger_range_ok = true;
+        if let Some(v) = ctx_patch.compact_trigger_pct {
+            if !(0.50..=0.95).contains(&v) || !v.is_finite() {
+                errors.push(format!(
+                    "context.compact_trigger_pct must be in [0.50, 0.95], got {v}"
+                ));
+                trigger_range_ok = false;
             } else {
-                ctx.recent_window = v;
+                next_compact_trigger_pct = v;
             }
         }
-        if let Some(v) = ctx_patch.summary_interval {
-            ctx.summary_interval = v;
+        let mut next_compact_retain_pct = ctx.compact_retain_pct;
+        let mut retain_range_ok = true;
+        if let Some(v) = ctx_patch.compact_retain_pct {
+            if !(0.20..=0.60).contains(&v) || !v.is_finite() {
+                errors.push(format!(
+                    "context.compact_retain_pct must be in [0.20, 0.60], got {v}"
+                ));
+                retain_range_ok = false;
+            } else {
+                next_compact_retain_pct = v;
+            }
+        }
+        // Cross-field invariant: `retain + 0.10 <= trigger`. Evaluated
+        // on the candidate pair (not on `ctx`) so a same-PATCH pair
+        // that fails the gap leaves the live config untouched.
+        let gap_ok = next_compact_retain_pct + 0.10 <= next_compact_trigger_pct;
+        if !gap_ok
+            && (ctx_patch.compact_trigger_pct.is_some() || ctx_patch.compact_retain_pct.is_some())
+        {
+            errors.push(format!(
+                "context.compact_retain_pct ({next_compact_retain_pct}) must be at least 0.10 below \
+                 compact_trigger_pct ({next_compact_trigger_pct}) — compaction must measurably reduce context size",
+            ));
+        }
+        // Commit candidate values only when range AND gap pass for the
+        // touched knobs. A patch that touches just one knob still
+        // commits that one knob iff its own range check passed AND the
+        // resulting pair satisfies the gap.
+        if gap_ok {
+            if trigger_range_ok && ctx_patch.compact_trigger_pct.is_some() {
+                ctx.compact_trigger_pct = next_compact_trigger_pct;
+            }
+            if retain_range_ok && ctx_patch.compact_retain_pct.is_some() {
+                ctx.compact_retain_pct = next_compact_retain_pct;
+            }
         }
 
         // #866 / #871: `summary_model` and `summary_provider` are validated
@@ -485,8 +585,8 @@ pub async fn patch_settings(
         info!(
             strategy = %ctx.strategy,
             max_input_tokens = ctx.max_input_tokens,
-            recent_window = ctx.recent_window,
-            summary_interval = ctx.summary_interval,
+            compact_trigger_pct = ctx.compact_trigger_pct,
+            compact_retain_pct = ctx.compact_retain_pct,
             summary_provider = ?ctx.summary_provider,
             "Updated context config via PATCH /settings"
         );
@@ -700,6 +800,38 @@ pub async fn patch_settings(
 /// ignored on purpose: this guard is about the top-level
 /// [`PatchSettingsRequest::security`] surface, not arbitrary key
 /// matches.
+/// #869: reject deprecated `context.recent_window` / `context.summary_interval`
+/// fields on the PATCH wire. The TOML loader is soft (one-time WARN) because
+/// operators editing config files don't read 4xx responses; the HTTP
+/// surface is loud because scripted clients (cached UI bundles, automation)
+/// should fail fast and update.
+///
+/// Returns `Some(message)` when the payload's `context` object names
+/// either legacy field — even with a `null` value, mirroring the
+/// fail-closed posture of `reject_security_knob`. Returns `None` for
+/// payloads that don't carry a `context` block at all, or carry one that
+/// only references new fields.
+fn reject_legacy_context_fields(body: &serde_json::Value) -> Option<String> {
+    let ctx = body.as_object()?.get("context")?.as_object()?;
+    let mut offenders: Vec<&str> = Vec::new();
+    if ctx.contains_key("recent_window") {
+        offenders.push("recent_window");
+    }
+    if ctx.contains_key("summary_interval") {
+        offenders.push("summary_interval");
+    }
+    if offenders.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "context.{} is deprecated as of v0.2.4 — the threshold-based \
+         \"compact\" strategy uses compact_trigger_pct (0.50–0.95) and \
+         compact_retain_pct (0.20–0.60). Update your client to send the \
+         new fields. See #869.",
+        offenders.join(" / context.")
+    ))
+}
+
 fn reject_security_knob(body: &serde_json::Value) -> Option<String> {
     let obj = body.as_object()?;
     if !obj.contains_key("security") {
@@ -722,10 +854,12 @@ fn reject_security_knob(body: &serde_json::Value) -> Option<String> {
 /// via PATCH /settings are `Some`. Fields that are `None` fall through to
 /// code defaults / TOML / env-var overrides.
 ///
-/// Backward-compatible: old `settings.json` files that contain the full
-/// `ContextConfig` will deserialize with all fields set to `Some`, which
-/// is functionally equivalent to the old wholesale-replace behavior (but
-/// new persists will only write the patchable subset).
+/// Backward-compatible: old `settings.json` files predating #869 contain
+/// `recent_window` / `summary_interval` keys. Serde silently ignores
+/// unknown keys here, so those values deserialize away cleanly. The next
+/// PATCH writes the new shape (`compact_trigger_pct` / `compact_retain_pct`).
+/// `strategy = "sliding-summary"` is rewritten to `"compact"` on apply
+/// to mirror the deserialise-time rewrite in `ContextConfig`.
 #[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PersistedContextOverrides {
@@ -733,10 +867,14 @@ pub struct PersistedContextOverrides {
     pub strategy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<usize>,
+    /// #869: trigger compaction when assembled history exceeds this fraction
+    /// of `max_input_tokens`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub recent_window: Option<usize>,
+    pub compact_trigger_pct: Option<f32>,
+    /// #869: after compaction, retain at most this fraction of
+    /// `max_input_tokens` worth of recent verbatim messages.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary_interval: Option<usize>,
+    pub compact_retain_pct: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_model: Option<String>,
     /// Persisted summary provider override (#866).
@@ -756,16 +894,23 @@ impl PersistedContextOverrides {
     /// Only fields that are `Some` overwrite the target.
     pub fn apply_to(&self, ctx: &mut alms_core::config::ContextConfig) {
         if let Some(ref v) = self.strategy {
-            ctx.strategy = v.clone();
+            // #869: rewrite the legacy alias on apply so a `settings.json`
+            // written before #869 lands resolves to the new canonical name
+            // without round-tripping through `ContextConfig::Deserialize`.
+            ctx.strategy = if v == "sliding-summary" {
+                "compact".to_string()
+            } else {
+                v.clone()
+            };
         }
         if let Some(v) = self.max_input_tokens {
             ctx.max_input_tokens = v;
         }
-        if let Some(v) = self.recent_window {
-            ctx.recent_window = v;
+        if let Some(v) = self.compact_trigger_pct {
+            ctx.compact_trigger_pct = v;
         }
-        if let Some(v) = self.summary_interval {
-            ctx.summary_interval = v;
+        if let Some(v) = self.compact_retain_pct {
+            ctx.compact_retain_pct = v;
         }
         if self.summary_model.is_some() {
             ctx.summary_model = self.summary_model.clone();
@@ -996,8 +1141,9 @@ fn persist_settings(state: &AppState) {
         context: Some(PersistedContextOverrides {
             strategy: Some(ctx.strategy.clone()),
             max_input_tokens: Some(ctx.max_input_tokens),
-            recent_window: Some(ctx.recent_window),
-            summary_interval: Some(ctx.summary_interval),
+            // #869: persist the threshold-based knobs.
+            compact_trigger_pct: Some(ctx.compact_trigger_pct),
+            compact_retain_pct: Some(ctx.compact_retain_pct),
             summary_model: ctx.summary_model.clone(),
             summary_provider: ctx.summary_provider.clone(),
             // run_summary_mode and run_summary_budget are NOT exposed in
@@ -1107,8 +1253,10 @@ pub fn load_persisted_settings(data_dir: &Path) -> Option<PersistedSettings> {
 mod tests {
     use super::*;
 
-    /// Simulate the old settings.json format (full ContextConfig with all fields
-    /// present). Verify backward compatibility: all fields deserialize as `Some`.
+    /// Simulate the pre-#869 settings.json format (full ContextConfig with
+    /// `recent_window` / `summary_interval`). Verify backward compatibility:
+    /// the legacy fields are dropped silently from the struct (serde ignores
+    /// unknown keys at this layer), and the new fields fall back to `None`.
     #[test]
     fn backward_compat_old_settings_json_with_full_context_config() {
         let old_json = r#"{
@@ -1131,30 +1279,36 @@ mod tests {
             Some(alms_core::config::RunSummaryMode::Off)
         );
         assert_eq!(ctx.run_summary_budget, Some(2000));
+        // #869: legacy keys are silently dropped; the new keys default to None.
+        assert_eq!(ctx.compact_trigger_pct, None);
+        assert_eq!(ctx.compact_retain_pct, None);
     }
 
-    /// New settings.json format omits run_summary_mode and run_summary_budget.
-    /// Verify they deserialize as `None`.
+    /// New settings.json format carries the threshold-based knobs and
+    /// omits run_summary_mode / run_summary_budget.
     #[test]
     fn new_format_omits_non_patchable_fields() {
         let new_json = r#"{
             "context": {
                 "strategy": "truncate",
                 "max_input_tokens": 128000,
-                "recent_window": 20,
-                "summary_interval": 30
+                "compact_trigger_pct": 0.85,
+                "compact_retain_pct": 0.35
             }
         }"#;
         let persisted: PersistedSettings = serde_json::from_str(new_json).unwrap();
         let ctx = persisted.context.unwrap();
         assert_eq!(ctx.strategy, Some("truncate".into()));
         assert_eq!(ctx.max_input_tokens, Some(128_000));
+        assert_eq!(ctx.compact_trigger_pct, Some(0.85));
+        assert_eq!(ctx.compact_retain_pct, Some(0.35));
         // Non-patchable fields should be None
         assert_eq!(ctx.run_summary_mode, None);
         assert_eq!(ctx.run_summary_budget, None);
     }
 
     /// Context overrides with `None` fields should not overwrite the target.
+    /// #869: also pin the `"sliding-summary"` → `"compact"` rewrite on apply.
     #[test]
     fn context_overrides_apply_only_some_fields() {
         let mut ctx = alms_core::config::ContextConfig::default();
@@ -1170,7 +1324,8 @@ mod tests {
         };
         overrides.apply_to(&mut ctx);
 
-        assert_eq!(ctx.strategy, "sliding-summary");
+        // #869: alias rewritten to canonical name on apply.
+        assert_eq!(ctx.strategy, "compact");
         assert_eq!(ctx.max_input_tokens, 64_000);
         // These should be UNCHANGED from defaults
         assert_eq!(
@@ -1182,8 +1337,9 @@ mod tests {
             ctx.run_summary_budget, 2000,
             "run_summary_budget should not be overwritten when override is None"
         );
-        assert_eq!(ctx.recent_window, 20);
-        assert_eq!(ctx.summary_interval, 30);
+        // #869: defaults preserved when overrides leave the new knobs None.
+        assert_eq!(ctx.compact_trigger_pct, 0.80);
+        assert_eq!(ctx.compact_retain_pct, 0.40);
     }
 
     /// #866: `summary_provider` applies to ContextConfig when set in
@@ -1270,8 +1426,9 @@ mod tests {
             context: Some(PersistedContextOverrides {
                 strategy: Some("truncate".into()),
                 max_input_tokens: Some(128_000),
-                recent_window: Some(20),
-                summary_interval: Some(30),
+                // #869: threshold knobs replace recent_window / summary_interval.
+                compact_trigger_pct: Some(0.80),
+                compact_retain_pct: Some(0.40),
                 summary_model: None,
                 summary_provider: None,
                 run_summary_mode: None,
@@ -1290,6 +1447,10 @@ mod tests {
             !json.contains("run_summary_budget"),
             "Serialized JSON should not contain run_summary_budget"
         );
+        // #869: pin that the legacy keys never appear on the persistence
+        // wire — the persist function dropped them.
+        assert!(!json.contains("recent_window"), "JSON: {json}");
+        assert!(!json.contains("summary_interval"), "JSON: {json}");
     }
 
     /// Round-trip: serialize then deserialize preserves values.
@@ -1297,10 +1458,14 @@ mod tests {
     fn round_trip_serialization() {
         let original = PersistedSettings {
             context: Some(PersistedContextOverrides {
-                strategy: Some("sliding-summary".into()),
+                // #869: use "compact" + threshold knobs for the round-trip
+                // shape. The legacy "sliding-summary" + recent_window /
+                // summary_interval combo is covered by the
+                // `backward_compat_*` test above.
+                strategy: Some("compact".into()),
                 max_input_tokens: Some(64_000),
-                recent_window: Some(10),
-                summary_interval: Some(15),
+                compact_trigger_pct: Some(0.85),
+                compact_retain_pct: Some(0.35),
                 summary_model: Some("gpt-4o-mini".into()),
                 summary_provider: None,
                 run_summary_mode: None,
@@ -1325,8 +1490,10 @@ mod tests {
         let deserialized: PersistedSettings = serde_json::from_str(&json).unwrap();
 
         let ctx = deserialized.context.unwrap();
-        assert_eq!(ctx.strategy, Some("sliding-summary".into()));
+        assert_eq!(ctx.strategy, Some("compact".into()));
         assert_eq!(ctx.max_input_tokens, Some(64_000));
+        assert_eq!(ctx.compact_trigger_pct, Some(0.85));
+        assert_eq!(ctx.compact_retain_pct, Some(0.35));
         assert_eq!(ctx.summary_model, Some("gpt-4o-mini".into()));
         assert_eq!(ctx.run_summary_mode, None);
         assert_eq!(ctx.run_summary_budget, None);
@@ -2447,6 +2614,241 @@ mod tests {
             state.agent_config.read().anthropic_thinking_budget,
             4096,
             "the LLM mutation must have landed when no security key is named"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #869 — context strategy redesign + legacy-field rejection
+    // ─────────────────────────────────────────────────────────────────
+
+    /// `PATCH /settings` with the new `compact_trigger_pct` knob persists
+    /// the value into the live `AgentConfig` and round-trips through
+    /// `GET /settings`. Pins the new wire surface end-to-end.
+    #[tokio::test]
+    async fn test_patch_context_compact_trigger_pct_persists() {
+        use axum::response::IntoResponse;
+
+        // Re-seed to the canonical defaults — `settings_test_app_state`
+        // can pick up a stray `settings.json` from the cwd's `.alms/`
+        // directory, so we explicitly write the baseline before
+        // exercising the PATCH path.
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.context_config.compact_trigger_pct = 0.80;
+            cfg.context_config.compact_retain_pct = 0.40;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                compact_trigger_pct: Some(0.85),
+                compact_retain_pct: Some(0.30),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let cfg = state.agent_config.read();
+        assert_eq!(cfg.context_config.compact_trigger_pct, 0.85);
+        assert_eq!(cfg.context_config.compact_retain_pct, 0.30);
+    }
+
+    /// `PATCH /settings` with `context.recent_window` is rejected with
+    /// `400 CONTEXT_LEGACY_FIELD_DEPRECATED` so cached UI bundles or
+    /// scripted clients fail loud rather than silently no-op'ing.
+    #[tokio::test]
+    async fn test_patch_context_recent_window_rejected_with_400() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        // Seed a known baseline so the post-rejection assertion has a
+        // stable reference even if the cwd's settings.json carried
+        // something else into AppState construction.
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.context_config.compact_trigger_pct = 0.80;
+        }
+
+        let payload = serde_json::json!({
+            "context": { "recent_window": 5 }
+        });
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body.get("code").and_then(|v| v.as_str()),
+            Some("CONTEXT_LEGACY_FIELD_DEPRECATED"),
+            "expected the dedicated rejection code, got body: {body}"
+        );
+        // The live config must NOT have been mutated by a rejected request.
+        assert_eq!(
+            state.agent_config.read().context_config.compact_trigger_pct,
+            0.80,
+            "rejected legacy-field PATCH must not mutate the live config"
+        );
+    }
+
+    /// `summary_interval` triggers the same rejection as `recent_window`.
+    #[tokio::test]
+    async fn test_patch_context_summary_interval_rejected_with_400() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let payload = serde_json::json!({
+            "context": { "summary_interval": 30 }
+        });
+        let resp = patch_settings(axum::extract::State(state.clone()), Json(payload))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// `PATCH /settings` with `strategy = "sliding-summary"` is accepted
+    /// as a back-compat alias and rewritten to `"compact"` on commit. The
+    /// PATCH does NOT 4xx — internal automation that still sends the
+    /// legacy strategy name continues to work for one major version.
+    #[tokio::test]
+    async fn test_patch_context_sliding_summary_alias_accepted() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                strategy: Some("sliding-summary".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(state.agent_config.read().context_config.strategy, "compact");
+    }
+
+    /// Out-of-range trigger / retain values fail with a 422 and don't
+    /// mutate the live config. Pins the per-knob clamps from
+    /// `normalize_episodic` at the PATCH layer.
+    #[tokio::test]
+    async fn test_patch_context_compact_trigger_out_of_range_rejected() {
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.context_config.compact_trigger_pct = 0.80;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                compact_trigger_pct: Some(0.99),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        // Live config baseline preserved.
+        assert_eq!(
+            state.agent_config.read().context_config.compact_trigger_pct,
+            0.80
+        );
+    }
+
+    /// PR #1012 / Codex review: `PATCH /settings` that fails the
+    /// cross-field `retain + 0.10 <= trigger` gap check must not commit
+    /// either `compact_trigger_pct` or `compact_retain_pct` to live
+    /// config. Pre-fix, both writes landed before the gap check ran,
+    /// leaving the daemon serving runs with the invalid pair until a
+    /// later PATCH or a restart.
+    ///
+    /// Baseline: `(0.80, 0.40)` (gap = 0.40, ok).
+    /// Patch:    `(0.55, 0.50)` — gap = 0.05, fails the gap floor.
+    /// Expected: 422 with the gap error message AND live config still
+    /// at baseline (0.80, 0.40).
+    #[tokio::test]
+    async fn test_patch_context_gap_floor_failure_does_not_commit() {
+        use axum::body::to_bytes;
+        use axum::response::IntoResponse;
+
+        let mut state = settings_test_app_state();
+        let tmp = tempfile::tempdir().unwrap();
+        state.data_dir = tmp.path().to_path_buf();
+        {
+            let mut cfg = state.agent_config.write();
+            cfg.context_config.compact_trigger_pct = 0.80;
+            cfg.context_config.compact_retain_pct = 0.40;
+        }
+
+        let body = PatchSettingsRequest {
+            context: Some(PatchContext {
+                // Both per-knob ranges pass (trigger in [0.50, 0.95],
+                // retain in [0.20, 0.60]); only the gap fails.
+                compact_trigger_pct: Some(0.55),
+                compact_retain_pct: Some(0.50),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resp = patch_settings(
+            axum::extract::State(state.clone()),
+            Json(serde_json::to_value(&body).unwrap()),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        // Body carries the gap-floor error message.
+        let body_bytes = to_bytes(resp.into_body(), 65536).await.unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let errors = body_json["errors"].as_array().expect("errors array");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.as_str().unwrap_or("").contains("at least 0.10 below")),
+            "expected gap-floor error, got: {errors:?}"
+        );
+
+        // Live config UNCHANGED at baseline — neither knob committed.
+        let cfg = state.agent_config.read();
+        assert_eq!(
+            cfg.context_config.compact_trigger_pct, 0.80,
+            "compact_trigger_pct must not commit when gap check fails — partial mutation regression"
+        );
+        assert_eq!(
+            cfg.context_config.compact_retain_pct, 0.40,
+            "compact_retain_pct must not commit when gap check fails — partial mutation regression"
         );
     }
 

@@ -36,13 +36,18 @@ max_context_tokens = 256_000        # storage limit (>= context.max_input_tokens
 
 [context]
 # How to manage the context window sent to the LLM
-strategy = "truncate"               # truncate (default) | sliding-summary | full
+strategy = "truncate"               # truncate (default) | compact | full
 # Max tokens to send to LLM (should be < model context window)
 max_input_tokens = 128000
-# Number of recent messages to always keep in full
-recent_window = 20
-# How often to update the rolling summary (in messages, sliding-summary only)
-summary_interval = 30
+# When strategy = "compact": trigger compaction when history exceeds
+# this fraction of the EFFECTIVE history budget (max_input_tokens minus
+# the system / input / episodic / reserve overhead). Range: 0.50–0.95.
+# Default: 0.80.
+compact_trigger_pct = 0.80
+# When compaction fires, retain this fraction of the EFFECTIVE history
+# budget worth of recent verbatim messages. Range: 0.20–0.60.
+# Default: 0.40.
+compact_retain_pct = 0.40
 # Episodic memory: cross-session summary generation after each run
 # run_summary_mode = "llm"          # off | heuristic | llm (default)
 # run_summary_budget = 2000         # max tokens for episodic injection (hard cap: 15% of max_input_tokens)
@@ -149,7 +154,7 @@ ALMS originally hardcoded `take(50)` messages in the agent loop. No compression,
 └─────────────────────────────────────────────┘
 ```
 
-**Strategy: `sliding-summary`** (available, but the compiled default is `truncate` for simplicity; `sliding-summary` can be enabled via `alms.toml` or `ALMS_CONTEXT_STRATEGY` env var):
+**Strategy: `compact`** (renamed from `sliding-summary` in #869; available, but the compiled default is `truncate` for simplicity; `compact` can be enabled via `alms.toml` or `ALMS_CONTEXT_STRATEGY` env var):
 
 1. **Token counting**: Approximate token count for each message (`chars / 3` as rough estimate for mixed content, or `tiktoken`-style BPE if we add the dep). Track cumulative tokens.
 
@@ -158,11 +163,29 @@ ALMS originally hardcoded `take(50)` messages in the agent loop. No compression,
    - Reserve space for current input
    - Fill remaining budget: recent messages first (newest to oldest), then rolling summary
 
-3. **Rolling summary generation**: When message count crosses `summary_interval`:
-   - Take messages outside the recent window that aren't yet summarized
-   - Use a **cheap/fast model** (not the main agent model) to summarize them
-   - Store the summary as a special system-level entry in the session
-   - This is automatic, not visible to the user, and doesn't affect the full history
+3. **Threshold-triggered compaction (#869, refined PR #1012)**: When
+   the assembled history's token estimate crosses `compact_trigger_pct`
+   of the **effective history budget** (`max_input_tokens` minus the
+   system prompt, current input, episodic block, and the 1000-token
+   reserve `ContextBuilder` uses — i.e. the actual room available for
+   history; default `0.80 * effective_budget`):
+   - Walk the uncovered tail backwards collecting messages whose cumulative
+     tokens fit `compact_retain_pct * effective_budget` (default `0.40 *
+     effective_budget`); everything older is the compress range.
+   - Use a **cheap/fast model** (not the main agent model) to summarize the
+     compress range and extend the rolling summary entry on the session.
+   - This is automatic, not visible to the user, and doesn't affect the
+     full history. `messages_covered` on the persisted `ContextSummary`
+     advances to the new verbatim-tail boundary.
+   - The two knobs share a 0.10 minimum gap — `normalize_episodic` and
+     PATCH /settings reject combinations that would leave compaction
+     unable to measurably reduce context size.
+   - PR #1012 / Codex review: pre-fix, the trigger threshold was
+     calculated against raw `max_input_tokens` while the dispatch
+     `retain_budget` was clamped to the effective budget. With large
+     workspace prompts or episodic blocks, `build_compact` could start
+     dropping messages by token budget before `maybe_summarize` ever
+     fired. Both knobs now share the same effective-budget denominator.
 
 4. **Smart truncation of tool outputs**: Long tool results (e.g., HTTP responses) are truncated in the context window but preserved in full history. The context version says `[truncated: 45KB response, first 2KB shown]`.
 
@@ -174,9 +197,20 @@ ALMS originally hardcoded `take(50)` messages in the agent loop. No compression,
 - Summary updates happen after each run completes (background task, not blocking)
 
 **Available strategies** (selectable via `[context] strategy` in `alms.toml`):
-- `truncate` (default): simple tail of last N messages (no summarization, just drops old ones)
+- `truncate` (default): pure token-budget walk — keep the most recent messages that fit `max_input_tokens` (no summarization, just drops old ones)
+- `compact`: the smart option described above — once history crosses the trigger threshold, fold older messages into a rolling LLM summary and keep a token-bounded verbatim tail
 - `full`: send everything (for small conversations or cheap models)
-- `sliding-summary`: the smart option described above — uses LLM to compress old messages
+
+> **Migration callout (v0.2.4 / #869).** `recent_window` and
+> `summary_interval` are deprecated and ignored as of v0.2.4 — the
+> `compact` strategy is now driven by token thresholds. Configs that
+> still set them produce a one-time `WARN` at startup and the values
+> are dropped. The legacy `strategy = "sliding-summary"` is accepted as
+> an alias for `"compact"` and rewritten on load; rename it at your
+> convenience. The PATCH /settings surface is stricter — requests that
+> still send `context.recent_window` / `context.summary_interval`
+> receive `400 CONTEXT_LEGACY_FIELD_DEPRECATED` so cached UI bundles
+> fail fast and update.
 
 **Tool call persistence and context reconstruction:**
 Tool calls and their results are persisted to the session database as structured `Content::ToolCall` / `Content::ToolResult` messages. During context building, these are reconstructed into proper OpenAI-format LLM messages (assistant messages with `tool_calls` array, tool-role messages with `tool_call_id`). This means the LLM has full visibility of previous tool executions across runs — it knows what tools were called, with what parameters, and what results were returned.
@@ -301,7 +335,7 @@ Agents have no awareness of what happened in previous sessions. Each new session
 
 | System | Table | Scope | Purpose |
 |--------|-------|-------|---------|
-| **Context summaries** | `context_summaries` | Within a single session | Compress old messages so the current session fits in the context window. Used by `sliding-summary` strategy. |
+| **Context summaries** | `context_summaries` | Within a single session | Compress old messages so the current session fits in the context window. Used by the `compact` strategy (renamed from `sliding-summary` in #869). |
 | **Session summaries** | `session_summaries` | Cross-session | One summary per session, updated after each run. Injected into *other* sessions to provide cross-session awareness. |
 
 **How session summaries are generated:**
