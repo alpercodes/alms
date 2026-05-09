@@ -17,6 +17,7 @@ import { dmPeer } from '../../state/agent-status.js';
 import { scrollToBottom } from '../../utils/format.js';
 import { decorateCodeBlocks } from '../../utils/decorate-code-blocks.js';
 import { ToolRow } from './tool-row.js';
+import { ContextDebugRow } from './context-debug-row.js';
 import { MessageTimestamp } from './message.js';
 import { dmThinkingBuffers } from '../../hooks/use-session-stream.js';
 import { cancelDm } from '../../api/sessions.js';
@@ -322,6 +323,20 @@ export function DmConversationView() {
                 }
                 if (m.type === 'job_completed') {
                     return html`<${DmDivider} key=${m.id} text=${`Job '${m.jobName || 'job'}' ${m.status || 'completed'}`} />`;
+                }
+                if (m.type === 'context_debug') {
+                    // Debug-mode context-window snapshot. The runtime emits
+                    // one `context_debug` event per agent turn, and DM
+                    // sessions alternate turns between two agents on the
+                    // same session — the panel header carries `agentName`
+                    // (e.g. "Context sent to LLM (alpha)" vs "(beta)") so
+                    // back-to-back snapshots from the two perspectives stay
+                    // visually unambiguous. Without this branch the event
+                    // landed in `chatMessages` (via `use-session-stream.js`)
+                    // but the DM renderer dropped it on the floor, so the
+                    // PR's "DM sessions covered" acceptance criterion
+                    // didn't actually hold. (#1003 / Codex review on #1015)
+                    return html`<${ContextDebugRow} key=${m.id} ...${m} />`;
                 }
                 if (m.type === 'dm_reasoning') {
                     return html`<${DmReasoningBlock} key=${m.id} ...${m} />`;

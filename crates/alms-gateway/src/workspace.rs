@@ -394,6 +394,7 @@ mod open_tests {
             summary_provider: None,
             summary_model: None,
             worktree_mode: alms_core::WorktreeMode::Off,
+            debug_mode: false,
             is_default: false,
             created_at: now,
             last_active: now,

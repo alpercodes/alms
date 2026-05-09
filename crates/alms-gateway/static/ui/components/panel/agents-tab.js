@@ -12,6 +12,7 @@ import {
 } from '../../utils/model-display.js';
 import { normalizeAgentName, validateNormalizedAgentName } from '../../utils/agent-name.js';
 import { shouldActivateFromClick, shouldActivateFromKey } from '../../utils/card-activation.js';
+import { debugModePatchDelta } from '../../utils/debug-mode-patch.js';
 
 const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high'];
 
@@ -168,6 +169,21 @@ export function AgentEditModal({ agent, onClose }) {
     const summaryProvider = useSignal(agent.summary_provider || '');
     const summaryModel = useSignal(agent.summary_model || '');
 
+    // Per-agent Debug mode toggle (#1003). When enabled, the runtime
+    // emits a `context_debug` SSE event after building the context
+    // window for each turn so the UI can render the assembled message
+    // array (system prompt + workspace + episodic + history + tool
+    // definitions). Plain boolean — `false` IS the default / cleared
+    // state, so there's no `clear_*` sentinel; PATCH semantics are
+    // "send `Some(true)` to enable, `Some(false)` to disable, omit
+    // the field to leave alone".
+    //
+    // Pre-#1003 server bundles would not echo `debug_mode` on the wire;
+    // when the agent record predates the field, the JSON value is
+    // `undefined` and we coerce it to `false` for the form's initial
+    // state. The `!!` mirrors the `!!hasTelegram` shape lower down.
+    const debugMode = useSignal(!!agent.debug_mode);
+
     const saving = useSignal(false);
     const error = useSignal('');
 
@@ -275,6 +291,12 @@ export function AgentEditModal({ agent, onClose }) {
                 body.summary_model = draftSummaryModel;
             }
         }
+
+        // Debug mode (#1003). Plain boolean — only emitted when the
+        // form value differs from the live record. Diff is delegated
+        // to `debugModePatchDelta` so the helper is unit-testable
+        // without mounting the component.
+        Object.assign(body, debugModePatchDelta(agent.debug_mode, debugMode.value));
 
         return body;
     };
@@ -423,6 +445,27 @@ export function AgentEditModal({ agent, onClose }) {
                            onInput=${e => { summaryModel.value = e.target.value; }} />
                     <span class="settings-hint">
                         Model slug for the summary provider. Set together with Summary provider.
+                    </span>
+                </div>
+
+                <div class="agent-edit-section-divider"></div>
+                <div class="agent-edit-section-title">Debug</div>
+
+                <div class="settings-row">
+                    <label class="settings-label">Context-window inspection</label>
+                    <label class="settings-toggle">
+                        <input type="checkbox"
+                               checked=${debugMode.value}
+                               onChange=${e => { debugMode.value = e.target.checked; }} />
+                        <span>${debugMode.value ? 'enabled' : 'disabled'}</span>
+                    </label>
+                    <span class="settings-hint">
+                        When enabled, every turn emits a snapshot of the full assembled context window
+                        (system prompts, workspace, episodic memory, history, tool definitions, in the order
+                        the runtime sends them). The web UI renders the snapshot in a collapsible panel
+                        below the chat. Works for both webchat and DM sessions — for DMs, each turn shows
+                        the per-perspective context the agent currently being inspected sees.
+                        Per-agent. Takes effect on the next run; previous turns are not retroactively shown.
                     </span>
                 </div>
 

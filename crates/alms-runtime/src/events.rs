@@ -111,6 +111,14 @@ pub enum RuntimeEvent {
     /// Only emitted when `debug_mode` is enabled on the agent config.
     /// The gateway converts this to a `context_debug` SSE event so the
     /// web UI can display exactly what the LLM sees.
+    ///
+    /// Subagent emissions are suppressed by the coordinator
+    /// (`alms-coordinator/src/lib.rs`) — the parent's session stream
+    /// only carries `ContextDebug` events from the top-level agent's
+    /// turn. For DM sessions (#1003) the runtime emits one event per
+    /// turn carrying the perspective of whichever agent is about to
+    /// run, with `agent_id` / `agent_name` populated so the UI can
+    /// attribute the snapshot to the correct DM participant.
     ContextDebug {
         /// The assembled messages array (system prompt, history, user input).
         messages: Value,
@@ -122,6 +130,22 @@ pub enum RuntimeEvent {
         system_tokens: usize,
         /// Number of history messages included in the context.
         history_message_count: usize,
+        /// UUID of the agent whose perspective produced this context.
+        ///
+        /// Always populated. For DM sessions the field lets the UI
+        /// attribute the panel to the correct participant (a single DM
+        /// session sees one `ContextDebug` per turn, alternating
+        /// between the two agents). For webchat sessions this is
+        /// just the active agent's id — informational only, since
+        /// there's only one possible source.
+        agent_id: String,
+        /// Human-readable name of the agent (`AgentRuntime::agent_name`).
+        ///
+        /// `None` for unnamed runtimes (legacy in-memory tests). When
+        /// `Some(name)`, the UI uses it as the panel header label.
+        /// Wire-shape compat: `None` is serialised as
+        /// `agent_name: null`, which the UI falls back to "agent" for.
+        agent_name: Option<String>,
     },
 }
 
@@ -288,6 +312,8 @@ mod tests {
             total_tokens: 150,
             system_tokens: 100,
             history_message_count: 0,
+            agent_id: "00000000-0000-0000-0000-000000000001".to_string(),
+            agent_name: Some("alpha".to_string()),
         })
         .unwrap();
 
@@ -301,12 +327,16 @@ mod tests {
                 total_tokens,
                 system_tokens,
                 history_message_count,
+                agent_id,
+                agent_name,
             } => {
                 assert_eq!(m, messages);
                 assert_eq!(tool_names, vec!["shell_exec", "fs_read"]);
                 assert_eq!(total_tokens, 150);
                 assert_eq!(system_tokens, 100);
                 assert_eq!(history_message_count, 0);
+                assert_eq!(agent_id, "00000000-0000-0000-0000-000000000001");
+                assert_eq!(agent_name.as_deref(), Some("alpha"));
             }
             _ => panic!("Expected ContextDebug event"),
         }

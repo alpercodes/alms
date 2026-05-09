@@ -322,6 +322,33 @@ mod config {
             if let Some(ref model) = record.summary_model {
                 cfg.context_config.summary_model = Some(model.clone());
             }
+            // Per-agent debug-mode toggle (#1003). The agent record's
+            // `debug_mode` is the single source of truth — it lands on
+            // the resolved config so the runtime emits a `ContextDebug`
+            // event on each turn. PATCH-mutable via
+            // `PATCH /agents/{id}` so flipping the flag at run-time
+            // takes effect on the next run without a restart. Note:
+            // the system-triggered notification debug-flip in
+            // `lifecycle::execute_run` (#546) runs AFTER this merge
+            // and may force `debug_mode = true` for notification runs
+            // landing on a user-facing session even when the agent
+            // record has it off.
+            //
+            // Merge is monotonic-on (`if true { cfg = true }`) rather
+            // than symmetric (`cfg = record.debug_mode || cfg`) by
+            // design: there is no server-level `debug_mode` knob today,
+            // but if one is added in the future the per-agent default
+            // (`false`) must NOT clobber a server-side `true` back to
+            // false. The default-false per-agent value is therefore a
+            // no-op rather than an explicit-disable, and pinning this
+            // is what `test_per_agent_debug_mode_false_does_not_clobber_server_default`
+            // guards against regression on. If `debug_mode` ever grows
+            // a third state ("explicitly off"), revisit this merge —
+            // `Option<bool>` with a clear-sentinel like #809's
+            // reasoning knobs would be the natural shape.
+            if record.debug_mode {
+                cfg.debug_mode = true;
+            }
         }
 
         // Apply per-agent provider override first (changes base_url +
@@ -524,6 +551,7 @@ mod tests {
             summary_provider: None,
             summary_model: None,
             worktree_mode: alms_core::WorktreeMode::Off,
+            debug_mode: false,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -2026,6 +2054,82 @@ mod tests {
             snapshot.thinking_budget_tokens, 0,
             "per-agent Some(0) must surface as a literal 0 in the snapshot, \
              confirming the disable reached the wire"
+        );
+    }
+
+    // ===================================================================
+    // #1003 — Per-agent debug_mode merge through resolve_agent_config
+    //
+    // The agent record's `debug_mode` flag must reach the resolved
+    // `AgentConfig.debug_mode` so the runtime's `if self.config.debug_mode`
+    // gate fires and the `ContextDebug` event is emitted on the next
+    // turn. Two pinned cells: per-agent `true` overrides a server-default
+    // `false`, and per-agent `false` doesn't accidentally clobber a
+    // server-level `true` (the system-triggered notification debug-flip
+    // in `lifecycle::execute_run` runs AFTER this merge, but a future
+    // refactor that introduced a server-level debug knob would land
+    // here first — pinning the asymmetry now means the merge stays
+    // "monotonic on": we OR per-agent into the server default, never
+    // override it back to false).
+    // ===================================================================
+
+    #[test]
+    fn test_per_agent_debug_mode_true_lands_on_resolved_config() {
+        let mut record = test_agent(None, None);
+        record.is_default = true;
+        record.debug_mode = true; // per-agent enable
+        let mgr = manager_with_agent(&record);
+        let base = AgentConfig {
+            debug_mode: false, // server default
+            ..base_config()
+        };
+        let server_llm = server_default_llm("any-model");
+        let secrets = empty_secrets();
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent debug_mode = true");
+
+        assert!(
+            resolved.agent_config.debug_mode,
+            "per-agent debug_mode = true must reach resolved AgentConfig.debug_mode \
+             so the runtime's emit gate fires"
+        );
+
+        // Belt-and-braces: the layered run-config snapshot (#837) also
+        // surfaces the effective value, so triage tooling sees the
+        // post-merge state for runs by this agent.
+        let snapshot = build_resolved_config(&resolved.agent_config, &resolved.llm);
+        assert!(
+            snapshot.debug_mode,
+            "per-agent debug_mode = true must surface in the persisted run snapshot"
+        );
+    }
+
+    #[test]
+    fn test_per_agent_debug_mode_false_does_not_clobber_server_default() {
+        // Defensive: if a future refactor introduced a server-level
+        // debug knob, the per-agent merge must not flip it OFF when
+        // the per-agent value is `false` (the default). The merge is
+        // "OR per-agent into server default" — `record.debug_mode = false`
+        // is the cleared / default state and must be a no-op.
+        let mut record = test_agent(None, None);
+        record.is_default = true;
+        record.debug_mode = false; // explicit per-agent disable
+        let mgr = manager_with_agent(&record);
+        let base = AgentConfig {
+            debug_mode: true, // hypothetical server-level enable
+            ..base_config()
+        };
+        let server_llm = server_default_llm("any-model");
+        let secrets = empty_secrets();
+
+        let resolved = resolve_agent_config(record.id, &mgr, &base, &server_llm, Some(&secrets))
+            .expect("success path: per-agent debug_mode = false");
+
+        assert!(
+            resolved.agent_config.debug_mode,
+            "server-default debug_mode = true must survive the per-agent merge \
+             when the per-agent value is the default-false; merge is monotonic on"
         );
     }
 

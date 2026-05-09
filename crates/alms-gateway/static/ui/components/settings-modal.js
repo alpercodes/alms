@@ -2,11 +2,14 @@ import { html, useSignal, useEffect } from '../deps.js';
 import { serverDefaults, refreshServerDefaults } from '../state/settings.js';
 import { patchSettings } from '../api/settings.js';
 import { listKeys, setKey, removeKey } from '../api/auth.js';
+import { agents, activeAgentId } from '../state/agents.js';
+import { updateAgent, listAgents } from '../api/agents.js';
 import {
     MODEL_SUGGESTIONS,
     ModelDisplay,
     formatProviderLabel,
 } from '../utils/model-display.js';
+import { debugModePatchDelta } from '../utils/debug-mode-patch.js';
 
 const PROVIDERS = ['openai', 'anthropic', 'openrouter', 'gemini'];
 
@@ -220,6 +223,24 @@ export function SettingsModal({ open, onClose }) {
     const llmGeminiCacheTouched = useSignal(false);
     const llmGeminiCacheTtl = useSignal('');
 
+    // Debug section (#1003) — per-agent context-window inspection
+    // toggle. Settings modal is server-level otherwise, but Debug is
+    // intentionally per-agent: it controls what the runtime emits
+    // for a specific agent's turns, and operators want a single
+    // discoverable place to flip it for the agent they're chatting
+    // with. The toggle writes through to the active agent's record
+    // via PATCH /agents/{id}; the AgentEditModal exposes the same
+    // field per-agent for fleets where multiple agents need
+    // independent settings.
+    //
+    // Initialised from the active agent's stored value when the
+    // modal opens; only PATCHed on Apply (not on every keystroke)
+    // for parity with the rest of the modal. The `touched` flag
+    // suppresses no-op PATCHes — a user opening the modal without
+    // toggling shouldn't trigger a network round-trip.
+    const debugMode = useSignal(false);
+    const debugModeTouched = useSignal(false);
+
     // Feedback for server settings save
     const serverSaving = useSignal(false);
     const serverError = useSignal('');
@@ -274,6 +295,17 @@ export function SettingsModal({ open, onClose }) {
             llmGeminiCacheTouched.value = false;
             llmGeminiCacheTtl.value = llmGem.cache_ttl_seconds != null
                 ? String(llmGem.cache_ttl_seconds) : '';
+
+            // Debug section (#1003) — populate from the active agent's
+            // stored `debug_mode`. `agents.value.find(...)` returns
+            // `undefined` when the active agent hasn't been resolved
+            // yet (e.g. first paint before /agents has returned);
+            // coercion through `!!` lands on `false` in that case so
+            // the toggle starts in the "disabled" position rather
+            // than indeterminate.
+            const active = agents.value.find(a => a.id === activeAgentId.value);
+            debugMode.value = !!(active && active.debug_mode);
+            debugModeTouched.value = false;
 
             saved.value = false;
             serverError.value = '';
@@ -439,8 +471,47 @@ export function SettingsModal({ open, onClose }) {
             }
         }
 
-        // Show success feedback.
-        saved.value = true;
+        // Debug section (#1003). Per-agent — runs through the
+        // `PATCH /agents/{id}` endpoint instead of `PATCH /settings`.
+        // Only fires when the user actually toggled the switch
+        // (`debugModeTouched`) AND the diff helper says the value
+        // changed, so opening + closing the modal without touching
+        // Debug never PATCHes the agent. The same helper is used by
+        // the AgentEditModal — both surfaces share the wire shape.
+        if (debugModeTouched.value && activeAgentId.value) {
+            const active = agents.value.find(a => a.id === activeAgentId.value);
+            const stored = active && active.debug_mode;
+            const delta = debugModePatchDelta(stored, debugMode.value);
+            if (Object.keys(delta).length > 0) {
+                try {
+                    await updateAgent(activeAgentId.value, delta);
+                    // Refresh the agents list so the new value is
+                    // visible in the AgentEditModal too without a
+                    // page reload.
+                    const data = await listAgents();
+                    if (data && Array.isArray(data.agents)) {
+                        agents.value = data.agents;
+                    }
+                } catch (err) {
+                    serverError.value = err.error?.message
+                        || err.message
+                        || 'Failed to save debug mode';
+                }
+            }
+        }
+
+        // Show success feedback only when no save path set an error.
+        // Pre-#1015 this flipped to `Saved!` unconditionally even when
+        // `patchSettings` rejected — fine in practice because the close
+        // timer below was gated on `!serverError.value`, so the modal
+        // stayed open with the error visible. With #1015's per-agent
+        // Debug PATCH bolted onto the same handler, an `updateAgent`
+        // failure now also reaches this line, and Codex flagged the
+        // "Saved! beneath a red error" pairing as misleading. Gating on
+        // `!serverError.value` covers both paths with one edit.
+        if (!serverError.value) {
+            saved.value = true;
+        }
         serverSaving.value = false;
 
         // Close after brief feedback, unless there was a server error
@@ -471,6 +542,36 @@ export function SettingsModal({ open, onClose }) {
                      edited from the Agents panel; server defaults are
                      edited below and propagate to the next run via
                      PATCH /settings. -->
+
+                <!-- Debug (per-agent, #1003) — context-window inspection
+                     toggle for the currently-active agent. PATCHes
+                     /agents/{active}, not /settings. The full per-agent
+                     config surface lives in the Agents panel; this row
+                     is mirrored here as a discoverable shortcut for
+                     the most common Debug-mode flow. -->
+                <${Section} key="debug" title="Debug" defaultOpen=${false}>
+                    <span class="settings-hint settings-section-desc">
+                        Per-agent context-window inspection. When enabled, every turn from the active agent
+                        emits a snapshot of the full assembled LLM context (system prompts, workspace,
+                        episodic memory, history, tool definitions). Works for both webchat and DM sessions —
+                        for DMs, each turn shows the per-perspective context the agent currently being
+                        inspected sees on its turn. Takes effect on the next run; previous turns are not
+                        retroactively shown.
+                    </span>
+                    <${EditRow} label="Debug mode (active agent)"
+                        desc="Mirrors the per-agent toggle in the Agents panel. Applies only to the currently-selected agent.">
+                        <label class="settings-toggle">
+                            <input type="checkbox"
+                                   checked=${debugMode.value}
+                                   disabled=${!activeAgentId.value}
+                                   onChange=${e => {
+                                       debugMode.value = e.target.checked;
+                                       debugModeTouched.value = true;
+                                   }} />
+                            <span>${debugMode.value ? 'enabled' : 'disabled'}</span>
+                        </label>
+                    <//>
+                <//>
 
                 <!-- Context (server-level, editable) -->
                 <${Section} key="ctx" title="Context" defaultOpen=${false}>

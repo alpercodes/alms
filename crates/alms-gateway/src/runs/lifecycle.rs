@@ -861,8 +861,10 @@ pub(super) async fn execute_run(state: AppState, params: RunParams) {
     // (#546 — debug_mode for notification runs)
     //
     // The flip happens before the snapshot is taken so the persisted
-    // `resolved_config.debug_mode` reflects the value the runtime actually
-    // uses, not the raw per-run override.
+    // `resolved_config.debug_mode` reflects the value the runtime
+    // actually uses, including this notification-flip — not just the
+    // raw per-agent record value. (Per-run overrides for `debug_mode`
+    // were removed in the #941 pivot.)
     let agent_config = if is_system_triggered
         && !is_peer_message
         && !is_internal_context_id(&context_id)

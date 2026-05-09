@@ -30,8 +30,9 @@ impl SqliteStore {
             "INSERT INTO agents \
              (id, name, description, model, posture, provider, telegram_token, \
               is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-              gemini_thinking_budget, summary_provider, summary_model, worktree_mode) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              gemini_thinking_budget, summary_provider, summary_model, worktree_mode, \
+              debug_mode) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 agent.id.0.to_string(),
                 &agent.name,
@@ -49,6 +50,7 @@ impl SqliteStore {
                 agent.summary_provider.as_deref(),
                 agent.summary_model.as_deref(),
                 agent.worktree_mode.as_wire_str(),
+                agent.debug_mode as i32,
             ],
         )
         .map_err(|e| AlmsError::Runtime(format!("SQLite create_agent_if_none_exist: {e}")))?;
@@ -66,8 +68,9 @@ impl SqliteStore {
                 "INSERT INTO agents \
                  (id, name, description, model, posture, provider, telegram_token, \
                   is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-                  gemini_thinking_budget, summary_provider, summary_model, worktree_mode) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                  gemini_thinking_budget, summary_provider, summary_model, worktree_mode, \
+                  debug_mode) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 params![
                     agent.id.0.to_string(),
                     &agent.name,
@@ -85,6 +88,7 @@ impl SqliteStore {
                     agent.summary_provider.as_deref(),
                     agent.summary_model.as_deref(),
                     agent.worktree_mode.as_wire_str(),
+                    agent.debug_mode as i32,
                 ],
             )
             .map_err(|e| match &e {
@@ -112,7 +116,8 @@ impl SqliteStore {
                  thinking_budget_tokens = ?6, reasoning_effort = ?7, \
                  gemini_thinking_budget = ?8, summary_provider = ?9, \
                  summary_model = ?10, worktree_mode = ?11, \
-                 last_active = ?12 WHERE id = ?13",
+                 debug_mode = ?12, \
+                 last_active = ?13 WHERE id = ?14",
                 params![
                     &agent.description,
                     agent.model.as_deref(),
@@ -125,6 +130,7 @@ impl SqliteStore {
                     agent.summary_provider.as_deref(),
                     agent.summary_model.as_deref(),
                     agent.worktree_mode.as_wire_str(),
+                    agent.debug_mode as i32,
                     agent.last_active.to_rfc3339(),
                     agent.id.0.to_string(),
                 ],
@@ -142,7 +148,8 @@ impl SqliteStore {
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-             gemini_thinking_budget, summary_provider, summary_model, worktree_mode \
+             gemini_thinking_budget, summary_provider, summary_model, worktree_mode, \
+             debug_mode \
              FROM agents WHERE id = ?1",
             params![id.0.to_string()],
             parse_agent_row,
@@ -160,7 +167,8 @@ impl SqliteStore {
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-             gemini_thinking_budget, summary_provider, summary_model, worktree_mode \
+             gemini_thinking_budget, summary_provider, summary_model, worktree_mode, \
+             debug_mode \
              FROM agents WHERE name = ?1",
             params![name],
             parse_agent_row,
@@ -180,7 +188,8 @@ impl SqliteStore {
         let result = conn.query_row(
             "SELECT id, name, description, model, posture, provider, telegram_token, \
              is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-             gemini_thinking_budget, summary_provider, summary_model, worktree_mode \
+             gemini_thinking_budget, summary_provider, summary_model, worktree_mode, \
+             debug_mode \
              FROM agents WHERE is_default = 1 LIMIT 1",
             [],
             parse_agent_row,
@@ -199,7 +208,8 @@ impl SqliteStore {
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
                  is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-                 gemini_thinking_budget, summary_provider, summary_model, worktree_mode \
+                 gemini_thinking_budget, summary_provider, summary_model, worktree_mode, \
+                 debug_mode \
                  FROM agents ORDER BY created_at",
             )
             .map_err(|e| AlmsError::Runtime(format!("SQLite prepare agents: {e}")))?;
@@ -228,7 +238,8 @@ impl SqliteStore {
             .prepare(
                 "SELECT id, name, description, model, posture, provider, telegram_token, \
                  is_default, created_at, last_active, thinking_budget_tokens, reasoning_effort, \
-                 gemini_thinking_budget, summary_provider, summary_model, worktree_mode \
+                 gemini_thinking_budget, summary_provider, summary_model, worktree_mode, \
+                 debug_mode \
                  FROM agents WHERE telegram_token IS NOT NULL AND telegram_token != '' \
                  ORDER BY created_at",
             )
@@ -430,6 +441,7 @@ mod tests {
             summary_provider: None,
             summary_model: None,
             worktree_mode: alms_core::WorktreeMode::Off,
+            debug_mode: false,
             is_default: false,
             created_at: chrono::Utc::now(),
             last_active: chrono::Utc::now(),
@@ -1465,6 +1477,46 @@ mod tests {
         let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
         assert!(loaded.summary_provider.is_none());
         assert!(loaded.summary_model.is_none());
+    }
+
+    #[test]
+    fn test_agent_debug_mode_roundtrip() {
+        // Issue #1003: per-agent debug_mode survives create -> load ->
+        // update -> load -> update -> load. Default for fresh agents is
+        // `false` (matches the schema's `NOT NULL DEFAULT 0`); flipping
+        // to `true` and back to `false` both round-trip cleanly through
+        // the SQLite INTEGER column.
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let mut agent = new_agent("debugger");
+        store.create_agent(&agent).unwrap();
+
+        // Default for fresh agents is `false`.
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(
+            !loaded.debug_mode,
+            "fresh agents must default to debug_mode = false"
+        );
+
+        // Flip to `true` and verify it round-trips.
+        agent = loaded;
+        agent.debug_mode = true;
+        store.update_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(
+            loaded.debug_mode,
+            "debug_mode = true must round-trip through update_agent"
+        );
+
+        // Flip back to `false`.
+        agent = loaded;
+        agent.debug_mode = false;
+        store.update_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(
+            !loaded.debug_mode,
+            "debug_mode = false must round-trip through update_agent"
+        );
     }
 
     #[test]

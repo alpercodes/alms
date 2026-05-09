@@ -189,6 +189,33 @@ pub struct AgentRecord {
     /// `[security].allow_full_os_access`.
     #[serde(default)]
     pub worktree_mode: WorktreeMode,
+    /// Per-agent context-window inspection toggle (#1003).
+    ///
+    /// When `true`, the runtime emits a `ContextDebug` runtime event
+    /// after building the context window for each turn. The gateway
+    /// converts this to a `context_debug` SSE event so the web UI can
+    /// render the assembled message array (system prompt + workspace +
+    /// episodic + history + tool definitions, in the order the runtime
+    /// sends them). The event is ephemeral — it is not persisted to
+    /// the in-memory event log and is not replayed on SSE reconnect.
+    ///
+    /// PATCH-mutable via `PATCH /agents/{id}` — flipping the flag at
+    /// run-time takes effect on the next run without restart. Subagents
+    /// do NOT inherit the flag: the coordinator hardcodes
+    /// `debug_mode: false` on the resolved config it constructs for each
+    /// subagent, and as a belt-and-braces second layer it filters
+    /// `RuntimeEvent::ContextDebug` out of the forwarded subagent
+    /// event stream. The user-facing rationale is that the parent's
+    /// debug panel is already collecting the parent's context window;
+    /// surfacing subagent debug panels mid-stream would interleave two
+    /// independent context windows in a single chat view with no clean
+    /// way to disambiguate them.
+    ///
+    /// This is a developer / operator inspection knob, not a config
+    /// override of any kind — it never affects what the LLM receives,
+    /// only what is mirrored to the UI for triage. Default: `false`.
+    #[serde(default)]
+    pub debug_mode: bool,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub last_active: DateTime<Utc>,
@@ -236,6 +263,11 @@ pub struct CreateAgentRequest {
     /// WORKTREE_REQUIRES_GIT` and the agent is NOT persisted.
     #[serde(default)]
     pub worktree_mode: Option<WorktreeMode>,
+    /// Per-agent debug-mode toggle (#1003). `None` is treated as
+    /// `false` for back-compat with clients that predate the field.
+    /// See [`AgentRecord::debug_mode`] for semantics.
+    #[serde(default)]
+    pub debug_mode: Option<bool>,
     #[serde(default)]
     pub is_default: Option<bool>,
 }
@@ -345,6 +377,15 @@ pub struct UpdateAgentRequest {
     /// contents AND deletes the `alms/<name>` branch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub force_worktree_remove: Option<bool>,
+    /// Per-agent debug-mode toggle (#1003). `Some(true)` enables the
+    /// context-window inspection panel for this agent on the next run;
+    /// `Some(false)` disables it. Omitting the field leaves the
+    /// existing value unchanged. See [`AgentRecord::debug_mode`] for
+    /// semantics. Empty-string sentinel and `clear_*` boolean are
+    /// intentionally not offered — `false` is itself the cleared /
+    /// default state, so the wire shape is the value field alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debug_mode: Option<bool>,
 }
 
 /// Validate an agent name slug.

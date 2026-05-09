@@ -430,6 +430,12 @@ pub(crate) fn agent_create(store: &SqliteStore, opts: AgentCreateOpts<'_>) -> an
         summary_provider,
         summary_model,
         worktree_mode,
+        // Debug mode (#1003) is operator-flippable via PATCH /agents/{id}
+        // (or the per-agent edit modal in the web UI) — `alms agent
+        // create` lands the record with `false` so existing CLI
+        // workflows are unaffected. Operators who want it enabled
+        // flip it after creation just like every other mutable knob.
+        debug_mode: false,
         is_default: default,
         created_at: now,
         last_active: now,
@@ -1165,6 +1171,7 @@ mod tests {
             summary_provider: None,
             summary_model: None,
             worktree_mode: WorktreeMode::Off,
+            debug_mode: false,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -1663,6 +1670,7 @@ mod tests {
             summary_provider: Some("openrouter".to_string()),
             summary_model: Some("minimax/minimax-m2.7".to_string()),
             worktree_mode: WorktreeMode::Off,
+            debug_mode: false,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -1817,6 +1825,7 @@ mod tests {
             summary_provider: Some("openrouter".to_string()),
             summary_model: Some("minimax/minimax-m2.7".to_string()),
             worktree_mode: WorktreeMode::Off,
+            debug_mode: false,
             is_default: false,
             created_at: now,
             last_active: now,

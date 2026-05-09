@@ -85,7 +85,11 @@ pub struct ResolvedRunConfig {
     /// Effective `debug_mode` flag. Reflects the value the runtime actually
     /// uses, including the system-triggered notification-run flip
     /// (#546) — i.e. the post-flip, post-bootstrap value, not the raw
-    /// per-run override.
+    /// per-agent record value (which the #546 flip can override to
+    /// `true` for notification runs landing on user-facing sessions).
+    /// Per-run overrides for `debug_mode` were removed in the #941 pivot
+    /// — the per-agent record is now the only operator-facing input
+    /// into this field.
     pub debug_mode: bool,
     /// Effective Anthropic extended-thinking budget in tokens (#767).
     /// `0` means extended thinking is disabled for this run; non-zero is

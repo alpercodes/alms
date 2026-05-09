@@ -1045,6 +1045,15 @@ export function openSessionStream(sessionId, opts) {
     });
 
     // -- context_debug: full context window snapshot (debug mode) --
+    //
+    // #1003: the event now carries `agent_id` and `agent_name` so the
+    // UI can attribute the panel to the specific agent whose turn
+    // produced the snapshot. This matters most for DM sessions where
+    // two agents alternate turns on the same session and each emits
+    // their own per-perspective context window — without attribution,
+    // back-to-back panels are indistinguishable. `agent_name` is
+    // optional on the wire (legacy unnamed runtimes serialise it as
+    // `null`); the renderer falls back to "agent" in that case.
     on('context_debug', (e) => {
         batch(() => {
             const data = JSON.parse(e.data);
@@ -1056,6 +1065,8 @@ export function openSessionStream(sessionId, opts) {
                 totalTokens: data.total_tokens,
                 systemTokens: data.system_tokens,
                 historyMessageCount: data.history_message_count,
+                agentId: data.agent_id,
+                agentName: data.agent_name,
             });
         });
     });

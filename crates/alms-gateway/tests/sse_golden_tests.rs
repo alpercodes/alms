@@ -156,6 +156,8 @@ async fn test_event_sequence_with_debug_mode() {
         1200,
         400,
         2,
+        "00000000-0000-0000-0000-000000000abc".to_string(),
+        Some("alpha".to_string()),
     ))
     .unwrap();
     tx.send(SseEventData::token_delta(run_id, "Hi there!", None))
@@ -188,6 +190,14 @@ async fn test_event_sequence_with_debug_mode() {
     assert_eq!(debug_data["history_message_count"], 2);
     assert_eq!(debug_data["tool_names"].as_array().unwrap().len(), 2);
     assert_eq!(debug_data["messages"].as_array().unwrap().len(), 2);
+    // #1003: agent attribution must reach the wire so the UI can label
+    // the panel correctly — especially important on DM sessions where
+    // two agents alternate turns on the same session.
+    assert_eq!(
+        debug_data["agent_id"],
+        "00000000-0000-0000-0000-000000000abc"
+    );
+    assert_eq!(debug_data["agent_name"], "alpha");
     assert!(
         debug_data["ts"].is_string(),
         "ts should be a string timestamp"

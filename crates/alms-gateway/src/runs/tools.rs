@@ -292,6 +292,8 @@ pub(super) async fn forward_runtime_events(
                 total_tokens,
                 system_tokens,
                 history_message_count,
+                agent_id,
+                agent_name,
             } => {
                 run_manager
                     .send_event(
@@ -304,6 +306,8 @@ pub(super) async fn forward_runtime_events(
                             total_tokens,
                             system_tokens,
                             history_message_count,
+                            agent_id,
+                            agent_name,
                         ),
                     )
                     .await;

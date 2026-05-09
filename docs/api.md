@@ -945,6 +945,7 @@ Named agents are persistent entities stored in SQLite. Each agent has a unique s
       "description": "",
       "model": null,
       "posture": null,
+      "debug_mode": false,
       "is_default": true,
       "created_at": "2026-03-12T...",
       "last_active": "2026-03-12T..."
@@ -952,6 +953,10 @@ Named agents are persistent entities stored in SQLite. Each agent has a unique s
   ]
 }
 ```
+
+`debug_mode` (#1003) is a per-agent toggle that enables a `context_debug` SSE event on each turn so the web UI can render the full assembled LLM context window in a dedicated panel. PATCH-mutable; not a config override of any kind — it never affects what the LLM receives, only what is mirrored to the UI for triage.
+
+> **CLI note.** `alms agent create` does not expose a `--debug-mode` flag — agents are always created with `debug_mode = false`. Operators flip the flag after creation via `PATCH /agents/{id}` (or the per-agent edit modal / Settings modal in the web UI), the same way every other PATCH-mutable knob is toggled. Debug mode is a triage tool, not a creation-time decision.
 
 ### 9.2 Create agent
 `POST /agents`
@@ -990,7 +995,8 @@ Path parameter accepts either a UUID or a name slug. UUID is tried first.
 {
   "description": "Updated description",
   "model": "new-model",
-  "posture": "guarded"
+  "posture": "guarded",
+  "debug_mode": true
 }
 ```
 
@@ -1030,6 +1036,15 @@ server default from `[llm.anthropic]` / `[llm.openai]` / `[llm.gemini]`,
 completing the two-layer precedence chain (per-agent > server default).
 Per-run overrides were removed in the #941 pivot; agents are the single
 per-tenant config surface.
+
+**Debug mode (#1003).** `debug_mode` is a plain `bool` (not `Option<bool>`), so
+no `clear_*` sentinel is needed — `false` is itself the cleared / default
+state. Send `"debug_mode": true` to enable the `context_debug` SSE event
+emission for this agent's runs (web UI renders the full assembled context
+window in a dedicated panel); send `"debug_mode": false` to disable; omit
+the field to leave the existing value unchanged. Works for both webchat
+and DM sessions — for DMs, the snapshot reflects the per-perspective
+context the agent currently being inspected sees on its turn.
 
 **Response 200** — updated `AgentRecord`
 **Response 400 CLEAR_AND_VALUE_CONFLICT** — both a value and the matching `clear_*` flag were sent for the same reasoning knob.

@@ -119,7 +119,8 @@ CREATE TABLE IF NOT EXISTS agents (
     gemini_thinking_budget INTEGER,
     summary_provider       TEXT,
     summary_model          TEXT,
-    worktree_mode          TEXT
+    worktree_mode          TEXT,
+    debug_mode             INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_is_default ON agents(is_default);
@@ -249,6 +250,15 @@ impl SqliteStore {
         // backward-compatible — agents created before #946 keep their
         // project-root sandbox without any operator action.
         let _ = conn.execute_batch("ALTER TABLE agents ADD COLUMN worktree_mode TEXT;");
+        // Auto-migrate: add debug_mode column for per-agent context-window
+        // inspection toggle (issue #1003). Existing rows default to `0`
+        // (disabled) — Debug mode was previously a per-run override that
+        // was removed in #941; restoring it on the agent record means
+        // agents created before #1003 keep their pre-#1003 behaviour
+        // (no context_debug SSE event emitted) without any operator
+        // action. NOT NULL DEFAULT 0 matches the schema for new DBs.
+        let _ = conn
+            .execute_batch("ALTER TABLE agents ADD COLUMN debug_mode INTEGER NOT NULL DEFAULT 0;");
         // Auto-migrate: add run_tool_calls table for per-run tool call storage.
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS run_tool_calls (\
@@ -529,6 +539,12 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
             }
         },
     };
+    // Per-agent debug-mode toggle (issue #1003). Stored as INTEGER
+    // (0 / 1); NULL is impossible because the column is `NOT NULL
+    // DEFAULT 0` on both fresh schemas and ALTER-TABLE-migrated rows.
+    // Any non-zero integer is treated as `true` to match the
+    // SQLite-boolean idiom used by `is_default` above.
+    let debug_mode: bool = row.get::<_, Option<i64>>(16)?.unwrap_or(0) != 0;
 
     let id_uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
@@ -554,6 +570,7 @@ fn parse_agent_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         summary_provider,
         summary_model,
         worktree_mode,
+        debug_mode,
         is_default: is_default != 0,
         created_at: created_at.with_timezone(&chrono::Utc),
         last_active: last_active.with_timezone(&chrono::Utc),

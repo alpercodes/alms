@@ -171,6 +171,7 @@ fn agent_to_json(agent: &AgentRecord) -> serde_json::Value {
         "summary_provider": agent.summary_provider,
         "summary_model": agent.summary_model,
         "worktree_mode": agent.worktree_mode.as_wire_str(),
+        "debug_mode": agent.debug_mode,
         "is_default": agent.is_default,
         "created_at": agent.created_at.to_rfc3339(),
         "last_active": agent.last_active.to_rfc3339(),
@@ -318,6 +319,10 @@ pub async fn create_agent(
         summary_provider: summary_provider_norm,
         summary_model: summary_model_norm,
         worktree_mode,
+        // Per-agent debug_mode (#1003). `None` from clients that predate
+        // the field maps to `false` — matches the schema default and
+        // preserves pre-#1003 behaviour (no context_debug SSE event).
+        debug_mode: req.debug_mode.unwrap_or(false),
         // Always INSERT with is_default=false; set_default_agent atomically
         // clears old default + sets new one in a single transaction.
         is_default: false,
@@ -553,6 +558,14 @@ pub(crate) fn apply_update_request(
         agent.worktree_mode = mode;
     }
 
+    // Debug mode (#1003). Plain boolean — no `clear_*` sentinel needed
+    // because `false` is itself the cleared / default state. Omitting
+    // the field on PATCH leaves the existing value unchanged; sending
+    // `Some(true)` / `Some(false)` writes through.
+    if let Some(debug_mode) = req.debug_mode {
+        agent.debug_mode = debug_mode;
+    }
+
     agent.last_active = Utc::now();
     Ok(())
 }
@@ -763,6 +776,7 @@ mod tests {
             summary_provider: None,
             summary_model: None,
             worktree_mode: WorktreeMode::Off,
+            debug_mode: false,
             is_default: false,
             created_at: now,
             last_active: now,
@@ -1112,6 +1126,224 @@ mod tests {
             !obj.contains_key("gemini_thinking_budget"),
             "gemini_thinking_budget must be omitted when None: {json}"
         );
+    }
+
+    // ==================================================================
+    // `debug_mode` (#1003) — agent_to_json + apply_update_request +
+    // CRUD round-trip
+    //
+    // Unlike the reasoning knobs above, `debug_mode` is a plain
+    // `bool` (not `Option<bool>`) on `AgentRecord`, so the wire shape
+    // always includes the field regardless of value. There is no
+    // `clear_*` sentinel — `false` is itself the cleared / default
+    // state. PATCH semantics: omitting the field on PATCH leaves the
+    // existing value unchanged; sending `Some(true)` / `Some(false)`
+    // writes through.
+    // ==================================================================
+
+    #[test]
+    fn agent_to_json_always_emits_debug_mode() {
+        // `debug_mode = false` (the default) must still appear on the
+        // wire so the UI can populate the toggle without a separate
+        // GET round-trip when the agent has never been touched.
+        let agent_off = new_agent("debug-off");
+        let json_off = agent_to_json(&agent_off);
+        assert_eq!(
+            json_off["debug_mode"],
+            serde_json::json!(false),
+            "debug_mode = false must appear on the wire"
+        );
+
+        let mut agent_on = new_agent("debug-on");
+        agent_on.debug_mode = true;
+        let json_on = agent_to_json(&agent_on);
+        assert_eq!(
+            json_on["debug_mode"],
+            serde_json::json!(true),
+            "debug_mode = true must appear on the wire"
+        );
+    }
+
+    #[test]
+    fn apply_update_request_flips_debug_mode_to_true() {
+        let mut agent = new_agent("debugger");
+        assert!(!agent.debug_mode);
+
+        let req = UpdateAgentRequest {
+            debug_mode: Some(true),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert!(
+            agent.debug_mode,
+            "apply_update_request must flip debug_mode to true"
+        );
+    }
+
+    #[test]
+    fn apply_update_request_flips_debug_mode_to_false() {
+        let mut agent = new_agent("debugger");
+        agent.debug_mode = true;
+
+        let req = UpdateAgentRequest {
+            debug_mode: Some(false),
+            ..Default::default()
+        };
+        apply_update_request(&mut agent, req).unwrap();
+        assert!(
+            !agent.debug_mode,
+            "apply_update_request must flip debug_mode to false"
+        );
+    }
+
+    #[test]
+    fn apply_update_request_leaves_debug_mode_unchanged_when_omitted() {
+        // Omitting `debug_mode` on PATCH (`None` on the wire) leaves
+        // the stored value alone — same shape as the rest of the
+        // mutable knobs. Run the assertion in both directions to make
+        // sure the behaviour is symmetric.
+        let mut agent_on = new_agent("on-stays-on");
+        agent_on.debug_mode = true;
+        apply_update_request(&mut agent_on, UpdateAgentRequest::default()).unwrap();
+        assert!(
+            agent_on.debug_mode,
+            "omitted debug_mode must leave true unchanged"
+        );
+
+        let mut agent_off = new_agent("off-stays-off");
+        agent_off.debug_mode = false;
+        apply_update_request(&mut agent_off, UpdateAgentRequest::default()).unwrap();
+        assert!(
+            !agent_off.debug_mode,
+            "omitted debug_mode must leave false unchanged"
+        );
+    }
+
+    #[test]
+    fn create_agent_request_debug_mode_default_is_false() {
+        // `CreateAgentRequest::debug_mode` is `Option<bool>` and
+        // defaults to `None` on the wire (clients can omit the field
+        // entirely). The create handler maps `None` -> `false` so
+        // pre-#1003 client bundles continue to create non-debug
+        // agents with no operator action.
+        let req: CreateAgentRequest = serde_json::from_value(serde_json::json!({
+            "name": "from-old-client",
+        }))
+        .unwrap();
+        assert!(
+            req.debug_mode.is_none(),
+            "Pre-#1003 client wire shape must deserialize with debug_mode = None"
+        );
+
+        // The handler's `unwrap_or(false)` lands the persisted record
+        // at debug_mode = false. (Exercised end-to-end by the route
+        // integration tests below; the unit-level proof is the
+        // `unwrap_or(false)` site in `create_agent`.)
+    }
+
+    #[test]
+    fn create_agent_request_explicit_debug_mode_round_trips() {
+        // Clients that DO set debug_mode on create must see the value
+        // survive the `Option<bool> -> bool` mapping.
+        let req: CreateAgentRequest = serde_json::from_value(serde_json::json!({
+            "name": "with-debug",
+            "debug_mode": true,
+        }))
+        .unwrap();
+        assert_eq!(
+            req.debug_mode,
+            Some(true),
+            "Explicit debug_mode = true must deserialize as Some(true)"
+        );
+    }
+
+    #[test]
+    fn debug_mode_round_trips_through_sqlite_and_patch_chain() {
+        // End-to-end: insert an agent, simulate `PATCH /agents/{id}
+        // { "debug_mode": true }` by deserialising the request body
+        // through `UpdateAgentRequest` (the same path the axum handler
+        // uses), apply via `apply_update_request`, persist, reload —
+        // assert the value reaches disk and comes back. This is what
+        // `resolve_agent_config` will see on the next `POST /runs`,
+        // and it's the only path that lands `cfg.debug_mode = true`
+        // for runtime emission of the `context_debug` SSE event.
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        // Fresh agent — debug_mode defaults to false.
+        let agent = new_agent("debug-roundtrip");
+        store.create_agent(&agent).unwrap();
+        let loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(
+            !loaded.debug_mode,
+            "fresh agents must default to debug_mode = false"
+        );
+
+        // PATCH `{"debug_mode": true}` via the same JSON shape the
+        // axum handler accepts.
+        let req: UpdateAgentRequest = serde_json::from_value(serde_json::json!({
+            "debug_mode": true,
+        }))
+        .unwrap();
+        assert_eq!(
+            req.debug_mode,
+            Some(true),
+            "PATCH JSON `{{\"debug_mode\": true}}` must deserialize as Some(true)"
+        );
+        let mut updated = loaded;
+        apply_update_request(&mut updated, req).unwrap();
+        store.update_agent(&updated).unwrap();
+
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(
+            reloaded.debug_mode,
+            "PATCH /agents/{{id}} {{debug_mode: true}} must round-trip through SQLite"
+        );
+
+        // PATCH back to false — same path.
+        let req: UpdateAgentRequest = serde_json::from_value(serde_json::json!({
+            "debug_mode": false,
+        }))
+        .unwrap();
+        assert_eq!(req.debug_mode, Some(false));
+        let mut updated = reloaded;
+        apply_update_request(&mut updated, req).unwrap();
+        store.update_agent(&updated).unwrap();
+
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(
+            !reloaded.debug_mode,
+            "PATCH /agents/{{id}} {{debug_mode: false}} must round-trip back to false"
+        );
+
+        // Omitting the field on a subsequent PATCH must leave the
+        // value alone — pin the "PATCH-without-debug_mode is a no-op
+        // on this field" contract that the UI's diff-on-Apply
+        // logic depends on.
+        store
+            .update_agent(&{
+                let mut a = reloaded;
+                a.debug_mode = true; // pre-flip the stored value
+                a
+            })
+            .unwrap();
+        let req: UpdateAgentRequest = serde_json::from_value(serde_json::json!({
+            "description": "unrelated change",
+        }))
+        .unwrap();
+        assert!(
+            req.debug_mode.is_none(),
+            "Omitted debug_mode in PATCH body must deserialize as None"
+        );
+        let mut loaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(loaded.debug_mode);
+        apply_update_request(&mut loaded, req).unwrap();
+        store.update_agent(&loaded).unwrap();
+        let reloaded = store.load_agent_by_id(agent.id).unwrap().unwrap();
+        assert!(
+            reloaded.debug_mode,
+            "PATCH that omits debug_mode must leave the stored value unchanged"
+        );
+        assert_eq!(reloaded.description, "unrelated change");
     }
 
     // ==================================================================
@@ -1493,6 +1725,7 @@ mod tests {
             summary_provider: Some("nonexistent".into()),
             summary_model: Some("some-model".into()),
             worktree_mode: None,
+            debug_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent_err(state.clone(), req).await;
@@ -1532,6 +1765,7 @@ mod tests {
             summary_provider: Some("anthropic".into()),
             summary_model: Some("claude-haiku-4".into()),
             worktree_mode: None,
+            debug_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent_err(state.clone(), req).await;
@@ -1559,6 +1793,7 @@ mod tests {
             summary_provider: Some("openrouter".into()),
             summary_model: None,
             worktree_mode: None,
+            debug_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent_err(state, req).await;
@@ -1583,6 +1818,7 @@ mod tests {
             summary_provider: None,
             summary_model: Some("minimax/minimax-m2.7".into()),
             worktree_mode: None,
+            debug_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent_err(state, req).await;
@@ -1609,6 +1845,7 @@ mod tests {
             summary_provider: Some("openrouter".into()),
             summary_model: Some("minimax/minimax-m2.7".into()),
             worktree_mode: None,
+            debug_mode: None,
             is_default: None,
         };
         let (status, body) = create_agent(axum::extract::State(state.clone()), Json(req))
@@ -1707,6 +1944,7 @@ mod tests {
             summary_provider: Some("openrouter".into()),
             summary_model: Some("minimax/minimax-m2.7".into()),
             worktree_mode: None,
+            debug_mode: None,
             is_default: None,
         };
         let (_status, _body) = create_agent(axum::extract::State(state.clone()), Json(req))
@@ -1843,6 +2081,7 @@ mod tests {
             summary_provider: None,
             summary_model: None,
             worktree_mode: Some(WorktreeMode::Git),
+            debug_mode: None,
             is_default: None,
         };
 
@@ -1889,6 +2128,7 @@ mod tests {
             summary_provider: None,
             summary_model: None,
             worktree_mode: Some(WorktreeMode::Git),
+            debug_mode: None,
             is_default: None,
         };
 
@@ -1968,6 +2208,7 @@ mod tests {
             summary_provider: None,
             summary_model: None,
             worktree_mode: Some(WorktreeMode::Git),
+            debug_mode: None,
             is_default: None,
         };
         let (_status, _body) = create_agent(axum::extract::State(state.clone()), Json(create_req))
@@ -2031,6 +2272,7 @@ mod tests {
             summary_provider: None,
             summary_model: None,
             worktree_mode: Some(WorktreeMode::Git),
+            debug_mode: None,
             is_default: None,
         };
         let _ = create_agent(axum::extract::State(state.clone()), Json(create_req))

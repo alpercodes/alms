@@ -406,7 +406,12 @@ impl SseEventData {
     ///
     /// Only emitted when debug mode is enabled. Contains the assembled
     /// messages array, tool names, and token count estimates so the web
-    /// UI can display exactly what the LLM sees.
+    /// UI can display exactly what the LLM sees. Carries the agent's
+    /// id and name (#1003) so the UI can attribute each snapshot to the
+    /// correct agent — important for DM sessions where two agents
+    /// alternate turns on the same session and emit independent
+    /// per-perspective context windows.
+    #[allow(clippy::too_many_arguments)]
     pub fn context_debug(
         run_id: RunId,
         messages: serde_json::Value,
@@ -414,6 +419,8 @@ impl SseEventData {
         total_tokens: usize,
         system_tokens: usize,
         history_message_count: usize,
+        agent_id: String,
+        agent_name: Option<String>,
     ) -> Self {
         Self::new(
             "context_debug",
@@ -424,6 +431,8 @@ impl SseEventData {
                 total_tokens,
                 system_tokens,
                 history_message_count,
+                agent_id,
+                agent_name,
                 ts: Utc::now(),
             },
         )
@@ -902,6 +911,11 @@ struct ContextDebugData {
     total_tokens: usize,
     system_tokens: usize,
     history_message_count: usize,
+    /// UUID of the agent whose perspective produced this context (#1003).
+    agent_id: String,
+    /// Human-readable agent name (#1003). `None` for unnamed runtimes.
+    /// Serialised as `agent_name: null` so the UI can render a fallback.
+    agent_name: Option<String>,
     ts: DateTime<Utc>,
 }
 
@@ -1402,8 +1416,18 @@ mod tests {
             {"role": "user", "content": "hello"},
         ]);
         let tool_names = vec!["shell_exec".to_string(), "fs_read".to_string()];
+        let agent_id = "00000000-0000-0000-0000-000000000abc".to_string();
 
-        let event = SseEventData::context_debug(run_id, messages, tool_names, 500, 200, 3);
+        let event = SseEventData::context_debug(
+            run_id,
+            messages,
+            tool_names,
+            500,
+            200,
+            3,
+            agent_id.clone(),
+            Some("alpha".to_string()),
+        );
 
         assert_eq!(event.event_type, "context_debug");
         assert_eq!(event.data["run_id"], run_id.0.to_string());
@@ -1412,6 +1436,32 @@ mod tests {
         assert_eq!(event.data["history_message_count"], 3);
         assert_eq!(event.data["tool_names"].as_array().unwrap().len(), 2);
         assert_eq!(event.data["messages"].as_array().unwrap().len(), 2);
+        // #1003: agent attribution must reach the wire.
+        assert_eq!(event.data["agent_id"], agent_id);
+        assert_eq!(event.data["agent_name"], "alpha");
         assert!(event.data["ts"].is_string(), "ts should be a string");
+    }
+
+    #[test]
+    fn test_context_debug_event_unnamed_agent() {
+        // Tim-style follow-up: unnamed runtimes (e.g. legacy in-memory
+        // tests) emit `agent_name = None`. The wire must serialise this
+        // as `agent_name: null` so the UI can fall back to a placeholder
+        // label rather than break.
+        let event = SseEventData::context_debug(
+            RunId::new(),
+            serde_json::json!([]),
+            vec![],
+            0,
+            0,
+            0,
+            "00000000-0000-0000-0000-000000000abc".to_string(),
+            None,
+        );
+        assert!(
+            event.data["agent_name"].is_null(),
+            "agent_name = None must serialise as null, got: {}",
+            event.data["agent_name"]
+        );
     }
 }

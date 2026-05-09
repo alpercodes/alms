@@ -78,7 +78,15 @@ function ContextMessage({ msg, index }) {
 }
 
 
-export function ContextDebugRow({ messages, toolNames, totalTokens, systemTokens, historyMessageCount }) {
+export function ContextDebugRow({
+    messages,
+    toolNames,
+    totalTokens,
+    systemTokens,
+    historyMessageCount,
+    agentName,
+    agentId,
+}) {
     const expanded = useSignal(false);
     const toggle = (e) => {
         e.stopPropagation();
@@ -87,13 +95,23 @@ export function ContextDebugRow({ messages, toolNames, totalTokens, systemTokens
 
     const msgCount = Array.isArray(messages) ? messages.length : 0;
 
+    // #1003: title carries the agent's name so DM sessions (where two
+    // agents emit independent per-perspective snapshots on the same
+    // session) are visually unambiguous. Falls back to a placeholder
+    // when the runtime is unnamed (`agentName === null`) \u2014 pre-#1003
+    // events also fall here because the field didn't exist on the
+    // wire and parses as `undefined`.
+    const title = agentName
+        ? `Context sent to LLM (${agentName})`
+        : 'Context sent to LLM';
+
     return html`
         <div class="cd-row" role="button" tabindex="0"
              onClick=${toggle} onKeyDown=${(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e); } }}>
             <div class="cd-header">
                 <span class="cd-chevron">${expanded.value ? '\u25BC' : '\u25B6'}</span>
                 <span class="cd-icon">CTX</span>
-                <span class="cd-title">Context sent to LLM</span>
+                <span class="cd-title">${title}</span>
                 <span class="cd-stats">
                     ${fmt(totalTokens)} tokens | ${msgCount} messages | ${(toolNames || []).length} tools
                 </span>

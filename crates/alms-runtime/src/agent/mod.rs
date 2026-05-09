@@ -852,6 +852,14 @@ impl AgentRuntime {
             total_tokens,
             system_tokens,
             history_message_count,
+            // #1003: attribute the snapshot to the agent whose
+            // perspective produced it. For DM sessions this is the
+            // agent whose turn is about to fire — the UI uses the
+            // pair to label the panel and group concurrent DM
+            // perspectives. For webchat sessions this is just the
+            // active agent.
+            agent_id: self.agent_id.0.to_string(),
+            agent_name: self.agent_name.clone(),
         });
     }
 
