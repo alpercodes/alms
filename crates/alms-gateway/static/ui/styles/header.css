@@ -22,47 +22,6 @@ header h1 {
   flex-shrink: 0;
 }
 
-.header-sep {
-  color: var(--text-disabled);
-  font-size: var(--text-sm);
-  flex-shrink: 0;
-}
-
-.header-agent {
-  display: flex;
-  align-items: center;
-  gap: var(--space-1);
-  font-size: var(--text-sm);
-  font-weight: 500;
-  color: var(--text-primary);
-  cursor: pointer;
-  padding: var(--space-1) var(--space-2);
-  border-radius: var(--radius-md);
-  border: none;
-  background: none;
-  transition: background var(--duration-normal);
-}
-.header-agent:hover { background: var(--surface-3); color: var(--text-primary); }
-.header-agent svg { opacity: 0.5; }
-
-/* Agent select — terminal style */
-#agent-select {
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  font-weight: 500;
-  color: var(--text-primary);
-  background: transparent;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  padding: var(--space-1) var(--space-2);
-  cursor: pointer;
-  outline: none;
-  max-width: 200px;
-}
-#agent-select:hover { border-color: var(--border-strong); color: var(--text-primary); }
-#agent-select:focus { border-color: var(--accent); }
-#agent-select option { background: var(--surface-2); color: var(--text-primary); }
-
 .header-spacer { flex: 1; }
 
 .status-dot {

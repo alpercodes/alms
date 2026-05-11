@@ -1,9 +1,7 @@
-import { h, html, computed, signal } from '../deps.js';
-import { agents, activeAgentId } from '../state/agents.js';
+import { html, computed, signal } from '../deps.js';
 import { activePanel, togglePanel } from '../state/panel.js';
 import { serverDefaults } from '../state/settings.js';
 import { theme, toggleTheme } from '../state/theme.js';
-import { switchAgent } from '../hooks/use-boot.js';
 import { IconGear, IconSun, IconMoon, IconMenu, IconX } from '../utils/icons.js';
 import { bootRetryAvailable, runBoot } from '../state/loading.js';
 
@@ -34,12 +32,6 @@ const effectivePosture = computed(() => {
 });
 
 export function Header({ onOpenSettings, status }) {
-    const onAgentChange = (e) => {
-        if (e.target.value && e.target.value !== activeAgentId.value) {
-            switchAgent(e.target.value);
-        }
-    };
-
     const posture = effectivePosture.value;
     const statusClass = status.value === 'connected' ? 'ok'
         : status.value === 'running' ? 'running'
@@ -52,19 +44,6 @@ export function Header({ onOpenSettings, status }) {
                 ${sidebarOpen.value ? html`<${IconX} />` : html`<${IconMenu} />`}
             </button>
             <h1>ALMS</h1>
-            <span class="header-sep">/</span>
-            <select id="agent-select" title="Active agent"
-                    value=${activeAgentId.value || ''}
-                    onChange=${onAgentChange}>
-                ${agents.value.length === 0
-                    ? html`<option value="">No agents</option>`
-                    : agents.value.map(a => html`
-                        <option value=${a.id}>
-                            ${a.name}${a.is_default ? ' *' : ''}${a.needs_bootstrap ? ' (setup)' : ''}
-                        </option>
-                    `)
-                }
-            </select>
 
             ${posture === 'guarded' && html`
                 <span id="posture-badge" class="guarded">guarded</span>
