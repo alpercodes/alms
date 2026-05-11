@@ -413,6 +413,19 @@ unless the operator passes `--force` (CLI) or
 tree and the branch. A `mode: git → off` PATCH is just a remove with
 the same semantics.
 
+**Force-true reversibility asymmetry.** If a `DELETE /agents` or a
+`PATCH /agents` `mode: git → off` flip is invoked with `force = true`
+and the underlying SQLite write subsequently fails, the gateway runs a
+best-effort compensation that restores the agent's `alms/<name>` branch
+and worktree directory at the SHA snapshotted before the remove (#1019,
+#1022). Committed history is reversible. **Uncommitted working-copy
+changes at the moment of the force-remove are not** — `git worktree
+remove --force` discards them before the gateway ever sees the persist
+failure, so there is nothing left to restore on the working-copy side.
+Operators who care about uncommitted state should commit before issuing
+a force DELETE / git→off flip, or omit `--force` so the remove refuses
+on a dirty tree.
+
 `[security].allow_full_os_access` takes precedence over worktree mode
 (below). The worktree itself stays on disk so the operator can flip
 the security knob off later without re-running `git worktree add` —
