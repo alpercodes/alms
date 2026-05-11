@@ -1,6 +1,7 @@
-import { html, useSignal } from '../../deps.js';
+import { html, useSignal, useRef, useEffect } from '../../deps.js';
 import { toolSummary, fmtSize } from '../../utils/tool-summary.js';
 import { renderToolOutput } from '../../utils/tool-output.js';
+import { decorateCodeBlocks } from '../../utils/decorate-code-blocks.js';
 import { TOOL_SUMMARY_LEN } from '../../utils/constants.js';
 
 /** Threshold (in characters) above which result text is truncated with a toggle. */
@@ -507,8 +508,22 @@ function RawParamsPane({ params }) {
  * paths, commands, URLs, agent names), the toggle is suppressed and
  * the rendered DOM is byte-identical to the pre-toggle behaviour.
  */
-function ParamsSection({ tool, params }) {
+function ParamsSection({ tool, params, panelRef }) {
     const showRawParams = useSignal(false);
+    // Local decorate-effect (PR #1021 follow-up to Codex P2).
+    //
+    // `showRawParams` is owned by this child, so toggling it re-renders
+    // `ParamsSection` but does NOT re-render the parent `ToolRow`. Without
+    // a local effect, freshly mounted `<pre class="tc-code-block">` nodes
+    // inside `RawParamsPane` (and inside the structured renderer when the
+    // toggle flips back) would never get a copy button until some
+    // unrelated `ToolRow` re-render fired. Running the decorator here on
+    // every render of this section catches each toggle. Idempotent — the
+    // `cb-copy-decorated` marker class makes the parent's safety-net pass
+    // a no-op when both fire on the same render.
+    useEffect(() => {
+        decorateCodeBlocks(panelRef?.current, 'pre.tc-code-block');
+    });
     const structured = renderParams(tool, params);
     if (!structured) return null;
 
@@ -586,8 +601,22 @@ function RawResultPane({ result, isFail, showFull, label, blockedTarget }) {
  * the structured renderer (the payload shape on failure is the runtime's
  * `{error, target?}` shell rather than the success shape).
  */
-function ResultSection({ tool, params, result, isFail, isCancelled, showFull }) {
+function ResultSection({ tool, params, result, isFail, isCancelled, showFull, panelRef }) {
     const showRaw = useSignal(false);
+    // Local decorate-effect (PR #1021 follow-up to Codex P2).
+    //
+    // `showRaw` is owned by this child, so toggling "View raw" re-renders
+    // `ResultSection` but does NOT re-render the parent `ToolRow`. Without
+    // a local effect, the fresh `<pre class="tc-code-block">` inside
+    // `RawResultPane` (and the structured pre when toggled back) would
+    // ship undecorated until some unrelated `ToolRow` re-render fired.
+    // `showFull` (Show-more) does re-render the parent because the signal
+    // is hoisted, so the parent's safety-net effect covers that path
+    // independently — both effects are idempotent thanks to the
+    // `cb-copy-decorated` marker.
+    useEffect(() => {
+        decorateCodeBlocks(panelRef?.current, 'pre.tc-code-block');
+    });
 
     if (result == null && !isFail) return null;
 
@@ -656,6 +685,57 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent, duratio
         expanded.value = !expanded.value;
     };
 
+    // Copy-button decorator pass for tool-output code blocks (#1016).
+    // The detail panel renders a tree of Preact components, but the
+    // payload-bearing `<pre class="tc-code-block">` panes (shell stdout,
+    // fs_read content, http_get body, ...) are still bare `<pre>` nodes
+    // — adding a real `<CodeBlockCopy>` wrapper component to every
+    // renderer would touch ~15 callsites in `tool-output.js` /
+    // `tool-row.js#renderParams` and risk shape regressions, so we
+    // mirror the post-render mutation pass `MarkdownBody` already uses
+    // for sealed agent messages (#986).
+    //
+    // The selector is narrowed to `pre.tc-code-block` so non-code panes
+    // (raw-error blocks, chat-history bubbles, summary text, message
+    // previews) are NOT decorated — the operator value is on actual
+    // payload code, not on prose.
+    //
+    // Intentional exclusion — `pre.tc-match-snippet` (fs_grep match
+    // snippets). Each fs_grep result emits up to three `<pre>` snippets
+    // per match (the matched line + context_before + context_after),
+    // and the operator-value content is filename + line number, both of
+    // which already render separately above the snippet. Three buttons
+    // per match would be visually noisy and the most copy-worthy thing
+    // (filename:line) isn't even inside the `<pre>`. To widen later if
+    // operator feedback flips, change the selector to
+    // `'pre.tc-code-block, pre.tc-match-snippet'`.
+    //
+    // This `ToolRow`-level effect handles the initial expand
+    // (`expanded.value` flips false→true) and any re-render driven by
+    // a signal `ToolRow` itself reads — `expanded`, `showFull` (the
+    // Show-more toggle on http_get / invoke_agent / RawResultPane).
+    //
+    // The `showRaw` / `showRawParams` toggles are owned by the child
+    // `ResultSection` / `ParamsSection` and only re-render those
+    // children, NOT `ToolRow` (signals re-render the component that
+    // reads `.value`). So each child also runs its own
+    // `decorateCodeBlocks` effect via `panelRef` — that's the path
+    // that catches a Raw / Raw-params toggle mounting a fresh
+    // `<pre class="tc-code-block">` (Codex P2 on PR #1021).
+    //
+    // Both passes are idempotent — the `cb-copy-decorated` marker
+    // class on each wrapped `<pre>` short-circuits the re-wrap, and
+    // the orphan sweep in `decorateCodeBlocks` cleans up any wrappers
+    // Preact left dangling during reconciliation. The redundant work
+    // on the first render is one extra `querySelectorAll` per row,
+    // which is cheap.
+    const detailRef = useRef(null);
+    useEffect(() => {
+        if (expanded.value) {
+            decorateCodeBlocks(detailRef.current, 'pre.tc-code-block');
+        }
+    });
+
     const summary = toolSummary(tool, params);
     const truncSummary = summary.length > TOOL_SUMMARY_LEN
         ? summary.slice(0, TOOL_SUMMARY_LEN) + '\u2026'
@@ -697,11 +777,13 @@ export function ToolRow({ tool, params, status, result, id, sourceAgent, duratio
                 ${isDone && html`<span class="tc-status-icon">\u2713</span>`}
             </div>
             ${expanded.value && html`
-                <div class="tc-detail" onClick=${(e) => e.stopPropagation()}>
-                    ${html`<${ParamsSection} tool=${tool} params=${params} />`}
+                <div class="tc-detail" ref=${detailRef}
+                     onClick=${(e) => e.stopPropagation()}>
+                    ${html`<${ParamsSection} tool=${tool} params=${params}
+                        panelRef=${detailRef} />`}
                     ${html`<${ResultSection} tool=${tool} params=${params}
                         result=${result} isFail=${isFail} isCancelled=${isCancelled}
-                        showFull=${showFull} />`}
+                        showFull=${showFull} panelRef=${detailRef} />`}
                 </div>
             `}
         </div>

@@ -21,8 +21,13 @@
 //   `useEffect` that re-fires on text updates (which never happens for
 //   sealed messages today, but defends against a future change).
 //
-// Pinned regression target:
+// Pinned regression targets:
 //   - issue #986 — copy button on every code block in agent messages.
+//   - issue #1016 — same affordance extended to tool-output `<pre>`
+//     blocks (shell stdout/stderr, fs_read content, http_get bodies, ...).
+//     The tool-row detail panel scopes the decorator to
+//     `pre.tc-code-block` (instead of every `<pre>`) so non-code panes
+//     like raw-error blocks and chat-history bubbles aren't decorated.
 //
 // Pure logic (extractCopyText, hasAsyncClipboard) lives in
 // `code-copy.js` and is unit-tested in `code-copy.test.mjs`. This file
@@ -227,11 +232,78 @@ function handleCopyClick(event, preEl, button) {
  *   element, e.g. `<div class="msg-body markdown-body">`. When null /
  *   undefined / not an element, returns immediately (defensive — the
  *   ref may not be attached yet on the first effect run).
+ * @param {string} [selector='pre'] — CSS selector that narrows which
+ *   `<pre>` descendants get decorated. Defaults to `'pre'` so the
+ *   pre-#1016 markdown-body callsites keep matching every fenced
+ *   block. Tool-row callsites pass `'pre.tc-code-block'` so we only
+ *   decorate the actual code-block panes (shell stdout/stderr,
+ *   fs_read content, http_get body, ...) and skip non-code `<pre>`
+ *   elements like raw-error panes, chat history rows, message
+ *   previews, etc.
  */
-export function decorateCodeBlocks(root) {
+export function decorateCodeBlocks(root, selector = 'pre') {
     if (!root || typeof root.querySelectorAll !== 'function') return;
 
-    const blocks = root.querySelectorAll('pre');
+    // Clean up orphan wrappers left behind when Preact unmounts a
+    // `<pre>` we wrapped in a previous pass (#1016). The markdown-body
+    // path doesn't have to worry about this because the inner tree is
+    // `dangerouslySetInnerHTML` and Preact never re-renders inside it,
+    // so wrappers there persist until the whole bubble unmounts. Tool-
+    // row detail panels are Preact-native, so a Raw / Show-more toggle
+    // can rip out a `<pre>` (Preact's reconciler) and leave the
+    // wrapper (which Preact doesn't track) sitting empty in the DOM.
+    // Sweep those up before each pass so the section's child count
+    // matches the JSX again.
+    //
+    // Two orphan shapes are handled (PR #1021 review by Tim):
+    //   (a) wrapper sitting empty — the `<pre>` Preact owned has been
+    //       unmounted, leaving us with `<div.code-block-wrapper>` that
+    //       only contains a stale `<button.code-block-copy>`. Drop the
+    //       whole wrapper.
+    //   (b) wrapper holding a fresh `<pre>` that lacks our
+    //       `cb-copy-decorated` marker — Preact mounted a new `<pre>`
+    //       inside the previous render's wrapper (because its `_dom`
+    //       parentNode pointer still resolved to the wrapper). If we
+    //       fell through to the wrap pass without unwrapping first we'd
+    //       end up with a wrapper-inside-a-wrapper. Move the inner
+    //       `<pre>` (and any other live children that weren't part of
+    //       our decoration) back up to the wrapper's parent and then
+    //       drop the wrapper, so the regular wrap pass below decorates
+    //       the `<pre>` cleanly at its real parent.
+    const orphans = root.querySelectorAll(`.${WRAPPER_CLS}`);
+    for (let i = 0; i < orphans.length; i++) {
+        const w = orphans[i];
+        if (!w.parentNode) continue;
+        const innerPre = w.querySelector('pre');
+        if (!innerPre) {
+            // Shape (a): wrapper with no `<pre>`. Drop it, button included.
+            w.parentNode.removeChild(w);
+            continue;
+        }
+        if (!innerPre.classList.contains(DECORATED_FLAG)) {
+            // Shape (b): wrapper holds a fresh undecorated `<pre>`.
+            // Move every non-button child back up to the wrapper's
+            // parent before unwrapping, so we don't strand any sibling
+            // content Preact mounted alongside the new `<pre>`.
+            const parent = w.parentNode;
+            const children = Array.from(w.childNodes);
+            for (let j = 0; j < children.length; j++) {
+                const child = children[j];
+                if (child.nodeType === 1
+                    && child.classList
+                    && child.classList.contains(BUTTON_CLS)) {
+                    // Stale copy button from our previous decoration —
+                    // discard it; the regular pass will mint a fresh
+                    // one bound to the new `<pre>`.
+                    continue;
+                }
+                parent.insertBefore(child, w);
+            }
+            parent.removeChild(w);
+        }
+    }
+
+    const blocks = root.querySelectorAll(selector);
     for (let i = 0; i < blocks.length; i++) {
         const pre = blocks[i];
         if (pre.classList.contains(DECORATED_FLAG)) continue;
@@ -242,6 +314,30 @@ export function decorateCodeBlocks(root) {
         // semantics; the button sits inside it.
         const parent = pre.parentNode;
         if (!parent) continue;
+
+        // Belt-and-suspenders against nested wrappers (PR #1021 review):
+        // the orphan sweep above unwraps the case where Preact mounted
+        // a fresh `<pre>` inside a previous-pass wrapper, but if any
+        // future reconciliation path slips a `<pre>` past that sweep
+        // we'd otherwise produce a `code-block-wrapper` directly inside
+        // another `code-block-wrapper`. Skip the wrap step when `parent`
+        // is already one of our wrappers and just adopt it: ensure a
+        // copy button is present and stamp the `<pre>` with the
+        // decorated marker.
+        if (parent.classList && parent.classList.contains(WRAPPER_CLS)) {
+            if (!parent.querySelector(`.${BUTTON_CLS}`)) {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = BUTTON_CLS;
+                btn.setAttribute('aria-label', 'Copy code');
+                btn.title = 'Copy code';
+                btn.innerHTML = copyIconMarkup();
+                btn.addEventListener('click', (e) => handleCopyClick(e, pre, btn));
+                parent.appendChild(btn);
+            }
+            pre.classList.add(DECORATED_FLAG);
+            continue;
+        }
 
         // Skip empty blocks — nothing to copy, button would mislead.
         const hasText = (pre.textContent || '').trim().length > 0;

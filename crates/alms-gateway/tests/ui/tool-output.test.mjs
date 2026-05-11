@@ -911,6 +911,120 @@ test('#969 wiring: tool-output.js exists on disk and exports renderToolOutput', 
 });
 
 // =========================================================================
+// PR #1021 follow-up — Codex P2.
+//
+// `showRaw` / `showRawParams` are owned by `ResultSection` /
+// `ParamsSection` respectively. Toggling them re-renders only the child
+// component, not `ToolRow`. The `ToolRow`-level decorate effect therefore
+// does NOT fire on a Raw / Raw-params toggle, so newly mounted
+// `<pre class="tc-code-block">` nodes would remain undecorated until some
+// unrelated `ToolRow` re-render happened. Fix is to additionally run the
+// decorator from inside each child section.
+//
+// Pin both the effect call AND the call argument shape (panelRef +
+// 'pre.tc-code-block' selector) at source-text level. A future refactor
+// that drops the child-level effect or stops calling the decorator will
+// surface here as a test failure rather than landing green with a
+// silently broken copy button on Raw-toggle round-trips.
+// =========================================================================
+
+/**
+ * Extract the source text of a single named top-level function from
+ * `tool-row.js`. Walks balanced parens to skip the parameter list (which
+ * may contain destructuring braces — `function ParamsSection({ tool,
+ * params, panelRef })`), then walks balanced braces over the function
+ * body. We can't use `import` because the test harness has to stub Preact
+ * hooks to load the module at all; a source-text slice keeps the wiring
+ * pin orthogonal to the harness.
+ */
+function extractFunctionBody(src, name) {
+    const startRe = new RegExp(`function\\s+${name}\\s*\\(`);
+    const m = startRe.exec(src);
+    if (!m) return null;
+    // Walk past the parameter list — handles destructuring braces.
+    let i = m.index + m[0].length - 1; // points at the opening `(`
+    let parenDepth = 0;
+    for (; i < src.length; i++) {
+        const c = src[i];
+        if (c === '(') parenDepth++;
+        else if (c === ')') {
+            parenDepth--;
+            if (parenDepth === 0) { i++; break; }
+        }
+    }
+    // Now find the opening brace of the function body.
+    i = src.indexOf('{', i);
+    if (i < 0) return null;
+    const bodyStart = i;
+    let depth = 0;
+    for (; i < src.length; i++) {
+        const c = src[i];
+        if (c === '{') depth++;
+        else if (c === '}') {
+            depth--;
+            if (depth === 0) return src.slice(bodyStart, i + 1);
+        }
+    }
+    return null;
+}
+
+test('#1021 wiring: ResultSection runs decorateCodeBlocks in a useEffect', () => {
+    const src = fs.readFileSync(TOOL_ROW_PATH, 'utf8');
+    const body = extractFunctionBody(src, 'ResultSection');
+    assert.ok(body,
+        'tool-row.js must define ResultSection as a top-level function.');
+    // The effect must (a) be a useEffect call and (b) invoke
+    // decorateCodeBlocks with the narrow `pre.tc-code-block` selector.
+    // `showRaw` re-renders ONLY this child — without this effect the
+    // newly mounted `<pre class="tc-code-block">` ships undecorated
+    // until some unrelated `ToolRow` re-render fires (Codex P2 on
+    // PR #1021).
+    const effectRe =
+        /useEffect\s*\(\s*\(\s*\)\s*=>\s*\{[^}]*decorateCodeBlocks\s*\([^)]*['"]pre\.tc-code-block['"][^)]*\)/m;
+    assert.ok(effectRe.test(body),
+        'ResultSection must run decorateCodeBlocks(panelRef..., "pre.tc-code-block") '
+        + 'inside a useEffect. Without this, toggling "View raw" mounts a fresh '
+        + '<pre class="tc-code-block"> that lacks a copy button until some '
+        + 'unrelated ToolRow re-render fires (Codex P2 on PR #1021).\n'
+        + 'Function body:\n' + body);
+});
+
+test('#1021 wiring: ParamsSection runs decorateCodeBlocks in a useEffect', () => {
+    const src = fs.readFileSync(TOOL_ROW_PATH, 'utf8');
+    const body = extractFunctionBody(src, 'ParamsSection');
+    assert.ok(body,
+        'tool-row.js must define ParamsSection as a top-level function.');
+    const effectRe =
+        /useEffect\s*\(\s*\(\s*\)\s*=>\s*\{[^}]*decorateCodeBlocks\s*\([^)]*['"]pre\.tc-code-block['"][^)]*\)/m;
+    assert.ok(effectRe.test(body),
+        'ParamsSection must run decorateCodeBlocks(panelRef..., "pre.tc-code-block") '
+        + 'inside a useEffect. Without this, toggling "View raw params" mounts a '
+        + 'fresh <pre class="tc-code-block"> that lacks a copy button until some '
+        + 'unrelated ToolRow re-render fires (Codex P2 on PR #1021).\n'
+        + 'Function body:\n' + body);
+});
+
+test('#1021 wiring: ToolRow passes panelRef down to both child sections', () => {
+    const src = fs.readFileSync(TOOL_ROW_PATH, 'utf8');
+    const body = extractFunctionBody(src, 'ToolRow');
+    assert.ok(body, 'tool-row.js must define ToolRow as a top-level function.');
+    // Each child must receive a panelRef prop pointing at the shared
+    // detail-panel ref so its decorator effect has a DOM root to walk.
+    // The prop name is part of the wiring contract — renaming it
+    // without updating the children breaks the round trip.
+    assert.ok(/<\$\{ParamsSection\}[^>]*panelRef=/.test(body),
+        'ToolRow must pass panelRef to ParamsSection. Without it the child\'s '
+        + 'decorate-effect has nothing to walk and copy buttons never appear '
+        + 'on Raw-params toggle (Codex P2 on PR #1021).\n'
+        + 'ToolRow body:\n' + body);
+    assert.ok(/<\$\{ResultSection\}[^>]*panelRef=/s.test(body),
+        'ToolRow must pass panelRef to ResultSection. Without it the child\'s '
+        + 'decorate-effect has nothing to walk and copy buttons never appear '
+        + 'on Raw toggle (Codex P2 on PR #1021).\n'
+        + 'ToolRow body:\n' + body);
+});
+
+// =========================================================================
 // Runtime → renderer shape contract
 //
 // The dispatcher's per-tool renderers read fields off the tool result
@@ -1113,31 +1227,54 @@ async function loadRenderParams() {
 
     // Replace the multi-symbol import line with the stub + bindings.
     // tool-row.js's import block is:
-    //   import { html, useSignal } from '../../deps.js';
+    //   import { html, useSignal, useRef, useEffect } from '../../deps.js';
     //   import { toolSummary, fmtSize } from '../../utils/tool-summary.js';
     //   import { renderToolOutput } from '../../utils/tool-output.js';
+    //   import { decorateCodeBlocks } from '../../utils/decorate-code-blocks.js';
     //   import { TOOL_SUMMARY_LEN } from '../../utils/constants.js';
+    //
+    // The deps regex pins all four symbols (html + useSignal + useRef
+    // + useEffect) — the wiring contract for the decorator pass added
+    // in #1016 genuinely depends on `useRef` (mounting the panel ref)
+    // and `useEffect` (re-running the decorator after Raw / Show-more
+    // toggles). Pinning them in the regex means a future refactor that
+    // strips either hook from the import will surface here as a test
+    // failure rather than landing green with a silently broken wiring
+    // (PR #1021 review by Tim).
+    //
+    // Order of html / useSignal / useRef / useEffect within the brace
+    // list isn't pinned — any ordering is fine, and additional symbols
+    // are still allowed (e.g. a future `useMemo` could be added without
+    // a test edit). The matcher uses lookahead `(?=...)` once per
+    // required symbol so they can appear in any order.
     const depsRe =
-        /^import\s*\{\s*html\s*,\s*useSignal\s*\}\s*from\s*['"]\.\.\/\.\.\/deps\.js['"];?\s*$/m;
+        /^import\s*\{(?=[^}]*\bhtml\b)(?=[^}]*\buseSignal\b)(?=[^}]*\buseRef\b)(?=[^}]*\buseEffect\b)[^}]*\}\s*from\s*['"]\.\.\/\.\.\/deps\.js['"];?\s*$/m;
     const summaryRe =
         /^import\s*\{[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/tool-summary\.js['"];?\s*$/m;
     const outputRe =
         /^import\s*\{[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/tool-output\.js['"];?\s*$/m;
+    const decorateRe =
+        /^import\s*\{[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/decorate-code-blocks\.js['"];?\s*$/m;
     const constsRe =
         /^import\s*\{[^}]*\}\s*from\s*['"]\.\.\/\.\.\/utils\/constants\.js['"];?\s*$/m;
 
     if (!depsRe.test(src) || !summaryRe.test(src)
-        || !outputRe.test(src) || !constsRe.test(src)) {
+        || !outputRe.test(src) || !decorateRe.test(src)
+        || !constsRe.test(src)) {
         throw new Error(
-            'tool-row.js: expected imports for html/useSignal, tool-summary, '
-            + 'tool-output, and constants. Update the test harness if the '
-            + 'imports were refactored.'
+            'tool-row.js: expected imports for html/useSignal/useRef/useEffect, '
+            + 'tool-summary, tool-output, decorate-code-blocks, and constants. '
+            + 'Update the test harness if the imports were refactored.'
         );
     }
 
     let stubbed = src.replace(
         depsRe,
-        stub + '\nconst html = __htmlStub;\nconst useSignal = () => ({ value: false });'
+        stub
+        + '\nconst html = __htmlStub;'
+        + '\nconst useSignal = () => ({ value: false });'
+        + '\nconst useRef = () => ({ current: null });'
+        + '\nconst useEffect = () => {};'
     );
     stubbed = stubbed.replace(
         summaryRe,
@@ -1146,6 +1283,10 @@ async function loadRenderParams() {
     stubbed = stubbed.replace(
         outputRe,
         'const renderToolOutput = () => null;'
+    );
+    stubbed = stubbed.replace(
+        decorateRe,
+        'const decorateCodeBlocks = () => {};'
     );
     stubbed = stubbed.replace(
         constsRe,
