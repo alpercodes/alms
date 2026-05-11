@@ -15,7 +15,8 @@ use crate::api_error;
 use crate::server::AppState;
 use alms_core::worktree::{self, WorktreeError};
 use alms_core::{
-    AgentId, AgentRecord, CreateAgentRequest, UpdateAgentRequest, WorktreeMode, validate_agent_name,
+    AgentId, AgentRecord, AlmsResult, CreateAgentRequest, UpdateAgentRequest, WorktreeMode,
+    validate_agent_name,
 };
 use alms_runtime::Posture;
 use alms_session::SqliteStore;
@@ -26,6 +27,7 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::Utc;
+use std::path::Path as StdPath;
 
 /// Validate a posture string. Empty string is allowed (means "clear override").
 fn validate_posture(posture: &str) -> Result<(), String> {
@@ -612,6 +614,333 @@ impl UpdateAgentError {
     }
 }
 
+/// Run the worktree side-effect for a `PATCH /agents` flip and then
+/// persist the agent row, with compensating cleanup if the persist
+/// step fails after the side-effect has already touched disk (#964).
+///
+/// The hazard: `update_agent` flips the worktree on disk BEFORE the
+/// SQLite row is updated (so a `git worktree add` failure surfaces a
+/// 4xx without drift). If the SQLite write itself fails — disk full,
+/// db locked, fs perm — the worktree state has already mutated and
+/// the on-disk layout silently diverges from the registry record.
+///
+/// This helper wraps the side-effect + persist pair so that on a
+/// post-side-effect persist failure we run the inverse operation
+/// (delete what we created, recreate what we removed) before
+/// returning the original error to the caller. Compensation is
+/// best-effort and force-true on both sides — for the off→git
+/// direction the worktree we're deleting is one we just created
+/// (no operator changes possible); for the git→off direction the
+/// worktree we're recreating is a fresh checkout off `HEAD`.
+///
+/// Every step (side-effect success, persist failure, compensation
+/// success, compensation failure) emits a structured `tracing` event
+/// on the `alms.worktree` target so operators can reconstruct the
+/// drift recovery from the daemon logs.
+///
+/// `persist` is taken as a closure so tests can inject a synthetic
+/// SQLite failure without a real SQLite layer behind the AppState.
+fn apply_worktree_flip_and_persist(
+    project_root: &StdPath,
+    agent_name: &str,
+    prev_mode: WorktreeMode,
+    new_mode: WorktreeMode,
+    force_remove: bool,
+    is_full_os_access_agent: bool,
+    persist: impl FnOnce() -> AlmsResult<()>,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    // Phase 1: side-effect. Same code path as the pre-#964 shape — a
+    // failure here surfaces a 4xx and the persist is never attempted,
+    // so the agent row stays at its old worktree_mode value. No drift.
+    //
+    // CRITICAL: compensation must NOT gate on the mode-transition
+    // alone — both `create_worktree` and `remove_worktree` are
+    // idempotent, so a transition like Off→Git can land in an
+    // `AlreadyExisted` outcome (operator's previous worktree was
+    // already on disk from a crash / prior-failed-PATCH / manual
+    // creation), and the symmetric Git→Off can land in
+    // `AlreadyAbsent` (operator nuked the worktree dir by hand).
+    // Running the inverse op against either of those would invent
+    // or destroy state this PATCH did not touch — silent data
+    // loss / silent state fabrication, the exact bug class #964
+    // and the #1019 Codex P1s exist to prevent. We track whether
+    // the side-effect call ACTUALLY mutated state and gate
+    // compensation on that flag, not on the mode transition.
+    let is_off_to_git = matches!(
+        (prev_mode, new_mode),
+        (WorktreeMode::Off, WorktreeMode::Git)
+    );
+    let is_git_to_off = matches!(
+        (prev_mode, new_mode),
+        (WorktreeMode::Git, WorktreeMode::Off)
+    );
+
+    // For the git→off direction we snapshot the branch HEAD BEFORE
+    // calling `remove_worktree` (which destroys both the worktree
+    // dir AND the `alms/<name>` branch). The snapshot lets the
+    // compensation path below restore the branch at its original
+    // tip if persist fails — without it, compensation would
+    // re-fork a fresh branch off `HEAD`, silently losing every
+    // commit the operator had on the agent branch. See #1019 /
+    // Codex P1 (first finding).
+    //
+    // `read_branch_head_sha` returns `Ok(None)` when the branch is
+    // missing (treated as "nothing to restore" — and combined with
+    // the `WorktreeRemove::AlreadyAbsent` outcome from the symmetric
+    // P1 fix, this means "no branch and no worktree to begin with"
+    // → no compensation runs at all).
+    let pre_remove_branch_sha: Option<String> = if is_git_to_off {
+        match worktree::read_branch_head_sha(project_root, agent_name) {
+            Ok(maybe_sha) => maybe_sha,
+            Err(e) => {
+                // Snapshot probe failure is non-fatal — we log and
+                // continue with `None`. Worst case the operator
+                // loses a branch on a persist failure, but that's
+                // strictly no worse than pre-#1019 behavior, and
+                // this only fires on a misbehaving git binary.
+                tracing::warn!(
+                    target: "alms.worktree",
+                    agent_name = %agent_name,
+                    error = %e,
+                    "Failed to snapshot branch HEAD before git→off worktree removal; \
+                     compensation on persist failure will fall back to fresh branch off HEAD."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // `did_create` / `did_remove` are set to `true` only when the
+    // helper actually mutated on-disk state. Idempotent no-op
+    // outcomes (`AlreadyExisted` / `AlreadyAbsent`) leave both
+    // flags `false`, which short-circuits compensation below — the
+    // PATCH owes no compensation for state it did not touch.
+    let mut did_create = false;
+    let mut did_remove = false;
+
+    if is_off_to_git {
+        match worktree::create_worktree(project_root, agent_name) {
+            Ok(outcome) => {
+                did_create = outcome.was_created();
+                if !did_create {
+                    // The worktree was already on disk before this
+                    // PATCH — likely operator drift from a prior
+                    // crash or a previously-failed PATCH that left
+                    // disk state behind. We did NOT mutate disk;
+                    // compensation must NOT delete this directory
+                    // on persist failure. See #1019 / Codex P1
+                    // (off→git side, second finding).
+                    tracing::warn!(
+                        target: "alms.worktree",
+                        agent_name = %agent_name,
+                        direction = "off->git",
+                        "PATCH off→git worktree was already on disk before the side-effect ran \
+                         (operator drift / prior failed PATCH); \
+                         compensation will skip destructive cleanup on persist failure."
+                    );
+                }
+            }
+            Err(e) => return Err(worktree_error_to_api(&e)),
+        }
+        if is_full_os_access_agent {
+            tracing::warn!(
+                target: "alms.security",
+                agent_name = %agent_name,
+                allow_full_os_access = true,
+                worktree_mode = "git",
+                "Agent '{}' PATCH attempting flip to worktree_mode=git AND is on \
+                 [security].allow_full_os_access — worktree pin will be skipped \
+                 at run time (security list wins).",
+                agent_name,
+            );
+        }
+    } else if is_git_to_off {
+        match worktree::remove_worktree(project_root, agent_name, force_remove) {
+            Ok(outcome) => {
+                did_remove = outcome.was_removed();
+                if !did_remove {
+                    // The worktree directory was not on disk before
+                    // this PATCH — operator drift, manual nuking,
+                    // or a partial state from a previous failed
+                    // PATCH. We did NOT mutate disk; compensation
+                    // must NOT recreate a fresh worktree+branch on
+                    // persist failure (that would invent state
+                    // this PATCH did not touch). See #1019 /
+                    // Codex P1 (symmetric git→off side).
+                    tracing::warn!(
+                        target: "alms.worktree",
+                        agent_name = %agent_name,
+                        direction = "git->off",
+                        "PATCH git→off worktree was already absent before the side-effect ran \
+                         (operator drift / manual cleanup); \
+                         compensation will skip recreate on persist failure."
+                    );
+                }
+            }
+            Err(e) => return Err(worktree_error_to_api(&e)),
+        }
+    }
+
+    // Phase 2: persist. On success, return — happy path is unchanged
+    // from pre-#964.
+    let persist_err = match persist() {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+
+    // Phase 3: compensation. The persist failed AFTER the side-effect
+    // touched disk; without compensation the agent record (still on
+    // the old worktree_mode) and the disk layout (now on the new
+    // mode) silently diverge. Run the inverse op, force=true (we own
+    // the state we're undoing — no operator changes possible during
+    // the millisecond between side-effect success and persist
+    // failure).
+    // Codex P1 round 3 (#1019): `WorktreeRemove::AlreadyAbsent` does
+    // NOT mean "no state was mutated" — `remove_worktree` calls
+    // `delete_branch` on the no-op path too, so the `alms/<name>`
+    // branch may already be gone even when `did_remove == false`. The
+    // pre-remove SHA snapshot is the load-bearing signal here: if we
+    // captured one before the side-effect ran, we know there was
+    // operator branch history to lose, so the branch-restore arm must
+    // run regardless of `did_remove`. Worktree-create / worktree-delete
+    // arms still gate on `did_create` / `did_remove` because those
+    // surfaces really are no-ops on the idempotent path.
+    let needs_branch_restore = is_git_to_off && pre_remove_branch_sha.is_some();
+
+    if !did_create && !did_remove && !needs_branch_restore {
+        // No side-effect to compensate. Cases that land here:
+        //   - Same-mode PATCH (Off↔Off, Git↔Git, or any PATCH that
+        //     does not flip worktree_mode).
+        //   - Off→Git flip where `create_worktree` was a no-op
+        //     (`AlreadyExisted`) — the worktree was already on disk.
+        //   - Git→Off flip where the worktree dir was already absent
+        //     AND no `alms/<name>` branch existed before the call —
+        //     so `delete_branch` had nothing to delete either.
+        // In all three the helper did not mutate disk, so persist
+        // failure alone never causes drift — just surface the error.
+        return Err(persist_failure_to_api(agent_name, &persist_err, None));
+    }
+
+    let compensation = if did_create {
+        // Off→Git flip where `create_worktree` actually provisioned
+        // disk state (not the `AlreadyExisted` no-op path) failed
+        // mid-flight — the worktree we just created is now
+        // stranded. Delete it. Force=true: it was a fresh checkout,
+        // nothing to lose.
+        worktree::remove_worktree(project_root, agent_name, true).map(|_| ())
+    } else if did_remove {
+        // Git→Off flip where `remove_worktree` actually deleted
+        // disk state (not the `AlreadyAbsent` no-op path) failed
+        // mid-flight — we already removed the worktree AND deleted
+        // the `alms/<name>` branch (`remove_worktree` calls `git
+        // branch -D` after `git worktree remove`). If we have a
+        // pre-removal SHA snapshot, restore the branch at that tip
+        // so the operator's commits come back intact; if we don't
+        // (probe failed before remove), fall back to a fresh
+        // `create_worktree` off HEAD. The fallback matches
+        // pre-#1019 behavior; the happy path preserves branch
+        // history. See #1019 / Codex P1 (first finding).
+        match pre_remove_branch_sha.as_deref() {
+            Some(sha) => {
+                worktree::restore_worktree_at_sha(project_root, agent_name, sha).map(|_| ())
+            }
+            None => worktree::create_worktree(project_root, agent_name).map(|_| ()),
+        }
+    } else {
+        // Git→Off flip where the worktree dir was already absent
+        // (`WorktreeRemove::AlreadyAbsent`) but the `alms/<name>`
+        // branch existed before the call AND `remove_worktree`'s
+        // best-effort `delete_branch` may have nuked it. We have a
+        // pre-remove SHA snapshot (else we wouldn't be in this arm
+        // — see `needs_branch_restore`), so restore the branch at
+        // that tip. `restore_worktree_at_sha` is happy to recreate
+        // the worktree dir alongside the branch; that's a strict
+        // superset of "just put the branch back" and matches what
+        // the operator had pre-PATCH (registry was at Git, so the
+        // worktree dir on disk was the documented happy-path
+        // shape). See #1019 / Codex P1 (third finding).
+        let sha = pre_remove_branch_sha
+            .as_deref()
+            .expect("needs_branch_restore => pre_remove_branch_sha is Some");
+        worktree::restore_worktree_at_sha(project_root, agent_name, sha).map(|_| ())
+    };
+
+    let direction = if did_create { "off->git" } else { "git->off" };
+    match compensation {
+        Ok(()) => {
+            tracing::warn!(
+                target: "alms.worktree",
+                agent_name = %agent_name,
+                direction = direction,
+                persist_error = %persist_err,
+                "PATCH /agents persist failed after worktree side-effect; \
+                 compensation succeeded — disk + record both reverted to \
+                 the pre-PATCH state."
+            );
+            Err(persist_failure_to_api(agent_name, &persist_err, None))
+        }
+        Err(comp_err) => {
+            // Both errors matter — the operator needs to know the
+            // SQLite row never moved AND the on-disk worktree is
+            // also broken. Log both, surface both in the API
+            // response.
+            tracing::error!(
+                target: "alms.worktree",
+                agent_name = %agent_name,
+                direction = direction,
+                persist_error = %persist_err,
+                compensation_error = %comp_err,
+                "PATCH /agents persist failed after worktree side-effect AND \
+                 compensation also failed — disk layout is now diverged from \
+                 the registry. Manual cleanup required."
+            );
+            Err(persist_failure_to_api(
+                agent_name,
+                &persist_err,
+                Some(&comp_err),
+            ))
+        }
+    }
+}
+
+/// Map a post-side-effect persist failure (and optionally a
+/// compensation failure) onto the wire shape. Distinct from
+/// `worktree_error_to_api` because the failure shape — SQLite write
+/// error after disk has moved — is qualitatively different from a
+/// failed `git worktree add`: the operator may have to manually
+/// clean up disk state before retrying.
+fn persist_failure_to_api(
+    agent_name: &str,
+    persist_err: &alms_core::AlmsError,
+    compensation_err: Option<&WorktreeError>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match compensation_err {
+        None => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            format!(
+                "agent '{agent_name}' worktree side-effect succeeded but the \
+                 registry write failed; compensation reverted the worktree to \
+                 its pre-PATCH state, so disk and record are consistent. \
+                 Underlying error: {persist_err}"
+            ),
+        ),
+        Some(comp) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WORKTREE_COMPENSATION_FAILED",
+            format!(
+                "agent '{agent_name}' worktree side-effect succeeded, the \
+                 registry write failed, AND the compensating cleanup also \
+                 failed — disk layout is now diverged from the agent record. \
+                 Manual cleanup required. Persist error: {persist_err}. \
+                 Compensation error: {comp}"
+            ),
+        ),
+    }
+}
+
 /// PUT /agents/{id_or_name} — update agent config.
 pub async fn update_agent(
     State(state): State<AppState>,
@@ -643,45 +972,21 @@ pub async fn update_agent(
         agent.summary_model.as_deref(),
     )?;
 
-    // Worktree-mode flip side-effects (#946). Done BEFORE persisting
-    // the row so a `git worktree add` failure surfaces a 4xx with no
-    // record drift.
+    // Worktree-mode flip side-effect + atomic persist (#946 / #964).
+    // The helper handles compensation if the persist fails after the
+    // side-effect has touched disk, so disk + registry stay
+    // consistent on every error path.
     let new_mode = agent.worktree_mode;
-    if prev_mode != new_mode {
-        match (prev_mode, new_mode) {
-            (WorktreeMode::Off, WorktreeMode::Git) => {
-                if let Err(e) = worktree::create_worktree(&state.project_root, &agent_name) {
-                    return Err(worktree_error_to_api(&e));
-                }
-                if state.security_config.is_full_os_access_agent(&agent_name) {
-                    tracing::warn!(
-                        target: "alms.security",
-                        agent_name = %agent_name,
-                        allow_full_os_access = true,
-                        worktree_mode = "git",
-                        "Agent '{}' flipped to worktree_mode=git AND is on \
-                         [security].allow_full_os_access — worktree pin will be skipped \
-                         at run time (security list wins).",
-                        agent_name,
-                    );
-                }
-            }
-            (WorktreeMode::Git, WorktreeMode::Off) => {
-                if let Err(e) =
-                    worktree::remove_worktree(&state.project_root, &agent_name, force_remove)
-                {
-                    return Err(worktree_error_to_api(&e));
-                }
-            }
-            // Same-mode transitions cannot reach here (prev != new),
-            // and Off→Off / Git→Git are filtered above.
-            _ => {}
-        }
-    }
-
-    store
-        .update_agent(&agent)
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", e))?;
+    let is_full_os = state.security_config.is_full_os_access_agent(&agent_name);
+    apply_worktree_flip_and_persist(
+        &state.project_root,
+        &agent_name,
+        prev_mode,
+        new_mode,
+        force_remove,
+        is_full_os,
+        || store.update_agent(&agent),
+    )?;
 
     Ok(Json(agent_to_json(&agent)))
 }
@@ -2311,5 +2616,1114 @@ mod tests {
             "force delete must remove the worktree"
         );
         assert!(store.load_agent_by_name("atlas").unwrap().is_none());
+    }
+
+    // ── #964: PATCH /agents worktree side-effect must compensate on
+    //          SQLite persist failure ────────────────────────────────
+
+    /// Captured-log harness mirrors the existing #947 boot-WARN tests
+    /// in `gateway.rs`. We need it here so the compensation tests can
+    /// assert on the structured `alms.worktree` events the helper
+    /// emits — `tracing::subscriber::with_default` is the documented
+    /// way to scope a custom subscriber to a single test invocation
+    /// without racing parallel tests.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = LogWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(self.0.clone())
+        }
+    }
+
+    struct LogWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn captured(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Run `f` under a fmt subscriber that captures every event at
+    /// the given level or higher into an in-memory buffer. Returns
+    /// the captured stdout. `with_target(true)` is required so
+    /// assertions can match on `alms.worktree`.
+    fn capture_logs<F: FnOnce()>(level: tracing::Level, f: F) -> String {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(level)
+            .with_target(true)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        logs.captured()
+    }
+
+    /// Initialize a fresh git repo with one commit at `dir`. Mirrors
+    /// the helper inside `worktree::tests` — duplicated here so the
+    /// agents-module tests don't have to depend on the worktree
+    /// module's private fixtures.
+    fn init_git_repo_for_tests(dir: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let s = std::process::Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(&["init", "--initial-branch=main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["commit", "--allow-empty", "-m", "init"]);
+    }
+
+    /// Issue #964 acceptance: on the `Off → Git` flip, a persist
+    /// failure after the worktree has been created must roll back
+    /// the on-disk state — the worktree directory must NOT exist
+    /// after the helper returns, so disk and (still-on-Off)
+    /// registry stay consistent.
+    #[test]
+    fn off_to_git_persist_failure_compensates_by_deleting_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+
+        let captured = capture_logs(tracing::Level::WARN, || {
+            let result = apply_worktree_flip_and_persist(
+                tmp.path(),
+                "atlas",
+                WorktreeMode::Off,
+                WorktreeMode::Git,
+                false,
+                false,
+                || {
+                    // Synthetic SQLite failure — mimics a "database is locked"
+                    // / disk-full / fs-perm error the way `update_agent`
+                    // would surface it.
+                    Err(alms_core::AlmsError::Runtime(
+                        "SQLite update_agent: database is locked".into(),
+                    ))
+                },
+            );
+            let (status, body) = result.expect_err("persist failure must surface as Err");
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(err_code(&body.0), "INTERNAL");
+        });
+
+        // Disk: worktree must be gone — compensation deleted what we
+        // just created.
+        assert!(
+            !worktree_dir.exists(),
+            "compensation must delete the just-created worktree on persist failure; \
+             still found at {}",
+            worktree_dir.display(),
+        );
+
+        // Audit log: structured WARN at alms.worktree target with
+        // direction + persist_error + the explicit "compensation
+        // succeeded" verb.
+        assert!(
+            captured.contains("alms.worktree"),
+            "compensation event must use the alms.worktree tracing target: {captured}"
+        );
+        assert!(
+            captured.contains("agent_name=\"atlas\"") || captured.contains("agent_name=atlas"),
+            "compensation event must carry structured agent_name: {captured}"
+        );
+        assert!(
+            captured.contains("direction=\"off->git\"") || captured.contains("direction=off->git"),
+            "compensation event must carry structured direction=off->git: {captured}"
+        );
+        assert!(
+            captured.contains("compensation succeeded"),
+            "compensation event message must say 'compensation succeeded': {captured}"
+        );
+    }
+
+    /// Issue #964 acceptance: on the `Git → Off` flip, a persist
+    /// failure after the worktree has been removed must recreate
+    /// the on-disk state — the worktree directory MUST exist again
+    /// after the helper returns, so disk and (still-on-Git)
+    /// registry stay consistent.
+    #[test]
+    fn git_to_off_persist_failure_compensates_by_recreating_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+
+        // Pre-provision the worktree so the Git→Off flip has
+        // something to remove.
+        worktree::create_worktree(tmp.path(), "atlas").unwrap();
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        assert!(worktree_dir.is_dir());
+
+        let captured = capture_logs(tracing::Level::WARN, || {
+            let result = apply_worktree_flip_and_persist(
+                tmp.path(),
+                "atlas",
+                WorktreeMode::Git,
+                WorktreeMode::Off,
+                true, // force_remove — the existing PATCH path passes this through
+                false,
+                || {
+                    Err(alms_core::AlmsError::Runtime(
+                        "SQLite update_agent: disk I/O error".into(),
+                    ))
+                },
+            );
+            let (status, body) = result.expect_err("persist failure must surface as Err");
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(err_code(&body.0), "INTERNAL");
+        });
+
+        // Disk: worktree must be back — compensation recreated it.
+        assert!(
+            worktree_dir.is_dir(),
+            "compensation must recreate the just-removed worktree on persist failure; \
+             still missing at {}",
+            worktree_dir.display(),
+        );
+
+        // Audit log: structured WARN at alms.worktree with the
+        // git->off direction.
+        assert!(
+            captured.contains("alms.worktree"),
+            "compensation event must use the alms.worktree tracing target: {captured}"
+        );
+        assert!(
+            captured.contains("direction=\"git->off\"") || captured.contains("direction=git->off"),
+            "compensation event must carry structured direction=git->off: {captured}"
+        );
+        assert!(
+            captured.contains("compensation succeeded"),
+            "compensation event must say 'compensation succeeded': {captured}"
+        );
+    }
+
+    /// Codex P1 (#1019 follow-up): regression guard for the
+    /// silent-data-loss case in the `git→off` compensation path.
+    ///
+    /// Before the fix, compensation called `create_worktree`,
+    /// which always forks a new branch from `HEAD`. So when an
+    /// operator had committed work on `alms/<name>` and triggered
+    /// a `git→off` flip that hit a persist failure, the helper
+    /// would happily report "compensation succeeded" while the
+    /// branch silently came back pointing at the parent project's
+    /// HEAD (typically `main`) — every commit on the agent branch
+    /// was orphaned in the reflog at best, lost at worst.
+    ///
+    /// This test makes a real commit on `alms/atlas`, snapshots
+    /// its tip, drives a `git→off` flip with a forced persist
+    /// failure, and asserts the post-compensation branch points
+    /// at the SAME tip and the committed file is back in the
+    /// worktree. Pre-fix this test fails: branch points at the
+    /// initial empty commit on `main`, file is missing.
+    #[test]
+    fn git_to_off_persist_failure_preserves_branch_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+
+        // Provision the worktree and commit real work on the
+        // agent branch so HEAD (parent's `main`) and `alms/atlas`
+        // diverge.
+        let worktree_path = worktree::create_worktree(tmp.path(), "atlas")
+            .unwrap()
+            .into_path();
+        std::fs::write(
+            worktree_path.join("agent-state.txt"),
+            "important agent work",
+        )
+        .unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let s = std::process::Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(
+            &worktree_path,
+            &["config", "user.email", "test@example.com"],
+        );
+        run(&worktree_path, &["config", "user.name", "Test"]);
+        run(&worktree_path, &["add", "agent-state.txt"]);
+        run(
+            &worktree_path,
+            &["commit", "-m", "agent commit — must survive"],
+        );
+
+        // Snapshot the agent branch tip BEFORE the flip.
+        let pre_flip_sha = worktree::read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("agent branch must exist after commit");
+
+        // Snapshot parent HEAD too — pre-fix, compensation would
+        // (incorrectly) restore the branch to this SHA, so we use
+        // it as the "wrong answer" baseline.
+        let parent_head_output = std::process::Command::new("git")
+            .current_dir(tmp.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let parent_head_sha = String::from_utf8_lossy(&parent_head_output.stdout)
+            .trim()
+            .to_string();
+        assert_ne!(
+            pre_flip_sha, parent_head_sha,
+            "test invariant: agent commit must diverge from parent HEAD",
+        );
+
+        // Drive the git→off flip with a synthetic persist failure
+        // — same shape as the SQLite "database is locked" error
+        // the production handler would surface.
+        let result = apply_worktree_flip_and_persist(
+            tmp.path(),
+            "atlas",
+            WorktreeMode::Git,
+            WorktreeMode::Off,
+            true, // force — required to remove the worktree+branch
+            false,
+            || {
+                Err(alms_core::AlmsError::Runtime(
+                    "SQLite update_agent: database is locked".into(),
+                ))
+            },
+        );
+        let (status, _) = result.expect_err("persist failure must surface as Err");
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        // The contract: registry stayed at Git, so disk must be
+        // back at Git too — worktree dir present, branch present
+        // AND POINTING AT THE PRE-FLIP SHA.
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        assert!(
+            worktree_dir.is_dir(),
+            "compensation must recreate the worktree directory"
+        );
+
+        let post_flip_sha = worktree::read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("compensation must restore the alms/atlas branch");
+        assert_eq!(
+            post_flip_sha, pre_flip_sha,
+            "compensation must restore alms/atlas to its pre-flip tip ({pre_flip_sha}), \
+             NOT fork a new branch from parent HEAD ({parent_head_sha}). \
+             Got: {post_flip_sha}. This is the silent-data-loss bug Codex P1 \
+             caught on PR #1019 — pre-fix the branch came back pointing at parent HEAD."
+        );
+        assert_ne!(
+            post_flip_sha, parent_head_sha,
+            "compensation MUST NOT have re-forked the branch from parent HEAD"
+        );
+
+        // Belt-and-braces: the committed file must be present
+        // inside the restored worktree. Pre-fix this assertion
+        // fails because the worktree was checked out at parent
+        // HEAD, which never had the file.
+        assert!(
+            worktree_dir.join("agent-state.txt").exists(),
+            "restored worktree must carry the committed file — direct evidence \
+             that history survived the round trip; missing file means the branch \
+             was re-forked from HEAD and the operator's commit is lost"
+        );
+    }
+
+    /// Issue #964 acceptance, third arm: when the COMPENSATION
+    /// itself also fails (worktree-delete fails after SQLite-write
+    /// failed), the helper must surface a distinct error code,
+    /// preserve both error strings, and emit an ERROR-level
+    /// structured log so the operator can see disk diverged.
+    #[test]
+    fn off_to_git_persist_and_compensation_both_fail_surfaces_both_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+
+        let captured = capture_logs(tracing::Level::ERROR, || {
+            let result = apply_worktree_flip_and_persist(
+                tmp.path(),
+                "atlas",
+                WorktreeMode::Off,
+                WorktreeMode::Git,
+                false,
+                false,
+                || {
+                    // Inside the persist closure, after the worktree
+                    // create has already touched disk, simulate a
+                    // catastrophic environment shift: the parent
+                    // git repo is nuked. Compensation will then run
+                    // `git -C <project> worktree remove ...`, which
+                    // fails because `.git` no longer exists. This
+                    // exercises the dual-failure path — the persist
+                    // result we return here is the "first" error,
+                    // and the inverse worktree op is the "second"
+                    // error.
+                    std::fs::remove_dir_all(tmp.path().join(".git"))
+                        .expect("nuke .git to break compensation");
+                    Err(alms_core::AlmsError::Runtime(
+                        "SQLite update_agent: disk full".into(),
+                    ))
+                },
+            );
+            let (status, body) = result.expect_err("dual failure must surface as Err");
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(err_code(&body.0), "WORKTREE_COMPENSATION_FAILED");
+
+            // Both error strings round-trip through the wire payload
+            // so the operator's audit log carries the full diagnosis.
+            let msg = body.0["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("disk full"),
+                "wire body must include the persist error: {msg}"
+            );
+            assert!(
+                msg.contains("Compensation error"),
+                "wire body must explicitly mention compensation failure: {msg}"
+            );
+        });
+
+        // Disk: worktree dir is still on disk (compensation tried
+        // to delete it but git failed). This is the divergent state
+        // — the test asserts we surfaced the divergence rather than
+        // hiding it.
+        assert!(
+            worktree_dir.exists(),
+            "compensation failed, so the orphan worktree dir must still be on disk \
+             — this is the divergence the operator needs to clean up manually"
+        );
+
+        // Audit log: ERROR-level event with BOTH persist_error and
+        // compensation_error fields, and the explicit "compensation
+        // also failed" verb.
+        assert!(
+            captured.contains("alms.worktree"),
+            "dual-failure event must use the alms.worktree tracing target: {captured}"
+        );
+        assert!(
+            captured.contains("ERROR"),
+            "dual failure must log at ERROR level (not WARN): {captured}"
+        );
+        assert!(
+            captured.contains("persist_error"),
+            "dual-failure event must carry structured persist_error: {captured}"
+        );
+        assert!(
+            captured.contains("compensation_error"),
+            "dual-failure event must carry structured compensation_error: {captured}"
+        );
+        assert!(
+            captured.contains("compensation also failed"),
+            "dual-failure event message must say 'compensation also failed': {captured}"
+        );
+    }
+
+    /// Regression guard: a same-mode PATCH (e.g. Git → Git) with a
+    /// persist failure must not run any compensating worktree op —
+    /// there's no side-effect to undo. The helper still surfaces
+    /// the persist error, but the wire shape stays `INTERNAL` (not
+    /// the dual-failure code) and disk is untouched.
+    #[test]
+    fn no_flip_persist_failure_skips_compensation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+        worktree::create_worktree(tmp.path(), "atlas").unwrap();
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+
+        let result = apply_worktree_flip_and_persist(
+            tmp.path(),
+            "atlas",
+            WorktreeMode::Git,
+            WorktreeMode::Git,
+            false,
+            false,
+            || {
+                Err(alms_core::AlmsError::Runtime(
+                    "SQLite update_agent: db locked".into(),
+                ))
+            },
+        );
+
+        let (status, body) = result.expect_err("persist failure must surface");
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err_code(&body.0),
+            "INTERNAL",
+            "no-flip persist failure must NOT use the dual-failure code"
+        );
+        // Worktree on disk is unchanged — no compensation ran.
+        assert!(
+            worktree_dir.is_dir(),
+            "same-mode PATCH must not touch the existing worktree on persist failure"
+        );
+    }
+
+    /// Codex P2 follow-up (#1019 round 5): when the `git→off`
+    /// compensation path runs and finds the agent branch already
+    /// at the snapshot SHA — the AlreadyAbsent flavor where
+    /// `remove_worktree` silently failed to delete the branch
+    /// (`git branch -D` refused due to stale worktree metadata,
+    /// locked ref, etc.) — the response must be the regular
+    /// `INTERNAL` persist-failure error, NOT
+    /// `WORKTREE_COMPENSATION_FAILED`. No drift was introduced —
+    /// the branch is still at the snapshot SHA, so compensation
+    /// is effectively a no-op.
+    ///
+    /// We model the "branch survived remove_worktree" state by
+    /// having the persist closure re-create the branch at the
+    /// snapshot SHA before returning Err. Pre-fix
+    /// `restore_worktree_at_sha` would then fail with `fatal: A
+    /// branch named ... already exists` and the operator would see
+    /// the scary dual-failure code.
+    #[test]
+    fn git_to_off_persist_failure_idempotent_when_branch_already_at_snapshot() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+
+        // Provision + real commit so the branch carries history.
+        let worktree_path = worktree::create_worktree(tmp.path(), "atlas")
+            .unwrap()
+            .into_path();
+        std::fs::write(worktree_path.join("agent-state.txt"), "important").unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let s = std::process::Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(
+            &worktree_path,
+            &["config", "user.email", "test@example.com"],
+        );
+        run(&worktree_path, &["config", "user.name", "Test"]);
+        run(&worktree_path, &["add", "agent-state.txt"]);
+        run(&worktree_path, &["commit", "-m", "agent commit"]);
+
+        let snapshot_sha = worktree::read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("agent branch must exist after commit");
+
+        let project_root = tmp.path().to_path_buf();
+        let snapshot_for_closure = snapshot_sha.clone();
+
+        let captured = capture_logs(tracing::Level::INFO, || {
+            let result = apply_worktree_flip_and_persist(
+                tmp.path(),
+                "atlas",
+                WorktreeMode::Git,
+                WorktreeMode::Off,
+                true, // force — required to remove the worktree+branch
+                false,
+                move || {
+                    // Phase 1's `remove_worktree` deleted the branch.
+                    // Re-create it at the same SHA before returning
+                    // the persist error — this is the post-state we
+                    // get when the AlreadyAbsent arm of
+                    // `remove_worktree` silently failed to delete
+                    // the branch.
+                    let s = std::process::Command::new("git")
+                        .current_dir(&project_root)
+                        .env("GIT_TERMINAL_PROMPT", "0")
+                        .args(["branch", "alms/atlas", &snapshot_for_closure])
+                        .status()
+                        .expect("git branch");
+                    assert!(s.success(), "test setup: re-creating branch failed");
+
+                    Err(alms_core::AlmsError::Runtime(
+                        "SQLite update_agent: database is locked".into(),
+                    ))
+                },
+            );
+            let (status, body) = result.expect_err("persist failure must surface");
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                err_code(&body.0),
+                "INTERNAL",
+                "branch already at snapshot SHA must surface the regular INTERNAL \
+                 persist error, NOT WORKTREE_COMPENSATION_FAILED — pre-fix the \
+                 idempotent restore would error with `branch already exists` and \
+                 the operator would see the scary dual-failure code"
+            );
+        });
+
+        // Branch must still be at the snapshot SHA — we never asked
+        // to touch it.
+        let post_sha = worktree::read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("branch must still exist after compensation");
+        assert_eq!(
+            post_sha, snapshot_sha,
+            "branch SHA must be unchanged across the idempotent compensation path"
+        );
+
+        // Worktree dir must be back on disk — the `git worktree
+        // add` step still ran inside the idempotent restore.
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        assert!(
+            worktree_dir.is_dir(),
+            "worktree dir must be restored after compensation"
+        );
+
+        // Audit log: the alms.worktree info-level trace must
+        // mention the idempotency skip — proves the new code path
+        // actually fired (rather than the test accidentally taking
+        // the case-(a) branch-missing path).
+        assert!(
+            captured.contains("alms.worktree"),
+            "compensation must emit alms.worktree event: {captured}"
+        );
+        assert!(
+            captured.contains("Branch already at snapshot SHA"),
+            "compensation must log the idempotency-skip message: {captured}"
+        );
+    }
+
+    /// Happy path through the helper: persist succeeds, no
+    /// compensation runs, no audit-log event fires. Tests the
+    /// pre-#964 wire shape stays unchanged when nothing goes wrong.
+    #[test]
+    fn off_to_git_happy_path_no_compensation_log() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+
+        let captured = capture_logs(tracing::Level::WARN, || {
+            apply_worktree_flip_and_persist(
+                tmp.path(),
+                "atlas",
+                WorktreeMode::Off,
+                WorktreeMode::Git,
+                false,
+                false,
+                || Ok(()),
+            )
+            .expect("happy path must return Ok");
+        });
+
+        assert!(worktree_dir.is_dir(), "worktree must exist on happy path");
+        assert!(
+            !captured.contains("compensation"),
+            "happy path must not emit a compensation log line: {captured}"
+        );
+    }
+
+    /// Codex P1 (#1019, second finding): regression guard for the
+    /// silent-data-loss case in the `off→git` compensation path.
+    ///
+    /// Before the fix, compensation gated on the mode-transition
+    /// alone — `(Off, Git)` ⇒ "the helper created a worktree". But
+    /// `create_worktree` is idempotent: when an operator's worktree
+    /// was already drifted-present (prior crash, manual `git
+    /// worktree add`, earlier failed PATCH that left state behind),
+    /// `create_worktree` returns `Ok(WorktreeCreate::AlreadyExisted)`
+    /// without running `git worktree add`. The pre-fix compensation
+    /// then ran `remove_worktree(..., force=true)` on this
+    /// pre-existing worktree, deleting an operator-owned directory
+    /// AND branch this PATCH never created.
+    ///
+    /// This test pre-creates the worktree on disk with a real
+    /// commit, drives an off→git PATCH with a forced persist
+    /// failure, and asserts the worktree directory AND its branch
+    /// AND the committed file all survive. Pre-fix the worktree
+    /// was deleted and the operator's commit was lost (only
+    /// recoverable via reflog).
+    #[test]
+    fn off_to_git_persist_failure_preserves_pre_existing_worktree() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+
+        // Pre-create the worktree to simulate operator drift —
+        // the disk has a worktree even though the registry record
+        // (still on Off) does not yet point at it.
+        let pre_existing = worktree::create_worktree(tmp.path(), "atlas")
+            .unwrap()
+            .into_path();
+        assert!(pre_existing.is_dir(), "test setup: worktree must exist");
+
+        // Make a real commit on the agent branch so we can prove
+        // the compensation path does NOT destroy operator history.
+        std::fs::write(pre_existing.join("operator-state.txt"), "drifted state").unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let s = std::process::Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(&pre_existing, &["config", "user.email", "test@example.com"]);
+        run(&pre_existing, &["config", "user.name", "Test"]);
+        run(&pre_existing, &["add", "operator-state.txt"]);
+        run(&pre_existing, &["commit", "-m", "drifted operator commit"]);
+
+        let pre_flip_sha = worktree::read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("agent branch must exist after commit");
+
+        // Drive an off→git flip with a synthetic persist failure.
+        // Pre-fix the helper would gate compensation on the
+        // (Off, Git) transition and run
+        // `remove_worktree(..., force=true)` even though the
+        // side-effect call was a no-op (`AlreadyExisted`),
+        // deleting the worktree dir + branch + commit above.
+        let captured = capture_logs(tracing::Level::WARN, || {
+            let result = apply_worktree_flip_and_persist(
+                tmp.path(),
+                "atlas",
+                WorktreeMode::Off,
+                WorktreeMode::Git,
+                false,
+                false,
+                || {
+                    Err(alms_core::AlmsError::Runtime(
+                        "SQLite update_agent: database is locked".into(),
+                    ))
+                },
+            );
+            let (status, body) = result.expect_err("persist failure must surface");
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            // No dual-failure code — we did not even run a
+            // destructive compensation. The wire shape must match
+            // the same-mode persist-failure path.
+            assert_eq!(
+                err_code(&body.0),
+                "INTERNAL",
+                "no-op side-effect persist failure must NOT use the \
+                 dual-failure code — there was nothing to compensate"
+            );
+        });
+
+        // The contract: the pre-existing worktree, branch, AND
+        // commit must all survive untouched. Pre-fix every one of
+        // these assertions fails.
+        assert!(
+            pre_existing.is_dir(),
+            "compensation must NOT delete a pre-existing worktree directory \
+             when create_worktree returned AlreadyExisted; this is the silent-data-loss \
+             bug Codex P1 caught on PR #1019 (off→git side, second finding)"
+        );
+        let post_flip_sha = worktree::read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("compensation must NOT have deleted the alms/atlas branch");
+        assert_eq!(
+            post_flip_sha, pre_flip_sha,
+            "alms/atlas branch SHA must be unchanged: this PATCH created no \
+             on-disk state and therefore must not undo any. Pre-fix the branch \
+             was deleted (or rewritten via -D / fresh -b)."
+        );
+        assert!(
+            pre_existing.join("operator-state.txt").exists(),
+            "operator's drifted commit must survive — direct evidence the \
+             pre-existing worktree was NOT torn down by spurious compensation"
+        );
+
+        // Audit log: the helper must emit a structured WARN
+        // explicitly noting that the worktree was already on disk.
+        // Operators rely on this line to recognize drift cases in
+        // post-mortem.
+        assert!(
+            captured.contains("alms.worktree"),
+            "no-op-create event must use the alms.worktree tracing target: {captured}"
+        );
+        assert!(
+            captured.contains("already on disk") || captured.contains("AlreadyExisted"),
+            "no-op-create event must explicitly call out the pre-existing \
+             state so operators can spot drift in audit logs: {captured}"
+        );
+        assert!(
+            !captured.contains("compensation succeeded")
+                && !captured.contains("compensation also failed"),
+            "no destructive compensation must run, so neither 'compensation \
+             succeeded' nor 'compensation also failed' must appear: {captured}"
+        );
+    }
+
+    /// Symmetric Codex P1 (#1019, second finding) — the git→off
+    /// arm of the same idempotent-helper hazard.
+    ///
+    /// Hazard: `remove_worktree` is idempotent — when the worktree
+    /// directory is not on disk, it returns
+    /// `Ok(WorktreeRemove::AlreadyAbsent)` after only a best-effort
+    /// branch cleanup. Pre-fix, the gateway compensation path gated
+    /// on the `(Git, Off)` transition alone and ran a fresh
+    /// `create_worktree` (or `restore_worktree_at_sha` if a snapshot
+    /// existed) on persist failure — fabricating a worktree + branch
+    /// the operator never had, simply because the registry row had
+    /// been at `Git`.
+    ///
+    /// This test simulates operator drift by setting up a registry
+    /// row at `Git` while the on-disk worktree has been manually
+    /// nuked, drives a git→off PATCH with a forced persist failure,
+    /// and asserts no spurious worktree / branch is created on
+    /// compensation. Pre-fix the test fails: a fresh worktree dir
+    /// appears at `<project>/.alms/worktrees/atlas/` and a fresh
+    /// `alms/atlas` branch is forked off `HEAD`.
+    #[test]
+    fn git_to_off_persist_failure_skips_recreate_when_worktree_already_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+
+        // Drift simulation: registry says Git, disk says nothing.
+        // No `create_worktree` is called — we go straight from
+        // "fresh repo" to the helper, mimicking the case where an
+        // operator manually `rm -rf` their worktree dir but the
+        // registry never noticed.
+        let worktree_dir = tmp.path().join(".alms").join("worktrees").join("atlas");
+        assert!(
+            !worktree_dir.exists(),
+            "test setup: worktree must NOT exist before the flip"
+        );
+        let branch_sha_before = worktree::read_branch_head_sha(tmp.path(), "atlas").unwrap();
+        assert!(
+            branch_sha_before.is_none(),
+            "test setup: alms/atlas branch must NOT exist before the flip"
+        );
+
+        // Drive a git→off flip with a synthetic persist failure.
+        // Pre-fix the helper would (a) snapshot the branch (returns
+        // None — no branch), (b) call `remove_worktree` (no-op,
+        // AlreadyAbsent), (c) on persist failure gate compensation
+        // on the (Git, Off) transition and run `create_worktree`
+        // (because pre_remove_branch_sha was None), fabricating a
+        // worktree + branch this PATCH never owned.
+        let captured = capture_logs(tracing::Level::WARN, || {
+            let result = apply_worktree_flip_and_persist(
+                tmp.path(),
+                "atlas",
+                WorktreeMode::Git,
+                WorktreeMode::Off,
+                true,
+                false,
+                || {
+                    Err(alms_core::AlmsError::Runtime(
+                        "SQLite update_agent: database is locked".into(),
+                    ))
+                },
+            );
+            let (status, body) = result.expect_err("persist failure must surface");
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                err_code(&body.0),
+                "INTERNAL",
+                "no-op side-effect persist failure must NOT use the \
+                 dual-failure code — there was nothing to compensate"
+            );
+        });
+
+        // The contract: no fabricated state. Worktree dir absent,
+        // branch absent. Pre-fix both of these assertions fail.
+        assert!(
+            !worktree_dir.exists(),
+            "compensation must NOT fabricate a worktree directory when \
+             remove_worktree returned AlreadyAbsent; this is the silent-state- \
+             fabrication bug — symmetric of the off→git Codex P1 on PR #1019"
+        );
+        let branch_sha_after = worktree::read_branch_head_sha(tmp.path(), "atlas").unwrap();
+        assert!(
+            branch_sha_after.is_none(),
+            "compensation must NOT fabricate the alms/atlas branch — this PATCH \
+             never touched any branch, so the post-failure state must equal \
+             the pre-PATCH state. Got branch at {branch_sha_after:?}."
+        );
+
+        // Audit log: the helper must emit a structured WARN
+        // explicitly noting that the worktree was already absent.
+        assert!(
+            captured.contains("alms.worktree"),
+            "no-op-remove event must use the alms.worktree tracing target: {captured}"
+        );
+        assert!(
+            captured.contains("already absent") || captured.contains("AlreadyAbsent"),
+            "no-op-remove event must explicitly call out the pre-absent \
+             state so operators can spot drift in audit logs: {captured}"
+        );
+        assert!(
+            !captured.contains("compensation succeeded")
+                && !captured.contains("compensation also failed"),
+            "no compensation must run, so neither 'compensation succeeded' \
+             nor 'compensation also failed' must appear: {captured}"
+        );
+    }
+
+    /// Codex P1 round 3 (#1019): when the worktree dir is already
+    /// absent on disk but the `alms/<name>` branch exists with
+    /// real commits, `remove_worktree` returns `AlreadyAbsent`
+    /// (the dir no-op) but ALSO calls `delete_branch(...)` as
+    /// best-effort cleanup --- silently nuking the operator branch
+    /// history. Pre-fix the helper gated compensation on
+    /// `did_remove == false`, so on persist failure no
+    /// compensation ran and the branch (with all its commits) was
+    /// gone for good.
+    ///
+    /// Post-fix contract: when we hold a pre-remove SHA snapshot,
+    /// compensation MUST restore the branch at that tip even when
+    /// `did_remove == false`. The committed file must be
+    /// reachable through the restored branch --- direct evidence
+    /// that no agent-only commits were lost in the failure path
+    /// this helper exists to make reversible.
+    #[test]
+    fn git_to_off_persist_failure_restores_branch_when_worktree_already_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+
+        // Provision the worktree, commit real agent work on the
+        // branch, then detach the worktree by hand (simulating
+        // operator drift / a previously-failed PATCH that left
+        // the branch but not the dir). The branch with commits
+        // must survive on its own.
+        let worktree_path = worktree::create_worktree(tmp.path(), "atlas")
+            .unwrap()
+            .into_path();
+        std::fs::write(
+            worktree_path.join("agent-state.txt"),
+            "important agent work that must survive",
+        )
+        .unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let s = std::process::Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(
+            &worktree_path,
+            &["config", "user.email", "test@example.com"],
+        );
+        run(&worktree_path, &["config", "user.name", "Test"]);
+        run(&worktree_path, &["add", "agent-state.txt"]);
+        run(
+            &worktree_path,
+            &["commit", "-m", "agent-only commit (must survive)"],
+        );
+
+        let pre_flip_sha = worktree::read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("branch must exist after commit");
+
+        // Detach the worktree (so git stops tracking it as a
+        // live worktree and removes the directory) but leave the
+        // branch behind. The helper will see
+        // `target.exists() == false` and return
+        // `WorktreeRemove::AlreadyAbsent` while `delete_branch`
+        // fires as best-effort cleanup --- the exact code path
+        // Codex P1 round 3 calls out.
+        let detach = std::process::Command::new("git")
+            .current_dir(tmp.path())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                worktree_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("git worktree remove");
+        assert!(
+            detach.status.success(),
+            "test setup: detach worktree failed: {}",
+            String::from_utf8_lossy(&detach.stderr)
+        );
+        assert!(
+            !worktree_path.exists(),
+            "test setup: worktree dir must be gone after `git worktree remove`"
+        );
+        let surviving_sha = worktree::read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("branch alms/atlas must survive `git worktree remove`");
+        assert_eq!(
+            surviving_sha, pre_flip_sha,
+            "test setup invariant: branch tip must still be at pre_flip_sha after \
+             worktree dir removal --- only the dir is gone, not the branch."
+        );
+
+        // Drive the git->off flip with a synthetic persist failure.
+        let result = apply_worktree_flip_and_persist(
+            tmp.path(),
+            "atlas",
+            WorktreeMode::Git,
+            WorktreeMode::Off,
+            true, // force
+            false,
+            || {
+                Err(alms_core::AlmsError::Runtime(
+                    "SQLite update_agent: database is locked".into(),
+                ))
+            },
+        );
+        let (status, body) = result.expect_err("persist failure must surface as Err");
+        assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            err_code(&body.0),
+            "INTERNAL",
+            "compensation succeeded (branch restored), so the wire shape \
+             stays INTERNAL --- not WORKTREE_COMPENSATION_FAILED"
+        );
+
+        // Contract: post-failure branch must still point at
+        // pre_flip_sha, with the committed content reachable.
+        let post_flip_sha = worktree::read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect(
+                "compensation MUST restore the alms/atlas branch even when the \
+                 worktree dir was already absent --- the branch was deleted by \
+                 `delete_branch` on the AlreadyAbsent path",
+            );
+        assert_eq!(
+            post_flip_sha, pre_flip_sha,
+            "compensation must restore the branch at the snapshotted SHA \
+             ({pre_flip_sha}), not lose the agent-only commits. Got {post_flip_sha}. \
+             This is the silent-data-loss bug Codex P1 round 3 caught on PR #1019."
+        );
+
+        // Belt-and-braces: the committed file must be reachable
+        // through the restored branch tip. Use `git show` so we
+        // are not depending on the worktree dir layout.
+        let show = std::process::Command::new("git")
+            .current_dir(tmp.path())
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["show", "alms/atlas:agent-state.txt"])
+            .output()
+            .expect("git show");
+        assert!(
+            show.status.success(),
+            "agent-state.txt must be reachable through the restored branch: stderr={}",
+            String::from_utf8_lossy(&show.stderr)
+        );
+        let content = String::from_utf8_lossy(&show.stdout);
+        assert!(
+            content.contains("important agent work that must survive"),
+            "restored branch must carry the agent commit content; got: {content}"
+        );
+    }
+
+    /// Tim Tier 2 (PR #1019): symmetric counterpart of
+    /// `off_to_git_persist_and_compensation_both_fail_surfaces_both_errors`.
+    /// When BOTH the SQLite write AND the compensating
+    /// `restore_worktree_at_sha` fail, the helper must surface a
+    /// `WORKTREE_COMPENSATION_FAILED` error code carrying both
+    /// error strings, and emit an ERROR-level structured log on
+    /// the `alms.worktree` target tagged with the `git->off`
+    /// direction. On-disk state stays diverged --- the test exists
+    /// to assert that the divergence is SURFACED, not hidden.
+    #[test]
+    fn git_to_off_persist_and_compensation_both_fail_surfaces_both_errors() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        init_git_repo_for_tests(tmp.path());
+
+        // Set up the same shape as
+        // `git_to_off_persist_failure_preserves_branch_history`:
+        // a real worktree with a real agent-only commit so the
+        // restore step has something to do.
+        let worktree_path = worktree::create_worktree(tmp.path(), "atlas")
+            .unwrap()
+            .into_path();
+        std::fs::write(worktree_path.join("agent-state.txt"), "agent work").unwrap();
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let s = std::process::Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(
+            &worktree_path,
+            &["config", "user.email", "test@example.com"],
+        );
+        run(&worktree_path, &["config", "user.name", "Test"]);
+        run(&worktree_path, &["add", "agent-state.txt"]);
+        run(&worktree_path, &["commit", "-m", "agent commit"]);
+
+        let captured = capture_logs(tracing::Level::ERROR, || {
+            let result = apply_worktree_flip_and_persist(
+                tmp.path(),
+                "atlas",
+                WorktreeMode::Git,
+                WorktreeMode::Off,
+                true, // force
+                false,
+                || {
+                    // Inside the persist closure --- after the
+                    // worktree has already been removed AND the
+                    // branch deleted --- nuke `.git` so the
+                    // compensation step `restore_worktree_at_sha`
+                    // fails on `is_git_repo` (returns
+                    // `NotAGitRepo`). Same trick the off->git
+                    // dual-failure test uses, applied to the
+                    // symmetric direction.
+                    std::fs::remove_dir_all(tmp.path().join(".git"))
+                        .expect("nuke .git to break compensation");
+                    Err(alms_core::AlmsError::Runtime(
+                        "SQLite update_agent: disk full".into(),
+                    ))
+                },
+            );
+            let (status, body) = result.expect_err("dual failure must surface as Err");
+            assert_eq!(status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(err_code(&body.0), "WORKTREE_COMPENSATION_FAILED");
+
+            // Wire body must carry both error strings so the
+            // operator audit trail is complete.
+            let msg = body.0["error"]["message"].as_str().unwrap_or_default();
+            assert!(
+                msg.contains("disk full"),
+                "wire body must include the persist error: {msg}"
+            );
+            assert!(
+                msg.contains("Compensation error"),
+                "wire body must explicitly mention compensation failure: {msg}"
+            );
+        });
+
+        // Audit log: ERROR-level event with BOTH persist_error and
+        // compensation_error fields, the explicit "compensation
+        // also failed" verb, and direction tagged "git->off".
+        assert!(
+            captured.contains("alms.worktree"),
+            "dual-failure event must use the alms.worktree tracing target: {captured}"
+        );
+        assert!(
+            captured.contains("ERROR"),
+            "dual failure must log at ERROR level (not WARN): {captured}"
+        );
+        assert!(
+            captured.contains("persist_error"),
+            "dual-failure event must carry structured persist_error: {captured}"
+        );
+        assert!(
+            captured.contains("compensation_error"),
+            "dual-failure event must carry structured compensation_error: {captured}"
+        );
+        assert!(
+            captured.contains("compensation also failed"),
+            "dual-failure event message must say compensation also failed: {captured}"
+        );
+        assert!(
+            captured.contains("git->off"),
+            "dual-failure event must tag direction = git->off: {captured}"
+        );
     }
 }

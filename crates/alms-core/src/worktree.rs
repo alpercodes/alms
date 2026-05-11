@@ -237,19 +237,100 @@ impl std::error::Error for WorktreeError {}
 /// Result alias for the worktree module.
 pub type WorktreeResult<T> = std::result::Result<T, WorktreeError>;
 
+/// Outcome of a `create_worktree` call.
+///
+/// Distinguishes "I provisioned this on disk just now" (`Created`)
+/// from "the path was already on disk and I left it alone"
+/// (`AlreadyExisted`). The compensation path in
+/// `apply_worktree_flip_and_persist` (alms-gateway) gates its
+/// destructive `remove_worktree` call on `Created` only — running
+/// the inverse op against an `AlreadyExisted` outcome would delete
+/// pre-existing operator state this PATCH did not actually create.
+/// See #1019 / Codex P1 (off→git side).
+#[derive(Debug, Clone)]
+pub enum WorktreeCreate {
+    /// `git worktree add` ran successfully — the directory and
+    /// branch are fresh state owned by this call.
+    Created(PathBuf),
+    /// The worktree directory already existed on disk before the
+    /// call. `git worktree add` was NOT run; only the idempotent
+    /// `.git/info/exclude` append fired. Compensation must NOT
+    /// destroy this worktree on persist failure.
+    AlreadyExisted(PathBuf),
+}
+
+impl WorktreeCreate {
+    /// Path to the worktree directory, regardless of whether it
+    /// was freshly created or already there.
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Created(p) | Self::AlreadyExisted(p) => p.as_path(),
+        }
+    }
+
+    /// Consume the outcome and return the path. Convenience for
+    /// call sites that don't care about the create-vs-existed
+    /// distinction (e.g. CLI agent create).
+    pub fn into_path(self) -> PathBuf {
+        match self {
+            Self::Created(p) | Self::AlreadyExisted(p) => p,
+        }
+    }
+
+    /// Returns `true` if the worktree was freshly provisioned by
+    /// the call that produced this outcome.
+    pub fn was_created(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
+/// Outcome of a `remove_worktree` call.
+///
+/// Distinguishes "I tore down the worktree just now" (`Removed`)
+/// from "the path was not on disk and I had nothing to do"
+/// (`AlreadyAbsent`). The compensation path in
+/// `apply_worktree_flip_and_persist` (alms-gateway) gates its
+/// destructive recreate call on `Removed` only — re-creating a
+/// branch + worktree off HEAD when the original `remove_worktree`
+/// was a no-op would fabricate state that did not exist before
+/// the PATCH. See #1019 / Codex P1 (symmetric git→off side).
+#[derive(Debug, Clone)]
+pub enum WorktreeRemove {
+    /// `git worktree remove` ran successfully — the directory and
+    /// (best-effort) the `alms/<name>` branch are gone.
+    Removed,
+    /// The worktree directory was not on disk to begin with. No
+    /// `git worktree remove` ran. The branch may or may not have
+    /// been deleted as a best-effort cleanup; the caller treats
+    /// this outcome as "I owe no compensation on persist failure".
+    AlreadyAbsent,
+}
+
+impl WorktreeRemove {
+    /// Returns `true` if the call actually removed a worktree
+    /// directory from disk. Compensation gates on this.
+    pub fn was_removed(&self) -> bool {
+        matches!(self, Self::Removed)
+    }
+}
+
 /// Create a per-agent worktree at `<project>/.alms/worktrees/<name>/`
 /// on branch `alms/<name>`.
 ///
 /// Idempotent in the "already exists" sense: when the worktree
-/// directory already exists and points at the right branch, the
-/// function returns `Ok(path)` without re-running `git worktree
-/// add`. This makes the call safe to retry from agent-create and
-/// from a `mode: off → git` flip.
+/// directory already exists, the function returns
+/// `Ok(WorktreeCreate::AlreadyExisted(path))` without re-running
+/// `git worktree add`. This makes the call safe to retry from
+/// agent-create and from a `mode: off → git` flip — but callers
+/// that need to compensate on a downstream failure (the gateway
+/// PATCH path) MUST inspect `was_created()` before running a
+/// destructive inverse op. Deleting an `AlreadyExisted` worktree
+/// would discard pre-existing operator state. See #1019 / Codex P1.
 ///
 /// On a non-git project returns `WorktreeError::NotAGitRepo`. The
 /// caller maps this to `400 WORKTREE_REQUIRES_GIT` and refuses to
 /// persist the agent record.
-pub fn create_worktree(project_root: &Path, agent_name: &str) -> WorktreeResult<PathBuf> {
+pub fn create_worktree(project_root: &Path, agent_name: &str) -> WorktreeResult<WorktreeCreate> {
     if !is_git_repo(project_root) {
         return Err(WorktreeError::NotAGitRepo);
     }
@@ -271,9 +352,13 @@ pub fn create_worktree(project_root: &Path, agent_name: &str) -> WorktreeResult<
         // refuses to clobber an existing path anyway, so re-running
         // would always fail. The exclude-append below stays
         // idempotent so this branch is safe.
+        //
+        // CRITICAL: return `AlreadyExisted` so compensation paths
+        // know NOT to destroy this worktree on a downstream
+        // persist failure — this PATCH did not create it.
         append_exclude_idempotent(project_root, agent_name)
             .map_err(|e| WorktreeError::Io(format!("append exclude (existing worktree): {e}")))?;
-        return Ok(target);
+        return Ok(WorktreeCreate::AlreadyExisted(target));
     }
 
     // `git worktree add <path> -b alms/<name>` — creates a NEW
@@ -297,6 +382,223 @@ pub fn create_worktree(project_root: &Path, agent_name: &str) -> WorktreeResult<
     append_exclude_idempotent(project_root, agent_name)
         .map_err(|e| WorktreeError::Io(format!("append exclude: {e}")))?;
 
+    Ok(WorktreeCreate::Created(target))
+}
+
+/// Read the current HEAD SHA of the per-agent branch `alms/<agent_name>`.
+///
+/// Returns `Ok(Some(sha))` when the branch exists, `Ok(None)` when the
+/// branch is missing (caller treats that as "nothing to snapshot"), and
+/// `Err(_)` on any other git failure. Used by the PATCH `git→off`
+/// compensation path so a persist failure after `remove_worktree` can
+/// restore the branch tip the operator had before the flip.
+///
+/// Implementation: `git -C <project_root> rev-parse <branch>`. The
+/// "branch missing" case is identified by stderr containing the
+/// `unknown revision` / `ambiguous argument` shape git uses for that
+/// outcome — distinguishing it from a real failure (executable
+/// missing, repo broken) avoids paving over genuine errors.
+pub fn read_branch_head_sha(
+    project_root: &Path,
+    agent_name: &str,
+) -> WorktreeResult<Option<String>> {
+    let branch = branch_name(agent_name);
+    let output = git_cmd(project_root)
+        .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .output()
+        .map_err(|e| WorktreeError::GitFailed(format!("spawn git rev-parse {branch}: {e}")))?;
+
+    if output.status.success() {
+        let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if sha.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(sha));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // `git rev-parse --verify refs/heads/<missing>` exits non-zero
+    // with `fatal: Needed a single revision` when the ref doesn't
+    // exist. Treat that and the `unknown revision` shape as
+    // "branch absent" rather than a hard failure.
+    if stderr.contains("Needed a single revision")
+        || stderr.contains("unknown revision")
+        || stderr.contains("ambiguous argument")
+    {
+        return Ok(None);
+    }
+
+    Err(WorktreeError::GitFailed(format!(
+        "git rev-parse refs/heads/{branch}: {}",
+        stderr.trim()
+    )))
+}
+
+/// Restore the per-agent worktree at `<project>/.alms/worktrees/<name>/`
+/// pointing at `sha` on branch `alms/<name>`.
+///
+/// Recreates the branch at `sha` (via `git branch alms/<name> <sha>`)
+/// and then attaches a new worktree to it (via `git worktree add
+/// <path> alms/<name>`). Used by the PATCH `git→off` compensation
+/// path when the original `remove_worktree` destroyed the branch:
+/// `create_worktree` would re-fork the branch off HEAD, silently
+/// losing the snapshotted commits, so the compensation must go
+/// through this function instead. See #1019 / Codex P1.
+///
+/// Idempotent on existence:
+///   - When the worktree dir already exists, the function only
+///     re-asserts the `.git/info/exclude` line and returns
+///     `Ok(path)` — same shape as `create_worktree`.
+///   - When the worktree dir is missing but the branch already
+///     exists at the snapshot SHA, the `git branch` step is skipped
+///     and the function proceeds straight to `git worktree add`.
+///     This handles the AlreadyAbsent compensation arm where
+///     `remove_worktree` ignored a `delete_branch` failure (e.g.
+///     stale worktree metadata) and left the branch behind — the
+///     world is already where the caller wants it, no compensation
+///     drift was introduced. See #1019 / Codex P2.
+///
+/// On a non-git project returns `WorktreeError::NotAGitRepo`. If the
+/// branch already exists at a DIFFERENT SHA, the function returns
+/// `WorktreeError::GitFailed` rather than silently rewriting the
+/// branch — that's a real conflict and surfacing it is correct.
+pub fn restore_worktree_at_sha(
+    project_root: &Path,
+    agent_name: &str,
+    sha: &str,
+) -> WorktreeResult<PathBuf> {
+    if !is_git_repo(project_root) {
+        return Err(WorktreeError::NotAGitRepo);
+    }
+
+    let target = worktree_path(project_root, agent_name);
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            WorktreeError::Io(format!("create worktrees parent {}: {e}", parent.display()))
+        })?;
+    }
+
+    if target.exists() {
+        // Already there — same shape as `create_worktree`. Idempotent
+        // append on the exclude file and return.
+        append_exclude_idempotent(project_root, agent_name)
+            .map_err(|e| WorktreeError::Io(format!("append exclude (existing worktree): {e}")))?;
+        return Ok(target);
+    }
+
+    let branch = branch_name(agent_name);
+
+    // Step 1: ensure the branch exists at `sha`. Three cases:
+    //
+    //  a) Branch missing — run `git branch <name> <sha>`. This is
+    //     the textbook compensation path where `remove_worktree`
+    //     successfully deleted both the worktree AND the branch.
+    //  b) Branch present at the snapshot SHA — skip `git branch`,
+    //     no-op the step. The world is already where we want it.
+    //     This case fires when `remove_worktree` took the
+    //     `AlreadyAbsent` arm and ignored a `delete_branch` failure
+    //     (`git branch -D` refused due to stale worktree metadata,
+    //     locked ref, etc.). Without this idempotency check the
+    //     compensation would surface `WORKTREE_COMPENSATION_FAILED`
+    //     to the operator even though no drift was introduced.
+    //     See #1019 / Codex P2.
+    //  c) Branch present at a DIFFERENT SHA — refuse with a
+    //     specific error. That's a real conflict (concurrent
+    //     overwrite, or a logic bug in the caller) and silently
+    //     resetting the branch would be a worse outcome than
+    //     surfacing it.
+    let existing_sha = read_branch_head_sha(project_root, agent_name)?;
+    // Track whether THIS call created the branch — only the
+    // create-side gets best-effort cleanup if `git worktree add`
+    // fails below. Pre-existing branches from case (b) are left
+    // alone on rollback, since the caller's contract is "ensure
+    // the branch exists at SHA" — we never asked to own it.
+    let branch_was_created_by_us = match existing_sha.as_deref() {
+        Some(existing) if existing == sha => {
+            // Case (b): branch already at the snapshot SHA. Skip
+            // the `git branch` step and proceed to attach the
+            // worktree. Emit a structured trace so the compensation
+            // path is greppable from the daemon log.
+            tracing::info!(
+                target: "alms.worktree",
+                agent_name = %agent_name,
+                branch = %branch,
+                sha = %sha,
+                "Branch already at snapshot SHA — skipping `git branch` step in restore_worktree_at_sha (no drift introduced)"
+            );
+            false
+        }
+        Some(existing) => {
+            // Case (c): branch exists at a different SHA. Refuse.
+            return Err(WorktreeError::GitFailed(format!(
+                "branch {branch} already exists at {existing} but compensation expected {sha} — \
+                 refusing to overwrite the branch ref"
+            )));
+        }
+        None => {
+            // Case (a): branch missing — create it at the snapshot
+            // SHA. We use plain `git branch <name> <sha>` —
+            // non-destructive (refuses to overwrite an existing
+            // branch). The compensation caller has just observed
+            // `remove_worktree` delete this branch, so the race
+            // window where another agent could resurrect it is
+            // millisecond-scale and any concurrent overwrite would
+            // be a legitimate fail.
+            let branch_output = git_cmd(project_root)
+                .args(["branch", &branch, sha])
+                .output()
+                .map_err(|e| {
+                    WorktreeError::GitFailed(format!("spawn git branch {branch} {sha}: {e}"))
+                })?;
+
+            if !branch_output.status.success() {
+                let stderr = String::from_utf8_lossy(&branch_output.stderr)
+                    .trim()
+                    .to_string();
+                return Err(WorktreeError::GitFailed(format!(
+                    "git branch {branch} {sha}: {stderr}"
+                )));
+            }
+            true
+        }
+    };
+
+    // Step 2: attach a worktree to the (now-existing) branch. Note
+    // the absence of `-b` — `git worktree add <path> <existing-branch>`
+    // checks out the existing ref rather than forking a new one off
+    // HEAD. This is the exact behavior `create_worktree` lacks and the
+    // reason this function exists.
+    let target_str = target.to_string_lossy().to_string();
+    let output = git_cmd(project_root)
+        .args(["worktree", "add", &target_str, &branch])
+        .output()
+        .map_err(|e| WorktreeError::GitFailed(format!("spawn git worktree add: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let msg = if stderr.is_empty() { stdout } else { stderr };
+        // Best-effort cleanup: only drop the branch when we created
+        // it in this call. If we took the case-(b) idempotency path
+        // and the branch pre-existed, we never asked to own it —
+        // dropping someone else's ref on rollback would be worse
+        // than leaving it in place. Failure here is not fatal — the
+        // original `git worktree add` error is what the operator
+        // needs to see.
+        if branch_was_created_by_us {
+            let _ = git_cmd(project_root)
+                .args(["branch", "-D", &branch])
+                .output();
+        }
+        return Err(WorktreeError::GitFailed(format!(
+            "git worktree add {target_str} {branch}: {msg}"
+        )));
+    }
+
+    append_exclude_idempotent(project_root, agent_name)
+        .map_err(|e| WorktreeError::Io(format!("append exclude: {e}")))?;
+
     Ok(target)
 }
 
@@ -308,10 +610,19 @@ pub fn create_worktree(project_root: &Path, agent_name: &str) -> WorktreeResult<
 /// then `git branch -D alms/<name>` so the branch is cleaned up too.
 ///
 /// If the worktree directory does not exist the call is a no-op and
-/// returns `Ok(())` — matches the agent-delete flow where worktree
-/// state may be partially missing if the operator nuked the
-/// directory by hand.
-pub fn remove_worktree(project_root: &Path, agent_name: &str, force: bool) -> WorktreeResult<()> {
+/// returns `Ok(WorktreeRemove::AlreadyAbsent)` — matches the
+/// agent-delete flow where worktree state may be partially missing
+/// if the operator nuked the directory by hand. Callers that need
+/// to compensate on a downstream failure (the gateway PATCH path)
+/// MUST inspect `was_removed()` before running a destructive
+/// recreate — re-fabricating a worktree + branch off HEAD when the
+/// original call was a no-op would invent state that did not exist
+/// before the PATCH. See #1019 / Codex P1 (symmetric git→off side).
+pub fn remove_worktree(
+    project_root: &Path,
+    agent_name: &str,
+    force: bool,
+) -> WorktreeResult<WorktreeRemove> {
     let target = worktree_path(project_root, agent_name);
 
     if !target.exists() {
@@ -320,8 +631,13 @@ pub fn remove_worktree(project_root: &Path, agent_name: &str, force: bool) -> Wo
         // still exists. Failures here are non-fatal — the caller's
         // intent is "make this agent gone" and a stray branch ref
         // does not block that.
+        //
+        // CRITICAL: return `AlreadyAbsent` so compensation paths
+        // know NOT to recreate a fresh worktree+branch on a
+        // downstream persist failure — this PATCH did not remove
+        // anything, so there is nothing to undo.
         let _ = delete_branch(project_root, agent_name, force);
-        return Ok(());
+        return Ok(WorktreeRemove::AlreadyAbsent);
     }
 
     if !force && worktree_has_uncommitted(&target).unwrap_or(true) {
@@ -359,7 +675,7 @@ pub fn remove_worktree(project_root: &Path, agent_name: &str, force: bool) -> Wo
         );
     }
 
-    Ok(())
+    Ok(WorktreeRemove::Removed)
 }
 
 /// Delete the `alms/<agent_name>` branch from the project's repo.
@@ -515,7 +831,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         init_git_repo(tmp.path());
 
-        let path = create_worktree(tmp.path(), "atlas").expect("create");
+        let outcome = create_worktree(tmp.path(), "atlas").expect("create");
+        assert!(
+            outcome.was_created(),
+            "first call must report Created (not AlreadyExisted): {outcome:?}"
+        );
+        let path = outcome.into_path();
         assert!(
             path.is_dir(),
             "worktree dir should exist: {}",
@@ -585,25 +906,38 @@ mod tests {
     #[test]
     fn create_worktree_idempotent_when_path_exists() {
         // First call provisions; second call should be a no-op (path
-        // already exists, branch already exists). Nothing to assert
-        // beyond "doesn't error".
+        // already exists, branch already exists). The second call MUST
+        // report `AlreadyExisted` so the gateway compensation path
+        // does not destroy the pre-existing worktree on a downstream
+        // persist failure. See #1019 / Codex P1.
         let tmp = TempDir::new().unwrap();
         init_git_repo(tmp.path());
-        create_worktree(tmp.path(), "atlas").unwrap();
-        let result = create_worktree(tmp.path(), "atlas");
+        let first = create_worktree(tmp.path(), "atlas").unwrap();
         assert!(
-            result.is_ok(),
-            "second create should be a no-op: {result:?}"
+            first.was_created(),
+            "first call must report Created: {first:?}"
         );
+
+        let second = create_worktree(tmp.path(), "atlas").expect("second create no-op");
+        assert!(
+            !second.was_created(),
+            "second call must report AlreadyExisted (not Created); got {second:?} — \
+             gateway compensation gates destructive cleanup on this distinction"
+        );
+        assert!(matches!(second, WorktreeCreate::AlreadyExisted(_)));
     }
 
     #[test]
     fn remove_worktree_clean_succeeds() {
         let tmp = TempDir::new().unwrap();
         init_git_repo(tmp.path());
-        let path = create_worktree(tmp.path(), "atlas").unwrap();
+        let path = create_worktree(tmp.path(), "atlas").unwrap().into_path();
 
-        remove_worktree(tmp.path(), "atlas", false).unwrap();
+        let outcome = remove_worktree(tmp.path(), "atlas", false).unwrap();
+        assert!(
+            outcome.was_removed(),
+            "must report Removed when the worktree was on disk: {outcome:?}"
+        );
         assert!(!path.exists(), "worktree dir should be gone");
     }
 
@@ -611,7 +945,7 @@ mod tests {
     fn remove_worktree_uncommitted_refuses_without_force() {
         let tmp = TempDir::new().unwrap();
         init_git_repo(tmp.path());
-        let path = create_worktree(tmp.path(), "atlas").unwrap();
+        let path = create_worktree(tmp.path(), "atlas").unwrap().into_path();
 
         // Add an untracked file inside the worktree → uncommitted.
         std::fs::write(path.join("dirty.txt"), "wip").unwrap();
@@ -631,26 +965,36 @@ mod tests {
     fn remove_worktree_uncommitted_succeeds_with_force() {
         let tmp = TempDir::new().unwrap();
         init_git_repo(tmp.path());
-        let path = create_worktree(tmp.path(), "atlas").unwrap();
+        let path = create_worktree(tmp.path(), "atlas").unwrap().into_path();
         std::fs::write(path.join("dirty.txt"), "wip").unwrap();
 
-        remove_worktree(tmp.path(), "atlas", true).unwrap();
+        let outcome = remove_worktree(tmp.path(), "atlas", true).unwrap();
+        assert!(outcome.was_removed());
         assert!(!path.exists(), "force remove should drop the worktree");
     }
 
     #[test]
     fn remove_worktree_missing_dir_is_noop() {
+        // The worktree directory was never on disk. The call must
+        // succeed (idempotent) AND report `AlreadyAbsent` so the
+        // gateway compensation path knows there is nothing to undo.
+        // See #1019 / Codex P1 (symmetric git→off side).
         let tmp = TempDir::new().unwrap();
         init_git_repo(tmp.path());
-        // Never created — remove should still succeed.
-        remove_worktree(tmp.path(), "ghost", false).unwrap();
+        let outcome = remove_worktree(tmp.path(), "ghost", false).unwrap();
+        assert!(
+            !outcome.was_removed(),
+            "ghost worktree must report AlreadyAbsent (not Removed); got {outcome:?} \
+             — gateway compensation gates destructive recreate on this distinction"
+        );
+        assert!(matches!(outcome, WorktreeRemove::AlreadyAbsent));
     }
 
     #[test]
     fn worktree_has_uncommitted_clean_returns_false() {
         let tmp = TempDir::new().unwrap();
         init_git_repo(tmp.path());
-        let path = create_worktree(tmp.path(), "atlas").unwrap();
+        let path = create_worktree(tmp.path(), "atlas").unwrap().into_path();
         assert!(!worktree_has_uncommitted(&path).unwrap());
     }
 
@@ -658,7 +1002,7 @@ mod tests {
     fn worktree_has_uncommitted_dirty_returns_true() {
         let tmp = TempDir::new().unwrap();
         init_git_repo(tmp.path());
-        let path = create_worktree(tmp.path(), "atlas").unwrap();
+        let path = create_worktree(tmp.path(), "atlas").unwrap().into_path();
         std::fs::write(path.join("dirty.txt"), "wip").unwrap();
         assert!(worktree_has_uncommitted(&path).unwrap());
     }
@@ -740,6 +1084,350 @@ mod tests {
         assert!(
             !stdout.contains("nonexistent-bogus-gitdir"),
             "git resolved to the bogus GIT_DIR — env_remove did not take effect; got:\n{stdout}",
+        );
+    }
+
+    /// `read_branch_head_sha` returns the live HEAD SHA of
+    /// `alms/<agent>` after `create_worktree` provisions the branch.
+    /// The SHA must be a 40-character hex string identifying the
+    /// commit the branch points at.
+    #[test]
+    fn read_branch_head_sha_returns_sha_for_existing_branch() {
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        create_worktree(tmp.path(), "atlas").unwrap();
+
+        let sha = read_branch_head_sha(tmp.path(), "atlas").expect("rev-parse");
+        let sha = sha.expect("branch must exist after create_worktree");
+        assert_eq!(
+            sha.len(),
+            40,
+            "expected 40-char SHA, got {} chars: {sha}",
+            sha.len()
+        );
+        assert!(
+            sha.chars().all(|c| c.is_ascii_hexdigit()),
+            "SHA must be hex: {sha}"
+        );
+
+        // Cross-check: matches what `git rev-parse alms/atlas` returns.
+        let direct = Command::new("git")
+            .current_dir(tmp.path())
+            .args(["rev-parse", "alms/atlas"])
+            .output()
+            .unwrap();
+        assert!(direct.status.success());
+        assert_eq!(String::from_utf8_lossy(&direct.stdout).trim(), sha);
+    }
+
+    /// `read_branch_head_sha` returns `Ok(None)` when the branch
+    /// is missing rather than an error — caller treats that as
+    /// "nothing to snapshot".
+    #[test]
+    fn read_branch_head_sha_returns_none_for_missing_branch() {
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+
+        let result = read_branch_head_sha(tmp.path(), "ghost").expect("rev-parse must not error");
+        assert!(
+            result.is_none(),
+            "missing branch must return Ok(None), got {result:?}"
+        );
+    }
+
+    /// `restore_worktree_at_sha` round-trip: snapshot SHA, remove
+    /// worktree (which deletes the branch), restore at the
+    /// snapshotted SHA — the new branch must point at the same
+    /// commit, with the worktree dir present.
+    #[test]
+    fn restore_worktree_at_sha_round_trip_preserves_branch_tip() {
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let path = create_worktree(tmp.path(), "atlas").unwrap().into_path();
+
+        // Make a real commit on the agent branch so we can prove
+        // its history survives the round trip.
+        std::fs::write(path.join("agent-work.txt"), "important agent state").unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(&path, &["config", "user.email", "test@example.com"]);
+        run(&path, &["config", "user.name", "Test"]);
+        run(&path, &["add", "agent-work.txt"]);
+        run(&path, &["commit", "-m", "agent commit"]);
+
+        let original_sha = read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("branch must exist after commit");
+
+        // Tear down the worktree (this deletes the branch too).
+        remove_worktree(tmp.path(), "atlas", true).unwrap();
+        assert!(
+            read_branch_head_sha(tmp.path(), "atlas").unwrap().is_none(),
+            "branch must be deleted by remove_worktree"
+        );
+
+        // Restore at the snapshot SHA.
+        let restored = restore_worktree_at_sha(tmp.path(), "atlas", &original_sha).unwrap();
+        assert!(restored.is_dir(), "restored worktree dir must exist");
+
+        let restored_sha = read_branch_head_sha(tmp.path(), "atlas")
+            .unwrap()
+            .expect("branch must exist after restore");
+        assert_eq!(
+            restored_sha, original_sha,
+            "restored branch must point at the snapshotted SHA, not a fresh HEAD-fork"
+        );
+
+        // The committed file must be present in the restored worktree.
+        assert!(
+            restored.join("agent-work.txt").exists(),
+            "restored worktree must carry the committed file — proof history survived"
+        );
+    }
+
+    /// `restore_worktree_at_sha` is idempotent on the "worktree
+    /// already exists" case (mirrors `create_worktree`).
+    #[test]
+    fn restore_worktree_at_sha_idempotent_when_path_exists() {
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        create_worktree(tmp.path(), "atlas").unwrap();
+        let sha = read_branch_head_sha(tmp.path(), "atlas").unwrap().unwrap();
+
+        // Second call — worktree dir is still on disk, branch
+        // already exists. Should return Ok with the same path.
+        let result = restore_worktree_at_sha(tmp.path(), "atlas", &sha);
+        assert!(
+            result.is_ok(),
+            "second restore on existing worktree must be a no-op: {result:?}"
+        );
+    }
+
+    /// Regression guard for the bug Codex P1 caught (#1019): if
+    /// the `git→off` compensation path were to call
+    /// `create_worktree` after the original `remove_worktree`
+    /// destroyed the branch, the new branch would fork off HEAD
+    /// and the agent's commits would be lost. This test pins down
+    /// the contract: `restore_worktree_at_sha` MUST point the
+    /// branch at the snapshotted SHA, NOT at HEAD.
+    #[test]
+    fn restore_worktree_at_sha_does_not_fork_from_head() {
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let path = create_worktree(tmp.path(), "atlas").unwrap().into_path();
+
+        // Commit on the agent branch so HEAD (still on `main` in
+        // the parent project) and `alms/atlas` diverge.
+        std::fs::write(path.join("a.txt"), "agent").unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(&path, &["config", "user.email", "test@example.com"]);
+        run(&path, &["config", "user.name", "Test"]);
+        run(&path, &["add", "a.txt"]);
+        run(&path, &["commit", "-m", "agent only"]);
+
+        let agent_sha = read_branch_head_sha(tmp.path(), "atlas").unwrap().unwrap();
+
+        // Capture HEAD SHA on the parent (still pointing at the
+        // initial empty commit on `main`) — this is what
+        // `create_worktree` would (incorrectly) fork from.
+        let head_output = Command::new("git")
+            .current_dir(tmp.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head_sha = String::from_utf8_lossy(&head_output.stdout)
+            .trim()
+            .to_string();
+        assert_ne!(
+            agent_sha, head_sha,
+            "test setup invariant: agent commit must diverge from parent HEAD"
+        );
+
+        // Tear down.
+        remove_worktree(tmp.path(), "atlas", true).unwrap();
+
+        // Restore via the new function — must land on agent_sha,
+        // NOT head_sha.
+        restore_worktree_at_sha(tmp.path(), "atlas", &agent_sha).unwrap();
+        let restored_sha = read_branch_head_sha(tmp.path(), "atlas").unwrap().unwrap();
+        assert_eq!(
+            restored_sha, agent_sha,
+            "restored branch must point at agent's tip, not parent HEAD; \
+             this is the silent-data-loss bug Codex P1 caught on PR #1019"
+        );
+        assert_ne!(
+            restored_sha, head_sha,
+            "restored branch MUST NOT fork from parent HEAD"
+        );
+    }
+
+    /// Codex P2 regression guard (#1019 round 5): when the agent
+    /// branch already exists at the snapshot SHA (worktree dir
+    /// missing — the AlreadyAbsent path where `remove_worktree`
+    /// silently failed to delete the branch), `restore_worktree_at_sha`
+    /// must be idempotent: skip `git branch <name> <sha>`, proceed
+    /// to `git worktree add`, and return Ok with the branch still
+    /// at the snapshot SHA.
+    ///
+    /// Pre-fix this scenario hits `git branch <name> <sha>` and
+    /// errors with `fatal: A branch named ... already exists`,
+    /// which surfaces to the operator as a scary
+    /// `WORKTREE_COMPENSATION_FAILED` even though no drift was
+    /// introduced.
+    #[test]
+    fn restore_worktree_at_sha_idempotent_when_branch_at_same_sha_no_worktree_dir() {
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        // Provision then commit so the branch carries real history.
+        let path = create_worktree(tmp.path(), "atlas").unwrap().into_path();
+        std::fs::write(path.join("agent-state.txt"), "important").unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(&path, &["config", "user.email", "test@example.com"]);
+        run(&path, &["config", "user.name", "Test"]);
+        run(&path, &["add", "agent-state.txt"]);
+        run(&path, &["commit", "-m", "agent commit"]);
+
+        let snapshot_sha = read_branch_head_sha(tmp.path(), "atlas").unwrap().unwrap();
+
+        // Simulate the AlreadyAbsent + branch-still-present arm:
+        // `git worktree remove --force` drops the working dir but
+        // leaves the branch ref intact. (`remove_worktree` would
+        // also try `git branch -D` after the worktree-remove step,
+        // but the `AlreadyAbsent` arm at line 474 ignores that
+        // failure — we model the post-state directly.)
+        run(
+            tmp.path(),
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                path.to_str().expect("utf8 path"),
+            ],
+        );
+        assert!(!path.exists(), "worktree dir must be gone");
+        assert_eq!(
+            read_branch_head_sha(tmp.path(), "atlas")
+                .unwrap()
+                .as_deref(),
+            Some(snapshot_sha.as_str()),
+            "test setup invariant: branch must still be at snapshot SHA"
+        );
+
+        // Drive the restore. This is the call that pre-fix would
+        // error with "branch already exists".
+        let restored = restore_worktree_at_sha(tmp.path(), "atlas", &snapshot_sha).expect(
+            "restore must be idempotent when branch is already at snapshot SHA \
+             — Codex P2 fix: skip the `git branch` step instead of erroring",
+        );
+        assert!(restored.is_dir(), "worktree dir must be back");
+
+        let post_sha = read_branch_head_sha(tmp.path(), "atlas").unwrap().unwrap();
+        assert_eq!(
+            post_sha, snapshot_sha,
+            "branch SHA must be unchanged across the idempotent restore"
+        );
+        assert!(
+            restored.join("agent-state.txt").exists(),
+            "committed file must be present in the restored worktree"
+        );
+    }
+
+    /// Codex P2 conflict-arm guard (#1019 round 5): if the branch
+    /// exists at a DIFFERENT SHA than the snapshot (e.g. concurrent
+    /// overwrite from another agent, or a logic bug in the caller),
+    /// `restore_worktree_at_sha` must refuse with
+    /// `WorktreeError::GitFailed` rather than silently rewriting
+    /// the ref. The error message must mention both SHAs so the
+    /// operator can diagnose the conflict from the log alone.
+    #[test]
+    fn restore_worktree_at_sha_errors_when_branch_exists_at_different_sha() {
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let path = create_worktree(tmp.path(), "atlas").unwrap().into_path();
+
+        // Snapshot the original SHA, then make a real commit so the
+        // branch advances past the snapshot.
+        let snapshot_sha = read_branch_head_sha(tmp.path(), "atlas").unwrap().unwrap();
+        std::fs::write(path.join("a.txt"), "drift").unwrap();
+        let run = |dir: &Path, args: &[&str]| {
+            let s = Command::new("git")
+                .current_dir(dir)
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(s.success(), "git {args:?} failed in {}", dir.display());
+        };
+        run(&path, &["config", "user.email", "test@example.com"]);
+        run(&path, &["config", "user.name", "Test"]);
+        run(&path, &["add", "a.txt"]);
+        run(&path, &["commit", "-m", "drift commit"]);
+
+        let drifted_sha = read_branch_head_sha(tmp.path(), "atlas").unwrap().unwrap();
+        assert_ne!(
+            snapshot_sha, drifted_sha,
+            "test invariant: branch must have advanced past the snapshot"
+        );
+
+        // Drop just the worktree dir, leave the branch at the
+        // drifted SHA. Then ask `restore_worktree_at_sha` to put
+        // the branch back at the OLD snapshot — this is the
+        // conflict case.
+        run(
+            tmp.path(),
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                path.to_str().expect("utf8 path"),
+            ],
+        );
+
+        let result = restore_worktree_at_sha(tmp.path(), "atlas", &snapshot_sha);
+        let err = result.expect_err("must refuse to rewrite branch at different SHA");
+        match err {
+            WorktreeError::GitFailed(msg) => {
+                assert!(
+                    msg.contains(&snapshot_sha) && msg.contains(&drifted_sha),
+                    "error message must mention both expected and existing SHAs to \
+                     surface the conflict: got {msg}"
+                );
+                assert!(
+                    msg.contains("refusing to overwrite"),
+                    "error message must explicitly say it refused the overwrite: got {msg}"
+                );
+            }
+            other => panic!("expected WorktreeError::GitFailed, got {other:?}"),
+        }
+        // Branch must still be at the drifted SHA — we refused to
+        // touch it.
+        let post_sha = read_branch_head_sha(tmp.path(), "atlas").unwrap().unwrap();
+        assert_eq!(
+            post_sha, drifted_sha,
+            "branch SHA must be untouched after the refused overwrite"
         );
     }
 
