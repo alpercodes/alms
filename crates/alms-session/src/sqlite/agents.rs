@@ -291,6 +291,19 @@ impl SqliteStore {
             .transaction()
             .map_err(|e| AlmsError::Runtime(format!("SQLite begin delete_agent: {e}")))?;
 
+        // 0. Look up the agent's name so we can identify DM sessions this
+        //    agent participated in (step 4b). DM sessions are owned by
+        //    `AgentId::nil()` and identify participants only via the
+        //    `context_id = "dm:<a>:<b>"` format, so we have to match by name
+        //    rather than by foreign key.
+        let agent_name: Option<String> = tx
+            .query_row(
+                "SELECT name FROM agents WHERE id = ?1",
+                params![&id_str],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+
         // 1. Collect session IDs belonging to this agent
         let session_ids: Vec<String> = {
             let mut stmt = tx
@@ -376,6 +389,144 @@ impl SqliteStore {
         })?;
         tx.execute("DELETE FROM runs WHERE agent_id = ?1", params![&id_str])
             .map_err(|e| AlmsError::Runtime(format!("SQLite delete dm-orphan runs: {e}")))?;
+
+        // 4b. Cascade-delete shared DM sessions whose other participant is
+        //     also gone (#1002).
+        //
+        //     Step 4 cleared this agent's *contribution* rows but deliberately
+        //     left the shared `sessions` row alone so a surviving DM partner
+        //     could keep using it. If neither partner remains, that row is
+        //     unreachable: nothing enumerates it (no agent owns it) and
+        //     non-orphan-class rows still keyed on it (`messages`,
+        //     `audit_events`, `context_summaries`) leak with no UI surface.
+        //
+        //     Strategy: parse `context_id = "dm:<a>:<b>"` to find the peer
+        //     name (one query against `sessions`, in-memory parse via
+        //     `alms_core::dm_participants`). If the peer is *not* present in
+        //     the `agents` table at this point in the transaction, the DM is
+        //     unreachable and the row plus every dependent table must go.
+        //     The agent row itself is still live (step 6 deletes it), so
+        //     we look up the *peer*, not the deleting agent.
+        if let Some(name) = &agent_name {
+            // Pull every DM session that mentions this agent. The
+            // `agent_id = nil` filter narrows to the shared-DM class;
+            // the `LIKE 'dm:%'` keeps the SQL honest if a non-DM
+            // session ever slips into the nil-owner bucket.
+            //
+            // FORWARD NOTE: this approach (parse `context_id` per
+            // session-type, probe `agents` per participant) only scales
+            // while DM is the *only* shared-session class. If group
+            // chats / channels / multi-party rooms ever land under the
+            // nil-owner bucket, the per-class parser branch here will
+            // need a fan-out, and an aggregate scan over rows (option 2
+            // from the #1002 design discussion) likely becomes the
+            // simpler shape. Revisit when the second shared class lands.
+            let dm_candidates: Vec<(String, String)> = {
+                let nil_id_str = AgentId::nil().0.to_string();
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id, context_id FROM sessions \
+                         WHERE agent_id = ?1 AND context_id LIKE 'dm:%'",
+                    )
+                    .map_err(|e| {
+                        AlmsError::Runtime(format!("SQLite prepare dm-candidate query: {e}"))
+                    })?;
+                stmt.query_map(params![&nil_id_str], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|e| AlmsError::Runtime(format!("SQLite query dm-candidates: {e}")))?
+                .filter_map(|r| r.ok())
+                .collect()
+            };
+
+            // Classify each DM session as "unreachable after this delete"
+            // by parsing the context_id, identifying the peer, and probing
+            // `agents` for the peer's existence. The deleting agent is
+            // still live in the `agents` table at this point in the
+            // transaction (step 6 removes it), so the peer lookup is the
+            // only thing that matters: peer-absent ⇒ both-gone ⇒ purge.
+            let mut to_purge: Vec<String> = Vec::new();
+            for (sid, ctx_id) in &dm_candidates {
+                // `dm_peer` returns `None` when:
+                //   - `ctx_id` does not match the `"dm:<a>:<b>"` shape
+                //     (some other pair shares the nil-owner bucket -- not
+                //     our cleanup to do), or
+                //   - neither participant matches `name` (same).
+                // Either way we skip; only `Some(peer)` is actionable.
+                let Some(peer) = alms_core::dm_peer(ctx_id, name) else {
+                    continue;
+                };
+
+                let peer_exists: bool = tx
+                    .query_row(
+                        "SELECT 1 FROM agents WHERE name = ?1",
+                        params![peer],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
+                if !peer_exists {
+                    to_purge.push(sid.clone());
+                }
+            }
+
+            // Cascade-delete each unreachable DM session and every
+            // dependent table keyed on it. Same FK-respecting order as
+            // step 2 above: child tables first, sessions row last.
+            for sid in &to_purge {
+                tx.execute(
+                    "DELETE FROM context_summaries WHERE session_id = ?1",
+                    params![sid],
+                )
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite delete dm-cascade summaries: {e}"))
+                })?;
+                tx.execute(
+                    "DELETE FROM session_summaries WHERE session_id = ?1",
+                    params![sid],
+                )
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite delete dm-cascade session_summaries: {e}"))
+                })?;
+                tx.execute(
+                    "DELETE FROM audit_events WHERE session_id = ?1",
+                    params![sid],
+                )
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite delete dm-cascade audit_events: {e}"))
+                })?;
+                tx.execute("DELETE FROM messages WHERE session_id = ?1", params![sid])
+                    .map_err(|e| {
+                        AlmsError::Runtime(format!("SQLite delete dm-cascade messages: {e}"))
+                    })?;
+                // Defensive: in the normal flow this subquery is empty by
+                // construction -- step 4 above already cleared every
+                // `runs WHERE agent_id = <deleted>` row, and the peer's
+                // runs on this DM session were cleared by step 4 of the
+                // peer's own earlier `delete_agent` call (peer-absent is
+                // the trigger for being in `to_purge`). So nothing matches
+                // `runs.session_id = ?1` at this point. We keep the DELETE
+                // anyway: cost is one empty subquery inside the same
+                // transaction, and it remains correct if step 4's ordering
+                // is ever rearranged or a future class of `run_tool_calls`
+                // row lands here under a `from_agent` we did not enumerate.
+                tx.execute(
+                    "DELETE FROM run_tool_calls WHERE run_id IN \
+                     (SELECT run_id FROM runs WHERE session_id = ?1)",
+                    params![sid],
+                )
+                .map_err(|e| {
+                    AlmsError::Runtime(format!("SQLite delete dm-cascade run_tool_calls: {e}"))
+                })?;
+                tx.execute("DELETE FROM runs WHERE session_id = ?1", params![sid])
+                    .map_err(|e| {
+                        AlmsError::Runtime(format!("SQLite delete dm-cascade runs: {e}"))
+                    })?;
+                tx.execute("DELETE FROM sessions WHERE id = ?1", params![sid])
+                    .map_err(|e| {
+                        AlmsError::Runtime(format!("SQLite delete dm-cascade sessions: {e}"))
+                    })?;
+            }
+        }
 
         // 5. Delete jobs belonging to this agent
         tx.execute("DELETE FROM jobs WHERE agent_id = ?1", params![&id_str])
@@ -1366,6 +1517,393 @@ mod tests {
             )
             .unwrap();
         assert_eq!(a_self_count, 0, "A's own non-DM session must be deleted");
+    }
+
+    #[test]
+    fn test_delete_agent_preserves_dm_session_when_peer_still_alive() {
+        // Regression guard for #1002: deleting one DM partner while the
+        // other is still alive must NOT touch the shared DM session row.
+        // This preserves the post-#1000 single-partner-delete behaviour
+        // and rules out the #1002 cascade from over-firing.
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let alice = new_agent("alice");
+        let bob = new_agent("bob");
+        store.create_agent(&alice).unwrap();
+        store.create_agent(&bob).unwrap();
+
+        let dm = Session::new(AgentId::nil(), "dm:alice:bob");
+        store.save_session(&dm).unwrap();
+
+        // Seed each side's #1000 orphan-class rows so we can also assert
+        // alice's contributions are gone (existing behaviour preserved).
+        let a_run = Run::new(dm.id, alice.id, "ping".to_string());
+        let a_run_id = a_run.run_id;
+        store.save_run(&a_run).unwrap();
+        store
+            .save_tool_call(
+                a_run_id,
+                &ToolCallRecord {
+                    seq: 0,
+                    role: ToolCallRole::Assistant,
+                    tool_name: Some("send_message".to_string()),
+                    tool_id: Some("call_a0".to_string()),
+                    params: Some(r#"{"to":"bob","text":"hi"}"#.to_string()),
+                    result: None,
+                    timestamp: chrono::Utc::now(),
+                    from_agent: Some(alice.id.0.to_string()),
+                },
+            )
+            .unwrap();
+        store
+            .upsert_session_summary(alice.id, dm.id, "alice's view", Some(a_run_id), None)
+            .unwrap();
+
+        let b_run = Run::new(dm.id, bob.id, "pong".to_string());
+        store.save_run(&b_run).unwrap();
+        store
+            .upsert_session_summary(bob.id, dm.id, "bob's view", Some(b_run.run_id), None)
+            .unwrap();
+
+        // Delete alice. Bob is still alive -- the DM session must survive
+        // and bob's rows on it must remain intact.
+        assert!(store.delete_agent(alice.id).unwrap());
+
+        // Pull every assertion off the connection lock in a single scope
+        // so the subsequent `load_session_summary` call (which also takes
+        // the lock) does not deadlock.
+        {
+            let conn = store.conn.lock();
+            let dm_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                    params![dm.id.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                dm_count, 1,
+                "DM session must survive while bob is still alive (post-#1000 behaviour)"
+            );
+
+            // Alice's #1000 orphan-class rows on the DM session are gone.
+            let alice_runs: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM runs WHERE agent_id = ?1",
+                    params![alice.id.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(alice_runs, 0, "alice's runs cleared by #1000 step 4");
+
+            // Bob's rows on the DM session are intact.
+            let bob_runs: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM runs WHERE agent_id = ?1",
+                    params![bob.id.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(bob_runs, 1, "bob's DM run must remain");
+        }
+
+        // Lock dropped -- safe to call store helpers that take it again.
+        let bob_summary = store
+            .load_session_summary(bob.id, dm.id)
+            .unwrap()
+            .expect("bob's session_summary on the DM must remain");
+        assert_eq!(bob_summary.summary, "bob's view");
+    }
+
+    #[test]
+    fn test_delete_agent_cascades_dm_session_when_both_partners_gone() {
+        // Issue #1002: when both DM partners are deleted in turn, the
+        // shared DM session row leaks because it's owned by
+        // `AgentId::nil()` and neither agent's delete enumerates it via
+        // `WHERE sessions.agent_id = ?1`. Pre-fix, deleting alice then
+        // bob left a dangling `sessions` row plus every non-orphan-class
+        // table keyed on it (`messages`, `audit_events`,
+        // `context_summaries`).
+        //
+        // Post-fix: when the second partner is deleted, the cascade in
+        // step 4b notices the first partner is already gone (peer
+        // lookup in the agents table fails) and purges the DM session
+        // plus every dependent row.
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let alice = new_agent("alice");
+        let bob = new_agent("bob");
+        store.create_agent(&alice).unwrap();
+        store.create_agent(&bob).unwrap();
+
+        // Shared DM session under the nil-agent sentinel.
+        let dm = Session::new(AgentId::nil(), "dm:alice:bob");
+        store.save_session(&dm).unwrap();
+
+        // Seed every dependent table keyed on the DM session: a
+        // `messages` row (non-orphan-class; only the per-session sweep
+        // can clear it), an `audit_events` row, a `context_summaries`
+        // row, alice's run + tool call + session_summary, bob's
+        // run + session_summary.
+        store
+            .save_message(dm.id, &new_message("hello bob"))
+            .unwrap();
+        let dm_audit = AuditEvent::allow(
+            dm.id,
+            "send_message",
+            serde_json::json!({"to": "bob"}),
+            serde_json::json!("ok"),
+        );
+        store.save_audit(&dm_audit).unwrap();
+        let dm_summary = ContextSummary {
+            text: "DM context summary".to_string(),
+            messages_covered: 1,
+            updated_at: Some(Timestamp::now()),
+        };
+        store.save_summary(dm.id, &dm_summary).unwrap();
+
+        let a_run = Run::new(dm.id, alice.id, "ping".to_string());
+        let a_run_id = a_run.run_id;
+        store.save_run(&a_run).unwrap();
+        store
+            .save_tool_call(
+                a_run_id,
+                &ToolCallRecord {
+                    seq: 0,
+                    role: ToolCallRole::Assistant,
+                    tool_name: Some("send_message".to_string()),
+                    tool_id: Some("call_a0".to_string()),
+                    params: Some(r#"{"to":"bob","text":"hi"}"#.to_string()),
+                    result: None,
+                    timestamp: chrono::Utc::now(),
+                    from_agent: Some(alice.id.0.to_string()),
+                },
+            )
+            .unwrap();
+        store
+            .upsert_session_summary(alice.id, dm.id, "alice's view", Some(a_run_id), None)
+            .unwrap();
+
+        let b_run = Run::new(dm.id, bob.id, "pong".to_string());
+        store.save_run(&b_run).unwrap();
+        store
+            .upsert_session_summary(bob.id, dm.id, "bob's view", Some(b_run.run_id), None)
+            .unwrap();
+
+        // Step 1: delete alice. DM session must still exist (bob alive).
+        assert!(store.delete_agent(alice.id).unwrap());
+        {
+            let conn = store.conn.lock();
+            let dm_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                    params![dm.id.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                dm_count, 1,
+                "after deleting alice, DM session must survive while bob is still alive"
+            );
+        }
+
+        // Step 2: delete bob. Now both participants are gone. The DM
+        // session row AND every dependent row keyed on it must be gone.
+        assert!(store.delete_agent(bob.id).unwrap());
+
+        let conn = store.conn.lock();
+        let dm_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![dm.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            dm_count, 0,
+            "after both partners deleted, the shared DM session row must be gone (#1002)"
+        );
+
+        // Every dependent table keyed on the DM session_id must be empty.
+        let dm_id_str = dm.id.0.to_string();
+        for table in [
+            "messages",
+            "audit_events",
+            "context_summaries",
+            "session_summaries",
+            "runs",
+        ] {
+            let n: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+                    params![&dm_id_str],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                n, 0,
+                "after #1002 cascade, no rows in `{table}` may reference the deleted DM session_id"
+            );
+        }
+
+        // Tool calls (keyed on run_id, not session_id) are gone too --
+        // both runs lived on the DM session and were cleared with it.
+        let n_calls: i64 = conn
+            .query_row("SELECT COUNT(*) FROM run_tool_calls", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n_calls, 0,
+            "all run_tool_calls keyed on DM runs must be gone after #1002 cascade"
+        );
+    }
+
+    #[test]
+    fn test_delete_agent_only_cascades_dms_where_peer_is_also_gone() {
+        // Issue #1002 edge case: alice has DMs with both bob and
+        // charlie. Deleting alice while bob and charlie are both alive
+        // must NOT cascade-delete either DM session -- both peers are
+        // still live participants. Only alice's per-agent #1000 orphan
+        // rows go.
+        //
+        // This guards against the cascade over-firing on
+        // multi-partner agents.
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let alice = new_agent("alice");
+        let bob = new_agent("bob");
+        let charlie = new_agent("charlie");
+        store.create_agent(&alice).unwrap();
+        store.create_agent(&bob).unwrap();
+        store.create_agent(&charlie).unwrap();
+
+        let dm_ab = Session::new(AgentId::nil(), "dm:alice:bob");
+        let dm_ac = Session::new(AgentId::nil(), "dm:alice:charlie");
+        store.save_session(&dm_ab).unwrap();
+        store.save_session(&dm_ac).unwrap();
+
+        // Seed alice's per-perspective rows on both DMs so step 4 has
+        // something to clear and we can confirm alice-only cleanup ran.
+        let a_ab_run = Run::new(dm_ab.id, alice.id, "hi bob".to_string());
+        store.save_run(&a_ab_run).unwrap();
+        let a_ac_run = Run::new(dm_ac.id, alice.id, "hi charlie".to_string());
+        store.save_run(&a_ac_run).unwrap();
+
+        // Seed bob's and charlie's rows on their respective DMs so we
+        // can confirm they survive untouched.
+        let b_run = Run::new(dm_ab.id, bob.id, "hi alice".to_string());
+        store.save_run(&b_run).unwrap();
+        let c_run = Run::new(dm_ac.id, charlie.id, "hi alice".to_string());
+        store.save_run(&c_run).unwrap();
+
+        // Delete alice. Both bob and charlie still exist as DM peers.
+        assert!(store.delete_agent(alice.id).unwrap());
+
+        let conn = store.conn.lock();
+
+        // Both DM session rows must survive -- the peers are still live.
+        for sid in [dm_ab.id, dm_ac.id] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                    params![sid.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "DM session {sid} must survive: peer is still alive");
+        }
+
+        // Alice's per-agent rows are gone (existing #1000 behaviour).
+        let alice_runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM runs WHERE agent_id = ?1",
+                params![alice.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alice_runs, 0, "alice's runs cleared by step 4");
+
+        // Bob's and charlie's DM runs remain intact.
+        for (peer_id, peer_name) in [(bob.id, "bob"), (charlie.id, "charlie")] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM runs WHERE agent_id = ?1",
+                    params![peer_id.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{peer_name}'s DM run must remain intact");
+        }
+    }
+
+    #[test]
+    fn test_delete_agent_recreating_deleted_agent_does_not_resurrect_old_dm() {
+        // Issue #1002 edge case: after both alice and bob are deleted,
+        // the DM session is purged. Creating a fresh agent also named
+        // `alice` must NOT inherit the old DM session row -- there is
+        // nothing to inherit, by construction. This is the intended
+        // semantics: a recreated agent starts with a clean slate, and
+        // any DM with the recreated alice would create a new session
+        // row on next contact.
+        let store = SqliteStore::open_in_memory().unwrap();
+
+        let alice = new_agent("alice");
+        let bob = new_agent("bob");
+        store.create_agent(&alice).unwrap();
+        store.create_agent(&bob).unwrap();
+
+        let dm = Session::new(AgentId::nil(), "dm:alice:bob");
+        store.save_session(&dm).unwrap();
+        store
+            .save_message(dm.id, &new_message("history we don't want to resurrect"))
+            .unwrap();
+
+        // Delete alice then bob -- the DM session goes away (#1002).
+        assert!(store.delete_agent(alice.id).unwrap());
+        assert!(store.delete_agent(bob.id).unwrap());
+
+        {
+            let conn = store.conn.lock();
+            let dm_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                    params![dm.id.0.to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(dm_count, 0, "DM session purged after both partners deleted");
+        }
+
+        // Recreate `alice` with a fresh AgentId. The old DM row is
+        // already gone; the new alice does not see the old DM history.
+        let new_alice = new_agent("alice");
+        assert_ne!(
+            new_alice.id, alice.id,
+            "freshly created agent must have a distinct UUID"
+        );
+        store.create_agent(&new_alice).unwrap();
+
+        let conn = store.conn.lock();
+        let still_zero: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                params![dm.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still_zero, 0,
+            "recreating alice must not resurrect the old DM session row"
+        );
+
+        // And no stale messages keyed on the old DM session_id remain.
+        let stale_msgs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?1",
+                params![dm.id.0.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_msgs, 0, "old DM messages must not survive recreate");
     }
 
     #[test]
